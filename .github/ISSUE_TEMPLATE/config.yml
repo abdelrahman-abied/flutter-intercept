@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/abdelrahman-abied/flutter-intercept/security/advisories/new
+    about: Please report security problems privately, not as a public issue.
+  - name: User documentation (devices, iPhone setup, settings, limitations)
+    url: https://github.com/abdelrahman-abied/flutter-intercept/blob/main/packages/extension/README.md
+    about: Check the Limitations section before reporting traffic that isn't intercepted.

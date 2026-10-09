@@ -1,0 +1,8 @@
+name: fi_flutter_app
+description: Flutter fixture for the Flutter Intercept VS Code integration test (platform folders are generated at test time).
+publish_to: none
+environment:
+  sdk: ^3.0.0
+dependencies:
+  flutter:
+    sdk: flutter

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- Same policy shape the extension must use (docs/spikes/webview.md), with a fixed dev nonce. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'self'; script-src 'nonce-flutterInterceptDev'; img-src 'self' data:;">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flutter Intercept · dev harness</title>
+  <link rel="stylesheet" href="../dist/webview.css">
+  <link rel="stylesheet" href="./themes.css">
+</head>
+<body class="vscode-dark">
+  <div id="dev-bar">
+    <strong>dev harness</strong>
+    <span>theme:</span>
+    <button type="button" data-theme="vscode-dark">dark</button>
+    <button type="button" data-theme="vscode-light">light</button>
+    <button type="button" data-theme="vscode-high-contrast">high contrast</button>
+    <span>·</span>
+    <button type="button" id="dev-stream">pause stream</button>
+    <button type="button" id="dev-burst">+1000 exchanges</button>
+    <button type="button" id="dev-proxy">stop proxy</button>
+    <button type="button" id="dev-error">host error</button>
+    <button type="button" id="dev-lan">open LAN</button>
+    <span>· last message →host:</span>
+    <code id="dev-last">–</code>
+  </div>
+  <div id="root"></div>
+  <!-- fake-host must run first: it defines window.acquireVsCodeApi -->
+  <script nonce="flutterInterceptDev" src="../dist/dev/fake-host.js"></script>
+  <script nonce="flutterInterceptDev" src="../dist/webview.js"></script>
+</body>
+</html>

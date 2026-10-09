@@ -1,0 +1,16 @@
+.vscode-test/**
+dist-test/**
+src/**
+test/**
+node_modules/**
+media/*.png.src
+**/*.map
+dist/meta.json
+tsconfig.json
+build.mjs
+vitest.config.mts
+.gitignore
+*.vsix
+stubs/**
+media/screenshots/**
+media/icon.svg

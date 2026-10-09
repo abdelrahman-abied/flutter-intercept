@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest an idea or an improvement.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the debugging situation you're in and what's hard about it today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to happen?
+      description: The behaviour or UI you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Workarounds, other tools, or other ways to solve it.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Traffic panel / UI
+        - Breakpoints & editing
+        - Mocks, blocks & rules
+        - Devices (Android, iOS simulator, iPhone, macOS)
+        - Setup / F5 integration
+        - Other

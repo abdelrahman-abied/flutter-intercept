@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      CI: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Proxy and extension unit tests compile and run real Dart programs (generated entries,
+      # a dart:io client through the proxy), so `dart` must be on PATH.
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Install
+        run: npm ci
+
+      # Order matters (proxy → webview → extension); the root script runs the workspaces in that order.
+      - name: Build
+        run: npm run build
+
+      # proxy (vitest) + webview (tsc + vitest) + extension (vitest unit tests).
+      # The VS Code integration and device suites need a desktop VS Code, Dart-Code and devices: not run in CI.
+      - name: Unit tests
+        run: npm test
+
+      - name: Bundle smoke test
+        run: npm run test:bundle -w flutter-intercept
+
+      - name: Package .vsix
+        if: runner.os == 'macOS'
+        run: npm run package -w flutter-intercept
+
+      - name: Upload .vsix
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-intercept-vsix
+          path: packages/extension/flutter-intercept.vsix
+          if-no-files-found: error
+          retention-days: 14

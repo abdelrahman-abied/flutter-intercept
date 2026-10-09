@@ -1,0 +1,134 @@
+{
+  "name": "flutter-intercept",
+  "displayName": "Flutter Intercept",
+  "description": "Inspect, pause, edit, block and mock your Flutter app's HTTP traffic — no code in your app, no setup. Just press F5.",
+  "categories": [
+    "Debuggers",
+    "Testing",
+    "Other"
+  ],
+  "keywords": [
+    "flutter",
+    "dart",
+    "dio",
+    "http",
+    "https",
+    "network",
+    "proxy",
+    "mock",
+    "api",
+    "intercept",
+    "debugging",
+    "inspector",
+    "breakpoint",
+    "charles",
+    "proxyman",
+    "android",
+    "ios",
+    "iphone"
+  ],
+  "version": "0.1.0",
+  "private": true,
+  "publisher": "abdulrahman-obaid",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "dist/extension.js",
+  "extensionDependencies": [
+    "Dart-Code.dart-code"
+  ],
+  "activationEvents": [
+    "onDebugResolve:dart",
+    "workspaceContains:pubspec.yaml",
+    "workspaceContains:*/pubspec.yaml",
+    "onView:flutterIntercept.traffic"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Flutter Intercept",
+      "properties": {
+        "flutterIntercept.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Route the HTTP traffic of Dart/Flutter debug sessions through Flutter Intercept. When off, debug sessions are launched untouched."
+        },
+        "flutterIntercept.port": {
+          "type": "number",
+          "default": 8899,
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Port of the local intercepting proxy. If it is busy the next free port (up to 8999) is used."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "flutterIntercept.openPanel",
+        "title": "Open Traffic Panel",
+        "category": "Flutter Intercept"
+      },
+      {
+        "command": "flutterIntercept.toggle",
+        "title": "Toggle Interception",
+        "category": "Flutter Intercept"
+      },
+      {
+        "command": "flutterIntercept.clear",
+        "title": "Clear Traffic",
+        "category": "Flutter Intercept"
+      },
+      {
+        "command": "flutterIntercept.debugWithIntercept",
+        "title": "Debug with Intercept",
+        "category": "Flutter Intercept"
+      }
+    ],
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "flutterIntercept",
+          "title": "Flutter Intercept",
+          "icon": "media/traffic.svg"
+        }
+      ]
+    },
+    "views": {
+      "flutterIntercept": [
+        {
+          "type": "webview",
+          "id": "flutterIntercept.traffic",
+          "name": "Traffic",
+          "icon": "media/traffic.svg"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "vitest run",
+    "test:integration": "node build.mjs --tests && node dist-test/runTest.js",
+    "package": "vsce package --no-dependencies --baseContentUrl https://github.com/abdelrahman-abied/flutter-intercept/blob/HEAD/packages/extension --baseImagesUrl https://github.com/abdelrahman-abied/flutter-intercept/raw/HEAD/packages/extension -o flutter-intercept.vsix",
+    "test:vsix": "npm run build && npm run package && node build.mjs --tests && FI_VSIX=flutter-intercept.vsix node dist-test/runTest.js",
+    "test:bundle": "node build.mjs --smoke && node dist-test/bundle-smoke.js"
+  },
+  "dependencies": {
+    "@flutter-intercept/proxy": "*"
+  },
+  "devDependencies": {
+    "@types/vscode": "~1.90.0",
+    "@vscode/test-electron": "^2.4.0",
+    "@vscode/vsce": "^3.2.0"
+  },
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/abdelrahman-abied/flutter-intercept.git",
+    "directory": "packages/extension"
+  },
+  "bugs": {
+    "url": "https://github.com/abdelrahman-abied/flutter-intercept/issues"
+  },
+  "homepage": "https://github.com/abdelrahman-abied/flutter-intercept#readme"
+}

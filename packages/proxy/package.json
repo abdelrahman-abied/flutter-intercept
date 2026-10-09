@@ -1,0 +1,10 @@
+{ "name": "@flutter-intercept/proxy", "version": "0.0.1", "private": true, "type": "commonjs",
+  "main": "dist/index.js", "types": "dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./rules": { "types": "./dist/rules.d.ts", "default": "./dist/rules.js" },
+    "./types": { "types": "./dist/types.d.ts", "default": "./dist/types.js" }
+  },
+  "typesVersions": { "*": { "rules": ["dist/rules.d.ts"], "types": ["dist/types.d.ts"] } },
+  "scripts": { "build": "tsc -p .", "test": "vitest run" },
+  "dependencies": { "mockttp": "~4.6.3" } }

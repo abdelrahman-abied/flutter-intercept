@@ -1,0 +1,5 @@
+name: dart_cli
+description: Fixture for the Flutter Intercept VS Code integration test. No dependencies.
+publish_to: none
+environment:
+  sdk: ^3.0.0

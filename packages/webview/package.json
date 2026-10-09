@@ -1,0 +1,10 @@
+{ "name": "@flutter-intercept/webview", "version": "0.0.1", "private": true,
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "tsc -p . && vitest run",
+    "typecheck": "tsc -p .",
+    "watch": "node build.mjs --watch",
+    "dev": "node build.mjs --dev"
+  },
+  "dependencies": { "@flutter-intercept/proxy": "*", "preact": "^10.24.0" },
+  "devDependencies": { "happy-dom": "^15.0.0" } }

@@ -1,0 +1,5 @@
+name: fi_compat
+description: dart:io-only harness that compiles and runs the generated entry on several Dart SDKs.
+publish_to: none
+environment:
+  sdk: '>=2.12.0 <4.0.0'

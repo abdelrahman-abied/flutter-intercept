@@ -1,0 +1,122 @@
+name: Bug report
+description: Something doesn't work as expected (traffic missing, wrong behaviour, errors).
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please check the [Limitations](https://github.com/abdelrahman-abied/flutter-intercept/blob/main/packages/extension/README.md#limitations) first: Flutter web, native HTTP stacks (cronet/cupertino), background isolates and apps with their own `HttpOverrides` zone aren't intercepted by design.
+
+        **Security problem?** Don't file it here: use [private vulnerability reporting](https://github.com/abdelrahman-abied/flutter-intercept/security/advisories/new).
+
+        **Before pasting logs, redact** tokens (`FLUTTER_INTERCEPT_PROXY=…`), device UDIDs, signing team IDs, emails and private hostnames/IPs.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a Flutter project that uses Dio …
+        2. Press F5 on an Android emulator …
+        3. …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Flutter Intercept version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: vscode
+    attributes:
+      label: VS Code version
+      description: Help → About (or `code --version`).
+    validations:
+      required: true
+  - type: input
+    id: dartcode
+    attributes:
+      label: Dart-Code (Dart extension) version
+    validations:
+      required: true
+  - type: input
+    id: flutter
+    attributes:
+      label: Flutter and Dart versions
+      description: Output of `flutter --version` (first two lines are enough).
+    validations:
+      required: true
+  - type: dropdown
+    id: device
+    attributes:
+      label: Device kind
+      multiple: true
+      options:
+        - Android emulator
+        - Android phone (USB/adb)
+        - iOS simulator
+        - iPhone over USB
+        - iPhone over Wi-Fi
+        - macOS desktop
+        - Plain Dart program (no device)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: client
+    attributes:
+      label: HTTP client
+      multiple: true
+      options:
+        - Dio
+        - package:http
+        - dart:io HttpClient
+        - Other (please say which below)
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Build mode
+      options:
+        - debug
+        - profile
+        - "release (release launches are never intercepted)"
+  - type: textarea
+    id: output
+    attributes:
+      label: Flutter Intercept output channel
+      description: "View → Output → select **Flutter Intercept** in the dropdown, reproduce the problem, then paste it here (redacted)."
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: console
+    attributes:
+      label: Debug console lines (optional)
+      description: Any `[flutter_intercept]` lines or HTTP errors from your app's debug console.
+      render: text
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Launch configuration (redacted), screenshots of the Traffic panel, VPN/proxy setup, etc.
