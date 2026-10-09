@@ -59,7 +59,12 @@ let deactivateHooks: (() => Promise<unknown>)[] = [];
 
 export function activate(context: vscode.ExtensionContext): FlutterInterceptApi {
   const output = vscode.window.createOutputChannel('Flutter Intercept');
-  const log = (msg: string) => output.appendLine(`${new Date().toISOString()} ${msg}`);
+  // TEST ONLY (FI_TEST_EXPOSE_MCP_TOKEN=1): keep the output-channel lines for the integration suites.
+  const testLogs: string[] | undefined = process.env.FI_TEST_EXPOSE_MCP_TOKEN === '1' ? [] : undefined;
+  const log = (msg: string) => {
+    output.appendLine(`${new Date().toISOString()} ${msg}`);
+    testLogs?.push(msg);
+  };
   const events: InterceptEvent[] = [];
   const reverses = new ReverseTracker({ log });
   const intercepted = new Set<string>(); // ids of live debug sessions running our entry
@@ -197,8 +202,11 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     version,
   });
   let lastAgentCall: { tool: string; at: number } | undefined;
+  // TEST ONLY (FI_TEST_EXPOSE_MCP_TOKEN=1): record agent tool calls for the integration suites.
+  const testAgentCalls: { tool: string; at: number; ok: boolean }[] | undefined = process.env.FI_TEST_EXPOSE_MCP_TOKEN === '1' ? [] : undefined;
   context.subscriptions.push(
     agentApi.onDidCall((e) => {
+      if (testAgentCalls) testAgentCalls.push(e);
       lastAgentCall = { tool: e.tool, at: e.at };
       controller.broadcastStatus();
     }),
@@ -349,7 +357,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     getRules: () => proxyHost.getRules(),
     prepare: (folder, config) => prepareLaunch(deps, folder, substituteCommonVariables(config, folder), 'command'),
     ...(() => {
-      const access = mcpTestAccess(process.env, () => mcp?.url, () => context.secrets.get(MCP_TOKEN_KEY));
+      const access = mcpTestAccess(process.env, () => mcp?.url, () => context.secrets.get(MCP_TOKEN_KEY), testAgentCalls, testLogs);
       return access ? { mcp: access } : {};
     })(),
   };

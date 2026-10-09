@@ -6,6 +6,10 @@
 export interface McpTestAccess {
   readonly url: string | undefined;
   token(): Thenable<string | undefined>;
+  /** Every agent tool call seen by the AgentApi (either door), oldest first. */
+  readonly calls: readonly { tool: string; at: number; ok: boolean }[];
+  /** The extension's output-channel lines (no tokens are ever logged). */
+  readonly logs: readonly string[];
 }
 
 export const EXPOSE_MCP_TOKEN_ENV = 'FI_TEST_EXPOSE_MCP_TOKEN';
@@ -14,6 +18,8 @@ export function mcpTestAccess(
   env: Record<string, string | undefined>,
   getUrl: () => string | undefined,
   getToken: () => Thenable<string | undefined>,
+  calls: readonly { tool: string; at: number; ok: boolean }[] = [],
+  logs: readonly string[] = [],
 ): McpTestAccess | undefined {
   if (env[EXPOSE_MCP_TOKEN_ENV] !== '1') return undefined;
   return {
@@ -21,5 +27,7 @@ export function mcpTestAccess(
       return getUrl();
     },
     token: getToken,
+    calls,
+    logs,
   };
 }

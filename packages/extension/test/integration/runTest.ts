@@ -50,7 +50,8 @@ async function main(): Promise<void> {
   fs.rmSync(path.join(extensionsDir, 'extensions.json'), { force: true });
 
   const version = process.env.FI_VSCODE_VERSION ?? 'stable';
-  let vscodeExecutablePath = await downloadAndUnzipVSCode({ version, cachePath: testRoot });
+  // FI_IDE_EXECUTABLE: run the suites in another VS Code-based IDE (e.g. Cursor's Electron binary).
+  let vscodeExecutablePath = process.env.FI_IDE_EXECUTABLE || (await downloadAndUnzipVSCode({ version, cachePath: testRoot }));
   // Recent macOS builds name the binary `Code`; @vscode/test-electron 2.5.x still expects `Electron`.
   if (!fs.existsSync(vscodeExecutablePath) && fs.existsSync(path.join(path.dirname(vscodeExecutablePath), 'Code'))) {
     vscodeExecutablePath = path.join(path.dirname(vscodeExecutablePath), 'Code');
@@ -66,11 +67,11 @@ async function main(): Promise<void> {
   for (const suite of suites) {
     // devices: the real sample app in place (no copy: keeps its Gradle/Xcode caches warm).
     const fixture =
-      suite === 'devices' || suite === 'agent'
+      suite === 'devices' || suite === 'agent' || suite === 'claude'
         ? path.resolve(extRoot, '..', '..', 'samples', 'demo_app')
         : path.join(workspaceRoot, suite === 'flutter' ? 'flutter_app' : 'dart_cli');
-    if (suite !== 'devices' && suite !== 'agent') fs.cpSync(path.join(extRoot, 'test', 'fixtures', path.basename(fixture)), fixture, { recursive: true });
-    if (suite === 'devices' || suite === 'agent') {
+    if (suite !== 'devices' && suite !== 'agent' && suite !== 'claude') fs.cpSync(path.join(extRoot, 'test', 'fixtures', path.basename(fixture)), fixture, { recursive: true });
+    if (suite === 'devices' || suite === 'agent' || suite === 'claude') {
       if (suite === 'devices' && !process.env.FI_DEVICES) throw new Error('FI_DEVICES=<deviceId,...> is required for the devices suite');
       if (!fs.existsSync(path.join(fixture, '.dart_tool', 'package_config.json'))) {
         execFileSync('flutter', ['pub', 'get', '--offline'], { cwd: fixture, stdio: 'inherit' });
@@ -146,7 +147,9 @@ async function main(): Promise<void> {
           FI_ALLOW_PHYSICAL_IOS: process.env.FI_ALLOW_PHYSICAL_IOS ?? '',
           FI_AGENT_DEVICES: process.env.FI_AGENT_DEVICES ?? '',
           // TEST ONLY: lets the agent suite read the MCP token from the activate() API (src/agent/testExposure.ts).
-          FI_TEST_EXPOSE_MCP_TOKEN: suite === 'agent' ? '1' : '',
+          FI_TEST_EXPOSE_MCP_TOKEN: suite === 'agent' || suite === 'claude' ? '1' : '',
+          FI_CLAUDE_EVIDENCE: process.env.FI_CLAUDE_EVIDENCE ?? '',
+          FI_CLAUDE_BUDGET: process.env.FI_CLAUDE_BUDGET ?? '',
           FI_RESULTS: resultsFile,
         },
       });

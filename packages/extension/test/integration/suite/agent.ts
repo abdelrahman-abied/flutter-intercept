@@ -299,13 +299,17 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
         await agentCfg.update('agent.access', 'readOnly', vscode.ConfigurationTarget.Global);
         await sleep(500);
         const before = api.getRules().length;
-        let lmMsg = 'not rejected';
-        try {
-          await tool('add_mock', { url: 'https://example.com/ro', body: 'x' });
-        } catch (e) {
-          lmMsg = (e as Error).message;
+        // The "direct" path (host without usable LM tools, e.g. Cursor) uses the suite's own adapter, not the
+        // extension's AgentApi, so the access setting can only be checked on the real LM door.
+        let lmMsg = viaLm ? 'not rejected' : 'n/a (no LM tools in this host)';
+        if (viaLm) {
+          try {
+            await tool('add_mock', { url: 'https://example.com/ro', body: 'x' });
+          } catch (e) {
+            lmMsg = (e as Error).message;
+          }
+          if (!/access|read-?only/i.test(lmMsg)) f.push(`LM add_mock under readOnly: ${lmMsg}`);
         }
-        if (!/access|read-?only/i.test(lmMsg)) f.push(`LM add_mock under readOnly: ${lmMsg}`);
         client = await connect();
         const m = await mcpCall('add_mock', { url: 'https://example.com/ro', body: 'x' });
         if (!m.isError || !/access|read-?only/i.test(m.text)) f.push(`MCP add_mock under readOnly: isError=${m.isError} ${m.text.slice(0, 200)}`);
@@ -328,13 +332,15 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
         }
         if (!refused) f.push('MCP server still answering 10 s after access=off');
         if (mcpAccess.url) f.push(`mcp url still set with access=off: ${mcpAccess.url}`);
-        let offMsg = 'not rejected';
-        try {
-          await tool('get_status');
-        } catch (e) {
-          offMsg = (e as Error).message;
+        let offMsg = viaLm ? 'not rejected' : 'n/a (no LM tools in this host)';
+        if (viaLm) {
+          try {
+            await tool('get_status');
+          } catch (e) {
+            offMsg = (e as Error).message;
+          }
+          if (!/off|access/i.test(offMsg)) f.push(`LM get_status with access=off: ${offMsg}`);
         }
-        if (!/off|access/i.test(offMsg)) f.push(`LM get_status with access=off: ${offMsg}`);
         out.output += `; off: MCP refused=${refused}, LM -> "${offMsg.slice(0, 100)}"`;
       } catch (e) {
         f.push(`exception: ${(e as Error).message}`);
