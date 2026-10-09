@@ -1,7 +1,16 @@
 import { execFile } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import type { Exchange, InterceptProxy, Rule } from '@flutter-intercept/proxy';
 import { ReverseTracker } from './adb';
+import { createAgentApi } from './agent/api';
+import { registerInstructionsCommand } from './agent/instructions';
+import { createAppLauncher } from './agent/launch';
+import { registerLmTools } from './agent/lmTools';
+import { registerMcp, type McpRegistration } from './agent/mcp';
+import { languageModelToolsContribution, toolDescriptions, toolSchemas } from './agent/schema';
+import type { AgentAccess } from './agent/types';
 import { CaStore } from './ca';
 import { InterceptDebugConfigurationProvider, InterceptEvent, prepareLaunch, PrepareDeps, readSettings } from './debug/provider';
 import { DebugConfig, debuggerTypeName, HOST_KEY, LAN_KEY, MARKER_KEY, ORIGINAL_PROGRAM_KEY, proxyHostFor } from './debug/rewrite';
@@ -157,8 +166,57 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     getEnabled: () => readSettings().enabled,
     setEnabled,
     log,
+    getAgentStatus: () => agentStatus(),
   });
   const view = new TrafficViewProvider(context.extensionUri, controller);
+
+  // AI agents (CONTRACTS §8): one AgentApi behind two front doors, Copilot tools and a local MCP server.
+  const agentSettings = (): { access: AgentAccess; redactSecrets: boolean; interceptEnabled: boolean } => {
+    const cfg = vscode.workspace.getConfiguration('flutterIntercept');
+    const access = cfg.get<string>('agent.access', 'readWrite');
+    return {
+      access: access === 'readOnly' || access === 'off' ? access : 'readWrite',
+      redactSecrets: cfg.get<boolean>('agent.redactSecrets', true),
+      interceptEnabled: readSettings().enabled,
+    };
+  };
+  const version = String((context.extension?.packageJSON as { version?: string } | undefined)?.version ?? '');
+  const launcher = createAppLauncher({});
+  context.subscriptions.push({ dispose: () => launcher.dispose() });
+  const agentApi = createAgentApi({
+    host: proxyHost,
+    applyRules: (rules) => controller.applyRules(rules),
+    clear: () => controller.clear(),
+    getSettings: agentSettings,
+    launcher,
+    projectRoot: () => flutterProjectRoot(),
+    version,
+  });
+  let lastAgentCall: { tool: string; at: number } | undefined;
+  context.subscriptions.push(
+    agentApi.onDidCall((e) => {
+      lastAgentCall = { tool: e.tool, at: e.at };
+      controller.broadcastStatus();
+    }),
+  );
+  registerLmTools(context, { tools: agentApi, contribution: languageModelToolsContribution(), log });
+  let mcp: McpRegistration | undefined;
+  void registerMcp(context, { tools: agentApi, schemas: toolSchemas, descriptions: toolDescriptions(), log, version })
+    .then((registration) => {
+      mcp = registration;
+      context.subscriptions.push(registration.onDidChange(() => controller.broadcastStatus()));
+      controller.broadcastStatus();
+    })
+    .catch((e: unknown) => log(`MCP server for AI agents failed to start: ${String(e)}`));
+  registerInstructionsCommand(context);
+  function agentStatus() {
+    return {
+      access: agentSettings().access,
+      ...(mcp?.url ? { mcpUrl: mcp.url } : {}),
+      clients: mcp?.clients ?? 0,
+      ...(lastAgentCall ? { lastCall: lastAgentCall } : {}),
+    };
+  }
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(VIEW_ID, view, { webviewOptions: { retainContextWhenHidden: true } }),
     { dispose: () => controller.dispose() },
@@ -334,4 +392,21 @@ function substituteCommonVariables(config: vscode.DebugConfiguration, folder?: v
   const out: vscode.DebugConfiguration = { ...config };
   for (const key of ['program', 'cwd'] as const) if (typeof out[key] === 'string') out[key] = sub(out[key]);
   return out;
+}
+
+/** The workspace folder holding the Flutter project (pubspec.yaml at its root or one level down). */
+function flutterProjectRoot(): string | undefined {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  for (const f of folders) {
+    const root = f.uri.fsPath;
+    if (fs.existsSync(path.join(root, 'pubspec.yaml'))) return root;
+    try {
+      for (const child of fs.readdirSync(root, { withFileTypes: true })) {
+        if (child.isDirectory() && fs.existsSync(path.join(root, child.name, 'pubspec.yaml'))) return path.join(root, child.name);
+      }
+    } catch {
+      // unreadable folder: try the next one
+    }
+  }
+  return folders[0]?.uri.fsPath;
 }

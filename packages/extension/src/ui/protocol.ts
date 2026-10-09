@@ -8,6 +8,15 @@ export interface Status {
   sessions: number;
   /** CONTRACTS §7: set while the LAN listener for a physical iPhone is open ("LAN open for iPhone"). Never the token. */
   lan?: { host: string; port: number; peer?: string };
+  /** CONTRACTS §8: AI agent access (never the MCP token). */
+  agent?: AgentStatus;
+}
+
+export interface AgentStatus {
+  access: string;
+  mcpUrl?: string;
+  clients: number;
+  lastCall?: { tool: string; at: number };
 }
 
 // host → webview

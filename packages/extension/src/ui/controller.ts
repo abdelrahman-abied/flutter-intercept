@@ -10,7 +10,7 @@
  */
 import type { Exchange, RequestEdit, ResponseEdit, Rule, RuleAction } from '@flutter-intercept/proxy';
 import { ruleFromExchange } from '@flutter-intercept/proxy/rules';
-import type { HostMsg, Status, ViewMsg } from './protocol';
+import type { AgentStatus, HostMsg, Status, ViewMsg } from './protocol';
 
 export type Sink = (msg: HostMsg) => void;
 
@@ -38,6 +38,8 @@ export interface ControllerDeps {
   newRuleId?: () => string;
   throttleMs?: number;
   log?: (msg: string) => void;
+  /** CONTRACTS §8: what the status line shows about AI agents (never the MCP token). */
+  getAgentStatus?: () => AgentStatus | undefined;
 }
 
 const RULE_KINDS = new Set<RuleAction['kind']>(['mock', 'block', 'breakpoint']);
@@ -230,6 +232,7 @@ export class InterceptController {
       ...(this.deps.host.lan
         ? { lan: { host: this.deps.host.lan.host, port: this.deps.host.lan.port, ...(this.deps.host.lan.peer ? { peer: this.deps.host.lan.peer } : {}) } }
         : {}),
+      ...(this.deps.getAgentStatus?.() ? { agent: this.deps.getAgentStatus() } : {}),
     };
   }
 

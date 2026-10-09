@@ -36,8 +36,7 @@ export interface LmVscode {
 
 /** One entry of package.json `contributes.languageModelTools` (only `name` matters here). */
 export interface LmToolContribution {
-  name: string;
-  [k: string]: unknown;
+  readonly name: string;
 }
 
 export interface LmToolsDeps {

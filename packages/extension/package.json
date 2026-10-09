@@ -27,7 +27,7 @@
     "ios",
     "iphone"
   ],
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "publisher": "abdulrahman-obaid",
   "license": "MIT",
@@ -42,7 +42,8 @@
     "onDebugResolve:dart",
     "workspaceContains:pubspec.yaml",
     "workspaceContains:*/pubspec.yaml",
-    "onView:flutterIntercept.traffic"
+    "onView:flutterIntercept.traffic",
+    "onMcpCollection:flutterIntercept.mcp"
   ],
   "contributes": {
     "configuration": {
@@ -59,6 +60,33 @@
           "minimum": 1,
           "maximum": 65535,
           "description": "Port of the local intercepting proxy. If it is busy the next free port (up to 8999) is used."
+        },
+        "flutterIntercept.agent.access": {
+          "type": "string",
+          "enum": [
+            "readWrite",
+            "readOnly",
+            "off"
+          ],
+          "default": "readWrite",
+          "enumDescriptions": [
+            "AI agents can read traffic and add mocks/blocks/breakpoints (every change is confirmed by the agent client).",
+            "AI agents can only read traffic.",
+            "No access for AI agents."
+          ],
+          "description": "What AI agents (Copilot agent mode, Claude Code, Cursor, other MCP clients) may do."
+        },
+        "flutterIntercept.agent.redactSecrets": {
+          "type": "boolean",
+          "default": true,
+          "description": "Hide Authorization, cookies, API keys, tokens and passwords from AI agents (tool results and HAR exports). The app always receives the real values."
+        },
+        "flutterIntercept.agent.mcpPort": {
+          "type": "number",
+          "default": 47823,
+          "minimum": 1024,
+          "maximum": 65535,
+          "description": "Port of the local MCP server for AI agents (listens on 127.0.0.1 only). If it is busy, the next free port is used."
         }
       }
     },
@@ -82,6 +110,16 @@
         "command": "flutterIntercept.debugWithIntercept",
         "title": "Debug with Intercept",
         "category": "Flutter Intercept"
+      },
+      {
+        "command": "flutterIntercept.connectAgent",
+        "title": "Connect AI Agent",
+        "category": "Flutter Intercept"
+      },
+      {
+        "command": "flutterIntercept.addAgentInstructions",
+        "title": "Add AI Agent Instructions",
+        "category": "Flutter Intercept"
       }
     ],
     "viewsContainers": {
@@ -102,7 +140,736 @@
           "icon": "media/traffic.svg"
         }
       ]
-    }
+    },
+    "languageModelTools": [
+      {
+        "name": "flutter_intercept_get_status",
+        "displayName": "Flutter Intercept: Intercept status",
+        "toolReferenceName": "interceptGetStatus",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Show proxy, session and traffic status.",
+        "modelDescription": "Get Flutter Intercept status: whether the intercepting proxy runs, the running debug sessions (device, program), how many requests are recorded and paused, and the agent access level. Call this first to see whether an app is running before using the other tools.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_list_requests",
+        "displayName": "Flutter Intercept: List HTTP requests",
+        "toolReferenceName": "interceptListRequests",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "List recorded HTTP requests.",
+        "modelDescription": "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob or /regex/, method, status (code, class like \"4xx\", or \"error\"), state or start time. Returns ids; call get_request for headers and bodies. Secrets are redacted.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL to match: a glob on the full URL where * matches any characters (e.g. \"https://api.example.com/v1/users*\"), or /regex/flags."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "status": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 100,
+                  "maximum": 599
+                },
+                {
+                  "type": "string",
+                  "enum": [
+                    "1xx",
+                    "2xx",
+                    "3xx",
+                    "4xx",
+                    "5xx",
+                    "error"
+                  ]
+                }
+              ],
+              "description": "An exact status code, a class (\"2xx\"..\"5xx\"), or \"error\" (failed/aborted exchanges)."
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "paused-request",
+                "paused-response",
+                "completed",
+                "mocked",
+                "blocked",
+                "aborted",
+                "error"
+              ]
+            },
+            "sinceMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Only exchanges that started at or after this time (epoch milliseconds)."
+            },
+            "limit": {
+              "default": 50,
+              "description": "Max items (newest first), 1-200.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_get_request",
+        "displayName": "Flutter Intercept: Get HTTP request details",
+        "toolReferenceName": "interceptGetRequest",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Show one request with headers and bodies.",
+        "modelDescription": "Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), timings and error. Use after list_requests or wait_for_request.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "includeBodies": {
+              "default": true,
+              "type": "boolean"
+            },
+            "maxBodyChars": {
+              "default": 20000,
+              "description": "Bodies longer than this are cut and marked truncated.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_wait_for_request",
+        "displayName": "Flutter Intercept: Wait for an HTTP request",
+        "toolReferenceName": "interceptWaitForRequest",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Wait for a matching request to complete.",
+        "modelDescription": "Wait until the app makes a request matching a URL glob (and optional method/status) and it completes, then return it. Use this right after triggering an action (hot_restart, launch_app, or a change the user makes in the app) to verify the resulting network call. By default only requests starting after this call count; returns {timedOut: true} after timeoutMs (default 30 s, max 120 s).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL to match: a glob on the full URL where * matches any characters (e.g. \"https://api.example.com/v1/users*\"), or /regex/flags."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "status": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 100,
+                  "maximum": 599
+                },
+                {
+                  "type": "string",
+                  "enum": [
+                    "1xx",
+                    "2xx",
+                    "3xx",
+                    "4xx",
+                    "5xx",
+                    "error"
+                  ]
+                }
+              ],
+              "description": "An exact status code, a class (\"2xx\"..\"5xx\"), or \"error\" (failed/aborted exchanges)."
+            },
+            "sinceMs": {
+              "default": "now",
+              "description": "Only exchanges that started at or after this time (epoch ms), or \"now\" (default) = when this call starts.",
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991,
+                  "description": "Only exchanges that started at or after this time (epoch milliseconds)."
+                },
+                {
+                  "type": "string",
+                  "const": "now"
+                }
+              ]
+            },
+            "timeoutMs": {
+              "default": 30000,
+              "description": "Give up after this long (max 120000) and return {timedOut: true}.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 120000
+            },
+            "includeBodies": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_list_paused",
+        "displayName": "Flutter Intercept: List paused requests",
+        "toolReferenceName": "interceptListPaused",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "List requests paused at a breakpoint.",
+        "modelDescription": "List exchanges currently paused by a breakpoint rule, with their phase (request or response) and the time they auto-resume. Resume or abort them with resume_request / abort_request.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_list_rules",
+        "displayName": "Flutter Intercept: List intercept rules",
+        "toolReferenceName": "interceptListRules",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "List mock, block and breakpoint rules.",
+        "modelDescription": "List the active intercept rules (mocks, blocks, breakpoints) in priority order: the first enabled matching rule wins. Rules created by agents are named \"[agent] ...\".",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_export_har",
+        "displayName": "Flutter Intercept: Export HAR",
+        "toolReferenceName": "interceptExportHar",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Export recorded traffic to a HAR file.",
+        "modelDescription": "Export recorded exchanges (optionally filtered by URL, method, start time) as a HAR 1.2 file under the project's .dart_tool/flutter_intercept/exports/ and return its path. Secrets are redacted according to the user's setting.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL to match: a glob on the full URL where * matches any characters (e.g. \"https://api.example.com/v1/users*\"), or /regex/flags."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "sinceMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Only exchanges that started at or after this time (epoch milliseconds)."
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_add_mock",
+        "displayName": "Flutter Intercept: Add mock rule",
+        "toolReferenceName": "interceptAddMock",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Add a rule that answers matching requests with a fake response.",
+        "modelDescription": "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins; remove it with remove_rule when done.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL to match: a glob on the full URL where * matches any characters (e.g. \"https://api.example.com/v1/users*\"), or /regex/flags."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "status": {
+              "default": 200,
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 599
+            },
+            "headers": {
+              "description": "Response headers. content-type defaults to application/json when body is an object.",
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "body": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {}
+                },
+                {
+                  "type": "array",
+                  "items": {}
+                }
+              ],
+              "description": "Response body: text, or a JSON object/array (sent as JSON)."
+            },
+            "delayMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 600000
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Optional label; it is shown as \"[agent] <name>\" in the rules list."
+            }
+          },
+          "required": [
+            "url",
+            "body"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_add_block",
+        "displayName": "Flutter Intercept: Add block rule",
+        "toolReferenceName": "interceptAddBlock",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Add a rule that blocks matching requests.",
+        "modelDescription": "Block matching requests: answer with a status (default 403) or reset the connection (mode \"reset\") to simulate a network failure. Inserted first; remove it with remove_rule when done.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL to match: a glob on the full URL where * matches any characters (e.g. \"https://api.example.com/v1/users*\"), or /regex/flags."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "mode": {
+              "default": "status",
+              "description": "\"status\" answers with `status`; \"reset\" drops the connection.",
+              "type": "string",
+              "enum": [
+                "status",
+                "reset"
+              ]
+            },
+            "status": {
+              "default": 403,
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 599
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Optional label; it is shown as \"[agent] <name>\" in the rules list."
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_add_breakpoint",
+        "displayName": "Flutter Intercept: Add breakpoint rule",
+        "toolReferenceName": "interceptAddBreakpoint",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Add a rule that pauses matching requests or responses.",
+        "modelDescription": "Pause matching requests before they are sent (phase \"request\") or their responses before the app gets them (phase \"response\", default). Paused exchanges appear in list_paused; continue them with resume_request (optionally edited) or abort_request. The app may time out if left paused.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL to match: a glob on the full URL where * matches any characters (e.g. \"https://api.example.com/v1/users*\"), or /regex/flags."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "phase": {
+              "default": "response",
+              "type": "string",
+              "enum": [
+                "request",
+                "response",
+                "both"
+              ]
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Optional label; it is shown as \"[agent] <name>\" in the rules list."
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_remove_rule",
+        "displayName": "Flutter Intercept: Remove rule",
+        "toolReferenceName": "interceptRemoveRule",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Remove a rule.",
+        "modelDescription": "Remove an intercept rule by id (see list_rules). Clean up the mocks, blocks and breakpoints you added once you are done.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "ruleId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          },
+          "required": [
+            "ruleId"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_resume_request",
+        "displayName": "Flutter Intercept: Resume paused request",
+        "toolReferenceName": "interceptResumeRequest",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Resume a paused request or response, optionally edited.",
+        "modelDescription": "Resume a paused exchange, optionally editing it first: for a paused request method/url/headers/body, for a paused response status/headers/body. headers replaces the whole header set; omit body to keep it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "edit": {
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "maxLength": 20,
+                  "pattern": "^[A-Za-z]+$",
+                  "description": "HTTP method (case-insensitive). Omit to match any method."
+                },
+                "url": {
+                  "description": "Absolute http(s) URL (paused requests only).",
+                  "type": "string"
+                },
+                "status": {
+                  "description": "Status code (paused responses only).",
+                  "type": "integer",
+                  "minimum": 100,
+                  "maximum": 599
+                },
+                "headers": {
+                  "description": "Replaces the WHOLE header set.",
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    ]
+                  }
+                },
+                "body": {
+                  "description": "New decoded body text. Omit to keep the original body.",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "description": "Changes to apply before resuming. Omit to resume unchanged."
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_abort_request",
+        "displayName": "Flutter Intercept: Abort paused request",
+        "toolReferenceName": "interceptAbortRequest",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Abort a paused request.",
+        "modelDescription": "Abort a paused exchange: the app sees a connection reset.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_clear_requests",
+        "displayName": "Flutter Intercept: Clear recorded requests",
+        "toolReferenceName": "interceptClearRequests",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Clear the recorded traffic list.",
+        "modelDescription": "Clear the recorded traffic list (in-flight and paused exchanges are kept). Useful before a step so that list_requests only shows what follows.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_launch_app",
+        "displayName": "Flutter Intercept: Launch Flutter app",
+        "toolReferenceName": "interceptLaunchApp",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Launch the app in a debug session with interception.",
+        "modelDescription": "Start the Flutter/Dart app in a normal VS Code debug session; Flutter Intercept routes its HTTP traffic through the proxy automatically. Optional deviceId (see get_status / the selected device), program (e.g. lib/main_dev.dart) and flutterMode (debug or profile). Returns once the session started; then use wait_for_request.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "deviceId": {
+              "description": "Flutter device id (e.g. \"emulator-5554\", a simulator UDID). Omit to use the device selected in VS Code.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "program": {
+              "description": "Entry point, e.g. \"lib/main_dev.dart\". Omit for the default (lib/main.dart).",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "flutterMode": {
+              "default": "debug",
+              "type": "string",
+              "enum": [
+                "debug",
+                "profile"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_stop_app",
+        "displayName": "Flutter Intercept: Stop Flutter app",
+        "toolReferenceName": "interceptStopApp",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Stop the app debug session(s).",
+        "modelDescription": "Stop an intercepted debug session (or all of them when sessionId is omitted).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "sessionId": {
+              "description": "Omit to stop every intercepted session.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_hot_restart",
+        "displayName": "Flutter Intercept: Hot restart Flutter app",
+        "toolReferenceName": "interceptHotRestart",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Hot restart the running app.",
+        "modelDescription": "Hot-restart the running app (or all intercepted sessions) so it starts over with the current code and rules; interception stays on. Follow with wait_for_request to verify the network calls made at startup.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "sessionId": {
+              "description": "Omit to hot-restart every intercepted session.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      }
+    ],
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "flutterIntercept.mcp",
+        "label": "Flutter Intercept"
+      }
+    ]
   },
   "scripts": {
     "build": "node build.mjs",
