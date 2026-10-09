@@ -11,7 +11,7 @@ import * as path from 'path';
 import * as tls from 'tls';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { InterceptProxy } from '../src';
-import { forbiddenReason, LAN_MAX_PENDING_PER_IP, lanIPv4Addresses, lanTesting } from '../src/lan';
+import { forbiddenReason, LAN_MAX_CONNECTIONS, LAN_MAX_PENDING_PER_IP, lanIPv4Addresses, lanTesting } from '../src/lan';
 import { currentRoutes, parseNetstatRoutes, refreshRoutes, routesTesting } from '../src/routes';
 import { startProxy, startUpstream, type Upstream } from './helpers';
 
@@ -21,7 +21,7 @@ const LAN_IP = lanIPv4Addresses()[0];
 let TOKEN = '';
 let AUTH = '';
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-async function until(cond: () => boolean, ms = 3000): Promise<void> {
+async function until(cond: () => boolean, ms = 10_000): Promise<void> {
   const end = Date.now() + ms;
   while (!cond() && Date.now() < end) await sleep(10);
 }
@@ -251,6 +251,17 @@ describe.skipIf(!LAN_IP)(`LAN hardening on ${LAN_IP ?? '(no LAN IPv4)'}`, () => 
     `GET ${url} HTTP/1.1\r\nHost: ${new URL(url).host}\r\n${auth ? `Proxy-Authorization: ${AUTH}\r\n` : ''}\r\n`;
 
   it('#1 close race: hammering connections during closeLan leaves no survivor that reaches a loopback service', async () => {
+    // What "survivor" must mean here: a connection the proxy still serves after closeLan. TCP-level
+    // leftovers are NOT that: on a slow runner the kernel's accept queue overflows, and Linux (and
+    // the macOS CI VMs) leave clients that believe they are connected (SYN-ACK seen) or still
+    // retrying their SYN while the server has no socket for them at all; they only learn on the next
+    // retransmit (RST). CI saw 83 / 240 such sockets with no reply and 0 secret hits. So we assert:
+    // (1) the gate keeps no socket and no listener, (2) once TCP has settled, any socket still open
+    // client-side gets no service — neither an unauthenticated request to a loopback-only service
+    // nor an AUTHENTICATED request to an allowed upstream reaches anything, and nothing but a
+    // refusal (407/403) ever comes back.
+    const probeUp = await startUpstream(LAN_IP); // allowed, but only ever targeted by the probes
+    upPorts.add(Number(new URL(probeUp.httpUrl).port));
     const open: net.Socket[] = [];
     let stop = false;
     const request = plainGet(`${up.httpUrl}/json`); // fixed now: this test's token, this test's upstream
@@ -265,24 +276,41 @@ describe.skipIf(!LAN_IP)(`LAN hardening on ${LAN_IP ?? '(no LAN IPv4)'}`, () => 
       }
     }, 1);
     await sleep(400);
+    const gate = (proxy as unknown as { lanGate: { sockets: Set<net.Socket>; closed: boolean } }).lanGate;
     await proxy.closeLan();
+    expect(gate.closed).toBe(true);
+    expect(gate.sockets.size).toBe(0); // (1) server side: nothing accepted survives
     await sleep(200);
     stop = true;
     clearInterval(gen);
+    // Probe every socket that is still open client-side NOW (a real survivor would be served now;
+    // the server's keep-alive timeout would hide it later), then let TCP settle and judge.
     await sleep(500);
-    const survivors = open.filter((s) => !s.destroyed && !s.closed);
+    const survivors = open.filter((s) => !s.closed);
+    const state = (a: net.Socket[]) => JSON.stringify(a.reduce<Record<string, number>>((m, s) => ((m[s.readyState] = (m[s.readyState] ?? 0) + 1), m), {}));
+    const atProbe = state(survivors);
     const replies: string[] = [];
     for (const s of survivors) {
       s.on('data', (d) => replies.push(d.toString().split('\r\n')[0]));
+      // The AUTHENTICATED request to an allowed upstream goes first: a real survivor would be served
+      // (probe hit) even if the unauthenticated one after it were refused by the SSRF rule alone.
+      s.write(plainGet(`${probeUp.httpUrl}/json`)); // valid token, allowed target
       s.write(plainGet(secretUrl(), false)); // no token, loopback-only target
     }
-    await sleep(800);
-    console.log(`[race] opened ${open.length}, survivors ${survivors.length}, replies ${JSON.stringify([...new Set(replies)])}, secret hits ${secret.hits.length}`);
+    // refused SYN retries and RSTs on retransmitted data arrive within seconds
+    await until(() => open.every((s) => s.closed), 20_000);
+    await sleep(500);
+    console.log(
+      `[race] opened ${open.length}, client-side open at probe ${survivors.length} ${atProbe}, still open after settling ${open.filter((s) => !s.closed).length}, ` +
+        `replies ${JSON.stringify([...new Set(replies)])}, secret hits ${secret.hits.length}, probe hits ${probeUp.hits.length}`,
+    );
     expect(open.length).toBeGreaterThan(100); // CI runners are slower than a dev Mac
-    expect(survivors.length).toBe(0);
-    expect(secret.hits).toEqual([]);
+    expect(secret.hits).toEqual([]); // (2)
+    expect(probeUp.hits).toEqual([]);
+    expect(replies.every((r) => /^HTTP\/1\.1 40[37]/.test(r))).toBe(true);
     await Promise.all(open.map((s) => new Promise<void>((r) => (s.closed ? r() : (s.once('close', () => r()), s.destroy())))));
-  }, 30_000);
+    await probeUp.close();
+  }, 60_000);
 
   it('#1 guards are keyed on the socket: survivors of a closed gate get 407 / 403, never an upstream', async () => {
     lanTesting.keepSocketsOnClose = true; // simulate the old race: sockets outlive closeLan
@@ -293,7 +321,7 @@ describe.skipIf(!LAN_IP)(`LAN hardening on ${LAN_IP ?? '(no LAN IPv4)'}`, () => 
     plain.on('error', () => undefined);
     await new Promise((r) => plain.on('connect', r));
     plain.write(plainGet(`${up.httpUrl}/json`));
-    await until(() => plainText.includes('{"hello":"world"}'));
+    await until(() => plainText.includes('{"hello":"world"}'), 15_000);
     expect(plainText).toMatch(/^HTTP\/1\.1 200/);
 
     const target = new URL(up.httpsUrl).host;
@@ -313,21 +341,21 @@ describe.skipIf(!LAN_IP)(`LAN hardening on ${LAN_IP ?? '(no LAN IPv4)'}`, () => 
 
     plainText = '';
     plain.write(plainGet(secretUrl(), false)); // no token
-    await until(() => plainText.length > 0);
+    await until(() => plainText.length > 0, 15_000);
     expect(plainText).toMatch(/^HTTP\/1\.1 407/);
 
     let tunnelText = '';
     tunnel.on('data', (d) => (tunnelText += d));
     tunnel.on('error', () => undefined);
     tunnel.write(`GET /json HTTP/1.1\r\nHost: ${target}\r\n\r\n`);
-    await until(() => tunnelText.length > 0);
+    await until(() => tunnelText.length > 0, 15_000);
     expect(tunnelText).toMatch(/^HTTP\/1\.1 (403|407)/);
 
     expect(secret.hits).toEqual([]);
     expect(up.hits).toEqual(['GET /json']); // only the request made before closeLan
     plain.destroy();
     tunnel.destroy();
-  }, 20_000);
+  }, 60_000);
 
   it('#2a pins the first authenticated peer; another IP with the valid token gets 407; rotation re-pins', async () => {
     const peers = fakePeers();
@@ -487,18 +515,28 @@ describe.skipIf(!LAN_IP)(`LAN hardening on ${LAN_IP ?? '(no LAN IPv4)'}`, () => 
     const rss0 = process.memoryUsage().rss;
     let maxLag = 0;
     let last = process.hrtime.bigint();
+    const gate = (proxy as unknown as { lanGate: { sockets: Set<unknown>; pendingPerIp: Map<string, number> } }).lanGate;
+    let maxSockets = 0;
+    let maxPending = 0;
     const lagTimer = setInterval(() => {
       const now = process.hrtime.bigint();
       maxLag = Math.max(maxLag, Number(now - last) / 1e6 - 10);
       last = now;
+      maxSockets = Math.max(maxSockets, gate.sockets.size);
+      maxPending = Math.max(maxPending, ...gate.pendingPerIp.values(), 0);
     }, 10);
     const out = await new Promise<string>((resolve) =>
       execFile(process.execPath, [path.join(__dirname, 'fixtures', 'lan_dos_client.cjs'), LAN_IP!, String(lanPort), '300', '4000'], (_e, so) => resolve(so)),
     );
     clearInterval(lagTimer);
     const grew = (process.memoryUsage().rss - rss0) / 1024 / 1024;
-    console.log(`[dos] ${out.trim()} maxLag=${maxLag.toFixed(0)}ms rssGrowth=${grew.toFixed(1)}MB`);
-    expect(grew).toBeLessThan(40); // reviewer measured +50 MB before; 16 heads × 64 KB is ~1 MB
+    console.log(`[dos] ${out.trim()} maxLag=${maxLag.toFixed(0)}ms rssGrowth=${grew.toFixed(1)}MB maxSockets=${maxSockets} maxPending=${maxPending}`);
+    // The deterministic bound: what the gate holds never exceeds its caps (≤ 32 heads × 64 KB).
+    expect(maxPending).toBeLessThanOrEqual(LAN_MAX_PENDING_PER_IP);
+    expect(maxSockets).toBeLessThanOrEqual(LAN_MAX_CONNECTIONS);
+    // RSS as a sanity bound. The reviewer measured +50 MB before the fix on macOS; Linux/glibc RSS
+    // is noisier (CI ubuntu: +38 MB with the gate holding ~2 MB), so it gets more headroom there.
+    expect(grew).toBeLessThan(process.platform === 'darwin' ? 40 : 100);
     // Lag is environment-dependent (a bare accept+drop of the same burst costs 100–650 ms on a dev
     // Mac); this only guards against a pathological stall. RSS above is the real assertion.
     expect(maxLag).toBeLessThan(5000);

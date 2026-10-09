@@ -564,6 +564,46 @@ It works in three layers:
   the test seam for the one allowed upstream and hard-forbidden targets for SSRF, so they don't
   depend on the route table or on IPv6 being available.
 
+**CI run 37927559659 (first public CI): the close-race test, an artefact, not a bypass.**
+- **Symptom:** `#1 close race` failed on both runners, "expected 83 / 240 to be 0" (ubuntu
+  10.1.0.216, macOS VM 192.168.64.17).
+- **The same CI logs:** `[race] opened 1665, survivors 83, replies [], secret hits 0` (ubuntu) and
+  `opened 1245, survivors 240, replies [], secret hits 0` (macOS).
+- **Why that is not a bypass:**
+  - The old test counted as a "survivor" every client socket not yet closed 500 ms after the
+    hammer stopped. That includes sockets still `opening` (SYN pending), and sockets the kernel
+    completed or half-completed while the accept queue overflowed on a slow runner.
+  - Those sockets have **no server-side socket at all**. They only learn of it on their next SYN
+    or data retransmit (RST), which can take seconds.
+  - A real survivor, a socket accepted by the gate and handed to mockttp, answers. With the guards
+    keyed on the socket it answers 407/403; the `#1 guards are keyed on the socket` test proves that,
+    and it passed on both runners. Without the guards it serves (the reviewer's original exploit got
+    `SECRET`).
+  - Here: no reply to any probe, and 0 secret hits.
+- **Reproduced locally under CPU stress** (14 busy processes on 14 cores): `client-side open at
+  probe 3 {"opening":3}`. Those were still-connecting sockets, so the old assertion would have
+  failed. They received no reply and closed by themselves.
+- **Test fix** (product code unchanged). The test now asserts the security property:
+  1. **Server side, deterministic:** right after `closeLan`, the gate is closed and holds **0
+     sockets**.
+  2. **Client side, probed immediately:** every socket still open gets an **authenticated** request
+     to an allowed upstream that only the probe uses, then an unauthenticated request to the
+     loopback-only service. The authenticated one goes first, because the unauthenticated one would
+     be 403'd by the SSRF rule even on broken code.
+  3. **After TCP settles** (up to 20 s for SYN and data retransmits): 0 hits on both services, and
+     nothing but a 403/407 ever came back. State counts are logged.
+- **Mutation check:** I reintroduced the bug (sockets outlive close, no closed-gate refusal, no
+  per-request auth, guards off for closed gates).
+  - The test fails on (1), with 64 sockets kept.
+  - With (1) disabled it still fails on (2): `probe hits 45`, `replies ["HTTP/1.1 200 OK"]`.
+- **Also:** the flood test now asserts the gate's caps deterministically (max sockets ≤ 128, max
+  pending per IP ≤ 32), sampled every 10 ms during the flood. RSS stays a sanity bound: 40 MB on
+  macOS, 100 MB on Linux (CI ubuntu showed +38 MB from glibc noise while the gate held about 2 MB).
+  The keyed-on-socket test and the default wait were given stress-tolerant timeouts.
+- **Results:**
+  - Fresh clone of 6980cc8 plus this fix, Node 22.23.3, `CI=true`: **5/5 runs, 110/110**.
+  - Under CPU stress: 2/2, 110/110.
+
 The LAN socket tests run in one file (`lan.test.ts` imports `lan-hardening.suite.ts`), so the flood
 doesn't starve the timing-based tests. Total after the route-based follow-up: **106 proxy tests passing, 3 runs in a row**; 212
 extension unit tests passing; minified-bundle LAN smoke test OK.
