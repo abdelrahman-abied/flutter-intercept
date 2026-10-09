@@ -80,3 +80,14 @@ Flutter Web (no dart:io), native adapters (cronet/cupertino/native_dio_adapter),
 background isolates, Dio `validateCertificate` pinning, mTLS client certificates, an app `connectionFactory` that ignores the proxy,
 apps that wrap their code in their own `HttpOverrides.runWithHttpOverrides`/`runZoned` overrides zone,
 (app `findProxy` assignments are neutralised by the wrapper client; since template v3 the entry trusts only the per-install CA — no accept-any callback — so DIRECT fallback keeps normal TLS verification; see docs/REVIEW-1.md, docs/spikes/template-v3.md.)
+
+## v0.2.0 — Agent API (2026-10-09)
+Goal: AI agents (Copilot agent mode, Claude Code, Cursor) use Flutter Intercept as well as developers.
+Contract: CONTRACTS §8. Parallel owners (disjoint files; each module exports `register(context, deps)`,
+the lead wires `extension.ts` + `package.json`):
+| Agent | Owns |
+|---|---|
+| B core | `src/agent/{api,schema,redact,har}.ts` + tests — the single implementation |
+| C MCP | `src/agent/mcp/**` + tests — server, auth, registration, connectAgent command |
+| A tools+launch | `src/agent/lmTools.ts`, `src/agent/launch.ts` + tests; device e2e of launch_app/hot_restart |
+| D docs+UI | `src/agent/instructions.ts`, webview agent indicator/badges, README "Use with AI agents" |

@@ -114,7 +114,9 @@
     "test:bundle": "node build.mjs --smoke && node dist-test/bundle-smoke.js"
   },
   "dependencies": {
-    "@flutter-intercept/proxy": "*"
+    "@flutter-intercept/proxy": "*",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/vscode": "~1.90.0",

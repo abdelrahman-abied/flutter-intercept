@@ -425,3 +425,77 @@ Extension:
 - `openLan` on the first physical-iOS session, `closeLan` when the last one ends and on deactivate.
 - Tell the user once: macOS may ask to allow incoming connections for VS Code; iOS asks for Local Network
   permission on first run — both must be allowed.
+
+## 8. Agent API — v0.2.0 (AI agents: Copilot agent mode, Claude Code, Cursor, any MCP client)
+
+One implementation (`packages/extension/src/agent/api.ts`, class `AgentApi`), two front doors that only
+translate: VS Code Language Model Tools and a local MCP server. Tool names below are the MCP names; LM tool
+names are `flutter_intercept_<name>`. Input schemas live in ONE module (`src/agent/schema.ts`, zod) and the
+package.json `languageModelTools` entries must equal them (unit-tested).
+
+### Access & safety (user decisions, 2026-10-09)
+- Setting `flutterIntercept.agent.access`: `"readWrite"` (default) | `"readOnly"` | `"off"`.
+  Write tools are refused (clear error) under readOnly; nothing is exposed under off.
+- Every WRITE tool needs confirmation: LM tools return `confirmationMessages` from `prepareInvocation`;
+  MCP tools carry annotations `readOnlyHint` / `destructiveHint` so clients (Claude Code, VS Code) ask.
+- Setting `flutterIntercept.agent.redactSecrets` (default true). Redaction applies to everything an agent
+  can read (tool results and HAR exports), never to what the app receives:
+  - headers matching `/^(authorization|proxy-authorization|cookie|set-cookie)$/i` or containing
+    `/(token|secret|api[-_]?key|session|password|auth)/i` → value `"[redacted]"`;
+  - URL query params and JSON body fields (any depth) whose name matches
+    `/(pass(word)?|token|secret|api[-_]?key|session|auth|credential|client[-_]?secret)/i` → `"[redacted]"`
+    (JSON edited structurally only if it parses losslessly; otherwise leave text and redact by regex on
+    `"name":"value"` pairs).
+- Agents never see the CA key, the iPhone LAN token or the MCP token. Rules created by agents get
+  `name` prefixed `"[agent] "` so the UI can mark them.
+- Result size caps: list ≤ 200 items (default 50); bodies ≤ `maxBodyChars` (default 20 000) with
+  `truncated: true`; base64 bodies become `"[binary N bytes]"`.
+
+### Tools
+| Tool | R/W | Input | Output |
+|---|---|---|---|
+| `get_status` | R | — | `{proxyRunning, port?, interceptEnabled, sessions:[{id, deviceId?, program, mode, lan?}], pausedCount, exchangeCount, agentAccess}` |
+| `list_requests` | R | `{url?: glob\|/re/, method?, status?: number\|"2xx".."5xx"\|"error", state?, sinceMs?, limit?}` | `{items:[{id, method, url, status?, state, durationMs?, startedAt, responseBytes?, matchedRuleId?}], total}` newest first |
+| `get_request` | R | `{id, includeBodies?=true, maxBodyChars?}` | full redacted Exchange view (headers, bodies, timings, error) |
+| `wait_for_request` | R | `{url, method?, status?, sinceMs?="now", timeoutMs?=30000 (≤120000), includeBodies?=false}` | first matching exchange that reaches a final state after `sinceMs`, or `{timedOut:true}` — must never hang past timeout |
+| `list_paused` | R | — | paused exchanges with phase + pauseDeadline |
+| `list_rules` | R | — | `{rules: Rule[]}` (order = priority) |
+| `add_mock` | W | `{url, method?, status?=200, headers?, body: string\|object, delayMs?, name?}` | `{ruleId}` inserted FIRST |
+| `add_block` | W | `{url, method?, mode?="status", status?=403, name?}` | `{ruleId}` |
+| `add_breakpoint` | W | `{url, method?, phase?="response", name?}` | `{ruleId}` |
+| `remove_rule` | W | `{ruleId}` | `{removed: boolean}` |
+| `resume_request` | W | `{id, edit?: RequestEdit\|ResponseEdit}` | `{resumed:true}` or error |
+| `abort_request` | W | `{id}` | `{aborted:true}` |
+| `clear_requests` | W | — | `{cleared:n}` |
+| `export_har` | R | `{url?, method?, sinceMs?}` | writes `<project>/.dart_tool/flutter_intercept/exports/<ts>.har` (redacted per setting) → `{path, entries}` |
+| `launch_app` | W | `{deviceId?, program?, flutterMode?="debug"}` | starts a normal Dart-Code debug session (our provider intercepts) → `{sessionId}` once started |
+| `stop_app` | W | `{sessionId?}` | `{stopped:n}` |
+| `hot_restart` | W | `{sessionId?}` | `{restarted:n}` (Dart-Code `hotRestart` custom request) |
+
+Validation reuses `validateRule`/`validateEdit` from `src/ui/controller.ts`; every error is returned as a
+tool error with a human-readable message, never thrown into the host.
+
+### MCP server
+- Streamable HTTP at `http://127.0.0.1:<port>/mcp` (`@modelcontextprotocol/sdk`, already installed),
+  setting `flutterIntercept.agent.mcpPort` (default 47823, next free on conflict). Binds 127.0.0.1 only
+  (verify, fail closed).
+- Auth: `Authorization: Bearer <token>`; token = 32 random bytes base64url, generated once, stored in
+  `context.secrets`; constant-time compare; 401 otherwise. Reject any request whose `Host` isn't
+  `127.0.0.1:<port>` / `localhost:<port>` or that carries an `Origin` header (browser/DNS-rebinding).
+- Registered for VS Code via `vscode.lm.registerMcpServerDefinitionProvider` (feature-detected; engines
+  stay ^1.90 — use typed shims, never bump @types/vscode beyond engines).
+- Command `flutterIntercept.connectAgent` — quick pick: Claude Code (copies
+  `claude mcp add --transport http flutter-intercept http://127.0.0.1:<port>/mcp --header "Authorization: Bearer <token>"`),
+  Cursor (copies an `mcp.json` snippet), Other (copies URL + header). Copies to clipboard only; never writes
+  config files.
+
+### Instructions command
+`flutterIntercept.addAgentInstructions` — user picks target(s): `AGENTS.md`, `CLAUDE.md`,
+`.github/copilot-instructions.md`; appends (or updates in place between markers
+`<!-- flutter-intercept:start -->` / `<!-- flutter-intercept:end -->`) a short section: when to use the tools,
+the verify-after-change loop (launch_app → wait_for_request → get_request), error-case testing with add_mock,
+cleanup (remove_rule), and that secrets are redacted. Never writes without the command.
+
+### UI
+`Status` gains `agent?: { access: string; mcpUrl?: string; clients: number; lastCall?: { tool: string; at: number } }`
+(never the token). Rules whose name starts with `"[agent] "` show an agent badge.
