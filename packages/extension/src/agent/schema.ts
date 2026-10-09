@@ -54,7 +54,12 @@ export const toolSchemas = {
     url,
     method: method.optional(),
     status: statusFilter.optional(),
-    sinceMs: z.union([sinceMs, z.literal('now')]).default('now').describe('Only exchanges that started at or after this time (epoch ms), or "now" (default) = when this call starts.'),
+    sinceMs: z
+      .union([sinceMs, z.literal('now')])
+      .optional()
+      .describe(
+        'Only exchanges that started at or after this time (epoch ms), or "now" = when this call starts. Default: the start of the latest launch_app/hot_restart if it was within the last 120 s (so requests the app sent since then count), otherwise "now".',
+      ),
     timeoutMs: z.number().int().min(0).max(120_000).default(30_000).describe('Give up after this long (max 120000) and return {timedOut: true}.'),
     includeBodies: z.boolean().default(false),
   }),
@@ -97,6 +102,9 @@ export const toolSchemas = {
 } satisfies Record<ToolName, z.ZodType>;
 
 export type ToolInput<T extends ToolName> = z.output<(typeof toolSchemas)[T]>;
+
+/** How long after a launch_app/hot_restart wait_for_request still defaults to its start time. */
+export const TRIGGER_WINDOW_MS = 120_000;
 
 export const ALL_TOOLS: ToolName[] = [...READ_TOOLS, ...WRITE_TOOLS];
 
@@ -141,7 +149,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   wait_for_request: {
     title: 'Wait for an HTTP request',
-    model: 'Wait until the app makes a request matching a URL glob (and optional method/status) and it completes, then return it. Use this right after triggering an action (hot_restart, launch_app, or a change the user makes in the app) to verify the resulting network call. By default only requests starting after this call count; returns {timedOut: true} after timeoutMs (default 30 s, max 120 s).',
+    model: 'Wait until the app makes a request matching a URL glob (and optional method/status) and it completes, then return it. Use this right after triggering an action to verify the resulting network call. After hot_restart or launch_app you can call wait_for_request directly: requests sent since the restart/launch are included, even if they finished before this call. Otherwise only requests starting after this call count (pass sinceMs to choose). Returns the sinceMs it used, and {timedOut: true} after timeoutMs (default 30 s, max 120 s).',
     user: 'Wait for a matching request to complete.',
   },
   list_paused: {
@@ -196,7 +204,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   launch_app: {
     title: 'Launch Flutter app',
-    model: 'Start the Flutter/Dart app in a normal VS Code debug session; Flutter Intercept routes its HTTP traffic through the proxy automatically. Optional deviceId (see get_status / the selected device), program (e.g. lib/main_dev.dart) and flutterMode (debug or profile). Returns once the session started; then use wait_for_request.',
+    model: 'Start the Flutter/Dart app in a normal VS Code debug session; Flutter Intercept routes its HTTP traffic through the proxy automatically. Optional deviceId (see get_status / the selected device), program (e.g. lib/main_dev.dart) and flutterMode (debug or profile). Returns {sessionId, sinceMs} once the session started; then call wait_for_request directly — requests the app sent since the launch are included.',
     user: 'Launch the app in a debug session with interception.',
   },
   stop_app: {
@@ -206,7 +214,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   hot_restart: {
     title: 'Hot restart Flutter app',
-    model: "Hot-restart the running app (or all intercepted sessions) so it starts over with the current code and rules; interception stays on. Follow with wait_for_request to verify the network calls made at startup.",
+    model: 'Hot-restart the running app (or all intercepted sessions) so it starts over with the current code and rules; interception stays on. Returns {restarted, sinceMs}. Then call wait_for_request directly to verify the network calls made at startup: requests sent since the restart are included, even ones that finished before wait_for_request was called.',
     user: 'Hot restart the running app.',
   },
 };

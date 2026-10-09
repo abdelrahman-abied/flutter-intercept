@@ -8,7 +8,7 @@ import { matches } from '@flutter-intercept/proxy/rules';
 import { validateEdit, validateRule } from '../ui/controller';
 import { buildHar, writeHar } from './har';
 import { redactBodyText, redactHeaders, redactUrl } from './redact';
-import { parseToolInput, ToolInput } from './schema';
+import { parseToolInput, ToolInput, TRIGGER_WINDOW_MS } from './schema';
 import { AgentAccess, AgentTools, AgentToolError, AppLauncher, isWriteTool, ToolName, ToolResult } from './types';
 
 export const AGENT_RULE_PREFIX = '[agent] ';
@@ -66,6 +66,8 @@ function bodyBytes(b: Body | undefined): number | undefined {
 
 export class AgentApi implements AgentTools {
   private readonly listeners = new Set<(e: { tool: ToolName; at: number; ok: boolean }) => void>();
+  /** Time captured just before the latest launch_app/hot_restart triggered through this API. */
+  private lastTriggerAt?: number;
 
   constructor(private readonly deps: AgentApiDeps) {}
 
@@ -144,12 +146,12 @@ export class AgentApi implements AgentTools {
         return this.clearRequests();
       case 'launch_app': {
         const i = input as ToolInput<'launch_app'>;
-        return this.deps.launcher.launch({ deviceId: i.deviceId, program: i.program, flutterMode: i.flutterMode });
+        return this.triggered(() => this.deps.launcher.launch({ deviceId: i.deviceId, program: i.program, flutterMode: i.flutterMode }));
       }
       case 'stop_app':
         return this.deps.launcher.stop((input as ToolInput<'stop_app'>).sessionId);
       case 'hot_restart':
-        return this.deps.launcher.hotRestart((input as ToolInput<'hot_restart'>).sessionId);
+        return this.triggered(() => this.deps.launcher.hotRestart((input as ToolInput<'hot_restart'>).sessionId));
       default:
         throw new AgentToolError(`unknown tool ${String(tool)}`, 'invalid');
     }
@@ -157,6 +159,23 @@ export class AgentApi implements AgentTools {
 
   private now(): number {
     return (this.deps.now ?? Date.now)();
+  }
+
+  /**
+   * Runs a launch/restart and records the time captured just BEFORE it was triggered, so a following
+   * wait_for_request also sees requests the app sent before the wait began (the restarted app is fast).
+   */
+  private async triggered(run: () => Promise<Record<string, unknown>>): Promise<ToolResult> {
+    const sinceMs = this.now();
+    const result = await run();
+    this.lastTriggerAt = sinceMs;
+    return { ...result, sinceMs };
+  }
+
+  /** wait_for_request's default `sinceMs`: the latest trigger if within TRIGGER_WINDOW_MS, else now. */
+  private defaultSince(): number {
+    const now = this.now();
+    return this.lastTriggerAt !== undefined && now - this.lastTriggerAt <= TRIGGER_WINDOW_MS ? this.lastTriggerAt : now;
   }
 
   private get redact(): boolean {
@@ -262,10 +281,10 @@ export class AgentApi implements AgentTools {
    * awaited — no polling. Resolves `{timedOut:true}` at the timeout; rejects on abort. Never hangs.
    */
   private waitForRequest(i: ToolInput<'wait_for_request'>, signal?: AbortSignal): Promise<ToolResult> {
-    const since = i.sinceMs === 'now' ? this.now() : i.sinceMs;
+    const since = i.sinceMs === undefined ? this.defaultSince() : i.sinceMs === 'now' ? this.now() : i.sinceMs;
     const f = { url: i.url, method: i.method, status: i.status as StatusFilter, sinceMs: since };
     const hit = (e: Exchange) => FINAL_STATES.has(e.state) && exchangeMatches(e, f);
-    const view = (e: Exchange) => ({ timedOut: false, ...this.detail(e, i.includeBodies, 20_000) });
+    const view = (e: Exchange) => ({ timedOut: false, sinceMs: since, ...this.detail(e, i.includeBodies, 20_000) });
     if (signal?.aborted) return Promise.reject(new AgentToolError('wait_for_request was cancelled', 'state'));
 
     return new Promise<ToolResult>((resolve, reject) => {
@@ -286,7 +305,7 @@ export class AgentApi implements AgentTools {
       // Subscribe before scanning so an exchange finishing in between is not missed.
       this.deps.host.on('exchange', onExchange);
       signal?.addEventListener('abort', onAbort, { once: true });
-      timer = setTimeout(() => finish(() => resolve({ timedOut: true, waitedMs: i.timeoutMs })), i.timeoutMs);
+      timer = setTimeout(() => finish(() => resolve({ timedOut: true, waitedMs: i.timeoutMs, sinceMs: since })), i.timeoutMs);
       const recorded = this.deps.host
         .getExchanges()
         .filter(hit)

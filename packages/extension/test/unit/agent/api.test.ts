@@ -258,7 +258,7 @@ describe('wait_for_request', () => {
   it('"now" ignores exchanges that started before the call', async () => {
     const { api, host } = setup();
     host.push(ex({ url: 'https://a/x', startedAt: Date.now() - 10_000 }));
-    expect(await api.call('wait_for_request', { url: 'https://a/x', timeoutMs: 50 })).toEqual({ timedOut: true, waitedMs: 50 });
+    expect(await api.call('wait_for_request', { url: 'https://a/x', timeoutMs: 50 })).toMatchObject({ timedOut: true, waitedMs: 50 });
   });
 
   it('status filter and error states count as final', async () => {
@@ -273,7 +273,7 @@ describe('wait_for_request', () => {
   it('times out with {timedOut:true} and never hangs; unsubscribes', async () => {
     const { api, host } = setup();
     const t0 = Date.now();
-    expect(await api.call('wait_for_request', { url: 'https://never/*', timeoutMs: 80 })).toEqual({ timedOut: true, waitedMs: 80 });
+    expect(await api.call('wait_for_request', { url: 'https://never/*', timeoutMs: 80 })).toMatchObject({ timedOut: true, waitedMs: 80 });
     expect(Date.now() - t0).toBeLessThan(1000);
     expect(host.listenerCount('exchange')).toBe(0);
   });
@@ -371,11 +371,11 @@ describe('write tools', () => {
 
   it('launch_app / stop_app / hot_restart go to the launcher', async () => {
     const { api, launcher } = setup();
-    expect(await api.call('launch_app', { deviceId: 'emulator-5554', program: 'lib/main_dev.dart' })).toEqual({ sessionId: 's1' });
+    expect(await api.call('launch_app', { deviceId: 'emulator-5554', program: 'lib/main_dev.dart' })).toMatchObject({ sessionId: 's1', sinceMs: expect.any(Number) });
     expect(launcher.launch).toHaveBeenCalledWith({ deviceId: 'emulator-5554', program: 'lib/main_dev.dart', flutterMode: 'debug' });
     expect(await api.call('stop_app', {})).toEqual({ stopped: 1 });
     expect(launcher.stop).toHaveBeenCalledWith(undefined);
-    expect(await api.call('hot_restart', { sessionId: 's1' })).toEqual({ restarted: 1 });
+    expect(await api.call('hot_restart', { sessionId: 's1' })).toMatchObject({ restarted: 1, sinceMs: expect.any(Number) });
     expect(launcher.hotRestart).toHaveBeenCalledWith('s1');
   });
 });
@@ -419,5 +419,90 @@ describe('export_har', () => {
     expect(entry.response.content).toMatchObject({ size: 2, encoding: 'base64', comment: expect.stringMatching(/truncated/) });
     expect(entry.startedDateTime).toBe(new Date(e.startedAt).toISOString());
     expect(entry._state).toBe('completed');
+  });
+});
+
+describe('wait_for_request after launch_app / hot_restart (no race)', () => {
+  function clocked() {
+    let now = 1_000_000;
+    const t = setup({ now: 0 });
+    // replace the clock: setup() fixes `now`; drive it by hand here
+    (t.api as unknown as { deps: AgentApiDeps }).deps.now = () => now;
+    return { ...t, tick: (ms: number) => (now += ms), at: () => now };
+  }
+
+  it('hot_restart returns sinceMs captured BEFORE the restart; a request sent before wait_for_request is matched', async () => {
+    const t = clocked();
+    let restartRequest: Exchange | undefined;
+    (t.launcher.hotRestart as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      t.tick(300); // the restart takes a moment …
+      restartRequest = ex({ url: 'https://api.example.com/config', startedAt: t.at() }); // … and the app already sent its request
+      t.host.push(restartRequest);
+      t.tick(200);
+      return { restarted: 1 };
+    });
+    const before = t.at();
+    const r = (await t.api.call('hot_restart', {})) as { restarted: number; sinceMs: number };
+    expect(r).toEqual({ restarted: 1, sinceMs: before });
+    t.tick(2_000); // the agent takes a while before waiting
+    const w = (await t.api.call('wait_for_request', { url: 'https://api.example.com/config*', timeoutMs: 50 })) as Record<string, unknown>;
+    expect(w).toMatchObject({ timedOut: false, id: restartRequest!.id, sinceMs: before });
+  });
+
+  it('launch_app sets the default the same way', async () => {
+    const t = clocked();
+    const before = t.at();
+    expect(await t.api.call('launch_app', {})).toEqual({ sessionId: 's1', sinceMs: before });
+    t.tick(5_000);
+    const early = ex({ url: 'https://a/boot', startedAt: before + 1_000 });
+    t.host.push(early);
+    expect(await t.api.call('wait_for_request', { url: 'https://a/boot', timeoutMs: 50 })).toMatchObject({ id: early.id, sinceMs: before });
+  });
+
+  it('after the 120 s window the default is "now" again', async () => {
+    const t = clocked();
+    await t.api.call('hot_restart', {});
+    const old = ex({ url: 'https://a/x', startedAt: t.at() + 10 });
+    t.host.push(old);
+    t.tick(120_001);
+    const w = (await t.api.call('wait_for_request', { url: 'https://a/x', timeoutMs: 30 })) as Record<string, unknown>;
+    expect(w).toEqual({ timedOut: true, waitedMs: 30, sinceMs: t.at() });
+  });
+
+  it('exactly at 120 s it still applies', async () => {
+    const t = clocked();
+    const before = t.at();
+    await t.api.call('hot_restart', {});
+    const e = ex({ url: 'https://a/y', startedAt: before + 5 });
+    t.host.push(e);
+    t.tick(120_000);
+    expect(await t.api.call('wait_for_request', { url: 'https://a/y', timeoutMs: 30 })).toMatchObject({ id: e.id, sinceMs: before });
+  });
+
+  it('explicit "now" or a number overrides the trigger default', async () => {
+    const t = clocked();
+    await t.api.call('hot_restart', {});
+    const e = ex({ url: 'https://a/z', startedAt: t.at() + 10 });
+    t.host.push(e);
+    t.tick(1_000);
+    expect(await t.api.call('wait_for_request', { url: 'https://a/z', sinceMs: 'now', timeoutMs: 30 })).toEqual({ timedOut: true, waitedMs: 30, sinceMs: t.at() });
+    expect(await t.api.call('wait_for_request', { url: 'https://a/z', sinceMs: e.startedAt + 1, timeoutMs: 30 })).toMatchObject({ timedOut: true, sinceMs: e.startedAt + 1 });
+    expect(await t.api.call('wait_for_request', { url: 'https://a/z', sinceMs: 0, timeoutMs: 30 })).toMatchObject({ id: e.id, sinceMs: 0 });
+  });
+
+  it('a failed restart does not move the default', async () => {
+    const t = clocked();
+    (t.launcher.hotRestart as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('no session'));
+    await rejects(t.api.call('hot_restart', {}), 'internal', /no session/);
+    t.tick(10);
+    const w = (await t.api.call('wait_for_request', { url: 'https://n/*', timeoutMs: 20 })) as Record<string, unknown>;
+    expect(w.sinceMs).toBe(t.at());
+  });
+
+  it('stop_app does not count as a trigger', async () => {
+    const t = clocked();
+    expect(await t.api.call('stop_app', {})).toEqual({ stopped: 1 });
+    const w = (await t.api.call('wait_for_request', { url: 'https://n/*', timeoutMs: 20 })) as Record<string, unknown>;
+    expect(w.sinceMs).toBe(t.at());
   });
 });

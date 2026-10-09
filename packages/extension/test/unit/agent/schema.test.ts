@@ -17,7 +17,7 @@ describe('tool schemas', () => {
   it('apply §8 defaults', () => {
     expect(parseToolInput('list_requests', {})).toEqual({ limit: 50 });
     expect(parseToolInput('get_request', { id: 'x' })).toEqual({ id: 'x', includeBodies: true, maxBodyChars: 20000 });
-    expect(parseToolInput('wait_for_request', { url: '*' })).toEqual({ url: '*', sinceMs: 'now', timeoutMs: 30000, includeBodies: false });
+    expect(parseToolInput('wait_for_request', { url: '*' })).toEqual({ url: '*', timeoutMs: 30000, includeBodies: false }); // sinceMs default is decided by the API (latest launch/restart or now)
     expect(parseToolInput('add_mock', { url: '*', body: { a: 1 } })).toMatchObject({ status: 200, body: { a: 1 } });
     expect(parseToolInput('add_block', { url: '*' })).toEqual({ url: '*', mode: 'status', status: 403 });
     expect(parseToolInput('add_breakpoint', { url: '*' })).toEqual({ url: '*', phase: 'response' });
