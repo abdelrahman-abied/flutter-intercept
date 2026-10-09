@@ -6,5 +6,5 @@
     "watch": "node build.mjs --watch",
     "dev": "node build.mjs --dev"
   },
-  "dependencies": { "@flutter-intercept/proxy": "*", "preact": "^10.24.0" },
+  "dependencies": { "@flutter-intercept/proxy": "*", "preact": "^11.0.0" },
   "devDependencies": { "happy-dom": "^15.0.0" } }
