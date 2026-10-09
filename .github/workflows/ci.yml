@@ -58,7 +58,7 @@ jobs:
 
       - name: Upload .vsix
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: flutter-intercept-vsix
           path: packages/extension/flutter-intercept.vsix
