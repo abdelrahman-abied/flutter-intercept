@@ -1,12 +1,14 @@
 /** Ready-to-paste client configurations for `flutterIntercept.connectAgent` (pure, unit-tested). */
 
-export type AgentClient = 'claude' | 'cursor' | 'other';
+export type AgentClient = 'claude' | 'cursor' | 'gemini' | 'other';
 
 export interface ConnectSnippet {
   client: AgentClient;
   label: string;
   /** What goes to the clipboard. Contains the token: treat as a secret. */
   text: string;
+  /** An alternative to copy instead (e.g. Gemini CLI's settings.json entry). */
+  alternative?: { label: string; text: string };
 }
 
 export const MCP_SERVER_NAME = 'flutter-intercept';
@@ -33,6 +35,17 @@ export function connectSnippet(client: AgentClient, url: string, token: string):
         client,
         label: 'Cursor',
         text: JSON.stringify({ mcpServers: { [MCP_SERVER_NAME]: { url, headers: { Authorization: `Bearer ${token}` } } } }, null, 2),
+      };
+    case 'gemini':
+      // Gemini CLI: `gemini mcp add` (user scope); or the equivalent ~/.gemini/settings.json entry.
+      return {
+        client,
+        label: 'Gemini CLI',
+        text: `gemini mcp add --transport http --scope user --header "${header}" ${MCP_SERVER_NAME} ${url}`,
+        alternative: {
+          label: 'settings.json snippet',
+          text: JSON.stringify({ mcpServers: { [MCP_SERVER_NAME]: { httpUrl: url, headers: { Authorization: `Bearer ${token}` } } } }, null, 2),
+        },
       };
     default:
       return { client: 'other', label: 'Other MCP client', text: `URL: ${url}\nHeader: ${header}\nTransport: Streamable HTTP` };

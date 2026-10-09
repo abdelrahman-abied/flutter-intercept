@@ -52,6 +52,13 @@ export interface RunningMcpServer {
   readonly url: string;
   /** Live MCP sessions (≈ connected agent clients). */
   readonly sessions: number;
+  /**
+   * Issue (or, with `undefined`, revoke) the single URL-path credential: requests to
+   * `/mcp/k/<pathToken>` are authorised like a Bearer token. Only for clients whose registration API
+   * can't carry headers (Cursor's `vscode.cursor.mcp.registerServer` drops them in 3.23); a fresh
+   * one replaces the previous. Returns the full URL to hand to that client.
+   */
+  issuePathToken(pathToken: string | undefined): string | undefined;
   close(): Promise<void>;
 }
 
@@ -63,6 +70,11 @@ export function generateToken(): string {
 }
 
 const digest = (s: string) => createHash('sha256').update(s, 'utf8').digest();
+
+/** Constant-time equality of two secrets (digests, so length doesn't leak either). */
+export function tokenEquals(a: string, b: string): boolean {
+  return timingSafeEqual(digest(a), digest(b)) && b.length > 0;
+}
 
 /** Constant-time `Authorization: Bearer <token>` check (digests, so length doesn't leak either). */
 export function bearerOk(header: string | string[] | undefined, token: string): boolean {
@@ -158,6 +170,7 @@ export async function startMcpServer(o: McpServerOptions): Promise<RunningMcpSer
   const postResponses = new Set<http.ServerResponse>();
   let port = 0;
   let closing = false;
+  let pathToken: string | undefined;
 
   const closeSession = async (id: string) => {
     const s = sessions.get(id);
@@ -168,7 +181,10 @@ export async function startMcpServer(o: McpServerOptions): Promise<RunningMcpSer
   };
 
   const handle = async (req: http.IncomingMessage, res: http.ServerResponse) => {
-    const path = (req.url ?? '').split('?')[0];
+    const rawPath = (req.url ?? '').split('?')[0];
+    // `/mcp/k/<token>`: the path credential (see issuePathToken). Checked in constant time below.
+    const pathCred = /^\/mcp\/k\/([A-Za-z0-9_-]+)$/.exec(rawPath)?.[1];
+    const path = pathCred !== undefined ? MCP_PATH : rawPath;
     if (closing) return send(res, 503, jsonRpcError('Server shutting down'));
     // 2. Browsers attach Origin; an MCP client has no reason to.
     if (req.headers.origin !== undefined) return send(res, 403, jsonRpcError('Forbidden'));
@@ -176,7 +192,8 @@ export async function startMcpServer(o: McpServerOptions): Promise<RunningMcpSer
     const host = (req.headers.host ?? '').toLowerCase();
     if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) return send(res, 403, jsonRpcError('Forbidden'));
     // 4. Token.
-    if (!bearerOk(req.headers.authorization, o.token)) {
+    const authorised = pathCred !== undefined ? pathToken !== undefined && tokenEquals(pathCred, pathToken) : bearerOk(req.headers.authorization, o.token);
+    if (!authorised) {
       return send(res, 401, jsonRpcError('Unauthorized'), { 'www-authenticate': 'Bearer realm="flutter-intercept"' });
     }
     if (path !== MCP_PATH) return send(res, 404, jsonRpcError('Not found'));
@@ -252,6 +269,11 @@ export async function startMcpServer(o: McpServerOptions): Promise<RunningMcpSer
     url,
     get sessions() {
       return sessions.size;
+    },
+    issuePathToken(t) {
+      if (t !== undefined && !/^[A-Za-z0-9_-]{32,}$/.test(t)) throw new Error('path token must be ≥ 32 base64url characters');
+      pathToken = t;
+      return t === undefined ? undefined : `http://127.0.0.1:${port}${MCP_PATH}/k/${t}`;
     },
     async close() {
       if (closing) return;

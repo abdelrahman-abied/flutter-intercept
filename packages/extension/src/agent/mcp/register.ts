@@ -5,7 +5,9 @@
  */
 import * as vscode from 'vscode';
 import type { AgentTools, ToolName } from '../types';
-import { connectSnippet, type AgentClient } from './connect';
+import { randomBytes } from 'crypto';
+import { runConnectAgent } from './connectFlow';
+import { CursorRegistrar, detectCursorMcp } from './cursor';
 import { DEFAULT_MCP_PORT, generateToken, startMcpServer, type RunningMcpServer, type ToolSchema } from './server';
 
 export const MCP_PROVIDER_ID = 'flutterIntercept.mcp';
@@ -73,6 +75,19 @@ export async function registerMcp(context: vscode.ExtensionContext, deps: McpDep
   let lastClients = 0;
   let disposed = false;
   let reconciling: Promise<void> = Promise.resolve();
+  // Cursor zero-config (no-op in VS Code, where `vscode.cursor` doesn't exist).
+  const cursorApi = detectCursorMcp(vscode);
+  const cursor = new CursorRegistrar(cursorApi, log);
+  const syncCursor = async () => {
+    const s = server;
+    if (!s) return cursor.sync(undefined);
+    const token = await getOrCreateToken(context.secrets);
+    await cursor.sync({
+      token,
+      issueUrl: () => s.issuePathToken(randomBytes(32).toString('base64url'))!,
+      revoke: () => void s.issuePathToken(undefined),
+    });
+  };
 
   const stop = async () => {
     const s = server;
@@ -104,6 +119,7 @@ export async function registerMcp(context: vscode.ExtensionContext, deps: McpDep
           log(`MCP: not started: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
+      await syncCursor();
       definitionsChanged.fire();
       changed.fire();
     }));
@@ -131,7 +147,9 @@ export async function registerMcp(context: vscode.ExtensionContext, deps: McpDep
   // so it never sits in VS Code's list of server definitions.
   const api = vscode as unknown as VscodeMcpShim;
   const Def = api.McpHttpServerDefinition;
-  if (api.lm?.registerMcpServerDefinitionProvider && Def) {
+  if (cursorApi) {
+    // Inside Cursor its own registration API is used (above); don't list the server twice.
+  } else if (api.lm?.registerMcpServerDefinitionProvider && Def) {
     try {
       disposables.push(
         api.lm.registerMcpServerDefinitionProvider(MCP_PROVIDER_ID, {
@@ -160,19 +178,16 @@ export async function registerMcp(context: vscode.ExtensionContext, deps: McpDep
         void vscode.window.showWarningMessage(`Flutter Intercept: ${why}`);
         return;
       }
-      const items: Array<vscode.QuickPickItem & { client: AgentClient }> = [
-        { label: 'Claude Code', description: 'copies a `claude mcp add …` command', client: 'claude' },
-        { label: 'Cursor', description: 'copies an mcp.json snippet', client: 'cursor' },
-        { label: 'Other MCP client', description: 'copies the URL and the Authorization header', client: 'other' },
-      ];
-      const pick = await vscode.window.showQuickPick(items, { title: 'Connect an AI agent to Flutter Intercept', placeHolder: 'Which client?' });
-      if (!pick || !server) return;
       const token = await getOrCreateToken(context.secrets);
-      const snippet = connectSnippet(pick.client, server.url, token);
-      await vscode.env.clipboard.writeText(snippet.text);
-      void vscode.window.showInformationMessage(
-        `Copied the ${snippet.label} configuration to the clipboard. It contains your Flutter Intercept access token: ` +
-          "treat it like a password — don't commit or share it. Nothing was written to any config file.",
+      await runConnectAgent(
+        {
+          pick: async (items) =>
+            (await vscode.window.showQuickPick(items, { title: 'Connect an AI agent to Flutter Intercept', placeHolder: 'Which client?' }))?.client,
+          copy: (text) => Promise.resolve(vscode.env.clipboard.writeText(text)),
+          info: (message, ...buttons) => Promise.resolve(vscode.window.showInformationMessage(message, ...buttons)),
+          error: async (message) => void (await vscode.window.showErrorMessage(message)),
+        },
+        { url: server.url, token, cursorAutoRegistered: cursor.isRegistered },
       );
     }),
   );
@@ -189,7 +204,7 @@ export async function registerMcp(context: vscode.ExtensionContext, deps: McpDep
     onDidChange: changed.event,
     dispose() {
       disposed = true;
-      void stop();
+      void cursor.unregister().finally(() => stop());
       for (const d of disposables) d.dispose();
     },
   };
