@@ -1,7 +1,20 @@
 import { EventEmitter } from 'events';
 import { describe, expect, it, vi } from 'vitest';
 import type { Exchange, Rule } from '@flutter-intercept/proxy';
-import { ControllerHost, InterceptController, ruleFromExchangeErrorMessage, validateEdit, validateRule, validateRules } from '../../src/ui/controller';
+import type { SendRequest } from '@flutter-intercept/proxy';
+import type { NetworkProfile } from '@flutter-intercept/proxy/network';
+import {
+  ControllerDeps,
+  ControllerHost,
+  InterceptController,
+  ruleFromExchangeErrorMessage,
+  sanitizeSendHeaders,
+  validateEdit,
+  validateNetworkProfile,
+  validateRule,
+  validateRules,
+  validateSendDraft,
+} from '../../src/ui/controller';
 import type { HostMsg } from '../../src/ui/protocol';
 
 class FakeHost extends EventEmitter implements ControllerHost {
@@ -29,6 +42,16 @@ class FakeHost extends EventEmitter implements ControllerHost {
   abort(id: string) {
     this.resumed.push(['abort', id]);
   }
+  sentReqs: SendRequest[] = [];
+  async send(req: SendRequest) {
+    this.sentReqs.push(req);
+    if (req.url.includes('fail')) throw new Error('upstream refused');
+    return { id: `sent${this.sentReqs.length}` };
+  }
+  networkProfile: NetworkProfile = { kind: 'none' };
+  setNetworkProfile(p: NetworkProfile) {
+    this.networkProfile = p;
+  }
   push(e: Exchange) {
     const i = this.exchanges.findIndex((x) => x.id === e.id);
     if (i >= 0) this.exchanges[i] = e;
@@ -50,7 +73,7 @@ const ex = (id: string, state: Exchange['state'] = 'completed', extra: Partial<E
   ...extra,
 });
 
-function setup(throttleMs = 20) {
+function setup(throttleMs = 20, extra: Partial<ControllerDeps> = {}) {
   const host = new FakeHost();
   let enabled = true;
   const saved: Rule[][] = [];
@@ -63,6 +86,7 @@ function setup(throttleMs = 20) {
     },
     newRuleId: () => 'rule_new',
     throttleMs,
+    ...extra,
   });
   const got: HostMsg[] = [];
   c.attach((m) => got.push(m));
@@ -315,5 +339,247 @@ describe('status carries the LAN listener (CONTRACTS §7)', () => {
     expect(JSON.stringify(replies)).not.toContain('SECRET');
     (host as unknown as { lan?: unknown }).lan = undefined;
     expect(c.status().lan).toBeUndefined();
+  });
+});
+
+describe('v0.3.0 rule fields (CONTRACTS §9.3)', () => {
+  const base = { id: 'r', enabled: true, match: { url: '*' } };
+  it('accepts throttle, fault, times and expiresAt', () => {
+    for (const action of [
+      { kind: 'throttle' },
+      { kind: 'throttle', latencyMs: 0, kbps: 1, dropRate: 0 },
+      { kind: 'throttle', latencyMs: 600_000, kbps: 10_000_000, dropRate: 1 },
+      { kind: 'throttle', kbps: 400.5, dropRate: 0.2 },
+      { kind: 'fault', fault: 'reset' },
+      { kind: 'fault', fault: 'timeout' },
+      { kind: 'fault', fault: 'truncate' },
+      { kind: 'fault', fault: 'dns' },
+    ]) {
+      expect(() => validateRule({ ...base, action }), JSON.stringify(action)).not.toThrow();
+    }
+    expect(validateRule({ ...base, action: { kind: 'block', mode: 'reset' }, times: 1, expiresAt: Date.now() + 1000 })).toMatchObject({ times: 1 });
+    expect(() => validateRule({ ...base, action: { kind: 'block', mode: 'reset' }, times: 1000 })).not.toThrow();
+  });
+
+  it.each([
+    [{ kind: 'throttle', latencyMs: -1 }, /latencyMs/],
+    [{ kind: 'throttle', latencyMs: 600_001 }, /latencyMs/],
+    [{ kind: 'throttle', latencyMs: 1.5 }, /latencyMs/],
+    [{ kind: 'throttle', kbps: 0 }, /kbps/],
+    [{ kind: 'throttle', kbps: 10_000_001 }, /kbps/],
+    [{ kind: 'throttle', kbps: Infinity }, /kbps/],
+    [{ kind: 'throttle', dropRate: 1.1 }, /dropRate/],
+    [{ kind: 'throttle', dropRate: '0.5' }, /dropRate/],
+    [{ kind: 'throttle', extra: 1 }, /unknown field "extra"/],
+    [{ kind: 'fault', fault: 'boom' }, /fault must be/],
+    [{ kind: 'fault' }, /fault must be/],
+    [{ kind: 'fault', fault: 'reset', status: 500 }, /unknown field/],
+  ])('rejects action %j', (action, re) => {
+    expect(() => validateRule({ ...base, action })).toThrow(re);
+  });
+
+  it.each([
+    [{ times: 0 }, /times/],
+    [{ times: 1001 }, /times/],
+    [{ times: 1.5 }, /times/],
+    [{ times: '2' }, /times/],
+    [{ expiresAt: NaN }, /expiresAt/],
+    [{ expiresAt: -5 }, /expiresAt/],
+    [{ expiresAt: '2026' }, /expiresAt/],
+  ])('rejects %j', (extra, re) => {
+    expect(() => validateRule({ ...base, action: { kind: 'block', mode: 'reset' }, ...extra })).toThrow(re);
+  });
+});
+
+describe('send (CONTRACTS §9.3)', () => {
+  it('validates, strips framing/proxy headers, sends as the editor and replies sent', async () => {
+    const { host, c, replies, reply } = setup();
+    await c.handle(
+      {
+        type: 'send',
+        request: { method: 'post', url: 'https://api.example.com/a', headers: { 'content-length': '3', 'proxy-authorization': 'Basic x', host: 'h', accept: 'a', 'x-fi-id': 'abcdefgh' }, body: '{}' },
+        resentFrom: 'e1',
+      },
+      reply,
+    );
+    expect(host.sentReqs).toEqual([{ method: 'POST', url: 'https://api.example.com/a', headers: { accept: 'a' }, body: '{}', initiator: 'editor', resentFrom: 'e1' }]);
+    expect(replies).toEqual([{ type: 'sent', id: 'sent1' }]);
+  });
+
+  it.each([
+    [{ method: 'GE T', url: 'https://a' }, /method/],
+    [{ method: 'GET', url: 'ftp://a' }, /http\(s\)/],
+    [{ method: 'GET', url: '/relative' }, /absolute/],
+    [{ method: 'GET' }, /url/],
+    [{ method: 'GET', url: 'https://a', headers: { 'x-a': 'b\r\nc' } }, /CR, LF/],
+    [{ method: 'GET', url: 'https://a', body: 1 }, /body/],
+    [{ method: 'GET', url: 'https://a', extra: 1 }, /unknown field/],
+    ['nope', /object/],
+  ])('rejects %j with an error reply, nothing sent', async (request, re) => {
+    const { host, c, replies, reply } = setup();
+    await c.handle({ type: 'send', request }, reply);
+    expect(host.sentReqs).toEqual([]);
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ type: 'error' });
+    expect((replies[0] as { message: string }).message).toMatch(re);
+  });
+
+  it('a failing send becomes an error reply', async () => {
+    const { c, replies, reply } = setup();
+    await c.handle({ type: 'send', request: { method: 'GET', url: 'https://fail.example.com/' } }, reply);
+    expect(replies).toEqual([{ type: 'error', message: 'upstream refused' }]);
+  });
+
+  it('pure helpers', () => {
+    expect(sanitizeSendHeaders({ Host: 'a', 'Content-Length': '1', ':path': '/', ok: ['1', '2'] })).toEqual({ ok: ['1', '2'] });
+    expect(validateSendDraft({ method: 'get', url: 'http://x.dev' })).toEqual({ method: 'GET', url: 'http://x.dev' });
+  });
+});
+
+describe('openSource / copySnippet (CONTRACTS §9.3)', () => {
+  const withSource = (id: string, appFrame?: number) =>
+    ex(id, 'completed', {
+      source: { frames: [{ fn: 'a', uri: 'dart:async' }, { fn: 'load', uri: 'package:app/api.dart', line: 3, column: 5 }], ...(appFrame !== undefined ? { appFrame } : {}) },
+    });
+
+  it('opens the app frame by default, or the requested frame', async () => {
+    const opened: [string, number][] = [];
+    const { host, c, replies, reply } = setup(20, { openSource: async (e, i) => opened.push([e.id, i]) });
+    host.exchanges = [withSource('a', 1)];
+    await c.handle({ type: 'openSource', id: 'a' }, reply);
+    await c.handle({ type: 'openSource', id: 'a', frame: 0 }, reply);
+    expect(opened).toEqual([
+      ['a', 1],
+      ['a', 0],
+    ]);
+    expect(replies).toEqual([]);
+  });
+
+  it('readable errors: no source, no app frame, bad frame, unknown exchange, opener failure', async () => {
+    const { host, c, replies, reply } = setup(20, {
+      openSource: async () => {
+        throw new Error('lib/api.dart is not in the workspace');
+      },
+    });
+    host.exchanges = [ex('plain'), ex('sent', 'completed', { initiator: 'agent' }), withSource('noapp'), withSource('ok', 1)];
+    await c.handle({ type: 'openSource', id: 'plain' }, reply);
+    await c.handle({ type: 'openSource', id: 'sent' }, reply);
+    await c.handle({ type: 'openSource', id: 'noapp' }, reply);
+    await c.handle({ type: 'openSource', id: 'ok', frame: 5 }, reply);
+    await c.handle({ type: 'openSource', id: 'gone' }, reply);
+    await c.handle({ type: 'openSource', id: 'ok' }, reply);
+    const msgs = replies.map((r) => (r.type === 'error' ? r.message : r.type));
+    expect(msgs[0]).toMatch(/No source for this request: its stack trace has not arrived/);
+    expect(msgs[1]).toMatch(/sent from the editor or an agent/);
+    expect(msgs[2]).toMatch(/No app call site/);
+    expect(msgs[3]).toMatch(/frame must be an index 0–1/);
+    expect(msgs[4]).toMatch(/no longer available/);
+    expect(msgs[5]).toBe('lib/api.dart is not in the workspace');
+  });
+
+  it('without the openSource dep: error', async () => {
+    const { host, c, replies, reply } = setup();
+    host.exchanges = [withSource('a', 1)];
+    await c.handle({ type: 'openSource', id: 'a' }, reply);
+    expect(replies).toMatchObject([{ type: 'error', message: expect.stringMatching(/not available/) }]);
+  });
+
+  it('copySnippet writes the UNREDACTED snippet to the clipboard', async () => {
+    const copied: string[] = [];
+    const { host, c, replies, reply } = setup(20, { copyToClipboard: async (t) => copied.push(t) });
+    host.exchanges = [ex('a', 'completed', { method: 'POST', requestHeaders: { authorization: 'Bearer REAL' }, requestBody: { text: '{"password":"pw"}', encoding: 'utf8' } })];
+    await c.handle({ type: 'copySnippet', id: 'a', format: 'curl' }, reply);
+    await c.handle({ type: 'copySnippet', id: 'a', format: 'dio' }, reply);
+    await c.handle({ type: 'copySnippet', id: 'a', format: 'wget' }, reply);
+    expect(copied[0]).toContain("-H 'authorization: Bearer REAL'");
+    expect(copied[0]).toContain('"password":"pw"');
+    expect(copied[1]).toContain("method: 'POST'");
+    expect(replies).toMatchObject([{ type: 'error', message: expect.stringMatching(/unknown format/) }]);
+  });
+});
+
+describe('network profile and spent rules (CONTRACTS §9.3/9.4)', () => {
+  it('setNetworkProfile validates, applies and broadcasts status; status omits "none"', async () => {
+    const { host, c, got, replies, reply } = setup();
+    expect(c.status().networkProfile).toBeUndefined();
+    await c.handle({ type: 'setNetworkProfile', profile: { kind: 'throttle', preset: 'slow-3g', latencyMs: 400, kbps: 400 } }, reply);
+    expect(host.networkProfile).toEqual({ kind: 'throttle', preset: 'slow-3g', latencyMs: 400, kbps: 400 });
+    expect(got.at(-1)).toMatchObject({ type: 'status', status: { networkProfile: { kind: 'throttle', preset: 'slow-3g' } } });
+    await c.handle({ type: 'setNetworkProfile', profile: { kind: 'none' } }, reply);
+    expect(got.at(-1)).toMatchObject({ type: 'status' });
+    expect((got.at(-1) as { status: object }).status).not.toHaveProperty('networkProfile');
+    await c.handle({ type: 'setNetworkProfile', profile: { kind: 'throttle', dropRate: 2 } }, reply);
+    await c.handle({ type: 'setNetworkProfile', profile: { kind: 'warp' } }, reply);
+    expect(replies.map((r) => r.type)).toEqual(['error', 'error']);
+    expect(host.networkProfile).toEqual({ kind: 'none' });
+  });
+
+  it('validateNetworkProfile', () => {
+    expect(validateNetworkProfile({ kind: 'offline' })).toEqual({ kind: 'offline' });
+    expect(() => validateNetworkProfile({ kind: 'offline', latencyMs: 1 })).toThrow(/unknown field/);
+    expect(() => validateNetworkProfile({ kind: 'throttle', preset: 'edge' })).toThrow(/preset/);
+  });
+
+  it('a spent rule is removed, persisted and broadcast; unknown ids are ignored', () => {
+    const { host, got, saved } = setup();
+    host.rules = [
+      { id: 'a', enabled: true, match: { url: '*' }, action: { kind: 'block', mode: 'reset' }, times: 1 },
+      { id: 'b', enabled: true, match: { url: '*' }, action: { kind: 'fault', fault: 'dns' } },
+    ];
+    host.emit('rule-spent', 'a', 'times');
+    expect(host.rules.map((r) => r.id)).toEqual(['b']);
+    expect(saved.at(-1)!.map((r) => r.id)).toEqual(['b']);
+    expect(got.at(-1)).toMatchObject({ type: 'rules', rules: [{ id: 'b' }] });
+    const n = got.length;
+    host.emit('rule-spent', 'zzz', 'expired');
+    expect(got.length).toBe(n);
+  });
+});
+
+describe('rule-hit → Rule.used (display only, CONTRACTS §9.2/9.4)', () => {
+  const rule = (id: string, extra: Partial<Rule> = {}): Rule => ({ id, enabled: true, match: { url: '*' }, action: { kind: 'block', mode: 'reset' }, times: 3, ...extra });
+
+  it('validateRule accepts and drops used', () => {
+    const r = validateRule({ ...rule('a'), used: 2 });
+    expect(r).not.toHaveProperty('used');
+    expect(r.times).toBe(3);
+    expect(validateRules([{ ...rule('a'), used: 1 }])[0]).not.toHaveProperty('used');
+  });
+
+  it('keeps the latest count, broadcasts rules (throttled) and in snapshots, never persists or applies used', async () => {
+    vi.useFakeTimers();
+    try {
+      const { host, c, got, saved, reply, replies } = setup(50);
+      host.rules = [rule('a'), rule('b')];
+      host.emit('rule-hit', 'a', 1);
+      host.emit('rule-hit', 'a', 2);
+      host.emit('rule-hit', 'zzz', 5); // unknown rule: ignored
+      expect(got).toEqual([]);
+      vi.advanceTimersByTime(60);
+      expect(got).toHaveLength(1);
+      expect(got[0]).toMatchObject({ type: 'rules', rules: [{ id: 'a', used: 2 }, { id: 'b' }] });
+      expect((got[0] as { rules: Rule[] }).rules[1]).not.toHaveProperty('used');
+      expect(host.rules[0]).not.toHaveProperty('used');
+
+      await c.handle({ type: 'ready' }, reply);
+      expect(replies[0]).toMatchObject({ type: 'snapshot', rules: [{ id: 'a', used: 2 }, { id: 'b' }] });
+
+      // The webview round-trips rules with `used`: accepted, stripped before the host and persistence.
+      await c.handle({ type: 'setRules', rules: [{ ...rule('a'), used: 2, enabled: false }] }, reply);
+      expect(host.rules).toEqual([{ ...rule('a'), enabled: false }]);
+      expect(saved.at(-1)).toEqual([{ ...rule('a'), enabled: false }]);
+      expect(got.at(-1)).toMatchObject({ type: 'rules', rules: [{ id: 'a', used: 2, enabled: false }] });
+
+      // Removed / spent rules drop their count; a proxy restart resets counts.
+      host.emit('rule-spent', 'a', 'times');
+      expect(c.rulesView()).toEqual([]);
+      host.rules = [rule('c')];
+      host.emit('rule-hit', 'c', 1);
+      host.emit('state', true);
+      vi.advanceTimersByTime(60);
+      expect(c.rulesView()).toEqual([rule('c')]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

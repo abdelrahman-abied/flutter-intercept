@@ -23,6 +23,12 @@ describe('tool schemas', () => {
     expect(parseToolInput('add_breakpoint', { url: '*' })).toEqual({ url: '*', phase: 'response' });
     expect(parseToolInput('launch_app', {})).toEqual({ flutterMode: 'debug' });
     expect(parseToolInput('get_status', undefined)).toEqual({});
+    // CONTRACTS §9.5
+    expect(parseToolInput('get_request_source', { id: 'x' })).toEqual({ id: 'x', maxFrames: 20 });
+    expect(parseToolInput('get_body_shape', { id: 'x' })).toEqual({ id: 'x', which: 'response', maxDepth: 6 });
+    expect(parseToolInput('simulate_network', { profile: 'slow-3g' })).toEqual({ profile: 'slow-3g' });
+    expect(parseToolInput('resend_request', { id: 'x' })).toEqual({ id: 'x' });
+    expect(parseToolInput('add_block', { url: '*', times: 2, ttlMs: 5000 })).toMatchObject({ times: 2, ttlMs: 5000 });
   });
 
   it.each<[Parameters<typeof parseToolInput>[0], unknown, RegExp]>([
@@ -43,6 +49,17 @@ describe('tool schemas', () => {
     ['add_breakpoint', { url: '*', phase: 'later' }, /phase/],
     ['resume_request', { id: 'x', edit: { foo: 1 } }, /edit/],
     ['launch_app', { flutterMode: 'release' }, /flutterMode/],
+    ['get_request', { id: 'x', snippet: 'wget' }, /snippet/],
+    ['get_request_source', { id: 'x', maxFrames: 31 }, /maxFrames/],
+    ['get_body_shape', { id: 'x', which: 'both' }, /which/],
+    ['get_body_shape', { id: 'x', maxDepth: 0 }, /maxDepth/],
+    ['simulate_network', { profile: '2g' }, /profile/],
+    ['simulate_network', { profile: 'custom', kbps: 0 }, /kbps/],
+    ['simulate_network', { profile: 'custom', latencyMs: 600_001 }, /latencyMs/],
+    ['simulate_network', { url: '*', fault: 'slow' }, /fault/],
+    ['resend_request', { id: 'x', edit: { status: 200 } }, /edit/],
+    ['add_mock', { url: '*', body: 'x', times: 1001 }, /times/],
+    ['add_breakpoint', { url: '*', ttlMs: 86_400_001 }, /ttlMs/],
   ])('%s rejects %j', (tool, input, re) => {
     expect(() => parseToolInput(tool, input)).toThrow(re);
   });

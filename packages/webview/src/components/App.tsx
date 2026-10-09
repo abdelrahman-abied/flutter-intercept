@@ -4,17 +4,19 @@ import type { Host } from '../host';
 import type { HostMsg, Status } from '../protocol';
 import { agentLine } from '../util';
 import {
-  filterExchanges, findExchange, hasActiveFilters, initialState, pausedCount, reducer, toPersisted,
-  type Persisted, type State,
+  filterExchanges, findExchange, hasActiveFilters, initialState, isProfileActive, pausedCount, profileLabel, reducer,
+  toPersisted, type Persisted, type State,
 } from '../state';
 import { Button, useNow } from './bits';
 import { DetailPane } from './DetailPane';
+import { Composer } from './Editors';
 import { Icon } from './Icon';
 import { RulesView } from './RulesView';
 import { Toolbar } from './Toolbar';
 import { TrafficList } from './TrafficList';
 
 const NOTICE_MS = 8000;
+const SHORT_NOTICE_MS = 2500;
 const PERSIST_MS = 300;
 const LAN_TITLE =
   'A physical iPhone can\'t reach this Mac\'s loopback, so the proxy also listens on this LAN address while an ' +
@@ -49,14 +51,14 @@ export function App({ host }: { host: Host }) {
     return () => { off(); if (timer !== undefined) clearTimeout(timer); };
   }, [host]);
 
-  const { filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId } = state;
+  const { filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId, composer } = state;
   // Debounced: drafts can hold multi-MB bodies and change on every keystroke.
   useEffect(() => {
     const t = setTimeout(() => {
       try { host.setState(toPersisted(state)); } catch { /* state too large etc. — non-critical */ }
     }, PERSIST_MS);
     return () => clearTimeout(t);
-  }, [filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId]);
+  }, [filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId, composer]);
 
   const ctx = useMemo(() => ({ state, dispatch, post: host.post }), [state, host]);
 
@@ -79,10 +81,11 @@ function TrafficView() {
   const { state, dispatch } = useApp();
   const list = useMemo(() => filterExchanges(state.exchanges, state.filters), [state.exchanges, state.filters]);
   const selected = state.selectedId ? findExchange(state, state.selectedId) : undefined;
+  const composing = !!state.composer?.open;
   const detailRef = useRef<HTMLElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
 
-  if (!state.exchanges.length) return <EmptyState />;
+  if (!state.exchanges.length && !composing) return <EmptyState />;
 
   const startDrag = (e: PointerEvent) => {
     const root = rootRef.current;
@@ -107,7 +110,7 @@ function TrafficView() {
   return (
     // --split is set through CSSOM (Preact assigns style objects via element.style),
     // which a strict style-src CSP allows; no style="" attributes are ever parsed.
-    <div ref={rootRef} class={`traffic${selected ? ' has-detail' : ''}`} style={{ '--split': `${state.splitPct}%` }}>
+    <div ref={rootRef} class={`traffic${selected || composing ? ' has-detail' : ''}`} style={{ '--split': `${state.splitPct}%` }}>
       <div class="list-pane">
         {list.length ? (
           <TrafficList list={list} onOpen={() => detailRef.current?.focus()} />
@@ -118,7 +121,7 @@ function TrafficView() {
           </div>
         )}
       </div>
-      {selected && (
+      {(selected || composing) && (
         <>
           <div class="splitter" role="separator" aria-orientation="vertical" aria-valuenow={Math.round(state.splitPct)}
             aria-valuemin={20} aria-valuemax={80} aria-label="Resize list and details" tabIndex={0}
@@ -127,7 +130,7 @@ function TrafficView() {
               const d = e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -5 : e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 5 : 0;
               if (d) { e.preventDefault(); dispatch({ type: 'setSplit', pct: state.splitPct + d }); }
             }} />
-          <DetailPane ex={selected} paneRef={detailRef} />
+          {composing ? <Composer /> : <DetailPane ex={selected!} paneRef={detailRef} />}
         </>
       )}
     </div>
@@ -175,6 +178,11 @@ function StatusLine() {
         {hasActiveFilters(filters) ? ` (${shown} shown)` : ''}
       </span>
       {paused > 0 && <span class="warn-text">{paused} paused</span>}
+      {isProfileActive(status.networkProfile) && (
+        <span class="net-status" title="Network profile applied to everything this app sends through the proxy. Change it in the toolbar.">
+          Network: {profileLabel(status.networkProfile)}
+        </span>
+      )}
       {status.lan && (
         <span class="lan-open" title={LAN_TITLE}>
           LAN open for iPhone · {status.lan.host}:{status.lan.port}
@@ -196,7 +204,7 @@ function NoticeBar() {
   const n = state.notice;
   useEffect(() => {
     if (!n) return;
-    const t = setTimeout(() => dispatch({ type: 'notice' }), NOTICE_MS);
+    const t = setTimeout(() => dispatch({ type: 'notice' }), n.short ? SHORT_NOTICE_MS : NOTICE_MS);
     return () => clearTimeout(t);
   }, [n?.id]);
   if (!n) return null;

@@ -1,5 +1,11 @@
+import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { useApp } from '../context';
-import { hasActiveFilters, pausedCount } from '../state';
+import { FILTER_HINT, parseFilter } from '../filter';
+import type { NetworkProfile } from '../protocol';
+import {
+  checkThrottle, customProfile, hasActiveFilters, isProfileActive, pausedCount, PROFILE_CHOICES, profileChoice,
+  profileForChoice, profileLabel, throttleFieldsOf, type ProfileChoice, type ThrottleFields,
+} from '../state';
 import { STATUS_CLASSES } from '../util';
 import { Button } from './bits';
 import { Icon } from './Icon';
@@ -10,6 +16,7 @@ export function Toolbar() {
   const { state, dispatch, post } = useApp();
   const { filters, status, view } = state;
   const paused = pausedCount(state.exchanges);
+  const filterErrors = parseFilter(filters.text).errors;
 
   return (
     <div class="toolbar" role="toolbar" aria-label="Flutter Intercept">
@@ -47,8 +54,12 @@ export function Toolbar() {
           <input
             class="filter-text"
             type="search"
-            placeholder="Filter URL (-term excludes)"
-            aria-label="Filter by URL"
+            placeholder="Filter: url m:POST s:4xx t:json body:token -word"
+            aria-label="Filter"
+            title={filterErrors.length ? `${filterErrors.join('\n')}\n\n${FILTER_HINT}` : FILTER_HINT}
+            aria-invalid={filterErrors.length > 0}
+            aria-description={FILTER_HINT}
+            spellcheck={false}
             value={filters.text}
             onInput={(e) => dispatch({ type: 'setFilters', patch: { text: (e.target as HTMLInputElement).value } })}
           />
@@ -82,6 +93,9 @@ export function Toolbar() {
         </>
       )}
 
+      <span class="sep" aria-hidden="true" />
+      <NetworkPicker profile={status.networkProfile} onSet={(profile) => post({ type: 'setNetworkProfile', profile })} />
+
       <span class="spacer" />
       {paused > 0 && (
         <button type="button" class="paused-alert" onClick={() => dispatch({ type: 'showPaused' })}
@@ -91,5 +105,78 @@ export function Toolbar() {
         </button>
       )}
     </div>
+  );
+}
+
+/**
+ * Global network profile (CONTRACTS §9.3 setNetworkProfile). Reflects status.networkProfile, and is
+ * clearly highlighted while active — a throttled app is easy to forget about.
+ */
+export function NetworkPicker({ profile, onSet }: { profile?: NetworkProfile; onSet: (p: NetworkProfile) => void }) {
+  const choice = profileChoice(profile);
+  const active = isProfileActive(profile);
+  const [custom, setCustom] = useState(false);
+  return (
+    <span class={`net-picker${active ? ' active' : ''}`}>
+      <label class="net-label" title={active
+        ? `Network profile: ${profileLabel(profile)}. Applies to everything this app sends through the proxy (mocks and blocks still answer as set).`
+        : 'Simulate a slow, flaky or offline network for this app only'}>
+        {active && <span class="dot" aria-hidden="true" />}
+        Network
+        <select aria-label="Network profile" value={choice}
+          onChange={(e) => {
+            const v = (e.target as HTMLSelectElement).value as ProfileChoice;
+            if (v === 'custom') setCustom(true);
+            else { setCustom(false); onSet(profileForChoice(v)); }
+          }}>
+          {PROFILE_CHOICES.map((c) => (
+            <option key={c.value} value={c.value}>
+              {c.value === 'custom' && choice === 'custom' ? `Custom: ${profileLabel(profile)}` : c.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      {choice === 'custom' && !custom && (
+        <Button kind="icon" title="Edit the custom profile" onClick={() => setCustom(true)}><Icon name="edit" /></Button>
+      )}
+      {custom && (
+        <CustomProfileForm initial={profile?.kind === 'throttle' ? throttleFieldsOf(profile) : { latencyMs: '300', kbps: '800', dropPct: '' }}
+          onApply={(p) => { setCustom(false); onSet(p); }} onCancel={() => setCustom(false)} />
+      )}
+    </span>
+  );
+}
+
+function CustomProfileForm({ initial, onApply, onCancel }: {
+  initial: ThrottleFields; onApply: (p: NetworkProfile) => void; onCancel: () => void;
+}) {
+  const [f, setF] = useState(initial);
+  const first = useRef<HTMLInputElement>(null);
+  useLayoutEffect(() => first.current?.focus(), []);
+  const check = checkThrottle(f);
+  const field = (key: keyof ThrottleFields, label: string, placeholder: string) => (
+    <label class="field small-field">
+      <span>{label}</span>
+      <input ref={key === 'latencyMs' ? first : undefined} value={f[key]} inputMode="numeric" placeholder={placeholder}
+        aria-invalid={!!check.errors[key]} title={check.errors[key]}
+        onInput={(e) => setF({ ...f, [key]: (e.target as HTMLInputElement).value })} />
+    </label>
+  );
+  const apply = () => { const p = customProfile(f); if (p) onApply(p); };
+  return (
+    <form class="net-custom" role="dialog" aria-label="Custom network profile"
+      onSubmit={(e) => { e.preventDefault(); apply(); }}
+      onKeyDown={(e) => { if (e.key === 'Escape') { e.preventDefault(); onCancel(); } }}>
+      <div class="field-row">
+        {field('latencyMs', 'Latency (ms)', '0')}
+        {field('kbps', 'Bandwidth (kbps)', 'unlimited')}
+        {field('dropPct', 'Fail (%)', '0')}
+      </div>
+      {Object.values(check.errors).map((m) => <div key={m} class="msg error">{m}</div>)}
+      <div class="re-actions">
+        <Button kind="primary" type="submit" disabled={Object.keys(check.errors).length > 0}>Apply</Button>
+        <Button onClick={onCancel}>Cancel</Button>
+      </div>
+    </form>
   );
 }

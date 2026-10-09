@@ -3,8 +3,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import type { Exchange, Rule } from '@flutter-intercept/proxy';
-import { AGENT_RULE_PREFIX, createAgentApi, type AgentApiDeps } from '../../../src/agent/api';
+import type { Exchange, Rule, SendRequest } from '@flutter-intercept/proxy';
+import type { NetworkProfile } from '@flutter-intercept/proxy/network';
+import { AGENT_RULE_PREFIX, createAgentApi, restoreRedactedHeaders, restoreRedactedQuery, type AgentApiDeps, type ResolvedFrame } from '../../../src/agent/api';
 import { buildHar } from '../../../src/agent/har';
 import { REDACTED } from '../../../src/agent/redact';
 import { AgentAccess, AgentToolError, type AppLauncher, type ToolName } from '../../../src/agent/types';
@@ -32,6 +33,18 @@ class FakeHost extends EventEmitter {
   abort(id: string) {
     this.aborted.push(id);
   }
+  sent: SendRequest[] = [];
+  async send(req: SendRequest) {
+    this.sent.push(req);
+    if (req.url.includes('unreachable')) throw new Error('ECONNREFUSED');
+    const id = `sent${this.sent.length}`;
+    this.exchanges.push({ id, startedAt: Date.now(), method: req.method, url: req.url, requestHeaders: req.headers ?? {}, state: 'pending', initiator: req.initiator, resentFrom: req.resentFrom });
+    return { id };
+  }
+  networkProfile: NetworkProfile = { kind: 'none' };
+  setNetworkProfile(p: NetworkProfile) {
+    this.networkProfile = p;
+  }
   push(e: Exchange) {
     const i = this.exchanges.findIndex((x) => x.id === e.id);
     if (i >= 0) this.exchanges[i] = e;
@@ -55,7 +68,7 @@ const ex = (over: Partial<Exchange> = {}): Exchange => ({
   ...over,
 });
 
-function setup(opts: { access?: AgentAccess; redact?: boolean; now?: number; root?: string | null } = {}) {
+function setup(opts: { access?: AgentAccess; redact?: boolean; now?: number; root?: string | null; extra?: Partial<AgentApiDeps> } = {}) {
   const host = new FakeHost();
   let access: AgentAccess = opts.access ?? 'readWrite';
   let redact = opts.redact ?? true;
@@ -89,6 +102,7 @@ function setup(opts: { access?: AgentAccess; redact?: boolean; now?: number; roo
     version: '0.2.0',
     newRuleId: () => `agent_${++idn}`,
     now: () => opts.now ?? Date.now(),
+    ...opts.extra,
   };
   const api = createAgentApi(deps);
   return { api, host, launcher, applied, cleared: () => cleared, root, setAccess: (a: AgentAccess) => (access = a), setRedact: (r: boolean) => (redact = r) };
@@ -115,7 +129,7 @@ describe('access gating', () => {
     const { api, host } = setup({ access: 'readOnly' });
     host.push(ex());
     await expect(api.call('list_requests', {})).resolves.toMatchObject({ total: 1 });
-    for (const t of ['add_mock', 'add_block', 'add_breakpoint', 'remove_rule', 'resume_request', 'abort_request', 'clear_requests', 'launch_app', 'stop_app', 'hot_restart'] as ToolName[]) {
+    for (const t of ['add_mock', 'add_block', 'add_breakpoint', 'remove_rule', 'resume_request', 'abort_request', 'clear_requests', 'launch_app', 'stop_app', 'hot_restart', 'simulate_network', 'resend_request'] as ToolName[]) {
       await rejects(api.call(t, { url: '*', body: 'x', ruleId: 'r', id: 'x' }), 'access', /read-only/);
     }
     expect(host.rules).toEqual([]);
@@ -162,6 +176,7 @@ describe('read tools', () => {
       pausedCount: 1,
       exchangeCount: 2,
       agentAccess: 'readWrite',
+      networkProfile: { kind: 'none', label: 'No throttling' },
     });
   });
 
@@ -504,5 +519,360 @@ describe('wait_for_request after launch_app / hot_restart (no race)', () => {
     expect(await t.api.call('stop_app', {})).toEqual({ stopped: 1 });
     const w = (await t.api.call('wait_for_request', { url: 'https://n/*', timeoutMs: 20 })) as Record<string, unknown>;
     expect(w.sinceMs).toBe(t.at());
+  });
+});
+
+describe('v0.3.0: times / ttlMs on rule tools (CONTRACTS §9.5)', () => {
+  it('add_mock / add_block / add_breakpoint pass times and expiresAt = now + ttlMs', async () => {
+    const { api, host } = setup({ now: 1_000_000 });
+    await api.call('add_mock', { url: '*/a', body: 'x', times: 1 });
+    await api.call('add_block', { url: '*/b', ttlMs: 60_000 });
+    await api.call('add_breakpoint', { url: '*/c', times: 3, ttlMs: 1000 });
+    expect(host.rules.map((r) => [r.match.url, r.times, r.expiresAt])).toEqual([
+      ['*/c', 3, 1_001_000],
+      ['*/b', undefined, 1_060_000],
+      ['*/a', 1, undefined],
+    ]);
+    await rejects(api.call('add_mock', { url: '*', body: 'x', times: 0 }), 'invalid', /times/);
+    await rejects(api.call('add_mock', { url: '*', body: 'x', ttlMs: 999 }), 'invalid', /ttlMs/);
+  });
+});
+
+describe('get_request snippet (from the redacted view)', () => {
+  it('curl / dart_http / dio never contain secrets', async () => {
+    const { api, host } = setup();
+    const e = ex({ method: 'POST', requestHeaders: { authorization: 'Bearer SECRET2', 'content-type': 'application/json' }, requestBody: { text: '{"password":"SECRET5","user":"ann"}', encoding: 'utf8' } });
+    host.push(e);
+    for (const snippet of ['curl', 'dart_http', 'dio']) {
+      const r = (await api.call('get_request', { id: e.id, snippet })) as { snippet: string };
+      expect(r.snippet, snippet).toContain('api.example.com/v1/items');
+      expect(r.snippet, snippet).toContain(REDACTED);
+      expect(r.snippet, snippet).not.toMatch(/SECRET/);
+      expect(r.snippet, snippet).toContain('ann');
+    }
+    expect(((await api.call('get_request', { id: e.id, snippet: 'curl' })) as { snippet: string }).snippet).toMatch(/^curl /);
+    expect(await api.call('get_request', { id: e.id })).not.toHaveProperty('snippet');
+    await rejects(api.call('get_request', { id: e.id, snippet: 'wget' }), 'invalid', /snippet/);
+  });
+});
+
+describe('get_request_source', () => {
+  const frames = [
+    { fn: '_InterceptedHttpClient.openUrl', uri: 'package:flutter_intercept_entry/entry.dart', line: 10 },
+    { fn: 'DioMixin.fetch', uri: 'package:dio/src/dio_mixin.dart', line: 400, column: 3 },
+    { fn: 'UserApi.load', uri: 'package:demo_app/api/user_api.dart', line: 42, column: 18, afterAsyncGap: true },
+    { fn: 'main', uri: 'file:///proj/lib/main.dart', line: 7, column: 3 },
+  ];
+  const resolveFrames = (fs: typeof frames): ResolvedFrame[] =>
+    fs.map((f) =>
+      f.uri.startsWith('package:demo_app/')
+        ? { ...f, path: path.join(path.sep, 'proj', 'lib', 'api', 'user_api.dart'), inProject: true }
+        : f.uri.startsWith('file:///proj/')
+          ? { ...f, path: path.join(path.sep, 'proj', 'lib', 'main.dart'), inProject: true }
+          : f.uri.startsWith('package:dio/')
+            ? { ...f, path: path.join(path.sep, 'home', 'me', '.pub-cache', 'dio', 'dio_mixin.dart'), inProject: false }
+            : { ...f, inProject: false },
+    );
+
+  it('returns the app frame with a project-relative path and every frame', async () => {
+    const { api, host } = setup({ root: path.join(path.sep, 'proj'), extra: { resolveFrames } });
+    const e = ex({ source: { frames, appFrame: 2 } });
+    host.push(e);
+    const r = (await api.call('get_request_source', { id: e.id })) as Record<string, any>;
+    expect(r.available).toBe(true);
+    expect(r.appFrame).toEqual({ fn: 'UserApi.load', uri: 'package:demo_app/api/user_api.dart', path: 'lib/api/user_api.dart', line: 42, column: 18 });
+    expect(r.appFrameIndex).toBe(2);
+    expect(r.totalFrames).toBe(4);
+    expect(r.frames[1]).toEqual({ fn: 'DioMixin.fetch', uri: 'package:dio/src/dio_mixin.dart', line: 400, column: 3, inProject: false }); // no absolute path outside the project
+    expect(r.frames[2]).toMatchObject({ inProject: true, afterAsyncGap: true });
+    expect(r.frames[3]).toMatchObject({ uri: '<project>/lib/main.dart', path: 'lib/main.dart' });
+    expect(JSON.stringify(r)).not.toContain('.pub-cache');
+    expect(JSON.stringify(r)).not.toContain('file:');
+    // maxFrames trims frames but never loses the app frame
+    const short = (await api.call('get_request_source', { id: e.id, maxFrames: 1 })) as Record<string, any>;
+    expect(short.frames).toHaveLength(1);
+    expect(short.appFrame.path).toBe('lib/api/user_api.dart');
+  });
+
+  it('never returns absolute file: URIs or paths outside the project (REVIEW-3 #4)', async () => {
+    const { api, host } = setup({ root: path.join(path.sep, 'proj') }); // no resolver
+    const e = ex({
+      source: {
+        frames: [
+          { fn: 'main', uri: 'file:///Users/alice/secret-client/bin/main.dart', line: 3 },
+          { fn: 'inProj', uri: 'file:///proj/bin/tool.dart', line: 4 },
+          { fn: 'weird', uri: 'http://evil.example/x.dart' },
+          { fn: 'unc', uri: 'file://evil.example/share/x.dart' },
+          { fn: 'escape', uri: 'file:///proj/../etc/passwd' },
+          { fn: 'sdk', uri: 'dart:async/zone.dart' },
+          { fn: 'pkg', uri: 'package:http/src/client.dart', line: 9 },
+        ],
+        appFrame: 0,
+      },
+    });
+    host.push(e);
+    const r = (await api.call('get_request_source', { id: e.id })) as Record<string, any>;
+    expect(r.appFrame).toEqual({ fn: 'main', uri: '<outside project>', line: 3 });
+    expect(r.frames.map((f: any) => [f.uri, f.path])).toEqual([
+      ['<outside project>', undefined],
+      ['<project>/bin/tool.dart', 'bin/tool.dart'],
+      ['<outside project>', undefined],
+      ['<outside project>', undefined],
+      ['<outside project>', undefined],
+      ['dart:async/zone.dart', undefined],
+      ['package:http/src/client.dart', undefined],
+    ]);
+    const text = JSON.stringify(r);
+    for (const leak of ['alice', 'secret-client', 'evil.example', 'passwd', 'file:']) expect(text).not.toContain(leak);
+  });
+
+  it('a resolver path outside the project (relative "..") is dropped too', async () => {
+    const { api, host } = setup({ root: path.join(path.sep, 'proj'), extra: { resolveFrames: (fs) => fs.map((f) => ({ ...f, path: '../other/x.dart', inProject: false })) } });
+    const e = ex({ source: { frames: [{ fn: 'f', uri: 'file:///other/x.dart' }], appFrame: 0 } });
+    host.push(e);
+    expect(((await api.call('get_request_source', { id: e.id })) as any).appFrame).toEqual({ fn: 'f', uri: '<outside project>' });
+  });
+
+  it('works without a resolver (raw frames) and when the resolver throws', async () => {
+    const { api, host } = setup({ extra: { resolveFrames: () => Promise.reject(new Error('boom')) } });
+    const e = ex({ source: { frames, appFrame: 2 } });
+    host.push(e);
+    const r = (await api.call('get_request_source', { id: e.id })) as Record<string, any>;
+    expect(r.appFrame).toEqual({ fn: 'UserApi.load', uri: 'package:demo_app/api/user_api.dart', line: 42, column: 18 });
+    expect(r.frames[0]).not.toHaveProperty('inProject');
+  });
+
+  it('explains when there is no source', async () => {
+    const { api, host } = setup();
+    const plain = ex();
+    const sent = ex({ initiator: 'agent' });
+    [plain, sent].forEach((e) => host.push(e));
+    expect(await api.call('get_request_source', { id: plain.id })).toMatchObject({ available: false, reason: expect.stringMatching(/no stack trace/) });
+    expect(await api.call('get_request_source', { id: sent.id })).toMatchObject({ available: false, reason: expect.stringMatching(/sent by an agent/) });
+    await rejects(api.call('get_request_source', { id: 'nope' }), 'not_found');
+  });
+});
+
+describe('get_body_shape', () => {
+  it('describes the response JSON without values', async () => {
+    const { api, host } = setup();
+    const e = ex({ responseBody: { text: JSON.stringify({ users: [{ id: 1, token: 'SECRET9', email: null }, { id: 2, token: 'x', email: 'a@b' }], total: 2 }), encoding: 'utf8' } });
+    host.push(e);
+    const r = (await api.call('get_body_shape', { id: e.id })) as Record<string, any>;
+    expect(r).toEqual({
+      contentType: 'application/json',
+      bytes: expect.any(Number),
+      shape: { users: { '[]': { id: 'integer', token: 'string', email: 'string|null' }, length: 2 }, total: 'integer' },
+    });
+    expect(JSON.stringify(r)).not.toContain('SECRET9');
+  });
+
+  it('request body, binary, missing, pending and non-JSON bodies', async () => {
+    const { api, host } = setup();
+    const req = ex({ method: 'POST', requestHeaders: { 'content-type': 'application/json' }, requestBody: { text: '{"a":[1,2]}', encoding: 'utf8' } });
+    const bin = ex({ responseBody: { text: 'AAEC', encoding: 'base64' }, responseHeaders: { 'content-type': 'image/png' } });
+    const pending = ex({ state: 'pending', status: undefined, responseBody: undefined, responseHeaders: undefined });
+    const html = ex({ responseBody: { text: '<html>', encoding: 'utf8' }, responseHeaders: { 'content-type': 'text/html' } });
+    [req, bin, pending, html].forEach((e) => host.push(e));
+    expect(await api.call('get_body_shape', { id: req.id, which: 'request' })).toMatchObject({ contentType: 'application/json', shape: { a: { '[]': 'integer', length: 2 } } });
+    expect(await api.call('get_body_shape', { id: bin.id })).toEqual({ contentType: 'image/png', bytes: 3, shape: null, reason: 'the response body is binary' });
+    expect(await api.call('get_body_shape', { id: pending.id })).toMatchObject({ shape: null, reason: expect.stringMatching(/not arrived yet/) });
+    expect(await api.call('get_body_shape', { id: html.id })).toMatchObject({ shape: null, reason: 'the body is not JSON' });
+  });
+
+  it('maxDepth limits nesting', async () => {
+    const { api, host } = setup();
+    const e = ex({ responseBody: { text: '{"a":{"b":{"c":1}}}', encoding: 'utf8' } });
+    host.push(e);
+    expect(await api.call('get_body_shape', { id: e.id, maxDepth: 1 })).toMatchObject({ shape: { a: '{…}' }, truncated: true });
+  });
+});
+
+describe('simulate_network', () => {
+  it('global profiles: presets, custom, offline, none; get_status reports it', async () => {
+    const { api, host } = setup();
+    expect(await api.call('simulate_network', { profile: 'slow-3g' })).toEqual({ profile: { kind: 'throttle', preset: 'slow-3g', latencyMs: 400, kbps: 400, label: 'Slow 3G' } });
+    expect(host.networkProfile).toEqual({ kind: 'throttle', preset: 'slow-3g', latencyMs: 400, kbps: 400 });
+    expect(await api.call('get_status', {})).toMatchObject({ networkProfile: { kind: 'throttle', label: 'Slow 3G' } });
+    await api.call('simulate_network', { profile: 'custom', latencyMs: 300, kbps: 800 });
+    expect(host.networkProfile).toEqual({ kind: 'throttle', latencyMs: 300, kbps: 800 });
+    await api.call('simulate_network', { profile: 'offline' });
+    expect(host.networkProfile).toEqual({ kind: 'offline' });
+    await api.call('simulate_network', { profile: 'none' });
+    expect(host.networkProfile).toEqual({ kind: 'none' });
+    expect(host.rules).toEqual([]);
+  });
+
+  it('url-scoped: throttle or fault rule inserted FIRST with [agent] name, times/ttlMs', async () => {
+    const { api, host } = setup({ now: 5000 });
+    host.rules = [{ id: 'old', enabled: true, match: { url: '*' }, action: { kind: 'block', mode: 'reset' } }];
+    const a = (await api.call('simulate_network', { url: '*/users*', profile: 'flaky' })) as { ruleId: string };
+    expect(host.rules[0]).toMatchObject({ id: a.ruleId, match: { url: '*/users*' }, action: { kind: 'throttle', latencyMs: 200, dropRate: 0.2 } });
+    expect(host.rules[0].name).toBe(`${AGENT_RULE_PREFIX}Flaky (20% fail) * */users*`);
+    await api.call('simulate_network', { url: '*/login', method: 'post', fault: 'timeout', times: 1, ttlMs: 10_000, name: 'login timeout' });
+    expect(host.rules[0]).toMatchObject({ name: '[agent] login timeout', match: { url: '*/login', method: 'POST' }, action: { kind: 'fault', fault: 'timeout' }, times: 1, expiresAt: 15_000 });
+    await api.call('simulate_network', { url: '*/x', profile: 'offline' });
+    expect(host.rules[0].action).toEqual({ kind: 'fault', fault: 'dns' });
+    await api.call('simulate_network', { url: '*/y', profile: 'custom', kbps: 56 });
+    expect(host.rules[0].action).toEqual({ kind: 'throttle', kbps: 56 });
+    expect(host.rules.at(-1)!.id).toBe('old');
+    expect(host.networkProfile).toEqual({ kind: 'none' });
+  });
+
+  it.each([
+    [{}, /profile is required/],
+    [{ profile: 'slow-3g', fault: 'reset', url: '*' }, /either profile or fault/],
+    [{ fault: 'reset' }, /fault needs a url/],
+    [{ profile: 'slow-3g', latencyMs: 10 }, /only used with profile "custom"/],
+    [{ profile: 'custom' }, /needs latencyMs/],
+    [{ profile: 'offline', times: 1 }, /only apply together with a url/],
+    [{ profile: 'none', url: '*' }, /changes nothing/],
+    [{ profile: 'warp' }, /profile/],
+    [{ profile: 'custom', dropRate: 2 }, /dropRate/],
+    [{ url: '*', fault: 'explode' }, /fault/],
+  ])('rejects %j', async (input, re) => {
+    const { api, host } = setup();
+    await rejects(api.call('simulate_network', input), 'invalid', re);
+    expect(host.rules).toEqual([]);
+    expect(host.networkProfile).toEqual({ kind: 'none' });
+  });
+});
+
+describe('resend_request', () => {
+  it('resends with the original (unredacted) headers and body as the agent', async () => {
+    const { api, host } = setup({ now: 777 });
+    const e = ex({
+      method: 'POST',
+      url: 'https://api.example.com/v1/login?access_token=SECRET1',
+      requestHeaders: { authorization: 'Bearer SECRET2', 'content-type': 'application/json', 'content-length': '20', host: 'api.example.com', 'proxy-authorization': 'Basic LAN' },
+      requestBody: { text: '{"password":"SECRET5"}', encoding: 'utf8' },
+    });
+    host.push(e);
+    const r = await api.call('resend_request', { id: e.id });
+    expect(r).toEqual({ id: 'sent1', sinceMs: 777 });
+    expect(host.sent[0]).toEqual({
+      method: 'POST',
+      url: 'https://api.example.com/v1/login?access_token=SECRET1',
+      headers: { authorization: 'Bearer SECRET2', 'content-type': 'application/json' },
+      body: '{"password":"SECRET5"}',
+      initiator: 'agent',
+      resentFrom: e.id,
+    });
+    expect(JSON.stringify(r)).not.toContain('SECRET');
+  });
+
+  it('edits: [redacted] header and query values are restored from the original', async () => {
+    const { api, host } = setup();
+    const e = ex({ url: 'https://api.example.com/v1/items?page=1&access_token=SECRET1' });
+    host.push(e);
+    await api.call('resend_request', {
+      id: e.id,
+      edit: { method: 'put', url: 'https://api.example.com/v1/items?page=2&access_token=[redacted]', headers: { Authorization: '[redacted]', accept: 'text/plain', cookie: '[redacted]' }, body: 'new' },
+    });
+    expect(host.sent[0]).toMatchObject({
+      method: 'PUT',
+      url: 'https://api.example.com/v1/items?page=2&access_token=SECRET1',
+      headers: { Authorization: 'Bearer SECRET2', accept: 'text/plain' },
+      body: 'new',
+    });
+  });
+
+  it('same origin only: path/query edits allowed, scheme/host/port/userinfo changes refused (REVIEW-3 #1)', async () => {
+    const { api, host } = setup();
+    const e = ex({ url: 'https://api.example.com/a?x=1' });
+    host.push(e);
+    host.push(ex({ url: 'https://other-app-origin.example.net/x' })); // another app origin: still refused
+    for (const url of [
+      'https://evil.example.org/a',
+      'https://other-app-origin.example.net/x',
+      'https://api.example.com@evil.example.org/',
+      'https://user:pw@api.example.com/a',
+      'http://api.example.com/a',
+      'https://api.example.com:8443/a',
+      'https://api.example.com.evil.example.org/a',
+      'https://[::1]/a',
+      'https://127.0.0.1/a',
+    ]) {
+      await rejects(api.call('resend_request', { id: e.id, edit: { url } }), 'invalid', /must keep the original origin https:\/\/api\.example\.com/);
+    }
+    expect(host.sent).toEqual([]);
+    await rejects(api.call('resend_request', { id: e.id, edit: { url: 'ftp://api.example.com/' } }), 'invalid', /http\(s\)/);
+    // Normalised equivalents of the same origin are fine.
+    await api.call('resend_request', { id: e.id, edit: { url: 'HTTPS://API.EXAMPLE.COM:443/other/path?y=2' } });
+    expect(host.sent.map((r) => r.url)).toEqual(['https://api.example.com/other/path?y=2']);
+  });
+
+  it('IPv6 origins compare normalised', async () => {
+    const { api, host } = setup();
+    const e = ex({ url: 'http://[::1]:8080/a' });
+    host.push(e);
+    await api.call('resend_request', { id: e.id, edit: { url: 'http://[0:0:0:0:0:0:0:1]:8080/b' } });
+    await rejects(api.call('resend_request', { id: e.id, edit: { url: 'http://[::2]:8080/b' } }), 'invalid', /original origin/);
+    await rejects(api.call('resend_request', { id: e.id, edit: { url: 'http://[::1]:8081/b' } }), 'invalid', /original origin/);
+    expect(host.sent).toHaveLength(1);
+  });
+
+  it.each<[string, Partial<Exchange>, RegExp]>([
+    ['agent-sent', { initiator: 'agent' }, /sent by an agent/],
+    ['editor-sent', { initiator: 'editor' }, /sent by .*the editor/],
+    ['LAN client', { viaLan: true }, /over the LAN/],
+    ['mocked', { state: 'mocked', matchedRuleId: 'm1' }, /handled by rule "m1"/],
+    ['blocked', { state: 'blocked', matchedRuleId: 'b1' }, /handled by rule "b1"/],
+    ['faulted', { state: 'blocked', matchedRuleId: 'f1', simulated: 'fault: reset' }, /handled by rule "f1"/],
+    ['paused then edited at a breakpoint', { state: 'completed', matchedRuleId: 'bp1', url: 'http://127.0.0.1:9200/' }, /handled by rule "bp1"/],
+    ['still paused', { state: 'paused-request', matchedRuleId: 'bp1' }, /handled by rule/],
+    ['dropped by the network profile', { state: 'blocked', simulated: 'Flaky' }, /did not complete .*state: blocked/],
+    ['upstream error', { state: 'error', status: undefined, error: 'ECONNREFUSED' }, /state: error/],
+    ['pending', { state: 'pending', status: undefined }, /state: pending/],
+    ['aborted', { state: 'aborted' }, /state: aborted/],
+    ['lan-* record', { id: 'lan-123e4567', state: 'error', url: 'http://127.0.0.1:6379/' }, /connection-level record/],
+    ['tls-* record', { id: 'tls-123e4567', state: 'error', url: 'https://sni.example/' }, /connection-level record/],
+    ['lan-* record even if completed', { id: 'lan-abc', state: 'completed' }, /connection-level record/],
+  ])('refuses %s', async (_name, over, re) => {
+    const { api, host } = setup();
+    const e = ex(over);
+    host.push(e);
+    await rejects(api.call('resend_request', { id: e.id }), 'invalid', new RegExp(`resend_request refused: .*${re.source}`));
+    expect(host.sent).toEqual([]);
+  });
+
+  it('binary or truncated original bodies need edit.body; send failures are tool errors', async () => {
+    const { api, host } = setup();
+    const bin = ex({ method: 'POST', requestBody: { text: 'AAEC', encoding: 'base64' } });
+    const cut = ex({ method: 'POST', requestBody: { text: 'abc', encoding: 'utf8', truncated: true } });
+    const down = ex({ url: 'https://unreachable.example.com/' });
+    [bin, cut, down].forEach((e) => host.push(e));
+    await rejects(api.call('resend_request', { id: bin.id }), 'invalid', /binary/);
+    await rejects(api.call('resend_request', { id: cut.id }), 'invalid', /truncated/);
+    await expect(api.call('resend_request', { id: bin.id, edit: { body: 'text' } })).resolves.toMatchObject({ id: expect.any(String) });
+    await rejects(api.call('resend_request', { id: down.id }), 'state', /could not send the request: ECONNREFUSED/);
+    await rejects(api.call('resend_request', { id: 'gone' }), 'not_found');
+    await rejects(api.call('resend_request', { id: bin.id, edit: { status: 200 } }), 'invalid');
+  });
+
+  it('list/get views show initiator, resentFrom, simulated and hasSource', async () => {
+    const { api, host } = setup();
+    const e = ex({ initiator: 'agent', resentFrom: 'e0', simulated: 'Slow 3G', source: { frames: [{ fn: 'f', uri: 'package:a/a.dart' }] } });
+    host.push(e);
+    expect(((await api.call('list_requests', {})) as { items: unknown[] }).items[0]).toMatchObject({ initiator: 'agent', simulated: 'Slow 3G' });
+    expect(await api.call('get_request', { id: e.id })).toMatchObject({ initiator: 'agent', resentFrom: 'e0', simulated: 'Slow 3G', hasSource: true });
+  });
+
+  it('pure restore helpers', () => {
+    expect(restoreRedactedHeaders({ a: ['[redacted]'], b: '[redacted]', c: 'x' }, { A: ['1', '2'] })).toEqual({ a: ['1', '2'], c: 'x' });
+    expect(restoreRedactedQuery('https://h/p?t=%5Bredacted%5D&x=1#f', 'https://h/p?x=0&t=S%20E')).toBe('https://h/p?t=S%20E&x=1#f');
+    expect(restoreRedactedQuery('https://h/p?t=[redacted]', 'https://h/p')).toBe('https://h/p?t=[redacted]');
+  });
+});
+
+describe('older proxy builds', () => {
+  it('simulate_network / resend_request give a clear state error without the host methods', async () => {
+    const { api, host } = setup();
+    (host as unknown as Record<string, unknown>).send = undefined;
+    (host as unknown as Record<string, unknown>).setNetworkProfile = undefined;
+    const e = ex();
+    host.push(e);
+    await rejects(api.call('simulate_network', { profile: 'offline' }), 'state', /cannot simulate/);
+    await rejects(api.call('resend_request', { id: e.id }), 'state', /cannot send/);
   });
 });

@@ -202,11 +202,14 @@ describe('MCP server: tools', () => {
     const c = await connect();
     const { tools: listed } = await c.listTools();
     expect(listed.map((t) => t.name).sort()).toEqual([...READ_TOOLS, ...WRITE_TOOLS].sort());
-    const destructive = new Set(['remove_rule', 'abort_request', 'clear_requests', 'stop_app']);
+    const destructive = new Set(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'resend_request', 'simulate_network']); // REVIEW-3 #7
+    const idempotentWrites = new Set(['remove_rule', 'abort_request', 'clear_requests', 'stop_app']);
     for (const t of listed) {
       const write = (WRITE_TOOLS as readonly string[]).includes(t.name);
       expect(t.annotations?.readOnlyHint, t.name).toBe(!write);
       expect(t.annotations?.destructiveHint, t.name).toBe(write && destructive.has(t.name));
+      expect(t.annotations?.idempotentHint, t.name).toBe(!write || idempotentWrites.has(t.name)); // CONTRACTS §9.5
+      expect(t.annotations?.openWorldHint, t.name).toBe(t.name === 'resend_request');
       expect(t.description, t.name).toBeTruthy();
       expect(t.inputSchema.type).toBe('object');
     }

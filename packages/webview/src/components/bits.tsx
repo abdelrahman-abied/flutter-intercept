@@ -1,5 +1,5 @@
-import type { ComponentChildren } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { Fragment, type ComponentChildren } from 'preact';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { Exchange, ExchangeState } from '../protocol';
 import { isPaused, pauseClock, statusClassOf } from '../util';
 
@@ -99,4 +99,85 @@ export function PauseTimer({ ex, verbose }: { ex: Pick<Exchange, 'state' | 'paus
       : `paused for ${c.label}`
     : c.label;
   return <span class={`countdown${c.urgent ? ' urgent' : ''}`} title={c.title}>{text}</span>;
+}
+
+// ---------------------------------------------------------------- menus
+
+export interface MenuItem { label: string; onSelect: () => void; disabled?: boolean; title?: string; separatorBefore?: boolean }
+
+/**
+ * Keyboard-accessible menu (role=menu): focuses the first enabled item, ↑/↓/Home/End move, Enter/Space
+ * activate, Escape/Tab close. A pointer-down outside closes it. `at` positions it (context menu) through
+ * CSSOM, which the strict style-src CSP allows.
+ */
+export function MenuList({ items, onClose, label, at }: {
+  items: MenuItem[]; onClose: (restoreFocus: boolean) => void; label: string; at?: { x: number; y: number };
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const enabled = () => Array.from(ref.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not([disabled])') ?? []);
+  useLayoutEffect(() => {
+    enabled()[0]?.focus();
+    const onDown = (e: Event) => { if (ref.current && !ref.current.contains(e.target as Node)) onClose(false); };
+    document.addEventListener('pointerdown', onDown, true);
+    return () => document.removeEventListener('pointerdown', onDown, true);
+  }, []);
+  // Keep a context menu inside the viewport.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el || !at || typeof window === 'undefined') return;
+    const r = el.getBoundingClientRect();
+    if (r.right > window.innerWidth) el.style.left = `${Math.max(0, window.innerWidth - r.width - 4)}px`;
+    if (r.bottom > window.innerHeight) el.style.top = `${Math.max(0, window.innerHeight - r.height - 4)}px`;
+  }, [at?.x, at?.y]);
+  const onKeyDown = (e: KeyboardEvent) => {
+    const list = enabled();
+    const i = list.indexOf(document.activeElement as HTMLButtonElement);
+    let next = -1;
+    switch (e.key) {
+      case 'ArrowDown': next = (i + 1) % list.length; break;
+      case 'ArrowUp': next = (i - 1 + list.length) % list.length; break;
+      case 'Home': next = 0; break;
+      case 'End': next = list.length - 1; break;
+      case 'Escape': e.preventDefault(); e.stopPropagation(); onClose(true); return;
+      case 'Tab': onClose(false); return;
+      default: return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    list[next]?.focus();
+  };
+  return (
+    <div ref={ref} class={`menu${at ? ' context' : ''}`} role="menu" aria-label={label} onKeyDown={onKeyDown}
+      style={at ? { left: `${at.x}px`, top: `${at.y}px` } : undefined}>
+      {items.map((it) => (
+        <Fragment key={it.label}>
+          {it.separatorBefore && <div class="menu-sep" role="separator" />}
+          <button type="button" role="menuitem" class="menu-item" disabled={it.disabled} title={it.title}
+            onClick={() => { onClose(true); it.onSelect(); }}>
+            {it.label}
+          </button>
+        </Fragment>
+      ))}
+    </div>
+  );
+}
+
+/** A button that opens a MenuList below it. */
+export function MenuButton({ label, title, items, children, class: cls }: {
+  label: string; title?: string; items: MenuItem[]; children: ComponentChildren; class?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const btn = useRef<HTMLButtonElement>(null);
+  return (
+    <span class={`menu-anchor${cls ? ' ' + cls : ''}`}>
+      <button ref={btn} type="button" class="btn btn-secondary" title={title} aria-haspopup="menu" aria-expanded={open}
+        onClick={() => setOpen(!open)}
+        onKeyDown={(e) => { if (e.key === 'ArrowDown' && !open) { e.preventDefault(); setOpen(true); } }}>
+        {children}
+      </button>
+      {open && (
+        <MenuList label={label} items={items} onClose={(restore) => { setOpen(false); if (restore) btn.current?.focus(); }} />
+      )}
+    </span>
+  );
 }

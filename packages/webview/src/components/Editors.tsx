@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Exchange } from '../protocol';
 import {
-  computeEdit, currentDraft, isBodyEditable, validateDraft,
-  type HeaderRow, type RequestDraft, type ResponseDraft,
+  composeSend, computeEdit, currentDraft, findExchange, isBodyEditable, validateDraft,
+  type DraftValidation, type HeaderRow, type RequestDraft, type ResponseDraft,
 } from '../state';
 import { formatJson } from '../json';
 import { base64ByteLength, type JsonCheck } from '../util';
@@ -93,6 +93,31 @@ export function BodyEditor(props: {
 
 const METHOD_SUGGESTIONS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
 
+/** Method + URL inputs of a request draft (paused-request editor and the resend composer). */
+export function MethodUrlLine({ draft, disabled, mod, onChange }: {
+  draft: RequestDraft; disabled?: boolean; mod?: (field: string) => string; onChange: (patch: Partial<RequestDraft>) => void;
+}) {
+  const m = mod ?? (() => '');
+  return (
+    <div class="pe-line">
+      <input class={`pe-method${m('method')}`} aria-label="Method" list="fi-methods" spellcheck={false}
+        value={draft.method} disabled={disabled} onInput={(e) => onChange({ method: (e.target as HTMLInputElement).value })} />
+      <datalist id="fi-methods">{METHOD_SUGGESTIONS.map((x) => <option key={x} value={x} />)}</datalist>
+      <input class={`pe-url${m('url')}`} aria-label="URL" spellcheck={false}
+        value={draft.url} disabled={disabled} onInput={(e) => onChange({ url: (e.target as HTMLInputElement).value })} />
+    </div>
+  );
+}
+
+function DraftErrors({ validation }: { validation: DraftValidation }) {
+  if (!validation.errors.length) return null;
+  return (
+    <ul class="msg error errors" role="alert">
+      {validation.errors.map((e) => <li key={e}>{e}</li>)}
+    </ul>
+  );
+}
+
 export function PauseEditor({ ex }: { ex: Exchange }) {
   const { state, dispatch, post } = useApp();
   const draft = currentDraft(state, ex);
@@ -143,13 +168,7 @@ export function PauseEditor({ ex }: { ex: Exchange }) {
     <form class="pause-editor" onSubmit={(e) => e.preventDefault()} onKeyDown={onKeyDown}
       aria-label={draft.kind === 'request' ? 'Edit paused request' : 'Edit paused response'}>
       {draft.kind === 'request' ? (
-        <div class="pe-line">
-          <input class={`pe-method${mod('method')}`} aria-label="Method" list="fi-methods" spellcheck={false}
-            value={draft.method} disabled={busy} onInput={(e) => set({ method: (e.target as HTMLInputElement).value })} />
-          <datalist id="fi-methods">{METHOD_SUGGESTIONS.map((m) => <option key={m} value={m} />)}</datalist>
-          <input class={`pe-url${mod('url')}`} aria-label="URL" spellcheck={false}
-            value={draft.url} disabled={busy} onInput={(e) => set({ url: (e.target as HTMLInputElement).value })} />
-        </div>
+        <MethodUrlLine draft={draft} disabled={busy} mod={mod} onChange={set} />
       ) : (
         <div class="pe-line">
           <label class="field-inline">
@@ -175,11 +194,7 @@ export function PauseEditor({ ex }: { ex: Exchange }) {
         </div>
       )}
 
-      {validation.errors.length > 0 && (
-        <ul class="msg error errors" role="alert">
-          {validation.errors.map((e) => <li key={e}>{e}</li>)}
-        </ul>
-      )}
+      <DraftErrors validation={validation} />
 
       {confirming && jsonBad && (
         <div class="confirm" role="alertdialog" aria-label="Send invalid JSON?">
@@ -210,5 +225,80 @@ export function PauseEditor({ ex }: { ex: Exchange }) {
         )}
       </div>
     </form>
+  );
+}
+
+// ---------------------------------------------------------------- edit & resend composer
+
+/** "Edit and resend": the request-draft editor → `send` (CONTRACTS §9.3). The host replies `sent`. */
+export function Composer() {
+  const { state, dispatch, post } = useApp();
+  const c = state.composer;
+  const [confirming, setConfirming] = useState(false);
+  useEffect(() => setConfirming(false), [c?.draft.body]);
+  if (!c) return null;
+  const draft = c.draft;
+  const original = c.resentFrom ? findExchange(state, c.resentFrom) : undefined;
+  const validation = validateDraft(draft);
+  const jsonBad = validation.json && !validation.json.ok ? validation.json : undefined;
+  const busy = c.sending;
+  const canSend = !busy && validation.errors.length === 0;
+  const set = (patch: Partial<RequestDraft>) => dispatch({ type: 'patchComposer', patch });
+  const close = () => dispatch({ type: 'closeComposer', discard: true });
+
+  const send = (force = false) => {
+    if (!canSend) return;
+    if (jsonBad && !force) { setConfirming(true); return; }
+    post({ type: 'send', request: composeSend(c), ...(c.resentFrom ? { resentFrom: c.resentFrom } : {}) });
+    dispatch({ type: 'composerSending' });
+  };
+
+  return (
+    <section class="detail composer" aria-label="Edit and resend" tabIndex={-1}>
+      <form class="pause-editor composer-form" onSubmit={(e) => { e.preventDefault(); send(); }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
+          if (e.key === 'Escape' && !busy) { e.preventDefault(); close(); }
+        }}>
+        <div class="detail-title composer-head">
+          <h3>{c.resentFrom ? 'Edit and resend' : 'New request'}</h3>
+          {c.resentFrom && (
+            original
+              ? <button type="button" class="link" onClick={() => dispatch({ type: 'select', id: original.id })}
+                  title="Show the original exchange (closes the composer; reopen it with “Edit and resend”)">
+                  from {original.method} {original.url}
+                </button>
+              : <span class="muted">from an exchange that is no longer listed</span>
+          )}
+          <span class="spacer" />
+          <Button kind="icon" title="Close (Esc)" onClick={close}><Icon name="close" /></Button>
+        </div>
+        <p class="hint">
+          Sent through the proxy like app traffic: rules and the network profile apply, and it appears in the list.
+        </p>
+        <MethodUrlLine draft={draft} disabled={busy} onChange={set} />
+        <h4 class="section-title">Headers</h4>
+        <HeadersEditor rows={draft.headers} disabled={busy} onChange={(headers) => set({ headers })} />
+        <h4 class="section-title">Body</h4>
+        {c.bodyNote && <div class="msg info" role="note">{c.bodyNote}</div>}
+        <BodyEditor label="Request body" value={draft.body} json={validation.json} disabled={busy} rows={8}
+          onInput={(body) => set({ body })} />
+        <DraftErrors validation={validation} />
+        {confirming && jsonBad && (
+          <div class="confirm" role="alertdialog" aria-label="Send invalid JSON?">
+            <span>The body is not valid JSON (line {jsonBad.line}, column {jsonBad.column}) but its content-type says JSON.</span>
+            <Button kind="danger" onClick={() => send(true)}>Send anyway</Button>
+            <Button onClick={() => setConfirming(false)}>Keep editing</Button>
+          </div>
+        )}
+        <div class="pe-actions">
+          <Button kind="primary" type="submit" disabled={!canSend} title="Send this request through the proxy (Ctrl/Cmd+Enter)">
+            <Icon name="play" /> Send
+          </Button>
+          <Button onClick={close} disabled={busy}>Cancel</Button>
+          <span class="pe-summary">{busy ? 'Sending…' : 'The new exchange is selected once the proxy records it.'}</span>
+        </div>
+      </form>
+    </section>
   );
 }

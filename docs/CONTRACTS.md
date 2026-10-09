@@ -13,8 +13,9 @@ the target is outside the project root, `_<first 8 hex of sha1(path)>` is append
 The **content is device independent** (same bytes for an emulator and a simulator session).
 Uses **dart:io, dart:async and dart:convert only** — never adds a dependency to the app.
 
-Template v3 (placeholders in `{{ }}`) — validated on Android emulator + iOS simulator and Dart SDKs 3.0–3.13
-(docs/spikes/template-v3.md). It **trusts** this install's CA (below) instead of accepting any certificate:
+Template v4 (placeholders in `{{ }}`) — v3 plus request → source (§9.1), validated on Android emulator + iOS
+simulator and Dart SDKs 3.0–3.13 (docs/spikes/template-v4.md; v3: docs/spikes/template-v3.md). It **trusts** this
+install's CA (below) instead of accepting any certificate:
 proxy leaf certificates pass normal chain + hostname verification; the `; DIRECT` fallback is verified exactly
 as without Flutter Intercept. The returned client is a wrapper that ignores app assignments to `findProxy`;
 `badCertificateCallback` is the app's own (forwarded):
@@ -24,6 +25,7 @@ as without Flutter Intercept. The returned client is a wrapper that ignores app 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import '{{TARGET_IMPORT}}' as target; // package:<app>/<path> when under lib/, else relative
 
 // Flutter sessions pass --dart-define=FLUTTER_INTERCEPT_PROXY=<host:port> (device dependent);
@@ -32,6 +34,220 @@ const _proxyAddress = String.fromEnvironment('FLUTTER_INTERCEPT_PROXY', defaultV
 const _proxy = 'PROXY $_proxyAddress; DIRECT';
 
 String _findProxy(Uri url) => _proxy;
+
+// Request -> source (CONTRACTS §9.1). Each request carries an opaque `x-fi-id` header; the stack
+// captured when the app opened it goes to the proxy out of band (never upstream). Flutter sessions
+// pass --dart-define=FLUTTER_INTERCEPT_TRACE=0 when the user turned it off.
+const _traceEnabled = String.fromEnvironment('FLUTTER_INTERCEPT_TRACE') != '0';
+// Libraries such as Dio open the connection several async hops after the app's call, so the stack at
+// that point no longer shows it. In debug (JIT) sessions the app runs in a zone that remembers where
+// each callback was registered (like package:stack_trace's Chain.capture); never in profile builds.
+const _traceChains = _traceEnabled && !bool.fromEnvironment('dart.vm.profile') && !bool.fromEnvironment('dart.vm.product');
+const _traceHeader = 'x-fi-id';
+// `.invalid` never resolves and the side channel has no `; DIRECT`: stacks only ever reach the proxy.
+final Uri _traceUrl = Uri.parse('https://trace.flutter-intercept.invalid/v1/traces');
+const _traceMaxChars = 16000;
+const _traceBatch = 50;
+const _traceQueueLimit = 1000;
+// Flutter apps keep the side channel's connection for the next batch; plain Dart programs close it.
+const _flutterApp = bool.fromEnvironment('dart.library.ui');
+
+// Random per isolate start (so ids stay unique across hot restarts) + a counter.
+final String _tracePrefix = () {
+  Random random;
+  try {
+    random = Random.secure();
+  } catch (_) {
+    random = Random(DateTime.now().microsecondsSinceEpoch);
+  }
+  final buffer = StringBuffer();
+  for (var i = 0; i < 16; i++) {
+    buffer.write(random.nextInt(16).toRadixString(16));
+  }
+  return buffer.toString();
+}();
+int _traceCount = 0;
+
+class _PendingTrace {
+  _PendingTrace(this.id, this.stack, this.chain);
+  final String id;
+  final StackTrace stack;
+  final List<StackTrace>? chain;
+
+  /// The VM stack, then (whole) earlier registrations in package:stack_trace's Chain format.
+  String format() {
+    var out = _lean('$stack');
+    final c = chain;
+    if (c != null) {
+      for (final t in c) {
+        final segment = _lean('$t');
+        if (segment.isEmpty) continue;
+        final next = '$out$_chainGap\n$segment';
+        if (next.length > _traceMaxChars) break;
+        out = next;
+      }
+    }
+    return out.length > _traceMaxChars ? out.substring(0, _traceMaxChars) : out;
+  }
+}
+
+/// VM stack lines without frames of `dart:` libraries and of this file (event loop and zone
+/// plumbing, never the app's call site); `<asynchronous suspension>` markers between kept frames stay.
+String _lean(String trace) {
+  final out = StringBuffer();
+  var suspended = false;
+  for (final line in trace.split('\n')) {
+    if (line.isEmpty) continue;
+    if (line == '<asynchronous suspension>') {
+      suspended = true;
+      continue;
+    }
+    if (line.contains('(dart:') || (line.contains('/.dart_tool/') && line.contains('/entry_'))) continue;
+    if (suspended && out.isNotEmpty) out.write('<asynchronous suspension>\n');
+    suspended = false;
+    out.write('$line\n');
+  }
+  return out.toString();
+}
+
+const _chainDepth = 10;
+const _chainGap = '===== asynchronous gap ===========================';
+// Registration stacks of the callback running now, newest first (null outside the chain zone).
+List<StackTrace>? _currentChain;
+
+List<StackTrace> _chainHere() {
+  final parent = _currentChain;
+  final out = <StackTrace>[StackTrace.current];
+  if (parent != null) {
+    for (var i = 0; i < parent.length && out.length < _chainDepth; i++) {
+      out.add(parent[i]);
+    }
+  }
+  return out;
+}
+
+// Microtasks and timers keep the chain they were scheduled under without a capture of their own: they
+// are scheduled at least once per `await`, which would double the cost, and the code that schedules
+// one from the app's call already registered a `then` (captured below) or runs the app's own closure.
+ZoneCallback<R> _registerCallback<R>(Zone self, ZoneDelegate parent, Zone zone, R Function() f) {
+  final chain = _currentChain;
+  final g = parent.registerCallback<R>(zone, f);
+  if (chain == null) return g;
+  return () {
+    final previous = _currentChain;
+    _currentChain = chain;
+    try {
+      return g();
+    } finally {
+      _currentChain = previous;
+    }
+  };
+}
+
+ZoneUnaryCallback<R, T> _registerUnaryCallback<R, T>(Zone self, ZoneDelegate parent, Zone zone, R Function(T) f) {
+  final chain = _chainHere();
+  final g = parent.registerUnaryCallback<R, T>(zone, f);
+  return (T a) {
+    final previous = _currentChain;
+    _currentChain = chain;
+    try {
+      return g(a);
+    } finally {
+      _currentChain = previous;
+    }
+  };
+}
+
+// Error handlers keep the chain they were registered under without a capture of their own (half the
+// cost of an `await`); a retry from an error handler still leads back to the app's call.
+ZoneBinaryCallback<R, T1, T2> _registerBinaryCallback<R, T1, T2>(
+    Zone self, ZoneDelegate parent, Zone zone, R Function(T1, T2) f) {
+  final chain = _currentChain;
+  final g = parent.registerBinaryCallback<R, T1, T2>(zone, f);
+  if (chain == null) return g;
+  return (T1 a, T2 b) {
+    final previous = _currentChain;
+    _currentChain = chain;
+    try {
+      return g(a, b);
+    } finally {
+      _currentChain = previous;
+    }
+  };
+}
+
+final List<_PendingTrace> _pendingTraces = <_PendingTrace>[];
+Timer? _traceTimer;
+int _tracePosts = 0;
+HttpClient? _traceClient;
+bool _traceFailed = false;
+
+/// Tags a request the app is opening with an id and queues the app's stack for the proxy.
+/// Must be called synchronously from the HttpClient member the app called.
+Future<HttpClientRequest> _traced(Future<HttpClientRequest> request) {
+  if (!_traceEnabled) return request;
+  final stack = StackTrace.current;
+  _traceCount++;
+  final id = '$_tracePrefix-${_traceCount.toRadixString(36)}';
+  if (_pendingTraces.length >= _traceQueueLimit) _pendingTraces.removeAt(0);
+  _pendingTraces.add(_PendingTrace(id, stack, _currentChain));
+  _traceTimer ??= Zone.root.createTimer(const Duration(milliseconds: 100), _flushTraces);
+  return request.then((HttpClientRequest r) {
+    try {
+      r.headers.set(_traceHeader, id);
+    } catch (_) {
+      // Headers already sent or immutable: this request just has no source.
+    }
+    return r;
+  });
+}
+
+void _flushTraces() {
+  _traceTimer = null;
+  while (_pendingTraces.isNotEmpty) {
+    final n = _pendingTraces.length < _traceBatch ? _pendingTraces.length : _traceBatch;
+    final batch = _pendingTraces.sublist(0, n);
+    _pendingTraces.removeRange(0, n);
+    _postTraces(batch);
+  }
+}
+
+class _UntracedOverrides extends HttpOverrides {}
+
+Future<void> _postTraces(List<_PendingTrace> batch) async {
+  _tracePosts++;
+  try {
+    // A plain dart:io client (not the app's, not wrapped, never traced) that may only use the proxy, over
+    // one connection so batches never compete with the app for the proxy's per-client connection budget.
+    final client = _traceClient ??=
+        HttpOverrides.runWithHttpOverrides<HttpClient>(() => HttpClient(), _UntracedOverrides())
+          ..findProxy = ((Uri url) => 'PROXY $_proxyAddress')
+          ..maxConnectionsPerHost = 1;
+    final traces = <Map<String, String>>[];
+    for (final t in batch) {
+      traces.add(<String, String>{'id': t.id, 'stack': t.format()});
+    }
+    final body = utf8.encode(jsonEncode(<String, Object>{'traces': traces}));
+    final request = await client.postUrl(_traceUrl);
+    request.headers.contentType = ContentType.json;
+    request.contentLength = body.length;
+    request.add(body);
+    final response = await request.close();
+    await response.drain<void>();
+  } catch (e) {
+    if (!_traceFailed) {
+      _traceFailed = true;
+      _note('request sources are unavailable (could not reach the intercept proxy: $e)');
+    }
+  } finally {
+    _tracePosts--;
+    // An idle keep-alive connection would hold a plain Dart program open for 15 s.
+    if (!_flutterApp && _tracePosts == 0 && _pendingTraces.isEmpty && _traceTimer == null) {
+      _traceClient?.close();
+      _traceClient = null;
+    }
+  }
+}
 
 // Certificate of this machine's Flutter Intercept CA (its private key never leaves the
 // development machine). It is *trusted* in addition to the normal roots, so the proxy's
@@ -138,35 +354,35 @@ class _InterceptedHttpClient implements HttpClient {
 
   @override
   Future<HttpClientRequest> open(String method, String host, int port, String path) =>
-      _client.open(method, host, port, path);
+      _traced(_client.open(method, host, port, path));
   @override
-  Future<HttpClientRequest> openUrl(String method, Uri url) => _client.openUrl(method, url);
+  Future<HttpClientRequest> openUrl(String method, Uri url) => _traced(_client.openUrl(method, url));
   @override
-  Future<HttpClientRequest> get(String host, int port, String path) => _client.get(host, port, path);
+  Future<HttpClientRequest> get(String host, int port, String path) => _traced(_client.get(host, port, path));
   @override
-  Future<HttpClientRequest> getUrl(Uri url) => _client.getUrl(url);
+  Future<HttpClientRequest> getUrl(Uri url) => _traced(_client.getUrl(url));
   @override
-  Future<HttpClientRequest> post(String host, int port, String path) => _client.post(host, port, path);
+  Future<HttpClientRequest> post(String host, int port, String path) => _traced(_client.post(host, port, path));
   @override
-  Future<HttpClientRequest> postUrl(Uri url) => _client.postUrl(url);
+  Future<HttpClientRequest> postUrl(Uri url) => _traced(_client.postUrl(url));
   @override
-  Future<HttpClientRequest> put(String host, int port, String path) => _client.put(host, port, path);
+  Future<HttpClientRequest> put(String host, int port, String path) => _traced(_client.put(host, port, path));
   @override
-  Future<HttpClientRequest> putUrl(Uri url) => _client.putUrl(url);
+  Future<HttpClientRequest> putUrl(Uri url) => _traced(_client.putUrl(url));
   @override
   Future<HttpClientRequest> delete(String host, int port, String path) =>
-      _client.delete(host, port, path);
+      _traced(_client.delete(host, port, path));
   @override
-  Future<HttpClientRequest> deleteUrl(Uri url) => _client.deleteUrl(url);
+  Future<HttpClientRequest> deleteUrl(Uri url) => _traced(_client.deleteUrl(url));
   @override
   Future<HttpClientRequest> patch(String host, int port, String path) =>
-      _client.patch(host, port, path);
+      _traced(_client.patch(host, port, path));
   @override
-  Future<HttpClientRequest> patchUrl(Uri url) => _client.patchUrl(url);
+  Future<HttpClientRequest> patchUrl(Uri url) => _traced(_client.patchUrl(url));
   @override
-  Future<HttpClientRequest> head(String host, int port, String path) => _client.head(host, port, path);
+  Future<HttpClientRequest> head(String host, int port, String path) => _traced(_client.head(host, port, path));
   @override
-  Future<HttpClientRequest> headUrl(Uri url) => _client.headUrl(url);
+  Future<HttpClientRequest> headUrl(Uri url) => _traced(_client.headUrl(url));
 
   @override
   set authenticate(dynamic f) => _client.authenticate = f;
@@ -200,12 +416,21 @@ Future<void> main(List<String> args) async {
   final overrides = _FlutterInterceptOverrides(HttpOverrides.current);
   HttpOverrides.global = overrides;
   // Zone value wins over a later `HttpOverrides.global = ...` inside the app.
-  await HttpOverrides.runWithHttpOverrides(() async {
-    // Works for `void main()`, `Future<void> main() async` and `main(List<String>)`.
-    final dynamic entry = target.main;
-    final dynamic result = entry is Function(List<String>) ? entry(args) : entry();
-    if (result is Future) await result;
+  await HttpOverrides.runWithHttpOverrides(() {
+    if (!_traceChains) return _runTarget(args);
+    return runZoned(() => _runTarget(args),
+        zoneSpecification: ZoneSpecification(
+            registerCallback: _registerCallback,
+            registerUnaryCallback: _registerUnaryCallback,
+            registerBinaryCallback: _registerBinaryCallback));
   }, overrides);
+}
+
+Future<void> _runTarget(List<String> args) async {
+  // Works for `void main()`, `Future<void> main() async` and `main(List<String>)`.
+  final dynamic entry = target.main;
+  final dynamic result = entry is Function(List<String>) ? entry(args) : entry();
+  if (result is Future) await result;
 }
 ```
 
@@ -499,3 +724,145 @@ cleanup (remove_rule), and that secrets are redacted. Never writes without the c
 ### UI
 `Status` gains `agent?: { access: string; mcpUrl?: string; clients: number; lastCall?: { tool: string; at: number } }`
 (never the token). Rules whose name starts with `"[agent] "` show an agent badge.
+
+## 9. v0.3.0 additions — "Where did this come from?" (2026-10-09)
+
+Plan: docs/ROADMAP.md §6, owners in docs/PLAN.md "v0.3.0". Types below are already in the code
+(`packages/proxy/src/{types,network}.ts`, both `protocol.ts`, `src/agent/types.ts`); behaviour is the owners'.
+
+### 9.1 Template v4 — request → source (amends §1)
+Everything in §1 stays; v4 adds a source trace per request. Still dart:io/async/convert only (no
+`dart:developer`, no new imports beyond what §1 lists unless the spike proves one is needed; `dart:math` allowed).
+- Every request-opening member of `_InterceptedHttpClient` (`open`, `openUrl`, `get`…`headUrl`) captures
+  `StackTrace.current` **synchronously at call time**, picks an opaque id (`/^[A-Za-z0-9_-]{8,64}$/`, unique per
+  process incl. hot restarts; no device/user data), and on the returned `HttpClientRequest` sets header
+  `x-fi-id: <id>` before handing it to the app.
+- Traces go out of band: `POST https://trace.flutter-intercept.invalid/v1/traces`, JSON
+  `{"traces":[{"id":"<id>","stack":"<StackTrace.toString(), ≤ 16 KB>"}]}`, batched (≤ 50 per POST, flushed
+  within ~100 ms), fire-and-forget, errors swallowed (at most one `_note`). Sent with a **dedicated client that
+  is never traced** (no recursion) whose `findProxy` is `PROXY <_proxyAddress>` **without `; DIRECT`**. HTTPS on
+  purpose: Android's cleartext policy can block `http://` in dart:io; the host is answered by the proxy with a
+  leaf from the trusted install CA. `.invalid` never resolves, so on DIRECT nothing but the opaque `x-fi-id`
+  header leaves the device.
+- `--dart-define=FLUTTER_INTERCEPT_TRACE=0` (setting `flutterIntercept.captureSource` = false) turns tracing
+  off: no header, no side channel. Default on. Flutter sessions only — plain Dart sessions take no dart-define
+  (the VM rejects it) and always trace (REVIEW-3 #6, accepted).
+- `stack` is the **lean VM format**: frames of `dart:` libraries and of the generated entry are dropped (original
+  `#n` numbering kept), `<asynchronous suspension>` kept between kept frames. In debug/JIT sessions earlier
+  registration stacks follow, separated by `===== asynchronous gap ===========================` (whole segments,
+  at most 10, total ≤ 16 000 chars). In profile, only the synchronous stack. `parseDartStack` (9.2) accepts both
+  this and the stack_trace Chain/terse formats.
+- **Zone chain (debug/JIT only**, `dart.vm.profile` / `dart.vm.product` false; off with `TRACE=0`): Dio builds its
+  pipeline from `Future.then` + `Completer`s, so the synchronous stack ends inside Dio. The app's `main` runs in a
+  `runZoned` with `registerCallback` / `registerUnaryCallback` / `registerBinaryCallback` hooks inside the overrides
+  zone; a stack is captured only when a `then`/`await` callback is registered (≈1.5–2 µs per await, measured).
+- Failure note, printed once per isolate run:
+  `[flutter_intercept] request sources are unavailable (could not reach the intercept proxy: <error>)`.
+- Spike first (docs/spikes/template-v4.md): does `StackTrace.current` in `openUrl` reach the app's call site
+  for Dio (interceptors, `QueuedInterceptor`, transformers) and `package:http` on Dart 3.0–3.13 + current SDK?
+  Measure overhead per request. Keep the entry's language-version rules (§1).
+
+### 9.2 Proxy additions (amends §3)
+```ts
+export interface StackFrame { fn: string; uri: string; line?: number; column?: number; afterAsyncGap?: boolean }
+export interface SourceInfo { frames: StackFrame[]; appFrame?: number }   // ≤ 30 frames; appFrame = index
+Exchange.source?: SourceInfo;              // set (and 'exchange' emitted) once the trace and the request meet
+Exchange.initiator?: 'editor' | 'agent';   // absent = the app
+Exchange.resentFrom?: string;              // id of the exchange this one was resent from
+Exchange.simulated?: string;               // human label when a throttle/fault/profile affected it
+Exchange.viaLan?: true;                    // came through the LAN listener (§7)
+Rule.times?: number;                       // rule applies to the first N matching requests, then is spent
+Rule.expiresAt?: number;                   // epoch ms; spent after this
+Rule.used?: number;                        // host-set hit count for rules with `times` (display only, not persisted)
+RuleAction +=
+  | { kind: 'throttle'; latencyMs?: number; kbps?: number; dropRate?: number }   // to the real server, slowed
+  | { kind: 'fault'; fault: 'reset' | 'timeout' | 'truncate' | 'dns' };
+InterceptProxyOptions.rewriteLocalhost?: boolean;  // default true
+// network.ts (dependency-free, `@flutter-intercept/proxy/network`): NetworkProfile, NETWORK_PRESETS
+// source.ts  (dependency-free, `@flutter-intercept/proxy/source`): parseDartStack, pickAppFrame, FRAMEWORK_PACKAGES
+
+class InterceptProxy {
+  send(req: SendRequest): Promise<{ id: string }>;  // resolves once recorded, before completion
+  setNetworkProfile(p: NetworkProfile): void; readonly networkProfile: NetworkProfile;
+  setAppPackages(names: string[]): void;            // app package names → preferred appFrame
+  on(event: 'rule-spent', l: (ruleId: string, reason: 'times' | 'expired') => void): this;
+}
+```
+- **Trace sink**: host `trace.flutter-intercept.invalid` (any scheme/port) is answered locally — 204, never
+  forwarded, never recorded, body ≤ 1 MB, bad JSON ignored. Traces wait (≤ 2000, 60 s) for their exchange and
+  vice versa; both arrival orders work. Authorised LAN clients may use it (no SSRF check needed: nothing is
+  contacted); unauthorised ones still get 407.
+- **`x-fi-id`** is removed before anything goes upstream (every route, incl. edits and `send`) and is never in
+  `Exchange.requestHeaders`. `appFrame` = first frame whose package is in `setAppPackages` if any, else the first
+  frame that is not `dart:`, not the generated entry, not a `FRAMEWORK_PACKAGES` package.
+- **`send`**: the request goes through the proxy's own loopback listener like app traffic (rules and the network
+  profile apply; recorded with `initiator`/`resentFrom`); upstream TLS stays strict. Invalid method/URL rejects.
+  Recorded `content-length` / `transfer-encoding` / connection headers are ignored (framing recomputed) and
+  `Host` always comes from the URL. Hosts strip `proxy-authorization` (may carry the LAN token) and `x-fi-id`.
+- **throttle**: `latencyMs` before forwarding, `kbps` caps the response body speed to the app (streaming
+  Transform in taps/flow, no full buffering), `dropRate` (0–1) = probability the exchange is reset instead.
+  **fault**: `reset` after the tunnel is up; `timeout` holds it unanswered until the client gives up (≤
+  `breakpointTimeoutMs`, then reset); `truncate` forwards, then cuts the response body mid-way; `dns` = the
+  closest the app can see to a failed lookup. Measured with the real Dart client and written down in
+  docs/spikes/faults.md — **a fault must never make Dart fall back to DIRECT** (i.e. never fail the connection
+  to the proxy itself). Faulted exchanges end `blocked`; throttled ones end normally; both set `simulated`.
+- Measured app view (docs/spikes/faults.md): reset/drop → `Connection reset by peer`; `dns`/offline → closed
+  without a response (`Connection closed before full header was received`) — a real connect-time
+  `SocketException` is impossible through a proxy without DIRECT fallback; timeout → the app's own timeout, else a
+  reset at `breakpointTimeoutMs`; truncate → status then `Connection closed while receiving data`. Not throttled:
+  uploads (kbps), websockets.
+- A throttle rule **replaces** the profile for the requests it matches. Under `offline` a request breakpoint fails
+  instead of pausing. `setNetworkProfile` throws on invalid input (host → `error`).
+- **Network profile** (global, this proxy = this app only): applies to everything that would reach the network
+  (pass-through, breakpoints, throttle rules, `send`); mock/block/fault rules still answer as configured; the
+  trace sink is never affected. `offline` = the `dns`-style fault for every request.
+- **Rule spending**: hit counts are keyed by rule id and survive `setRules` (dropped when the id disappears); a
+  rule whose `times` is used up or whose `expiresAt` passed no longer matches and `rule-spent` fires once (an
+  expiry timer fires it even without traffic). The host removes spent rules (9.4). For rules with `times`,
+  `on('rule-hit', (ruleId, used) => …)` fires on every hit; the host sets `Rule.used` and re-broadcasts `rules`.
+- **rewriteLocalhost** (loopback-listener clients only; LAN clients keep the §7 SSRF guard, unchanged):
+  targets `10.0.2.2` / `10.0.3.2` (emulator aliases for the host) are connected to `127.0.0.1` on the same port;
+  `localhost` / `127.0.0.1` already reach the host machine because the proxy runs there — verify, including
+  mockttp's own loop protection. `Exchange.url` stays what the app sent.
+
+### 9.3 Extension ↔ webview (amends §4)
+```ts
+// host → webview
+| { type: 'sent'; id: string }                      // after a successful 'send' (select it)
+Status.networkProfile?: NetworkProfile;             // absent = none
+// webview → host
+| { type: 'send'; request: { method: string; url: string; headers?: Record<string, string | string[]>; body?: string }; resentFrom?: string }
+| { type: 'openSource'; id: string; frame?: number } // default = appFrame; opens the file at line:column
+| { type: 'copySnippet'; id: string; format: SnippetFormat } // 'curl' | 'dart_http' | 'dio'; host writes the clipboard
+| { type: 'setNetworkProfile'; profile: NetworkProfile }
+```
+Host obligations: `sent` after `send`; `status` after `setNetworkProfile`; `error` for any failure (incl. "no
+source for this request", "file not in the workspace"). `copySnippet` is the user's own clipboard: unredacted.
+Rule validation (`validateRule`) accepts `throttle`, `fault`, `times` (int 1–1000), `expiresAt` (epoch ms).
+
+### 9.4 Extension host
+- `src/source/resolve.ts` (pure, no vscode): `resolveFrames(frames, projectRoots, fs?) → ResolvedFrame[]`
+  (`ResolvedFrame = StackFrame & { path?: string; inProject: boolean }`) using each root's
+  `.dart_tool/package_config.json` (cached by mtime) for `package:` URIs and `file://` URIs as is.
+  `src/source/open.ts` opens a resolved frame in an editor (1-based line/column from Dart → 0-based) — only
+  files inside a workspace folder or a resolved package root (REVIEW-3 #3); UNC / non-local paths are refused.
+- Snippets: `src/codegen/snippets.ts` (pure): `toSnippet(req, format)` for `curl`, `dart_http`, `dio`, from
+  `{method, url, headers, body?: Body}`; binary bodies become a commented placeholder, never inline garbage.
+- Spent rules: the host listens to `rule-spent`, removes the rule (persist + broadcast `rules`).
+- Settings: `flutterIntercept.captureSource` (bool, default true), `flutterIntercept.rewriteLocalhost` (bool,
+  default true). The network profile is session state (not persisted across reloads).
+
+### 9.5 Agent API additions (amends §8)
+| Tool | R/W | Input | Output |
+|---|---|---|---|
+| `get_request_source` | R | `{id, maxFrames?=20}` | `{available:true, appFrame?: {fn, uri, path?, line?, column?}, frames}` (`path` project-relative) or `{available:false, reason}` |
+| `get_body_shape` | R | `{id, which?="response", maxDepth?=6}` | `{contentType?, bytes, shape, truncated?}` — JSON structure only (key → type, arrays as one merged element + length, `string\|null` unions, no values); < 1k tokens for a 1 MB body; non-JSON → `{shape:null, reason}` |
+| `simulate_network` | W | `{profile: "none"\|"offline"\|"slow-3g"\|"fast-3g"\|"flaky"\|"custom", latencyMs?, kbps?, dropRate?, url?, method?, fault?, times?, ttlMs?, name?}` | no `url` → sets the global profile `{profile}`; with `url` → inserts a throttle (or `fault`) rule FIRST → `{ruleId}` |
+| `resend_request` | W | `{id, edit?: RequestEdit}` | `{id, sinceMs}` of the new exchange. REVIEW-3 #1: only an app exchange (no `initiator`) that reached the server unchanged (`completed`, no `matchedRuleId`, not `viaLan`), and only to **that exchange's own origin** (`edit.url` may change path/query, never scheme/host/port); the confirmation names the target |
+- `get_request` gains `snippet?: "curl"\|"dart_http"\|"dio"` → `snippet` built from the **redacted** view.
+- `add_mock` / `add_block` / `add_breakpoint` gain `times?` (1–1000) and `ttlMs?` (1 000–86 400 000 →
+  `expiresAt = now + ttlMs`).
+- Annotations: `openWorldHint: true` only for `resend_request`; `idempotentHint: true` for read tools and for
+  `remove_rule`, `abort_request`, `clear_requests`, `stop_app`; false otherwise. `destructiveHint: true` for
+  `resend_request` and `simulate_network` (REVIEW-3 #7: it adds a rule per call with `url`; offline cuts the app off).
+- Instructions (`instructions.ts`) mention `get_request_source`, `get_body_shape` and `times`/`ttlMs` cleanup.

@@ -22,6 +22,8 @@ import { lanAddressForIphone } from './lanAddress';
 import { LanNetworkWatcher, netFingerprint } from './lanWatch';
 import { LanLifecycle } from './lanLifecycle';
 import { InterceptProxyHost } from './proxyHost';
+import { openFrame } from './source/open';
+import { packageRootsFor, resolveFrames } from './source/resolve';
 import { InterceptController, validateRules } from './ui/controller';
 import { TrafficViewProvider, VIEW_ID } from './ui/view';
 
@@ -80,6 +82,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       return new Proxy(opts);
     },
     onStop: () => reverses.removeAll(),
+    rewriteLocalhost: () => vscode.workspace.getConfiguration('flutterIntercept').get<boolean>('rewriteLocalhost', true),
     // A changed flutterIntercept.port takes effect on the next launch when no intercepted session is live.
     canRestart: () => intercepted.size === 0,
     canReopenLan: (): boolean => lanLife.liveSessions === 0,
@@ -176,6 +179,17 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     setEnabled,
     log,
     getAgentStatus: () => agentStatus(),
+    // CONTRACTS §9.3/9.4: request → source and Copy as … (the user's own clipboard: unredacted).
+    openSource: async (ex, frameIndex) => {
+      const frame = ex.source?.frames[frameIndex];
+      if (!frame) throw new Error('No source location was recorded for this request.');
+      const roots = flutterProjectRoots();
+      const [resolved] = resolveFrames([frame], roots);
+      // REVIEW-3 #3: trace frames are app-controlled; open only workspace and package files.
+      const workspace = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+      await openFrame(resolved, { allowedRoots: [...workspace, ...packageRootsFor(roots)] });
+    },
+    copyToClipboard: (text) => Promise.resolve(vscode.env.clipboard.writeText(text)),
   });
   const view = new TrafficViewProvider(context.extensionUri, controller);
 
@@ -199,8 +213,13 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     getSettings: agentSettings,
     launcher,
     projectRoot: () => flutterProjectRoot(),
+    resolveFrames: (frames) => resolveFrames(frames, flutterProjectRoots()),
     version,
   });
+  // CONTRACTS §9.2: the app's own packages decide which stack frame is the call site.
+  const refreshAppPackages = () => proxyHost.setAppPackages(appPackageNames(flutterProjectRoots()));
+  refreshAppPackages();
+  context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(refreshAppPackages));
   let lastAgentCall: { tool: string; at: number } | undefined;
   // TEST ONLY (FI_TEST_EXPOSE_MCP_TOKEN=1): record agent tool calls for the integration suites.
   const testAgentCalls: { tool: string; at: number; ok: boolean }[] | undefined = process.env.FI_TEST_EXPOSE_MCP_TOKEN === '1' ? [] : undefined;
@@ -300,6 +319,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       const conf = session.configuration as DebugConfig;
       if (session.type !== 'dart' || !conf[ORIGINAL_PROGRAM_KEY]) return;
       intercepted.add(session.id);
+      refreshAppPackages(); // pubspec names may have changed since activation
       controller.setSessions(intercepted.size);
       if (!revealed) {
         revealed = true;
@@ -411,6 +431,36 @@ function substituteCommonVariables(config: vscode.DebugConfiguration, folder?: v
 }
 
 /** The workspace folder holding the Flutter project (pubspec.yaml at its root or one level down). */
+/** Every Flutter/Dart project root in the workspace (folders with a pubspec.yaml, or their direct children). */
+function flutterProjectRoots(): string[] {
+  const roots: string[] = [];
+  for (const f of vscode.workspace.workspaceFolders ?? []) {
+    const root = f.uri.fsPath;
+    if (fs.existsSync(path.join(root, 'pubspec.yaml'))) roots.push(root);
+    try {
+      for (const child of fs.readdirSync(root, { withFileTypes: true })) {
+        if (child.isDirectory() && fs.existsSync(path.join(root, child.name, 'pubspec.yaml'))) roots.push(path.join(root, child.name));
+      }
+    } catch {
+      // unreadable folder: skip it
+    }
+  }
+  return roots;
+}
+
+function appPackageNames(roots: string[]): string[] {
+  const names = new Set<string>();
+  for (const root of roots) {
+    try {
+      const m = /^name:\s*["']?([A-Za-z0-9_]+)/m.exec(fs.readFileSync(path.join(root, 'pubspec.yaml'), 'utf8'));
+      if (m) names.add(m[1]);
+    } catch {
+      // no readable pubspec
+    }
+  }
+  return [...names];
+}
+
 function flutterProjectRoot(): string | undefined {
   const folders = vscode.workspace.workspaceFolders ?? [];
   for (const f of folders) {

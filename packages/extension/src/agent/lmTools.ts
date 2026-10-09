@@ -116,7 +116,51 @@ export function invocationMessage(tool: ToolName, input: unknown): string {
       return i.sessionId ? `Stopping session ${plain(i.sessionId)}` : 'Stopping intercepted debug sessions';
     case 'hot_restart':
       return i.sessionId ? `Hot restarting session ${plain(i.sessionId)}` : 'Hot restarting intercepted debug sessions';
+    case 'get_request_source':
+      return `Finding the code that sent request ${plain(i.id)}`;
+    case 'get_body_shape':
+      return `Reading the ${i.which === 'request' ? 'request' : 'response'} body structure of ${plain(i.id)}`;
+    case 'simulate_network':
+      return i.url
+        ? `Simulating ${i.fault ? `a ${plain(i.fault)} fault` : plain(i.profile)} for ${m}${plain(i.url)}`
+        : `Setting the network profile to ${plain(i.profile)}`;
+    case 'resend_request':
+      return `Resending request ${plain(i.id)}`;
   }
+}
+
+/** Human text for a simulate_network profile / fault. */
+function simulationText(i: Record<string, unknown>): string {
+  if (i.fault) {
+    const f = String(i.fault);
+    return f === 'reset' ? 'a connection reset' : f === 'timeout' ? 'a timeout (no answer)' : f === 'truncate' ? 'a truncated response' : f === 'dns' ? 'a DNS failure' : code(f);
+  }
+  switch (i.profile) {
+    case 'slow-3g':
+      return '**Slow 3G** (+400 ms, 400 kbps)';
+    case 'fast-3g':
+      return '**Fast 3G** (+150 ms, 1600 kbps)';
+    case 'flaky':
+      return '**Flaky** (+200 ms, 20% of requests fail)';
+    case 'offline':
+      return '**offline** (every request fails)';
+    case 'none':
+      return '**normal** speed (no throttling)';
+    case 'custom': {
+      const parts = [i.latencyMs !== undefined && `+${Number(i.latencyMs)} ms`, i.kbps !== undefined && `${Number(i.kbps)} kbps`, i.dropRate !== undefined && `${Math.round(Number(i.dropRate) * 100)}% fail`].filter(Boolean);
+      return `**custom** (${parts.join(', ') || 'no change'})`;
+    }
+    default:
+      return code(i.profile ?? '?');
+  }
+}
+
+/** ", only the next N requests" / ", for N s" suffix for rules with times / ttlMs. */
+function spendText(i: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (typeof i.times === 'number') parts.push(i.times === 1 ? 'only the next matching request' : `the next ${i.times} matching requests`);
+  if (typeof i.ttlMs === 'number') parts.push(`for ${Math.round(i.ttlMs / 1000)} s`);
+  return parts.length ? ` (${parts.join(', ')}; then removed automatically)` : '';
 }
 
 function bodySummary(body: unknown): string {
@@ -126,7 +170,7 @@ function bodySummary(body: unknown): string {
 }
 
 /** Exactly what a write tool will change, for the confirmation dialog (markdown). */
-export function confirmationText(tool: ToolName, input: unknown, ruleName?: string): { title: string; message: string } {
+export function confirmationText(tool: ToolName, input: unknown, ruleName?: string, request?: { method: string; url: string }): { title: string; message: string } {
   const i = obj(input);
   const named = str(i.name) ? ` named ${code('[agent] ' + String(i.name))}` : '';
   switch (tool) {
@@ -134,18 +178,18 @@ export function confirmationText(tool: ToolName, input: unknown, ruleName?: stri
       return {
         title: 'Add a mock rule',
         message:
-          `Mock ${target(i)} → **${i.status ?? 200}** (${bodySummary(i.body)}${i.headers ? ', custom headers' : ''}${i.delayMs ? `, ${i.delayMs} ms delay` : ''})${named}.\n\n` +
+          `Mock ${target(i)} → **${i.status ?? 200}** (${bodySummary(i.body)}${i.headers ? ', custom headers' : ''}${i.delayMs ? `, ${i.delayMs} ms delay` : ''})${named}${spendText(i)}.\n\n` +
           'Inserted as the first rule: matching requests from the app get this response and never reach the server.',
       };
     case 'add_block':
       return {
         title: 'Add a block rule',
-        message: `Block ${target(i)}: ${i.mode === 'reset' ? 'the connection is reset' : `the app gets **${i.status ?? 403}**`}${named}. The server is never contacted.`,
+        message: `Block ${target(i)}: ${i.mode === 'reset' ? 'the connection is reset' : `the app gets **${i.status ?? 403}**`}${named}${spendText(i)}. The server is never contacted.`,
       };
     case 'add_breakpoint':
       return {
         title: 'Add a breakpoint rule',
-        message: `Pause ${target(i)} at the **${i.phase ?? 'response'}** phase${named}. Matching requests wait (up to the breakpoint timeout) until resumed or aborted.`,
+        message: `Pause ${target(i)} at the **${i.phase ?? 'response'}** phase${named}${spendText(i)}. Matching requests wait (up to the breakpoint timeout) until resumed or aborted.`,
       };
     case 'remove_rule':
       return { title: 'Remove a rule', message: `Remove rule ${code(i.ruleId)}${ruleName ? ` (${code(ruleName)})` : ''}.` };
@@ -178,6 +222,39 @@ export function confirmationText(tool: ToolName, input: unknown, ruleName?: stri
         title: 'Hot restart the app',
         message: `Hot restart ${i.sessionId ? `session ${code(i.sessionId)}` : '**every** intercepted debug session'}: the app restarts from \`main()\` and loses its state.`,
       };
+    case 'simulate_network':
+      return i.url
+        ? {
+            title: 'Simulate network conditions',
+            message: `Give ${target(i)} ${simulationText(i)}${named}${spendText(i)}. Inserted as the first rule.`,
+          }
+        : {
+            title: 'Simulate network conditions',
+            message: `Set **all** of the app's traffic to ${simulationText(i)} until changed.`,
+          };
+    case 'resend_request': {
+      const e = obj(i.edit);
+      const parts = [e.headers && 'headers replaced', e.body !== undefined && `body (${String(e.body).length} chars)`].filter(Boolean);
+      const extra = parts.length ? ` Also edited: ${parts.join(', ')}.` : '';
+      if (!request) {
+        return { title: 'Resend a request', message: `Resend recorded request ${code(i.id)} to the real server with its original credentials (the request was not found, so the call will fail).${extra}` };
+      }
+      const method = (str(e.method) ?? request.method).toUpperCase();
+      let target: string;
+      let note = '';
+      try {
+        const orig = new URL(request.url);
+        const u = new URL(str(e.url) ?? request.url);
+        target = `${u.origin}${u.pathname}`;
+        if (u.origin !== orig.origin) note = ` This changes the origin from ${code(orig.origin)}, so the call will be refused.`;
+      } catch {
+        target = String(e.url ?? request.url);
+      }
+      return {
+        title: 'Resend a request',
+        message: `Send **${method}** ${code(target)} (recorded request ${code(i.id)}) again to the real server, with the original request's credentials.${extra}${note}`,
+      };
+    }
     default:
       return { title: 'Flutter Intercept', message: invocationMessage(tool, input) };
   }
@@ -201,7 +278,16 @@ export function makeLmTool(tool: ToolName, deps: LmToolsDeps & { vscode: LmVscod
             // describe by id only
           }
         }
-        const { title, message } = confirmationText(tool, options?.input, ruleName);
+        let request: { method: string; url: string } | undefined;
+        if (tool === 'resend_request') {
+          try {
+            const r = (await deps.tools.call('get_request', { id: obj(options?.input).id, includeBodies: false })) as { method?: unknown; url?: unknown };
+            if (typeof r.method === 'string' && typeof r.url === 'string') request = { method: r.method, url: r.url };
+          } catch {
+            // describe by id only
+          }
+        }
+        const { title, message } = confirmationText(tool, options?.input, ruleName, request);
         prepared.confirmationMessages = { title, message: new vs.MarkdownString(message) };
       }
       return prepared;

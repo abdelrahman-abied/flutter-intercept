@@ -1,6 +1,7 @@
 import type * as http from 'http';
 import type * as stream from 'stream';
 import { BODY_CAP_BYTES } from './body';
+import { ResponseShaper, type Shaping } from './shaper';
 
 /*
  * Bounded, passive body capture + a bounded response-breakpoint buffer, via two wrapped mockttp
@@ -12,6 +13,8 @@ import { BODY_CAP_BYTES } from './body';
  *      the stream in flowing mode before mockttp reads it, losing data);
  *    - the tracked response's `write`/`end`, to see the bytes sent to the app and its completion.
  *    Only the first BODY_CAP_BYTES of each direction are kept; totals are counted.
+ *    When the flow sets `shaping` (throttle / network profile / truncate fault), the response bytes go
+ *    through a ResponseShaper (src/shaper.ts) on their way to the app, and only delivered bytes are kept.
  * 2. buffer-utils#streamToBuffer — mockttp calls it WITHOUT a size limit only to buffer an upstream
  *    response for beforeResponse (our response breakpoints). We cap that at
  *    RESPONSE_PAUSE_LIMIT_BYTES: above it the upstream is destroyed and the app gets a 502 that says
@@ -35,6 +38,8 @@ export interface Tap {
   onRequestEnd?: () => void;
   /** finished = response fully written; false = connection closed first. Called once. */
   onResponseDone?: (finished: boolean) => void;
+  /** Set by the flow before the first response byte: pace and/or cut the body to the app. */
+  shaping?: Shaping;
 }
 
 const taps = new Map<string, Tap>();
@@ -43,15 +48,19 @@ let limitHook: boolean | undefined;
 
 const newCapture = (): Capture => ({ chunks: [], captured: 0, total: 0, ended: false });
 
-function add(c: Capture, chunk: unknown, encoding?: unknown): void {
-  if (chunk === undefined || chunk === null || typeof chunk === 'function') return;
-  const buf = Buffer.isBuffer(chunk)
+function toBuffer(chunk: unknown, encoding?: unknown): Buffer | undefined {
+  if (chunk === undefined || chunk === null || typeof chunk === 'function') return undefined;
+  return Buffer.isBuffer(chunk)
     ? chunk
     : typeof chunk === 'string'
       ? Buffer.from(chunk, typeof encoding === 'string' ? (encoding as BufferEncoding) : 'utf8')
       : chunk instanceof Uint8Array
         ? Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
         : undefined;
+}
+
+function add(c: Capture, chunk: unknown, encoding?: unknown): void {
+  const buf = toBuffer(chunk, encoding);
   if (!buf) return;
   c.total += buf.length;
   if (c.captured < BODY_CAP_BYTES) {
@@ -114,12 +123,36 @@ function attach(id: string, req: http.IncomingMessage, raw: http.ServerResponse,
   } as typeof req.emit;
 
   const write = tracked.write;
+  const end = tracked.end;
+  let shaper: ResponseShaper | undefined;
+  const shaped = (): ResponseShaper | undefined => {
+    if (!tap.shaping) return undefined;
+    shaper ??= new ResponseShaper(
+      tracked,
+      tap.shaping,
+      write as unknown as (chunk: Buffer) => boolean,
+      end as unknown as (cb?: () => void) => unknown,
+      (buf) => add(tap.res, buf),
+    );
+    return shaper;
+  };
   tracked.write = function (this: unknown, chunk: unknown, enc?: unknown, cb?: unknown) {
+    const sh = shaped();
+    if (sh) {
+      const buf = toBuffer(chunk, enc);
+      const callback = typeof enc === 'function' ? enc : cb;
+      return sh.write(buf ?? Buffer.alloc(0), callback as ((e?: Error | null) => void) | undefined);
+    }
     add(tap.res, chunk, enc);
     return (write as (...x: unknown[]) => boolean).call(this, chunk, enc, cb);
   } as typeof tracked.write;
-  const end = tracked.end;
   tracked.end = function (this: unknown, chunk?: unknown, enc?: unknown, cb?: unknown) {
+    const sh = shaped();
+    if (sh) {
+      const callback = [chunk, enc, cb].find((x) => typeof x === 'function') as (() => void) | undefined;
+      sh.end(typeof chunk === 'function' ? undefined : toBuffer(chunk, enc), callback);
+      return this;
+    }
     add(tap.res, chunk, enc);
     return (end as (...x: unknown[]) => unknown).call(this, chunk, enc, cb);
   } as typeof tracked.end;

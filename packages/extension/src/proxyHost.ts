@@ -8,10 +8,14 @@
  * - `stop()` also removes every adb reverse we created.
  * - CA: the per-install CA from `getCa` (src/ca.ts) signs the proxy's leaf certificates; generated
  *   entries trust exactly that CA, so it must be the same object for every start.
+ * - CONTRACTS §9.2/9.4: forwards `send`, the network profile and the app package names (all re-applied
+ *   when the proxy restarts) and re-emits `rule-spent`. Every new proxy member is optional, so an older
+ *   proxy build degrades to a clear "not supported" error instead of crashing.
  */
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
-import type { Exchange, InterceptProxyOptions, Rule } from '@flutter-intercept/proxy';
+import type { Exchange, InterceptProxyOptions, Rule, SendRequest } from '@flutter-intercept/proxy';
+import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 
 export interface ProxyHost {
   /** Starts the proxy if needed (idempotent) and resolves with the port actually listened on. */
@@ -39,7 +43,15 @@ export interface ProxyLike {
   readonly lan?: { host: string; port: number };
   /** Review 2 #2: the peer IP the LAN listener is pinned to (first authenticated device), if any. */
   readonly lanPeer?: string;
+  // CONTRACTS §9.2. Optional: older proxy builds lack them.
+  send?(req: SendRequest): Promise<{ id: string }>;
+  setNetworkProfile?(p: NetworkProfile): void;
+  setAppPackages?(names: string[]): void;
+  on(event: 'rule-spent', l: (ruleId: string, reason: 'times' | 'expired') => void): unknown;
+  on(event: 'rule-hit', l: (ruleId: string, used: number) => void): unknown;
 }
+
+const NO_PROFILE: NetworkProfile = { kind: 'none' };
 
 /** An open LAN listener. `token` is a secret: never log it or show it. */
 export interface LanOpening {
@@ -85,17 +97,22 @@ export interface InterceptProxyHostOptions {
   canReopenLan?: () => boolean;
   /** A new token had to be issued while an iPhone session is alive: the user must relaunch it. */
   onLanTokenRotatedWhileLive?: () => void;
+  /** CONTRACTS §9.2 `rewriteLocalhost` (setting `flutterIntercept.rewriteLocalhost`), read at each proxy start. */
+  rewriteLocalhost?: () => boolean;
 }
 
 /**
  * Events: 'exchange' (Exchange), 'removed' (string[]), 'state' (running: boolean),
- * 'lan' ({host, port} | undefined — never the token).
- * Rules are kept here so they survive restarts and apply from the first request.
+ * 'lan' ({host, port} | undefined — never the token), 'rule-spent' (ruleId, reason), 'rule-hit' (ruleId, used).
+ * Rules, the network profile and the app package names are kept here so they survive restarts and
+ * apply from the first request.
  */
 export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private proxy?: ProxyLike;
   private starting?: Promise<number>;
   private rules: Rule[] = [];
+  private profile: NetworkProfile = NO_PROFILE;
+  private appPackages: string[] = [];
   /** The configured port the running proxy was started for. */
   private configuredAtStart?: number;
   private lanState?: LanOpening;
@@ -144,7 +161,13 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     let lastError: unknown;
     const ca = this.opts.getCa ? await this.opts.getCa() : undefined;
     for (let port = first; port <= last; port++) {
-      const proxy = this.opts.factory({ port, host: this.opts.host ?? '127.0.0.1', ...(ca ? { ca } : {}) });
+      const rewrite = this.opts.rewriteLocalhost?.();
+      const proxy = this.opts.factory({
+        port,
+        host: this.opts.host ?? '127.0.0.1',
+        ...(ca ? { ca } : {}),
+        ...(rewrite !== undefined ? { rewriteLocalhost: rewrite } : {}),
+      });
       try {
         await proxy.start();
       } catch (e) {
@@ -153,8 +176,12 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         throw e;
       }
       proxy.setRules(this.rules);
+      if (this.profile.kind !== 'none') this.applyProfile(proxy); // a new proxy starts with none
+      if (this.appPackages.length) proxy.setAppPackages?.(this.appPackages);
       proxy.on('exchange', (e) => this.emit('exchange', e));
       proxy.on('removed', (ids) => this.emit('removed', ids));
+      proxy.on('rule-spent', (ruleId, reason) => this.emit('rule-spent', ruleId, reason));
+      proxy.on('rule-hit', (ruleId, used) => this.emit('rule-hit', ruleId, used));
       this.proxy = proxy;
       this.opts.log?.(`proxy listening on ${this.opts.host ?? '127.0.0.1'}:${proxy.port}${port !== first ? ` (port ${first} busy)` : ''}`);
       this.emit('state', true);
@@ -283,6 +310,40 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
 
   resume(id: string, edit?: unknown): void {
     this.proxy?.resume(id, edit);
+  }
+
+  /**
+   * CONTRACTS §9.2 `send`: starts the proxy if needed (the request goes through its loopback listener like
+   * app traffic) and resolves with the new exchange id once it is recorded.
+   */
+  async send(req: SendRequest): Promise<{ id: string }> {
+    await this.start();
+    const proxy = this.proxy;
+    if (!proxy) throw new Error('The proxy is not running.');
+    if (!proxy.send) throw new Error('This proxy build cannot send requests.');
+    return proxy.send(req);
+  }
+
+  /** The global network profile (session state, not persisted); re-applied after a proxy restart. */
+  get networkProfile(): NetworkProfile {
+    return this.profile;
+  }
+
+  setNetworkProfile(p: NetworkProfile): void {
+    if (p.kind !== 'none' && this.proxy && !this.proxy.setNetworkProfile) throw new Error('This proxy build cannot simulate network conditions.');
+    this.profile = p;
+    if (this.proxy) this.applyProfile(this.proxy);
+  }
+
+  private applyProfile(proxy: ProxyLike): void {
+    if (proxy.setNetworkProfile) proxy.setNetworkProfile(this.profile);
+    else if (this.profile.kind !== 'none') this.opts.log?.('this proxy build cannot simulate network conditions: profile ignored');
+  }
+
+  /** App package names (pubspec `name`s) → the proxy prefers their frames as `appFrame`. */
+  setAppPackages(names: string[]): void {
+    this.appPackages = [...new Set(names.filter((n) => typeof n === 'string' && n.length > 0))];
+    this.proxy?.setAppPackages?.(this.appPackages);
   }
 
   abort(id: string): void {

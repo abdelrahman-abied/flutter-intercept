@@ -1,12 +1,13 @@
 import { useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Rule } from '../protocol';
+import type { FaultKind } from '@flutter-intercept/proxy/types';
 import {
-  countMatches, deleteRule, describeAction, formToRule, isAgentRule, moveRule, NEW_RULE, ruleDisplayName, ruleLabel, ruleStats,
-  ruleToForm, toggleRule,
-  upsertRule, validateRuleForm, type RuleForm,
+  countMatches, deleteRule, describeAction, FAULT_LABEL, formToRule, isAgentRule, moveRule, NEW_RULE, ruleBudget, ruleDisplayName,
+  ruleHits, ruleLabel, ruleStats, ruleToForm, toggleRule, upsertRule, validateRuleForm, type RuleForm, type ThrottleFields,
 } from '../state';
-import { AgentBadge, Button } from './bits';
+import { formatTime } from '../util';
+import { AgentBadge, Button, useNow } from './bits';
 import { BodyEditor, HeadersEditor } from './Editors';
 import { Icon } from './Icon';
 
@@ -15,6 +16,7 @@ export function RulesView() {
   const { rules } = state;
   const stats = useMemo(() => ruleStats(rules, state.exchanges), [rules, state.exchanges]);
   const [dragFrom, setDragFrom] = useState<number | null>(null);
+  const now = useNow(rules.some((r) => r.expiresAt !== undefined));
 
   const commit = (next: Rule[], notice?: string, undoable = false) => {
     dispatch({ type: 'setRules', rules: next, notice, undoable });
@@ -44,6 +46,7 @@ export function RulesView() {
             {rules.map((r, i) => {
               const s = stats[i];
               const shadowed = r.enabled && s.matches > s.wins;
+              const budget = ruleBudget(r, ruleHits(r, state.exchanges), now);
               return (
                 <li
                   key={r.id}
@@ -67,7 +70,16 @@ export function RulesView() {
                     <div class="rule-name">
                       <span class={`badge kind kind-${r.action.kind}`}>{r.action.kind}</span>
                       {isAgentRule(r) && <AgentBadge />}
-                      {ruleDisplayName(r)}
+                      <span class="rule-title">{ruleDisplayName(r)}</span>
+                      {budget && (
+                        <span class={`badge rule-budget${budget.spent ? ' spent' : ''}`}
+                          title={[
+                            r.times !== undefined ? `Applies to the first ${r.times} matching request${r.times === 1 ? '' : 's'} (counted from the exchanges listed), then is removed.` : '',
+                            r.expiresAt !== undefined ? `Removed at ${formatTime(r.expiresAt).slice(0, 8)}.` : '',
+                          ].filter(Boolean).join(' ')}>
+                          {budget.text}
+                        </span>
+                      )}
                     </div>
                     <div class="rule-sub">
                       <code>{r.match.method?.toUpperCase() ?? 'ANY'} {r.match.url}</code>
@@ -136,10 +148,18 @@ export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r
     onSave(formToRule(form), form.isNew);
   };
 
-  const radio = <K extends 'kind' | 'blockMode' | 'phase'>(key: K, value: RuleForm[K], label: string) => (
+  const radio = <K extends 'kind' | 'blockMode' | 'phase' | 'fault'>(key: K, value: RuleForm[K], label: string) => (
     <label class="radio">
       <input type="radio" name={key} checked={form[key] === value} onChange={() => set({ [key]: value } as Partial<RuleForm>)} />
       {label}
+    </label>
+  );
+  const setThrottle = (patch: Partial<ThrottleFields>) => set({ throttle: { ...form.throttle, ...patch } });
+  const throttleField = (key: keyof ThrottleFields, label: string, placeholder: string) => (
+    <label class="field small-field">
+      <span>{label}</span>
+      <input value={form.throttle[key]} inputMode="numeric" placeholder={placeholder} aria-invalid={!!v.errors[key]}
+        onInput={(e) => setThrottle({ [key]: (e.target as HTMLInputElement).value })} />
     </label>
   );
 
@@ -188,6 +208,8 @@ export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r
           {radio('kind', 'mock', 'Mock response')}
           {radio('kind', 'block', 'Block')}
           {radio('kind', 'breakpoint', 'Breakpoint')}
+          {radio('kind', 'throttle', 'Throttle')}
+          {radio('kind', 'fault', 'Fault')}
         </div>
 
         {form.kind === 'mock' && (
@@ -238,6 +260,64 @@ export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r
             {radio('phase', 'both', 'Both')}
           </div>
         )}
+
+        {form.kind === 'throttle' && (
+          <>
+            <div class="hint">Forwards to the real server, slowed down. “Fail” resets that share of the requests.</div>
+            <div class="field-row">
+              {throttleField('latencyMs', 'Latency (ms)', '0')}
+              {throttleField('kbps', 'Bandwidth (kbps)', 'unlimited')}
+              {throttleField('dropPct', 'Fail (%)', '0')}
+            </div>
+            {(['latencyMs', 'kbps', 'dropPct', 'throttle'] as const).map((k) => v.errors[k] && <div key={k} class="msg error">{v.errors[k]}</div>)}
+          </>
+        )}
+
+        {form.kind === 'fault' && (
+          <>
+            <div class="radios">
+              {(Object.keys(FAULT_LABEL) as FaultKind[]).map((k) => radio('fault', k, FAULT_LABEL[k][0].toUpperCase() + FAULT_LABEL[k].slice(1)))}
+            </div>
+            <div class="hint">
+              {form.fault === 'dns' ? 'The app sees a failed host lookup, as when offline.'
+                : form.fault === 'timeout' ? 'The request is held unanswered until the app gives up (its own timeout).'
+                : form.fault === 'truncate' ? 'Forwards to the server, then cuts the response body mid-way.'
+                : 'The connection is reset once it is up — the app sees a network error.'}
+            </div>
+          </>
+        )}
+      </fieldset>
+
+      <fieldset>
+        <legend>Lifetime</legend>
+        <div class="field-row">
+          <label class="field lifetime-field">
+            <span>Only first N requests</span>
+            <input value={form.times} inputMode="numeric" placeholder="every" aria-invalid={!!v.errors.times}
+              onInput={(e) => set({ times: (e.target as HTMLInputElement).value })} />
+          </label>
+          <label class="field lifetime-field">
+            <span>Expires in</span>
+            <input value={form.expiresIn} inputMode="decimal" placeholder="never" aria-invalid={!!v.errors.expiresIn}
+              onInput={(e) => set({ expiresIn: (e.target as HTMLInputElement).value, keepExpiresAt: undefined })} />
+          </label>
+          <label class="field">
+            <span class="sr-only">Unit</span>
+            <select aria-label="Expiry unit" value={form.expiresUnit}
+              onChange={(e) => set({ expiresUnit: (e.target as HTMLSelectElement).value as RuleForm['expiresUnit'], keepExpiresAt: undefined })}>
+              <option value="s">seconds</option>
+              <option value="m">minutes</option>
+              <option value="h">hours</option>
+            </select>
+          </label>
+        </div>
+        {v.errors.times && <div class="msg error">{v.errors.times}</div>}
+        {v.errors.expiresIn && <div class="msg error">{v.errors.expiresIn}</div>}
+        <div class="hint">
+          {form.keepExpiresAt !== undefined
+            ? `Expires at ${formatTime(form.keepExpiresAt).slice(0, 8)} — change the field to reset it.`
+            : 'A spent or expired rule is removed automatically, so a temporary mock never lingers.'}
+        </div>
       </fieldset>
 
       {confirmJson && jsonBad && (

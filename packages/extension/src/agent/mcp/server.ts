@@ -27,8 +27,21 @@ const MAX_CONNECTIONS = 64;
 const MAX_SESSIONS = 16;
 const SESSION_IDLE_MS = 60 * 60 * 1000;
 
-/** Write tools that destroy state or work in progress (clients ask before running them). */
-export const DESTRUCTIVE_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['remove_rule', 'abort_request', 'clear_requests', 'stop_app']);
+/**
+ * Write tools that destroy state or work in progress (clients ask before running them). resend_request
+ * replays a request, with the app's credentials, against the real backend (a POST may create data);
+ * simulate_network can cut off all of the app's traffic ("offline") (REVIEW-3 #7).
+ */
+export const DESTRUCTIVE_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'resend_request', 'simulate_network']);
+
+/**
+ * CONTRACTS §9.5: write tools whose repeated call with the same input has no further effect. Not
+ * simulate_network: with a url every call inserts another rule (REVIEW-3 #7).
+ */
+export const IDEMPOTENT_WRITE_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['remove_rule', 'abort_request', 'clear_requests', 'stop_app']);
+
+/** CONTRACTS §9.5: tools that reach beyond the local proxy (the real backend). */
+export const OPEN_WORLD_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['resend_request']);
 
 /** A zod schema (v3 or v4) — the SDK converts it to JSON Schema and validates input with it. */
 export type ToolSchema = object;
@@ -90,8 +103,8 @@ export function toolAnnotations(tool: ToolName) {
     readOnlyHint: !write,
     // The MCP default for destructiveHint is TRUE when readOnlyHint is false: say it explicitly.
     destructiveHint: write ? DESTRUCTIVE_TOOLS.has(tool) : false,
-    idempotentHint: !write,
-    openWorldHint: false,
+    idempotentHint: !write || IDEMPOTENT_WRITE_TOOLS.has(tool),
+    openWorldHint: OPEN_WORLD_TOOLS.has(tool),
   };
 }
 

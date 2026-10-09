@@ -2,10 +2,11 @@ import type { JSX } from 'preact';
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Exchange } from '../protocol';
-import { clientGaveUp, isAgentRule, ruleDisplayName } from '../state';
+import { clientGaveUp, findExchange, initiatorLabel, isAgentRule, ruleDisplayName } from '../state';
 import type { Rule } from '../protocol';
-import { bodyByteLength, formatBytes, formatDuration, isPaused, splitUrl } from '../util';
-import { AgentBadge, PauseTimer, StateBadge, StatusText } from './bits';
+import { bodyByteLength, formatBytes, formatDuration, isPaused, shortFrameLocation, splitUrl } from '../util';
+import { useExchangeActions } from './actions';
+import { AgentBadge, MenuList, PauseTimer, StateBadge, StatusText } from './bits';
 
 export const ROW_HEIGHT = 22;
 const OVERSCAN = 8;
@@ -22,6 +23,7 @@ export function TrafficList({ list, onOpen }: { list: Exchange[]; onOpen: () => 
   const [scrollTop, setScrollTop] = useState(0);
   const [height, setHeight] = useState(0);
   const followTail = useRef(true);
+  const [menu, setMenu] = useState<{ id: string; x: number; y: number } | undefined>();
 
   useLayoutEffect(() => {
     const el = ref.current!;
@@ -72,10 +74,25 @@ export function TrafficList({ list, onOpen }: { list: Exchange[]; onOpen: () => 
       case 'PageUp': selectIndex(cur < 0 ? 0 : cur - pageRows); break;
       case 'Enter': if (state.selectedId) onOpen(); break;
       case 'Escape': dispatch({ type: 'select', id: undefined }); break;
+      case 'ContextMenu': openMenuForSelection(); break;
+      case 'F10':
+        if (!e.shiftKey) return;
+        openMenuForSelection();
+        break;
       default: return;
     }
     e.preventDefault();
   };
+
+  // Shift+F10 / the context-menu key open the menu at the selected row.
+  const openMenuForSelection = () => {
+    const el = ref.current!;
+    const i = state.selectedId ? list.findIndex((x) => x.id === state.selectedId) : -1;
+    if (i < 0) return;
+    const r = el.getBoundingClientRect();
+    setMenu({ id: list[i].id, x: r.left + 24, y: r.top + (i + 1) * ROW_HEIGHT - el.scrollTop });
+  };
+  const menuEx = menu ? findExchange(state, menu.id) : undefined;
 
   const vh = height || FALLBACK_VIEWPORT;
   const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
@@ -88,7 +105,8 @@ export function TrafficList({ list, onOpen }: { list: Exchange[]; onOpen: () => 
     const ex = list[i];
     rows.push(<Row key={ex.id} ex={ex} selected={ex.id === state.selectedId} gaveUp={clientGaveUp(state, ex)}
       agentRule={ex.matchedRuleId ? agentRules.get(ex.matchedRuleId) : undefined}
-      onSelect={() => dispatch({ type: 'select', id: ex.id })} onOpen={onOpen} />);
+      onSelect={() => dispatch({ type: 'select', id: ex.id })} onOpen={onOpen}
+      onMenu={(x, y) => { dispatch({ type: 'select', id: ex.id }); setMenu({ id: ex.id, x, y }); }} />);
   }
 
   return (
@@ -111,6 +129,7 @@ export function TrafficList({ list, onOpen }: { list: Exchange[]; onOpen: () => 
         aria-activedescendant={state.selectedId ? `ex-${state.selectedId}` : undefined}
         onScroll={onScroll}
         onKeyDown={onKeyDown}
+        aria-keyshortcuts="Shift+F10"
       >
         <div class="list-spacer" style={{ height: `${list.length * ROW_HEIGHT}px` }}>
           <div class="list-window" style={{ transform: `translateY(${start * ROW_HEIGHT}px)` }}>
@@ -118,13 +137,24 @@ export function TrafficList({ list, onOpen }: { list: Exchange[]; onOpen: () => 
           </div>
         </div>
       </div>
+      {menu && menuEx && (
+        <RowMenu ex={menuEx} at={menu} onClose={(restore) => { setMenu(undefined); if (restore) ref.current?.focus(); }} />
+      )}
     </div>
   );
 }
 
-function Row({ ex, selected, gaveUp, agentRule, onSelect, onOpen }: {
+function RowMenu({ ex, at, onClose }: { ex: Exchange; at: { x: number; y: number }; onClose: (restore: boolean) => void }) {
+  const actions = useExchangeActions(ex);
+  return <MenuList label={`Actions for ${ex.method} ${ex.url}`} items={actions.menuItems} at={at} onClose={onClose} />;
+}
+
+function Row({ ex, selected, gaveUp, agentRule, onSelect, onOpen, onMenu }: {
   ex: Exchange; selected: boolean; gaveUp: boolean; agentRule?: Rule; onSelect: () => void; onOpen: () => void;
+  onMenu: (x: number, y: number) => void;
 }) {
+  const sentBy = initiatorLabel(ex);
+  const app = ex.source?.appFrame !== undefined ? ex.source.frames[ex.source.appFrame] : undefined;
   const { host, path } = splitUrl(ex.url);
   const size = bodyByteLength(ex.responseBody);
   return (
@@ -135,16 +165,19 @@ function Row({ ex, selected, gaveUp, agentRule, onSelect, onOpen }: {
       class={`row cols st-${ex.state}${selected ? ' selected' : ''}`}
       onClick={onSelect}
       onDblClick={onOpen}
+      onContextMenu={(e) => { e.preventDefault(); onMenu(e.clientX, e.clientY); }}
     >
       <span class="c-method">{ex.method}</span>
       <span class="c-status"><StatusText ex={ex} /></span>
       <span class="c-host" title={host}>{host}</span>
-      <span class="c-path" title={ex.url}>{path}</span>
+      <span class="c-path" title={app ? `${ex.url}\nCalled from ${app.fn} (${shortFrameLocation(app)})` : ex.url}>{path}</span>
       <span class="c-dur">{isPaused(ex) ? <PauseTimer ex={ex} /> : formatDuration(ex.durationMs)}</span>
       <span class="c-size">{formatBytes(size)}{ex.responseBody?.truncated ? '+' : ''}</span>
       <span class="c-state">
         <StateBadge ex={ex} gaveUp={gaveUp} />
         {agentRule && <AgentBadge title={`Matched agent rule “${ruleDisplayName(agentRule)}”`} />}
+        {sentBy && <span class="badge mini sent-badge" title={sentBy}>{ex.resentFrom ? 'resent' : 'sent'}</span>}
+        {ex.simulated && <span class="badge mini sim-badge" title={`Simulated: ${ex.simulated}`}>sim</span>}
       </span>
     </div>
   );

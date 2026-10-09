@@ -1,3 +1,4 @@
+import { EventEmitter } from 'events';
 import * as http from 'http';
 import * as net from 'net';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -171,5 +172,97 @@ describe('InterceptProxyHost CA wiring', () => {
     await host.start();
     await host.stop();
     expect(seen).toEqual([ca, ca]);
+  });
+});
+
+describe('InterceptProxyHost v0.3.0 forwarding (CONTRACTS §9.2/9.4)', () => {
+  type Opts = { port: number; rewriteLocalhost?: boolean };
+  function fake(o: Opts, calls: unknown[], features = true) {
+    const ee = new EventEmitter();
+    const base = {
+      opts: o,
+      ee,
+      port: o.port,
+      start: async () => undefined,
+      stop: async () => undefined,
+      setRules: () => undefined,
+      getExchanges: () => [],
+      clear: () => undefined,
+      resume: () => undefined,
+      abort: () => undefined,
+      on: (ev: string, l: (...a: any[]) => void) => ee.on(ev, l),
+    };
+    if (!features) return base;
+    return {
+      ...base,
+      send: async (req: unknown) => {
+        calls.push(['send', o.port, req]);
+        return { id: 'x1' };
+      },
+      setNetworkProfile: (p: unknown) => calls.push(['profile', o.port, p]),
+      setAppPackages: (n: unknown) => calls.push(['packages', o.port, n]),
+    };
+  }
+
+  it('send starts the proxy on demand and forwards the request', async () => {
+    const calls: unknown[] = [];
+    const host = new InterceptProxyHost({ getPort: () => 7001, factory: (o) => fake(o, calls) });
+    expect(host.running).toBe(false);
+    await expect(host.send({ method: 'GET', url: 'https://a.dev/', initiator: 'editor' })).resolves.toEqual({ id: 'x1' });
+    expect(host.running).toBe(true);
+    expect(calls).toContainEqual(['send', 7001, { method: 'GET', url: 'https://a.dev/', initiator: 'editor' }]);
+  });
+
+  it('network profile and app packages are applied at start and re-applied after a restart', async () => {
+    const calls: unknown[] = [];
+    let port = 7101;
+    const host = new InterceptProxyHost({ getPort: () => port, factory: (o) => fake(o, calls), canRestart: () => true });
+    host.setNetworkProfile({ kind: 'offline' }); // before start: stored
+    host.setAppPackages(['demo_app', 'demo_app', '']);
+    expect(host.networkProfile).toEqual({ kind: 'offline' });
+    await host.start();
+    expect(calls).toEqual([
+      ['profile', 7101, { kind: 'offline' }],
+      ['packages', 7101, ['demo_app']],
+    ]);
+    host.setNetworkProfile({ kind: 'throttle', preset: 'slow-3g', latencyMs: 400, kbps: 400 });
+    expect(calls.at(-1)).toEqual(['profile', 7101, { kind: 'throttle', preset: 'slow-3g', latencyMs: 400, kbps: 400 }]);
+    port = 7102;
+    await host.start(); // port changed → restart
+    expect(calls.slice(-2)).toEqual([
+      ['profile', 7102, { kind: 'throttle', preset: 'slow-3g', latencyMs: 400, kbps: 400 }],
+      ['packages', 7102, ['demo_app']],
+    ]);
+  });
+
+  it('re-emits rule-spent / rule-hit and passes rewriteLocalhost', async () => {
+    const seen: unknown[] = [];
+    const made: ReturnType<typeof fake>[] = [];
+    const host = new InterceptProxyHost({
+      getPort: () => 7201,
+      rewriteLocalhost: () => false,
+      factory: (o) => {
+        const p = fake(o, []);
+        made.push(p);
+        return p;
+      },
+    });
+    host.on('rule-spent', (...a: unknown[]) => seen.push(a));
+    await host.start();
+    expect(made[0].opts.rewriteLocalhost).toBe(false);
+    host.on('rule-hit', (...a: unknown[]) => seen.push(['hit', ...a]));
+    made[0].ee.emit('rule-spent', 'r1', 'times');
+    made[0].ee.emit('rule-hit', 'r2', 2);
+    expect(seen).toEqual([['r1', 'times'], ['hit', 'r2', 2]]);
+  });
+
+  it('an older proxy build: clear errors for send/profile, "none" still accepted', async () => {
+    const logs: string[] = [];
+    const host = new InterceptProxyHost({ getPort: () => 7301, factory: (o) => fake(o, [], false), log: (m) => logs.push(m) });
+    await host.start();
+    await expect(host.send({ method: 'GET', url: 'https://a.dev/', initiator: 'agent' })).rejects.toThrow(/cannot send requests/);
+    expect(() => host.setNetworkProfile({ kind: 'offline' })).toThrow(/cannot simulate/);
+    expect(() => host.setNetworkProfile({ kind: 'none' })).not.toThrow();
+    expect(() => host.setAppPackages(['a'])).not.toThrow();
   });
 });

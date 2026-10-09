@@ -61,6 +61,16 @@
           "maximum": 65535,
           "description": "Port of the local intercepting proxy. If it is busy the next free port (up to 8999) is used."
         },
+        "flutterIntercept.captureSource": {
+          "type": "boolean",
+          "default": true,
+          "description": "Record where in your code each request was made (a stack trace sent out of band to the proxy), so you can jump from a request to its source line. Takes effect on the next launch. Flutter sessions only (plain Dart programs always record)."
+        },
+        "flutterIntercept.rewriteLocalhost": {
+          "type": "boolean",
+          "default": true,
+          "description": "Send requests the app makes to the emulator host aliases (10.0.2.2, 10.0.3.2) to this machine's localhost. localhost and 127.0.0.1 already reach this machine through the proxy. Never applies to physical iPhones (LAN mode)."
+        },
         "flutterIntercept.agent.access": {
           "type": "string",
           "enum": [
@@ -246,7 +256,7 @@
         "toolReferenceName": "interceptGetRequest",
         "canBeReferencedInPrompt": true,
         "userDescription": "Show one request with headers and bodies.",
-        "modelDescription": "Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), timings and error. Use after list_requests or wait_for_request.",
+        "modelDescription": "Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), timings and error. Use after list_requests or wait_for_request. Pass snippet (\"curl\", \"dart_http\" or \"dio\") to also get the request as runnable code (redacted values stay \"[redacted]\"). For large JSON responses prefer get_body_shape first.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -265,6 +275,15 @@
               "type": "integer",
               "minimum": 0,
               "maximum": 1000000
+            },
+            "snippet": {
+              "description": "Also return the request as code: \"curl\", \"dart_http\" (package:http) or \"dio\". Built from the redacted view.",
+              "type": "string",
+              "enum": [
+                "curl",
+                "dart_http",
+                "dio"
+              ]
             }
           },
           "required": [
@@ -438,12 +457,91 @@
         ]
       },
       {
+        "name": "flutter_intercept_get_request_source",
+        "displayName": "Flutter Intercept: Find the code that sent a request",
+        "toolReferenceName": "interceptGetRequestSource",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Show the Dart call site that sent a request.",
+        "modelDescription": "Find where in the app's Dart code a recorded request was made. Returns appFrame (the app's call site: function, package URI, path relative to the project, line, column) and the stack frames (inProject marks the project's own files; afterAsyncGap marks frames after an await). Use it to go from an unexpected, failing or duplicated request straight to the code that sent it. Returns {available: false, reason} when there is no trace: source capture off, a request sent by the editor/an agent, or the trace has not arrived yet (retry shortly).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "maxFrames": {
+              "default": 20,
+              "description": "Max stack frames to return (1-30).",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 30
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_get_body_shape",
+        "displayName": "Flutter Intercept: Get JSON body structure",
+        "toolReferenceName": "interceptGetBodyShape",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Show the structure of a JSON body.",
+        "modelDescription": "Get the structure of a recorded JSON response (or request, which:\"request\") body without its values: key names and types only, every array merged into one element shape plus its length. Compact even for megabyte bodies, so use it before get_request to understand an API response or to write/fix model classes and parsing code. Notation: \"string\" | \"integer\" | \"number\" | \"boolean\" | \"null\"; unions like \"string|null\"; \"key?\" = missing in some merged objects; arrays {\"[]\": element shape, \"length\": n or \"min-max\"}; {\"|\": [...]} = a union mixing objects/arrays; \"{…}\" / \"[…]\" = deeper than maxDepth; \"…\" = more keys omitted. Non-JSON bodies return {shape: null, reason}.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "which": {
+              "default": "response",
+              "description": "Which body to describe.",
+              "type": "string",
+              "enum": [
+                "response",
+                "request"
+              ]
+            },
+            "maxDepth": {
+              "default": 6,
+              "description": "Nesting depth to describe (1-12); deeper structure shows as \"{…}\" / \"[…]\".",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 12
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
         "name": "flutter_intercept_add_mock",
         "displayName": "Flutter Intercept: Add mock rule",
         "toolReferenceName": "interceptAddMock",
         "canBeReferencedInPrompt": true,
         "userDescription": "Add a rule that answers matching requests with a fake response.",
-        "modelDescription": "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins; remove it with remove_rule when done.",
+        "modelDescription": "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins. Pass times (e.g. 1 = only the next request, to test a retry) or ttlMs to have it removed automatically; otherwise remove it with remove_rule when done.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -503,6 +601,18 @@
               "type": "string",
               "maxLength": 200,
               "description": "Optional label; it is shown as \"[agent] <name>\" in the rules list."
+            },
+            "times": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "description": "Apply the rule to the first N matching requests only (1-1000); it is then removed automatically."
+            },
+            "ttlMs": {
+              "type": "integer",
+              "minimum": 1000,
+              "maximum": 86400000,
+              "description": "Remove the rule automatically after this many milliseconds (1000-86400000)."
             }
           },
           "required": [
@@ -524,7 +634,7 @@
         "toolReferenceName": "interceptAddBlock",
         "canBeReferencedInPrompt": true,
         "userDescription": "Add a rule that blocks matching requests.",
-        "modelDescription": "Block matching requests: answer with a status (default 403) or reset the connection (mode \"reset\") to simulate a network failure. Inserted first; remove it with remove_rule when done.",
+        "modelDescription": "Block matching requests: answer with a status (default 403) or reset the connection (mode \"reset\") to simulate a network failure. Inserted first; times / ttlMs remove it automatically, otherwise remove it with remove_rule when done. For timeouts, slow or truncated responses use simulate_network.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -559,6 +669,18 @@
               "type": "string",
               "maxLength": 200,
               "description": "Optional label; it is shown as \"[agent] <name>\" in the rules list."
+            },
+            "times": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "description": "Apply the rule to the first N matching requests only (1-1000); it is then removed automatically."
+            },
+            "ttlMs": {
+              "type": "integer",
+              "minimum": 1000,
+              "maximum": 86400000,
+              "description": "Remove the rule automatically after this many milliseconds (1000-86400000)."
             }
           },
           "required": [
@@ -579,7 +701,7 @@
         "toolReferenceName": "interceptAddBreakpoint",
         "canBeReferencedInPrompt": true,
         "userDescription": "Add a rule that pauses matching requests or responses.",
-        "modelDescription": "Pause matching requests before they are sent (phase \"request\") or their responses before the app gets them (phase \"response\", default). Paused exchanges appear in list_paused; continue them with resume_request (optionally edited) or abort_request. The app may time out if left paused.",
+        "modelDescription": "Pause matching requests before they are sent (phase \"request\") or their responses before the app gets them (phase \"response\", default). Paused exchanges appear in list_paused; continue them with resume_request (optionally edited) or abort_request. The app may time out if left paused. times: 1 pauses only the next matching request.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -608,6 +730,18 @@
               "type": "string",
               "maxLength": 200,
               "description": "Optional label; it is shown as \"[agent] <name>\" in the rules list."
+            },
+            "times": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "description": "Apply the rule to the first N matching requests only (1-1000); it is then removed automatically."
+            },
+            "ttlMs": {
+              "type": "integer",
+              "minimum": 1000,
+              "maximum": 86400000,
+              "description": "Remove the rule automatically after this many milliseconds (1000-86400000)."
             }
           },
           "required": [
@@ -853,6 +987,165 @@
               "minLength": 1
             }
           },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_simulate_network",
+        "displayName": "Flutter Intercept: Simulate network conditions (all app traffic or matching requests)",
+        "toolReferenceName": "interceptSimulateNetwork",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Throttle or break the network for the app or for matching requests.",
+        "modelDescription": "Simulate bad network conditions to test loading states, timeouts, retries and offline handling. Without url: set the profile for ALL app traffic: \"slow-3g\", \"fast-3g\", \"flaky\" (20% of requests fail), \"offline\" (every request fails), \"custom\" (latencyMs, kbps, dropRate), or \"none\" to restore normal speed (do this when done). With url (glob or /regex/): add a rule, inserted first, that slows only matching requests with the given profile, or makes them fail with fault (\"reset\", \"timeout\", \"truncate\", \"dns\"); times / ttlMs remove the rule automatically, otherwise use remove_rule. Mocks and blocks still answer instantly. get_status shows the active profile; affected exchanges carry a \"simulated\" label.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "profile": {
+              "description": "\"slow-3g\" (+400 ms, 400 kbps), \"fast-3g\" (+150 ms, 1600 kbps), \"flaky\" (+200 ms, 20% of requests fail), \"offline\" (every request fails), \"custom\" (use latencyMs/kbps/dropRate), \"none\" (restore). Required unless `fault` is given.",
+              "type": "string",
+              "enum": [
+                "none",
+                "offline",
+                "slow-3g",
+                "fast-3g",
+                "flaky",
+                "custom"
+              ]
+            },
+            "latencyMs": {
+              "description": "custom: added latency per request, ms.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 600000
+            },
+            "kbps": {
+              "description": "custom: response bandwidth, kilobits per second.",
+              "type": "number",
+              "minimum": 1,
+              "maximum": 10000000
+            },
+            "dropRate": {
+              "description": "custom: share of requests that fail (0-1).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "url": {
+              "description": "Only affect requests matching this URL glob or /regex/ (adds a rule, inserted first). Omit to set the profile for ALL app traffic.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "fault": {
+              "description": "With url: make matching requests fail instead of slowing them: \"reset\" (connection reset), \"timeout\" (no answer until the client gives up), \"truncate\" (response cut mid-body), \"dns\" (lookup failure).",
+              "type": "string",
+              "enum": [
+                "reset",
+                "timeout",
+                "truncate",
+                "dns"
+              ]
+            },
+            "times": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "description": "Apply the rule to the first N matching requests only (1-1000); it is then removed automatically."
+            },
+            "ttlMs": {
+              "type": "integer",
+              "minimum": 1000,
+              "maximum": 86400000,
+              "description": "Remove the rule automatically after this many milliseconds (1000-86400000)."
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Optional label; it is shown as \"[agent] <name>\" in the rules list."
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_resend_request",
+        "displayName": "Flutter Intercept: Resend a request",
+        "toolReferenceName": "interceptResendRequest",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Send a recorded request again, optionally edited.",
+        "modelDescription": "Send a recorded request again through the proxy, optionally edited (method, url, headers, body), without involving the app — e.g. to check a fix on the backend or try a different payload. Only for an app request that reached the real server unchanged (state \"completed\", no rule matched it, not from a physical device over LAN), and only to that request's own origin: edit.url may change path and query, never scheme, host or port. Anything else is refused with the reason. Omitted fields keep the original, including secret headers you only see as \"[redacted]\"; a \"[redacted]\" value in edit.headers (or the query) is replaced by the original. Rules and the network profile apply. Returns {id, sinceMs}: the new exchange starts \"pending\"; wait for it with wait_for_request (same url, that sinceMs) or check get_request(id).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "edit": {
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "maxLength": 20,
+                  "pattern": "^[A-Za-z]+$",
+                  "description": "HTTP method (case-insensitive). Omit to match any method."
+                },
+                "url": {
+                  "description": "Absolute http(s) URL with the SAME origin (scheme, host, port) as the recorded request; only path and query may change.",
+                  "type": "string",
+                  "maxLength": 8192
+                },
+                "headers": {
+                  "description": "Replaces the WHOLE header set. A value of \"[redacted]\" is replaced by the original value of that header.",
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    ]
+                  }
+                },
+                "body": {
+                  "description": "New body text. Omit to keep the original body.",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "description": "Changes to the recorded request. Omit to send it unchanged."
+            }
+          },
+          "required": [
+            "id"
+          ],
           "additionalProperties": false
         },
         "tags": [

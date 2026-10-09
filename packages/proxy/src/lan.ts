@@ -23,6 +23,7 @@ import * as https from 'https';
 import * as net from 'net';
 import * as os from 'os';
 import { currentRoutes, type RouteTable } from './routes';
+import { isTraceHost } from './trace';
 
 export const LAN_USERNAME = 'flutter-intercept';
 export const SSRF_MARKER = "Flutter Intercept: blocked a LAN client's request";
@@ -281,6 +282,10 @@ function checkIp(host: string, ip: string, port: number, listenerHost?: string):
 /** Pre-check before connecting: resolves names (so `localhost` and friends count). */
 export async function precheckTarget(hostIn: string, port: number, listenerHost?: string): Promise<void> {
   const host = hostIn.replace(/^\[|\]$/g, '');
+  // The trace sink (CONTRACTS §9.2) is answered by the proxy itself and never contacted. Requests inside
+  // a tunnel to it still pass the per-request 403 rule and the connect-time guard (an absolute-form
+  // request in the tunnel names its own target), so this exemption can't reach anything else.
+  if (isTraceHost(host)) return;
   if (net.isIP(host)) return checkIp(host, host, port, listenerHost);
   const lower = host.toLowerCase().replace(/\.$/, '');
   if (lower === 'localhost' || lower.endsWith('.localhost')) {

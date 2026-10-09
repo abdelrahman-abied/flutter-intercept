@@ -13,7 +13,8 @@
 #   --app <dir>              Flutter project (default samples/demo_app)
 #   --entry-dir <dir>        where to generate the entry (default .dart_tool/flutter_intercept;
 #                            use distinct dirs when running two devices in parallel)
-#   --template v1|v2|v3      entry template from scripts/e2e/templates (default v3)
+#   --template v1|v2|v3|v4   entry template from scripts/e2e/templates (default v4: + request -> source
+#                            traces, checked against the demo's call sites; v3 = no traces)
 #   --attack                 REVIEW-1 #1: run scripts/e2e/evil_server.dart (self-signed CN=evil.example)
 #                            on :8443 and make the app GET it (EVIL_URL); it must never be accepted —
 #                            proxy up (proxy refuses upstream) or down (DIRECT must fail verification)
@@ -42,7 +43,7 @@ DEVICE=${1:-}
 [ -z "$DEVICE" ] && { sed -n '2,20p' "$0"; exit 64; }
 shift
 TARGET=lib/main.dart PORT=8899 MODE=debug EMU_HOST=0 DO_RESTART=1 DO_FALLBACK=1 APP_MODE="" ENTRY_DIR=.dart_tool/flutter_intercept ATTACK=0 EVIL_PORT=8443 LAN="" TOKEN=""
-export FI_TEMPLATE=${FI_TEMPLATE:-v3}
+export FI_TEMPLATE=${FI_TEMPLATE:-v4}
 APP="$REPO/samples/demo_app"
 DEFINES=()
 while [ $# -gt 0 ]; do
@@ -156,6 +157,7 @@ echo "[e2e] entry=$ENTRY_REL proxy=$HOST:$PORT$( [ -n "$LAN" ] && echo ' (LAN, t
 
 # --- flutter run, stdin from a fifo so we can send r/R/q
 mkfifo "$FIFO"
+: > "$LOG" # exists before flutter run's redirect (which waits for the fifo) so wait_batch can grep it
 sleep 100000 > "$FIFO" &
 HOLDER_PID=$!
 (cd "$APP" && exec flutter run -d "$DEVICE" -t "$ENTRY_REL" "--$MODE" \
@@ -197,6 +199,47 @@ assert_intercepted() {
   expect "$n" http_plain  '^http_plain 200 .*"_intercepted":true' "plain http:// via proxy"
   expect "$n" http_comment '^http_comment 403 .*"blocked":true' "blocked"
 }
+# Template v4 (CONTRACTS §9.1): first lib/ frame of the trace the proxy got for the newest request
+# matching <method> <url-regex>, as `fn (package:demo_app/file.dart:line:col)`.
+trace_frame() {
+  python3 - "$PLOG" "$1" "$2" <<'PY'
+import json, re, sys
+log, method, url = sys.argv[1], sys.argv[2], re.compile(sys.argv[3])
+ids, traces = [], {}
+for line in open(log, errors='replace'):
+    m = re.search(r'PROXY_REQ (\S+) (\S+) .* fi=(\S+)', line)
+    if m and m.group(1) == method and url.search(m.group(2)):
+        ids.append(m.group(3))
+    t = re.search(r'PROXY_TRACE (\S+) (".*")$', line)
+    if t:
+        traces[t.group(1)] = json.loads(t.group(2))
+for i in reversed(ids):
+    if i in traces:
+        for f in traces[i].split('\n'):
+            m = re.match(r'#\d+\s+(.*\(package:demo_app/.*\))$', f)
+            if m:
+                print(m.group(1)); sys.exit(0)
+        print('<no app frame>'); sys.exit(0)
+print('<no trace>' if ids else '<no request with x-fi-id>')
+PY
+}
+expect_trace() { # method url-regex frame-regex description
+  local f; f=$(trace_frame "$1" "$2")
+  if echo "$f" | grep -Eq "$3"; then pass "source of $4: $f"; else fail "source of $4 — got: $f"; fi
+}
+assert_traces() {
+  [ "$FI_TEMPLATE" = v4 ] || return 0
+  # package:http opens the connection synchronously from the app's call: always found (AOT/profile
+  # stacks have no column).
+  expect_trace POST 'jsonplaceholder\.typicode\.com/todos$' '^OrdersApi\.createOrder \(package:demo_app/api/orders_api\.dart:1[0-9][:)]' "http POST (OrdersApi.createOrder)"
+  expect_trace GET 'jsonplaceholder\.typicode\.com/todos/1$' '^_httpGet \(package:demo_app/demo\.dart:' "http GET (_httpGet)"
+  if [ "$MODE" = debug ]; then
+    # Dio opens it several async hops later: found through the entry's zone chains (debug only).
+    expect_trace GET 'jsonplaceholder\.typicode\.com/albums/1$' '^CatalogApi\.fetchAlbum \(package:demo_app/api/catalog_api\.dart:3[0-9][:)]' "Dio GET with interceptors (CatalogApi.fetchAlbum)"
+    expect_trace GET 'jsonplaceholder\.typicode\.com/users/1$' '^dioUser\.<anonymous closure> \(package:demo_app/demo\.dart:' "Dio GET (dioUser)"
+    expect_trace POST 'jsonplaceholder\.typicode\.com/posts$' '^dioPost\.<anonymous closure> \(package:demo_app/demo\.dart:' "Dio POST (dioPost)"
+  fi
+}
 expect_note() { # text description
   if grep -q "\[flutter_intercept\] $1" "$LOG"; then pass "console note: $2"; else fail "missing console note '[flutter_intercept] $1'"; fi
 }
@@ -230,6 +273,8 @@ assert_intercepted 1
 assert_attack 1 proxy-up
 grep -q 'PROXY_EDIT 200 GET https://httpbin.org/gzip gzip=true' "$PLOG" \
   && pass "proxy saw gzip upstream body and re-gzipped it" || fail "proxy gzip edit line missing"
+sleep 1 # traces are flushed ~100 ms after the request
+assert_traces
 if [ "$FI_TEMPLATE" != v1 ]; then
   case $APP_MODE in
     charles|env) expect_note 'ignored app findProxy' "app findProxy ignored" ;;
@@ -246,6 +291,12 @@ if [ "$DO_RESTART" = 1 ]; then
   grep -q 'Restarted application' "$LOG" && pass "hot restart" || fail "no 'Restarted application'"
   assert_intercepted $RUN
   assert_attack $RUN proxy-up
+  sleep 1
+  assert_traces
+  if [ "$FI_TEMPLATE" = v4 ]; then
+    p=$(grep -o 'fi=[0-9a-f]*-' "$PLOG" | sort -u | wc -l | tr -d ' ')
+    [ "$p" -ge 2 ] && pass "trace ids get a new prefix after hot restart ($p prefixes)" || fail "trace id prefix not renewed by hot restart ($p)"
+  fi
 fi
 
 if [ -n "$LAN" ]; then

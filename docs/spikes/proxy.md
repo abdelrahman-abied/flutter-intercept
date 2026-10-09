@@ -608,6 +608,54 @@ The LAN socket tests run in one file (`lan.test.ts` imports `lan-hardening.suite
 doesn't starve the timing-based tests. Total after the route-based follow-up: **106 proxy tests passing, 3 runs in a row**; 212
 extension unit tests passing; minified-bundle LAN smoke test OK.
 
+## v0.3.0 additions (CONTRACTS §9.2, 2026-10-09)
+
+Faults, throttling and profiles have their own write-up: **docs/spikes/faults.md** (measured with the real
+Dart client). Changes to how we patch / use mockttp:
+
+- **`preprocessRequest` hook is now mandatory.** Besides the LAN per-request check it takes the internal
+  headers `x-fi-id` (trace id) and `x-fi-send` (marks `send()` requests, random nonce) off
+  `req.rawHeaders` (pairs) and `req.headers` right after mockttp's own preprocessing, before any rule,
+  recording or passthrough reads them. That covers every route, websockets included; edits strip them again.
+  `start()` now fails closed if the hook can't be installed (x-fi-id would reach real servers).
+- **Trace sink**: a rule after the LAN 407 rule and before the LAN 403 rule answers any request whose URL host
+  is `trace.flutter-intercept.invalid` with 204 (`CallbackStep`; reading that body is fine, it is never
+  forwarded). `decide()` returns a constant `trace` flow for it, so it is never recorded or throttled. HTTPS
+  works through mockttp's normal CONNECT + MITM (leaf for the `.invalid` name). LAN: the gate's CONNECT
+  precheck exempts that host (nothing is contacted); requests inside such a tunnel still pass the per-request
+  403 rule (an absolute-form request there names its own target — tested) and the guarded agents.
+  Joining: `src/trace.ts` (`TraceJoin`, ≤ 2000 per side, 60 s; a trace stays for its TTL after a match because
+  dart:io re-sends the same headers on redirects). Stacks: `src/source.ts`.
+- **Taps**: the tracked response's `write`/`end` wrappers hand bytes to a `ResponseShaper` (`src/shaper.ts`)
+  when the flow sets `tap.shaping` (kbps, truncate). It overrides `writableEnded` per instance while a paced
+  `end()` is pending (mockttp checks it when the upstream ends).
+- **Route matchers may return a promise**: the plain route's matcher resolves after the throttle latency
+  (mockttp awaits matcher results in rule order), so latency is added without reading the request body.
+- **`getAgent` hook**: the pooled agents are `RewritingHttp(s)Agent`s when `rewriteLocalhost` (default on):
+  `createConnection` maps `10.0.2.2` / `10.0.3.2` to `127.0.0.1` (TLS identity still checked against the
+  name the app used); websocket upgrades to those aliases get a fresh rewriting agent. LAN sockets get their
+  guarded agents first, unchanged. Measured: `localhost` / `127.0.0.1` targets already reach the host (the
+  proxy runs there; mockttp only rewrites `localhost` for non-loopback clients). mockttp's loop protection
+  (`isSocketLoop`, per passthrough step) ends a request to the proxy's own port with a 500 "Passthrough loop
+  detected" (plus a `console.error`), for `127.0.0.1:<port>` and `10.0.2.2:<port>` alike — no hang.
+- **`send()`** uses a per-proxy keep-alive `http.Agent` to the loopback listener and absolute-form requests,
+  also for `https://` (mockttp forwards those over TLS, strict as configured), so no CONNECT/TLS to ourselves.
+- **Rule spending** lives in `matchRule()` (replaces `findRule` in the proxy): counts per id for rules with
+  `times`, `'rule-hit'`/`'rule-spent'` emitted on `nextTick` (a listener calling `setRules` can't re-enter
+  matching), unref'd expiry timers re-armed on every `setRules`.
+
+- **REVIEW-3 fixes.** #2 (trace-sink CPU DoS): `parseDartStack` no longer uses backtracking regexes (the old
+  VM/terse patterns were quadratic: a 100 KB line took 1.5 s); lines over 2 KB are skipped and frames are split
+  with string operations; ≤ 50 traces per POST; traces are stored raw (≤ 2000, ≤ 8 M chars, 60 s) and parsed
+  only when they meet an exchange. Measured: a 949 KB adversarial POST joined to 50 exchanges, max event-loop
+  gap 4 ms (test asserts < 100 ms). Websocket upgrades: `x-fi-id` stripped (now tested).
+- **`Exchange.viaLan`**: set from the socket (`lanGateOf`, like every LAN guard) in `decide()`, so plain, in-tunnel
+  and SSRF-refused LAN requests all carry it; `recordBlocked` (LAN CONNECT refusals) too. TLS-handshake error
+  records (`tls-*`) don't carry it: mockttp's `tls-client-error` event has no socket to key on.
+
+Tests: `test/source.test.ts` (14), `test/v3.test.ts` (27), `test/faults.test.ts` (18, real Dart), and 5 LAN
+tests in `test/lan.test.ts`. Suite: **174 passing**.
+
 ## Open issues
 
 - LAN mode: **IPv4 only** (per contract). The SSRF rule is route-based and macOS-only
@@ -655,3 +703,14 @@ extension unit tests passing; minified-bundle LAN smoke test OK.
 9. `ruleFromExchange(e, 'mock')` now throws `RuleFromExchangeError` with code
    `'truncated' | 'binary'` (exported from both the index and `/rules`). The host already maps it
    to an `error` message (packages/extension controller).
+10. **(v0.3.0) `send()` always derives `Host` from the URL** and recomputes framing (`content-length`,
+    `transfer-encoding`, connection headers are ignored), so a one-click Resend of recorded headers works
+    even with a stale `content-length` or an edited URL. A deliberately different `Host` (virtual-host
+    testing) is not honoured; supporting it would need an explicit field, since a recorded Host can't be
+    told apart from a deliberate one.
+11. **(v0.3.0) A throttle rule replaces the network profile** for the requests it matches (rule settings win;
+    the profile doesn't fill unset fields), and under `offline` a request breakpoint fails (dns fault)
+    instead of pausing. `Exchange.simulated` for a timeout fault says how it ended ("…the app gave up
+    after 1.5 s" / "…reset after 300.0 s"). Please confirm or adjust §9.2.
+12. **(v0.3.0) `setNetworkProfile` throws** on an invalid profile (unknown kind, negative values, `dropRate`
+    outside 0–1); the host should surface it as an `error`.

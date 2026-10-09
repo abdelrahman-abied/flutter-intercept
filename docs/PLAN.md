@@ -91,3 +91,15 @@ the lead wires `extension.ts` + `package.json`):
 | C MCP | `src/agent/mcp/**` + tests — server, auth, registration, connectAgent command |
 | A tools+launch | `src/agent/lmTools.ts`, `src/agent/launch.ts` + tests; device e2e of launch_app/hot_restart |
 | D docs+UI | `src/agent/instructions.ts`, webview agent indicator/badges, README "Use with AI agents" |
+
+## v0.3.0 — "Where did this come from?" (started 2026-10-09, branch `feature/0.3.0`)
+Contract: CONTRACTS §9 (types already in code). Plan: ROADMAP §6. Same rules as before: disjoint files, no
+`npm install`, random ports in tests (8899 is for device runs), findings in `docs/spikes/<topic>.md`, contract
+change requests go there too — only the lead edits CONTRACTS.md, extension.ts, package.json (extension), README.
+| Agent | WPs | Owns |
+|---|---|---|
+| P proxy | WP1 trace sink + header strip + `source.ts`, WP3 `send()`, WP5 throttle/fault + profiles, WP6 rewrite, WP7 rule spending | `packages/proxy/**` (except `network.ts`, `types.ts`: lead) · `docs/spikes/faults.md` |
+| E entry + source | WP1 template v4 + Dio spike, source resolver/open, demo app scenarios | `src/entry/**`, `src/source/**`, `test/unit/{generator,source*}.test.ts`, `scripts/e2e/**`, `samples/demo_app/lib/**`, `test/integration/suite/devices.ts`, `docs/spikes/template-v4.md` |
+| H host + agent | WP2 snippets, WP3/5 host messages, WP7 agent tools, all new agent tools | `src/agent/**`, `src/codegen/**`, `src/ui/{controller,view}.ts`, `src/proxyHost.ts`, their unit tests, `test/integration/suite/agent.ts` |
+| W webview | WP4 search, WP2 copy menu, WP3 composer, WP1 "Open source", WP5 profile picker + rule editor, WP7 times/ttl | `packages/webview/**` (except `protocol.ts`: lead) |
+| lead | contract, wiring, packaging | CONTRACTS, PLAN, `extension.ts`, extension `package.json`, README/CHANGELOG, device E2E, security review of trace channel + rewrite |

@@ -22,6 +22,21 @@ const sinceMs = z.number().int().min(0).describe('Only exchanges that started at
 const id = z.string().min(1).max(200);
 const ruleName = z.string().max(200).describe('Optional label; it is shown as "[agent] <name>" in the rules list.');
 const headerMap = z.record(z.string(), z.string());
+const times = z
+  .number()
+  .int()
+  .min(1)
+  .max(1000)
+  .describe('Apply the rule to the first N matching requests only (1-1000); it is then removed automatically.');
+const ttlMs = z
+  .number()
+  .int()
+  .min(1000)
+  .max(86_400_000)
+  .describe('Remove the rule automatically after this many milliseconds (1000-86400000).');
+export const SNIPPET_FORMATS = ['curl', 'dart_http', 'dio'] as const;
+export const NETWORK_PROFILES = ['none', 'offline', 'slow-3g', 'fast-3g', 'flaky', 'custom'] as const;
+export const FAULT_KINDS = ['reset', 'timeout', 'truncate', 'dns'] as const;
 
 export const EXCHANGE_STATES = ['pending', 'paused-request', 'paused-response', 'completed', 'mocked', 'blocked', 'aborted', 'error'] as const;
 
@@ -34,6 +49,18 @@ const editSchema = z
     body: z.string().optional().describe('New decoded body text. Omit to keep the original body.'),
   })
   .describe('Changes to apply before resuming. Omit to resume unchanged.');
+
+const requestEditSchema = z
+  .strictObject({
+    method: method.optional(),
+    url: z.string().max(8192).optional().describe('Absolute http(s) URL with the SAME origin (scheme, host, port) as the recorded request; only path and query may change.'),
+    headers: z
+      .record(z.string(), z.union([z.string(), z.array(z.string())]))
+      .optional()
+      .describe('Replaces the WHOLE header set. A value of "[redacted]" is replaced by the original value of that header.'),
+    body: z.string().optional().describe('New body text. Omit to keep the original body.'),
+  })
+  .describe('Changes to the recorded request. Omit to send it unchanged.');
 
 export const toolSchemas = {
   get_status: z.strictObject({}),
@@ -49,6 +76,10 @@ export const toolSchemas = {
     id,
     includeBodies: z.boolean().default(true),
     maxBodyChars: z.number().int().min(0).max(1_000_000).default(20_000).describe('Bodies longer than this are cut and marked truncated.'),
+    snippet: z
+      .enum(SNIPPET_FORMATS)
+      .optional()
+      .describe('Also return the request as code: "curl", "dart_http" (package:http) or "dio". Built from the redacted view.'),
   }),
   wait_for_request: z.strictObject({
     url,
@@ -73,6 +104,8 @@ export const toolSchemas = {
     body: z.union([z.string(), z.record(z.string(), z.unknown()), z.array(z.unknown())]).describe('Response body: text, or a JSON object/array (sent as JSON).'),
     delayMs: z.number().int().min(0).max(600_000).optional(),
     name: ruleName.optional(),
+    times: times.optional(),
+    ttlMs: ttlMs.optional(),
   }),
   add_block: z.strictObject({
     url,
@@ -80,12 +113,16 @@ export const toolSchemas = {
     mode: z.enum(['status', 'reset']).default('status').describe('"status" answers with `status`; "reset" drops the connection.'),
     status: z.number().int().min(100).max(599).default(403),
     name: ruleName.optional(),
+    times: times.optional(),
+    ttlMs: ttlMs.optional(),
   }),
   add_breakpoint: z.strictObject({
     url,
     method: method.optional(),
     phase: z.enum(['request', 'response', 'both']).default('response'),
     name: ruleName.optional(),
+    times: times.optional(),
+    ttlMs: ttlMs.optional(),
   }),
   remove_rule: z.strictObject({ ruleId: id }),
   resume_request: z.strictObject({ id, edit: editSchema.optional() }),
@@ -99,6 +136,36 @@ export const toolSchemas = {
   }),
   stop_app: z.strictObject({ sessionId: z.string().min(1).optional().describe('Omit to stop every intercepted session.') }),
   hot_restart: z.strictObject({ sessionId: z.string().min(1).optional().describe('Omit to hot-restart every intercepted session.') }),
+  get_request_source: z.strictObject({
+    id,
+    maxFrames: z.number().int().min(1).max(30).default(20).describe('Max stack frames to return (1-30).'),
+  }),
+  get_body_shape: z.strictObject({
+    id,
+    which: z.enum(['response', 'request']).default('response').describe('Which body to describe.'),
+    maxDepth: z.number().int().min(1).max(12).default(6).describe('Nesting depth to describe (1-12); deeper structure shows as "{…}" / "[…]".'),
+  }),
+  simulate_network: z.strictObject({
+    profile: z
+      .enum(NETWORK_PROFILES)
+      .optional()
+      .describe(
+        '"slow-3g" (+400 ms, 400 kbps), "fast-3g" (+150 ms, 1600 kbps), "flaky" (+200 ms, 20% of requests fail), "offline" (every request fails), "custom" (use latencyMs/kbps/dropRate), "none" (restore). Required unless `fault` is given.',
+      ),
+    latencyMs: z.number().int().min(0).max(600_000).optional().describe('custom: added latency per request, ms.'),
+    kbps: z.number().min(1).max(10_000_000).optional().describe('custom: response bandwidth, kilobits per second.'),
+    dropRate: z.number().min(0).max(1).optional().describe('custom: share of requests that fail (0-1).'),
+    url: url.optional().describe('Only affect requests matching this URL glob or /regex/ (adds a rule, inserted first). Omit to set the profile for ALL app traffic.'),
+    method: method.optional(),
+    fault: z
+      .enum(FAULT_KINDS)
+      .optional()
+      .describe('With url: make matching requests fail instead of slowing them: "reset" (connection reset), "timeout" (no answer until the client gives up), "truncate" (response cut mid-body), "dns" (lookup failure).'),
+    times: times.optional(),
+    ttlMs: ttlMs.optional(),
+    name: ruleName.optional(),
+  }),
+  resend_request: z.strictObject({ id, edit: requestEditSchema.optional() }),
 } satisfies Record<ToolName, z.ZodType>;
 
 export type ToolInput<T extends ToolName> = z.output<(typeof toolSchemas)[T]>;
@@ -144,7 +211,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   get_request: {
     title: 'Get HTTP request details',
-    model: 'Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), timings and error. Use after list_requests or wait_for_request.',
+    model: 'Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), timings and error. Use after list_requests or wait_for_request. Pass snippet ("curl", "dart_http" or "dio") to also get the request as runnable code (redacted values stay "[redacted]"). For large JSON responses prefer get_body_shape first.',
     user: 'Show one request with headers and bodies.',
   },
   wait_for_request: {
@@ -169,17 +236,17 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   add_mock: {
     title: 'Add mock rule',
-    model: "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins; remove it with remove_rule when done.",
+    model: "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins. Pass times (e.g. 1 = only the next request, to test a retry) or ttlMs to have it removed automatically; otherwise remove it with remove_rule when done.",
     user: 'Add a rule that answers matching requests with a fake response.',
   },
   add_block: {
     title: 'Add block rule',
-    model: 'Block matching requests: answer with a status (default 403) or reset the connection (mode "reset") to simulate a network failure. Inserted first; remove it with remove_rule when done.',
+    model: 'Block matching requests: answer with a status (default 403) or reset the connection (mode "reset") to simulate a network failure. Inserted first; times / ttlMs remove it automatically, otherwise remove it with remove_rule when done. For timeouts, slow or truncated responses use simulate_network.',
     user: 'Add a rule that blocks matching requests.',
   },
   add_breakpoint: {
     title: 'Add breakpoint rule',
-    model: 'Pause matching requests before they are sent (phase "request") or their responses before the app gets them (phase "response", default). Paused exchanges appear in list_paused; continue them with resume_request (optionally edited) or abort_request. The app may time out if left paused.',
+    model: 'Pause matching requests before they are sent (phase "request") or their responses before the app gets them (phase "response", default). Paused exchanges appear in list_paused; continue them with resume_request (optionally edited) or abort_request. The app may time out if left paused. times: 1 pauses only the next matching request.',
     user: 'Add a rule that pauses matching requests or responses.',
   },
   remove_rule: {
@@ -216,6 +283,26 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
     title: 'Hot restart Flutter app',
     model: 'Hot-restart the running app (or all intercepted sessions) so it starts over with the current code and rules; interception stays on. Returns {restarted, sinceMs}. Then call wait_for_request directly to verify the network calls made at startup: requests sent since the restart are included, even ones that finished before wait_for_request was called.',
     user: 'Hot restart the running app.',
+  },
+  get_request_source: {
+    title: 'Find the code that sent a request',
+    model: "Find where in the app's Dart code a recorded request was made. Returns appFrame (the app's call site: function, package URI, path relative to the project, line, column) and the stack frames (inProject marks the project's own files; afterAsyncGap marks frames after an await). Use it to go from an unexpected, failing or duplicated request straight to the code that sent it. Returns {available: false, reason} when there is no trace: source capture off, a request sent by the editor/an agent, or the trace has not arrived yet (retry shortly).",
+    user: 'Show the Dart call site that sent a request.',
+  },
+  get_body_shape: {
+    title: 'Get JSON body structure',
+    model: 'Get the structure of a recorded JSON response (or request, which:"request") body without its values: key names and types only, every array merged into one element shape plus its length. Compact even for megabyte bodies, so use it before get_request to understand an API response or to write/fix model classes and parsing code. Notation: "string" | "integer" | "number" | "boolean" | "null"; unions like "string|null"; "key?" = missing in some merged objects; arrays {"[]": element shape, "length": n or "min-max"}; {"|": [...]} = a union mixing objects/arrays; "{…}" / "[…]" = deeper than maxDepth; "…" = more keys omitted. Non-JSON bodies return {shape: null, reason}.',
+    user: 'Show the structure of a JSON body.',
+  },
+  simulate_network: {
+    title: 'Simulate network conditions (all app traffic or matching requests)',
+    model: 'Simulate bad network conditions to test loading states, timeouts, retries and offline handling. Without url: set the profile for ALL app traffic: "slow-3g", "fast-3g", "flaky" (20% of requests fail), "offline" (every request fails), "custom" (latencyMs, kbps, dropRate), or "none" to restore normal speed (do this when done). With url (glob or /regex/): add a rule, inserted first, that slows only matching requests with the given profile, or makes them fail with fault ("reset", "timeout", "truncate", "dns"); times / ttlMs remove the rule automatically, otherwise use remove_rule. Mocks and blocks still answer instantly. get_status shows the active profile; affected exchanges carry a "simulated" label.',
+    user: 'Throttle or break the network for the app or for matching requests.',
+  },
+  resend_request: {
+    title: 'Resend a request',
+    model: 'Send a recorded request again through the proxy, optionally edited (method, url, headers, body), without involving the app — e.g. to check a fix on the backend or try a different payload. Only for an app request that reached the real server unchanged (state "completed", no rule matched it, not from a physical device over LAN), and only to that request\'s own origin: edit.url may change path and query, never scheme, host or port. Anything else is refused with the reason. Omitted fields keep the original, including secret headers you only see as "[redacted]"; a "[redacted]" value in edit.headers (or the query) is replaced by the original. Rules and the network profile apply. Returns {id, sinceMs}: the new exchange starts "pending"; wait for it with wait_for_request (same url, that sinceMs) or check get_request(id).',
+    user: 'Send a recorded request again, optionally edited.',
   },
 };
 

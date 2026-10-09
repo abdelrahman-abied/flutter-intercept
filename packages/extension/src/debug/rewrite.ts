@@ -49,8 +49,10 @@ export function proxyHostFor(deviceId: string | undefined, override?: string): s
 }
 
 export { PROXY_DEFINE };
+/** CONTRACTS §9.1: `FLUTTER_INTERCEPT_TRACE=0` turns the entry's request → source traces off. */
+export const TRACE_DEFINE = 'FLUTTER_INTERCEPT_TRACE';
 /** Every dart-define we own. */
-export const OUR_DEFINES = [SHA_DEFINE, PROXY_DEFINE] as const;
+export const OUR_DEFINES = [SHA_DEFINE, PROXY_DEFINE, TRACE_DEFINE] as const;
 
 /** toolArgs without the given defines (both `--dart-define=K=V` and `--dart-define K=V`). */
 export function stripDefines(toolArgs: unknown, names: readonly string[] = OUR_DEFINES): string[] {
@@ -76,8 +78,13 @@ export function withShaDefine(toolArgs: unknown, sha: string): string[] {
 }
 
 /** Replaces (never duplicates) both of our defines: the entry hash and the proxy address. */
-export function withInterceptDefines(toolArgs: unknown, sha: string, proxyAddress: string): string[] {
-  return [...stripDefines(toolArgs), `--dart-define=${SHA_DEFINE}=${sha}`, `--dart-define=${PROXY_DEFINE}=${proxyAddress}`];
+export function withInterceptDefines(toolArgs: unknown, sha: string, proxyAddress: string, captureSource = true): string[] {
+  return [
+    ...stripDefines(toolArgs),
+    `--dart-define=${SHA_DEFINE}=${sha}`,
+    `--dart-define=${PROXY_DEFINE}=${proxyAddress}`,
+    ...(captureSource ? [] : [`--dart-define=${TRACE_DEFINE}=0`]),
+  ];
 }
 
 /** Dart-Code's DebuggerType enum (out/dist/extension.js, `var DebuggerType`). */
@@ -109,6 +116,8 @@ export interface RewriteContext {
    * has already merged them into `toolArgs`, in "before" mode it hasn't yet.
    */
   settingsToolArgs?: string[];
+  /** Setting `flutterIntercept.captureSource` (default true); false adds `FLUTTER_INTERCEPT_TRACE=0` (Flutter only). */
+  captureSource?: boolean;
   /** fsPath of the active editor's file (only used in "before" mode when program is missing). */
   activeFile?: string;
   fs?: FsLike;
@@ -325,7 +334,7 @@ function rewriteOrSkip(input: DebugConfig, ctx: RewriteContext): RewriteResult {
   // flutter_tools keeps .dart_tool out of Gradle inputs: the SHA define forces a rebuild of a changed entry.
   // Flutter only: the Dart VM rejects --dart-define; plain Dart uses the entry's localhost:<port> default.
   // LAN (physical iOS): `flutter-intercept:<token>@<lanIp>:<port>`; the token lives only in this define.
-  if (flutter) config.toolArgs = withInterceptDefines(config.toolArgs, plan.sha, lan ? lanProxyAddress(lan) : `${proxyHost}:${proxyPort}`);
+  if (flutter) config.toolArgs = withInterceptDefines(config.toolArgs, plan.sha, lan ? lanProxyAddress(lan) : `${proxyHost}:${proxyPort}`, ctx.captureSource !== false);
   if (mode === 'before' || mode === 'already') {
     if (!config.cwd && cwd) config.cwd = cwd;
     // Pin the debugger type; otherwise Dart-Code treats a program under .dart_tool/ as plain Dart.

@@ -206,7 +206,7 @@ input:disabled, textarea:disabled { opacity: 0.6; }
   flex: none;
 }
 .sep { width: 1px; align-self: stretch; margin: 2px 2px; background: var(--fi-border); }
-.filter-text { width: 220px; flex: 0 1 220px; }
+.filter-text { width: 300px; flex: 0 1 300px; }
 .filter-method { width: auto; }
 .toggles { display: inline-flex; gap: 2px; }
 .toggle {
@@ -644,6 +644,7 @@ textarea.code-input {
 .field.grow { flex: 1; }
 .method-field { width: 100px; }
 .small-field { width: 110px; }
+.lifetime-field { width: 150px; }
 .radios { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 4px 0; }
 .radio, .check { display: inline-flex; align-items: center; cursor: pointer; }
 .re-actions { display: flex; gap: 6px; margin-top: 8px; }
@@ -673,6 +674,136 @@ textarea.code-input {
   white-space: nowrap;
   overflow: hidden;
 }
+
+/* ------------------------------------------------------------------ v0.3.0: menus, source, resend, network */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.menu-anchor { position: relative; display: inline-flex; }
+.menu {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  z-index: 20;
+  min-width: 180px;
+  padding: 4px 0;
+  display: flex;
+  flex-direction: column;
+  color: var(--vscode-menu-foreground, var(--vscode-foreground));
+  background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+  border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border, var(--fi-border)));
+  border-radius: 4px;
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, transparent);
+}
+.menu.context { position: fixed; top: auto; }
+.menu-item {
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 3px 16px;
+  line-height: 18px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.menu-item:hover:not(:disabled), .menu-item:focus {
+  background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
+  color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground));
+  outline: 1px solid var(--vscode-menu-selectionBorder, transparent);
+  outline-offset: -1px;
+}
+.menu-item:disabled { opacity: 0.5; cursor: default; }
+.menu-sep { height: 1px; margin: 4px 0; background: var(--vscode-menu-separatorBackground, var(--fi-border)); }
+
+.badge.mini { font-size: 10px; line-height: 15px; margin-left: 3px; padding: 0 4px; }
+.sent-badge { background: transparent; color: var(--vscode-charts-green); border: 1px solid var(--vscode-charts-green); }
+.sim-badge { background: transparent; color: var(--vscode-charts-orange); border: 1px solid var(--vscode-charts-orange); }
+
+.source { margin-top: 4px; font-size: 12px; }
+.source-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.source-fn { font-weight: 600; }
+.source-loc { color: var(--vscode-textLink-foreground); font-family: var(--fi-mono); font-size: var(--fi-mono-size); }
+.frames {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 2px 0;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--fi-border);
+  border-radius: 3px;
+  background: var(--vscode-textCodeBlock-background, transparent);
+}
+.frame-btn {
+  display: flex;
+  gap: 12px;
+  width: 100%;
+  padding: 1px 8px;
+  text-align: left;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-family: var(--fi-mono);
+  font-size: var(--fi-mono-size);
+}
+.frame-btn:hover { background: var(--vscode-list-hoverBackground); }
+.frame-fn { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.frame-loc { flex: none; color: var(--fi-muted); }
+.frame.framework .frame-btn { opacity: 0.55; }
+.frame.app .frame-fn { font-weight: 700; }
+.frame.app .frame-btn { box-shadow: inset 2px 0 0 var(--vscode-focusBorder); }
+.async-gap { padding: 0 8px; color: var(--fi-muted); font-style: italic; font-size: 11px; }
+
+.composer-head h3 { margin: 4px 0; font-size: 13px; white-space: nowrap; }
+.composer-head .link { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.composer .pause-editor { padding: 0 8px 8px; overflow: auto; flex: 1; min-height: 0; }
+
+.net-picker { position: relative; display: inline-flex; align-items: center; gap: 4px; }
+.net-label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fi-muted); }
+.net-picker.active .net-label {
+  color: var(--vscode-statusBarItem-warningForeground, var(--vscode-foreground));
+  background: var(--vscode-statusBarItem-warningBackground, var(--vscode-inputValidation-warningBackground));
+  border-radius: 11px;
+  padding: 0 0 0 8px;
+  font-weight: 600;
+}
+.net-picker.active .dot { background: currentColor; }
+.net-custom {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  padding: 6px 10px 8px;
+  min-width: 320px;
+  background: var(--vscode-editorWidget-background);
+  color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-editorWidget-border, var(--fi-border));
+  border-radius: 4px;
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, transparent);
+}
+.net-status { color: var(--vscode-editorWarning-foreground, var(--fi-warn)); font-weight: 600; }
+.net-status::before { content: '● '; }
+
+.filter-text[aria-invalid='true'] { border-color: var(--vscode-inputValidation-warningBorder, var(--fi-warn)); }
+
+.rule-title { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.badge.rule-budget {
+  flex: none;
+  font-size: 10px;
+  line-height: 15px;
+  background: transparent;
+  color: var(--vscode-charts-blue);
+  border: 1px solid var(--vscode-charts-blue);
+  font-variant-numeric: tabular-nums;
+}
+.badge.rule-budget.spent { color: var(--fi-muted); border-color: var(--fi-border); text-decoration: line-through; }
+.kind-throttle { background: var(--vscode-charts-blue); color: var(--vscode-editor-background); }
+.kind-fault { background: var(--vscode-charts-red, var(--vscode-errorForeground)); color: var(--vscode-editor-background); }
 
 /* High contrast: VSCode adds this class to <body>; draw borders where themes rely on fills. */
 body.vscode-high-contrast .row.selected,

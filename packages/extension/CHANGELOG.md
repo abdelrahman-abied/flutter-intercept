@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.0
+
+### Where did this request come from?
+
+**Request → source line**
+- Each request records where your code made it. The detail pane shows the call site (for example
+  `CatalogApi.fetchAlbum  lib/api/catalog_api.dart:37`) and **Open source** jumps to that line. Expand it to see
+  the whole stack; SDK and HTTP-library frames are dimmed.
+- Works for `package:http`, `HttpClient` and Dio, including interceptors and `QueuedInterceptor`.
+- Still no code in your app: the generated entry sends a short stack trace to the proxy over a side channel that
+  only exists while the proxy is reachable. Turn it off with `flutterIntercept.captureSource`.
+
+**Copy, resend, search**
+- **Copy as cURL**, **Copy as Dart (http)** and **Copy as Dio** on any request (detail pane or right-click).
+- **Resend** a request as it was, or **Edit and resend** it (method, URL, headers, body). The new request shows up
+  in the list with a link to the original.
+- Search with filters in the text box: `m:POST`, `s:4xx`, `s:error`, `t:json`, `body:"token"`, `h:authorization`,
+  `state:mocked`, `src:login_page.dart`. Put `-` in front of any of them to exclude.
+
+**Bad networks on demand**
+- A network picker in the toolbar: **Offline**, **Slow 3G**, **Fast 3G**, **Flaky (20% fail)** or your own
+  latency, bandwidth and failure rate. It only affects the app you're debugging, not your Mac.
+- New rule actions: **Throttle** (latency, bandwidth, failure rate) and **Fault** (connection reset, timeout,
+  response cut off half-way, failed lookup), for one endpoint at a time.
+- Rules can stop on their own: **only the first N requests** or **expires in** a set time.
+
+**localhost from the emulator**
+- Requests to `10.0.2.2` / `10.0.3.2` (the emulator's names for your Mac) reach your Mac's `localhost` while
+  intercepting, and `localhost` itself already does. Setting `flutterIntercept.rewriteLocalhost`.
+
+### Agent API
+- New tools: `get_request_source` (the file and line that sent a request), `get_body_shape` (the structure of a
+  large JSON body in a few hundred tokens), `simulate_network` (a network profile, or a throttle / fault rule for
+  one URL) and `resend_request` (only to servers the app already talked to).
+- `get_request` can return the request as a cURL, Dart http or Dio snippet, built from the redacted view.
+- `add_mock`, `add_block` and `add_breakpoint` take `times` and `ttlMs`, so an agent's rules clean themselves up.
+
 ## 0.2.0
 
 ### Agent API: AI agents can use Flutter Intercept

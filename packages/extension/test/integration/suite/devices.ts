@@ -13,6 +13,13 @@
  *  E. flutterIntercept.enabled=false → lib/main.dart launched directly, app works, nothing recorded.
  *  F. Android only: flutterMode=profile → intercepted.
  *  G. Android only: flutterMode=release → NOT intercepted (program untouched, app works, nothing recorded).
+ *  H. flutterIntercept.captureSource=false → FLUTTER_INTERCEPT_TRACE=0 define, no exchange gets a source.
+ *
+ * Request → source (CONTRACTS §9, template v4), in A and after the hot restart in B: a Dio request made
+ * through interceptors (CatalogApi.fetchAlbum) and a package:http request (OrdersApi.createOrder) carry
+ * `source.appFrame` = their call site in lib/ (file + line looked up in the demo's source, resolved to the
+ * workspace file by src/source/resolve.ts), `x-fi-id` is in no recorded request, and httpbin's echo of the
+ * request headers it received (http_gzip, http_plain) shows the upstream never saw it.
  *
  * Physical iPhone (CONTRACTS §7, LAN mode) — double opt-in: FI_DEVICES=<udid> AND FI_ALLOW_PHYSICAL_IOS=1.
  *  A also asserts host = the Mac's default-route IPv4, a single `FLUTTER_INTERCEPT_PROXY=flutter-intercept:<token>@<lanIp>:<port>`
@@ -20,6 +27,7 @@
  *  C asserts the LAN listener closes after the last iPhone session; F/G (profile/release) run too.
  */
 import { execFileSync } from 'child_process';
+import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -27,6 +35,7 @@ import type { Exchange } from '@flutter-intercept/proxy';
 import type { HostMsg } from '../../../src/ui/protocol';
 import { kindFromId } from '../../../src/iosDevices';
 import { defaultRouteIPv4 } from '../../../src/lanAddress';
+import { resolveFrames } from '../../../src/source/resolve';
 import { activateBoth, freePort, outputOf, registerOutputTracker, RunOutcome, sleep, startSession, stopSession, waitFor } from './helpers';
 
 const JP = 'https://jsonplaceholder.typicode.com';
@@ -38,11 +47,32 @@ const URLS = {
   http_plain: { method: 'GET', url: 'http://httpbin.org/get?plain=1' },
   dio_user2: { method: 'GET', url: `${JP}/users/2` },
   http_comment: { method: 'GET', url: `${JP}/comments/1` },
+  catalog_album: { method: 'GET', url: `${JP}/albums/1` },
+  orders_create: { method: 'POST', url: `${JP}/todos` },
 } as const;
 type Label = keyof typeof URLS;
 const NET_LABELS = Object.keys(URLS) as Label[];
 
 interface DemoResult { status: string; body: string }
+
+/** Call sites in samples/demo_app/lib whose requests must carry `source.appFrame` (CONTRACTS §9). */
+const SOURCE_SITES = {
+  // Dio through a sync and a QueuedInterceptor: the connection opens several async hops after the call.
+  catalog_album: { file: 'api/catalog_api.dart', needle: "_dio.get<Object?>('https://jsonplaceholder.typicode.com/albums/", fn: 'CatalogApi.fetchAlbum' },
+  // package:http with a long-lived Client.
+  orders_create: { file: 'api/orders_api.dart', needle: 'return _client.post(', fn: 'OrdersApi.createOrder' },
+} as const;
+
+/** 1-based line of the first line of lib/<file> containing `needle`. */
+function lineOf(root: string, file: string, needle: string): number {
+  const lines = fs.readFileSync(path.join(root, 'lib', ...file.split('/')), 'utf8').split(/\r?\n/);
+  const i = lines.findIndex((l) => l.includes(needle));
+  if (i < 0) throw new Error(`${needle} not found in lib/${file}`);
+  return i + 1;
+}
+
+const hasHeader = (headers: Record<string, unknown> | undefined, name: string) =>
+  Object.keys(headers ?? {}).some((h) => h.toLowerCase() === name);
 
 /** The app's own evidence lines (kept in results-devices.json). */
 const evidence = (text: string) =>
@@ -136,6 +166,56 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
     return outputOf(session).slice(from);
   }
 
+  /**
+   * CONTRACTS §9: the Dio + http call sites resolve to their lib/ file and line; `x-fi-id` never reaches the
+   * upstream (httpbin echoes the headers it got) nor the recorded request headers.
+   */
+  async function checkSources(since: number, failures: string[]): Promise<string> {
+    const found: string[] = [];
+    for (const [label, site] of Object.entries(SOURCE_SITES) as [keyof typeof SOURCE_SITES, (typeof SOURCE_SITES)[keyof typeof SOURCE_SITES]][]) {
+      const { method, url } = URLS[label];
+      let ex: Exchange;
+      try {
+        // The trace is posted ~100 ms after the request; both arrival orders are matched by the proxy.
+        ex = await waitFor(() => api.getExchanges().find((e) => e.startedAt >= since && sameUrl(e, method, url) && e.source), 20_000, 200);
+      } catch {
+        const e = api.getExchanges().find((x) => x.startedAt >= since && sameUrl(x, method, url));
+        failures.push(`${label}: no source on the exchange (${e ? `recorded, state ${e.state}` : 'not recorded'})`);
+        continue;
+      }
+      const src = ex.source!;
+      const frame = src.appFrame === undefined ? undefined : src.frames[src.appFrame];
+      const wantUri = `package:demo_app/${site.file}`;
+      const wantLine = lineOf(root, site.file, site.needle);
+      if (!frame) {
+        failures.push(`${label}: source has no appFrame: ${src.frames.slice(0, 6).map((f) => `${f.fn} ${f.uri}:${f.line}`).join(' | ')}`);
+        continue;
+      }
+      if (frame.uri !== wantUri || frame.line !== wantLine || !frame.fn.startsWith(site.fn)) {
+        failures.push(`${label}: appFrame ${frame.fn} ${frame.uri}:${frame.line}:${frame.column} != ${site.fn} ${wantUri}:${wantLine}`);
+      }
+      const [resolved] = resolveFrames([frame], [root]);
+      const wantPath = path.join(root, 'lib', ...site.file.split('/'));
+      if (resolved.path !== wantPath || !resolved.inProject) failures.push(`${label}: resolved to ${resolved.path} inProject=${resolved.inProject}, want ${wantPath}`);
+      found.push(`${label}=${frame.fn}@${site.file}:${frame.line}`);
+    }
+    const recorded = api.getExchanges().filter((e) => e.startedAt >= since);
+    const leaked = recorded.filter((e) => hasHeader(e.requestHeaders, 'x-fi-id'));
+    if (leaked.length) failures.push(`x-fi-id in recorded request headers: ${leaked.map((e) => e.url).join(', ')}`);
+    for (const label of ['http_gzip', 'http_plain'] as const) {
+      const e = recorded.find((x) => sameUrl(x, URLS[label].method, URLS[label].url));
+      let echoed: Record<string, unknown> | undefined;
+      try {
+        echoed = (JSON.parse(e?.responseBody?.text ?? '') as { headers?: Record<string, unknown> }).headers;
+      } catch {
+        echoed = undefined;
+      }
+      if (!echoed) failures.push(`${label}: no httpbin header echo to check (${(e?.responseBody?.text ?? '<no body>').slice(0, 80)})`);
+      else if (hasHeader(echoed, 'x-fi-id')) failures.push(`${label}: the upstream received x-fi-id`);
+    }
+    return found.join(' ');
+  }
+
   /** Checks that every network label printed `want` (default 2xx) and was recorded since `since`. */
   function checkBatch(text: string, since: number, expectRecorded: boolean, failures: string[], want: Partial<Record<Label, (r: DemoResult) => string | undefined>> = {}) {
     const res = demoResults(text);
@@ -209,11 +289,12 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
       if (!gz || !/gzip/.test(enc) || !/"gzipped": ?true/.test(gz.responseBody?.text ?? '')) failures.push(`gzip exchange: enc=${enc} body=${gz?.responseBody?.text?.slice(0, 80)}`);
       const plain = recorded.find((e) => e.url.startsWith('http://httpbin.org/get'));
       if (!plain) failures.push('plain http not recorded');
+      const sources = await checkSources(since, failures);
       if (isAndroid) {
         const list = adbReverseList(dev);
         if (list.includes(`tcp:${api.proxyHost.port}`)) failures.push(`adb reverse exists for an emulator: ${list.trim()}`);
       }
-      check(`DEV ${tag} A launch (F5, deviceId only)`, failures, t0, { output: evidence(text), mode: `host=${c.flutterInterceptProxyHost} port=${c.flutterInterceptPort} exchanges=${recorded.length}` });
+      check(`DEV ${tag} A launch (F5, deviceId only)`, failures, t0, { output: evidence(text), mode: `host=${c.flutterInterceptProxyHost} port=${c.flutterInterceptPort} exchanges=${recorded.length} ${sources}` });
     } catch (e) {
       check(`DEV ${tag} A launch (F5, deviceId only)`, [...failures, `exception: ${(e as Error).message}`], t0);
     }
@@ -250,7 +331,8 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
         if (st('dio_user2') !== 'mocked') failures.push(`dio_user2 state ${st('dio_user2')}`);
         if (st('http_comment') !== 'blocked') failures.push(`http_comment state ${st('http_comment')}`);
         if (pausedCount < 1) failures.push(`paused count while paused = ${pausedCount}`);
-        check(`DEV ${tag} B mock+block+breakpoint edit after hot restart`, failures, t0, { output: evidence(text), mode: `pausedCount=${pausedCount} exchanges=${recorded.length}` });
+        const sources = await checkSources(since, failures);
+        check(`DEV ${tag} B mock+block+breakpoint edit after hot restart`, failures, t0, { output: evidence(text), mode: `pausedCount=${pausedCount} exchanges=${recorded.length} ${sources}` });
       } catch (e) {
         check(`DEV ${tag} B mock+block+breakpoint edit after hot restart`, [...failures, `exception: ${(e as Error).message}`], t0);
       }
@@ -277,6 +359,17 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
       if (!/\[flutter_intercept\] ignored app findProxy/.test(text)) f.push('missing "[flutter_intercept] ignored app findProxy" note');
       if (!/findProxy=charles/.test(text)) f.push('app did not run in charles mode');
     });
+
+    // ---- H. captureSource=false: no x-fi-id, no traces, no source ----
+    const hStart = Date.now();
+    await cfg.update('captureSource', false, vscode.ConfigurationTarget.Global);
+    await runSimple(`DEV ${tag} H captureSource=false: no request sources`, dev, {}, true, (_t, f, c) => {
+      const trace = ((c.toolArgs ?? []) as string[]).filter((a) => a.startsWith('--dart-define=FLUTTER_INTERCEPT_TRACE='));
+      if (trace.length !== 1 || trace[0] !== '--dart-define=FLUTTER_INTERCEPT_TRACE=0') f.push(`trace define ${JSON.stringify(trace)}`);
+      const withSource = api.getExchanges().filter((e) => e.startedAt >= hStart && e.source);
+      if (withSource.length) f.push(`${withSource.length} exchange(s) got a source although capture is off`);
+    });
+    await cfg.update('captureSource', undefined, vscode.ConfigurationTarget.Global);
 
     // ---- E. interception off ----
     await cfg.update('enabled', false, vscode.ConfigurationTarget.Global);

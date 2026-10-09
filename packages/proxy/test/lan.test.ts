@@ -312,6 +312,95 @@ describe.skipIf(!LAN_IP)(`LAN mode on ${LAN_IP ?? '(no LAN IPv4)'}`, () => {
     expect((await lanGet(port, `${up.httpUrl}/json`, 'A'.repeat(43))).status).toBe(200);
   });
 
+  // ------------------------------------------------------------ v0.3.0: trace sink, rewriteLocalhost
+
+  /** CONNECT through the LAN listener (with `authorization`), then one request inside the TLS tunnel. */
+  const inTunnel = (target: string, req: { method?: string; path: string; host?: string; body?: string }, authorization = auth()) =>
+    new Promise<string>((resolve, reject) => {
+      const c = http.request({ host: LAN_IP, port: lanPort, method: 'CONNECT', path: target, headers: { 'proxy-authorization': authorization } });
+      c.on('connect', (res, socket) => {
+        if (res.statusCode !== 200) return resolve(`CONNECT ${res.statusCode}`);
+        const name = target.split(':')[0];
+        const t = tls.connect({ socket, rejectUnauthorized: false, servername: net.isIP(name) ? 'localhost' : name });
+        const r = http.request(
+          { method: req.method ?? 'GET', path: req.path, headers: { host: req.host ?? target, 'content-type': 'application/json' }, createConnection: () => t },
+          (rs) => {
+            let b = '';
+            rs.on('data', (d) => (b += d));
+            rs.on('end', () => resolve(`${rs.statusCode} ${b}`));
+          },
+        );
+        r.on('error', reject);
+        r.end(req.body);
+      });
+      c.on('error', reject);
+      c.end();
+    });
+
+  const STACK = '#0      Api.load (package:lan_app/api.dart:7:3)';
+
+  it('trace sink: an authorised LAN client posts traces over HTTPS (CONNECT) and plain HTTP; they join', async () => {
+    proxy.setAppPackages(['lan_app']);
+    const body = JSON.stringify({ traces: [{ id: 'lan-trace-https', stack: STACK }] });
+    expect(await inTunnel('trace.flutter-intercept.invalid:443', { method: 'POST', path: '/v1/traces', body })).toBe('204 ');
+    const plain = JSON.stringify({ traces: [{ id: 'lan-trace-plain', stack: STACK }] });
+    const r = await raw(LAN_IP!, lanPort, [
+      `POST http://trace.flutter-intercept.invalid/v1/traces HTTP/1.1\r\nHost: trace.flutter-intercept.invalid\r\n${authLine()}Content-Length: ${plain.length}\r\n\r\n${plain}`,
+    ]);
+    expect(r.text).toMatch(/^HTTP\/1\.1 204/);
+    for (const id of ['lan-trace-https', 'lan-trace-plain']) {
+      const g = await raw(LAN_IP!, lanPort, [get(`${up.httpUrl}/json?${id}`, `${authLine()}x-fi-id: ${id}\r\n`)]);
+      expect(g.text).toMatch(/^HTTP\/1\.1 200/);
+    }
+    const ex = await settled(proxy);
+    expect(ex).toHaveLength(2); // the trace posts are not recorded
+    for (const e of ex) expect(e.source?.frames[e.source.appFrame!]).toMatchObject({ fn: 'Api.load', uri: 'package:lan_app/api.dart' });
+    expect(up.hits.length).toBe(2);
+  });
+
+  it('trace sink: unauthorised LAN clients still get 407 (plain and CONNECT), nothing is ingested', async () => {
+    const body = JSON.stringify({ traces: [{ id: 'unauth-trace-1', stack: STACK }] });
+    const plain = await raw(LAN_IP!, lanPort, [
+      `POST http://trace.flutter-intercept.invalid/v1/traces HTTP/1.1\r\nHost: trace.flutter-intercept.invalid\r\nContent-Length: ${body.length}\r\n\r\n${body}`,
+    ]);
+    expect(plain.text).toMatch(/^HTTP\/1\.1 407/);
+    expect(await inTunnel('trace.flutter-intercept.invalid:443', { method: 'POST', path: '/v1/traces', body }, auth('wrong-token-wrong-token'))).toBe(
+      'CONNECT 407',
+    );
+    await lanGet(lanPort, `${up.httpUrl}/json`); // fine, but without a trace to join
+    const g = await raw(LAN_IP!, lanPort, [get(`${up.httpUrl}/json?x`, `${authLine()}x-fi-id: unauth-trace-1\r\n`)]);
+    expect(g.text).toMatch(/^HTTP\/1\.1 200/);
+    for (const e of await settled(proxy)) expect(e.source).toBeUndefined();
+  });
+
+  it('trace sink exemption reaches nothing else: inside a tunnel to it, an absolute-form request to a local service is 403', async () => {
+    const otherUrl = `http://127.0.0.1:${new URL(other.httpUrl).port}/json`;
+    const text = await inTunnel('trace.flutter-intercept.invalid:443', { path: otherUrl });
+    expect(text).toMatch(/^403 .*blocked a LAN client's request/); // the per-request SSRF rule still applies
+    expect(other.hits).toEqual([]);
+  });
+
+  it('viaLan: set on every LAN exchange (plain, in a CONNECT tunnel, SSRF refusals), never on loopback ones', async () => {
+    expect((await lanGet(lanPort, `${up.httpUrl}/json?plain`)).status).toBe(200);
+    expect(await inTunnel(new URL(up.httpsUrl).host, { path: '/json?tunnel' })).toMatch(/^200 /);
+    expect((await lanGet(lanPort, `http://127.0.0.1:${new URL(other.httpUrl).port}/`)).status).toBe(403);
+    expect((await raw(LAN_IP!, lanPort, [connect(`127.0.0.1:${new URL(other.httpsUrl).port}`, authLine())])).text).toMatch(/^HTTP\/1\.1 403/);
+    expect((await raw('127.0.0.1', proxy.port, [get(`${loopUp.httpUrl}/json?loopback`)])).text).toMatch(/^HTTP\/1\.1 200/);
+    const all = await settled(proxy);
+    expect(all).toHaveLength(5);
+    for (const e of all) expect(e.viaLan, `${e.method} ${e.url}`).toBe(e.url.includes('loopback') ? undefined : true);
+  });
+
+  it('rewriteLocalhost does not apply to LAN clients (10.0.2.2 is never turned into this machine)', async () => {
+    const port = new URL(loopUp.httpUrl).port;
+    const r = await raw(LAN_IP!, lanPort, [get(`http://10.0.2.2:${port}/json`, authLine())], 1500);
+    expect(r.text).not.toMatch(/^HTTP\/1\.1 200/);
+    expect(loopUp.hits).toEqual([]);
+    // the same request from loopback IS rewritten
+    expect((await raw('127.0.0.1', proxy.port, [get(`http://10.0.2.2:${port}/json`)])).text).toMatch(/^HTTP\/1\.1 200/);
+    expect(loopUp.hits).toEqual(['GET /json']);
+  });
+
   describe('real dart:io client via `PROXY flutter-intercept:<token>@<lanIp>:<port>`', () => {
     let exe: string;
     let tmp: string;

@@ -11,6 +11,9 @@ export const READ_TOOLS = [
   'list_paused',
   'list_rules',
   'export_har',
+  // CONTRACTS §9.5
+  'get_request_source',
+  'get_body_shape',
 ] as const;
 
 export const WRITE_TOOLS = [
@@ -24,6 +27,9 @@ export const WRITE_TOOLS = [
   'launch_app',
   'stop_app',
   'hot_restart',
+  // CONTRACTS §9.5
+  'simulate_network',
+  'resend_request',
 ] as const;
 
 export type ReadToolName = (typeof READ_TOOLS)[number];

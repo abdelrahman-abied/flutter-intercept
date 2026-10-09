@@ -26,8 +26,12 @@
 // targets that are loopback, link-local, unspecified or an address of this Mac (403). The token is
 // never logged.
 //
+// Trace sink (CONTRACTS §9.1/§9.2, template v4): host trace.flutter-intercept.invalid is answered
+// locally (204, never forwarded); each trace is logged as `PROXY_TRACE <id> <stack as a JSON string>`.
+// The request header `x-fi-id` is logged (`fi=<id>` on PROXY_REQ) and stripped before upstream.
+//
 // Greppable log lines: PROXY_READY, PROXY_REQ, PROXY_EDIT, PROXY_PASS,
-// PROXY_MOCK, PROXY_BLOCK, PROXY_ERR.
+// PROXY_MOCK, PROXY_BLOCK, PROXY_ERR, PROXY_TRACE.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -288,7 +292,12 @@ Future<void> _handle(HttpRequest req, String scheme) async {
     url = Uri.parse('$scheme://${req.headers.value('host')}${req.uri}');
   }
   final ua = req.headers.value('user-agent');
-  log('PROXY_REQ ${req.method} $url ua="$ua"');
+  if (url.host == traceHost) {
+    await _traceSink(req);
+    return;
+  }
+  final fi = req.headers.value('x-fi-id');
+  log('PROXY_REQ ${req.method} $url ua="$ua"${fi == null ? '' : ' fi=$fi'}');
   final s = url.toString();
   try {
     if (_token != null && await _forbiddenTarget(url.host)) {
@@ -322,7 +331,7 @@ Future<void> _handle(HttpRequest req, String scheme) async {
     final upReq = await upstream.openUrl(req.method, url);
     upReq.followRedirects = false;
     req.headers.forEach((name, values) {
-      if (const {'host', 'proxy-connection', 'proxy-authorization', 'connection', 'content-length', 'transfer-encoding'}
+      if (const {'host', 'proxy-connection', 'proxy-authorization', 'connection', 'content-length', 'transfer-encoding', 'x-fi-id'}
           .contains(name)) {
         return;
       }
@@ -372,4 +381,21 @@ Future<void> _handle(HttpRequest req, String scheme) async {
       await req.response.close();
     } catch (_) {}
   }
+}
+
+const traceHost = 'trace.flutter-intercept.invalid';
+
+/// Template v4 side channel: `{"traces":[{"id","stack"}]}` -> one PROXY_TRACE line per trace, 204.
+Future<void> _traceSink(HttpRequest req) async {
+  try {
+    final body = await req.fold<List<int>>(<int>[], (a, b) => a..addAll(b));
+    final obj = jsonDecode(utf8.decode(body)) as Map<String, dynamic>;
+    for (final t in (obj['traces'] as List).cast<Map<String, dynamic>>()) {
+      log('PROXY_TRACE ${t['id']} ${jsonEncode(t['stack'])}');
+    }
+  } catch (e) {
+    log('PROXY_ERR trace $e');
+  }
+  req.response.statusCode = 204;
+  await req.response.close();
 }

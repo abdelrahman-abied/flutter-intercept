@@ -75,6 +75,7 @@ function rewriteFor(
     physicalIos: lan.physicalIos,
     lan: lan.lan,
     settingsToolArgs: dartSettingsToolArgs(folder),
+    captureSource: vscode.workspace.getConfiguration('flutterIntercept', folder?.uri).get<boolean>('captureSource', true),
     folder: folder?.uri.fsPath,
     workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((w) => w.uri.fsPath),
     activeFile: active?.scheme === 'file' ? active.fsPath : undefined,

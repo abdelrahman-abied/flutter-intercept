@@ -1,5 +1,6 @@
 import * as http from 'http';
 import * as https from 'https';
+import * as tls from 'tls';
 
 /*
  * Upstream connection pooling across client connections.
@@ -14,13 +15,49 @@ import * as https from 'https';
  * Our rules are recognised by their `proxyConfig`: each InterceptProxy passes a unique callback
  * (that always answers "no upstream proxy"), and getAgent receives it as `proxySettingSource`.
  * If the hook can't be installed the callback is harmless and mockttp's default pooling applies.
+ *
+ * rewriteLocalhost (CONTRACTS §9.2): the emulator aliases for the host machine (10.0.2.2 Android
+ * emulator, 10.0.3.2 Genymotion) mean "this Mac" to the app; the proxy runs on that Mac, so our agents
+ * connect those targets to 127.0.0.1 on the same port. Done at connect time only: the URL, the Host
+ * header and the exchange keep what the app sent, and TLS still verifies the certificate against the
+ * name the app asked for. Only our pooled (loopback-client) agents do this — LAN clients get their gate's
+ * guarded agents first, so the §7 SSRF guard is unchanged.
  */
+
+/** Emulator aliases for the host machine → the address our agents actually connect to. */
+export const HOST_ALIASES: Readonly<Record<string, string>> = { '10.0.2.2': '127.0.0.1', '10.0.3.2': '127.0.0.1' };
+
+function rewritten(options: any): any {
+  const host = String(options?.host ?? options?.hostname ?? '');
+  const to = HOST_ALIASES[host];
+  if (!to) return options;
+  const out = { ...options, host: to };
+  if (options.hostname !== undefined) out.hostname = to;
+  // Verify the upstream certificate against the name the app asked for, not 127.0.0.1.
+  if (!out.servername && !options.checkServerIdentity) {
+    out.checkServerIdentity = (_h: string, cert: tls.PeerCertificate) => tls.checkServerIdentity(host, cert);
+  }
+  return out;
+}
+
+class RewritingHttpAgent extends http.Agent {
+  override createConnection(options: any, cb?: any): any {
+    return (http.Agent.prototype as any).createConnection.call(this, rewritten(options), cb);
+  }
+}
+
+class RewritingHttpsAgent extends https.Agent {
+  override createConnection(options: any, cb?: any): any {
+    return (https.Agent.prototype as any).createConnection.call(this, rewritten(options), cb);
+  }
+}
 
 type ProxySettingCallback = (params: { hostname: string }) => undefined;
 
 interface Pool {
   http: http.Agent;
   https: https.Agent;
+  rewrite: boolean;
   /** Set while LAN mode is on: LAN-originated requests get SSRF-guarded agents. */
   lan?: LanUpstream;
 }
@@ -65,6 +102,10 @@ function installHook(): boolean {
         if (o.protocol === 'https:') return pool.https;
         if (o.protocol === 'http:' || o.protocol === undefined) return pool.http;
       }
+      // Websocket upgrades to an emulator host alias: a fresh (unpooled) rewriting agent.
+      if (pool?.rewrite && (o.protocol === 'ws:' || o.protocol === 'wss:') && o.hostname && HOST_ALIASES[o.hostname]) {
+        return o.protocol === 'wss:' ? new RewritingHttpsAgent() : new RewritingHttpAgent();
+      }
       return original.call(this, o); // ws/wss, dead connections, everything else
     };
     return (hookInstalled = true);
@@ -81,11 +122,13 @@ export interface UpstreamPool {
   destroy(): void;
 }
 
-export function createUpstreamPool(): UpstreamPool {
+export function createUpstreamPool(opts: { rewriteLocalhost?: boolean } = {}): UpstreamPool {
   const active = installHook();
+  const rewrite = opts.rewriteLocalhost ?? true;
   const pool: Pool = {
-    http: new http.Agent({ keepAlive: true }),
-    https: new https.Agent({ keepAlive: true }),
+    http: rewrite ? new RewritingHttpAgent({ keepAlive: true }) : new http.Agent({ keepAlive: true }),
+    https: rewrite ? new RewritingHttpsAgent({ keepAlive: true }) : new https.Agent({ keepAlive: true }),
+    rewrite,
   };
   const proxyConfig: ProxySettingCallback = () => undefined;
   pools.set(proxyConfig, pool);

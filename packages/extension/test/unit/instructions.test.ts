@@ -32,7 +32,9 @@ describe('agent section content', () => {
     expect(mentioned.length).toBeGreaterThan(10);
     for (const name of mentioned) expect(known, `unknown tool ${name}`).toContain(name);
     for (const must of ['launch_app', 'wait_for_request', 'get_request', 'add_mock', 'remove_rule', 'add_breakpoint',
-      'list_paused', 'resume_request', 'clear_requests']) expect(mentioned).toContain(must);
+      'list_paused', 'resume_request', 'clear_requests', 'get_request_source', 'get_body_shape', 'simulate_network', 'resend_request']) expect(mentioned).toContain(must);
+    expect(AGENT_SECTION).toContain('`times: 1`'); // CONTRACTS §9.5: times/ttlMs cleanup
+    expect(AGENT_SECTION).toContain('`ttlMs`');
     expect(AGENT_SECTION).toContain('delayMs');
     expect(AGENT_SECTION).toContain('[redacted]');
     expect(AGENT_SECTION).toMatch(/Release builds are never intercepted/);

@@ -2,7 +2,7 @@
 # Compiles and runs the generated entry (dart:io harness lib/app.dart) on several
 # Dart SDKs and language versions, through scripts/e2e/mitm_proxy.dart.
 #   run_compat.sh <dart-sdk-dir>...      (each dir contains bin/dart)
-# env: FI_TEMPLATE=v1|v2|v3 (default v3), PORT (default 8899), LANGS (default "2.12 3.0"),
+# env: FI_TEMPLATE=v1|v2|v3|v4 (default v4), PORT (default 8899), LANGS (default "2.12 3.0"),
 #      FI_EVIL_URL (attack case: URL of scripts/e2e/evil_server.dart), FI_PROXY_DOWN=1 (no proxy;
 #      only the attack case runs)
 set -uo pipefail
@@ -31,9 +31,9 @@ open(sys.argv[1], 'w').write('\n'.join(out) + '\n')
 PY
 export FI_PINS="$WORK/pins.pem"
 
-export FI_TEMPLATE=${FI_TEMPLATE:-v3}
+export FI_TEMPLATE=${FI_TEMPLATE:-v4}
 CA_ARGS=()
-[ "$FI_TEMPLATE" = v3 ] && CA_ARGS=(--ca "$WORK/ca")
+case $FI_TEMPLATE in v1|v2) ;; *) CA_ARGS=(--ca "$WORK/ca") ;; esac
 if [ "${FI_PROXY_DOWN:-0}" = 1 ]; then
   export FI_ONLY_ATTACK=1
   # The CA still has to exist for the entry; mint it with the proxy, then stop the proxy.
@@ -48,7 +48,7 @@ else
   for _ in $(seq 1 60); do grep -q PROXY_READY "$WORK/proxy.log" && break; sleep 0.5; done
 fi
 trap 'kill $PROXY 2>/dev/null; pkill -f "mitm_proxy.dart --port $PORT " 2>/dev/null' EXIT
-[ "$FI_TEMPLATE" = v3 ] && export FI_CA_CERT="$WORK/ca/ca.pem"
+[ ${#CA_ARGS[@]} -gt 0 ] && export FI_CA_CERT="$WORK/ca/ca.pem"
 
 cp "$HERE/pubspec.yaml" "$WORK/pubspec.yaml.orig"
 status=0
@@ -60,9 +60,14 @@ for sdk in "$@"; do
     ENTRY=$("$E2E/gen_entry.sh" "$HERE" lib/app.dart localhost "$PORT")
     ver=$("$sdk/bin/dart" --version 2>&1 | sed -E 's/.*version: ([^ ]+).*/\1/')
     log="$WORK/run_${ver}_lang$lang.log"
+    traces0=$(grep -c PROXY_TRACE "$WORK/proxy.log" 2>/dev/null)
     (cd "$HERE" && "$sdk/bin/dart" run "$ENTRY") > "$log" 2>&1
     res=$(grep -o 'COMPAT_DONE failures=[0-9]*' "$log" || echo "DID NOT RUN")
-    echo "== dart $ver lang $lang template $FI_TEMPLATE: $res"
+    sleep 0.5
+    # v4: request -> source traces received by the proxy, and how many name a frame of lib/app.dart.
+    traces=$(tail -n +$((traces0 + 1)) <(grep PROXY_TRACE "$WORK/proxy.log" 2>/dev/null) | wc -l | tr -d ' ')
+    appframes=$(tail -n +$((traces0 + 1)) <(grep PROXY_TRACE "$WORK/proxy.log" 2>/dev/null) | grep -c 'package:fi_compat/app.dart')
+    echo "== dart $ver lang $lang template $FI_TEMPLATE: $res traces=$traces with_app_frame=$appframes"
     grep -E '^COMPAT [a-z_]+ FAIL|^COMPAT attack|Error:|\[flutter_intercept\]' "$log" | cut -c1-220 | sed 's/^/   /'
     [ "$res" = "COMPAT_DONE failures=0" ] || status=1
   done

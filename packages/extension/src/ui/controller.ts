@@ -7,10 +7,16 @@
  * fresh `snapshot` after `clear` (the proxy keeps in-flight exchanges); `status` after
  * `setInterceptEnabled`; `removed` for evictions; `error` for failed actions.
  * `exchange` updates are coalesced per id and flushed every `throttleMs`.
+ *
+ * CONTRACTS §9.3/9.4: `sent` after `send`; `status` after `setNetworkProfile`; `openSource` / `copySnippet`
+ * go through injected deps (no reply on success, `error` on failure); a `rule-spent` event from the host
+ * removes that rule (persisted + `rules` broadcast).
  */
-import type { Exchange, RequestEdit, ResponseEdit, Rule, RuleAction } from '@flutter-intercept/proxy';
+import type { Exchange, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
+import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 import { ruleFromExchange } from '@flutter-intercept/proxy/rules';
-import type { AgentStatus, HostMsg, Status, ViewMsg } from './protocol';
+import { SNIPPET_FORMATS, toSnippet } from '../codegen/snippets';
+import type { AgentStatus, HostMsg, SendDraft, SnippetFormat, Status, ViewMsg } from './protocol';
 
 export type Sink = (msg: HostMsg) => void;
 
@@ -28,6 +34,14 @@ export interface ControllerHost {
   on(event: 'exchange', l: (e: Exchange) => void): unknown;
   on(event: 'removed', l: (ids: string[]) => void): unknown;
   on(event: 'state', l: (running: boolean) => void): unknown;
+  /** CONTRACTS §9.2: a rule's `times` were used up or it expired. Optional on older hosts. */
+  on(event: 'rule-spent', l: (ruleId: string, reason: 'times' | 'expired') => void): unknown;
+  /** CONTRACTS §9.2: a rule with `times` matched; `used` = matches so far. Optional on older hosts. */
+  on(event: 'rule-hit', l: (ruleId: string, used: number) => void): unknown;
+  /** CONTRACTS §9.2 `send` (through the proxy, recorded with `initiator`). Optional: older proxy builds lack it. */
+  send?(req: SendRequest): Promise<{ id: string }>;
+  setNetworkProfile?(p: NetworkProfile): void;
+  readonly networkProfile?: NetworkProfile;
 }
 
 export interface ControllerDeps {
@@ -40,9 +54,19 @@ export interface ControllerDeps {
   log?: (msg: string) => void;
   /** CONTRACTS §8: what the status line shows about AI agents (never the MCP token). */
   getAgentStatus?: () => AgentStatus | undefined;
+  /**
+   * CONTRACTS §9.4: open `exchange.source.frames[frameIndex]` in an editor (src/source/open.ts). Rejects with a
+   * user-readable message ("file not in the workspace", …), which the webview shows.
+   */
+  openSource?: (exchange: Exchange, frameIndex: number) => Promise<unknown>;
+  /** Writes the user's clipboard (`vscode.env.clipboard.writeText`). */
+  copyToClipboard?: (text: string) => Promise<unknown>;
 }
 
+/** Kinds `createRuleFromExchange` can build (throttle/fault rules come from the rule editor). */
 const RULE_KINDS = new Set<RuleAction['kind']>(['mock', 'block', 'breakpoint']);
+const FAULTS = new Set(['reset', 'timeout', 'truncate', 'dns']);
+const PRESET_IDS = new Set(['slow-3g', 'fast-3g', 'flaky']);
 
 // ---------------------------------------------------------------------------------------------
 // Host-side validation of everything the webview sends (review #7). The webview is ours, but
@@ -88,6 +112,33 @@ function checkHeaders(v: unknown, where: string, multi: boolean): void {
   }
 }
 
+function isInt(v: unknown, min: number, max: number): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= min && v <= max;
+}
+
+function isNum(v: unknown, min: number, max: number): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
+}
+
+/** latencyMs 0–600000 (integer), kbps 1–10 000 000, dropRate 0–1; each optional. */
+function checkThrottle(a: Record<string, unknown>, where: string): void {
+  if (a.latencyMs !== undefined && !isInt(a.latencyMs, 0, 600_000)) fail(where, 'latencyMs must be an integer 0–600000');
+  if (a.kbps !== undefined && !isNum(a.kbps, 1, 10_000_000)) fail(where, 'kbps must be a number 1–10000000');
+  if (a.dropRate !== undefined && !isNum(a.dropRate, 0, 1)) fail(where, 'dropRate must be a number 0–1');
+}
+
+function checkUrl(v: unknown, where: string): string {
+  if (typeof v !== 'string') fail(where, 'url must be a string');
+  let u: URL;
+  try {
+    u = new URL(v);
+  } catch {
+    fail(where, `url must be absolute: ${v}`);
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') fail(where, 'url must be http(s)');
+  return v;
+}
+
 function checkBody(v: unknown, where: string): void {
   if (typeof v !== 'string') fail(where, 'body must be a string');
   if (v.length > MAX_TEXT) fail(where, 'body is too large');
@@ -95,10 +146,15 @@ function checkBody(v: unknown, where: string): void {
 
 export function validateRule(raw: unknown, where = 'rule'): Rule {
   if (!isObj(raw)) fail(where, 'must be an object');
-  onlyKeys(raw, ['id', 'enabled', 'name', 'match', 'action'], where);
+  // `used` is display-only (CONTRACTS §9.2 rule-hit): accepted so the webview can round-trip rules, then dropped.
+  onlyKeys(raw, ['id', 'enabled', 'name', 'match', 'action', 'times', 'expiresAt', 'used'], where);
   if (typeof raw.id !== 'string' || !raw.id.trim() || raw.id.length > 200) fail(where, 'id must be a non-empty string');
   if (typeof raw.enabled !== 'boolean') fail(where, 'enabled must be a boolean');
   if (raw.name !== undefined && (typeof raw.name !== 'string' || raw.name.length > 500)) fail(where, 'name must be a string');
+  if (raw.times !== undefined && !isInt(raw.times, 1, 1000)) fail(where, 'times must be an integer 1–1000');
+  if (raw.expiresAt !== undefined && (typeof raw.expiresAt !== 'number' || !Number.isFinite(raw.expiresAt) || raw.expiresAt <= 0)) {
+    fail(where, 'expiresAt must be a time in epoch milliseconds');
+  }
   const m = raw.match;
   if (!isObj(m)) fail(where, 'match is required (a rule without match would match everything)');
   onlyKeys(m, ['url', 'method'], `${where}.match`);
@@ -128,8 +184,20 @@ export function validateRule(raw: unknown, where = 'rule'): Rule {
       onlyKeys(a, ['kind', 'phase'], aw);
       if (a.phase !== 'request' && a.phase !== 'response' && a.phase !== 'both') fail(aw, 'phase must be "request", "response" or "both"');
       break;
+    case 'throttle':
+      onlyKeys(a, ['kind', 'latencyMs', 'kbps', 'dropRate'], aw);
+      checkThrottle(a, aw);
+      break;
+    case 'fault':
+      onlyKeys(a, ['kind', 'fault'], aw);
+      if (typeof a.fault !== 'string' || !FAULTS.has(a.fault)) fail(aw, 'fault must be "reset", "timeout", "truncate" or "dns"');
+      break;
     default:
       fail(aw, `unknown kind ${JSON.stringify(a.kind)}`);
+  }
+  if ('used' in raw) {
+    const { used: _used, ...rest } = raw;
+    return rest as unknown as Rule;
   }
   return raw as unknown as Rule;
 }
@@ -157,20 +225,58 @@ export function validateEdit(raw: unknown, phase?: 'request' | 'response'): Requ
   const allowed = phase === 'request' ? ['method', 'url', 'headers', 'body'] : phase === 'response' ? ['status', 'headers', 'body'] : ['method', 'url', 'status', 'headers', 'body'];
   onlyKeys(raw, allowed, where);
   if (raw.method !== undefined && (typeof raw.method !== 'string' || !TOKEN.test(raw.method))) fail(where, 'method must be an HTTP method name');
-  if (raw.url !== undefined) {
-    if (typeof raw.url !== 'string') fail(where, 'url must be a string');
-    let u: URL;
-    try {
-      u = new URL(raw.url);
-    } catch {
-      fail(where, `url must be absolute: ${raw.url}`);
-    }
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') fail(where, 'url must be http(s)');
-  }
+  if (raw.url !== undefined) checkUrl(raw.url, where);
   if (raw.status !== undefined) checkStatus(raw.status, where);
   if (raw.headers !== undefined) checkHeaders(raw.headers, where, true);
   if (raw.body !== undefined) checkBody(raw.body, where);
   return raw as RequestEdit | ResponseEdit;
+}
+
+/** Headers `send` never forwards: framing the proxy recomputes, hop-by-hop, and the proxy's own credential. */
+const SEND_DROPPED = new Set(['content-length', 'host', 'connection', 'keep-alive', 'proxy-connection', 'proxy-authorization', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'x-fi-id']);
+
+/** Drops framing / hop-by-hop / proxy headers from a request about to be sent again. */
+export function sanitizeSendHeaders(h: Record<string, string | string[]> | undefined): Record<string, string | string[]> | undefined {
+  if (!h) return h;
+  const out: Record<string, string | string[]> = {};
+  for (const [k, v] of Object.entries(h)) if (!SEND_DROPPED.has(k.toLowerCase()) && !k.startsWith(':')) out[k] = v;
+  return out;
+}
+
+/** Validates the webview composer's request (CONTRACTS §9.3 `send`): method, absolute http(s) URL, headers, text body. */
+export function validateSendDraft(raw: unknown): SendDraft {
+  const where = 'send';
+  if (!isObj(raw)) fail(where, 'request must be an object');
+  onlyKeys(raw, ['method', 'url', 'headers', 'body'], where);
+  if (typeof raw.method !== 'string' || !TOKEN.test(raw.method)) fail(where, 'method must be an HTTP method name');
+  checkUrl(raw.url, where);
+  if (raw.headers !== undefined) checkHeaders(raw.headers, where, true);
+  if (raw.body !== undefined) checkBody(raw.body, where);
+  return {
+    method: raw.method.toUpperCase(),
+    url: raw.url as string,
+    ...(raw.headers !== undefined ? { headers: sanitizeSendHeaders(raw.headers as Record<string, string | string[]>) } : {}),
+    ...(raw.body !== undefined ? { body: raw.body as string } : {}),
+  };
+}
+
+/** Validates a network profile (CONTRACTS §9.2 network.ts). */
+export function validateNetworkProfile(raw: unknown): NetworkProfile {
+  const where = 'networkProfile';
+  if (!isObj(raw)) fail(where, 'must be an object');
+  switch (raw.kind) {
+    case 'none':
+    case 'offline':
+      onlyKeys(raw, ['kind'], where);
+      return { kind: raw.kind };
+    case 'throttle':
+      onlyKeys(raw, ['kind', 'preset', 'latencyMs', 'kbps', 'dropRate'], where);
+      if (raw.preset !== undefined && (typeof raw.preset !== 'string' || !PRESET_IDS.has(raw.preset))) fail(where, 'preset must be "slow-3g", "fast-3g" or "flaky"');
+      checkThrottle(raw, where);
+      return raw as unknown as NetworkProfile;
+    default:
+      return fail(where, `unknown kind ${JSON.stringify(raw.kind)}`);
+  }
 }
 
 function checkId(v: unknown, where: string): string {
@@ -188,9 +294,17 @@ export function ruleFromExchangeErrorMessage(e: unknown, kind: string): string {
   return `Can't create ${what} from this exchange: ${msg}`;
 }
 
+/** The request of `ex` as a code snippet (unredacted: the caller decides what to redact). */
+export function snippetFor(ex: Exchange, format: SnippetFormat): string {
+  return toSnippet({ method: ex.method, url: ex.url, headers: ex.requestHeaders, ...(ex.requestBody ? { body: ex.requestBody } : {}) }, format);
+}
+
 export class InterceptController {
   private readonly sinks = new Set<Sink>();
   private readonly pending = new Map<string, Exchange>();
+  /** Latest `rule-hit` count per rule id (display only: never persisted, never sent to the proxy). */
+  private readonly used = new Map<string, number>();
+  private rulesDirty = false;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private readonly paused = new Set<string>();
   private sessions = 0;
@@ -205,9 +319,13 @@ export class InterceptController {
     // Start/stop/restart: the exchange list belongs to the proxy instance, so resend everything.
     deps.host.on('state', () => {
       this.pending.clear();
+      this.rulesDirty = false;
+      this.used.clear(); // hit counts belong to the proxy instance
       this.recomputePaused(deps.host.getExchanges());
       this.broadcast(this.snapshot());
     });
+    deps.host.on('rule-spent', (ruleId) => this.onRuleSpent(ruleId));
+    deps.host.on('rule-hit', (ruleId, used) => this.onRuleHit(ruleId, used));
   }
 
   attach(sink: Sink): () => void {
@@ -233,7 +351,22 @@ export class InterceptController {
         ? { lan: { host: this.deps.host.lan.host, port: this.deps.host.lan.port, ...(this.deps.host.lan.peer ? { peer: this.deps.host.lan.peer } : {}) } }
         : {}),
       ...(this.deps.getAgentStatus?.() ? { agent: this.deps.getAgentStatus() } : {}),
+      ...(this.networkProfile() ? { networkProfile: this.networkProfile() } : {}),
     };
+  }
+
+  /** The active network profile, or undefined when none (CONTRACTS §9.3: omitted from Status). */
+  private networkProfile(): NetworkProfile | undefined {
+    const p = this.deps.host.networkProfile;
+    return p && p.kind !== 'none' ? p : undefined;
+  }
+
+  /** Validates, applies and broadcasts `status` (webview `setNetworkProfile`; the agent API may use it too). */
+  setNetworkProfile(raw: unknown): void {
+    const p = validateNetworkProfile(raw);
+    if (!this.deps.host.setNetworkProfile) throw new Error('This proxy build cannot simulate network conditions.');
+    this.deps.host.setNetworkProfile(p);
+    this.broadcastStatus();
   }
 
   setSessions(n: number): void {
@@ -247,7 +380,7 @@ export class InterceptController {
   }
 
   snapshot(): HostMsg {
-    return { type: 'snapshot', exchanges: this.deps.host.getExchanges(), rules: this.deps.host.getRules(), status: this.status() };
+    return { type: 'snapshot', exchanges: this.deps.host.getExchanges(), rules: this.rulesView(), status: this.status() };
   }
 
   async handle(raw: unknown, reply: Sink): Promise<void> {
@@ -295,6 +428,42 @@ export class InterceptController {
           this.applyRules([rule, ...this.deps.host.getRules()]);
           return;
         }
+        case 'send': {
+          const request = validateSendDraft(msg.request);
+          if (msg.resentFrom !== undefined) checkId(msg.resentFrom, 'send');
+          if (!this.deps.host.send) throw new Error('This proxy build cannot send requests.');
+          const { id } = await this.deps.host.send({ ...request, initiator: 'editor', ...(msg.resentFrom ? { resentFrom: msg.resentFrom } : {}) });
+          this.send(reply, { type: 'sent', id });
+          return;
+        }
+        case 'openSource': {
+          const ex = this.exchangeOrThrow(checkId(msg.id, 'openSource'));
+          const frames = ex.source?.frames ?? [];
+          if (!frames.length) {
+            throw new Error(
+              ex.initiator
+                ? 'No source for this request: it was sent from the editor or an agent, not by the app.'
+                : 'No source for this request: its stack trace has not arrived (source capture may be off, or the app was launched before it was turned on).',
+            );
+          }
+          const frame = msg.frame ?? ex.source?.appFrame;
+          if (frame === undefined) throw new Error('No app call site was found in this request\'s stack trace. Pick a frame to open.');
+          if (!isInt(frame, 0, frames.length - 1)) fail('openSource', `frame must be an index 0–${frames.length - 1}`);
+          if (!this.deps.openSource) throw new Error('Opening source is not available in this editor.');
+          await this.deps.openSource(ex, frame);
+          return;
+        }
+        case 'copySnippet': {
+          if (!SNIPPET_FORMATS.includes(msg.format)) fail('copySnippet', `unknown format ${JSON.stringify(msg.format)}`);
+          const ex = this.exchangeOrThrow(checkId(msg.id, 'copySnippet'));
+          if (!this.deps.copyToClipboard) throw new Error('Copying is not available in this editor.');
+          // The user's own clipboard: unredacted (CONTRACTS §9.3).
+          await this.deps.copyToClipboard(snippetFor(ex, msg.format));
+          return;
+        }
+        case 'setNetworkProfile':
+          this.setNetworkProfile(msg.profile);
+          return;
         default:
           return;
       }
@@ -316,16 +485,54 @@ export class InterceptController {
 
   /** Validates (throws InvalidMessageError, nothing applied or persisted), then applies + persists + broadcasts. */
   applyRules(input: Rule[]): void {
-    const rules = validateRules(input);
+    const rules = validateRules(input); // drops `used`
     this.deps.host.setRules(rules);
     this.deps.saveRules(rules);
-    this.broadcast({ type: 'rules', rules });
+    const ids = new Set(rules.map((r) => r.id));
+    for (const id of [...this.used.keys()]) if (!ids.has(id)) this.used.delete(id);
+    this.rulesDirty = false;
+    this.broadcast({ type: 'rules', rules: this.rulesView() });
+  }
+
+  /** The host's rules with the latest `used` counts (CONTRACTS §9.2 rule-hit) for the webview. */
+  rulesView(): Rule[] {
+    const rules = this.deps.host.getRules();
+    if (!this.used.size) return rules;
+    return rules.map((r) => (this.used.has(r.id) ? { ...r, used: this.used.get(r.id) } : r));
   }
 
   dispose(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     this.sinks.clear();
+  }
+
+  private exchangeOrThrow(id: string): Exchange {
+    const ex = this.deps.host.getExchanges().find((e) => e.id === id);
+    if (!ex) throw new Error('That exchange is no longer available.');
+    return ex;
+  }
+
+  private onRuleHit(ruleId: string, used: number): void {
+    if (typeof ruleId !== 'string' || typeof used !== 'number' || !Number.isFinite(used)) return;
+    if (!this.deps.host.getRules().some((r) => r.id === ruleId) || this.used.get(ruleId) === used) return;
+    this.used.set(ruleId, used);
+    this.rulesDirty = true;
+    if (!this.timer) this.timer = setTimeout(() => this.flush(), this.deps.throttleMs ?? 50);
+  }
+
+  /** CONTRACTS §9.4: a spent rule (times used up / expired) is removed, persisted and broadcast. */
+  private onRuleSpent(ruleId: string): void {
+    const rules = this.deps.host.getRules();
+    const next = rules.filter((r) => r.id !== ruleId);
+    if (next.length === rules.length) return;
+    this.used.delete(ruleId);
+    try {
+      this.applyRules(next);
+      this.deps.log?.(`rule ${ruleId} spent: removed`);
+    } catch (e) {
+      this.deps.log?.(`removing spent rule ${ruleId} failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   private newRuleId(): string {
@@ -352,6 +559,10 @@ export class InterceptController {
   private flush(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
+    if (this.rulesDirty) {
+      this.rulesDirty = false;
+      this.broadcast({ type: 'rules', rules: this.rulesView() });
+    }
     if (this.pending.size === 0) return;
     const batch = [...this.pending.values()];
     this.pending.clear();

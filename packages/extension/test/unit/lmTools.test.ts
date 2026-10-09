@@ -187,6 +187,17 @@ describe('prepareInvocation', () => {
     expect((rm!.confirmationMessages!.message as Markdown).value).toBe('Remove rule `r1` (`[agent] login 500`).');
   });
 
+  it('resend_request confirmation names the exact method + origin + path (REVIEW-3 #1)', async () => {
+    const { vs, tools } = fakeVscode();
+    const ft = fakeTools('readWrite', async (t, i) => (t === 'get_request' ? { id: i.id, method: 'POST', url: 'https://api.example.com/v1/login?token=[redacted]' } : {}));
+    registerLmTools({ subscriptions: [] }, { tools: ft.tools, vscode: vs });
+    const p = await tools.get('flutter_intercept_resend_request')!.prepareInvocation({ input: { id: 'e7' } }, token());
+    expect((p!.confirmationMessages!.message as Markdown).value).toBe(
+      "Send **POST** `https://api.example.com/v1/login` (recorded request `e7`) again to the real server, with the original request's credentials.",
+    );
+    expect(ft.calls[0]).toMatchObject({ tool: 'get_request', input: { id: 'e7', includeBodies: false } });
+  });
+
   it('no confirmation under readOnly (the call is refused anyway)', async () => {
     const { vs, tools } = fakeVscode();
     registerLmTools({ subscriptions: [] }, { tools: fakeTools('readOnly').tools, vscode: vs });
@@ -206,6 +217,21 @@ describe('texts', () => {
     );
     expect(confirmationText('stop_app', {}).message).toContain('**every**');
     expect(confirmationText('launch_app', { deviceId: 'emulator-5554', flutterMode: 'profile' }).message).toContain('`emulator-5554` in **profile** mode');
+    // CONTRACTS §9.5
+    expect(confirmationText('simulate_network', { profile: 'slow-3g' }).message).toBe("Set **all** of the app's traffic to **Slow 3G** (+400 ms, 400 kbps) until changed.");
+    expect(confirmationText('simulate_network', { url: '*/login', method: 'post', fault: 'timeout', times: 1 }).message).toBe(
+      'Give POST `*/login` a timeout (no answer) (only the next matching request; then removed automatically). Inserted as the first rule.',
+    );
+    expect(confirmationText('add_mock', { url: '*/a', body: 'x', times: 2, ttlMs: 30_000 }).message).toContain('(the next 2 matching requests, for 30 s; then removed automatically)');
+    const req = { method: 'GET', url: 'https://api.example.com/v1/users/1?token=[redacted]' };
+    expect(confirmationText('resend_request', { id: 'e1', edit: { method: 'put', body: 'xx' } }, undefined, req).message).toBe(
+      "Send **PUT** `https://api.example.com/v1/users/1` (recorded request `e1`) again to the real server, with the original request's credentials. Also edited: body (2 chars).",
+    );
+    expect(confirmationText('resend_request', { id: 'e1', edit: { url: 'https://evil.example/x' } }, undefined, req).message).toContain(
+      'This changes the origin from `https://api.example.com`, so the call will be refused.',
+    );
+    expect(confirmationText('resend_request', { id: 'e1' }).message).toContain('was not found');
+    expect(invocationMessage('get_body_shape', { id: 'e1' })).toBe('Reading the response body structure of e1');
   });
 
   it('formatResult is pretty when small and compact when large', () => {

@@ -1,10 +1,53 @@
-{ "name": "@flutter-intercept/proxy", "version": "0.0.1", "private": true, "type": "commonjs",
-  "main": "dist/index.js", "types": "dist/index.d.ts",
+{
+  "name": "@flutter-intercept/proxy",
+  "version": "0.0.1",
+  "private": true,
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
-    "./rules": { "types": "./dist/rules.d.ts", "default": "./dist/rules.js" },
-    "./types": { "types": "./dist/types.d.ts", "default": "./dist/types.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./rules": {
+      "types": "./dist/rules.d.ts",
+      "default": "./dist/rules.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    },
+    "./network": {
+      "types": "./dist/network.d.ts",
+      "default": "./dist/network.js"
+    },
+    "./source": {
+      "types": "./dist/source.d.ts",
+      "default": "./dist/source.js"
+    }
   },
-  "typesVersions": { "*": { "rules": ["dist/rules.d.ts"], "types": ["dist/types.d.ts"] } },
-  "scripts": { "build": "tsc -p .", "test": "vitest run" },
-  "dependencies": { "mockttp": "~4.6.3" } }
+  "typesVersions": {
+    "*": {
+      "rules": [
+        "dist/rules.d.ts"
+      ],
+      "types": [
+        "dist/types.d.ts"
+      ],
+      "network": [
+        "dist/network.d.ts"
+      ],
+      "source": [
+        "dist/source.d.ts"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "mockttp": "~4.6.3"
+  }
+}

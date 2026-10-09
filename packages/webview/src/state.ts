@@ -3,12 +3,15 @@
  * Side effects (posting ViewMsg to the host) live in the components / app shell.
  */
 import type {
-  Exchange, HostMsg, RequestEdit, ResponseEdit, Rule, RuleAction, Status,
+  Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit, Rule, RuleAction, SendDraft, SnippetFormat, Status,
 } from './protocol';
+import type { FaultKind } from '@flutter-intercept/proxy/types';
 import { compileMatcher, matches } from '@flutter-intercept/proxy/rules';
+import { describeProfile, NETWORK_PRESETS, presetProfile, type NetworkPresetId } from '@flutter-intercept/proxy/network';
+import { matchesFilter, parseFilter } from './filter';
 import {
-  describeMatcherUrl, headerValue, isAbsoluteUrl, isJsonContentType, isPaused, newId, statusClassOf, validateJson,
-  type Headers, type JsonCheck, type StatusClass,
+  describeMatcherUrl, formatRemaining, headerValue, isAbsoluteUrl, isJsonContentType, isPaused, newId, statusClassOf,
+  validateJson, type Headers, type JsonCheck, type StatusClass,
 } from './util';
 
 /** Host `error` messages kept for the banner (newest last). */
@@ -30,7 +33,19 @@ export interface RequestDraft { kind: 'request'; method: string; url: string; he
 export interface ResponseDraft { kind: 'response'; status: string; headers: HeaderRow[]; body: string }
 export type Draft = RequestDraft | ResponseDraft;
 
-export interface Notice { id: number; text: string; undoRules?: Rule[] }
+export interface Notice { id: number; text: string; undoRules?: Rule[]; short?: boolean }
+
+/** "Edit and resend" composer (CONTRACTS §9.3 `send`). Hidden (open=false) keeps the draft for reopening. */
+export interface Composer {
+  resentFrom?: string;
+  draft: RequestDraft;
+  /** The original body could not be copied (binary or truncated): it is not part of the draft. */
+  bodyNote?: string;
+  /** Original request body text, to detect a body change (content-length is then dropped). */
+  originalBody?: string;
+  open: boolean;
+  sending: boolean;
+}
 export interface HostError { id: number; message: string }
 
 export interface State {
@@ -50,6 +65,9 @@ export interface State {
   awaitingRule?: { kind: RuleAction['kind']; knownIds: string[] };
   notice?: Notice;
   splitPct: number;                     // list width in the side-by-side layout
+  composer?: Composer;
+  /** Host said `sent` before the new exchange arrived: select it when it does. */
+  pendingSelectId?: string;
 }
 
 export const NEW_RULE = '__new__';
@@ -74,11 +92,11 @@ export function initialState(): State {
 }
 
 /** The part of State worth keeping across webview reloads (vscode.setState). */
-export type Persisted = Pick<State, 'filters' | 'view' | 'detailTab' | 'selectedId' | 'splitPct' | 'drafts' | 'editingRuleId'>;
+export type Persisted = Pick<State, 'filters' | 'view' | 'detailTab' | 'selectedId' | 'splitPct' | 'drafts' | 'editingRuleId' | 'composer'>;
 export function toPersisted(s: State): Persisted {
   return {
     filters: s.filters, view: s.view, detailTab: s.detailTab, selectedId: s.selectedId, splitPct: s.splitPct,
-    drafts: s.drafts, editingRuleId: s.editingRuleId,
+    drafts: s.drafts, editingRuleId: s.editingRuleId, composer: s.composer,
   };
 }
 
@@ -100,13 +118,17 @@ export type Action =
   | { type: 'setRules'; rules: Rule[]; notice?: string; undoable?: boolean }
   | { type: 'editRule'; id?: string }
   | { type: 'awaitRule'; kind: RuleAction['kind'] }
-  | { type: 'notice'; text?: string }
+  | { type: 'notice'; text?: string; short?: boolean }
   | { type: 'dismissErrors' }
-  | { type: 'setSplit'; pct: number };
+  | { type: 'setSplit'; pct: number }
+  | { type: 'openComposer'; id?: string }
+  | { type: 'patchComposer'; patch: Partial<RequestDraft> }
+  | { type: 'closeComposer'; discard?: boolean }
+  | { type: 'composerSending' };
 
 let noticeSeq = 0;
 let errorSeq = 0;
-const notice = (text: string, undoRules?: Rule[]): Notice => ({ id: ++noticeSeq, text, undoRules });
+const notice = (text: string, undoRules?: Rule[], short?: boolean): Notice => ({ id: ++noticeSeq, text, undoRules, short });
 
 // ---------------------------------------------------------------- reducer
 
@@ -126,12 +148,13 @@ export function reducer(state: State, action: Action): State {
         splitPct: p.splitPct ?? state.splitPct,
         drafts: p.drafts ?? state.drafts,
         editingRuleId: p.editingRuleId ?? state.editingRuleId,
+        composer: p.composer ? { ...p.composer, sending: false } : state.composer,
       };
     }
 
     case 'select': {
       const ex = action.id ? findExchange(state, action.id) : undefined;
-      return { ...state, selectedId: ex?.id, detailTab: tabFor(ex, state.detailTab) };
+      return { ...state, selectedId: ex?.id, detailTab: tabFor(ex, state.detailTab), composer: hideComposer(state.composer) };
     }
 
     case 'move': {
@@ -146,7 +169,7 @@ export function reducer(state: State, action: Action): State {
         case 'prev': idx = cur < 0 ? list.length - 1 : Math.max(cur - 1, 0); break;
       }
       const ex = list[idx];
-      return { ...state, selectedId: ex.id, detailTab: tabFor(ex, state.detailTab) };
+      return { ...state, selectedId: ex.id, detailTab: tabFor(ex, state.detailTab), composer: hideComposer(state.composer) };
     }
 
     case 'setFilters':
@@ -218,14 +241,47 @@ export function reducer(state: State, action: Action): State {
       return { ...state, awaitingRule: { kind: action.kind, knownIds: state.rules.map((r) => r.id) } };
 
     case 'notice':
-      return { ...state, notice: action.text ? notice(action.text) : undefined };
+      return { ...state, notice: action.text ? notice(action.text, undefined, action.short) : undefined };
 
     case 'dismissErrors':
       return { ...state, hostErrors: [] };
 
     case 'setSplit':
       return { ...state, splitPct: Math.max(20, Math.min(80, action.pct)) };
+
+    case 'openComposer': {
+      // Reopening on the same exchange keeps the hidden draft; another exchange (or a blank one) starts fresh.
+      const cur = state.composer;
+      if (cur && cur.resentFrom === action.id && !cur.sending) {
+        return { ...state, view: 'traffic', composer: { ...cur, open: true } };
+      }
+      const ex = action.id ? findExchange(state, action.id) : undefined;
+      if (action.id && !ex) return state;
+      return { ...state, view: 'traffic', composer: ex ? composerFromExchange(ex) : blankComposer() };
+    }
+
+    case 'patchComposer':
+      if (!state.composer) return state;
+      return { ...state, composer: { ...state.composer, draft: { ...state.composer.draft, ...action.patch } } };
+
+    case 'closeComposer':
+      return { ...state, composer: action.discard ? undefined : hideComposer(state.composer) };
+
+    case 'composerSending':
+      return state.composer ? { ...state, composer: { ...state.composer, sending: true } } : state;
   }
+}
+
+function hideComposer(c: Composer | undefined): Composer | undefined {
+  if (!c || !c.open) return c;
+  return { ...c, open: false };
+}
+
+/** Select `id` (a request the host just sent) and close the composer that sent it. */
+function selectSent(state: State, id: string): State {
+  const composer = state.composer?.sending ? undefined : state.composer;
+  if (!state.exchanges.some((e) => e.id === id)) return { ...state, pendingSelectId: id, composer };
+  return { ...state, pendingSelectId: undefined, selectedId: id, detailTab: 'response', view: 'traffic', composer };
 }
 
 function applyHostMsg(state: State, msg: HostMsg): State {
@@ -247,6 +303,10 @@ function applyHostMsg(state: State, msg: HostMsg): State {
         next.editingRuleId = undefined;
       }
       if (state.selectedId && !byId.has(state.selectedId)) next.selectedId = undefined;
+      if (state.pendingSelectId && byId.has(state.pendingSelectId)) {
+        next.selectedId = state.pendingSelectId;
+        next.pendingSelectId = undefined;
+      }
       if (next.selectedId) {
         next.detailTab = tabFor(byId.get(next.selectedId), state.detailTab);
       } else {
@@ -297,9 +357,18 @@ function applyHostMsg(state: State, msg: HostMsg): State {
           next.detailTab = tabFor(ex, state.detailTab);
         }
       }
+      if (state.pendingSelectId === ex.id) {
+        next.pendingSelectId = undefined;
+        next.selectedId = ex.id;
+        next.detailTab = tabFor(ex, 'response');
+        next.composer = hideComposer(next.composer);
+      }
       if (next.selectedId && !exchanges.some((e) => e.id === next.selectedId)) next.selectedId = undefined;
       return next;
     }
+
+    case 'sent':
+      return selectSent(state, msg.id);
 
     case 'rules': {
       const next: State = { ...state, rules: msg.rules };
@@ -353,6 +422,7 @@ function applyHostMsg(state: State, msg: HostMsg): State {
         ...state,
         hostErrors: [...state.hostErrors, { id: ++errorSeq, message: msg.message }].slice(-MAX_HOST_ERRORS),
         resolving: {},
+        composer: state.composer?.sending ? { ...state.composer, sending: false } : state.composer,
       };
 
     case 'cleared':
@@ -413,11 +483,13 @@ export function hasActiveFilters(f: Filters): boolean {
   return !!f.text.trim() || !!f.method || f.statusClasses.length > 0 || f.pausedOnly;
 }
 
+/**
+ * The text box speaks the filter language in ./filter (free words match the URL, m: s: t: body: h: state:
+ * src:, -negation); it is AND-ed with the method / status-class / paused-only controls.
+ */
 export function filterExchanges(exchanges: Exchange[], f: Filters): Exchange[] {
   if (!hasActiveFilters(f)) return exchanges;
-  const terms = f.text.toLowerCase().split(/\s+/).filter(Boolean);
-  const include = terms.filter((t) => !t.startsWith('-') || t.length === 1);
-  const exclude = terms.filter((t) => t.startsWith('-') && t.length > 1).map((t) => t.slice(1));
+  const parsed = parseFilter(f.text);
   const method = f.method.toUpperCase();
   return exchanges.filter((e) => {
     if (f.pausedOnly && !isPaused(e)) return false;
@@ -426,12 +498,7 @@ export function filterExchanges(exchanges: Exchange[], f: Filters): Exchange[] {
       const c = statusClassOf(e);
       if (!c || !f.statusClasses.includes(c)) return false;
     }
-    if (terms.length) {
-      const url = e.url.toLowerCase();
-      for (const t of include) if (!url.includes(t)) return false;
-      for (const t of exclude) if (url.includes(t)) return false;
-    }
-    return true;
+    return parsed.empty || matchesFilter(e, parsed);
   });
 }
 
@@ -572,6 +639,157 @@ export function validateDraft(d: Draft): DraftValidation {
   return { errors, json };
 }
 
+// ---------------------------------------------------------------- edit & resend (CONTRACTS §9.3 `send`)
+
+/** A finished exchange can be resent (not pending, not waiting at a breakpoint). */
+export function canResend(ex: Pick<Exchange, 'state'>): boolean {
+  return ex.state !== 'pending' && !isPaused(ex);
+}
+
+/** Why the original request body can't be reproduced as text, if it can't. */
+export function unsendableBody(ex: Pick<Exchange, 'requestBody'>): string | undefined {
+  const b = ex.requestBody;
+  if (!b) return undefined;
+  if (b.encoding === 'base64') return 'The original body is binary and can\'t be resent as text — it is not included.';
+  if (b.truncated) return 'The original body was truncated at 5 MB — it is not included.';
+  return undefined;
+}
+
+export function composerFromExchange(ex: Exchange): Composer {
+  const bodyNote = unsendableBody(ex);
+  const text = !bodyNote && ex.requestBody ? ex.requestBody.text : '';
+  return {
+    resentFrom: ex.id,
+    draft: { kind: 'request', method: ex.method, url: ex.url, headers: headersToRows(ex.requestHeaders), body: text },
+    bodyNote,
+    originalBody: bodyNote ? undefined : text,
+    open: true,
+    sending: false,
+  };
+}
+
+export function blankComposer(): Composer {
+  return { draft: { kind: 'request', method: 'GET', url: 'https://', headers: [], body: '' }, open: true, sending: false };
+}
+
+/**
+ * The `send` request for a composer draft. content-length is dropped whenever the body differs from the
+ * original (or the original body is unknown) so a stale length never reaches the server; a Host header that
+ * doesn't match the URL is dropped too.
+ */
+export function composeSend(c: Pick<Composer, 'draft' | 'originalBody'>): SendDraft {
+  const d = c.draft;
+  const req: SendDraft = { method: d.method.trim().toUpperCase(), url: d.url.trim() };
+  let rows = d.headers.filter((r) => r.name.trim());
+  const bodyChanged = c.originalBody === undefined || d.body !== c.originalBody;
+  if (bodyChanged) rows = rows.filter((r) => r.name.trim().toLowerCase() !== 'content-length');
+  // A copied Host header that no longer matches the (edited) URL would send the request to the wrong virtual host.
+  let urlHost: string | undefined;
+  try { urlHost = new URL(req.url).host.toLowerCase(); } catch { /* validated elsewhere */ }
+  rows = rows.filter((r) => r.name.trim().toLowerCase() !== 'host' || r.value.trim().toLowerCase() === urlHost);
+  if (rows.length) req.headers = rowsToRecord(rows);
+  if (d.body !== '') req.body = d.body;
+  return req;
+}
+
+/** One-click "Resend": the recorded request as is. undefined when its body can't be reproduced. */
+export function resendRequest(ex: Exchange): SendDraft | undefined {
+  if (!canResend(ex) || unsendableBody(ex)) return undefined;
+  const req: SendDraft = { method: ex.method, url: ex.url };
+  if (Object.keys(ex.requestHeaders).length) req.headers = ex.requestHeaders;
+  if (ex.requestBody?.text) req.body = ex.requestBody.text;
+  return req;
+}
+
+/** Who sent an exchange that the app didn't (list badge + detail line). */
+export function initiatorLabel(ex: Pick<Exchange, 'initiator' | 'resentFrom'>): string | undefined {
+  if (!ex.initiator && !ex.resentFrom) return undefined;
+  const who = ex.initiator === 'agent' ? 'an AI agent' : 'the editor';
+  return ex.resentFrom ? `Resent by ${who}` : `Sent by ${who}`;
+}
+
+export const SNIPPET_LABEL: Record<SnippetFormat, string> = { curl: 'cURL', dart_http: 'Dart (http)', dio: 'Dio' };
+export const SNIPPET_FORMATS: readonly SnippetFormat[] = ['curl', 'dart_http', 'dio'];
+
+// ---------------------------------------------------------------- network profile (CONTRACTS §9.3)
+
+export type ProfileChoice = 'none' | 'offline' | NetworkPresetId | 'custom';
+
+export const PROFILE_CHOICES: readonly { value: ProfileChoice; label: string }[] = [
+  { value: 'none', label: 'No throttling' },
+  { value: 'offline', label: 'Offline' },
+  ...NETWORK_PRESETS.map((p) => ({ value: p.id as ProfileChoice, label: p.label })),
+  { value: 'custom', label: 'Custom…' },
+];
+
+export function profileChoice(p: NetworkProfile | undefined): ProfileChoice {
+  if (!p || p.kind === 'none') return 'none';
+  if (p.kind === 'offline') return 'offline';
+  if (p.preset && NETWORK_PRESETS.some((x) => x.id === p.preset)) return p.preset;
+  return 'custom';
+}
+
+/** Profile for a non-custom choice. */
+export function profileForChoice(c: Exclude<ProfileChoice, 'custom'>): NetworkProfile {
+  if (c === 'none') return { kind: 'none' };
+  if (c === 'offline') return { kind: 'offline' };
+  return presetProfile(c);
+}
+
+export function isProfileActive(p: NetworkProfile | undefined): boolean {
+  return !!p && p.kind !== 'none';
+}
+
+export function profileLabel(p: NetworkProfile | undefined): string {
+  return describeProfile(p ?? { kind: 'none' });
+}
+
+export interface ThrottleFields { latencyMs: string; kbps: string; dropPct: string }
+export interface ThrottleCheck {
+  errors: Partial<Record<keyof ThrottleFields | 'all', string>>;
+  value: { latencyMs?: number; kbps?: number; dropRate?: number };
+}
+
+const isInt = (s: string) => /^\d+$/.test(s.trim());
+
+/** Latency 0–60 000 ms, bandwidth 1–1 000 000 kbps (empty = unlimited), failure 0–100 %. At least one set. */
+export function checkThrottle(f: ThrottleFields): ThrottleCheck {
+  const errors: ThrottleCheck['errors'] = {};
+  const value: ThrottleCheck['value'] = {};
+  const lat = f.latencyMs.trim();
+  if (lat) {
+    if (!isInt(lat) || +lat > 60_000) errors.latencyMs = '0–60000 ms';
+    else if (+lat > 0) value.latencyMs = +lat;
+  }
+  const kbps = f.kbps.trim();
+  if (kbps) {
+    if (!isInt(kbps) || +kbps < 1 || +kbps > 1_000_000) errors.kbps = '1–1000000 kbps (empty = unlimited)';
+    else value.kbps = +kbps;
+  }
+  const drop = f.dropPct.trim();
+  if (drop) {
+    const n = Number(drop);
+    if (!/^\d+(\.\d+)?$/.test(drop) || n > 100) errors.dropPct = '0–100 %';
+    else if (n > 0) value.dropRate = Math.round(n * 100) / 10_000;
+  }
+  if (!Object.keys(errors).length && !Object.keys(value).length) errors.all = 'Set a latency, a bandwidth limit or a failure rate.';
+  return { errors, value };
+}
+
+export function throttleFieldsOf(v: { latencyMs?: number; kbps?: number; dropRate?: number } | undefined): ThrottleFields {
+  return {
+    latencyMs: v?.latencyMs ? String(v.latencyMs) : '',
+    kbps: v?.kbps ? String(v.kbps) : '',
+    dropPct: v?.dropRate ? String(Math.round(v.dropRate * 10_000) / 100) : '',
+  };
+}
+
+export function customProfile(f: ThrottleFields): NetworkProfile | undefined {
+  const c = checkThrottle(f);
+  if (Object.keys(c.errors).length) return undefined;
+  return { kind: 'throttle', ...c.value };
+}
+
 // ---------------------------------------------------------------- rules
 
 export function moveRule(rules: Rule[], from: number, to: number): Rule[] {
@@ -634,12 +852,45 @@ export function countMatches(m: Rule['match'], exchanges: Exchange[]): number {
   return n;
 }
 
+export const FAULT_LABEL: Record<FaultKind, string> = {
+  reset: 'connection reset',
+  timeout: 'timeout (never answered)',
+  truncate: 'truncated response',
+  dns: 'DNS failure (host lookup)',
+};
+
 export function describeAction(a: RuleAction): string {
   switch (a.kind) {
     case 'mock': return `Mock ${a.status}${a.delayMs ? ` after ${a.delayMs} ms` : ''}`;
     case 'block': return a.mode === 'reset' ? 'Block (connection reset)' : `Block with ${a.status ?? 403}`;
     case 'breakpoint': return a.phase === 'both' ? 'Break on request + response' : `Break on ${a.phase}`;
+    case 'throttle': return `Throttle (${describeProfile({ kind: 'throttle', latencyMs: a.latencyMs, kbps: a.kbps, dropRate: a.dropRate })})`;
+    case 'fault': return `Fault: ${FAULT_LABEL[a.fault]}`;
   }
+}
+
+/** How often a rule was used, judged from the exchanges listed (the proxy keeps the real count). */
+export function ruleHits(rule: Pick<Rule, 'id'>, exchanges: Exchange[]): number {
+  let n = 0;
+  for (const e of exchanges) if (e.matchedRuleId === rule.id) n++;
+  return n;
+}
+
+/** "2 of 3 left · expires in 4m 10s" for rules with `times` / `expiresAt`; undefined otherwise. */
+export function ruleBudget(rule: Pick<Rule, 'times' | 'expiresAt'>, hits: number, now: number): { text: string; spent: boolean } | undefined {
+  const parts: string[] = [];
+  let spent = false;
+  if (rule.times !== undefined) {
+    const left = Math.max(0, rule.times - hits);
+    if (!left) spent = true;
+    parts.push(`${left} of ${rule.times} left`);
+  }
+  if (rule.expiresAt !== undefined) {
+    const ms = rule.expiresAt - now;
+    if (ms <= 0) { spent = true; parts.push('expired'); }
+    else parts.push(`expires in ${formatRemaining(ms)}`);
+  }
+  return parts.length ? { text: parts.join(' · '), spent } : undefined;
 }
 
 export function ruleLabel(r: Rule): string {
@@ -674,9 +925,20 @@ export interface RuleForm {
   blockMode: 'reset' | 'status';
   blockStatus: string;
   phase: 'request' | 'response' | 'both';
+  throttle: ThrottleFields;
+  fault: FaultKind;
+  times: string;                // '' = unlimited; 1–1000
+  expiresIn: string;            // '' = never
+  expiresUnit: ExpiryUnit;
+  /** The rule's current expiresAt, kept as is until the user edits the "Expires in" field. */
+  keepExpiresAt?: number;
 }
 
-export function ruleToForm(rule?: Rule): RuleForm {
+export type ExpiryUnit = 's' | 'm' | 'h';
+export const EXPIRY_UNIT_MS: Record<ExpiryUnit, number> = { s: 1000, m: 60_000, h: 3_600_000 };
+export const MAX_EXPIRY_MS = 24 * 3_600_000;
+
+export function ruleToForm(rule?: Rule, now = Date.now()): RuleForm {
   const f: RuleForm = {
     id: rule?.id ?? newId('rule'),
     isNew: !rule,
@@ -692,7 +954,17 @@ export function ruleToForm(rule?: Rule): RuleForm {
     blockMode: 'reset',
     blockStatus: '403',
     phase: 'both',
+    throttle: { latencyMs: '400', kbps: '', dropPct: '' },
+    fault: 'reset',
+    times: rule?.times !== undefined ? String(rule.times) : '',
+    expiresIn: '',
+    expiresUnit: 'm',
   };
+  if (rule?.expiresAt !== undefined) {
+    f.keepExpiresAt = rule.expiresAt;
+    const left = rule.expiresAt - now;
+    if (left > 0) f.expiresIn = String(Math.max(1, Math.ceil(left / 60_000)));
+  }
   const a = rule?.action;
   if (a?.kind === 'mock') {
     f.mockStatus = String(a.status);
@@ -704,12 +976,20 @@ export function ruleToForm(rule?: Rule): RuleForm {
     if (a.status !== undefined) f.blockStatus = String(a.status);
   } else if (a?.kind === 'breakpoint') {
     f.phase = a.phase;
+  } else if (a?.kind === 'throttle') {
+    f.throttle = throttleFieldsOf(a);
+  } else if (a?.kind === 'fault') {
+    f.fault = a.fault;
   }
   return f;
 }
 
+export type RuleFormField =
+  | 'url' | 'method' | 'mockStatus' | 'mockDelayMs' | 'blockStatus' | 'mockHeaders'
+  | 'latencyMs' | 'kbps' | 'dropPct' | 'throttle' | 'times' | 'expiresIn';
+
 export interface RuleFormValidation {
-  errors: Partial<Record<'url' | 'method' | 'mockStatus' | 'mockDelayMs' | 'blockStatus' | 'mockHeaders', string>>;
+  errors: Partial<Record<RuleFormField, string>>;
   urlHint: string;
   json?: JsonCheck;
 }
@@ -745,11 +1025,24 @@ export function validateRuleForm(f: RuleForm): RuleFormValidation {
     if (isJsonContentType(ct) && f.mockBody.trim()) json = validateJson(f.mockBody);
   } else if (f.kind === 'block' && f.blockMode === 'status' && !isStatus(f.blockStatus)) {
     errors.blockStatus = '100–599';
+  } else if (f.kind === 'throttle') {
+    const t = checkThrottle(f.throttle);
+    if (t.errors.latencyMs) errors.latencyMs = t.errors.latencyMs;
+    if (t.errors.kbps) errors.kbps = t.errors.kbps;
+    if (t.errors.dropPct) errors.dropPct = t.errors.dropPct;
+    if (t.errors.all) errors.throttle = t.errors.all;
+  }
+  const times = f.times.trim();
+  if (times && (!isInt(times) || +times < 1 || +times > 1000)) errors.times = 'Whole number 1–1000 (empty = every request)';
+  const exp = f.expiresIn.trim();
+  if (exp && f.keepExpiresAt === undefined) {
+    const ms = Number(exp) * EXPIRY_UNIT_MS[f.expiresUnit];
+    if (!/^\d+(\.\d+)?$/.test(exp) || !(ms >= 1000) || ms > MAX_EXPIRY_MS) errors.expiresIn = 'Between 1 second and 24 hours (empty = never)';
   }
   return { errors, urlHint, json };
 }
 
-export function formToRule(f: RuleForm): Rule {
+export function formToRule(f: RuleForm, now = Date.now()): Rule {
   let action: RuleAction;
   if (f.kind === 'mock') {
     const headers = rowsToFlatRecord(f.mockHeaders);
@@ -758,11 +1051,18 @@ export function formToRule(f: RuleForm): Rule {
     if (f.mockDelayMs.trim() && Number(f.mockDelayMs) > 0) action.delayMs = Number(f.mockDelayMs);
   } else if (f.kind === 'block') {
     action = f.blockMode === 'reset' ? { kind: 'block', mode: 'reset' } : { kind: 'block', mode: 'status', status: Number(f.blockStatus) };
+  } else if (f.kind === 'throttle') {
+    action = { kind: 'throttle', ...checkThrottle(f.throttle).value };
+  } else if (f.kind === 'fault') {
+    action = { kind: 'fault', fault: f.fault };
   } else {
     action = { kind: 'breakpoint', phase: f.phase };
   }
   const rule: Rule = { id: f.id, enabled: f.enabled, match: { url: f.url.trim() }, action };
   if (f.name.trim()) rule.name = f.name.trim();
   if (f.method.trim()) rule.match.method = f.method.trim().toUpperCase();
+  if (f.times.trim()) rule.times = Number(f.times.trim());
+  if (f.keepExpiresAt !== undefined) rule.expiresAt = f.keepExpiresAt;
+  else if (f.expiresIn.trim()) rule.expiresAt = now + Math.round(Number(f.expiresIn.trim()) * EXPIRY_UNIT_MS[f.expiresUnit]);
   return rule;
 }

@@ -42,6 +42,10 @@ Intercept skips all of that:
 | **Mock** | Answer a request with your own status, headers, body and delay, without calling the server. |
 | **Block** | Fail a request with a connection reset or an error status. |
 | **One-click rules** | **Mock this**, **Block this** and **Break on this** on any recorded request. |
+| **Where did it come from?** | Each request shows the line of your code that made it. **Open source** jumps there. |
+| **Copy and resend** | Copy as cURL, Dart http or Dio. Resend a request, or edit it first. |
+| **Bad networks** | Offline, Slow 3G, Flaky or custom, for your app only. Throttle and fault rules per endpoint. |
+| **Search** | `m:POST s:4xx body:"token" src:login_page.dart` and friends. |
 | **Rules** | Glob or `/regex/` URL matching plus method. First match wins. Saved per workspace. |
 | **Theme-aware** | Follows your VS Code theme: light, dark and high contrast. |
 

@@ -35,6 +35,31 @@ export interface Exchange {
   pauseDeadline?: number; // epoch ms when breakpointTimeoutMs auto-resumes
   matchedRuleId?: string;
   error?: string;
+  /** CONTRACTS §9.2: the app call site, once the entry's trace and the request meet. */
+  source?: SourceInfo;
+  /** Who sent it when not the app (CONTRACTS §9.2 `send`). */
+  initiator?: 'editor' | 'agent';
+  /** Id of the exchange this one was resent from. */
+  resentFrom?: string;
+  /** Set when the client came through the LAN listener (physical iPhone, CONTRACTS §7). */
+  viaLan?: true;
+  /** Human label when a throttle / fault / network profile affected it (e.g. "Slow 3G: +400 ms, 400 kbps"). */
+  simulated?: string;
+}
+
+/** One parsed Dart stack frame. `line`/`column` are 1-based as Dart prints them. */
+export interface StackFrame {
+  fn: string;
+  uri: string; // package:app/x.dart, file:///…, dart:async, …
+  line?: number;
+  column?: number;
+  /** An `<asynchronous suspension>` / async gap precedes this frame. */
+  afterAsyncGap?: boolean;
+}
+
+export interface SourceInfo {
+  frames: StackFrame[]; // ≤ 30
+  appFrame?: number; // index into frames of the app's call site
 }
 
 export interface Matcher {
@@ -47,7 +72,12 @@ export interface Matcher {
 export type RuleAction =
   | { kind: 'mock'; status: number; headers?: Record<string, string>; body: string; delayMs?: number }
   | { kind: 'block'; mode: 'reset' | 'status'; status?: number } // reset = connection reset
-  | { kind: 'breakpoint'; phase: 'request' | 'response' | 'both' };
+  | { kind: 'breakpoint'; phase: 'request' | 'response' | 'both' }
+  // CONTRACTS §9.2. throttle passes through to the real server, slowed; dropRate 0–1 = share reset instead.
+  | { kind: 'throttle'; latencyMs?: number; kbps?: number; dropRate?: number }
+  | { kind: 'fault'; fault: FaultKind };
+
+export type FaultKind = 'reset' | 'timeout' | 'truncate' | 'dns';
 
 export interface Rule {
   id: string;
@@ -55,6 +85,22 @@ export interface Rule {
   name?: string;
   match: Matcher;
   action: RuleAction;
+  /** Applies to the first N matching requests, then is spent (CONTRACTS §9.2). */
+  times?: number;
+  /** Epoch ms after which the rule is spent. */
+  expiresAt?: number;
+  /** Read-only, set by the host for rules with `times`: matching requests so far. Never persisted; ignored by setRules. */
+  used?: number;
+}
+
+/** CONTRACTS §9.2 `InterceptProxy.send`. */
+export interface SendRequest {
+  method: string;
+  url: string;
+  headers?: Record<string, string | string[]>;
+  body?: string;
+  initiator: 'editor' | 'agent';
+  resentFrom?: string;
 }
 
 // `headers`, when present, REPLACES the whole header set. `body` is the decoded text;
@@ -90,4 +136,9 @@ export interface InterceptProxyOptions {
    * Default 256 MB.
    */
   maxStoredBodyBytes?: number;
+  /**
+   * CONTRACTS §9.2. Loopback clients only: connect 10.0.2.2 / 10.0.3.2 targets (emulator aliases for the
+   * host) to 127.0.0.1. Default true. LAN clients keep the §7 SSRF guard.
+   */
+  rewriteLocalhost?: boolean;
 }

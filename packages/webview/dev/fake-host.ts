@@ -11,6 +11,13 @@
  *              ?lan=1 start with the iPhone LAN listener open (dev bar: open/close LAN)
  *              ?agent=connected|readOnly|off simulated Agent API status (dev bar cycles it; "connected" adds an
  *              "[agent] …" mock rule and fakes tool calls)
+ *              ?net=offline|slow-3g|fast-3g|flaky start with that network profile
+ *
+ * v0.3.0 (CONTRACTS §9): exchanges carry a fake `source` (Dio / http stacks with async gaps) that arrives a moment
+ * after the request, like the real trace side channel; `send` runs through the simulated proxy (initiator, resentFrom)
+ * and is answered with `sent`; `setNetworkProfile` updates status and slows / fails pass-through traffic;
+ * throttle / fault rules are simulated; rules with `times` / `expiresAt` are spent and removed like the host does.
+ * `openSource` / `copySnippet` only log (plus an `error` for a request without a source or an SDK frame).
  *
  * Semantics follow CONTRACTS §3/§4: pausedAt/pauseDeadline while paused, auto-resume unedited at the
  * deadline, a client that gives up while paused → 'error' (late resume ignored), invalid edit → 'error'
@@ -18,9 +25,11 @@
  * createRuleFromExchange uses the proxy's ruleFromExchange and inserts the rule first.
  */
 import type {
-  Body, Exchange, HostMsg, RequestEdit, ResponseEdit, Rule, Status, ViewMsg,
+  Body, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit, Rule, SendDraft, Status, ViewMsg,
 } from '../src/protocol';
+import type { SourceInfo, StackFrame } from '@flutter-intercept/proxy/types';
 import { matches, ruleFromExchange } from '@flutter-intercept/proxy/rules';
+import { describeProfile, presetProfile, type NetworkPresetId } from '@flutter-intercept/proxy/network';
 
 const params = new URLSearchParams(location.search);
 
@@ -63,7 +72,29 @@ let rules: Rule[] = [
     match: { method: 'GET', url: 'https://api.shop.example.com/v1/me' },
     action: { kind: 'breakpoint', phase: 'response' },
   },
+  {
+    id: 'rule_throttle_feed', enabled: true, name: 'Slow feed',
+    match: { method: 'GET', url: 'https://api.shop.example.com/v1/feed' },
+    action: { kind: 'throttle', latencyMs: 1200, kbps: 256 },
+  },
+  {
+    id: 'rule_fault_reco', enabled: true, name: 'Recommendations: DNS failure (first 3)',
+    match: { url: 'https://api.shop.example.com/v1/recommendations*' },
+    action: { kind: 'fault', fault: 'dns' }, times: 3, expiresAt: Date.now() + 10 * 60_000,
+  },
 ];
+/** Rule hit counts by id (the proxy keeps them across setRules; dropped when the id disappears). */
+const hits = new Map<string, number>();
+const isSpent = (r: Rule) => (r.times !== undefined && (hits.get(r.id) ?? 0) >= r.times) || (r.expiresAt !== undefined && r.expiresAt <= Date.now());
+/** Host behaviour (CONTRACTS §9.4): a spent rule is removed and the new list broadcast. */
+function removeSpentRules() {
+  const keep = rules.filter((r) => !isSpent(r));
+  if (keep.length === rules.length) return;
+  rules = keep;
+  for (const id of [...hits.keys()]) if (!rules.some((r) => r.id === id)) hits.delete(id);
+  send({ type: 'rules', rules });
+}
+setInterval(removeSpentRules, 1000);
 
 const BP_TIMEOUT = Number(params.get('bpTimeout') ?? 300_000);
 const CLIENT_TIMEOUT = Number(params.get('clientTimeout') ?? 120_000);
@@ -127,7 +158,59 @@ function onViewMsg(msg: ViewMsg) {
       send({ type: 'rules', rules });
       break;
     }
+    case 'send': {
+      const problem = invalidSend(msg.request);
+      if (problem) { send({ type: 'error', message: `Send failed: ${problem}` }); break; }
+      const id = simulate(templateFor(msg.request), { initiator: 'editor', resentFrom: msg.resentFrom });
+      send({ type: 'sent', id });
+      break;
+    }
+    case 'openSource': {
+      const ex = find(msg.id);
+      const frame = ex?.source?.frames[msg.frame ?? ex.source.appFrame ?? -1];
+      if (!ex?.source) send({ type: 'error', message: 'No source for this request (the trace has not arrived, or capture is off).' });
+      else if (!frame || frame.uri.startsWith('dart:')) send({ type: 'error', message: `Can't open ${frame?.uri ?? 'that frame'}: the file is not in the workspace.` });
+      else console.info(`[fake-host] would open ${frame.uri}:${frame.line}:${frame.column ?? 1}`);
+      break;
+    }
+    case 'copySnippet': {
+      const ex = find(msg.id);
+      if (!ex) { send({ type: 'error', message: 'No such exchange' }); break; }
+      const curl = `curl -X ${ex.method} '${ex.url}'${Object.entries(ex.requestHeaders).map(([k, v]) => ` -H '${k}: ${v}'`).join('')}`;
+      console.info(`[fake-host] clipboard (${msg.format}):`, curl);
+      navigator.clipboard?.writeText(`// ${msg.format} (dev harness: always cURL)\n${curl}`).catch(() => {});
+      break;
+    }
+    case 'setNetworkProfile':
+      status = { ...status, networkProfile: msg.profile.kind === 'none' ? undefined : msg.profile };
+      if (!status.networkProfile) delete status.networkProfile;
+      send({ type: 'status', status });
+      break;
   }
+}
+
+function invalidSend(r: SendDraft): string | undefined {
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(r.method)) return `invalid method ${r.method}`;
+  try {
+    const u = new URL(r.url);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return `unsupported URL ${r.url}`;
+  } catch { return `invalid URL ${r.url}`; }
+  return undefined;
+}
+
+/** A sent request answers like the template with the same method + path when there is one, else echoes. */
+function templateFor(r: SendDraft): Template {
+  const base = TEMPLATES.find((t) => t.method === r.method && sameRoute(t.url(), r.url));
+  const reqBody: Body | undefined = r.body !== undefined ? { text: r.body, encoding: 'utf8' } : undefined;
+  if (base) return { ...base, url: () => r.url, reqHeaders: r.headers ?? {}, reqBody: () => reqBody, src: undefined };
+  return {
+    weight: 0, method: r.method, url: () => r.url, reqHeaders: r.headers ?? {}, reqBody: () => reqBody,
+    status: 200, resHeaders: JSON_RES, latency: [40, 200],
+    resBody: () => json({ echo: { method: r.method, url: r.url, body: r.body ?? null } }),
+  };
+}
+function sameRoute(a: string, b: string): boolean {
+  try { return new URL(a).pathname.replace(/\d+/g, 'N') === new URL(b).pathname.replace(/\d+/g, 'N'); } catch { return false; }
 }
 
 (window as unknown as { acquireVsCodeApi: () => unknown }).acquireVsCodeApi = () => {
@@ -145,7 +228,8 @@ function onViewMsg(msg: ViewMsg) {
 function find(id: string) { return exchanges.find((e) => e.id === id); }
 
 function update(ex: Exchange, patch: Partial<Exchange>): Exchange {
-  const next = { ...ex, ...patch } as Exchange;
+  // Merge into the stored version (like the proxy): a late `source` must survive updates made from an older copy.
+  const next = { ...(find(ex.id) ?? ex), ...patch } as Exchange;
   for (const k of Object.keys(next) as (keyof Exchange)[]) if (next[k] === undefined) delete next[k];
   exchanges = exchanges.map((e) => (e.id === ex.id ? next : e));
   send({ type: 'exchange', exchange: next });
@@ -210,6 +294,34 @@ interface Template {
   latency: [number, number];
   error?: string;
   weight: number;
+  /** App call chain (innermost first): [function, path under package:shop/, line]. */
+  src?: { http: 'dio' | 'http'; chain: [string, string, number][] };
+}
+
+// ---------------------------------------------------------------- fake source traces (CONTRACTS §9.2)
+
+const ENTRY_URI = 'file:///Users/dev/shop/.dart_tool/flutter_intercept/entry_lib__main.dart';
+const LIB_FRAMES: Record<'dio' | 'http', StackFrame[]> = {
+  dio: [
+    { fn: 'DioMixin._dispatchRequest', uri: 'package:dio/src/dio_mixin.dart', line: 544, column: 46 },
+    { fn: 'DioMixin.fetch.<anonymous closure>', uri: 'package:dio/src/dio_mixin.dart', line: 455, column: 12, afterAsyncGap: true },
+    { fn: 'DioMixin.fetch', uri: 'package:dio/src/dio_mixin.dart', line: 430, column: 5, afterAsyncGap: true },
+  ],
+  http: [
+    { fn: 'IOClient.send', uri: 'package:http/src/io_client.dart', line: 90, column: 38 },
+    { fn: 'BaseClient._sendUnstreamed', uri: 'package:http/src/base_client.dart', line: 93, column: 32 },
+    { fn: 'BaseClient.get', uri: 'package:http/src/base_client.dart', line: 28, column: 7 },
+  ],
+};
+function fakeSource(src: NonNullable<Template['src']>): SourceInfo {
+  const lib = LIB_FRAMES[src.http];
+  const frames: StackFrame[] = [
+    { fn: '_InterceptedHttpClient.openUrl', uri: ENTRY_URI, line: 141, column: 22 },
+    ...lib,
+    ...src.chain.map(([fn, path, line], i): StackFrame => ({ fn, uri: `package:shop/${path}`, line, column: 7 + i * 4, afterAsyncGap: i > 0 })),
+    { fn: '_rootRunUnary', uri: 'dart:async/zone.dart', line: 1407, column: 47, afterAsyncGap: true },
+  ];
+  return { frames, appFrame: 1 + lib.length };
 }
 
 const json = (v: unknown): Body => ({ text: JSON.stringify(v), encoding: 'utf8' });
@@ -226,21 +338,26 @@ const product = (id: number) => ({
 });
 
 const TEMPLATES: Template[] = [
-  { weight: 6, method: 'GET', url: () => `https://api.shop.example.com/v1/products?page=${rnd(1, 9)}&limit=20`, reqHeaders: { ...UA, ...AUTH, accept: 'application/json' },
+  { weight: 6, src: { http: 'dio', chain: [['ProductsApi.list', 'data/products_api.dart', 31], ['ProductsRepository.page', 'data/products_repository.dart', 17], ['_HomePageState._loadMore', 'ui/home_page.dart', 54]] },
+    method: 'GET', url: () => `https://api.shop.example.com/v1/products?page=${rnd(1, 9)}&limit=20`, reqHeaders: { ...UA, ...AUTH, accept: 'application/json' },
     status: 200, resHeaders: JSON_RES, resBody: () => json({ page: 1, total: 183, items: Array.from({ length: 20 }, (_, i) => product(100 + i)) }), latency: [60, 400] },
-  { weight: 4, method: 'GET', url: () => `https://api.shop.example.com/v1/products/${rnd(1, 300)}`, reqHeaders: { ...UA, ...AUTH },
+  { weight: 4, src: { http: 'dio', chain: [['ProductsApi.byId', 'data/products_api.dart', 44], ['ProductPage.build.<anonymous closure>', 'ui/product_page.dart', 23]] },
+    method: 'GET', url: () => `https://api.shop.example.com/v1/products/${rnd(1, 300)}`, reqHeaders: { ...UA, ...AUTH },
     status: 200, resHeaders: JSON_RES, resBody: () => json({ ...product(rnd(1, 300)), description: 'A thing you will love.\nSecond line.', variants: [{ sku: 'A-1', size: 'M' }, { sku: 'A-2', size: 'L' }], meta: null }), latency: [40, 250] },
-  { weight: 2, method: 'POST', url: () => 'https://api.shop.example.com/v1/cart/items', reqHeaders: { ...UA, ...AUTH, 'content-type': 'application/json' },
+  { weight: 2, src: { http: 'dio', chain: [['CartApi.add', 'data/cart_api.dart', 19], ['CartNotifier.add', 'state/cart_notifier.dart', 37], ['AddToCartButton._onPressed', 'ui/widgets/add_to_cart_button.dart', 28]] },
+    method: 'POST', url: () => 'https://api.shop.example.com/v1/cart/items', reqHeaders: { ...UA, ...AUTH, 'content-type': 'application/json' },
     reqBody: () => json({ productId: rnd(1, 300), quantity: rnd(1, 3) }), status: 201, resHeaders: JSON_RES, resBody: () => json({ cartId: 'c_91', items: 3, total: { amount: 42.5, currency: 'EUR' } }), latency: [80, 300] },
   { weight: 3, method: 'GET', url: () => `https://cdn.shop.example.com/img/${rnd(1, 300)}.png`, reqHeaders: { 'user-agent': 'Dart/3.5 (dart:io)' },
     status: 200, resHeaders: { 'content-type': 'image/png', 'cache-control': 'max-age=86400' }, resBody: () => ({ text: PNG_16PX, encoding: 'base64' }), latency: [20, 120] },
-  { weight: 1, method: 'GET', url: () => 'https://api.shop.example.com/v1/me', reqHeaders: { ...UA },
+  { weight: 1, src: { http: 'http', chain: [['AuthService.me', 'auth/auth_service.dart', 62], ['main', 'main.dart', 18]] },
+    method: 'GET', url: () => 'https://api.shop.example.com/v1/me', reqHeaders: { ...UA },
     status: 401, resHeaders: { 'content-type': 'application/problem+json', 'www-authenticate': 'Bearer' }, resBody: () => json({ type: 'about:blank', title: 'Unauthorized', status: 401, detail: 'Token expired' }), latency: [30, 90] },
   { weight: 1, method: 'GET', url: () => 'https://api.shop.example.com/v1/recommendations', reqHeaders: { ...UA, ...AUTH },
     status: 503, resHeaders: { 'content-type': 'text/html', 'retry-after': '30' }, resBody: () => ({ text: '<html><body><h1>503 Service Unavailable</h1></body></html>', encoding: 'utf8' }), latency: [900, 2500] },
   { weight: 1, method: 'POST', url: () => 'https://telemetry.example.net/v2/collect', reqHeaders: { 'content-type': 'application/json' },
     reqBody: () => json({ events: [{ name: 'screen_view', screen: 'home' }] }), status: 'error', error: 'SocketException: Connection refused (OS Error: Connection refused, errno = 61)', latency: [10, 40] },
-  { weight: 1, method: 'PUT', url: () => 'https://api.shop.example.com/v1/profile', reqHeaders: { ...UA, ...AUTH, 'content-type': 'application/json' },
+  { weight: 1, src: { http: 'http', chain: [['ProfileApi.save', 'data/profile_api.dart', 25]] },
+    method: 'PUT', url: () => 'https://api.shop.example.com/v1/profile', reqHeaders: { ...UA, ...AUTH, 'content-type': 'application/json' },
     reqBody: () => json({ displayName: 'Ada', newsletter: true }), status: 204, resHeaders: { 'x-request-id': 'req-11' }, latency: [50, 200] },
   { weight: 1, method: 'GET', url: () => 'https://api.shop.example.com/v1/checkout/legacy', reqHeaders: { ...UA },
     status: 302, resHeaders: { location: 'https://api.shop.example.com/v2/checkout', 'set-cookie': ['session=abc; HttpOnly', 'theme=dark'] }, latency: [20, 60] },
@@ -248,7 +365,8 @@ const TEMPLATES: Template[] = [
     status: 200, resHeaders: { 'content-type': 'application/pdf', 'content-length': '7340032' }, resBody: () => ({ text: 'JVBERi0xLjcK'.repeat(2000), encoding: 'base64', truncated: true }), latency: [400, 1200] },
   { weight: 1, method: 'GET', url: () => 'https://api.shop.example.com/v1/flags', reqHeaders: { ...UA }, status: 200, resHeaders: JSON_RES, resBody: () => json({ newCheckout: false }), latency: [20, 50] },
   { weight: 1, method: 'GET', url: () => 'https://ads.tracker.example.org/pixel?u=42', reqHeaders: { 'user-agent': 'Dart/3.5 (dart:io)' }, status: 200, resHeaders: { 'content-type': 'image/gif' }, latency: [20, 60] },
-  { weight: 1, method: 'GET', url: () => 'https://api.shop.example.com/v1/feed', reqHeaders: { ...UA, ...AUTH }, status: 200, resHeaders: JSON_RES,
+  { weight: 1, src: { http: 'dio', chain: [['FeedApi.load', 'data/feed_api.dart', 12], ['FeedController.refresh', 'state/feed_controller.dart', 40]] },
+    method: 'GET', url: () => 'https://api.shop.example.com/v1/feed', reqHeaders: { ...UA, ...AUTH }, status: 200, resHeaders: JSON_RES,
     resBody: () => json({ sections: Array.from({ length: 150 }, (_, i) => ({ id: i, title: `Section ${i}`, items: [product(i), product(i + 1)], layout: { kind: 'carousel', columns: 2 } })) }), latency: [100, 600] },
 ];
 
@@ -279,24 +397,62 @@ function applyResponseEdit(ex: Exchange, e?: ResponseEdit): Partial<Exchange> {
   return p;
 }
 
-/** Run one exchange through the simulated proxy. `instant` = no timers (preload). */
-function simulate(t: Template, opts: { instant?: boolean; startedAt?: number } = {}) {
+/** Run one exchange through the simulated proxy. `instant` = no timers (preload). Returns the exchange id. */
+function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; initiator?: 'editor' | 'agent'; resentFrom?: string } = {}): string {
   const id = `ex_${++seq}`;
   let ex: Exchange = {
     id, startedAt: opts.startedAt ?? Date.now(), method: t.method, url: t.url(),
     requestHeaders: t.reqHeaders ?? {}, requestBody: t.reqBody?.(), state: 'pending',
   };
-  const rule = rules.find((r) => r.enabled && matches(r.match, ex.method, ex.url));
-  if (rule) ex.matchedRuleId = rule.id;
-  const latency = rnd(...t.latency);
+  if (opts.initiator) ex.initiator = opts.initiator;
+  if (opts.resentFrom) ex.resentFrom = opts.resentFrom;
+  if (!ex.requestBody) delete ex.requestBody;
+  const rule = rules.find((r) => r.enabled && !isSpent(r) && matches(r.match, ex.method, ex.url));
+  if (rule) {
+    ex.matchedRuleId = rule.id;
+    hits.set(rule.id, (hits.get(rule.id) ?? 0) + 1);
+    if (isSpent(rule)) setTimeout(removeSpentRules, opts.instant ? 0 : 50);
+  }
   const later = (ms: number, fn: () => void) => (opts.instant ? fn() : setTimeout(fn, ms));
+  const a = rule?.action;
+
+  // Network profile (global) + throttle rule: what would reach the network is slowed or failed.
+  const reachesNetwork = !a || a.kind === 'breakpoint' || a.kind === 'throttle';
+  const profile: NetworkProfile = status.networkProfile ?? { kind: 'none' };
+  let latency = rnd(...t.latency);
+  const simulated: string[] = [];
+  let drop = 0;
+  let kbps: number | undefined;
+  if (reachesNetwork && profile.kind === 'throttle') {
+    latency += profile.latencyMs ?? 0;
+    drop = profile.dropRate ?? 0;
+    kbps = profile.kbps;
+    simulated.push(describeProfile(profile));
+  }
+  if (a?.kind === 'throttle') {
+    latency += a.latencyMs ?? 0;
+    drop = Math.max(drop, a.dropRate ?? 0);
+    kbps = a.kbps !== undefined ? Math.min(a.kbps, kbps ?? Infinity) : kbps;
+    simulated.push(`Throttle rule: ${describeProfile({ kind: 'throttle', latencyMs: a.latencyMs, kbps: a.kbps, dropRate: a.dropRate })}`);
+  }
+  if (simulated.length) ex.simulated = simulated.join(' + ');
+
+  // The trace side channel: the source meets the exchange a moment later.
+  const attachSource = () => {
+    if (!t.src) return;
+    const cur = find(id);
+    if (cur) update(cur, { source: fakeSource(t.src) });
+  };
 
   const finish = (cur: Exchange) => {
     if (t.status === 'error') {
       update(cur, { state: 'error', error: t.error, durationMs: latency });
       return;
     }
-    const resp: Partial<Exchange> = { status: t.status, responseHeaders: t.resHeaders ?? {}, responseBody: t.resBody?.() };
+    const body = t.resBody?.();
+    const bytes = body ? (body.encoding === 'base64' ? body.text.length * 0.75 : body.text.length) : 0;
+    const transfer = kbps ? Math.round((bytes * 8) / kbps) : 0;
+    const resp: Partial<Exchange> = { status: t.status, responseHeaders: t.resHeaders ?? {}, responseBody: body };
     if (rule?.action.kind === 'breakpoint' && rule.action.phase !== 'request') {
       pause(cur, 'response', resp, (edit) => {
         const p = find(id) ?? cur;
@@ -304,13 +460,17 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number } =
       });
       return;
     }
-    update(cur, { ...resp, state: 'completed', durationMs: latency });
+    later(transfer, () => update(find(id) ?? cur, { ...resp, state: 'completed', durationMs: latency + transfer }));
   };
 
   record(ex, !opts.instant);
   if (!opts.instant) send({ type: 'exchange', exchange: ex });
+  later(40, attachSource);
 
-  const a = rule?.action;
+  const fail = (error: string, label: string, after = 2) => later(after, () => update(find(id) ?? ex, {
+    state: 'blocked', error, durationMs: after, simulated: ex.simulated ? `${ex.simulated} → ${label}` : label,
+  }));
+
   if (a?.kind === 'mock') {
     later(a.delayMs ?? 5, () => update(ex, {
       state: 'mocked', status: a.status, responseHeaders: a.headers ?? {}, responseBody: { text: a.body, encoding: 'utf8' }, durationMs: a.delayMs ?? 5,
@@ -319,6 +479,23 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number } =
     later(2, () => update(ex, a.mode === 'reset'
       ? { state: 'blocked', durationMs: 2, error: 'Connection reset by rule' }
       : { state: 'blocked', status: a.status ?? 403, responseHeaders: {}, durationMs: 2 }));
+  } else if (a?.kind === 'fault') {
+    const host = (() => { try { return new URL(ex.url).host; } catch { return ex.url; } })();
+    if (a.fault === 'dns') fail(`SocketException: Failed host lookup: '${host}' (simulated)`, 'Fault: DNS failure');
+    else if (a.fault === 'reset') fail('Connection reset by peer (simulated fault)', 'Fault: connection reset');
+    else if (a.fault === 'timeout') fail('Client gave up waiting (simulated timeout)', 'Fault: timeout', opts.instant ? 0 : 8000);
+    else later(latency, () => {
+      const body = t.resBody?.();
+      update(find(id) ?? ex, {
+        state: 'blocked', status: t.status === 'error' ? 200 : t.status, responseHeaders: t.resHeaders ?? {},
+        responseBody: body ? { ...body, text: body.text.slice(0, Math.floor(body.text.length / 2)), truncated: true } : undefined,
+        durationMs: latency, error: 'Response body cut mid-way (simulated)', simulated: 'Fault: truncated response',
+      });
+    });
+  } else if (reachesNetwork && profile.kind === 'offline') {
+    fail("SocketException: Failed host lookup (OS Error: nodename nor servname provided) — network profile Offline", 'Offline');
+  } else if (drop && random() < drop) {
+    fail('Connection reset by peer (simulated drop)', `dropped (${Math.round(drop * 100)}% fail)`, Math.min(latency, 300));
   } else if (a?.kind === 'breakpoint' && a.phase !== 'response') {
     ex = pause(ex, 'request', {}, (edit) => {
       const p = find(id) ?? ex;
@@ -328,6 +505,7 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number } =
   } else {
     later(latency, () => finish(find(id) ?? ex));
   }
+  return id;
 }
 
 // ---------------------------------------------------------------- boot
@@ -417,6 +595,17 @@ function wire() {
       send({ type: 'status', status });
     }
   }, 7000);
+  // An AI agent resends a recent finished exchange (CONTRACTS §9.5 resend_request): initiator 'agent', no `sent`.
+  document.getElementById('dev-agent-resend')?.addEventListener('click', () => {
+    const src = [...exchanges].reverse().find((e) => e.state === 'completed');
+    if (!src) return;
+    simulate(templateFor({ method: src.method, url: src.url, headers: src.requestHeaders, body: src.requestBody?.encoding === 'utf8' ? src.requestBody.text : undefined }),
+      { initiator: 'agent', resentFrom: src.id });
+  });
+  const net = params.get('net');
+  if (net === 'offline') status = { ...status, networkProfile: { kind: 'offline' } };
+  else if (net && ['slow-3g', 'fast-3g', 'flaky'].includes(net)) status = { ...status, networkProfile: presetProfile(net as NetworkPresetId) };
+  if (net) send({ type: 'status', status });
   document.getElementById('dev-error')!.addEventListener('click', () => {
     send({ type: 'error', message: 'Simulated host error: could not apply rules (example).' });
   });

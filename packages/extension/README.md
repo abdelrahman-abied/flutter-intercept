@@ -28,8 +28,21 @@ and the traffic shows up.
 
 **Live traffic list**
 - Every request shows its method, status, host, path, time, size and state (paused, mocked, blocked, error).
-- Filter by URL text, method, status class (2xx–5xx, errors) or paused only.
+- Filter by URL text, method, status class (2xx–5xx, errors) or paused only. The text box also takes filters:
+  `m:POST`, `s:4xx`, `s:error`, `t:json`, `body:"token"`, `h:authorization`, `state:mocked`, `src:login_page.dart`
+  (prefix any of them with `-` to exclude).
 - Keyboard navigation and a resizable detail pane.
+
+**Where a request came from**
+- The detail pane shows the line of your code that made the request (for example
+  `CatalogApi.fetchAlbum  lib/api/catalog_api.dart:37`). **Open source** jumps there; expand it for the whole
+  stack. Works with `package:http`, `HttpClient` and Dio (including interceptors).
+- In profile builds Dio requests get no call site, and columns are missing (AOT stacks are shorter).
+- Turn it off with `flutterIntercept.captureSource`.
+
+**Copy and resend**
+- **Copy as cURL**, **Copy as Dart (http)** or **Copy as Dio** from the detail pane or a row's right-click menu.
+- **Resend** a request unchanged, or **Edit and resend** it. The new request is listed with a link to the original.
 
 **Request and response details**
 - Headers and bodies. gzip/deflate/br are decoded, JSON shows as a collapsible tree, binary bodies show their
@@ -52,12 +65,21 @@ and the traffic shows up.
 
 ![“Mock this” creates a rule from the response and opens it for editing](media/screenshots/mock-this-dark.png)
 
+**Bad networks**
+- The toolbar's network picker slows down or cuts off the app you're debugging (not your Mac): **Offline**,
+  **Slow 3G**, **Fast 3G**, **Flaky (20% fail)** or **Custom** latency, bandwidth and failure rate. The status line
+  shows it while it's on.
+- **Throttle** and **Fault** rules do the same for one endpoint. Faults: connection reset, timeout (the request
+  is held until your app gives up), response cut off half-way, and failed lookup (the connection closes without a
+  response).
+
 **Rules**
 - Each rule matches on method plus URL. The URL is a glob such as `https://api.example.com/users/*` or a
   `/regex/`.
 - Rules run top to bottom and the first enabled match wins. The list shows which rules are shadowed by an
   earlier one.
 - Reorder, enable/disable, delete with undo. Rules are saved per workspace.
+- A rule can apply to **only the first N requests** or **expire** after a time; it removes itself afterwards.
 
 ![Rules tab: ordered rules with enable toggles and match counts](media/screenshots/rules-dark.png)
 
@@ -160,6 +182,13 @@ Cursor, and any client that speaks MCP (Model Context Protocol).
 | Clear the recorded traffic | `clear_requests` |
 | Save the traffic as a HAR file in `.dart_tool/flutter_intercept/exports/` | `export_har` |
 | Launch the app through Dart-Code, stop it, or hot-restart it | `launch_app`, `stop_app`, `hot_restart` |
+| Find the file and line that sent a request | `get_request_source` |
+| See the structure of a large JSON body without reading it | `get_body_shape` |
+| Slow down or cut off the network (everything, or one URL) | `simulate_network` |
+| Send a recorded request again, optionally edited (only to servers the app already used) | `resend_request` |
+
+`get_request` can also return the request as a cURL, Dart http or Dio snippet. `add_mock`, `add_block` and
+`add_breakpoint` take `times` and `ttlMs`, so rules an agent adds can clean themselves up.
 
 In VS Code the tools are named `flutter_intercept_<tool>`; over MCP they use the names above.
 
@@ -221,6 +250,8 @@ Running the command again updates it in place, and the rest of the file is left 
 | `flutterIntercept.port` | `8899` | Port of the local proxy. If it's busy, the next free port up to 8999 is used. A change applies at the next launch when no intercepted session is running. |
 | `flutterIntercept.agent.access` | `readWrite` | What AI agents may do: `readWrite`, `readOnly` or `off`. See [Use with AI agents](#use-with-ai-agents). |
 | `flutterIntercept.agent.redactSecrets` | `true` | Show secrets (auth headers, cookies, tokens, passwords) to agents as `[redacted]`. |
+| `flutterIntercept.captureSource` | `true` | Record which line of your code made each request (see [Where a request came from](#features)). Applies at the next launch. Flutter sessions only: plain Dart programs can't take the setting (the Dart VM rejects `--dart-define`) and always record. |
+| `flutterIntercept.rewriteLocalhost` | `true` | Requests to `10.0.2.2` / `10.0.3.2` (the emulator's names for your Mac) go to your Mac's `localhost`. Never applies to iPhones. |
 | `flutterIntercept.agent.mcpPort` | `47823` | Port of the local MCP server for agents. If it's busy, the next free port is used. |
 
 | Command | What it does |
@@ -248,6 +279,7 @@ What isn't intercepted, or behaves differently while intercepting:
   requests fail with `bad certificate` while intercepting. Turn interception off to test pinning.
 - **mTLS (client certificates)**: the proxy can't present your app's client certificate to the server.
 - **A custom `connectionFactory`** that ignores the proxy host and port bypasses the proxy.
+- **Throttling and faults** don't slow down uploads and don't apply to WebSockets.
 - **Long breakpoints and client timeouts**: if your app's own timeout fires while a request is paused (for
   example Dio's `receiveTimeout`), the app gives up. The exchange is then marked "gave up" and can't be resumed.
   Raise the timeout in debug builds if you need long pauses.

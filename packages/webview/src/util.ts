@@ -1,4 +1,6 @@
 import type { Body, Exchange } from './protocol';
+import type { StackFrame } from '@flutter-intercept/proxy/types';
+import { FRAMEWORK_PACKAGES } from '@flutter-intercept/proxy/source';
 
 export type StatusClass = '2xx' | '3xx' | '4xx' | '5xx' | 'error';
 export const STATUS_CLASSES: StatusClass[] = ['2xx', '3xx', '4xx', '5xx', 'error'];
@@ -48,6 +50,15 @@ export function pauseClock(ex: Pick<Exchange, 'state' | 'pausedAt' | 'pauseDeadl
     return { label: t, title: `Paused for ${t}`, urgent: false };
   }
   return undefined;
+}
+
+/** Time left, coarse: "42s", "4m 10s", "1h 5m" (never negative). */
+export function formatRemaining(ms: number): string {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
 /** "3s ago", "2m ago", "1h ago" (never negative). */
@@ -207,6 +218,38 @@ export function describeMatcherUrl(url: string): MatcherUrlInfo {
   } catch (e) {
     return { kind: 'regex', source: m[1], flags: m[2], error: (e as Error).message };
   }
+}
+
+// ---------------------------------------------------------------- source frames (CONTRACTS §9.2)
+
+/** Package name of a `package:name/…` uri. */
+export function packageOf(uri: string): string | undefined {
+  const m = /^package:([^/]+)\//.exec(uri);
+  return m ? m[1] : undefined;
+}
+
+/** SDK, HTTP-stack / Flutter packages and the generated Flutter Intercept entry: shown dimmed. */
+export function isFrameworkFrame(f: Pick<StackFrame, 'uri'>): boolean {
+  if (f.uri.startsWith('dart:')) return true;
+  if (f.uri.includes('.dart_tool/flutter_intercept/')) return true;
+  const pkg = packageOf(f.uri);
+  return !!pkg && FRAMEWORK_PACKAGES.includes(pkg);
+}
+
+/** Short location for a frame: last two path segments + line, e.g. "api/client.dart:42". */
+export function shortFrameLocation(f: Pick<StackFrame, 'uri' | 'line'>): string {
+  let path = f.uri;
+  if (!path.startsWith('dart:')) {
+    path = path.replace(/^package:[^/]+\//, '').replace(/^file:\/\/\/?/, '/');
+    const segs = path.split('/').filter(Boolean);
+    path = segs.slice(-2).join('/');
+  }
+  return f.line !== undefined ? `${path}:${f.line}` : path;
+}
+
+/** Full location for tooltips: "package:app/api.dart:42:7". */
+export function fullFrameLocation(f: Pick<StackFrame, 'uri' | 'line' | 'column'>): string {
+  return `${f.uri}${f.line !== undefined ? `:${f.line}` : ''}${f.line !== undefined && f.column !== undefined ? `:${f.column}` : ''}`;
 }
 
 // ---------------------------------------------------------------- JSON

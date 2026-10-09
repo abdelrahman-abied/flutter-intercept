@@ -4,6 +4,8 @@
  *
  * Per device: get_status → launch_app → wait_for_request(GET users/1) → add_mock(users/1) →
  * hot_restart → the restarted app prints the mocked body → remove_rule → stop_app.
+ * v0.3.0 (MCP door): get_request_source, get_body_shape, get_request snippets, resend_request (and its origin
+ * refusal), simulate_network (global profile + url-scoped fault with times:1), add_mock with ttlMs.
  *
  * Two paths, chosen automatically:
  *  - "lm":     the extension registered `flutter_intercept_*` (lead wiring + package.json
@@ -290,6 +292,140 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
       console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
     }
 
+    // v0.3.0 tools (CONTRACTS §9.5) over MCP against the real AgentApi + proxy: source, body shape, snippets,
+    // resend (origin-restricted), network profile, url-scoped fault with times:1 (spent rule removed by the
+    // host), add_mock with ttlMs (expiry removes it without traffic).
+    for (const dev of devices) {
+      const out: RunOutcome = { name: `AGENT ${dev} v0.3.0 tools over MCP: source, shape, snippet, resend, simulate_network, times/ttlMs`, output: '', proxyHits: [], failures: [], ms: 0 };
+      const f = out.failures;
+      const t0 = Date.now();
+      let sessionId: string | undefined;
+      const notes: string[] = [];
+      const rulesNow = async () => ((await mcpCall('list_rules')).result.rules ?? []) as Rule[];
+      const gone = async (ruleId: string, ms: number) => {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {
+          if (!(await rulesNow()).some((r) => r.id === ruleId)) return true;
+          await sleep(250);
+        }
+        return false;
+      };
+      try {
+        client = await connect();
+        const since = Date.now();
+        const l = await mcpCall('launch_app', { deviceId: dev });
+        sessionId = l.result.sessionId;
+        if (l.isError || !sessionId) throw new Error(`launch_app: ${l.text.slice(0, 200)}`);
+        const w = await mcpCall('wait_for_request', { url: USERS1, method: 'GET', sinceMs: since, timeoutMs: 120_000 });
+        if (w.isError || w.result.timedOut || w.result.status !== 200) throw new Error(`wait_for_request: ${w.text.slice(0, 200)}`);
+        const id = w.result.id as string;
+
+        // get_request_source: the trace may arrive just after the exchange completes.
+        let src: any;
+        for (let i = 0; i < 20; i++) {
+          src = (await mcpCall('get_request_source', { id })).result;
+          if (src.available) break;
+          await sleep(250);
+        }
+        if (!src?.available) f.push(`get_request_source: ${JSON.stringify(src).slice(0, 300)}`);
+        else {
+          if (!/^lib\/.+\.dart$/.test(src.appFrame?.path ?? '')) f.push(`get_request_source appFrame.path not project-relative lib/…: ${JSON.stringify(src.appFrame)}`);
+          if (!(src.appFrame?.line > 0)) f.push(`get_request_source appFrame.line: ${JSON.stringify(src.appFrame)}`);
+          if (JSON.stringify(src).includes(process.env.HOME ?? '/Users/')) f.push('get_request_source leaks an absolute home path');
+          notes.push(`source ${src.appFrame?.path}:${src.appFrame?.line} (${src.appFrame?.fn})`);
+        }
+
+        // get_body_shape: jsonplaceholder users/1.
+        const shape = await mcpCall('get_body_shape', { id });
+        const sh = shape.result.shape;
+        if (shape.isError || sh?.id !== 'integer' || typeof sh?.address !== 'object' || sh?.email !== 'string') f.push(`get_body_shape: ${shape.text.slice(0, 300)}`);
+        if (shape.text.length > 4000) f.push(`get_body_shape result too large: ${shape.text.length} chars`);
+        if (/Leanne|Sincere@april\.biz/.test(shape.text)) f.push('get_body_shape returned values');
+
+        // get_request snippets (redacted view).
+        for (const fmt of ['curl', 'dart_http', 'dio']) {
+          const g = await mcpCall('get_request', { id, snippet: fmt, includeBodies: false });
+          const snip = String(g.result.snippet ?? '');
+          if (g.isError || !snip.includes('jsonplaceholder.typicode.com/users/1')) f.push(`get_request snippet ${fmt}: ${g.text.slice(0, 200)}`);
+          if (!snip.includes('[redacted]')) f.push(`snippet ${fmt} has no [redacted] auth header: ${snip.slice(0, 300)}`);
+        }
+
+        // resend_request: same origin works and is recorded as the agent's; another origin is refused.
+        const rs = await mcpCall('resend_request', { id });
+        const newId = rs.result.id as string | undefined;
+        if (rs.isError || !newId) f.push(`resend_request: ${rs.text.slice(0, 200)}`);
+        else {
+          let g: any;
+          for (let i = 0; i < 120; i++) {
+            g = (await mcpCall('get_request', { id: newId, includeBodies: false })).result;
+            if (g.state && !['pending', 'paused-request', 'paused-response'].includes(g.state)) break;
+            await sleep(250);
+          }
+          if (g?.state !== 'completed' || g?.status !== 200 || g?.initiator !== 'agent' || g?.resentFrom !== id) f.push(`resent exchange: ${JSON.stringify(g).slice(0, 300)}`);
+          notes.push(`resent ${id} -> ${newId} ${g?.state} ${g?.status}`);
+        }
+        const foreign = await mcpCall('resend_request', { id, edit: { url: 'https://example.com/' } });
+        if (!foreign.isError || !/must keep the original origin/.test(foreign.text)) f.push(`resend to a foreign origin not refused: ${foreign.text.slice(0, 200)}`);
+        // REVIEW-3 #1: an exchange a rule handled (here: a mocked one) is never resent.
+        const mk = await mcpCall('add_mock', { url: 'https://jsonplaceholder.typicode.com/users/2', body: { m: 1 }, times: 1 });
+        const restart2 = Date.now();
+        await mcpCall('hot_restart', { sessionId });
+        const mw = await mcpCall('wait_for_request', { url: 'https://jsonplaceholder.typicode.com/users/2', sinceMs: restart2, timeoutMs: 60_000 });
+        if (mw.result.state === 'mocked') {
+          const rm = await mcpCall('resend_request', { id: mw.result.id });
+          if (!rm.isError || !/handled by rule/.test(rm.text)) f.push(`resend of a mocked exchange not refused: ${rm.text.slice(0, 200)}`);
+        } else f.push(`users/2 was not mocked: ${mw.text.slice(0, 200)}`);
+        if (mk.result.ruleId) await mcpCall('remove_rule', { ruleId: mk.result.ruleId });
+
+        // Global network profile: visible in get_status and in the UI status.
+        const slow = await mcpCall('simulate_network', { profile: 'slow-3g' });
+        if (slow.isError || slow.result.profile?.label !== 'Slow 3G') f.push(`simulate_network slow-3g: ${slow.text.slice(0, 200)}`);
+        const st = (await mcpCall('get_status')).result;
+        if (st.networkProfile?.preset !== 'slow-3g') f.push(`get_status networkProfile: ${JSON.stringify(st.networkProfile)}`);
+        if ((api.controller.status() as any).networkProfile?.preset !== 'slow-3g') f.push('UI status lacks the network profile');
+        const none = await mcpCall('simulate_network', { profile: 'none' });
+        if (none.isError || none.result.profile?.kind !== 'none') f.push(`simulate_network none: ${none.text.slice(0, 200)}`);
+        if ((api.controller.status() as any).networkProfile) f.push('UI status still shows a profile after "none"');
+
+        // url-scoped fault, times: 1 → the next users/1 fails, then the host removes the spent rule.
+        const fault = await mcpCall('simulate_network', { url: USERS1, method: 'GET', fault: 'reset', times: 1 });
+        const faultRule = fault.result.ruleId as string | undefined;
+        if (fault.isError || !faultRule) f.push(`simulate_network fault: ${fault.text.slice(0, 200)}`);
+        else {
+          const r = (await rulesNow()).find((x) => x.id === faultRule);
+          if (!r || r.times !== 1 || !r.name?.startsWith('[agent] ') || (r.action as any).fault !== 'reset') f.push(`fault rule: ${JSON.stringify(r)}`);
+          const restartAt = Date.now();
+          const h = await mcpCall('hot_restart', { sessionId });
+          if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+          const wf = await mcpCall('wait_for_request', { url: USERS1, method: 'GET', sinceMs: restartAt, timeoutMs: 90_000 });
+          if (wf.isError || wf.result.timedOut || wf.result.state !== 'blocked' || !wf.result.simulated) f.push(`faulted users/1: ${wf.text.slice(0, 300)}`);
+          if (!(await gone(faultRule, 10_000))) f.push('spent fault rule (times: 1) was not removed');
+          notes.push(`fault -> ${wf.result.state} "${wf.result.simulated ?? ''}"`);
+        }
+
+        // add_mock with ttlMs: expires (and is removed) without any traffic.
+        const m = await mcpCall('add_mock', { url: 'https://jsonplaceholder.typicode.com/never-called*', body: { x: 1 }, ttlMs: 2000 });
+        const mockRule = m.result.ruleId as string | undefined;
+        if (m.isError || !mockRule) f.push(`add_mock ttlMs: ${m.text.slice(0, 200)}`);
+        else if (!(await gone(mockRule, 15_000))) f.push('expired add_mock rule (ttlMs: 2000) was not removed');
+
+        const s2 = await mcpCall('stop_app', { sessionId });
+        if (s2.isError || s2.result.stopped !== 1) f.push(`stop_app: ${s2.text.slice(0, 200)}`);
+        else sessionId = undefined;
+        out.output = notes.join('; ');
+      } catch (e) {
+        f.push(`exception: ${(e as Error).message}`);
+      } finally {
+        if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
+        await mcpCall('simulate_network', { profile: 'none' }).catch(() => undefined);
+        await client?.close().catch(() => undefined);
+        client = undefined;
+      }
+      out.ms = Date.now() - t0;
+      results.push(out);
+      console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+    }
+
     // Access: readOnly blocks writes on both doors; off stops the MCP server.
     {
       const out: RunOutcome = { name: 'AGENT access: readOnly blocks add_mock (LM + MCP), off stops MCP', output: '', proxyHits: [], failures: [], ms: 0 };
@@ -313,6 +449,9 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
         client = await connect();
         const m = await mcpCall('add_mock', { url: 'https://example.com/ro', body: 'x' });
         if (!m.isError || !/access|read-?only/i.test(m.text)) f.push(`MCP add_mock under readOnly: isError=${m.isError} ${m.text.slice(0, 200)}`);
+        const sn = await mcpCall('simulate_network', { profile: 'offline' });
+        if (!sn.isError || !/access|read-?only/i.test(sn.text)) f.push(`MCP simulate_network under readOnly: isError=${sn.isError} ${sn.text.slice(0, 200)}`);
+        if ((api.controller.status() as any).networkProfile) f.push('a network profile was set under readOnly');
         const st = await mcpCall('get_status');
         if (st.isError) f.push(`MCP get_status under readOnly: ${st.text.slice(0, 200)}`);
         await client.close().catch(() => undefined);

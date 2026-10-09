@@ -11,6 +11,9 @@ import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'api/catalog_api.dart';
+import 'api/local_api.dart';
+import 'api/orders_api.dart';
 import 'pinned_roots.dart';
 
 /// --dart-define=APP_SETS_OVERRIDES=true : the app installs its own
@@ -72,19 +75,29 @@ class AppHttpOverrides extends HttpOverrides {
       super.createHttpClient(context)..userAgent = 'demo-app-own-overrides';
 }
 
-final _dio = Dio(BaseOptions(
-  connectTimeout: const Duration(seconds: 20),
-  receiveTimeout: const Duration(seconds: 20),
-  validateStatus: (_) => true,
-))
-  ..httpClientAdapter = _customClient
-      ? IOHttpClientAdapter(
-          createHttpClient: appHttpClient,
-          validateCertificate: appPinning == 'dio_validate'
-              ? (cert, host, port) => _issuerTrusted(cert)
-              : null,
-        )
-      : IOHttpClientAdapter();
+HttpClientAdapter _dioAdapter() => _customClient
+    ? IOHttpClientAdapter(
+        createHttpClient: appHttpClient,
+        validateCertificate: appPinning == 'dio_validate'
+            ? (cert, host, port) => _issuerTrusted(cert)
+            : null,
+      )
+    : IOHttpClientAdapter();
+
+BaseOptions _dioOptions() => BaseOptions(
+      connectTimeout: const Duration(seconds: 20),
+      receiveTimeout: const Duration(seconds: 20),
+      validateStatus: (_) => true,
+    );
+
+final _dio = Dio(_dioOptions())..httpClientAdapter = _dioAdapter();
+
+final _catalog = CatalogApi(Dio(_dioOptions())
+  ..httpClientAdapter = _dioAdapter()
+  ..interceptors.addAll([DemoClientHeaderInterceptor(), DemoAuthInterceptor()]));
+
+final _httpClient = _customClient ? IOClient(appHttpClient()) : http.Client();
+final _orders = OrdersApi(_httpClient);
 
 int _batch = 0;
 
@@ -169,6 +182,21 @@ Future<void> attack() => _timed('attack', () async {
       return (r.statusCode, r.body);
     });
 
+Future<void> catalogAlbum() => _timed('catalog_album', () async {
+      final r = await _catalog.fetchAlbum(1);
+      return (r.statusCode ?? -1, r.data);
+    });
+
+Future<void> ordersCreate() => _timed('orders_create', () async {
+      final r = await _orders.createOrder(item: 'coffee beans', quantity: 2);
+      return (r.statusCode, r.body);
+    });
+
+Future<void> localHealth() => _timed('local_health', () async {
+      final r = await fetchLocalHealth(_httpClient);
+      return (r.statusCode, r.body);
+    });
+
 Future<void> prefs() => _timed('prefs', () async {
       final p = await SharedPreferences.getInstance();
       final n = (p.getInt('launches') ?? 0) + 1;
@@ -188,6 +216,9 @@ Future<void> runBatch() async {
     dioUser2(),
     httpComment(),
     prefs(),
+    catalogAlbum(),
+    ordersCreate(),
+    if (localPort > 0) localHealth(),
     if (evilUrl.isNotEmpty) attack(),
   ]);
   log('DEMO_BATCH done $_batch');
@@ -196,7 +227,8 @@ Future<void> runBatch() async {
 void runDemo({required String flavor}) {
   log('DEMO_START flavor=$flavor appSetsOverrides=$appSetsOverrides '
       'appZoneOverrides=$appZoneOverrides findProxy=${appFindProxy.isEmpty ? '-' : appFindProxy} '
-      'pinning=${appPinning.isEmpty ? '-' : appPinning} repeat=$repeatSeconds');
+      'pinning=${appPinning.isEmpty ? '-' : appPinning} repeat=$repeatSeconds'
+      '${localPort > 0 ? ' local=$localHealthUrl' : ''}');
   if (appSetsOverrides) HttpOverrides.global = AppHttpOverrides();
 
   void start() {
@@ -235,6 +267,9 @@ class DemoApp extends StatelessWidget {
               ('Dio POST', dioPost),
               ('http GET gzip', httpGzip),
               ('http GET plain http://', httpPlain),
+              ('Dio GET album (interceptors)', catalogAlbum),
+              ('http POST order', ordersCreate),
+              if (localPort > 0) ('GET host server /health', localHealth),
             ])
               Padding(
                 padding: const EdgeInsets.only(bottom: 8),

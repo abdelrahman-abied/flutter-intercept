@@ -10,6 +10,7 @@ import {
   selectDebuggerType,
   stripDefines,
   stripShaDefine,
+  TRACE_DEFINE,
   withInterceptDefines,
   withShaDefine,
 } from '../../src/debug/rewrite';
@@ -337,5 +338,17 @@ describe('device-independent entry content (REVIEW-1 #2)', () => {
     if (dev.kind !== 'rewrite' || prod.kind !== 'rewrite') throw new Error('expected rewrites');
     expect(dev.config.program).toBe(entry(flutterApp, 'lib__flavors__dev__main'));
     expect(prod.config.program).toBe(entry(flutterApp, 'lib__flavors__prod__main'));
+  });
+});
+
+describe('captureSource (CONTRACTS §9.1)', () => {
+  it('adds FLUTTER_INTERCEPT_TRACE=0 only when source capture is off', () => {
+    expect(withInterceptDefines([], 'abc', 'localhost:1')).not.toContain(`--dart-define=${TRACE_DEFINE}=0`);
+    expect(withInterceptDefines([], 'abc', 'localhost:1', false)).toContain(`--dart-define=${TRACE_DEFINE}=0`);
+  });
+
+  it('strips an earlier trace define', () => {
+    const args = withInterceptDefines([`--dart-define=${TRACE_DEFINE}=0`, '--verbose'], 'abc', 'localhost:1');
+    expect(args).toEqual(['--verbose', '--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=abc', '--dart-define=FLUTTER_INTERCEPT_PROXY=localhost:1']);
   });
 });

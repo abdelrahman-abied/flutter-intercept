@@ -13,4 +13,11 @@ export type {
   ResponseEdit,
   Rule,
   RuleAction,
+  FaultKind,
+  SendRequest,
+  SourceInfo,
+  StackFrame,
 } from './types';
+export { NETWORK_PRESETS, NO_PROFILE, presetProfile, describeProfile } from './network';
+export type { NetworkProfile, NetworkPreset, NetworkPresetId } from './network';
+export { parseDartStack, pickAppFrame, toSourceInfo, FRAMEWORK_PACKAGES } from './source';
