@@ -145,6 +145,8 @@ async function main(): Promise<void> {
           FI_DEVICES: process.env.FI_DEVICES ?? '',
           FI_ALLOW_PHYSICAL_IOS: process.env.FI_ALLOW_PHYSICAL_IOS ?? '',
           FI_AGENT_DEVICES: process.env.FI_AGENT_DEVICES ?? '',
+          // TEST ONLY: lets the agent suite read the MCP token from the activate() API (src/agent/testExposure.ts).
+          FI_TEST_EXPOSE_MCP_TOKEN: suite === 'agent' ? '1' : '',
           FI_RESULTS: resultsFile,
         },
       });

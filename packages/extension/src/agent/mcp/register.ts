@@ -10,7 +10,7 @@ import { DEFAULT_MCP_PORT, generateToken, startMcpServer, type RunningMcpServer,
 
 export const MCP_PROVIDER_ID = 'flutterIntercept.mcp';
 export const CONNECT_AGENT_COMMAND = 'flutterIntercept.connectAgent';
-const TOKEN_KEY = 'flutterIntercept.agent.mcpToken';
+export const TOKEN_KEY = 'flutterIntercept.agent.mcpToken';
 
 export interface McpDeps {
   tools: AgentTools;

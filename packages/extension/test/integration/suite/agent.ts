@@ -18,7 +18,12 @@ import type { Exchange, Rule } from '@flutter-intercept/proxy';
 import { createAppLauncher } from '../../../src/agent/launch';
 import { lmToolName, makeLmTool, LmVscode, registerLmTools } from '../../../src/agent/lmTools';
 import { AgentTools, AgentToolError, ToolName } from '../../../src/agent/types';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { activateBoth, freePort, outputOf, registerOutputTracker, RunOutcome, sleep, waitFor } from './helpers';
+
+/** Values the demo app sends in headers on GET users/1: must never appear in any tool output. */
+const SECRETS = ['demo-secret-123', 'demo-key-456'];
 
 const USERS1 = 'https://jsonplaceholder.typicode.com/users/1';
 
@@ -118,6 +123,7 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
       if (viaLm) {
         const r = await lm!.invokeTool!(lmToolName(name), { input, toolInvocationToken: undefined }, cts.token);
         const text = (r.content ?? []).map((p: any) => p.value ?? '').join('');
+        allOutputs.push(text);
         return { result: JSON.parse(text) };
       }
       const t = makeLmTool(name, { tools: direct, vscode: realVs });
@@ -132,6 +138,7 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
     }
   }
 
+  const allOutputs: string[] = [];
   const devices = (process.env.FI_AGENT_DEVICES || 'macos').split(',').filter(Boolean);
   for (const dev of devices) {
     const out: RunOutcome = { name: `AGENT ${dev} launch → wait → mock + hot restart → stop (${path})`, output: '', proxyHits: [], failures: [], ms: 0 };
@@ -155,7 +162,13 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
 
       const waited = (await tool('wait_for_request', { url: USERS1, method: 'GET', sinceMs: since, timeoutMs: 120_000 })).result;
       if (waited.timedOut || waited.status !== 200) f.push(`wait_for_request: ${JSON.stringify(waited)}`);
-      console.log(`[suite] agent wait_for_request -> ${JSON.stringify(waited)} at +${Date.now() - since} ms`);
+      console.log(`[suite] agent wait_for_request -> ${JSON.stringify(waited).slice(0, 160)} at +${Date.now() - since} ms`);
+      if (viaLm && waited.id) {
+        const detail = (await tool('get_request', { id: waited.id })).result;
+        const auth = JSON.stringify(detail.requestHeaders ?? {});
+        if (!/"authorization":\s*"\[redacted\]"/i.test(auth)) f.push(`get_request Authorization not redacted: ${auth.slice(0, 200)}`);
+        if (!/"x-api-key":\s*"\[redacted\]"/i.test(auth)) f.push(`get_request X-Api-Key not redacted: ${auth.slice(0, 200)}`);
+      }
 
       const mock = await tool('add_mock', { url: USERS1, method: 'GET', status: 200, body: { mocked: 'agent' }, name: 'users/1' });
       const ruleId = mock.result.ruleId;
@@ -191,6 +204,157 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
     results.push(out);
     console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? `\n         ${f.join('\n         ')}` : ''}\n${out.output}`);
   }
+  // ---------------- MCP door (real @modelcontextprotocol/sdk client, Streamable HTTP) ----------------
+  const mcpAccess = (api as any).mcp as { url?: string; token(): Thenable<string | undefined> } | undefined;
+  if (!mcpAccess) {
+    results.push({ name: 'AGENT MCP', output: '', proxyHits: [], failures: ['api.mcp missing: FI_TEST_EXPOSE_MCP_TOKEN not applied'], ms: 0 });
+  } else {
+    await waitFor(() => mcpAccess.url || undefined, 30_000, 200).catch(() => undefined);
+    const url = mcpAccess.url!;
+    const token = (await mcpAccess.token())!;
+    const connect = async () => {
+      const client = new Client({ name: 'fi-agent-suite', version: '0.0.0' });
+      await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
+      return client;
+    };
+    let client: Client | undefined;
+    const mcpCall = async (name: ToolName, args: Record<string, unknown> = {}): Promise<{ result: any; isError: boolean; text: string }> => {
+      const r: any = await client!.callTool({ name, arguments: args });
+      const text = (r.content ?? []).map((c: any) => c.text ?? '').join('');
+      allOutputs.push(text);
+      let result: any;
+      try {
+        result = JSON.parse(text);
+      } catch {
+        result = { text };
+      }
+      return { result, isError: !!r.isError, text };
+    };
+
+    // Auth: no token -> 401.
+    {
+      const out: RunOutcome = { name: 'AGENT MCP auth: no token -> 401, server bound to 127.0.0.1', output: '', proxyHits: [], failures: [], ms: 0 };
+      const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' });
+      if (res.status !== 401) out.failures.push(`no-token status ${res.status}`);
+      const bad = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer nope' }, body: '{}' });
+      if (bad.status !== 401) out.failures.push(`wrong-token status ${bad.status}`);
+      if (!/^http:\/\/127\.0\.0\.1:\d+\/mcp$/.test(url)) out.failures.push(`url ${url}`);
+      out.mode = `no token ${res.status}, wrong token ${bad.status}, ${url}`;
+      results.push(out);
+      console.log(`[suite] ${out.failures.length ? 'FAIL' : 'ok  '} ${out.name}${out.failures.length ? '\n         ' + out.failures.join('\n         ') : ''}`);
+    }
+
+    for (const dev of devices) {
+      const out: RunOutcome = { name: `AGENT ${dev} over MCP: launch → wait → mock + hot restart → get_request → remove → stop`, output: '', proxyHits: [], failures: [], ms: 0 };
+      const f = out.failures;
+      const t0 = Date.now();
+      let sessionId: string | undefined;
+      try {
+        client = await connect();
+        const st = await mcpCall('get_status');
+        if (st.isError || !Array.isArray(st.result.sessions)) f.push(`get_status: ${st.text.slice(0, 200)}`);
+        const since = Date.now();
+        const l = await mcpCall('launch_app', { deviceId: dev });
+        sessionId = l.result.sessionId;
+        if (l.isError || !sessionId) f.push(`launch_app: ${l.text.slice(0, 200)}`);
+        const w = await mcpCall('wait_for_request', { url: USERS1, method: 'GET', sinceMs: since, timeoutMs: 120_000 });
+        if (w.isError || w.result.timedOut || w.result.status !== 200) f.push(`wait_for_request: ${w.text.slice(0, 200)}`);
+        const m = await mcpCall('add_mock', { url: USERS1, method: 'GET', status: 200, body: { mocked: 'mcp' }, name: 'users/1 via mcp' });
+        const ruleId = m.result.ruleId;
+        if (m.isError || !ruleId) f.push(`add_mock: ${m.text.slice(0, 200)}`);
+        const restartAt = Date.now();
+        const h = await mcpCall('hot_restart', { sessionId });
+        if (h.isError || h.result.restarted !== 1) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+        const w2 = await mcpCall('wait_for_request', { url: USERS1, method: 'GET', sinceMs: restartAt, timeoutMs: 90_000 });
+        if (w2.isError || w2.result.timedOut) f.push(`wait after restart: ${w2.text.slice(0, 200)}`);
+        const g = await mcpCall('get_request', { id: w2.result.id, includeBodies: true });
+        const view = JSON.stringify(g.result);
+        if (g.isError || !view.includes('mocked') || !view.includes('mcp')) f.push(`get_request body: ${view.slice(0, 300)}`);
+        if (g.result.state !== 'mocked') f.push(`get_request state ${g.result.state}`);
+        if (!/"authorization":\s*"\[redacted\]"/i.test(view)) f.push(`MCP get_request Authorization not redacted: ${view.slice(0, 300)}`);
+        out.output = `get_request state=${g.result.state} requestHeaders=${JSON.stringify(g.result.requestHeaders ?? {}).slice(0, 200)} body=${JSON.stringify(g.result.responseBody ?? '').slice(0, 120)}`;
+        const r = await mcpCall('remove_rule', { ruleId });
+        if (r.isError || r.result.removed !== true) f.push(`remove_rule: ${r.text.slice(0, 200)}`);
+        const s2 = await mcpCall('stop_app', { sessionId });
+        if (s2.isError || s2.result.stopped !== 1) f.push(`stop_app: ${s2.text.slice(0, 200)}`);
+        else sessionId = undefined;
+      } catch (e) {
+        f.push(`exception: ${(e as Error).message}`);
+      } finally {
+        if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
+        await client?.close().catch(() => undefined);
+        client = undefined;
+      }
+      out.ms = Date.now() - t0;
+      results.push(out);
+      console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+    }
+
+    // Access: readOnly blocks writes on both doors; off stops the MCP server.
+    {
+      const out: RunOutcome = { name: 'AGENT access: readOnly blocks add_mock (LM + MCP), off stops MCP', output: '', proxyHits: [], failures: [], ms: 0 };
+      const f = out.failures;
+      const agentCfg = vscode.workspace.getConfiguration('flutterIntercept');
+      try {
+        await agentCfg.update('agent.access', 'readOnly', vscode.ConfigurationTarget.Global);
+        await sleep(500);
+        const before = api.getRules().length;
+        let lmMsg = 'not rejected';
+        try {
+          await tool('add_mock', { url: 'https://example.com/ro', body: 'x' });
+        } catch (e) {
+          lmMsg = (e as Error).message;
+        }
+        if (!/access|read-?only/i.test(lmMsg)) f.push(`LM add_mock under readOnly: ${lmMsg}`);
+        client = await connect();
+        const m = await mcpCall('add_mock', { url: 'https://example.com/ro', body: 'x' });
+        if (!m.isError || !/access|read-?only/i.test(m.text)) f.push(`MCP add_mock under readOnly: isError=${m.isError} ${m.text.slice(0, 200)}`);
+        const st = await mcpCall('get_status');
+        if (st.isError) f.push(`MCP get_status under readOnly: ${st.text.slice(0, 200)}`);
+        await client.close().catch(() => undefined);
+        client = undefined;
+        if (api.getRules().length !== before) f.push('a rule was added under readOnly');
+        out.output = `readOnly: LM -> "${lmMsg.slice(0, 100)}"; MCP -> "${m.text.slice(0, 100)}"`;
+
+        await agentCfg.update('agent.access', 'off', vscode.ConfigurationTarget.Global);
+        let refused = false;
+        for (let i = 0; i < 40 && !refused; i++) {
+          try {
+            await fetch(url, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}' });
+            await sleep(250);
+          } catch {
+            refused = true;
+          }
+        }
+        if (!refused) f.push('MCP server still answering 10 s after access=off');
+        if (mcpAccess.url) f.push(`mcp url still set with access=off: ${mcpAccess.url}`);
+        let offMsg = 'not rejected';
+        try {
+          await tool('get_status');
+        } catch (e) {
+          offMsg = (e as Error).message;
+        }
+        if (!/off|access/i.test(offMsg)) f.push(`LM get_status with access=off: ${offMsg}`);
+        out.output += `; off: MCP refused=${refused}, LM -> "${offMsg.slice(0, 100)}"`;
+      } catch (e) {
+        f.push(`exception: ${(e as Error).message}`);
+      } finally {
+        await agentCfg.update('agent.access', undefined, vscode.ConfigurationTarget.Global);
+      }
+      results.push(out);
+      console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name}${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+    }
+  }
+
+  // Redaction: the real header values never appear in anything a tool returned (both doors).
+  {
+    const leaked = SECRETS.filter((sec) => allOutputs.some((o) => o.includes(sec)));
+    const out: RunOutcome = { name: `AGENT redaction: secrets absent from all ${allOutputs.length} tool outputs`, output: '', proxyHits: [], failures: leaked.map((l) => `leaked ${l}`), ms: 0 };
+    if (!allOutputs.length) out.failures.push('no tool outputs collected');
+    results.push(out);
+    console.log(`[suite] ${out.failures.length ? 'FAIL' : 'ok  '} ${out.name}${out.failures.length ? ' ' + out.failures.join(', ') : ''}`);
+  }
+
   for (const d of suiteSubs) d.dispose();
   launcher.dispose();
   return results;

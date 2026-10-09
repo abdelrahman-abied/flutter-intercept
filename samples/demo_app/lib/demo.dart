@@ -118,7 +118,9 @@ Future<void> _timed(String label, Future<(int, Object?)> Function() fn) async {
 }
 
 Future<void> dioUser() => _timed('dio_user', () async {
-      final r = await _dio.get<Object?>('https://jsonplaceholder.typicode.com/users/1');
+      // Credentials like a real app sends them (tools must show them redacted to AI agents).
+      final r = await _dio.get<Object?>('https://jsonplaceholder.typicode.com/users/1',
+          options: Options(headers: {'Authorization': 'Bearer demo-secret-123', 'X-Api-Key': 'demo-key-456'}));
       return (r.statusCode ?? -1, r.data);
     });
 

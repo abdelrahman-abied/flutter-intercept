@@ -9,6 +9,8 @@ import { registerInstructionsCommand } from './agent/instructions';
 import { createAppLauncher } from './agent/launch';
 import { registerLmTools } from './agent/lmTools';
 import { registerMcp, type McpRegistration } from './agent/mcp';
+import { TOKEN_KEY as MCP_TOKEN_KEY } from './agent/mcp/register';
+import { mcpTestAccess, type McpTestAccess } from './agent/testExposure';
 import { languageModelToolsContribution, toolDescriptions, toolSchemas } from './agent/schema';
 import type { AgentAccess } from './agent/types';
 import { CaStore } from './ca';
@@ -49,6 +51,8 @@ export interface FlutterInterceptApi {
   /** Same path as the webview's `setRules` (persists to workspaceState, broadcasts `rules`). */
   setRules(rules: Rule[]): void;
   getRules(): Rule[];
+  /** TEST ONLY (FI_TEST_EXPOSE_MCP_TOKEN=1, integration agent suite): MCP URL + token. Absent otherwise. */
+  readonly mcp?: McpTestAccess;
 }
 
 let deactivateHooks: (() => Promise<unknown>)[] = [];
@@ -344,6 +348,10 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     setRules: (rules) => controller.applyRules(rules),
     getRules: () => proxyHost.getRules(),
     prepare: (folder, config) => prepareLaunch(deps, folder, substituteCommonVariables(config, folder), 'command'),
+    ...(() => {
+      const access = mcpTestAccess(process.env, () => mcp?.url, () => context.secrets.get(MCP_TOKEN_KEY));
+      return access ? { mcp: access } : {};
+    })(),
   };
 }
 
