@@ -142,7 +142,13 @@ describe('MCP server: transport security', () => {
     expect((await raw({ headers: mcpHeaders(), method: 'GET' })).status).toBe(400);
     expect((await raw({ headers: { ...mcpHeaders(), 'mcp-session-id': 'nope' }, body: initBody })).status).toBe(404);
     const big = Buffer.alloc(1024 * 1024 + 10, 'a');
-    expect((await raw({ headers: mcpHeaders(), body: big })).status).toBe(413);
+    // The server answers 413 and closes; on a fast close the client may still be writing and see
+    // ECONNRESET/EPIPE instead of the status. Both mean the oversized body was refused.
+    const outcome = await raw({ headers: mcpHeaders(), body: big }).then(
+      (r) => r.status,
+      (e: NodeJS.ErrnoException) => e.code,
+    );
+    expect([413, 'ECONNRESET', 'EPIPE']).toContain(outcome);
   });
 
   it('never logs the token', async () => {
