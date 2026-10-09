@@ -7,4 +7,4 @@
     "dev": "node build.mjs --dev"
   },
   "dependencies": { "@flutter-intercept/proxy": "*", "preact": "^10.24.0" },
-  "devDependencies": { "happy-dom": "^15.0.0" } }
+  "devDependencies": { "happy-dom": "^20.14.5" } }

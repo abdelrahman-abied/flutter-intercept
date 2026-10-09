@@ -117,9 +117,9 @@
     "@flutter-intercept/proxy": "*"
   },
   "devDependencies": {
-    "@types/vscode": "~1.90.0",
-    "@vscode/test-electron": "^2.4.0",
-    "@vscode/vsce": "^3.2.0"
+    "@types/vscode": "~1.140.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^4.0.0"
   },
   "icon": "media/icon.png",
   "repository": {
