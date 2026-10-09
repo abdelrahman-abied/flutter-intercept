@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- Marketplace page: screenshots now load from the public GitHub repository.
+- README cleanup.
+
 ## 0.1.0 — first public preview
 
 ### Getting started
