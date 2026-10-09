@@ -78,8 +78,6 @@ Code installs for you.
 
 ## Works with AI agents
 
-> Coming in 0.2.0.
-
 AI coding agents can drive Flutter Intercept too: GitHub Copilot (agent mode), Claude Code, Cursor, or any MCP
 client. They can:
 - launch your app and wait for a request, then check exactly what was sent;
