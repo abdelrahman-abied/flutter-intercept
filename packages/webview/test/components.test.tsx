@@ -464,3 +464,42 @@ describe('LAN listener status (physical iPhone)', () => {
     expect($('.lan-open')).toBeNull();
   });
 });
+
+describe('Agent API indicators (CONTRACTS §8)', () => {
+  it('status line shows agent connection and last call, never a token', async () => {
+    await mount();
+    await emit({ type: 'snapshot', exchanges: [], rules: [], status });
+    expect($('.agent-status')).toBeNull();
+    const agent = { access: 'readWrite', mcpUrl: 'http://127.0.0.1:47823/mcp', clients: 1, lastCall: { tool: 'wait_for_request', at: Date.now() - 3000 } };
+    await emit({ type: 'status', status: { ...status, agent } });
+    const el = $('.agent-status')!;
+    expect(el.textContent).toBe('Agent: connected · last: wait_for_request 3s ago');
+    expect(el.getAttribute('title')).toContain('http://127.0.0.1:47823/mcp');
+    expect($('.statusline')!.textContent + el.getAttribute('title')).not.toMatch(/bearer|token/i);
+    await emit({ type: 'status', status: { ...status, agent: { access: 'readOnly', clients: 0 } } });
+    expect($('.agent-status')!.textContent).toBe('Agent (read-only): idle');
+    await emit({ type: 'status', status: { ...status, agent: { access: 'off', clients: 0 } } });
+    expect($('.agent-status')!.textContent).toBe('Agent access: off');
+  });
+
+  it('agent rules get a badge in the rules list, the traffic row and the detail pane', async () => {
+    await mount();
+    const agentRule = rule({ id: 'ag1', name: '[agent] Products 500', match: { url: 'https://api.example.com/products*' },
+      action: { kind: 'mock', status: 500, body: '{}' } });
+    const mine = rule({ id: 'me1', name: 'Mine' });
+    const hit = ex({ url: 'https://api.example.com/products', state: 'mocked', status: 500, matchedRuleId: 'ag1' });
+    const other = ex({ matchedRuleId: 'me1' });
+    await emit({ type: 'snapshot', exchanges: [hit, other], rules: [agentRule, mine], status });
+    expect($(`#ex-${hit.id} .agent-badge`)).not.toBeNull();
+    expect($(`#ex-${hit.id} .agent-badge`)!.getAttribute('title')).toBe('Matched agent rule “Products 500”');
+    expect($(`#ex-${other.id} .agent-badge`)).toBeNull();
+    await click($(`#ex-${hit.id}`)!);
+    expect($('.detail-facts .agent-badge')).not.toBeNull();
+    expect($('.detail-facts')!.textContent).toContain('rule #1 “Products 500”');
+    await click(button(/Rules/));
+    const names = $$('.rule-name');
+    expect(names[0].querySelector('.agent-badge')!.textContent).toBe('agent');
+    expect(names[0].textContent).toBe('mockagentProducts 500');
+    expect(names[1].querySelector('.agent-badge')).toBeNull();
+  });
+});

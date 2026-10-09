@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useReducer, useRef } from 'preact/hooks';
 import { AppContext, useApp } from '../context';
 import type { Host } from '../host';
-import type { HostMsg } from '../protocol';
+import type { HostMsg, Status } from '../protocol';
+import { agentLine } from '../util';
 import {
   filterExchanges, findExchange, hasActiveFilters, initialState, pausedCount, reducer, toPersisted,
   type Persisted, type State,
 } from '../state';
-import { Button } from './bits';
+import { Button, useNow } from './bits';
 import { DetailPane } from './DetailPane';
 import { Icon } from './Icon';
 import { RulesView } from './RulesView';
@@ -179,8 +180,15 @@ function StatusLine() {
           LAN open for iPhone · {status.lan.host}:{status.lan.port}
         </span>
       )}
+      {status.agent && <AgentStatusItem agent={status.agent} />}
     </footer>
   );
+}
+
+function AgentStatusItem({ agent }: { agent: NonNullable<Status['agent']> }) {
+  const now = useNow(!!agent.lastCall);
+  const line = agentLine(agent, now);
+  return <span class={`agent-status agent-${line.kind}`} title={line.title}>{line.text}</span>;
 }
 
 function NoticeBar() {

@@ -2,10 +2,11 @@ import { useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Rule } from '../protocol';
 import {
-  countMatches, deleteRule, describeAction, formToRule, moveRule, NEW_RULE, ruleLabel, ruleStats, ruleToForm, toggleRule,
+  countMatches, deleteRule, describeAction, formToRule, isAgentRule, moveRule, NEW_RULE, ruleDisplayName, ruleLabel, ruleStats,
+  ruleToForm, toggleRule,
   upsertRule, validateRuleForm, type RuleForm,
 } from '../state';
-import { Button } from './bits';
+import { AgentBadge, Button } from './bits';
 import { BodyEditor, HeadersEditor } from './Editors';
 import { Icon } from './Icon';
 
@@ -65,7 +66,8 @@ export function RulesView() {
                   <div class="rule-main" onDblClick={() => dispatch({ type: 'editRule', id: r.id })}>
                     <div class="rule-name">
                       <span class={`badge kind kind-${r.action.kind}`}>{r.action.kind}</span>
-                      {ruleLabel(r)}
+                      {isAgentRule(r) && <AgentBadge />}
+                      {ruleDisplayName(r)}
                     </div>
                     <div class="rule-sub">
                       <code>{r.match.method?.toUpperCase() ?? 'ANY'} {r.match.url}</code>

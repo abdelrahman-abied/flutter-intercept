@@ -646,6 +646,19 @@ export function ruleLabel(r: Rule): string {
   return r.name?.trim() || `${r.match.method ? r.match.method.toUpperCase() + ' ' : ''}${r.match.url}`;
 }
 
+/** Rules created through the Agent API are named "[agent] …" (CONTRACTS §8). */
+export const AGENT_RULE_PREFIX = '[agent] ';
+export function isAgentRule(r: Pick<Rule, 'name'> | undefined): boolean {
+  return !!r?.name?.startsWith(AGENT_RULE_PREFIX);
+}
+
+/** Label without the "[agent] " prefix (the UI shows an agent badge instead). */
+export function ruleDisplayName(r: Rule): string {
+  if (!isAgentRule(r)) return ruleLabel(r);
+  const rest = r.name!.slice(AGENT_RULE_PREFIX.length).trim();
+  return rest || `${r.match.method ? r.match.method.toUpperCase() + ' ' : ''}${r.match.url}`;
+}
+
 export interface RuleForm {
   id: string;
   isNew: boolean;

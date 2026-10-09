@@ -138,12 +138,90 @@ Flutter Intercept reminds you of steps 3 and 4 once.
   renew it.
 - **Wireless launches are slower.** The first debug launch over Wi-Fi can take around 40 s to install and start.
 
+## Use with AI agents
+
+AI coding agents can use Flutter Intercept the way you do. They can run the app, watch its requests, check what was
+sent, and fake server responses to test error states. This works with GitHub Copilot (agent mode), Claude Code,
+Cursor, and any client that speaks MCP (Model Context Protocol).
+
+| What the agent can do | Tool |
+| --- | --- |
+| See whether the proxy and app sessions are running | `get_status` |
+| List recent requests (filter by URL, method, status, state) | `list_requests` |
+| Read one request in full (headers, bodies, timings, error) | `get_request` |
+| Wait until the app makes a matching request (with a timeout) | `wait_for_request` |
+| See requests paused at a breakpoint | `list_paused` |
+| List the rules in priority order | `list_rules` |
+| Answer matching requests with a mock (status, headers, body, delay) | `add_mock` |
+| Block matching requests | `add_block` |
+| Pause matching requests or responses | `add_breakpoint` |
+| Remove a rule | `remove_rule` |
+| Resume a paused request, optionally with edits, or abort it | `resume_request`, `abort_request` |
+| Clear the recorded traffic | `clear_requests` |
+| Save the traffic as a HAR file in `.dart_tool/flutter_intercept/exports/` | `export_har` |
+| Launch the app through Dart-Code, stop it, or hot-restart it | `launch_app`, `stop_app`, `hot_restart` |
+
+In VS Code the tools are named `flutter_intercept_<tool>`; over MCP they use the names above.
+
+### Connecting
+
+- **GitHub Copilot (agent mode in VS Code):** nothing to set up. The tools are available as soon as the extension
+  is installed.
+- **Claude Code, Cursor and other MCP clients:**
+  1. Run **Flutter Intercept: Connect AI agent** and pick your client.
+  2. The command copies the setup to the clipboard: the `claude mcp add …` command for Claude Code, an
+     `mcp.json` snippet for Cursor, or the URL and header for other clients.
+  3. Paste it into your client. The command never writes config files itself.
+- **The MCP server** runs at `http://127.0.0.1:<port>/mcp` (default port 47823) and accepts only local
+  connections that carry its secret token.
+
+### Access, confirmations and secrets
+
+- **Access level.** `flutterIntercept.agent.access` decides what agents may do:
+  - `readWrite` (the default);
+  - `readOnly`: agents can look, but changes are refused;
+  - `off`: nothing is exposed.
+- **Confirmations.** Every tool that changes something asks you to confirm in the client: adding or removing
+  rules, resuming or aborting requests, clearing traffic, and launching, stopping or restarting the app.
+- **Secret redaction.** With `flutterIntercept.agent.redactSecrets` on (the default), agents see `[redacted]`
+  instead of:
+  - authorization, cookie and token-like headers;
+  - password, token, key and session fields in URLs and JSON bodies.
+
+  Redaction only affects what agents read. Your app always receives the real values.
+- **What agents never see:** Flutter Intercept's CA key, the iPhone LAN token, or the MCP token.
+- **Agent rules are marked.** Rules an agent creates are named `[agent] …`. They get an **agent** badge in the
+  rules list and on the requests they match.
+- **The status line** shows whether an agent is connected and its last tool call, for example
+  `Agent: connected · last: wait_for_request 3s ago`.
+
+### Teach your agent the workflow
+
+Run **Flutter Intercept: Add AI Agent Instructions** and pick `AGENTS.md`, `CLAUDE.md` and/or
+`.github/copilot-instructions.md`. It adds a short section that tells agents:
+- to verify changes against real traffic: launch the app, then `wait_for_request`, then `get_request`;
+- to test error states with mocks;
+- to clean up the rules they add.
+
+The section sits between `<!-- flutter-intercept:start -->` and `<!-- flutter-intercept:end -->` markers.
+Running the command again updates it in place, and the rest of the file is left alone.
+
+### Example prompts
+
+- "Run the app and check that the login request sends the email and password."
+- "Make the products endpoint return 500 and check that the error UI shows up, then remove the mock."
+- "Mock the feed endpoint with a 10-second delay and check the loading state."
+- "Pause the next checkout request, change the quantity to 3, and resume it."
+
 ## Settings and commands
 
 | Setting | Default | Description |
 |---|---|---|
 | `flutterIntercept.enabled` | `true` | Route the HTTP traffic of Dart/Flutter debug sessions through Flutter Intercept. When off, sessions launch untouched. |
 | `flutterIntercept.port` | `8899` | Port of the local proxy. If it's busy, the next free port up to 8999 is used. A change applies at the next launch when no intercepted session is running. |
+| `flutterIntercept.agent.access` | `readWrite` | What AI agents may do: `readWrite`, `readOnly` or `off`. See [Use with AI agents](#use-with-ai-agents). |
+| `flutterIntercept.agent.redactSecrets` | `true` | Show secrets (auth headers, cookies, tokens, passwords) to agents as `[redacted]`. |
+| `flutterIntercept.agent.mcpPort` | `47823` | Port of the local MCP server for agents. If it's busy, the next free port is used. |
 
 | Command | What it does |
 |---|---|
@@ -151,6 +229,8 @@ Flutter Intercept reminds you of steps 3 and 4 once.
 | **Flutter Intercept: Toggle Interception** | Same as clicking `Intercept: on/off` in the status bar. |
 | **Flutter Intercept: Clear Traffic** | Clears the list. Requests still in flight stay. |
 | **Flutter Intercept: Debug with Intercept** | Starts an intercepted debug session directly. A fallback if F5 isn't picked up. |
+| **Flutter Intercept: Connect AI agent** | Copies the setup for Claude Code, Cursor or another MCP client to the clipboard. |
+| **Flutter Intercept: Add AI Agent Instructions** | Adds or updates the Flutter Intercept section in `AGENTS.md`, `CLAUDE.md` or `.github/copilot-instructions.md`. |
 
 ## Limitations
 
@@ -185,6 +265,11 @@ What isn't intercepted, or behaves differently while intercepting:
     `ios/Flutter/Generated.xcconfig` and `ios/Flutter/flutter_export_environment.sh` (both gitignored by default)
     and into the debug app. It is only usable while that session's listener is open, and only from the device it
     locked to.
+- **AI agent access is local and gated.** The MCP server for agents listens on `127.0.0.1` only.
+  - Every request must carry a secret token, which is kept in VS Code's secret storage. Requests from browsers
+    (an `Origin` header or a foreign `Host`) are refused.
+  - Changes need your confirmation, and `flutterIntercept.agent.access` can make access read-only or turn it off.
+  - Secrets are redacted in everything agents read. See [Use with AI agents](#use-with-ai-agents).
 - **Only sessions you launch from VS Code** while interception is on.
   - It doesn't attach to running apps.
   - It leaves test runs and web sessions alone.

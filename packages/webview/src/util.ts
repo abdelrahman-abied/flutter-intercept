@@ -50,6 +50,35 @@ export function pauseClock(ex: Pick<Exchange, 'state' | 'pausedAt' | 'pauseDeadl
   return undefined;
 }
 
+/** "3s ago", "2m ago", "1h ago" (never negative). */
+export function formatAgo(at: number, now: number): string {
+  const s = Math.max(0, Math.round((now - at) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  return `${Math.floor(m / 60)}h ago`;
+}
+
+export interface AgentLine { text: string; title: string; kind: 'off' | 'idle' | 'connected' }
+
+/** Status-line text for Status.agent. Never includes a token (the status has none). */
+export function agentLine(a: { access: string; mcpUrl?: string; clients: number; lastCall?: { tool: string; at: number } }, now: number): AgentLine {
+  const accessText = a.access === 'readOnly' ? 'read-only' : a.access === 'off' ? 'off' : 'read & write';
+  if (a.access === 'off') {
+    return { text: 'Agent access: off', title: 'AI agents cannot use Flutter Intercept (setting flutterIntercept.agent.access).', kind: 'off' };
+  }
+  const connected = a.clients > 0;
+  const head = `Agent${a.access === 'readOnly' ? ' (read-only)' : ''}: ${connected ? 'connected' : 'idle'}`;
+  const last = a.lastCall ? ` · last: ${a.lastCall.tool} ${formatAgo(a.lastCall.at, now)}` : '';
+  const title = [
+    `AI agent access: ${accessText}.`,
+    `${a.clients} MCP client${a.clients === 1 ? '' : 's'} connected.`,
+    a.mcpUrl ? `MCP server: ${a.mcpUrl}` : '',
+    a.lastCall ? `Last tool call: ${a.lastCall.tool} at ${formatTime(a.lastCall.at).slice(0, 8)}.` : 'No tool calls yet.',
+  ].filter(Boolean).join('\n');
+  return { text: head + last, title, kind: connected ? 'connected' : 'idle' };
+}
+
 export function formatTime(epochMs: number): string {
   const d = new Date(epochMs);
   const p = (x: number, w = 2) => String(x).padStart(w, '0');

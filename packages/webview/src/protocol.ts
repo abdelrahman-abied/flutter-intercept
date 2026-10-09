@@ -18,7 +18,9 @@ export type HostMsg =
 export interface Status {
   proxyRunning: boolean; port?: number; interceptEnabled: boolean; sessions: number;
   lan?: { host: string; port: number }; // present while the LAN listener is open (never the token)
+  agent?: AgentStatus;                  // CONTRACTS §8 (never the MCP token)
 }
+export interface AgentStatus { access: string; mcpUrl?: string; clients: number; lastCall?: { tool: string; at: number } }
 
 // webview → host
 export type ViewMsg =

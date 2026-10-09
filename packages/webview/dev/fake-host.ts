@@ -9,6 +9,8 @@
  *              ?bpTimeout=300000 breakpoint auto-resume · ?clientTimeout=120000 fake app gives up while paused
  *              ?max=1000 ring buffer (evictions are reported with a 'removed' message)
  *              ?lan=1 start with the iPhone LAN listener open (dev bar: open/close LAN)
+ *              ?agent=connected|readOnly|off simulated Agent API status (dev bar cycles it; "connected" adds an
+ *              "[agent] …" mock rule and fakes tool calls)
  *
  * Semantics follow CONTRACTS §3/§4: pausedAt/pauseDeadline while paused, auto-resume unedited at the
  * deadline, a client that gives up while paused → 'error' (late resume ignored), invalid edit → 'error'
@@ -381,6 +383,40 @@ function wire() {
     send({ type: 'status', status });
   });
   if (params.get('lan') === '1') lanBtn.click();
+
+  // Agent API status (CONTRACTS §8): none → connected → read-only → off → none.
+  const agentBtn = document.getElementById('dev-agent')!;
+  const AGENT_RULE: Rule = {
+    id: 'rule_agent_empty', enabled: true, name: '[agent] Empty recommendations',
+    match: { method: 'GET', url: 'https://api.shop.example.com/v1/recommendations*' },
+    action: { kind: 'mock', status: 200, headers: { 'content-type': 'application/json' }, body: '[]' },
+  };
+  const modes = ['none', 'connected', 'readOnly', 'off'] as const;
+  let agentMode: (typeof modes)[number] = 'none';
+  const setAgent = (mode: (typeof modes)[number]) => {
+    agentMode = mode;
+    agentBtn.textContent = `agent: ${mode}`;
+    const mcpUrl = 'http://127.0.0.1:47823/mcp';
+    if (mode === 'none') delete status.agent;
+    else if (mode === 'connected') status = { ...status, agent: { access: 'readWrite', mcpUrl, clients: 1, lastCall: { tool: 'wait_for_request', at: Date.now() - 3000 } } };
+    else if (mode === 'readOnly') status = { ...status, agent: { access: 'readOnly', mcpUrl, clients: 1, lastCall: { tool: 'list_requests', at: Date.now() - 65_000 } } };
+    else status = { ...status, agent: { access: 'off', clients: 0 } };
+    if (mode === 'connected' && !rules.some((r) => r.id === AGENT_RULE.id)) {
+      rules = [AGENT_RULE, ...rules];
+      send({ type: 'rules', rules });
+    }
+    send({ type: 'status', status: { ...status } });
+  };
+  agentBtn.addEventListener('click', () => setAgent(modes[(modes.indexOf(agentMode) + 1) % modes.length]));
+  const agentParam = params.get('agent');
+  if (agentParam && (modes as readonly string[]).includes(agentParam)) setAgent(agentParam as (typeof modes)[number]);
+  // Fake an agent tool call now and then while "connected".
+  setInterval(() => {
+    if (agentMode === 'connected' && status.agent) {
+      status = { ...status, agent: { ...status.agent, lastCall: { tool: random() < 0.5 ? 'wait_for_request' : 'get_request', at: Date.now() } } };
+      send({ type: 'status', status });
+    }
+  }, 7000);
   document.getElementById('dev-error')!.addEventListener('click', () => {
     send({ type: 'error', message: 'Simulated host error: could not apply rules (example).' });
   });

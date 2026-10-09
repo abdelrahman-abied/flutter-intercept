@@ -71,6 +71,11 @@ export function Button(props: {
   );
 }
 
+/** Marks rules created through the Agent API ("[agent] …" names). */
+export function AgentBadge({ title }: { title?: string }) {
+  return <span class="badge agent-badge" title={title ?? 'Created by an AI agent'}>agent</span>;
+}
+
 /** Re-renders every `ms` while `active`; returns the current time. */
 export function useNow(active: boolean, ms = 1000): number {
   const [now, setNow] = useState(() => Date.now());

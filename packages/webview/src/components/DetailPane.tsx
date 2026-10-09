@@ -1,9 +1,9 @@
 import type { Ref } from 'preact';
 import { useApp } from '../context';
 import type { Exchange, RuleAction } from '../protocol';
-import { clientGaveUp, describeAction, ruleLabel } from '../state';
+import { clientGaveUp, describeAction, isAgentRule, ruleDisplayName } from '../state';
 import { formatDuration, formatTime, isPaused } from '../util';
-import { Button, PauseTimer, StateBadge, StatusText } from './bits';
+import { AgentBadge, Button, PauseTimer, StateBadge, StatusText } from './bits';
 import { PauseEditor } from './Editors';
 import { Icon } from './Icon';
 import { BodyView, HeadersTable } from './Viewers';
@@ -52,8 +52,9 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             {rule && (
               <>
                 {' · '}
+                {isAgentRule(rule) && <AgentBadge title="This exchange matched a rule created by an AI agent" />}
                 <button type="button" class="link" onClick={() => dispatch({ type: 'editRule', id: rule.id })}>
-                  rule #{ruleIndex + 1} “{ruleLabel(rule)}”
+                  rule #{ruleIndex + 1} “{ruleDisplayName(rule)}”
                 </button>
                 {` (${describeAction(rule.action)})`}
               </>

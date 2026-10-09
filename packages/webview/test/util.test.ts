@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  base64ByteLength, bodyByteLength, describeMatcherUrl, formatBytes, formatCountdown, formatDuration, headerValue,
+  agentLine, base64ByteLength, bodyByteLength, describeMatcherUrl, formatAgo, formatBytes, formatCountdown, formatDuration, headerValue,
   isJsonContentType, pauseClock, splitUrl, statusClassOf, utf8ByteLength, validateJson,
 } from '../src/util';
 import { isHostMsg } from '../src/host';
@@ -110,5 +110,27 @@ describe('formatting and helpers', () => {
     expect(isHostMsg({ type: 'resume' })).toBe(false);
     expect(isHostMsg('snapshot')).toBe(false);
     expect(isHostMsg(null)).toBe(false);
+  });
+});
+
+describe('agent status line', () => {
+  const now = 1_000_000_000;
+  it('formatAgo', () => {
+    expect(formatAgo(now - 3_000, now)).toBe('3s ago');
+    expect(formatAgo(now - 125_000, now)).toBe('2m ago');
+    expect(formatAgo(now - 2 * 3600_000, now)).toBe('2h ago');
+    expect(formatAgo(now + 5_000, now)).toBe('0s ago');
+  });
+  it('connected / idle / read-only / off', () => {
+    const mcpUrl = 'http://127.0.0.1:47823/mcp';
+    expect(agentLine({ access: 'readWrite', mcpUrl, clients: 1, lastCall: { tool: 'wait_for_request', at: now - 3000 } }, now))
+      .toMatchObject({ text: 'Agent: connected · last: wait_for_request 3s ago', kind: 'connected' });
+    expect(agentLine({ access: 'readWrite', clients: 0 }, now)).toMatchObject({ text: 'Agent: idle', kind: 'idle' });
+    expect(agentLine({ access: 'readOnly', mcpUrl, clients: 2 }, now).text).toBe('Agent (read-only): connected');
+    expect(agentLine({ access: 'off', clients: 0 }, now)).toMatchObject({ text: 'Agent access: off', kind: 'off' });
+    const t = agentLine({ access: 'readWrite', mcpUrl, clients: 2, lastCall: { tool: 'get_request', at: now } }, now).title;
+    expect(t).toContain('2 MCP clients connected');
+    expect(t).toContain(mcpUrl);
+    expect(t).not.toMatch(/token|bearer/i);
   });
 });

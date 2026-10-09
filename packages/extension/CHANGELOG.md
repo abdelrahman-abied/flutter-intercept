@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.2.0 (unreleased)
+
+### Agent API: AI agents can use Flutter Intercept
+
+**Tools**
+- Agents can read and drive Flutter Intercept:
+  - read: `get_status`, `list_requests`, `get_request`, `wait_for_request`, `list_paused`, `list_rules`,
+    `export_har`;
+  - change: `add_mock`, `add_block`, `add_breakpoint`, `remove_rule`, `resume_request`, `abort_request`,
+    `clear_requests`, `launch_app`, `stop_app`, `hot_restart`.
+- **GitHub Copilot agent mode**: the tools are available as VS Code language model tools
+  (`flutter_intercept_<tool>`).
+- **Claude Code, Cursor and other MCP clients**: a local MCP server at `http://127.0.0.1:<port>/mcp`, protected
+  by a secret token.
+
+**Commands**
+- **Connect AI agent** copies the client setup to the clipboard.
+- **Add AI Agent Instructions** writes a short usage section into `AGENTS.md`, `CLAUDE.md` or
+  `.github/copilot-instructions.md`. It updates the section in place between markers.
+
+**Settings**
+- `flutterIntercept.agent.access`: `readWrite`, `readOnly` or `off`.
+- `flutterIntercept.agent.redactSecrets`: on by default.
+- `flutterIntercept.agent.mcpPort`: default 47823.
+
+**Safety**
+- Every tool that changes something asks for confirmation.
+- Secrets are redacted in everything agents read; the app still receives the real values.
+- Agents never see the CA key, the iPhone LAN token or the MCP token.
+
+**Traffic panel**
+- The status line shows the agent's connection and last tool call.
+- Rules created by agents (`[agent] …`) get an agent badge in the rules list and on the requests they match.
+
 ## 0.1.1
 
 - Marketplace page: screenshots now load from the public GitHub repository.

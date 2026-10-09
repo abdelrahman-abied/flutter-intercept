@@ -2,9 +2,10 @@ import type { JSX } from 'preact';
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Exchange } from '../protocol';
-import { clientGaveUp } from '../state';
+import { clientGaveUp, isAgentRule, ruleDisplayName } from '../state';
+import type { Rule } from '../protocol';
 import { bodyByteLength, formatBytes, formatDuration, isPaused, splitUrl } from '../util';
-import { PauseTimer, StateBadge, StatusText } from './bits';
+import { AgentBadge, PauseTimer, StateBadge, StatusText } from './bits';
 
 export const ROW_HEIGHT = 22;
 const OVERSCAN = 8;
@@ -79,10 +80,14 @@ export function TrafficList({ list, onOpen }: { list: Exchange[]; onOpen: () => 
   const vh = height || FALLBACK_VIEWPORT;
   const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
   const end = Math.min(list.length, Math.ceil((scrollTop + vh) / ROW_HEIGHT) + OVERSCAN);
+  // Matched-rule chips: only agent rules are marked in the row (the detail pane names every rule).
+  const agentRules = new Map<string, Rule>();
+  for (const r of state.rules) if (isAgentRule(r)) agentRules.set(r.id, r);
   const rows: JSX.Element[] = [];
   for (let i = start; i < end; i++) {
     const ex = list[i];
     rows.push(<Row key={ex.id} ex={ex} selected={ex.id === state.selectedId} gaveUp={clientGaveUp(state, ex)}
+      agentRule={ex.matchedRuleId ? agentRules.get(ex.matchedRuleId) : undefined}
       onSelect={() => dispatch({ type: 'select', id: ex.id })} onOpen={onOpen} />);
   }
 
@@ -117,8 +122,8 @@ export function TrafficList({ list, onOpen }: { list: Exchange[]; onOpen: () => 
   );
 }
 
-function Row({ ex, selected, gaveUp, onSelect, onOpen }: {
-  ex: Exchange; selected: boolean; gaveUp: boolean; onSelect: () => void; onOpen: () => void;
+function Row({ ex, selected, gaveUp, agentRule, onSelect, onOpen }: {
+  ex: Exchange; selected: boolean; gaveUp: boolean; agentRule?: Rule; onSelect: () => void; onOpen: () => void;
 }) {
   const { host, path } = splitUrl(ex.url);
   const size = bodyByteLength(ex.responseBody);
@@ -137,7 +142,10 @@ function Row({ ex, selected, gaveUp, onSelect, onOpen }: {
       <span class="c-path" title={ex.url}>{path}</span>
       <span class="c-dur">{isPaused(ex) ? <PauseTimer ex={ex} /> : formatDuration(ex.durationMs)}</span>
       <span class="c-size">{formatBytes(size)}{ex.responseBody?.truncated ? '+' : ''}</span>
-      <span class="c-state"><StateBadge ex={ex} gaveUp={gaveUp} /></span>
+      <span class="c-state">
+        <StateBadge ex={ex} gaveUp={gaveUp} />
+        {agentRule && <AgentBadge title={`Matched agent rule “${ruleDisplayName(agentRule)}”`} />}
+      </span>
     </div>
   );
 }

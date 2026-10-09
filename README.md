@@ -76,6 +76,26 @@ Code installs for you.
    - **Break on this** to pause matching requests so you can edit them.
 5. Click `Intercept: on` in the status bar to turn interception off for your next sessions.
 
+## Works with AI agents
+
+> Coming in 0.2.0.
+
+AI coding agents can drive Flutter Intercept too: GitHub Copilot (agent mode), Claude Code, Cursor, or any MCP
+client. They can:
+- launch your app and wait for a request, then check exactly what was sent;
+- mock a 500, an empty list or a slow response to test error states;
+- pause and edit live traffic;
+- clean up the rules they added.
+
+Copilot picks up the tools automatically. Other clients connect with **Flutter Intercept: Connect AI agent**.
+
+You stay in control:
+- changes need your confirmation;
+- access can be made read-only or turned off;
+- secrets are redacted in everything agents read.
+
+See [Use with AI agents](packages/extension/README.md#use-with-ai-agents).
+
 ## Supported targets
 
 | Target | Setup |

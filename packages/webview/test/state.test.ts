@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { HostMsg } from '../src/protocol';
 import {
-  EMPTY_FILTERS, MAX_HOST_ERRORS, NEW_RULE, clientGaveUp, countMatches, computeRequestEdit, computeResponseEdit, currentDraft, deleteRule,
+  EMPTY_FILTERS, MAX_HOST_ERRORS, NEW_RULE, clientGaveUp, countMatches, isAgentRule, ruleDisplayName, computeRequestEdit, computeResponseEdit, currentDraft, deleteRule,
   draftFromExchange, filterExchanges, formToRule, headersChanged, initialState, moveRule, pausedCount,
   reducer, rowsToRecord, ruleStats, ruleToForm, toPersisted, toggleRule, upsertRule, validateDraft,
   validateRuleForm, winningRuleIndex,
@@ -471,5 +471,18 @@ describe('rule form', () => {
     expect(validateRuleForm({ ...ok, mockStatus: '99', mockDelayMs: 'soon' }).errors).toEqual({ mockStatus: '100–599', mockDelayMs: 'Milliseconds, whole number' });
     expect(validateRuleForm({ ...ok, mockBody: '{a:1}' }).json).toMatchObject({ ok: false, line: 1, column: 2 });
     expect(validateRuleForm({ ...ok, kind: 'block', blockMode: 'status', blockStatus: 'x' }).errors).toEqual({ blockStatus: '100–599' });
+  });
+});
+
+describe('agent rules', () => {
+  it('detects the "[agent] " prefix and strips it for display', () => {
+    const a = rule({ name: '[agent] Products 500', match: { url: '*/products*' } });
+    expect(isAgentRule(a)).toBe(true);
+    expect(ruleDisplayName(a)).toBe('Products 500');
+    expect(ruleDisplayName(rule({ name: '[agent] ', match: { method: 'get', url: '*/x' } }))).toBe('GET */x');
+    expect(isAgentRule(rule({ name: 'agent rule' }))).toBe(false);
+    expect(isAgentRule(rule({ name: '[Agent] x' }))).toBe(false);
+    expect(isAgentRule(undefined)).toBe(false);
+    expect(ruleDisplayName(rule({ name: 'Mine' }))).toBe('Mine');
   });
 });
