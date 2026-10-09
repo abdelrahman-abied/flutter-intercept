@@ -9,6 +9,7 @@
  *               provider is re-registered after ours -> our hook runs BEFORE it.
  */
 import * as fs from 'fs';
+import { runAgentSuite } from './agent';
 import { runDartSuite } from './dart';
 import { runDevicesSuite } from './devices';
 import { runFlutterSuite } from './flutter';
@@ -17,7 +18,7 @@ import { RunOutcome } from './helpers';
 export async function run(): Promise<void> {
   const suite = process.env.FI_SUITE ?? 'dart';
   const results: RunOutcome[] =
-    suite === 'flutter' ? await runFlutterSuite() : suite === 'devices' ? await runDevicesSuite() : await runDartSuite();
+    suite === 'flutter' ? await runFlutterSuite() : suite === 'devices' ? await runDevicesSuite() : suite === 'agent' ? await runAgentSuite() : await runDartSuite();
   const failed = results.filter((r) => r.failures.length);
   if (process.env.FI_RESULTS) {
     fs.writeFileSync(

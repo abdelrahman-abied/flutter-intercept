@@ -66,12 +66,12 @@ async function main(): Promise<void> {
   for (const suite of suites) {
     // devices: the real sample app in place (no copy: keeps its Gradle/Xcode caches warm).
     const fixture =
-      suite === 'devices'
+      suite === 'devices' || suite === 'agent'
         ? path.resolve(extRoot, '..', '..', 'samples', 'demo_app')
         : path.join(workspaceRoot, suite === 'flutter' ? 'flutter_app' : 'dart_cli');
-    if (suite !== 'devices') fs.cpSync(path.join(extRoot, 'test', 'fixtures', path.basename(fixture)), fixture, { recursive: true });
-    if (suite === 'devices') {
-      if (!process.env.FI_DEVICES) throw new Error('FI_DEVICES=<deviceId,...> is required for the devices suite');
+    if (suite !== 'devices' && suite !== 'agent') fs.cpSync(path.join(extRoot, 'test', 'fixtures', path.basename(fixture)), fixture, { recursive: true });
+    if (suite === 'devices' || suite === 'agent') {
+      if (suite === 'devices' && !process.env.FI_DEVICES) throw new Error('FI_DEVICES=<deviceId,...> is required for the devices suite');
       if (!fs.existsSync(path.join(fixture, '.dart_tool', 'package_config.json'))) {
         execFileSync('flutter', ['pub', 'get', '--offline'], { cwd: fixture, stdio: 'inherit' });
       }
@@ -144,6 +144,7 @@ async function main(): Promise<void> {
           FI_FLUTTER_RUNS: process.env.FI_FLUTTER_RUNS ?? '1',
           FI_DEVICES: process.env.FI_DEVICES ?? '',
           FI_ALLOW_PHYSICAL_IOS: process.env.FI_ALLOW_PHYSICAL_IOS ?? '',
+          FI_AGENT_DEVICES: process.env.FI_AGENT_DEVICES ?? '',
           FI_RESULTS: resultsFile,
         },
       });
