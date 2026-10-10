@@ -327,19 +327,28 @@ endpoints.
 16. [Generate a Dart model from traffic](#generate-a-dart-model-from-traffic)
 17. [Generate a fixture test](#generate-a-fixture-test)
 
+**Web, sockets and GraphQL**
+
+18. [Run a Flutter Web app in Chrome](#run-a-flutter-web-app-in-chrome)
+19. [Get past CORS errors while you develop](#get-past-cors-errors-while-you-develop)
+20. [Watch WebSocket messages and SSE events](#watch-websocket-messages-and-sse-events)
+21. [Work with GraphQL operations](#work-with-graphql-operations)
+22. [See requests from native clients and background isolates](#see-requests-from-native-clients-and-background-isolates)
+
 **Devices**
 
-18. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
-19. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
-20. [Run on a physical iPhone](#run-on-a-physical-iphone)
-21. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
+23. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
+24. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
+25. [Run on a physical iPhone](#run-on-a-physical-iphone)
+26. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
 
 **AI agents**
 
-22. [Connect an AI agent](#connect-an-ai-agent)
-23. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
-24. [Control what agents can see and do](#control-what-agents-can-see-and-do)
-25. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
+27. [Connect an AI agent](#connect-an-ai-agent)
+28. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
+29. [Control what agents can see and do](#control-what-agents-can-see-and-do)
+30. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
+31. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
 
 ### Run your app with interception
 
@@ -380,7 +389,9 @@ You'll narrow a busy list down to the requests you care about.
    - `t:json` (also `html`, `image`, `text`, `xml`, `binary`, `other`);
    - `body:token` or `body:"a phrase"`, `h:authorization` or `h:name=value`;
    - `state:paused` (also `mocked`, `blocked`, `error`, `simulated`, `resent`), `src:login_page.dart`;
-   - `contract:error` (also `warning`, `ok`, `unchecked`): the [model check](#check-responses-against-your-models).
+   - `contract:error` (also `warning`, `ok`, `unchecked`): the [model check](#check-responses-against-your-models);
+   - `kind:ws` (also `sse`, `http`), `op:getUser` (GraphQL), `cors:problem` (also `ok`, `preflight`, `patched`),
+     `captured:native`, `browser:internal` (or `app`).
 3. Put `-` in front of any word or filter to exclude it, for example `-s:2xx`.
 4. Or use the toolbar: **All methods**, the **2xx** to **5xx** and **err** toggles, and **paused only**.
 
@@ -599,6 +610,89 @@ Retrofit interface, depending on your project's dev dependencies.
 **Tip:** secrets in the recorded traffic are always redacted in fixtures. Check the rest of the data before you
 commit them.
 
+### Run a Flutter Web app in Chrome
+
+You'll intercept a web build the same way as a mobile one.
+
+1. Pick **Chrome** as the device and press **F5**.
+2. Flutter Intercept starts that Chrome with itself as the proxy, trusting only its own CA. Your everyday
+   browser isn't touched.
+3. Use the app in the Chrome window that opens.
+
+**You should see:** the app's requests in the list. Chrome's own background requests are hidden; click
+**Show browser traffic** in the toolbar (it shows how many are hidden) to see them, or filter with
+`browser:internal`.
+
+**Tip:** everything you open in that debug Chrome window is recorded, so keep it to your app. The `web-server`
+device and launches with your own Chrome profile (`--user-data-dir`) aren't intercepted. Turn web interception
+off with `flutterIntercept.web.enabled`. More in [Flutter Web](#flutter-web).
+
+### Get past CORS errors while you develop
+
+You'll see why the browser blocks a request and unblock it for local development.
+
+1. Run your web app in Chrome and trigger a call to an API without the right CORS headers.
+2. The row gets a **CORS** badge. Select it: the **CORS** section says why a browser blocks it, for example a
+   missing `Access-Control-Allow-Origin` header.
+3. Click **Add CORS rule (dev only)**, check the origin and route it names, tick
+   **Allow credentials (cookies)** only if you need them, and click **Add rule**.
+4. Trigger the request again.
+
+**You should see:** a "CORS rule added first: …" notice with **Undo**, the request going through, and the section
+saying it was patched by Flutter Intercept.
+
+**Tip:** this only helps during development: your server's CORS setup isn't fixed, and a production build is
+still blocked. Find problems with `cors:problem`. Mocks answer their own preflights. In **Rules**, the action is
+**CORS (dev only)** with an **Allow origin** field.
+
+### Watch WebSocket messages and SSE events
+
+You'll follow a live socket or event stream message by message.
+
+1. Run an app that opens a WebSocket (`dart:io` `WebSocket` or a package on top of it) or reads a Server-Sent
+   Events stream, for example `wss://echo.websocket.org`.
+2. Its row has a **WS** or **SSE** badge, and the size column counts messages.
+3. Select it and open **Messages (N)** (**Events (N)** for SSE). New messages appear while it shows **live**.
+4. Filter with words (`-word` excludes) and, for WebSockets, **All**, **↑ Sent** or **↓ Received**.
+5. Click a message to see it; switch **Pretty** / **Raw**, or copy it.
+
+**You should see:** sent and received counts, and how the connection closed (for example "Closed by the server").
+
+**Tip:** filter the list with `kind:ws` or `kind:sse`. Block and **Fault** rules work on sockets, so you can test
+reconnects; mocks and resend don't. Each message keeps up to 64 KB; older ones are dropped on long connections.
+
+### Work with GraphQL operations
+
+You'll tell GraphQL requests apart on a shared `/graphql` endpoint.
+
+1. Run an app that sends GraphQL, for example `POST https://countries.trevorblades.com/graphql` with the
+   operation `CountryByCode`.
+2. Each row shows its operation, such as **GQL CountryByCode**.
+3. Filter with `op:CountryByCode` (case-insensitive, matches the start of the name; separate several with
+   commas).
+4. Click **Mock this**, **Block this** or **Break on this** on one operation.
+
+**You should see:** a rule that matches only that operation; its **op** badge in **Rules** shows the name.
+
+**Tip:** for a rule on a GraphQL URL, the editor's **GraphQL operation** field suggests the operations seen so
+far. Names are exact and case-sensitive; leave it empty for any operation.
+
+### See requests from native clients and background isolates
+
+You'll find the requests Flutter Intercept can't intercept, instead of missing them.
+
+1. Run an app that uses `cupertino_http`, `cronet_http` or another native client, or makes requests in
+   `compute` / `Isolate.run`.
+2. Native requests appear marked **native**, read from the app's HTTP profile in debug and profile mode.
+3. A banner at the top of the panel names the native client or the background isolate; close it with
+   **Dismiss this warning**.
+
+**You should see:** native requests with what the HTTP profile recorded, but **Mock this**, **Block this**,
+**Break on this** and resend disabled: they never went through the proxy.
+
+**Tip:** filter with `captured:native`. Requests from a background isolate go direct, so rules don't apply to
+them. Turn native listing off with `flutterIntercept.nativeClients`.
+
 ### Run on an Android emulator or phone
 
 You'll intercept an Android build.
@@ -725,6 +819,25 @@ You'll have an agent debug a parsing error, break fields, write models and tests
 project itself (the tools only return them).
 
 **Tip:** agents match URLs with globs only (`*/users/*`), never regexes.
+
+### Let agents read sockets, GraphQL and CORS
+
+You'll have an agent work with the 0.5.0 traffic types.
+
+1. [Connect your agent](#connect-an-ai-agent), then run **Flutter Intercept: Add AI Agent Instructions** again
+   to pick up the new tools.
+2. Ask, for example:
+   - "Open the chat screen and check the WebSocket messages the app sends after login." (`get_frames`)
+   - "List the GraphQL `CountryByCode` requests and mock that operation with an error." (`list_requests`,
+     `add_mock` with a GraphQL operation)
+   - "The web build fails with a CORS error on the API. Unblock it for local development." (`add_cors_rule`)
+   - "Are any requests escaping the proxy?" (`get_status` reports background-isolate and native-client warnings)
+3. Approve the changes when the client asks.
+
+**You should see:** messages and events with secrets redacted, and rules scoped to one GraphQL operation.
+
+**Tip:** agents don't see Chrome's own background requests unless they ask for them. A CORS rule an agent adds
+allows only local pages and no credentials, unless it names an origin or asks for credentials.
 
 ## Settings and commands
 
