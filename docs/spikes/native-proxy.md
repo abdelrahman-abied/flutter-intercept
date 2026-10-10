@@ -142,6 +142,12 @@ including plain http, the WebSocket upgrade and SSE through the proxy.
   `bypassWindowMs`, `proxySaw` deps).
 - `src/vm/watcher.ts` / `index.ts`: session-scoped `nativeRouted(sessionId)`, `nativeRouteFailed(sessionId, client)`,
   `proxySaw(q)` on `CreateVmWatcherDeps`; re-exports `matchesProxyExchange`, `BypassQuery`, `BYPASS_WINDOW_MS`.
+- REVIEW-8 #7: records carry `owner` (random per instance), `pid` and `heartbeat` (refreshed every 30 s while
+  routed, `tick()`); `recover()` and `apply()` leave a record alone while its owner lives (pid alive and heartbeat
+  ≤ 2 min old), so another VS Code window can't revert a live session's emulator. `isRouted()` re-reads
+  `http_proxy` at most every 10 s (and the heartbeat every 30 s): a route reverted or replaced by someone else is
+  dropped, and the core then imports native entries again; while routed, a finished native entry that `proxySaw`
+  says the proxy never recorded is imported too.
 - Tests: `test/unit/adb.globalProxy.test.ts` (fake settings provider with ConnectivityService semantics),
   `test/unit/vm.bypass.test.ts` (fake profiles: verdicts, texts, window, caps, routed mode, trust failure),
   devices suite check J (and a no-false-positive assertion in I).

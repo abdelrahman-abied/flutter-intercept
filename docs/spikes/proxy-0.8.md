@@ -3,14 +3,15 @@
 Notes for CONTRACTS §14.2–§14.6 (the lead folds them in). Code: `packages/proxy/src/` — `hosts.ts` (host patterns),
 `tunnel.ts` + `tls-records.ts` (passthrough), `pace.ts` (link simulation), `upstream-request.ts` (per-request view:
 timings, upload pacing, retry), `idle.ts`, `replay-stream.ts`, plus wiring in `intercept-proxy.ts`, `upstream-pool.ts`,
-`upstream-proxy.ts` (noProxy), `lan.ts`, `shaper.ts`, `replay.ts`, `rules.ts`. Tests: `test/v8.test.ts` (32).
+`upstream-proxy.ts` (noProxy), `lan.ts`, `shaper.ts`, `replay.ts`, `rules.ts`. Tests: `test/v8.test.ts` (36).
 
 ## API for the host
 
 ```ts
 new InterceptProxy({ ..., tlsPassthrough?: string[], clientCertificates?: ClientCertificate[] });
-setTlsPassthrough(hosts: string[] | undefined): void          // throws on an invalid pattern; nothing changes then
+setTlsPassthrough(hosts: string[] | undefined): { hosts: string[]; problems: string[] } // bad entries dropped one by one
 readonly tlsPassthrough: string[]                              // patterns in use
+readonly tlsPassthroughProblems: string[]                      // one sentence per refused entry, naming it
 readonly tlsPassthroughAvailable: boolean                      // false only if mockttp's CONNECT hook failed
 setClientCertificates(certs: ClientCertificate[] | undefined): { host: string; problem?: string }[]  // per entry, in order
 readonly clientCertificates: { host: string; problem?: string }[] // = Status.clientCertificates
@@ -18,12 +19,20 @@ setUpstreamProxy({ url, ignoreCertErrors?, noProxy?: string[] })  // noProxy: ho
 readonly upstreamProxy: { url; ignoreCertErrors; noProxy?: string[] } | undefined
 setNetworkProfile({ kind: 'throttle', ..., uploadKbps })       // validated like kbps
 ```
-New exports: `parseHostPattern`, `matchesHostPattern`, `HostPattern`, `loadClientCertificate`, `parseNoProxy`,
-`MAX_REPLAY_GAP_MS`, `IDLE_SOCKET_TIMEOUT_MS`.
+New exports: `parseHostPattern`, `parseHostPatterns`, `hostPatternProblem`, `matchesHostPattern`, `HostPattern`,
+`HostPatternProblem`, `loadClientCertificate`, `isLoopbackOrigin`, `parseNoProxy`, `MAX_REPLAY_GAP_MS`,
+`IDLE_SOCKET_TIMEOUT_MS`. The host-pattern parser is also a dependency-free subpath, `@flutter-intercept/proxy/hosts`
+(`parseHostPattern(input): HostPattern` throws with the reason; `parseHostPatterns(list): {patterns, problems:
+{host, problem}[]}`; `hostPatternProblem(input): string | undefined`; `matchesHostPattern(p, hostname, port)`;
+`normalizeHostname`; `splitHostPort`), so the host's settings validators use the same code (REVIEW-8 #4).
 
-Host patterns (passthrough and certificates): hostname glob, case-insensitive, `*` = any characters including dots
-(`*.bank.example` matches `a.b.bank.example`, not `bank.example`), optional `:port` (`[::1]:8443` for IPv6); a bare `*`
-is refused ("list the hosts instead").
+Host patterns (passthrough and certificates; REVIEW-8 #4), case-insensitive, optional `:port` (`[::1]:8443` for
+IPv6): an exact host or IP; `*` inside a label matches within that one label (`api-*.corp.example` matches
+`api-eu.corp.example`, not `api-eu.evil.corp.example`); a leading `*.` matches any subdomain depth (`*.bank.example`
+matches `a.b.bank.example`, not `bank.example`). Refused, with a reason: `*`, `*.*`, a wildcard in the last label
+(`api.corp.*`), fewer than two fixed labels next to a wildcard (`*.com`, `*-*.local`), wildcards in IP addresses
+(`10.0.0.*`, `[fe80::*]`). `10.0.0.1` never matches `10.0.0.1.evil.example`. Lists drop refused entries one by one
+(`setTlsPassthrough` returns them in `problems`; `setClientCertificates` already reported per entry).
 
 ## TLS passthrough (§14.2)
 
@@ -58,7 +67,10 @@ is refused ("list the hosts instead").
   makes dart:io fall back to DIRECT (docs/spikes/faults.md), i.e. skip the proxy. So the tunnel opens, the TLS
   handshake with the real server completes, and the connection is cut where the app's first application-data record
   begins (`tls-records.ts` reads only the 5-byte record headers of the app → server direction: TLS 1.2 = first type-23
-  record; TLS 1.3 = second type-23 record, the first being the client's Finished; non-TLS = at once). `block` →
+  record; TLS 1.3 = second type-23 record, the first being the client's Finished; non-TLS = at once). **0-RTT
+  (REVIEW-8 #5):** the ClientHello (first record, ≤ 18 KB) is parsed; when it offers `early_data` (extension 42) — or
+  can't be parsed / doesn't fit its record — the cut is at the first type-23 record, so early data never reaches the
+  server. `block` →
   reset (a status can't be sent inside an undecrypted tunnel; `mode: 'status'` adds a note), `fault reset` → RST,
   `dns` → FIN, `timeout` → held until the app gives up or `breakpointTimeoutMs`, then RST. The server sees the
   handshake but never the request. Exchange `blocked`. **Verified with a real dart:io client** (`PROXY …; DIRECT`,
@@ -87,6 +99,18 @@ is refused ("list the hosts instead").
 - `Exchange.clientCertificate` = the matching pattern, set when the pool picks the agent for an `https:` / `wss:`
   upstream request (the request-plan hook, below) — i.e. only exchanges that reached the server; reused connections
   carry it too (the certificate was presented on that connection).
+- **App traffic only (REVIEW-8 #1).** A request or WebSocket upgrade to a certificate host that carries an `Origin`
+  other than a loopback one (`http(s)://localhost | 127.0.0.1 | [::1]`, any port — the Flutter Web dev server) comes
+  from a web page (a third-party frame or ad, another site open in the debug Chrome) and is refused in the flow
+  decision, before any upstream connection: 403, `Flutter Intercept: Refused: a client certificate is configured for
+  <host>, and this request comes from a web page (Origin …), not the app. …`, exchange `blocked` with that text in
+  `error`, no `clientCertificate`. Requests without `Origin` (dart:io, native clients) are the app's. Also checked
+  after GraphQL-deferred rule choice and, as a backstop, when the pool picks the agent (a request a breakpoint edit or
+  script moved onto a certificate host): the upstream request is refused there (403, same text, `blocked`).
+  **Residual:** the loopback proxy has no authentication, so other local processes (and other local users) that use
+  it, other apps on the Android emulator (10.0.2.2), and — when native routing is on (`nativeClients: "proxy"`) —
+  every emulator app's native traffic, can still make requests that present the certificate; only browser pages are
+  told apart (by `Origin`). The review's loopback proxy credential for certificate hosts is not built.
 
 ## Upload / WebSocket / SSE throttling (§14.4)
 
@@ -100,8 +124,12 @@ is refused ("list the hosts instead").
 - **WebSocket frames:** throttle rules now apply to `ws(s)://` (`WEBSOCKET_ACTIONS` gains `throttle`; `ruleProblem`
   allows it) and the throttle profile applies to upgrades. On mockttp's `ws-upgrade` (before its pipe attaches), the
   app-side socket's `send` / `ping` / `pong` / `close` are paced with `{latency, kbps}` and the server side's with
-  `{latency, uploadKbps}` — in order, close included; anything due after a side closed is dropped. `dropRate` resets
-  the upgrade (like a drop fault). `simulated` = the rule / profile label. Frames are recorded when the proxy
+  `{latency, uploadKbps}` — in order, close included; anything due after a side closed is dropped. **Backpressure
+  (REVIEW-8 #6):** a direction holding more than `WS_THROTTLE_QUEUE_MAX` (8 MB) pauses the socket that feeds it
+  (`ws.pause()`: TCP then pushes back on the peer, like a real slow link) until half of it drained; without pause
+  support the connection is closed with 1013 and a note in `error`. Tested: a server pushing 64 MB through a 400 kbps
+  throttle gets fewer than 40 MB out and the proxy's RSS grows less than 32 MB (without the cap: all 64 MB queued).
+  `dropRate` resets the upgrade (like a drop fault). `simulated` = the rule / profile label. Frames are recorded when the proxy
   receives them.
 - **SSE:** on an event-stream response the shaper also delays each chunk by `latencyMs` (backpressure only beyond
   1 MB queued, so delays don't add up), on top of the latency added before forwarding the request (so an SSE's first
@@ -171,5 +199,6 @@ clients still through the guard, to the checked address (TLS verified against th
   passthrough hosts act after the TLS handshake (reset / FIN / hold), not on the CONNECT; rules match a tunnel as
   method CONNECT; throttle rules now apply to WebSocket URLs; SSE first-event latency is 2 × latency.
 - Residual: a TLS 1.3 HelloRetryRequest flow reads like TLS 1.2 to the record finder, so the cut lands on the client's
-  Finished — still after the client's handshake completed, so the app fails at the request. TLS 1.3 0-RTT early data
-  (dart:io doesn't send it) would be cut at once.
+  Finished — still after the client's handshake completed, so the app fails at the request.
+- REVIEW-8 #11 (x-fi-id inside passthrough tunnels) is not fixable in the proxy (encrypted); it needs the entry to skip
+  tagging passthrough hosts (lead).

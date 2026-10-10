@@ -39,12 +39,14 @@ export class LinkQueue {
   private bytes = 0;
   private readonly latency: number;
   private readonly kbps: number;
-  /** Called after every delivery that leaves the queue at or below PACE_HIGH_WATER bytes. */
+  /** Called after every delivery that leaves the queue at or below `lowWater` bytes (default PACE_HIGH_WATER). */
   onDrain?: () => void;
+  private readonly lowWater: number;
 
-  constructor(shape: LinkShape) {
+  constructor(shape: LinkShape, opts: { lowWater?: number } = {}) {
     this.latency = Math.max(0, shape.latencyMs ?? 0);
     this.kbps = Math.max(0, shape.kbps ?? 0);
+    this.lowWater = opts.lowWater ?? PACE_HIGH_WATER;
   }
 
   get queuedBytes(): number {
@@ -112,7 +114,7 @@ export class LinkQueue {
       } catch {
         /* a delivery must never stop the queue */
       }
-      if (this.bytes <= PACE_HIGH_WATER) this.onDrain?.();
+      if (this.bytes <= this.lowWater) this.onDrain?.();
     }
     this.schedule();
   }

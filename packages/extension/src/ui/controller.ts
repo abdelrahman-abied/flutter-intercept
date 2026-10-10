@@ -485,10 +485,11 @@ function isNum(v: unknown, min: number, max: number): v is number {
   return typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
 }
 
-/** latencyMs 0–600000 (integer), kbps 1–10 000 000, dropRate 0–1; each optional. */
+/** latencyMs 0–600000 (integer), kbps / uploadKbps (CONTRACTS §14.4) 1–10 000 000, dropRate 0–1; each optional. */
 function checkThrottle(a: Record<string, unknown>, where: string): void {
   if (a.latencyMs !== undefined && !isInt(a.latencyMs, 0, 600_000)) fail(where, 'latencyMs must be an integer 0–600000');
   if (a.kbps !== undefined && !isNum(a.kbps, 1, 10_000_000)) fail(where, 'kbps must be a number 1–10000000');
+  if (a.uploadKbps !== undefined && !isNum(a.uploadKbps, 1, 10_000_000)) fail(where, 'uploadKbps must be a number 1–10000000');
   if (a.dropRate !== undefined && !isNum(a.dropRate, 0, 1)) fail(where, 'dropRate must be a number 0–1');
 }
 
@@ -649,7 +650,7 @@ function validateAction(a: unknown, aw: string, inStep: boolean): RuleAction {
       if (a.phase !== 'request' && a.phase !== 'response' && a.phase !== 'both') fail(aw, 'phase must be "request", "response" or "both"');
       break;
     case 'throttle':
-      onlyKeys(a, ['kind', 'latencyMs', 'kbps', 'dropRate'], aw);
+      onlyKeys(a, ['kind', 'latencyMs', 'kbps', 'uploadKbps', 'dropRate'], aw);
       checkThrottle(a, aw);
       break;
     case 'fault':
@@ -912,7 +913,7 @@ export function validateNetworkProfile(raw: unknown): NetworkProfile {
       onlyKeys(raw, ['kind'], where);
       return { kind: raw.kind };
     case 'throttle':
-      onlyKeys(raw, ['kind', 'preset', 'latencyMs', 'kbps', 'dropRate'], where);
+      onlyKeys(raw, ['kind', 'preset', 'latencyMs', 'kbps', 'uploadKbps', 'dropRate'], where);
       if (raw.preset !== undefined && (typeof raw.preset !== 'string' || !PRESET_IDS.has(raw.preset))) fail(where, 'preset must be "slow-3g", "fast-3g" or "flaky"');
       checkThrottle(raw, where);
       return raw as unknown as NetworkProfile;

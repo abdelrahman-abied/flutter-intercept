@@ -4,7 +4,18 @@
 import { EventEmitter } from 'events';
 import { describe, expect, it } from 'vitest';
 import type { ClientCertificate, InterceptProxyOptions } from '@flutter-intercept/proxy';
-import { InterceptProxyHost, normalizeNoProxy, normalizeTlsPassthrough, resolveUpstreamProxy, type VscodeHttpProxy } from '../../src/proxyHost';
+import { parseHostPattern } from '@flutter-intercept/proxy';
+import { InterceptProxyHost, normalizeNoProxy, normalizeTlsPassthrough, resolveUpstreamProxy, splitNoProxy, type VscodeHttpProxy } from '../../src/proxyHost';
+
+/** P's REVIEW-8 #4 parser is in the built proxy (it refuses `*.com`). */
+export const SHARED_PARSER_FIXED = (() => {
+  try {
+    parseHostPattern('*.com');
+    return false;
+  } catch {
+    return true;
+  }
+})();
 
 interface Fake {
   opts: InterceptProxyOptions;
@@ -30,9 +41,15 @@ function factory(made: Fake[], features = true) {
     if (!features) return base;
     return {
       ...base,
-      setUpstreamProxy: (...a: unknown[]) => f.calls.push(['setUpstreamProxy', ...a]),
-      setTlsPassthrough: (...a: unknown[]) => f.calls.push(['setTlsPassthrough', ...a]),
-      setClientCertificates: (...a: unknown[]) => f.calls.push(['setClientCertificates', ...a]),
+      setUpstreamProxy: (...a: unknown[]) => {
+        f.calls.push(['setUpstreamProxy', ...a]);
+      },
+      setTlsPassthrough: (...a: unknown[]) => {
+        f.calls.push(['setTlsPassthrough', ...a]);
+      },
+      setClientCertificates: (...a: unknown[]) => {
+        f.calls.push(['setClientCertificates', ...a]);
+      },
     };
   };
 }
@@ -52,10 +69,19 @@ const cert = (h: string): ClientCertificate => ({ host: h, cert: '-----BEGIN CER
 
 describe('normalizeTlsPassthrough (CONTRACTS §14.2)', () => {
   it('keeps lower-case hostname globs, dedupes, reports the rest', () => {
-    const r = normalizeTlsPassthrough([' API.Bank.example ', '*.pinned.example', 'api.bank.example', '*', 'host.example.', '', 'https://x.example/', 'a b', 'x.example:443', 7, 'a..b']);
-    expect(r.hosts).toEqual(['api.bank.example', '*.pinned.example', '*', 'host.example']);
-    expect(r.problems).toHaveLength(5);
-    expect(r.problems.join('\n')).toMatch(/https:\/\/x\.example\/.*not a host name glob/);
+    // the proxy's own parseHostPattern decides (REVIEW-8 #4): bare * and non-host text are refused one by one
+    const r = normalizeTlsPassthrough([' API.Bank.example ', '*.pinned.example', 'api.bank.example', '*', 'host.example.', '', 'https://x.example/', 'a b', 'x.example:443', 7]);
+    expect(r.hosts).toEqual(['api.bank.example', '*.pinned.example', 'host.example', 'x.example:443']);
+    expect(r.problems).toHaveLength(4);
+    expect(r.problems.join('\n')).toMatch(/matches every host/);
+    expect(r.problems.every((p) => p.startsWith('flutterIntercept.tlsPassthrough: '))).toBe(true);
+  });
+
+  // REVIEW-8 #4: needs P's label-bounded parser in the proxy build; skipped while the built proxy still accepts *.com.
+  it.skipIf(!SHARED_PARSER_FIXED)('refuses patterns an attacker could register (shared parser, REVIEW-8 #4)', () => {
+    const r = normalizeTlsPassthrough(['*.*', '*.com', '10.0.0.*', 'api.corp.*', '*.bank.example']);
+    expect(r.hosts).toEqual(['*.bank.example']);
+    expect(r.problems).toHaveLength(4);
   });
 
   it('non-arrays and caps', () => {
@@ -100,6 +126,79 @@ describe('InterceptProxyHost: TLS passthrough (CONTRACTS §14.2)', () => {
     h.setTlsPassthrough(['a.example']);
     h.setTlsPassthrough(['b.example']);
     expect(logs.filter((l) => /cannot pass TLS through/.test(l))).toHaveLength(1);
+  });
+});
+
+describe('TLS passthrough: hosts in effect and problems in Status (REVIEW-8 #4)', () => {
+  const proxyWith = (setTls: (hosts: string[]) => unknown, live?: () => string[]) =>
+    new InterceptProxyHost({
+      getPort: () => 9100,
+      factory: (opts) => {
+        const p = {
+          port: opts.port,
+          start: async () => undefined,
+          stop: async () => undefined,
+          setRules: () => undefined,
+          getExchanges: () => [],
+          clear: () => undefined,
+          resume: () => undefined,
+          abort: () => undefined,
+          on: () => undefined,
+          setTlsPassthrough: setTls,
+        };
+        if (live) Object.defineProperty(p, 'tlsPassthrough', { get: live });
+        return p as never;
+      },
+    });
+
+  it('a newer proxy returns what it accepted: Status shows only those, its problems become a warning', async () => {
+    let inEffect: string[] = [];
+    const h = proxyWith(
+      (hosts) => {
+        inEffect = hosts.filter((x) => x !== 'b.example');
+        return { hosts: inEffect, problems: ['"b.example" refused by the proxy'] };
+      },
+      () => inEffect,
+    );
+    await h.start();
+    const r = h.setTlsPassthrough(['a.example', 'b.example', '*']);
+    expect(h.tlsPassthrough).toEqual(['a.example']);
+    expect(r.hosts).toEqual(['a.example']);
+    expect(r.problems).toHaveLength(2);
+    const w = h.warnings.find((x) => x.id === 'settings:tlsPassthrough');
+    expect(w?.text).toMatch(/matches every host.*b\.example" refused/);
+    h.setTlsPassthrough(['a.example']);
+    inEffect = ['a.example'];
+    // the proxy still reports b's problem for the old list only: a clean list clears the warning
+    const h2 = proxyWith((hosts) => ({ hosts, problems: [] }), () => ['a.example']);
+    await h2.start();
+    h2.setTlsPassthrough(['a.example']);
+    expect(h2.warnings.find((x) => x.id === 'settings:tlsPassthrough')).toBeUndefined();
+  });
+
+  it('an older proxy that throws keeps its previous list: Status shows that list, not the new one', async () => {
+    let inEffect: string[] = [];
+    const h = proxyWith(
+      (hosts) => {
+        if (hosts.includes('bad.example')) throw new Error('TLS passthrough: "bad.example" refused');
+        inEffect = hosts;
+      },
+      () => inEffect,
+    );
+    await h.start();
+    h.setTlsPassthrough(['a.example']);
+    expect(h.tlsPassthrough).toEqual(['a.example']);
+    h.setTlsPassthrough(['a.example', 'bad.example']);
+    expect(h.tlsPassthrough).toEqual(['a.example']);
+    expect(h.warnings.find((x) => x.id === 'settings:tlsPassthrough')?.text).toMatch(/previous list stays in effect/);
+  });
+
+  it('setting problems before the proxy starts show up once it runs', async () => {
+    const h = proxyWith((hosts) => ({ hosts, problems: [] }));
+    h.setTlsPassthrough(['a.example', '*']);
+    expect(h.warnings.find((x) => x.id === 'settings:tlsPassthrough')?.text).toMatch(/matches every host/);
+    await h.start();
+    expect(h.warnings.find((x) => x.id === 'settings:tlsPassthrough')?.text).toMatch(/matches every host/);
   });
 });
 
@@ -181,6 +280,21 @@ describe('normalizeNoProxy / resolveUpstreamProxy (CONTRACTS §14.6)', () => {
     ]);
     expect(normalizeNoProxy(undefined)).toEqual([]);
     expect(normalizeNoProxy('x')).toEqual([]);
+  });
+
+  it('reports the http.noProxy entries it drops (REVIEW-8 #12): problem, log and a Status warning', () => {
+    expect(splitNoProxy(['a.example', '10.0.0.0/8', '<local>', '*.ok.example']).dropped).toEqual(['10.0.0.0/8', '<local>']);
+    const r = resolveUpstreamProxy({}, { url: 'http://corp:3128', noProxy: ['a.example', '10.0.0.0/8', '<local>'] });
+    expect(r.cfg).toEqual({ url: 'http://corp:3128', noProxy: ['a.example'] });
+    expect(r.problem).toMatch(/"10\.0\.0\.0\/8", "<local>" can't be used.*go through the proxy/);
+    const logs: string[] = [];
+    const h = host([], { vscodeHttpProxy: () => ({ url: 'http://corp:3128', noProxy: ['<local>'] }), logs });
+    expect(h.applyUpstreamSettings({}).problem).toMatch(/<local>/);
+    expect(logs.join('\n')).toMatch(/<local>/);
+    expect(h.warnings.find((w) => w.id === 'settings:upstream')?.text).toMatch(/<local>/);
+    expect(h.upstreamProxySource).toBe('http.proxy');
+    h.applyUpstreamSettings({ url: 'http://mine:8888' });
+    expect(h.warnings.find((w) => w.id === 'settings:upstream')).toBeUndefined();
   });
 
   it('ours wins; VS Code http.proxy only when ours is empty; noProxy carried; ignoreCertErrors only from ours', () => {

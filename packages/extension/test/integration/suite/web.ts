@@ -15,15 +15,16 @@
  *  E. flutterIntercept.web.enabled=false: no flags, app works, nothing recorded.
  *  F. web-server device: not intercepted, with the one-time notice reason.
  *  v0.8.0 (CONTRACTS §14.7), in the A-C session:
- *  G. web screenshot: `Page.captureScreenshot` over CDP on the debug Chrome's port (`--web-browser-debug-port` we add).
+ *  G. web screenshot: `Page.captureScreenshot` over CDP; the browser found by its process (this session's flags) and
+ *     owning its DevTools listener; the page by the app URL from the adapter's `app.webLaunchUrl` event.
  *  H. DIRECT fallback: the proxy is stopped mid-session; after a hot restart every call still works (PAC
  *     `PROXY 127.0.0.1:<port>; DIRECT`) and nothing is recorded; the proxy is started again afterwards.
  */
+import { execFile } from 'child_process';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { Exchange } from '@flutter-intercept/proxy';
-import { webBrowserDebugPortOf } from '../../../src/debug/rewrite';
-import { captureWebPng } from '../../../src/web/screenshot';
+import { captureWebPng, webLaunchUrlOf } from '../../../src/web/screenshot';
 import { activateBoth, freePort, outputOf, registerOutputTracker, RunOutcome, sleep, startSession, stopSession, waitFor } from './helpers';
 
 const JP = 'https://jsonplaceholder.typicode.com';
@@ -58,9 +59,15 @@ const evidence = (text: string) => text.split(/\r?\n/).filter((l) => /WEB_(START
 /** Debug-adapter `stopped` events per session (breakpoint check). */
 const stops = new Map<string, { reason: string; threadId: number }[]>();
 let stopTracker = false;
+/** flutter_tools' `app.webLaunchUrl` per session (forwarded by the debug adapter). */
+const launchUrls = new Map<string, string>();
 function registerStopTracker(): void {
   if (stopTracker) return;
   stopTracker = true;
+  vscode.debug.onDidReceiveDebugSessionCustomEvent((e) => {
+    const url = webLaunchUrlOf(e);
+    if (url) launchUrls.set(e.session.id, url);
+  });
   vscode.debug.registerDebugAdapterTrackerFactory('dart', {
     createDebugAdapterTracker(session) {
       return {
@@ -129,7 +136,7 @@ export async function runWebSuite(): Promise<RunOutcome[]> {
     // v0.8.0: a loopback PAC URL (DIRECT fallback) for this proxy port.
     const pac = new RegExp(`^--web-browser-flag=--proxy-pac-url=http://127\\.0\\.0\\.1:\\d+/flutter-intercept-${api.proxyHost.port}\\.pac$`);
     if (proxy.length !== 1 || !pac.test(proxy[0])) failures.push(`proxy flags ${JSON.stringify(proxy)}`);
-    if (args.filter((a) => a.startsWith('--web-browser-debug-port=')).length !== 1 || !webBrowserDebugPortOf(c)) failures.push(`debug port flag missing: ${args.join(' ')}`);
+    if (args.some((a) => a.startsWith('--web-browser-debug-port'))) failures.push(`debug port pinned (REVIEW-8 #10): ${args.join(' ')}`);
     if (pin.length !== 1 || !/=[A-Za-z0-9+/]{43}=$/.test(pin[0])) failures.push(`SPKI flags ${JSON.stringify(pin)}`);
     if (args.some((a) => a.includes('FLUTTER_INTERCEPT_'))) failures.push(`entry defines on a web session: ${args.join(' ')}`);
     for (const a of userArgs) if (!args.includes(a)) failures.push(`user toolArg ${a} lost`);
@@ -233,8 +240,14 @@ export async function runWebSuite(): Promise<RunOutcome[]> {
     failures = [];
     let shotInfo = '';
     try {
-      const png = await captureWebPng(webBrowserDebugPortOf(session.configuration) ?? 0);
-      shotInfo = `${png.readUInt32BE(16)}x${png.readUInt32BE(20)} ${png.length} bytes`;
+      const appUrl = launchUrls.get(session.id);
+      if (!appUrl) throw new Error('no app.webLaunchUrl event seen for the session');
+      const exec = (cmd: string, args: string[]) =>
+        new Promise<{ stdout: Buffer; stderr: string }>((resolve, reject) =>
+          execFile(cmd, args, { encoding: 'buffer', timeout: 10_000, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => (err ? reject(err) : resolve({ stdout, stderr: stderr.toString('utf8') }))),
+        );
+      const png = await captureWebPng(appUrl, session.configuration.flutterInterceptWebFlags, { exec });
+      shotInfo = `${appUrl} ${png.readUInt32BE(16)}x${png.readUInt32BE(20)} ${png.length} bytes`;
       if (png.length < 1000) failures.push(`tiny screenshot ${shotInfo}`);
     } catch (e) {
       failures.push(`screenshot: ${(e as Error).message}`);

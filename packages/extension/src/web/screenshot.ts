@@ -1,15 +1,19 @@
 /**
  * Flutter Web screenshots (CONTRACTS §13.8, §14.7): `Page.captureScreenshot` over the Chrome DevTools Protocol of the
- * debug Chrome/Edge flutter_tools started. The provider gives that browser a known remote-debugging port
- * (`--web-browser-debug-port`, src/debug/rewrite.ts `webBrowserDebugPortOf`); we connect to it on 127.0.0.1 only.
+ * debug Chrome/Edge flutter_tools started — of the app's page only.
  *
- * Loopback only: the target list comes from `http://127.0.0.1:<port>/json/list`, and the WebSocket URL is rebuilt as
- * `ws://127.0.0.1:<port>/devtools/page/<id>` from a validated id — the host in the browser's `webSocketDebuggerUrl` is
- * never used. vscode-free; uses the `ws` package (already a dependency) unless a `webSocket` factory is injected.
+ * Finding that browser without trusting a port we chose (REVIEW-8 #10): src/web/browsers.ts lists the browser processes
+ * flutter_tools started with this session's own browser flags, and accepts a DevTools port only when the listener on it
+ * belongs to that process. Of that browser we capture only a page whose origin is the session's app URL (flutter_tools'
+ * `app.webLaunchUrl`, forwarded by the debug adapter as `flutter.forwardedEvent`) — never another tab.
+ *
+ * Loopback only: everything goes to http/ws://127.0.0.1:<port>; the host in the browser's own URLs is never used.
+ * vscode-free; uses the `ws` package (already a dependency) unless a `webSocket` factory is injected.
  */
 import * as http from 'http';
 import { MAX_SCREENSHOT_BYTES, pngSize, saveScreenshot } from '../screenshot';
 import type { Screenshot, ScreenshotTarget } from '../screenshot/types';
+import { BrowserDiscoveryDeps, browserFlagValues, Exec, listDebugBrowsers, listenerBelongsTo } from './browsers';
 
 export const DEVTOOLS_HOST = '127.0.0.1';
 const LIST_TIMEOUT_MS = 5_000;
@@ -29,13 +33,33 @@ export interface CdpSocket {
 }
 
 export interface WebScreenshotDeps {
-  /** The session's browser remote-debugging port: `webBrowserDebugPortOf(session.configuration)`. */
-  devToolsPort(sessionId: string): number | undefined | Promise<number | undefined>;
+  /** The session's app URL (`app.webLaunchUrl`): track it with `webLaunchUrlOf` on the debug adapter's custom events. */
+  appUrl(sessionId: string): string | undefined | Promise<string | undefined>;
+  /** The session's recorded browser flags: `session.configuration.flutterInterceptWebFlags`. */
+  webFlags(sessionId: string): unknown;
+  /** Runs a tool with an argument array, no shell (the same `exec` as ScreenshotDeps). */
+  exec: Exec;
   log(msg: string): void;
   /** Test seams. */
+  platform?: NodeJS.Platform;
+  uid?: number | null;
+  procRoot?: string;
   getJson?(url: string): Promise<unknown>;
   webSocket?(url: string): CdpSocket;
   now?(): Date;
+}
+
+type LocateDeps = Pick<WebScreenshotDeps, 'exec' | 'getJson' | 'platform' | 'uid' | 'procRoot'>;
+
+/**
+ * The app URL in a debug adapter custom event (`vscode.debug.onDidReceiveDebugSessionCustomEvent`): flutter_tools'
+ * `app.webLaunchUrl` forwarded as `flutter.forwardedEvent {event, params: {url, launched}}`. Loopback http(s) only.
+ */
+export function webLaunchUrlOf(e: { event?: unknown; body?: unknown } | undefined): string | undefined {
+  if (!e || e.event !== 'flutter.forwardedEvent') return undefined;
+  const body = e.body as { event?: unknown; params?: { url?: unknown } } | undefined;
+  if (body?.event !== 'app.webLaunchUrl' || typeof body.params?.url !== 'string') return undefined;
+  return loopbackOrigin(body.params.url) ? body.params.url : undefined;
 }
 
 /** `Screenshot` with the CDP method (CONTRACTS §13.8 `method` gains `'devtools'`). */
@@ -47,25 +71,24 @@ export interface CdpTarget {
   url?: string;
 }
 
-function isLoopbackHttp(url: string | undefined): boolean {
-  if (!url) return false;
+/** `http(s)://localhost|127.x.x.x|[::1][:port]` origin of `url`, else undefined. */
+export function loopbackOrigin(url: string | undefined): string | undefined {
+  if (!url) return undefined;
   try {
     const u = new URL(url);
-    return (u.protocol === 'http:' || u.protocol === 'https:') && (u.hostname === 'localhost' || u.hostname === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(u.hostname));
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return undefined;
+    if (u.hostname !== 'localhost' && u.hostname !== '[::1]' && !/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(u.hostname)) return undefined;
+    return u.origin;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
-/**
- * The page to capture: a `page` target whose id is safe to put in a URL; the app on a loopback origin first (the dev
- * server), else any other http(s) page (e.g. `--web-hostname` on a LAN address). DevTools / chrome:// pages never.
- */
-export function pickTarget(list: unknown): CdpTarget | undefined {
-  const pages = (Array.isArray(list) ? list : [])
+/** The `page` target showing the app (`origin` = the app URL's origin); never any other tab. Safe ids only. */
+export function appPage(list: unknown, origin: string): CdpTarget | undefined {
+  return (Array.isArray(list) ? list : [])
     .filter((t): t is CdpTarget => !!t && typeof t === 'object' && typeof (t as CdpTarget).id === 'string')
-    .filter((t) => t.type === 'page' && /^[A-Za-z0-9_-]{1,128}$/.test(t.id));
-  return pages.find((t) => isLoopbackHttp(t.url)) ?? pages.find((t) => typeof t.url === 'string' && /^https?:\/\//i.test(t.url));
+    .find((t) => t.type === 'page' && /^[A-Za-z0-9_-]{1,128}$/.test(t.id) && loopbackOrigin(t.url) === origin);
 }
 
 function checkPort(port: unknown): number {
@@ -157,13 +180,39 @@ function cdpCall(socket: CdpSocket, method: string, params: Record<string, unkno
   });
 }
 
-/** PNG of the app's page in the browser listening for DevTools on 127.0.0.1:`port`. */
-export async function captureWebPng(port: number, deps: Pick<WebScreenshotDeps, 'getJson' | 'webSocket'> = {}): Promise<Buffer> {
+/** The verified debug browser (pid, DevTools port) and app page for this session, or an error saying why not. */
+export async function locateAppPage(appUrl: string, webFlags: unknown, deps: LocateDeps): Promise<{ port: number; page: CdpTarget }> {
+  const origin = loopbackOrigin(appUrl);
+  if (!origin) throw new Error('the app URL is not a loopback http(s) URL');
+  const flags = browserFlagValues(webFlags);
+  if (!flags.length) throw new Error('this session was not started with Flutter Intercept\'s browser flags');
+  const disco: BrowserDiscoveryDeps = { exec: deps.exec, platform: deps.platform, procRoot: deps.procRoot, ...('uid' in deps ? { uid: deps.uid } : {}) };
+  const browsers = await listDebugBrowsers(flags, disco);
+  if (!browsers.length) throw new Error('no debug browser started by flutter_tools for this session was found');
+  const getJson = deps.getJson ?? getLoopbackJson;
+  let unverified = 0;
+  for (const b of browsers) {
+    // The DevTools listener must be that browser process (never a process that took the port first).
+    if (!(await listenerBelongsTo(b.pid, b.port, disco))) {
+      unverified++;
+      continue;
+    }
+    try {
+      const page = appPage(await getJson(`http://${DEVTOOLS_HOST}:${b.port}/json/list`), origin);
+      if (page) return { port: b.port, page };
+    } catch {
+      /* browser gone */
+    }
+  }
+  if (unverified === browsers.length) throw new Error("the debug browser's DevTools port is not held by the browser itself");
+  throw new Error(`the app's page (${origin}) is not open in the debug browser`);
+}
+
+/** PNG of the app's page (`appUrl`) in the debug browser flutter_tools started with `webFlags`. */
+export async function captureWebPng(appUrl: string, webFlags: unknown, deps: LocateDeps & Pick<WebScreenshotDeps, 'webSocket'>): Promise<Buffer> {
+  const { port, page } = await locateAppPage(appUrl, webFlags, deps);
   checkPort(port);
-  const list = await (deps.getJson ?? getLoopbackJson)(`http://${DEVTOOLS_HOST}:${port}/json/list`);
-  const target = pickTarget(list);
-  if (!target) throw new Error('no app page in the debug browser');
-  const socket = (deps.webSocket ?? defaultWebSocket)(`ws://${DEVTOOLS_HOST}:${port}/devtools/page/${target.id}`);
+  const socket = (deps.webSocket ?? defaultWebSocket)(`ws://${DEVTOOLS_HOST}:${port}/devtools/page/${page.id}`);
   const result = await cdpCall(socket, 'Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: false }, CAPTURE_TIMEOUT_MS);
   const b64 = result.data;
   if (typeof b64 !== 'string' || !b64) throw new Error('Page.captureScreenshot: no image');
@@ -178,15 +227,13 @@ export async function captureWebPng(port: number, deps: Pick<WebScreenshotDeps, 
  * and saves it like every other screenshot (`saveScreenshot`, 0600 under `.dart_tool/flutter_intercept/screenshots/`).
  */
 export async function webScreenshot(target: ScreenshotTarget, deps: WebScreenshotDeps): Promise<WebScreenshot> {
-  const port = await deps.devToolsPort(target.sessionId);
-  if (port === undefined) {
-    throw new Error(
-      'Could not take a screenshot of this web app: its browser has no known debug port (only Chrome / Edge sessions started with Flutter Intercept on).',
-    );
+  const appUrl = await deps.appUrl(target.sessionId);
+  if (!appUrl) {
+    throw new Error("Could not take a screenshot of this web app: its URL is not known yet (Chrome / Edge sessions only, once the app has started).");
   }
   let png: Buffer;
   try {
-    png = await captureWebPng(checkPort(port), deps);
+    png = await captureWebPng(appUrl, await deps.webFlags(target.sessionId), deps);
   } catch (e) {
     const why = String((e as Error)?.message ?? e).replace(/[\r\n\t]+/g, ' ').slice(0, 300);
     throw new Error(`Could not take a screenshot of this web app (${why}).`);

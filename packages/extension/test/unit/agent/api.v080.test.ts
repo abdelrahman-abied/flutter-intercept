@@ -4,6 +4,7 @@
 import { EventEmitter } from 'events';
 import { describe, expect, it, vi } from 'vitest';
 import type { Exchange, Rule } from '@flutter-intercept/proxy';
+import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 import { createAgentApi, type AgentApiDeps } from '../../../src/agent/api';
 import { parseToolInput } from '../../../src/agent/schema';
 import { AgentToolError, type AppLauncher } from '../../../src/agent/types';
@@ -27,6 +28,10 @@ class FakeHost extends EventEmitter {
   }
   resume() {}
   abort() {}
+  networkProfile: NetworkProfile = { kind: 'none' };
+  setNetworkProfile(p: NetworkProfile) {
+    this.networkProfile = p;
+  }
 }
 
 class FakeRecordings {
@@ -215,5 +220,20 @@ describe('multipart bodies in get_request (CONTRACTS §14.6)', () => {
     const d = (await api.call('get_request', { id: 'u2' })) as Record<string, any>;
     expect(d.requestBody.text).toContain('name="title"\r\n\r\nhello');
     expect(d.requestBody.text).not.toContain(SECRET);
+  });
+});
+
+describe('uploadKbps in simulate_network / add_sequence (CONTRACTS §14.4)', () => {
+  it('custom profile and custom rule carry uploadKbps; presets carry their upload value; sequence steps too', async () => {
+    const { api, host } = setup();
+    await api.call('simulate_network', { profile: 'custom', uploadKbps: 64 });
+    expect(host.networkProfile).toEqual({ kind: 'throttle', uploadKbps: 64 });
+    await api.call('simulate_network', { profile: 'custom', url: 'https://api.example.com/upload*', uploadKbps: 32, kbps: 1000 });
+    expect(host.rules[0].action).toEqual({ kind: 'throttle', kbps: 1000, uploadKbps: 32 });
+    await api.call('simulate_network', { profile: 'fast-3g', url: 'https://api.example.com/*' });
+    expect(host.rules[0].action).toMatchObject({ kind: 'throttle', latencyMs: 150, kbps: 1600, uploadKbps: 750 });
+    await rejectsWith(api.call('simulate_network', { profile: 'slow-3g', uploadKbps: 10 }), /only used with profile "custom"/, 'invalid');
+    await api.call('add_sequence', { url: 'https://api.example.com/x*', steps: [{ kind: 'throttle', uploadKbps: 8 }, { kind: 'passthrough' }] });
+    expect(JSON.stringify(host.rules[0].action)).toContain('"uploadKbps":8');
   });
 });

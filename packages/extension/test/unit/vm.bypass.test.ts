@@ -121,7 +121,7 @@ const MAIN = 'isolates/1';
 const vm = { type: 'VM', isolates: [{ id: MAIN, name: 'main', isSystemIsolate: false }] };
 const LOG = 'ext.dart.io.httpEnableTimelineLogging';
 
-function setup(o: { mode?: NativeClientsMode; httpProfile?: boolean; routed?: () => boolean } = {}) {
+function setup(o: { mode?: NativeClientsMode; httpProfile?: boolean; routed?: () => boolean; proxySaw?: (q: { url: string }) => boolean | undefined } = {}) {
   const recorded: Omit<Exchange, 'id'>[] = [];
   const warnings: SessionWarning[][] = [];
   const failures: (string | undefined)[] = [];
@@ -143,6 +143,7 @@ function setup(o: { mode?: NativeClientsMode; httpProfile?: boolean; routed?: ()
     isOurProxy: ours,
     nativeRouted: o.routed,
     nativeRouteFailed: (c) => failures.push(c),
+    proxySaw: o.proxySaw,
     now: () => Date.now(),
   });
   return { t, core, recorded, warnings, failures, push: (...polls: ProfileEntry[][]) => (queue = [...queue, ...polls]), logging: () => t.calls.filter((c) => c.method === LOG).map((c) => c.params.enabled) };
@@ -247,6 +248,19 @@ describe('nativeClients "proxy" (routed native clients)', () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(s.recorded).toHaveLength(3);
     expect(s.recorded[2]).toMatchObject({ captured: 'vm-profile', state: 'completed' });
+  });
+
+  it('REVIEW-8 #7: a routed entry the proxy never recorded (route reverted meanwhile) is imported after all', async () => {
+    const s = setup({ mode: 'proxy', httpProfile: true, routed: () => true, proxySaw: (q) => q.url.endsWith('/posts/1') && false });
+    s.push([native(1)]);
+    await s.core.start(s.t);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(s.recorded).toHaveLength(1);
+    const seen = setup({ mode: 'proxy', httpProfile: true, routed: () => true, proxySaw: () => true });
+    seen.push([native(1)]);
+    await seen.core.start(seen.t);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(seen.recorded).toEqual([]);
   });
 
   it('"proxy" without routing (iOS simulator, macOS, physical devices) behaves like "profile"', async () => {

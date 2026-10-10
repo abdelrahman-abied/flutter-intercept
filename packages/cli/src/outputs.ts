@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { Exchange, ReplayEntry, ReplayOptions } from '@flutter-intercept/proxy';
 import { buildHar } from '../../extension/src/agent/har';
-import { createRecordingService, slugify, DEFAULT_MAX_RECORDING_BYTES } from '../../extension/src/recordings/store';
+import { createRecordingService, recordedExchange, serializeRecording, slugify, DEFAULT_MAX_RECORDING_BYTES } from '../../extension/src/recordings/store';
 import { replayOptionsFor, toReplay } from '../../extension/src/recordings/replay';
 import { validateRecording } from '../../extension/src/recordings/validate';
 import type { Recording } from '../../extension/src/recordings/types';
@@ -102,4 +102,21 @@ export async function writeRecording(value: string, exchanges: Exchange[], proje
     await store.remove(meta.id).catch(() => undefined);
   }
   return { path: file, exchanges: meta.exchanges };
+}
+
+/**
+ * A redacted copy of the recording file `src` at `dest` (REVIEW-8 #2: what the GitHub Action uploads; the unredacted
+ * file stays local). Secrets are redacted like agent views, WebSocket / SSE frames included. Replaying the copy misses
+ * requests whose bodies held secrets (their hashes differ). Returns the number of exchanges.
+ */
+export function writeRedactedRecordingCopy(src: string, dest: string): number {
+  const st = fs.statSync(src);
+  if (!st.isFile()) throw new Error(`${src} is not a regular file`);
+  if (st.size > DEFAULT_MAX_RECORDING_BYTES) throw new Error(`${src} is larger than 200 MB`);
+  const id = slugify(path.basename(src, path.extname(src))).replace(/^-+|-+$/g, '') || 'recording';
+  const rec = validateRecording(JSON.parse(fs.readFileSync(src, 'utf8')), id, src);
+  const entries = rec.redacted ? rec.entries : rec.entries.map((e) => recordedExchange(e, true));
+  const text = serializeRecording({ id: rec.id, name: rec.name, createdAt: rec.createdAt, exchanges: entries.length, redacted: true }, entries, DEFAULT_MAX_RECORDING_BYTES);
+  writeOutput(dest, text);
+  return entries.length;
 }

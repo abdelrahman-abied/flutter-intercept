@@ -160,11 +160,11 @@ stop the proxy, fetch again, restart the proxy on the same port), and `flutter r
 ```
 --web-browser-flag=--proxy-pac-url=http://127.0.0.1:<pacPort>/flutter-intercept-<proxyPort>.pac
 --web-browser-flag=--ignore-certificate-errors-spki-list=<pin>          (unchanged)
---web-browser-debug-port=<free loopback port>                           (new: web screenshots)
 ```
 
-The script: loopback (`localhost`, `*.localhost`, `127.*`, `::1`) → `DIRECT`; everything else →
-`PROXY 127.0.0.1:<proxyPort>; DIRECT`.
+The script: loopback (`localhost`, `*.localhost`, IPv4 literals `/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/`, `::1` / `[::1]`) →
+`DIRECT`; everything else → `PROXY 127.0.0.1:<proxyPort>; DIRECT`. (REVIEW-8 #3: the first draft used
+`shExpMatch(host, "127.*")`, which also sent DNS names like `127.evil.example` DIRECT; now a test asserts they are proxied.)
 
 | PAC source | Chrome honours it | Proxy up | Proxy stopped | Verdict |
 |---|---|---|---|---|
@@ -206,19 +206,17 @@ session to be intercepted immediately. If the proxy comes back on another port, 
 - Only the temp-profile browser flutter_tools starts gets the flags; `--user-data-dir` launches stay skipped (#10).
 - The SPKI pin is still only for this install's CA; the PAC changes routing, not trust.
 - The user's own `--proxy-pac-url` / `--proxy-server` / `--no-proxy-server` / `--proxy-auto-detect` still wins (skip).
-- Re-resolve strips exactly the recorded `flutterInterceptWebFlags` (now including the PAC flag and the debug-port flag).
+- Re-resolve strips exactly the recorded `flutterInterceptWebFlags` (now including the PAC flag; a pre-review `--web-browser-debug-port` recorded there is stripped too).
 
 ### Implementation
 - `src/debug/pacServer.ts` — `pacScript(port)`, `PacServer` (binds 127.0.0.1:0, `unref`'d, Host must be
   `127.0.0.1:<pacPort>` else 403, GET/HEAD only, serves `/flutter-intercept-<port>.pac` only while `currentPort()` is that
   port, else 404; `no-store`). Not served by the proxy: a crash of the proxy must not take the PAC down with it.
 - `rewrite.ts` — `webInterceptFlags(port, pin, {pacUrl, debugPort})`, `isOurPacUrl` (loopback, `.pac`, no comma),
-  `webDebugPortArg`, `webBrowserDebugPortOf(config)`; `RewriteContext.webPacUrl` / `webDebugPort`. No PAC URL → the
-  v0.5.0 `--proxy-server` flag (graceful). The user's own `--web-browser-debug-port` is kept and used.
+  `RewriteContext.webPacUrl`. No PAC URL → the v0.5.0 `--proxy-server` flag (graceful).
 - `provider.ts` — for web launches (first pass `needsCa`, or the status-bar device is a web device): PAC URL from
   `PrepareDeps.webPac` (default: one lazily started `PacServer` per deps object, serving the port `proxyHost.start()` returned
-  while `proxyHost.running`) and a free loopback port (`PrepareDeps.freePort`, default the OS); each bounded to 2 s and
-  falling back (logged) without failing the launch.
+  while `proxyHost.running`), bounded to 2 s and falling back (logged) without failing the launch.
 - Edge: same `ChromiumLauncher` flags in flutter_tools (Windows only); not runnable here, code-read only.
 
 ## web-server device: one-time notice with the manual flags (never automatic)
@@ -239,25 +237,43 @@ fresh profile is both required and the REVIEW-5 #10 guarantee. Nothing is ever r
 
 ## Web screenshots over CDP
 
-flutter_tools starts Chrome with `--remote-debugging-port=<findFreePort()>` unless `--web-browser-debug-port` is given
-(`chrome.dart` `launch`, `web_device.dart:146`); the port is not exposed by DWDS or the daemon. So the provider passes
-`--web-browser-debug-port=<free loopback port>` (recorded and stripped like the browser flags) and
-`webBrowserDebugPortOf(session.configuration)` reads it back (ours or the user's own).
+flutter_tools starts Chrome with `--remote-debugging-port=<findFreePort()>` (`chrome.dart` `launch`); neither DWDS nor the
+daemon exposes the port. A first draft pinned it with `--web-browser-debug-port=<port picked at resolve time>`; REVIEW-8
+#10 showed a local user could bind that port during the tens of seconds before Chrome starts. **Not pinned any more.**
+Chrome's `DevToolsActivePort` file is no help: measured, Chrome 154 writes it only for `--remote-debugging-port=0`, and
+flutter_tools always passes a concrete port (and can't use 0: it connects to the number it passed).
 
-`src/web/screenshot.ts`: `GET http://127.0.0.1:<port>/json/list` (≤ 1 MB, 5 s) → the `page` target on a loopback origin
-(the dev server; else any http(s) page; never devtools:// / chrome://; id `[A-Za-z0-9_-]{1,128}`) → WebSocket rebuilt as
-`ws://127.0.0.1:<port>/devtools/page/<id>` (the advertised `webSocketDebuggerUrl` host is never used; no Origin header, so
-Chrome's `--remote-allow-origins` check does not apply; `maxPayload` ~21 MB) → `Page.captureScreenshot {format: png,
-fromSurface: true}` (15 s) → PNG checked (IHDR, ≤ 16 MB) → `saveScreenshot` (0600, `.dart_tool/flutter_intercept/screenshots/`).
-Measured in the flutter run above: 54 638 bytes, 756×413 (headless window), the sample's text rendered.
+So `src/web/browsers.ts` finds the browser by its process:
+- `ps -A -ww -o pid=,uid=,args=` (Windows: `Get-CimInstance Win32_Process` for chrome.exe / msedge.exe). Keep processes
+  owned by this user, not `--type=` children, whose command line has a `flutter_tools_chrome_device.*` user-data-dir, a
+  `--remote-debugging-port=N`, and every browser flag this session was given (`flutterInterceptWebFlags`).
+- Use port N only when the TCP listener on it belongs to that pid: `lsof -nP -a -p <pid> -iTCP:N -sTCP:LISTEN -t` (macOS),
+  `/proc/net/tcp{,6}` LISTEN inode ∈ `/proc/<pid>/fd` (Linux), `netstat -ano -p TCP` (Windows). If that can't be checked
+  (no lsof), nothing is used.
+
+`src/web/screenshot.ts` then:
+- reads `GET http://127.0.0.1:N/json/list` and takes **only** the `page` whose origin equals the session's app URL. The URL
+  is flutter_tools' `app.webLaunchUrl`, which the debug adapter forwards as the custom event `flutter.forwardedEvent`;
+  `webLaunchUrlOf(e)` reads it. No fallback to other tabs: no match is an error.
+- rebuilds the WebSocket URL as `ws://127.0.0.1:N/devtools/page/<id>` (no Origin header, bounded messages).
+- calls `Page.captureScreenshot`, checks the PNG (≤ 16 MB) and saves it with `saveScreenshot`.
+
+Measured, manual `flutter run -d chrome` with no pinned port:
+- 54 397 bytes, 756×413.
+- Another origin → refused ("the app's page (http://localhost:1) is not open in the debug browser").
+- Another session's flags → refused ("no debug browser … for this session").
+- Windows (PowerShell / netstat) and Linux (`/proc`) are unit-tested only; I could not run them here.
 
 ## Integration suite (`FI_SUITE=web`), v0.8.0 additions
-A now expects the PAC flag + the debug-port flag; **G** captures a screenshot over CDP from the A–C session; **H** stops the
+A now expects the PAC flag (and no pinned debug port); **G** captures a screenshot over CDP from the A–C session
+(app URL from the adapter's `app.webLaunchUrl` event, browser found and verified as above); **H** stops the
 proxy mid-session, hot-restarts, expects every call to still work and nothing recorded, then starts the proxy again.
 
 Command: `cd packages/extension && node build.mjs && npm run package && node build.mjs --tests && FI_VSIX=flutter-intercept.vsix FI_SUITE=web node dist-test/runTest.js`
 
-Result (2026-10-10, packaged VSIX, random proxy port): **8/8 passed** (first run).
+Result (2026-10-10, packaged VSIX, random proxy port, before the REVIEW-8 #3 / #10 changes): **8/8 passed** (first run).
+After those changes it was not re-run: the extension doesn't build until `extension.ts` is rewired to the new
+`webScreenshot` deps. The new discovery path was checked with the manual `flutter run` above.
 
 ```
 [suite] ok   FI-W A launch on chrome (flags, all requests recorded, breakpoint) (46744 ms) exchanges=21 breakpoint=hit

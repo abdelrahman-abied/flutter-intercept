@@ -254,6 +254,10 @@ export class ReverseTracker {
 // Revert = `put :0` (clears ConnectivityService's global proxy; a bare `delete` leaves it active), then `delete`
 // when the key was unset before, or the previous value. Every applied value is written to the store first, so a
 // crash is repaired by `recover()` on the next activation (or the next apply on that emulator).
+// REVIEW-8 #7: the store (globalState) is shared by every VS Code window, so each record names its owner (a random
+// id per instance + its pid) and carries a heartbeat refreshed every 30 s while routed; `recover()` only reverts
+// records whose owner is gone (pid dead, or heartbeat older than 2 min). The emulator's actual `http_proxy` is
+// re-read every 30 s (and on demand, ≤ 1 per 10 s): a route someone else reverted or replaced is dropped.
 // ---------------------------------------------------------------------------------------------------------------
 
 /** The emulator's alias for the host loopback (CONTRACTS §2). */
@@ -269,6 +273,10 @@ export interface GlobalProxyRecord {
   value: string;
   /** `http_proxy` before we touched it (`null` = unset). */
   previous: string | null;
+  /** REVIEW-8 #7: the instance that set it (random per extension host), its pid and its last heartbeat (epoch ms). */
+  owner?: string;
+  pid?: number;
+  heartbeat?: number;
 }
 
 /** Persistence for crash recovery (the host passes `context.globalState`-backed get / set). */
@@ -283,6 +291,32 @@ export type GlobalProxyResult =
 
 export interface AndroidGlobalProxyOptions extends AdbOptions {
   store?: GlobalProxyStore;
+  /** Owner id of this instance (default: random). */
+  ownerId?: string;
+  /** This process's pid (default `process.pid`). */
+  pid?: number;
+  /** Whether a pid is alive (default `process.kill(pid, 0)`). */
+  pidAlive?(pid: number): boolean;
+  now?(): number;
+  /** Heartbeat + re-check period while routed, ms (default 30 s; 0 = no timer, tests drive `tick()`). */
+  heartbeatMs?: number;
+  /** A record whose heartbeat is older than this belongs to a gone owner, ms (default 2 min). */
+  staleMs?: number;
+  /** `isRouted()` re-reads `http_proxy` at most this often, ms (default 10 s). */
+  recheckMs?: number;
+}
+
+export const GLOBAL_PROXY_HEARTBEAT_MS = 30_000;
+export const GLOBAL_PROXY_STALE_MS = 120_000;
+const RECHECK_MS = 10_000;
+
+function defaultPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
 }
 
 /** `settings get` output → value, `null` when unset. */
@@ -299,7 +333,10 @@ function isValidRecord(r: unknown): r is GlobalProxyRecord {
     EMULATOR_SERIAL.test(o.serial) &&
     typeof o.value === 'string' &&
     /^10\.0\.2\.2:\d{1,5}$/.test(o.value) &&
-    (o.previous === null || (typeof o.previous === 'string' && o.previous.length <= 300))
+    (o.previous === null || (typeof o.previous === 'string' && o.previous.length <= 300)) &&
+    (o.owner === undefined || (typeof o.owner === 'string' && o.owner.length <= 100)) &&
+    (o.pid === undefined || (Number.isInteger(o.pid) && o.pid > 0)) &&
+    (o.heartbeat === undefined || Number.isFinite(o.heartbeat))
   );
 }
 
@@ -313,13 +350,36 @@ export class AndroidGlobalProxy {
   private readonly sessions = new Map<string, string>(); // sessionId → serial
   private readonly active = new Map<string, GlobalProxyRecord>(); // serial → record (applied by this process)
   private chain: Promise<unknown> = Promise.resolve();
+  private readonly owner: string;
+  private readonly pid: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private readonly lastCheck = new Map<string, number>(); // serial → epoch ms
+  private checking = false;
 
-  constructor(private readonly opts: AndroidGlobalProxyOptions = {}) {}
+  constructor(private readonly opts: AndroidGlobalProxyOptions = {}) {
+    this.owner = opts.ownerId ?? `fi-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+    this.pid = opts.pid ?? process.pid;
+  }
 
-  /** Whether this session's emulator is routed through the proxy right now. */
+  /**
+   * Whether this session's emulator is routed through the proxy right now. Re-reads the emulator's `http_proxy` in
+   * the background at most every `recheckMs` (REVIEW-8 #7); a route that is no longer ours is dropped then.
+   */
   isRouted(sessionId: string): boolean {
     const serial = this.sessions.get(sessionId);
-    return serial !== undefined && this.active.has(serial);
+    if (serial === undefined || !this.active.has(serial)) return false;
+    if (this.now() - (this.lastCheck.get(serial) ?? 0) >= (this.opts.recheckMs ?? RECHECK_MS)) void this.recheck();
+    return this.active.has(serial);
+  }
+
+  /** Heartbeat + re-check (the timer calls it; tests may call it directly). */
+  tick(): Promise<void> {
+    return this.serial(async () => {
+      await this.recheckNow();
+      if (this.active.size === 0) return;
+      const t = this.now();
+      await this.save(this.stored().map((r) => (this.active.has(r.serial) && r.owner === this.owner ? { ...r, heartbeat: t } : r)));
+    });
   }
 
   /** Emulators currently routed by us. */
@@ -366,6 +426,7 @@ export class AndroidGlobalProxy {
       let n = 0;
       for (const rec of this.stored()) {
         if (this.active.has(rec.serial) || !connected.includes(rec.serial)) continue; // offline: kept for later
+        if (this.ownerAlive(rec)) continue; // REVIEW-8 #7: another window's live session
         if (await this.revert(rec)) n++;
       }
       return n;
@@ -373,6 +434,63 @@ export class AndroidGlobalProxy {
   }
 
   // ------------------------------------------------------------------------------------------------- internals
+
+  private now(): number {
+    try {
+      return this.opts.now ? this.opts.now() : Date.now();
+    } catch {
+      return Date.now();
+    }
+  }
+
+  /** Someone else's live record: owner differs, pid alive and heartbeat fresh. */
+  private ownerAlive(r: GlobalProxyRecord): boolean {
+    if (!r.owner || r.owner === this.owner || r.pid === undefined || r.heartbeat === undefined) return false;
+    if (this.now() - r.heartbeat > (this.opts.staleMs ?? GLOBAL_PROXY_STALE_MS)) return false;
+    try {
+      return (this.opts.pidAlive ?? defaultPidAlive)(r.pid);
+    } catch {
+      return false;
+    }
+  }
+
+  private recheck(): Promise<void> {
+    if (this.checking) return Promise.resolve();
+    this.checking = true;
+    return this.serial(() => this.recheckNow()).finally(() => (this.checking = false));
+  }
+
+  /** Drops routes whose emulator no longer has our value (reverted by another window, the user, a script). */
+  private async recheckNow(): Promise<void> {
+    const adb = this.adb();
+    if (!adb) return;
+    for (const rec of [...this.active.values()]) {
+      this.lastCheck.set(rec.serial, this.now());
+      let current: string | null;
+      try {
+        current = await this.get(adb, rec.serial, 'http_proxy');
+      } catch {
+        continue; // offline for a moment: keep it
+      }
+      if (current === rec.value) continue;
+      this.active.delete(rec.serial);
+      for (const [sid, s] of this.sessions) if (s === rec.serial) this.sessions.delete(sid);
+      await this.save(this.stored().filter((r) => !(r.serial === rec.serial && r.owner === this.owner)));
+      this.log(`native proxy: ${rec.serial} http_proxy changed outside this window (${current ?? 'unset'}); no longer routed`);
+    }
+    this.updateTimer();
+  }
+
+  private updateTimer(): void {
+    const ms = this.opts.heartbeatMs ?? GLOBAL_PROXY_HEARTBEAT_MS;
+    if (this.active.size > 0 && !this.timer && ms > 0) {
+      this.timer = setInterval(() => void this.tick(), ms);
+      this.timer.unref?.();
+    } else if (this.active.size === 0 && this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
 
   private serial<T>(fn: () => Promise<T>): Promise<T> {
     const p = this.chain.then(fn, fn);
@@ -440,6 +558,10 @@ export class AndroidGlobalProxy {
         previous = mine.previous;
       } else {
         const stale = this.stored().find((r) => r.serial === serial);
+        if (stale && current === stale.value && this.ownerAlive(stale)) {
+          this.log(`native proxy: ${serial} is routed by another VS Code window; not changing it`);
+          return { applied: false, reason: 'user-proxy' };
+        }
         if (stale && current === stale.value) {
           previous = stale.previous; // left by a previous run: its `previous` is the real one
         } else if (current !== null && current !== CLEARED) {
@@ -455,7 +577,7 @@ export class AndroidGlobalProxy {
           previous = current;
         }
       }
-      const rec: GlobalProxyRecord = { serial, value, previous };
+      const rec: GlobalProxyRecord = { serial, value, previous, owner: this.owner, pid: this.pid, heartbeat: this.now() };
       // Persist first: a crash between `put` and the next save must still be repairable.
       await this.save([...this.stored().filter((r) => r.serial !== serial), rec]);
       if (current !== value) await this.exec(adb, ['-s', serial, 'shell', 'settings', 'put', 'global', 'http_proxy', value]);
@@ -466,6 +588,8 @@ export class AndroidGlobalProxy {
       }
       this.active.set(serial, rec);
       this.sessions.set(sessionId, serial);
+      this.lastCheck.set(serial, this.now());
+      this.updateTimer();
       if (!mine) this.log(`native proxy: ${serial} http_proxy → ${value} (previously ${previous ?? 'unset'})`);
       return { applied: true, serial, value };
     } catch (e) {
@@ -479,6 +603,7 @@ export class AndroidGlobalProxy {
   private async revert(rec: GlobalProxyRecord): Promise<boolean> {
     this.active.delete(rec.serial);
     for (const [sid, s] of this.sessions) if (s === rec.serial) this.sessions.delete(sid);
+    this.updateTimer();
     const adb = this.adb();
     if (!adb) return false;
     try {

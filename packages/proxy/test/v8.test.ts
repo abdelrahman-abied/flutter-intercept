@@ -15,11 +15,11 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Exchange, Frame, InterceptProxy, ReplayEntry, Rule } from '../src';
 import { loadClientCertificate } from '../src';
-import { matchesHostPattern, parseHostPattern } from '../src/hosts';
+import { hostPatternProblem, matchesHostPattern, parseHostPattern, parseHostPatterns } from '../src/hosts';
 import { poolTesting } from '../src/idle';
 import { lanIPv4Addresses, lanTesting } from '../src/lan';
 import { MAX_REPLAY_GAP_MS, sseSchedule, wsScript } from '../src/replay-stream';
-import { AppDataFinder } from '../src/tls-records';
+import { AppDataFinder, offersEarlyData } from '../src/tls-records';
 import { bypassesProxy, createUpstreamAgents, parseNoProxy, parseUpstreamProxy } from '../src/upstream-proxy';
 import { nextExchange, selfSignedCert, settled, sleep, startProxy, startTinyProxy, startUpstream, viaProxy, type Upstream } from './helpers';
 
@@ -84,24 +84,61 @@ function requestOver(socket: tls.TLSSocket, p = '/hello', headers: Record<string
 
 // ---------------------------------------------------------------- unit
 
+const rec = (type: number, len: number) => Buffer.concat([Buffer.from([type, 3, 3, len >> 8, len & 255]), Buffer.alloc(len, 1)]);
+
+/** A minimal, well-formed ClientHello record, with or without the early_data extension. */
+function clientHello(early: boolean): Buffer {
+  const ext = (type: number, data: Buffer) => Buffer.concat([Buffer.from([type >> 8, type & 255, data.length >> 8, data.length & 255]), data]);
+  const exts = Buffer.concat([ext(0, Buffer.from('000e00000b6578616d706c652e636f6d', 'hex')), ext(43, Buffer.from([2, 3, 4])), ...(early ? [ext(42, Buffer.alloc(0))] : []), ext(21, Buffer.alloc(150))]);
+  const body = Buffer.concat([Buffer.from([3, 3]), Buffer.alloc(32, 7), Buffer.from([32]), Buffer.alloc(32, 9), Buffer.from([0, 2, 0x13, 0x01]), Buffer.from([1, 0]), Buffer.from([exts.length >> 8, exts.length & 255]), exts]);
+  const hs = Buffer.concat([Buffer.from([1, 0, body.length >> 8, body.length & 255]), body]);
+  return Buffer.concat([Buffer.from([22, 3, 1, hs.length >> 8, hs.length & 255]), hs]);
+}
+
 describe('host patterns, TLS record finder, replay schedule, noProxy (unit)', () => {
-  it('host patterns: globs, ports, IPv6, refusals', () => {
+  it('host patterns: label-bounded *, leading *. = any depth, refusals (REVIEW-8 #4)', () => {
     const p = parseHostPattern('*.Bank.example');
     expect(matchesHostPattern(p, 'api.bank.example', 443)).toBe(true);
     expect(matchesHostPattern(p, 'a.b.BANK.example.', 8443)).toBe(true);
     expect(matchesHostPattern(p, 'bank.example', 443)).toBe(false);
     expect(matchesHostPattern(p, 'evilbank.example', 443)).toBe(false);
+    const mid = parseHostPattern('api-*.corp.example');
+    expect(matchesHostPattern(mid, 'api-eu.corp.example', 443)).toBe(true);
+    expect(matchesHostPattern(mid, 'api-eu.evil.corp.example', 443)).toBe(false);
+    expect(matchesHostPattern(mid, 'api-x.y.corp.example', 443)).toBe(false);
     const q = parseHostPattern('api.example.com:8443');
     expect(matchesHostPattern(q, 'api.example.com', 8443)).toBe(true);
     expect(matchesHostPattern(q, 'api.example.com', 443)).toBe(false);
     expect(matchesHostPattern(parseHostPattern('[::1]:443'), '[::1]', 443)).toBe(true);
-    expect(matchesHostPattern(parseHostPattern('10.0.0.*'), '10.0.0.7', 443)).toBe(true);
-    for (const bad of ['', '*', 'a b', 'https://x.com', 'x.com:99999', 'x.com:abc']) expect(() => parseHostPattern(bad), bad).toThrow();
+    const ip = parseHostPattern('10.0.0.1');
+    expect(matchesHostPattern(ip, '10.0.0.1', 443)).toBe(true);
+    expect(matchesHostPattern(ip, '10.0.0.1.evil.example', 443)).toBe(false);
+    const refused: Record<string, RegExp> = {
+      '*': /every host/,
+      '*.*': /last label/,
+      '*.com': /too broad/,
+      '*.local': /too broad/,
+      '*-*.local': /too broad/,
+      'api.corp.*': /last label/,
+      '10.0.0.*': /not allowed in IP addresses/,
+      '[fe80::*]': /not allowed in IP addresses/,
+      '': /expected a host/,
+      'a b': /not a host name pattern/,
+      'https://x.com': /port must be a number|not a host/,
+      'x.com:99999': /out of range/,
+    };
+    for (const [bad, why] of Object.entries(refused)) {
+      expect(() => parseHostPattern(bad), bad).toThrow(why);
+      expect(hostPatternProblem(bad), bad).toMatch(why);
+    }
+    expect(hostPatternProblem('*.corp.example')).toBeUndefined();
+    const list = parseHostPatterns(['ok.example', '10.0.0.*', '*.*', 'b.example']);
+    expect(list.patterns.map((x) => x.pattern)).toEqual(['ok.example', 'b.example']);
+    expect(list.problems.map((x) => x.host)).toEqual(['10.0.0.*', '*.*']);
   });
 
   it('AppDataFinder: TLS 1.3 (CCS, Finished, then the request), TLS 1.2, split headers, not TLS', () => {
-    const rec = (type: number, len: number) => Buffer.concat([Buffer.from([type, 3, 3, len >> 8, len & 255]), Buffer.alloc(len, 1)]);
-    const hello = rec(22, 300);
+    const hello = clientHello(false);
     const t13 = Buffer.concat([hello, rec(20, 1), rec(23, 53), rec(23, 100)]);
     expect(new AppDataFinder().push(t13)).toBe(hello.length + 6 + 58);
     const t12 = Buffer.concat([hello, rec(22, 70), rec(20, 1), rec(22, 40), rec(23, 100)]);
@@ -112,6 +149,17 @@ describe('host patterns, TLS record finder, replay schedule, noProxy (unit)', ()
     for (let i = 0; i < t13.length && at < 0; i++) if (f.push(t13.subarray(i, i + 1)) >= 0) at = i;
     expect(at).toBe(hello.length + 6 + 58 + 4); // found once the record header is complete
     expect(new AppDataFinder().push(Buffer.from('GET / HTTP/1.1\r\n'))).toBe(0);
+  });
+
+  it('AppDataFinder: a ClientHello offering early_data is cut before the first type-23 record (REVIEW-8 #5)', () => {
+    const hello = clientHello(true);
+    expect(offersEarlyData(hello.subarray(5))).toBe(true);
+    expect(offersEarlyData(clientHello(false).subarray(5))).toBe(false);
+    const zeroRtt = Buffer.concat([hello, rec(23, 125), rec(23, 60), rec(23, 100)]);
+    expect(new AppDataFinder().push(zeroRtt)).toBe(hello.length);
+    // a ClientHello that doesn't fit its record counts as offering early data
+    const cut = Buffer.concat([rec(22, 4).fill(0, 5).fill(1, 5, 6).fill(0xff, 6), rec(23, 10)]);
+    expect(new AppDataFinder().push(cut)).toBe(9);
   });
 
   it('replay schedules: gaps kept up to 5 s, negative gaps clamped, keyed to client messages', () => {
@@ -258,9 +306,15 @@ describe('TLS passthrough (CONTRACTS §14.2)', () => {
     }
   });
 
-  it('invalid patterns throw and change nothing', () => {
-    expect(() => proxy.setTlsPassthrough(['ok.example', 'not a host'])).toThrow(/TLS passthrough/);
-    expect(proxy.tlsPassthrough).toEqual(['127.0.0.1']);
+  it('refused patterns are dropped one by one and reported; the rest apply (REVIEW-8 #4)', () => {
+    const r = proxy.setTlsPassthrough(['ok.example', 'not a host', '*.*', '*.com', '127.0.0.1']);
+    expect(r.hosts).toEqual(['ok.example', '127.0.0.1']);
+    expect(r.problems).toHaveLength(3);
+    expect(r.problems[0]).toMatch(/^"not a host" is not a host name pattern/);
+    expect(r.problems[1]).toMatch(/^"\*\.\*": the last label/);
+    expect(r.problems[2]).toMatch(/^"\*\.com" is too broad/);
+    expect(proxy.tlsPassthrough).toEqual(['ok.example', '127.0.0.1']);
+    expect(proxy.tlsPassthroughProblems).toHaveLength(3);
   });
 });
 
@@ -393,11 +447,47 @@ describe.skipIf(!haveCerts)('mTLS client certificates (CONTRACTS §14.3)', () =>
   it('PEM cert + key; a port-specific pattern for another port is not used; the first match wins', async () => {
     proxy.setClientCertificates([
       { host: `127.0.0.1:${srv.port === 1 ? 2 : 1}`, cert: read('othercert.pem').toString(), key: read('other.pem').toString() },
-      { host: '127.0.0.*', cert: read('cert.pem').toString(), key: read('key.pem').toString() },
+      { host: '127.0.0.1', cert: read('cert.pem').toString(), key: read('key.pem').toString() },
+      { host: '127.0.0.1', cert: read('othercert.pem').toString(), key: read('other.pem').toString() },
     ]);
     const r = await viaProxy(proxy.port, `https://127.0.0.1:${srv.port}/whoami`);
     expect(r).toMatchObject({ status: 200, text: 'fi-test-client' });
-    expect((await settled(proxy)).at(-1)?.clientCertificate).toBe('127.0.0.*');
+    expect((await settled(proxy)).at(-1)?.clientCertificate).toBe('127.0.0.1');
+  });
+
+  it('a web page (foreign Origin) never gets the certificate: 403 before any connection; loopback origins do (REVIEW-8 #1)', async () => {
+    proxy.setClientCertificates([{ host: '127.0.0.1', pfx: read('client.pfx'), passphrase: 's3cret-pass' }]);
+    const evil = await viaProxy(proxy.port, `https://127.0.0.1:${srv.port}/whoami`, { headers: { origin: 'https://evil.example' } });
+    expect(evil.status).toBe(403);
+    expect(evil.text).toMatch(/comes from a web page \(Origin https:\/\/evil\.example\)/);
+    const ex = (await settled(proxy)).at(-1)!;
+    expect(ex).toMatchObject({ state: 'blocked', status: 403 });
+    expect(ex.clientCertificate).toBeUndefined();
+    expect(srv.hits).toEqual([]);
+    const own = await viaProxy(proxy.port, `https://127.0.0.1:${srv.port}/whoami`, { headers: { origin: 'http://localhost:5123' } });
+    expect(own).toMatchObject({ status: 200, text: 'fi-test-client' });
+    // a request scripted onto the certificate host after the decision is refused too (backstop)
+    proxy.setRules([rule('s', 'http://elsewhere.invalid/*', { kind: 'script', code: `function onRequest(r) { return { url: 'https://127.0.0.1:${srv.port}/whoami' }; }` })]);
+    const moved = await viaProxy(proxy.port, 'http://elsewhere.invalid/x', { headers: { origin: 'https://evil.example' } });
+    expect(moved.status).toBe(403);
+    expect(srv.hits).toEqual(['GET /whoami']);
+    const last = (await settled(proxy)).at(-1)!;
+    expect(last.error).toMatch(/Refused: a client certificate/);
+    expect(last.state).toBe('blocked');
+  });
+
+  it('a WebSocket upgrade from a web page to a certificate host is refused too (REVIEW-8 #1)', async () => {
+    proxy.setClientCertificates([{ host: '127.0.0.1', pfx: read('client.pfx'), passphrase: 's3cret-pass' }]);
+    const t = await tunnel(proxy.port, '127.0.0.1:1', 'localhost');
+    const ws = new WebSocket('wss://127.0.0.1:1/socket', { headers: { origin: 'https://evil.example' }, rejectUnauthorized: false, createConnection: () => t.tls! } as WebSocket.ClientOptions);
+    const status = await new Promise<number>((resolve) => {
+      ws.on('unexpected-response', (_q, res) => resolve(res.statusCode ?? 0));
+      ws.on('error', () => resolve(-1));
+    });
+    expect(status).toBe(403);
+    const ex = await waitFor(proxy, (e) => e.kind === 'websocket' && e.state !== 'pending');
+    expect(ex).toMatchObject({ state: 'blocked', status: 403 });
+    expect(ex.error).toMatch(/comes from a web page/);
   });
 
   it('problems are reported per entry in words, and those entries are skipped', () => {
@@ -532,6 +622,45 @@ describe('upload, WebSocket and SSE throttling (CONTRACTS §14.4)', () => {
       const ex = await done;
       expect(ex).toMatchObject({ state: 'completed', matchedRuleId: 't', simulated: '+250 ms' });
       expect(ex.frames!.filter((f) => f.kind === 'text').length).toBe(4);
+    });
+
+    it('a throttled WebSocket fed 64 MB keeps RSS growth under 32 MB: the server is paused, not buffered (REVIEW-8 #6)', async () => {
+      const feed = http.createServer();
+      const fwss = new WebSocketServer({ server: feed });
+      let sent = 0;
+      let stop = false;
+      fwss.on('connection', (ws) => {
+        const chunk = Buffer.alloc(1024 * 1024, 7);
+        const next = () => {
+          if (stop || sent >= 64 || ws.readyState !== WebSocket.OPEN) return;
+          sent++;
+          ws.send(chunk, { binary: true }, () => next());
+        };
+        next();
+      });
+      feed.listen(0, '127.0.0.1');
+      await once(feed, 'listening');
+      try {
+        proxy.setNetworkProfile({ kind: 'throttle', kbps: 400 });
+        const before = process.memoryUsage().rss;
+        let peak = before;
+        const ws = await open(`ws://127.0.0.1:${(feed.address() as AddressInfo).port}/feed`);
+        let received = 0;
+        ws.on('message', (d) => (received += (d as Buffer).length));
+        for (let i = 0; i < 40; i++) {
+          await sleep(100);
+          peak = Math.max(peak, process.memoryUsage().rss);
+        }
+        stop = true;
+        expect(sent).toBeLessThan(40); // held back by TCP, not queued in the proxy
+        expect(received).toBeLessThan(2 * 1024 * 1024); // 50 KB/s
+        expect((peak - before) / 1024 / 1024).toBeLessThan(32);
+        ws.terminate();
+      } finally {
+        for (const c of fwss.clients) c.terminate();
+        feed.closeAllConnections();
+        await new Promise((r) => feed.close(r));
+      }
     });
 
     it('download bandwidth paces server messages (profile)', async () => {

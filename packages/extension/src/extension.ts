@@ -16,7 +16,7 @@ import { languageModelToolsContribution, toolDescriptions, toolSchemas } from '.
 import type { AgentAccess } from './agent/types';
 import { CaStore } from './ca';
 import { InterceptDebugConfigurationProvider, InterceptEvent, prepareLaunch, PrepareDeps, readSettings } from './debug/provider';
-import { DebugConfig, debuggerTypeName, HOST_KEY, LAN_KEY, MARKER_KEY, ORIGINAL_PROGRAM_KEY, proxyHostFor, WEB_KEY } from './debug/rewrite';
+import { DebugConfig, debuggerTypeName, HOST_KEY, LAN_KEY, MARKER_KEY, ORIGINAL_PROGRAM_KEY, proxyHostFor, WEB_FLAGS_KEY, WEB_KEY } from './debug/rewrite';
 import { IosDeviceClassifier } from './iosDevices';
 import { IosUsbToolingChecker, needsRosettaWarning, resolveFlutterSdk, ROSETTA_INSTALL_COMMAND, rosettaWarningText } from './iosUsbTooling';
 import { lanAddressForIphone } from './lanAddress';
@@ -29,9 +29,8 @@ import { createContractService, DONT_CHECK } from './contract/service';
 import { openFrame } from './source/open';
 import { AndroidGlobalProxy } from './adb';
 import { deviceKind, takeScreenshot } from './screenshot';
-import { webScreenshot } from './web/screenshot';
+import { webLaunchUrlOf, webScreenshot } from './web/screenshot';
 import { PacServer } from './debug/pacServer';
-import { webBrowserDebugPortOf } from './debug/rewrite';
 import { createWebServerNotice } from './debug/webServerNotice';
 import { createVmWatcher, matchesProxyExchange } from './vm';
 import { checkSourcePath, packageRootsFor, resolveFrames } from './source/resolve';
@@ -105,7 +104,9 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   context.subscriptions.push({ dispose: () => void nativeRoutes.releaseAll() });
   const nativeMode = (): 'profile' | 'proxy' | 'off' => {
     const v = vscode.workspace.getConfiguration('flutterIntercept').get<string>('nativeClients', 'profile');
-    return v === 'off' ? 'off' : v === 'proxy' ? 'proxy' : 'profile';
+    if (v === 'off') return 'off';
+    // REVIEW-8 #8: "proxy" changes the emulator's global proxy, so only the user's own settings can turn it on.
+    return v === 'proxy' && userSetting<string>('nativeClients') === 'proxy' ? 'proxy' : 'profile';
   };
   const proxyHost: InterceptProxyHost = new InterceptProxyHost({
     getPort: () => readSettings().port,
@@ -269,6 +270,21 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     proxyHost.setTlsPassthrough(vscode.workspace.getConfiguration('flutterIntercept').get('tlsPassthrough', []));
   };
   applyTlsPassthrough();
+  /** Runs a tool with an argument array (no shell), stdout as bytes. */
+  const execTool = (cmd: string, args: string[], opts?: { timeoutMs?: number; maxBuffer?: number }) =>
+    new Promise<{ stdout: Buffer; stderr: string }>((resolve, reject) =>
+      execFile(cmd, args, { encoding: 'buffer', timeout: opts?.timeoutMs ?? 15_000, maxBuffer: opts?.maxBuffer ?? 32 * 1024 * 1024 }, (err, stdout, stderr) =>
+        err ? reject(err) : resolve({ stdout, stderr: stderr.toString('utf8') }),
+      ),
+    );
+  // Flutter Web: the app's URL from flutter_tools' app.webLaunchUrl (forwarded by Dart-Code), for web screenshots.
+  const webLaunchUrls = new Map<string, string>();
+  context.subscriptions.push(
+    vscode.debug.onDidReceiveDebugSessionCustomEvent((e) => {
+      const u = webLaunchUrlOf(e);
+      if (u) webLaunchUrls.set(e.session.id, u);
+    }),
+  );
   // CONTRACTS §14.3: client certificates for mTLS (user settings only; passphrases in secret storage).
   const applyClientCertificates = async () => {
     const r = await loadClientCertificates(userSetting<unknown>('clientCertificates'), {
@@ -537,24 +553,17 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     appPackageName: () => appPackageNames(flutterProjectRoots())[0],
     version,
     exporters,
-    // CONTRACTS §13.8: VM-service screenshot first, adb / simctl as fallbacks (argument arrays, no shell).
-    // Flutter Web: the debug Chrome's DevTools port (loopback only, CONTRACTS §14.7).
+    // CONTRACTS §13.8: VM-service screenshot first, device tools as fallbacks (argument arrays, no shell).
+    // Flutter Web: the session's own debug Chrome, found by process + flags, only the app's page (CONTRACTS §14.7).
     takeScreenshot: (target) =>
       deviceKind(target.deviceId) === 'web'
         ? webScreenshot(target, {
-            devToolsPort: (id) => webBrowserDebugPortOf(debugSessions.get(id)?.configuration),
+            appUrl: (id) => webLaunchUrls.get(id),
+            webFlags: (id) => debugSessions.get(id)?.configuration[WEB_FLAGS_KEY],
+            exec: execTool,
             log,
           })
-        : takeScreenshot(target, {
-        callService: (sessionId, method, params) => vm.callService(sessionId, method, params),
-        exec: (cmd, args, opts) =>
-          new Promise((resolve, reject) =>
-            execFile(cmd, args, { encoding: 'buffer', timeout: opts?.timeoutMs ?? 15_000, maxBuffer: opts?.maxBuffer ?? 32 * 1024 * 1024 }, (err, stdout, stderr) =>
-              err ? reject(err) : resolve({ stdout, stderr: stderr.toString('utf8') }),
-            ),
-          ),
-        log,
-      }),
+        : takeScreenshot(target, { callService: (sessionId, method, params) => vm.callService(sessionId, method, params), exec: execTool, log }),
   });
   // CONTRACTS §9.2: the app's own packages decide which stack frame is the call site.
   const refreshAppPackages = () => proxyHost.setAppPackages(appPackageNames(flutterProjectRoots()));
@@ -744,6 +753,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     }),
     vscode.debug.onDidTerminateDebugSession((session) => {
       debugSessions.delete(session.id);
+      webLaunchUrls.delete(session.id);
       void nativeRoutes.release(session.id).catch((e: unknown) => log(`emulator proxy release failed: ${String(e)}`));
       lanLife.ended(session.id); // also on crash / app killed: closes the LAN listener after the last iPhone session
       if (webSessions.delete(session.id) && webSessions.size === 0) proxyHost.setWebSessionActive(false);

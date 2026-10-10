@@ -112,9 +112,8 @@ recorded during the run. The file is validated first, so a typo fails before the
 ## GitHub Action
 
 The repository root is a composite action. It builds the CLI from the action's own checkout (only the locked
-dependencies are installed, nothing else comes from npm), runs `flutter-intercept test`, uploads the HAR, the JUnit
-report and a recording written to a path with `actions/upload-artifact`, and fails the step when flutter fails or
-an expectation fails. The runner needs Node.js 18 or later on `PATH` (GitHub-hosted runners have it) and Flutter.
+dependencies are installed, nothing else comes from npm), runs `flutter-intercept test`, uploads the HAR (redacted) and the JUnit report with
+`actions/upload-artifact`, and fails the step when flutter fails or an expectation fails. The runner needs Node.js 18 or later on `PATH` (GitHub-hosted runners have it) and Flutter.
 
 ```yaml
 name: integration
@@ -215,8 +214,9 @@ jobs:
 | `working-directory` | Flutter project root (default `.`). The other paths are relative to it. |
 | `device` | Flutter device id. Empty: the only connected device. |
 | `targets` | Test files or directories, one per line or space-separated (default `integration_test/`). |
-| `har`, `junit` | Output paths; uploaded. The HAR is redacted. `junit` needs `assert`. |
-| `record` | A `.json` path is written and uploaded (not redacted: replay needs the real bodies); a name is saved in the project's recordings. |
+| `har`, `junit` | Output paths; uploaded. The HAR is redacted. `junit` needs `assert`. Plain paths only: `* ? [ ] { } !` are refused (upload-artifact would read them as patterns). |
+| `record` | A `.json` path, or a name saved in the project's recordings. **The recording contains live credentials** (tokens, cookies, login bodies, API keys the app sends): replay needs the real values, so it is not redacted, and it stays on the runner. |
+| `upload-recording` | `true` uploads a **redacted copy** (`<record>.redacted.json`) next to the HAR, never the recording itself, and logs a warning. Replaying the redacted copy misses requests whose bodies held secrets (their hashes differ). Default `false`. |
 | `assert` | Expectations file. A failed expectation fails the step (exit code 1). |
 | `replay`, `replay-fallback` | Answer from a recording; `passthrough` (default) or `fail` for unmatched requests. |
 | `network-profile` | `offline`, `slow-3g`, `fast-3g` or `flaky`. |
@@ -226,7 +226,10 @@ jobs:
 | `artifact-name` | Artifact name (default `flutter-intercept`). Make it unique per job, for example per matrix entry. |
 | `upload-artifacts` | `false` skips the upload. |
 
-Outputs: `exit-code`, and the absolute paths `har`, `junit`, `record`.
+Outputs: `exit-code`, and the absolute paths `har`, `junit`, `record` (the unredacted recording on the runner).
+
+Artifacts can be downloaded by anyone with read access to the repository (on a public repository, any signed-in
+GitHub user) for 90 days by default. That is why only redacted files are uploaded.
 
 ## Physical iPhones
 
@@ -237,14 +240,17 @@ reach the Mac's loopback address, so for the length of the run the proxy also li
   the run is refused (exit code 2);
 - every request must carry a token that is new for each run (32 random bytes). The token is passed to the app in
   the `FLUTTER_INTERCEPT_PROXY` define and is never printed: the logged command shows
-  `flutter-intercept:***@<address>:<port>`. Don't pass `-v` to flutter, because verbose builds print define values;
+  `flutter-intercept:***@<address>:<port>`. In GitHub Actions the CLI also registers the token with `::add-mask::`,
+  so the runner masks it in every log line, flutter's included. Still, don't pass `-v` to flutter, because verbose
+  builds print define values;
 - the first device that connects with the token is the only one accepted, and LAN clients can't reach this Mac's
   own services (localhost, its other addresses) through the proxy;
 - the listener closes when the run ends, also on Ctrl-C.
 
 Before the first CI run, allow two things by hand: on macOS, incoming connections for `node` if the application
 firewall is on; on the iPhone, the app's Local Network access (iOS asks on the app's first run, and nobody can
-answer that prompt in CI). The iPhone and the Mac must be on the same, trusted network. `run` refuses physical
+answer that prompt in CI). The iPhone and the Mac must be on the same, trusted network. Don't run pull requests
+from forks on the runner that has the iPhone: they run untrusted code on that machine. `run` refuses physical
 iPhones, because it would have to print the token.
 
 ## npm

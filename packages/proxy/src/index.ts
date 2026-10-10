@@ -25,8 +25,8 @@ export { requestBodyHash } from './replay';
 export { parseUpstreamProxy, parseNoProxy } from './upstream-proxy';
 export type { UpstreamProxyConfig } from './upstream-proxy';
 // v0.8.0 (CONTRACTS §14)
-export { parseHostPattern, matchesHostPattern } from './hosts';
-export type { HostPattern } from './hosts';
+export { parseHostPattern, parseHostPatterns, hostPatternProblem, matchesHostPattern } from './hosts';
+export type { HostPattern, HostPatternProblem } from './hosts';
 export { loadClientCertificate } from './intercept-proxy';
 export { MAX_REPLAY_GAP_MS } from './replay-stream';
 export { IDLE_SOCKET_TIMEOUT_MS } from './idle';

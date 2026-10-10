@@ -8,7 +8,18 @@ import * as os from 'os';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { parseHostPattern } from '@flutter-intercept/proxy';
 import { clientCertHosts, loadClientCertificates, MAX_CLIENT_CERT_FILE_BYTES, normalizeCertHost, passphraseSecretKey, type ClientCertLoadDeps } from '../../src/ui/clientCerts';
+
+/** P's REVIEW-8 #4 parser is in the built proxy (it refuses `*.com`). */
+const SHARED_PARSER_FIXED = (() => {
+  try {
+    parseHostPattern('*.com');
+    return false;
+  } catch {
+    return true;
+  }
+})();
 
 let dir: string;
 let ws: string;
@@ -46,16 +57,26 @@ afterAll(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+const C = (f: string) => path.join(ws, 'certs', f);
+
 function deps(over: Partial<ClientCertLoadDeps> = {}, logs: string[] = []): ClientCertLoadDeps {
   return { workspaceFolders: () => [ws], getPassphrase: () => undefined, log: (m) => logs.push(m), ...over };
 }
 
 describe('normalizeCertHost / clientCertHosts / passphraseSecretKey', () => {
+  it.skipIf(!SHARED_PARSER_FIXED)('REVIEW-8 #4: refuses registrable wildcard patterns (shared parser)', async () => {
+    for (const h of ['*.*', '*.com', '10.0.0.*', 'api.corp.*']) expect(normalizeCertHost(h), h).toBeUndefined();
+    const r = await loadClientCertificates([{ host: 'api.corp.*', cert: C('client.crt'), key: C('client.key') }], deps());
+    expect(r.certs).toEqual([]);
+    expect(r.problems[0].problem).toMatch(/its host can't be used/);
+  });
+
   it('accepts hostname globs with an optional port', () => {
     expect(normalizeCertHost(' API.Corp.example ')).toBe('api.corp.example');
     expect(normalizeCertHost('*.corp.example:8443')).toBe('*.corp.example:8443');
     expect(normalizeCertHost('x:0')).toBeUndefined();
     expect(normalizeCertHost('x:70000')).toBeUndefined();
+    expect(normalizeCertHost('*')).toBeUndefined(); // the proxy refuses it too
     expect(normalizeCertHost('https://x')).toBeUndefined();
     expect(normalizeCertHost(5)).toBeUndefined();
     expect(clientCertHosts([{ host: 'A.example' }, { host: 'a.example' }, { host: 'bad host' }, null, { host: 'b.example:443' }])).toEqual(['a.example', 'b.example:443']);
@@ -69,7 +90,7 @@ describe('loadClientCertificates (CONTRACTS §14.3)', () => {
     const logs: string[] = [];
     const r = await loadClientCertificates(
       [
-        { host: 'api.corp.example', cert: 'certs/client.crt', key: 'certs/client.key' },
+        { host: 'api.corp.example', cert: C('client.crt'), key: C('client.key') },
         { host: '*.corp.example:8443', cert: path.join(ws, 'certs', 'inside-link.crt'), key: path.join(ws, 'certs', 'client.key') },
       ],
       deps({}, logs),
@@ -87,7 +108,7 @@ describe('loadClientCertificates (CONTRACTS §14.3)', () => {
   });
 
   it('encrypted key: passphrase from the getter; missing / wrong passphrase → problem naming the command, never the passphrase', async () => {
-    const entry = [{ host: 'secure.example', cert: 'certs/client.crt', key: 'certs/client.enc.key' }];
+    const entry = [{ host: 'secure.example', cert: C('client.crt'), key: C('client.enc.key') }];
     const asked: string[] = [];
     const ok = await loadClientCertificates(entry, deps({ getPassphrase: (h) => (asked.push(h), PASS) }));
     expect(asked).toEqual(['secure.example']);
@@ -108,34 +129,31 @@ describe('loadClientCertificates (CONTRACTS §14.3)', () => {
   });
 
   it('a key that does not belong to the certificate', async () => {
-    const r = await loadClientCertificates([{ host: 'a.example', cert: 'certs/client.crt', key: 'certs/other.key' }], deps());
+    const r = await loadClientCertificates([{ host: 'a.example', cert: C('client.crt'), key: C('other.key') }], deps());
     expect(r.problems[0].problem).toMatch(/key doesn't belong to the certificate/);
   });
 
   it('pfx: read as bytes and validated (injected validator sees bytes + passphrase); garbage fails the real check', async () => {
     const seen: unknown[] = [];
-    const r = await loadClientCertificates([{ host: 'p12.example', pfx: 'certs/client.p12' }], deps({ getPassphrase: () => PASS, validate: (c) => seen.push(c) }));
+    const r = await loadClientCertificates([{ host: 'p12.example', pfx: C('client.p12') }], deps({ getPassphrase: () => PASS, validate: (c) => seen.push(c) }));
     expect(r.problems).toEqual([]);
     expect(Buffer.isBuffer(r.certs[0].pfx)).toBe(true);
     expect(r.certs[0].pfx).toHaveLength(7);
     expect(seen).toHaveLength(1);
-    const real = await loadClientCertificates([{ host: 'p12.example', pfx: 'certs/client.p12' }], deps());
+    const real = await loadClientCertificates([{ host: 'p12.example', pfx: C('client.p12') }], deps());
     expect(real.certs).toEqual([]);
     expect(real.problems[0].problem).toMatch(/^Client certificate for p12\.example: /);
   });
 
   it('path rules: symlink out of the workspace, ".." out of it, directory, too big, empty, not PEM, missing, no workspace', async () => {
     const cases: [Record<string, unknown>, RegExp][] = [
-      [{ host: 'a.example', cert: 'certs/client.crt', key: 'certs/escape.key' }, /key path leaves its workspace folder/],
-      [{ host: 'a.example', cert: 'certs/client.crt', key: '../outside/secret.key' }, /key path leaves its workspace folder/],
-      [{ host: 'a.example', pfx: 'certs/dirlink' }, /leaves its workspace folder/],
       [{ host: 'a.example', pfx: path.join(ws, 'certs', 'dirlink') }, /pfx path is not a regular file/],
-      [{ host: 'a.example', pfx: 'certs/big.p12' }, /larger than 1 MB/],
-      [{ host: 'a.example', cert: 'certs/empty.crt', key: 'certs/client.key' }, /cert file is empty/],
-      [{ host: 'a.example', cert: 'certs/notpem.crt', key: 'certs/client.key' }, /isn't a PEM certificate/],
-      [{ host: 'a.example', cert: 'certs/client.crt', key: 'certs/client.crt' }, /isn't a PEM private key/],
-      [{ host: 'a.example', pfx: 'certs/nope.p12' }, /pfx file was not found/],
-      [{ host: 'a.example', pfx: 'x\0y' }, /not a valid path/],
+      [{ host: 'a.example', pfx: C('big.p12') }, /larger than 1 MB/],
+      [{ host: 'a.example', cert: C('empty.crt'), key: C('client.key') }, /cert file is empty/],
+      [{ host: 'a.example', cert: C('notpem.crt'), key: C('client.key') }, /isn't a PEM certificate/],
+      [{ host: 'a.example', cert: C('client.crt'), key: C('client.crt') }, /isn't a PEM private key/],
+      [{ host: 'a.example', pfx: C('nope.p12') }, /pfx file was not found/],
+      [{ host: 'a.example', pfx: '/x\0y' }, /not a valid path/],
     ];
     for (const [entry, re] of cases) {
       const r = await loadClientCertificates([entry], deps());
@@ -143,10 +161,8 @@ describe('loadClientCertificates (CONTRACTS §14.3)', () => {
       expect(r.problems[0].problem, JSON.stringify(entry)).toMatch(re);
       // problems never name the path
       expect(r.problems[0].problem).not.toContain(dir);
-      expect(r.problems[0].problem).not.toContain('certs/');
+      expect(r.problems[0].problem).not.toContain('/certs');
     }
-    const noWs = await loadClientCertificates([{ host: 'a.example', pfx: 'certs/client.p12' }], deps({ workspaceFolders: () => [] }));
-    expect(noWs.problems[0].problem).toMatch(/no workspace folder is open/);
   });
 
   it('a FIFO is refused without blocking', async () => {
@@ -157,12 +173,24 @@ describe('loadClientCertificates (CONTRACTS §14.3)', () => {
     } catch {
       return; // no mkfifo: nothing to test
     }
-    const r = await loadClientCertificates([{ host: 'a.example', pfx: 'certs/pipe.p12' }], deps());
+    const r = await loadClientCertificates([{ host: 'a.example', pfx: C('pipe.p12') }], deps());
     expect(r.problems[0].problem).toMatch(/not a regular file/);
   });
 
-  it('relative paths try each workspace folder in order', async () => {
-    const r = await loadClientCertificates([{ host: 'a.example', cert: 'certs/client.crt', key: 'certs/client.key' }], deps({ workspaceFolders: () => [outside, ws] }));
+  it('REVIEW-8 #9: a relative path is refused even when the file exists in an open workspace folder', async () => {
+    for (const entry of [
+      { host: 'a.example', cert: 'certs/client.crt', key: 'certs/client.key' },
+      { host: 'a.example', pfx: 'certs/client.p12' },
+      { host: 'a.example', cert: C('client.crt'), key: './certs/client.key' },
+    ]) {
+      const r = await loadClientCertificates([entry], deps({ workspaceFolders: () => [ws] }));
+      expect(r.certs).toEqual([]);
+      expect(r.problems[0].problem).toMatch(/path is relative; use an absolute path .*could pick up a file from a cloned repository/);
+    }
+  });
+
+  it('an absolute path may go through a symlink (the user chose it)', async () => {
+    const r = await loadClientCertificates([{ host: 'a.example', cert: C('client.crt'), key: C('escape.key') }], deps());
     expect(r.certs).toHaveLength(1);
   });
 
@@ -172,17 +200,17 @@ describe('loadClientCertificates (CONTRACTS §14.3)', () => {
         null,
         { host: 'bad host', pfx: 'x' },
         { host: 'a.example' },
-        { host: 'b.example', pfx: 'certs/client.p12', cert: 'certs/client.crt' },
-        { host: 'c.example', cert: 'certs/client.crt' },
-        { host: 'd.example', key: 'certs/client.key' },
-        { host: 'e.example', cert: 'certs/client.crt', key: 'certs/client.key' },
+        { host: 'b.example', pfx: C('client.p12'), cert: C('client.crt') },
+        { host: 'c.example', cert: C('client.crt') },
+        { host: 'd.example', key: C('client.key') },
+        { host: 'e.example', cert: C('client.crt'), key: C('client.key') },
       ],
       deps(),
     );
     expect(r.status.map((s) => s.host)).toEqual(['(entry 1)', '(entry 2)', 'a.example', 'b.example', 'c.example', 'd.example', 'e.example']);
     expect(r.problems.map((p) => p.problem)).toEqual([
       expect.stringMatching(/must be an object/),
-      expect.stringMatching(/host must be a host name glob/),
+      expect.stringMatching(/its host can't be used: .*not a host name pattern/),
       expect.stringMatching(/either pfx .* or cert and key/),
       expect.stringMatching(/either pfx .* or cert and key/),
       expect.stringMatching(/cert but no key/),

@@ -5,7 +5,7 @@ import { EventEmitter } from 'events';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Exchange, ReplayEntry, Rule } from '@flutter-intercept/proxy';
 import type { Recording, RecordingMeta, RecordingService } from '../../src/recordings/types';
-import { ControllerDeps, ControllerHost, InterceptController, isRecordable, recordingSummary, tunnelBlockRule, tunnelReason } from '../../src/ui/controller';
+import { ControllerDeps, ControllerHost, InterceptController, isRecordable, recordingSummary, tunnelBlockRule, tunnelReason, validateNetworkProfile, validateRule } from '../../src/ui/controller';
 import type { HostMsg, Status } from '../../src/ui/protocol';
 
 class FakeHost extends EventEmitter implements ControllerHost {
@@ -197,5 +197,19 @@ describe('recordings with streams (CONTRACTS §14.5)', () => {
     expect(recordingSummary(m)).toEqual({ id: 'r', name: 'n', createdAt: 1, exchanges: 3, redacted: true });
     expect(recordingSummary({ ...m, streams: 2, frames: 40 })).toEqual({ id: 'r', name: 'n', createdAt: 1, exchanges: 3, redacted: true, streams: 2, frames: 40 });
     expect(recordingSummary({ ...m, streams: 0, frames: 0 })).not.toHaveProperty('streams');
+  });
+});
+
+describe('uploadKbps (CONTRACTS §14.4, REVIEW-8 #12)', () => {
+  const base = { id: 'r1', enabled: true, match: { url: 'https://api.example.com/*' } };
+  it('throttle rules, sequence steps and custom profiles accept uploadKbps (1–10000000)', () => {
+    expect(validateRule({ ...base, action: { kind: 'throttle', kbps: 400, uploadKbps: 200 } }).action).toEqual({ kind: 'throttle', kbps: 400, uploadKbps: 200 });
+    expect(() => validateRule({ ...base, action: { kind: 'throttle', uploadKbps: 0 } })).toThrow(/uploadKbps must be a number/);
+    expect(() => validateRule({ ...base, action: { kind: 'throttle', uploadKbps: '5' } })).toThrow(/uploadKbps/);
+    const seq = validateRule({ ...base, action: { kind: 'sequence', steps: [{ action: { kind: 'throttle', uploadKbps: 50 } }, { action: { kind: 'passthrough' } }] } });
+    expect(JSON.stringify(seq.action)).toContain('"uploadKbps":50');
+    expect(validateNetworkProfile({ kind: 'throttle', latencyMs: 100, uploadKbps: 750 })).toEqual({ kind: 'throttle', latencyMs: 100, uploadKbps: 750 });
+    expect(validateNetworkProfile({ kind: 'throttle', preset: 'fast-3g', latencyMs: 150, kbps: 1600, uploadKbps: 750 })).toMatchObject({ uploadKbps: 750 });
+    expect(() => validateNetworkProfile({ kind: 'throttle', uploadKbps: 20_000_000 })).toThrow(/uploadKbps/);
   });
 });

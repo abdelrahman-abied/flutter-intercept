@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.8.0
+
+### CI, pinned hosts, certificates and coverage
+
+**CI**
+- A **GitHub Action** (`uses: abdelrahman-abied/flutter-intercept@v0.8.0`) runs your integration tests through the
+  proxy and uploads the HAR, JUnit report and recording as artifacts.
+- CI mode works with **physical iPhones** on the same Wi-Fi (token-protected LAN listener, token never printed).
+- The CLI is ready to publish to npm (`flutter-intercept-cli`).
+
+**Pinned hosts and client certificates**
+- **TLS passthrough** (`flutterIntercept.tlsPassthrough`): listed hosts are tunnelled without decryption, so the app's
+  own certificate pinning (Dio `validateCertificate`, native) keeps working. Tunnels show bytes and can be blocked.
+- **Client certificates** (`flutterIntercept.clientCertificates`): the proxy presents your certificate to servers that
+  require mTLS. Passphrases live in VS Code's secret storage.
+
+**Coverage**
+- **WebSocket and SSE recordings**: streams are saved with their messages and replayed by a stand-in server; diffs
+  compare message counts and types.
+- **Upload throttling**: network profiles and throttle rules slow uploads, WebSocket messages and SSE events too.
+- **Flutter Web keeps working if the proxy stops** (a PAC with a direct fallback), the `web-server` device gets a
+  copyable Chrome command, and agents can take screenshots of web apps.
+- **Native clients on Android emulators** can be routed through the proxy (`nativeClients: proxy`); **Save CA
+  Certificate…** helps trust it in a debug network security config.
+- A banner names hosts whose requests **bypass the proxy** (an `HttpOverrides` zone or a custom `connectionFactory`).
+- Screenshots on physical iPhones (`devicectl`).
+
+**Smaller things**
+- VS Code's `http.proxy` (user settings) is used as the upstream proxy when `flutterIntercept.upstreamProxy` is empty.
+- Idle upstream connections close after 30 s; a request that fails on a stale reused connection is retried once
+  (safe methods only).
+- OpenAPI exports describe the auth schemes seen (bearer, basic, API key); Postman collections set request auth.
+- Multipart bodies are redacted for agents (secret fields, file parts summarised).
+
+### Agent API
+- `list_requests` / `get_request` cover tunnels (`kind: "tunnel"`), client-certificate use and upload throttling;
+  `get_status` lists passthrough hosts and certificate problems; `save_recording` includes WebSocket and SSE.
+
 ## 0.7.0
 
 ### Timing, scripts, exports and more

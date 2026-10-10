@@ -2,7 +2,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { actionPlan, CLI_INPUTS, escapeCommandData, githubOutput, inputEnvName, readInputs, runAction, splitList } from '../src/action';
+import { actionPlan, CLI_INPUTS, escapeCommandData, githubOutput, inputEnvName, readInputs, redactedCopyPath, runAction, splitList, type CliModule } from '../src/action';
+import { writeRecording, writeRedactedRecordingCopy } from '../src/outputs';
+import type { Exchange } from '@flutter-intercept/proxy';
 import { parseYaml, type Yaml } from './yaml-subset';
 
 const repo = path.join(__dirname, '..', '..', '..');
@@ -169,12 +171,15 @@ describe('action entry (dist/action.js)', () => {
       '--device=emulator-5554', '--har=build/traffic.har', '--record=build/run.json', '--assert=ci/expect.json', '--junit=build/junit.xml',
       '--replay=login', '--replay-fallback=fail', '--network-profile=slow-3g', '--rules=ci/rules.json', '--approve-shared-rules', '--', '--flavor', 'dev',
     ]);
-    expect(plan.artifacts).toEqual({ har: 'build/traffic.har', junit: 'build/junit.xml', record: 'build/run.json' });
+    // REVIEW-8 #2: the (unredacted) recording is not uploaded by default
+    expect(plan.artifacts).toEqual({ har: 'build/traffic.har', junit: 'build/junit.xml' });
+    expect(plan.record).toBe('build/run.json');
+    expect(plan.warnings).toEqual([]);
   });
 
   it('defaults: empty inputs → plain test; approve false; rules none → --no-rules; a recording name is not uploaded', () => {
-    expect(actionPlan(readInputs({ FI_INPUT_DEVICE: '  ', FI_INPUT_APPROVE_SHARED_RULES: 'false' }))).toEqual({ argv: ['test'], artifacts: {} });
-    expect(actionPlan({ rules: 'none', record: 'nightly' })).toEqual({ argv: ['test', '--record=nightly', '--no-rules'], artifacts: {} });
+    expect(actionPlan(readInputs({ FI_INPUT_DEVICE: '  ', FI_INPUT_APPROVE_SHARED_RULES: 'false' }))).toEqual({ argv: ['test'], artifacts: {}, warnings: [] });
+    expect(actionPlan({ rules: 'none', record: 'nightly' })).toEqual({ argv: ['test', '--record=nightly', '--no-rules'], artifacts: {}, warnings: [] });
     // a device id that starts with "-" stays a value
     expect(actionPlan({ device: '--no-rules' }).argv).toEqual(['test', '--device=--no-rules']);
   });
@@ -183,6 +188,26 @@ describe('action entry (dist/action.js)', () => {
     expect(() => actionPlan({ 'approve-shared-rules': 'maybe' })).toThrow(/approve-shared-rules must be true or false/);
     expect(() => actionPlan({ targets: '--flavor dev' })).toThrow(/looks like an option/);
     expect(() => actionPlan({ har: 'a\nb' })).toThrow(/single line/);
+    expect(() => actionPlan({ 'upload-recording': 'yes please' })).toThrow(/upload-recording must be true or false/);
+  });
+
+  it('REVIEW-8 #12: artifact paths must be literal (upload-artifact reads globs and ! exclusions)', () => {
+    for (const [name, v] of [['har', '**'], ['har', 'build/*.har'], ['junit', 'j?.xml'], ['record', 'build/[ab].json'], ['har', '{a,b}.har'], ['junit', '!build/j.xml']] as const) {
+      expect(() => actionPlan({ [name]: v, ...(name === 'junit' ? { assert: 'e.json' } : {}) }), `${name}=${v}`).toThrow(/must be a plain file path/);
+    }
+    expect(actionPlan({ har: 'build/traffic-1.har', junit: 'out dir/j.xml', record: 'build/run.json' }).artifacts).toEqual({ har: 'build/traffic-1.har', junit: 'out dir/j.xml' });
+  });
+
+  it('REVIEW-8 #2: upload-recording uploads a redacted copy, never the recording itself', () => {
+    expect(redactedCopyPath('build/run.json')).toBe('build/run.redacted.json');
+    expect(redactedCopyPath('build/run')).toBe('build/run.redacted.json');
+    const plan = actionPlan({ record: 'build/run.json', 'upload-recording': 'true', har: 'build/t.har' });
+    expect(plan.artifacts).toEqual({ har: 'build/t.har', recordRedacted: 'build/run.redacted.json' });
+    expect(plan.record).toBe('build/run.json');
+    expect(plan.warnings).toEqual([expect.stringMatching(/uploading a redacted copy \(build\/run\.redacted\.json\); build\/run\.json keeps the real credentials/)]);
+    const named = actionPlan({ record: 'nightly', 'upload-recording': 'true' });
+    expect(named.artifacts).toEqual({});
+    expect(named.warnings).toEqual([expect.stringMatching(/set record to a \.json path/)]);
   });
 
   it('formats $GITHUB_OUTPUT entries and escapes workflow command data', () => {
@@ -212,7 +237,7 @@ describe('action entry (dist/action.js)', () => {
       let argv: string[] | undefined;
       const code = await runAction(
         { GITHUB_OUTPUT: outFile, FI_INPUT_DEVICE: 'macos', FI_INPUT_HAR: 'build/t.har', FI_INPUT_ASSERT: 'e.json', FI_INPUT_JUNIT: 'build/j.xml', FI_INPUT_FLUTTER_ARGS: '--dart-define=API_KEY=s3cret' },
-        { cwd: dir, log: (l) => logs.push(l), loadCli: () => ({ main: async (a) => ((argv = a), 1) }) },
+        { cwd: dir, log: (l) => logs.push(l), loadCli: () => ({ main: async (a) => ((argv = a), 1), writeRedactedRecordingCopy: () => 0 }) },
       );
       expect(code).toBe(1);
       expect(argv).toEqual(['test', '--device=macos', '--har=build/t.har', '--assert=e.json', '--junit=build/j.xml', '--', '--dart-define=API_KEY=s3cret']);
@@ -225,6 +250,42 @@ describe('action entry (dist/action.js)', () => {
       });
       expect(logs.join('\n')).toContain('--dart-define=API_KEY=***');
       expect(logs.join('\n')).not.toContain('s3cret');
+    });
+
+    it('REVIEW-8 #2: with record (default inputs) only the HAR / JUnit are artifacts; with upload-recording a redacted copy is', async () => {
+      const secret = 'Bearer s3cret-live-token-0123456789';
+      const exchange = {
+        id: '1', startedAt: 1, durationMs: 5, method: 'POST', url: 'https://api.example.test/login',
+        requestHeaders: { authorization: secret, 'content-type': 'application/json' },
+        requestBody: { encoding: 'utf8', text: '{"password":"hunter2-pass"}', size: 27 },
+        status: 200, responseHeaders: { 'content-type': 'application/json' },
+        responseBody: { encoding: 'utf8', text: '{"access_token":"tok-abcdef0123456789"}', size: 39 }, state: 'completed',
+      } as unknown as Exchange;
+      const cli: CliModule = {
+        main: async (a) => {
+          const rec = a.find((x) => x.startsWith('--record='))!.slice('--record='.length);
+          await writeRecording(rec, [exchange], dir, dir);
+          return 0;
+        },
+        writeRedactedRecordingCopy,
+      };
+      const outA = path.join(dir, 'out_a');
+      await runAction({ GITHUB_OUTPUT: outA, FI_INPUT_HAR: 'build/t.har', FI_INPUT_RECORD: 'build/run.json' }, { cwd: dir, log: () => undefined, loadCli: () => cli });
+      expect(outputs(outA).artifacts).toBe(path.join(dir, 'build/t.har'));
+      expect(outputs(outA).record).toBe(path.join(dir, 'build/run.json'));
+      expect(fs.existsSync(path.join(dir, 'build/run.redacted.json'))).toBe(false);
+
+      const outB = path.join(dir, 'out_b');
+      const logs: string[] = [];
+      await runAction({ GITHUB_OUTPUT: outB, FI_INPUT_RECORD: 'build/run.json', FI_INPUT_UPLOAD_RECORDING: 'true' }, { cwd: dir, log: (l) => logs.push(l), loadCli: () => cli });
+      expect(outputs(outB).artifacts).toBe(path.join(dir, 'build/run.redacted.json'));
+      expect(logs[0]).toMatch(/^::warning title=flutter-intercept::upload-recording: uploading a redacted copy/);
+      const original = fs.readFileSync(path.join(dir, 'build/run.json'), 'utf8');
+      expect(original).toContain('s3cret-live-token');
+      const copy = fs.readFileSync(path.join(dir, 'build/run.redacted.json'), 'utf8');
+      expect(JSON.parse(copy)).toMatchObject({ redacted: true, exchanges: 1 });
+      for (const s of ['s3cret-live-token', 'hunter2-pass', 'tok-abcdef0123456789']) expect(copy).not.toContain(s);
+      expect(copy).toContain('api.example.test/login');
     });
 
     it('a bad input is an ::error:: and exit code 2, the CLI never runs', async () => {

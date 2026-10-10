@@ -24,7 +24,10 @@ export function pacScript(proxyPort: number): string {
   if (!Number.isInteger(proxyPort) || proxyPort <= 0 || proxyPort > 65535) throw new Error(`bad proxy port ${proxyPort}`);
   return [
     'function FindProxyForURL(url, host) {',
-    '  if (host === "localhost" || dnsDomainIs(host, ".localhost") || host === "::1" || host === "[::1]" || shExpMatch(host, "127.*")) return "DIRECT";',
+    // IP literals only (REVIEW-8 #3): a glob like shExpMatch(host, "127.*") would also send DNS names such as
+    // 127.x.attacker.example DIRECT, past the panel, rules and agents. Same set as Chrome's implicit loopback bypass.
+    '  if (host === "localhost" || dnsDomainIs(host, ".localhost") || host === "::1" || host === "[::1]" ||',
+    '      /^127\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$/.test(host)) return "DIRECT";',
     `  return "PROXY ${PAC_HOST}:${proxyPort}; DIRECT";`,
     '}',
     '',

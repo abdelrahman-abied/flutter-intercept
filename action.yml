@@ -21,13 +21,17 @@ inputs:
     required: false
     default: ""
   har:
-    description: Write a HAR of the run to this path (secrets redacted) and upload it.
+    description: Write a HAR of the run to this path (secrets redacted) and upload it. A plain path, no glob characters.
     required: false
     default: ""
   record:
-    description: Save the run as a recording. A path ending in .json is written there and uploaded (not redacted); a name is saved in the project's recordings.
+    description: Save the run as a recording. A path ending in .json is written there (not redacted, kept on the runner); a name is saved in the project's recordings.
     required: false
     default: ""
+  upload-recording:
+    description: Upload a redacted copy of the recording (record must be a .json path). The unredacted file, which holds live credentials, is never uploaded.
+    required: false
+    default: "false"
   assert:
     description: Expectations file (JSON array of assert_traffic inputs). Any failed expectation fails the step.
     required: false
@@ -65,7 +69,7 @@ inputs:
     required: false
     default: flutter-intercept
   upload-artifacts:
-    description: Upload the HAR, JUnit report and recording (when their paths are set) with actions/upload-artifact.
+    description: Upload the HAR, the JUnit report and (with upload-recording) the redacted recording copy with actions/upload-artifact.
     required: false
     default: "true"
 
@@ -80,7 +84,7 @@ outputs:
     description: Absolute path of the JUnit report, when junit is set.
     value: ${{ steps.run.outputs.junit }}
   record:
-    description: Absolute path of the recording, when record is a file path.
+    description: Absolute path of the (unredacted, local) recording, when record is a file path.
     value: ${{ steps.run.outputs.record }}
 
 runs:
@@ -121,6 +125,7 @@ runs:
         FI_INPUT_RULES: ${{ inputs.rules }}
         FI_INPUT_APPROVE_SHARED_RULES: ${{ inputs.approve-shared-rules }}
         FI_INPUT_FLUTTER_ARGS: ${{ inputs.flutter-args }}
+        FI_INPUT_UPLOAD_RECORDING: ${{ inputs.upload-recording }}
       run: exec node "$GITHUB_ACTION_PATH/packages/cli/dist/action.js"
 
     - name: Upload traffic

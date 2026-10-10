@@ -89,7 +89,13 @@ and the traffic shows up.
 - A notification tells you when a request fails while the panel is hidden (`flutterIntercept.notifications`).
 - **Open in new window** moves the traffic view into a window of its own, for a second screen.
 - `flutter-intercept test` runs your integration tests through the proxy in CI, with shared rules, replay and
-  traffic assertions ([CI mode](#run-integration-tests-through-flutter-intercept-in-ci)).
+  traffic assertions ([CI mode](#run-integration-tests-through-flutter-intercept-in-ci)), also as a GitHub Action.
+
+**Pinned hosts, client certificates and native clients**
+- **TLS passthrough** lets hosts your app pins itself through without decryption, so pinning keeps working.
+- **Client certificates** (mTLS): the proxy presents your certificate to servers that require one.
+- Native clients (`cronet_http`, `ok_http`) can be routed through the proxy on Android emulators.
+- A banner names hosts whose requests bypass the proxy (an `HttpOverrides` zone or a custom `connectionFactory`).
 
 **Copy and resend**
 - **Copy as cURL**, **Copy as Dart (http)** or **Copy as Dio** from the detail pane or a row's right-click menu.
@@ -399,22 +405,29 @@ endpoints.
 37. [Get notified when requests fail](#get-notified-when-requests-fail)
 38. [Run integration tests through Flutter Intercept in CI](#run-integration-tests-through-flutter-intercept-in-ci)
 
+**Pinned hosts, certificates and native clients**
+
+39. [Let pinned hosts through without decryption](#let-pinned-hosts-through-without-decryption)
+40. [Use a client certificate (mTLS)](#use-a-client-certificate-mtls)
+41. [Route native clients on an Android emulator](#route-native-clients-on-an-android-emulator)
+42. [Find requests that bypass the proxy](#find-requests-that-bypass-the-proxy)
+
 **Devices**
 
-39. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
-40. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
-41. [Run on a physical iPhone](#run-on-a-physical-iphone)
-42. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
+43. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
+44. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
+45. [Run on a physical iPhone](#run-on-a-physical-iphone)
+46. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
 
 **AI agents**
 
-43. [Connect an AI agent](#connect-an-ai-agent)
-44. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
-45. [Control what agents can see and do](#control-what-agents-can-see-and-do)
-46. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
-47. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
-48. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
-49. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
+47. [Connect an AI agent](#connect-an-ai-agent)
+48. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
+49. [Control what agents can see and do](#control-what-agents-can-see-and-do)
+50. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
+51. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
+52. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
+53. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
 
 ### Run your app with interception
 
@@ -588,12 +601,13 @@ You'll check how your app behaves on a bad connection.
 
 1. In the panel toolbar, open **Network**.
 2. Pick **Offline**, **Slow 3G**, **Fast 3G** or **Flaky (20% fail)**.
-3. Or pick **Custom…**, fill in **Latency (ms)**, **Bandwidth (kbps)** and **Fail (%)**, and click **Apply**.
+3. Or pick **Custom…**, fill in **Latency (ms)**, **Download (kbps)**, **Upload (kbps)** and **Fail (%)**, and click
+   **Apply**.
 
 **You should see:** the picker highlighted, `Network: …` in the status line, and affected rows marked **sim**.
 
-**Tip:** only the app you're debugging is affected, not your Mac. Mocks and blocks still answer as set. Pick
-**No throttling** to switch it off; it's easy to forget.
+**Tip:** only the app you're debugging is affected, not your Mac. Uploads, WebSocket messages and SSE events are
+slowed too. Mocks and blocks still answer as set. Pick **No throttling** to switch it off; it's easy to forget.
 
 ### Slow down or break a single endpoint
 
@@ -691,8 +705,10 @@ You'll intercept a web build the same way as a mobile one.
 **Show browser traffic** in the toolbar (it shows how many are hidden) to see them, or filter with
 `browser:internal`.
 
-**Tip:** everything you open in that debug Chrome window is recorded, so keep it to your app. The `web-server`
-device and launches with your own Chrome profile (`--user-data-dir`) aren't intercepted. Turn web interception
+**Tip:** everything you open in that debug Chrome window is recorded, so keep it to your app. If the proxy stops,
+the page keeps working without it. For the `web-server` device, click **Copy Chrome Command** in the notice to start
+a separate Chrome (a throwaway profile) through Flutter Intercept. Launches with your own Chrome profile
+(`--user-data-dir`) aren't intercepted. Turn web interception
 off with `flutterIntercept.web.enabled`. More in [Flutter Web](#flutter-web).
 
 ### Get past CORS errors while you develop
@@ -856,8 +872,9 @@ You'll save a session and later run the app against it, even offline.
 **You should see:** a "Replaying …" bar while it's on, and replayed rows marked as simulated.
 
 **Tip:** recordings live in `.dart_tool/flutter_intercept/recordings/`, which git ignores by default. An
-unredacted recording is refused where git would track it. Only finished HTTP exchanges are saved, not WebSocket,
-SSE or native-client traffic. Your rules still apply before the recording.
+unredacted recording is refused where git would track it. Finished WebSocket and SSE streams are saved with their
+messages and replayed by a stand-in server in the same order and timing; native-client traffic and tunnels aren't
+saved. Your rules still apply before the recording.
 
 ### Compare two recordings
 
@@ -912,8 +929,9 @@ You'll send Flutter Intercept's outgoing traffic through another proxy.
 **You should see:** "via upstream proxy 127.0.0.1:8888" in the panel. With certificate checks off, it adds
 "certificate checks OFF".
 
-**Tip:** VS Code's own `http.proxy` setting doesn't apply to your app's traffic; use this setting instead. Only the
-user setting counts, so a cloned repo can't reroute your traffic. Requests to `localhost` and the
+**Tip:** when this setting is empty, VS Code's own `http.proxy` (and `http.noProxy`) from your user settings is
+used; the panel then says "via VS Code proxy". Only user settings count, so a cloned repo can't reroute your
+traffic. Requests to `localhost` and the
 emulator aliases go direct. Turn certificate checks off only for a proxy you run yourself.
 
 ### Open the traffic view in its own window
@@ -1007,9 +1025,10 @@ yourself (mocks, blocks, faults, offline) are never reported.
 
 You'll run `integration_test` on a device or CI runner with your shared rules and check the traffic.
 
-1. Build the runner from this repository: `npm ci && npm run build`, then use
-   `node packages/cli/dist/cli.js`.
-2. From your Flutter project, run:
+1. **GitHub Actions:** add a step `uses: abdelrahman-abied/flutter-intercept@v0.8.0` with inputs such as
+   `device: macos`, `har: build/traffic.har`, `assert: ci/expect.json` and `junit: build/traffic.xml`. It builds the
+   runner, runs your tests and uploads the files as artifacts. Skip to "You should see".
+2. **Elsewhere:** build the runner from this repository (`npm ci && npm run build`) and, from your Flutter project, run:
 
    ```bash
    node <repo>/packages/cli/dist/cli.js test integration_test/app_test.dart -d macos \
@@ -1024,8 +1043,82 @@ code is non-zero if a test or an assertion failed.
 
 **Tip:** shared rules that need approval in the editor are skipped unless you pass `--approve-shared-rules`.
 The expectations file is a list of `assert_traffic` checks, for example
-`[{"url": "*/todos/*", "expect": {"status": 200}}]`. Works on macOS, Android emulators and phones, and
-iOS simulators; not on physical iPhones or the web. See `packages/cli/README.md`.
+`[{"url": "*/todos/*", "expect": {"status": 200}}]`. Works on macOS, Android emulators and phones, iOS
+simulators and physical iPhones on the same Wi-Fi (token-protected, like in the editor); not on the web. See
+`packages/cli/README.md` for complete workflows.
+
+### Let pinned hosts through without decryption
+
+You'll keep certificate pinning working for a few hosts while the rest of the traffic is intercepted.
+
+1. Open your settings and add the hosts to `flutterIntercept.tlsPassthrough`, for example
+   `["api.mybank.example", "*.payments.example"]`.
+2. Run the app.
+
+**You should see:** connections to those hosts listed as tunnels (a lock, "TLS passthrough — not decrypted") with
+the bytes sent and received, and your pinning checks passing.
+
+**Tip:** use it for Dio `validateCertificate` or native pinning. Nothing inside a tunnel can be read, mocked or
+paused; a block rule still cuts the connection. `*` in a pattern also matches dots (`*.example` matches
+`a.b.example`).
+
+### Use a client certificate (mTLS)
+
+You'll reach a server that requires your app's client certificate.
+
+1. Open your **user** settings and add an entry to `flutterIntercept.clientCertificates`, for example
+   `{"host": "api.corp.example", "pfx": "~/certs/app.p12"}` (or `"cert"` and `"key"` PEM files).
+2. If the file has a passphrase, run **Flutter Intercept: Set Client Certificate Passphrase…**.
+3. Run the app.
+
+**You should see:** requests to that host succeed, with a "client certificate: api.corp.example" badge in the
+details. A certificate that can't be loaded shows the reason in the status line.
+
+**Tip:** the passphrase is kept in VS Code's secret storage, and certificate contents never appear in the panel,
+logs or anything AI agents read.
+
+### Route native clients on an Android emulator
+
+You'll mock and pause requests from `cronet_http` or `ok_http`, not only list them.
+
+1. In your **user** settings, set `flutterIntercept.nativeClients` to `proxy` (a workspace setting can't turn this on).
+2. For HTTPS, run **Flutter Intercept: Save CA Certificate…** and save it as
+   `android/app/src/debug/res/raw/flutter_intercept_ca.pem` (the debug source set, so release builds never include
+   it). Then trust it in a **debug-only** network security config:
+
+   ```xml
+   <!-- android/app/src/debug/res/xml/network_security_config.xml -->
+   <network-security-config>
+     <debug-overrides>
+       <trust-anchors><certificates src="@raw/flutter_intercept_ca" /></trust-anchors>
+     </debug-overrides>
+   </network-security-config>
+   ```
+
+   and point the debug manifest at it (`android/app/src/debug/AndroidManifest.xml`:
+   `<application android:networkSecurityConfig="@xml/network_security_config" />`).
+3. Run a debug session on an Android emulator.
+
+**You should see:** native requests as normal rows, with rules, mocks and breakpoints working on them.
+
+**Tip:** Flutter Intercept sets the emulator's proxy only while the session runs and restores the previous value when
+the session ends or VS Code closes. After a VS Code crash it's restored the next time Flutter Intercept starts while
+that emulator runs; by hand: `adb -s <emulator> shell settings put global http_proxy :0`, then
+`adb -s <emulator> shell settings delete global http_proxy`. Another window's session is never touched. If HTTPS fails because the app doesn't trust the certificate, routing turns itself off for that session and tells you.
+Physical phones and iOS simulators can't be routed this way; their native requests stay read-only.
+
+### Find requests that bypass the proxy
+
+You'll find app code that sends requests around Flutter Intercept.
+
+1. Run a debug session and use the app.
+2. If a banner says requests to a host bypass the proxy, the app uses its own `HttpOverrides` zone
+   (`HttpOverrides.runWithHttpOverrides` or `runZoned`) or a custom `connectionFactory` for them.
+
+**You should see:** one banner per host, naming it and the likely cause.
+
+**Tip:** checking runs for the first minute after the app starts or hot-restarts (all session long for apps that
+use native clients). Remove the app's own override in debug builds to intercept those requests.
 
 ### Run on an Android emulator or phone
 
@@ -1227,13 +1320,15 @@ Exports follow `flutterIntercept.agent.redactSecrets`.
 | `flutterIntercept.agent.screenshots` | `true` | Let agents take screenshots of the running app (`take_screenshot`); each one asks for your confirmation. |
 | `flutterIntercept.captureSource` | `true` | Record which line of your code made each request (see [Where a request came from](#features)). Applies at the next launch. Flutter sessions only: plain Dart programs can't take the setting (the Dart VM rejects `--dart-define`) and always record. |
 | `flutterIntercept.web.enabled` | `true` | Intercept Flutter Web apps launched in Chrome from VS Code. |
-| `flutterIntercept.nativeClients` | `profile` | List requests of native HTTP clients (cupertino_http, cronet_http) read-only from the app's HTTP profile, or `off`. |
+| `flutterIntercept.nativeClients` | `profile` | List requests of native HTTP clients (cupertino_http, cronet_http) read-only from the app's HTTP profile; `proxy` (user settings only) also routes them through Flutter Intercept on Android emulators; or `off`. |
 | `flutterIntercept.backgroundIsolates` | `intercept` | Requests from background isolates (`compute`, `Isolate.run`, `Isolate.spawn`) go through Flutter Intercept too, in debug sessions. `warn` only tells you about them. |
 | `flutterIntercept.notifications` | `errors` | Notify when the app's requests fail while the panel is hidden: `errors` (network errors, 5xx), `all` (also 4xx) or `off`. |
 | `flutterIntercept.contractCheck` | `true` | Check JSON responses against your json_serializable / freezed models and show fields that would make `fromJson` throw. |
 | `flutterIntercept.rewriteLocalhost` | `true` | Requests to `10.0.2.2` / `10.0.3.2` (the emulator's names for your Mac) go to your Mac's `localhost`. Never applies to iPhones. |
 | `flutterIntercept.agent.mcpPort` | `47823` | Port of the local MCP server for agents. If it's busy, the next free port is used. |
 | `flutterIntercept.upstreamProxy` | empty | Send intercepted traffic on through another HTTP proxy, such as Charles or Burp at `http://127.0.0.1:8888`, or a corporate proxy. Empty = connect to servers directly. Requests to `localhost` and the emulator aliases always go direct. |
+| `flutterIntercept.tlsPassthrough` | `[]` | Hosts (globs, e.g. `*.bank.example`) whose HTTPS is passed through without decryption, for apps that pin certificates. Listed as tunnels. |
+| `flutterIntercept.clientCertificates` | `[]` | Client certificates for servers that require mTLS: `{host, pfx}` or `{host, cert, key}` (paths). User settings only; passphrases via the command below. |
 | `flutterIntercept.upstreamProxyIgnoreCertErrors` | `false` | Accept any certificate from servers reached through the upstream proxy. Only for a proxy that decrypts HTTPS itself (Charles, Burp). The panel shows "certificate checks OFF" while it's on. |
 
 `flutterIntercept.upstreamProxy`, `flutterIntercept.upstreamProxyIgnoreCertErrors` and the `flutterIntercept.agent.*`
@@ -1246,6 +1341,8 @@ cloned project can't reroute your traffic or widen agent access.
 | **Flutter Intercept: Open Traffic in Editor** | Opens the traffic view as an editor tab. |
 | **Flutter Intercept: Open Traffic in New Window** | Opens the traffic view in a window of its own (VS Code 1.85+). |
 | **Flutter Intercept: Export Traffic as OpenAPI** / **as Postman Collection** | Writes the recorded traffic to an OpenAPI 3.1 file or a Postman collection. |
+| **Flutter Intercept: Set Client Certificate Passphrase…** | Stores (or clears) the passphrase of a client certificate in VS Code's secret storage. |
+| **Flutter Intercept: Save CA Certificate…** | Saves the public CA certificate, for example to trust it in an app's debug network security config. |
 | **Flutter Intercept: Toggle Interception** | Same as clicking `Intercept: on/off` in the status bar. |
 | **Flutter Intercept: Clear Traffic** | Clears the list. Requests still in flight stay. |
 | **Flutter Intercept: Debug with Intercept** | Starts an intercepted debug session directly. A fallback if F5 isn't picked up. |
@@ -1256,10 +1353,12 @@ cloned project can't reroute your traffic or widen agent access.
 
 What isn't intercepted, or behaves differently while intercepting:
 
-- **Flutter web**: only on Chrome launched from VS Code (not the `web-server` device). There is no direct
-  fallback: if the proxy stops, the page loses network until you restart the session.
+- **Flutter web**: only on Chrome launched from VS Code. For the `web-server` device, a notice offers a command
+  that starts a separate Chrome with the right flags. If the proxy stops, the page goes direct; after the proxy
+  returns, Chrome can take about 5 minutes to use it again.
 - **Native HTTP stacks**: `cronet_http`, `cupertino_http`, `native_dio_adapter` bypass `dart:io`. Their requests
-  are listed read-only (from the app's HTTP profile) but can't be mocked, paused or blocked.
+  are listed read-only (from the app's HTTP profile). On Android emulators they can be routed through the proxy
+  (`nativeClients: proxy`, HTTPS needs the app's debug network security config); not on phones or iOS simulators.
 - **Background isolates**: intercepted in debug sessions only. In profile mode, and for isolates started with
   `Isolate.spawnUri`, their requests go direct and a banner tells you. Requests from very short-lived isolates may
   have no source line.
@@ -1267,23 +1366,23 @@ What isn't intercepted, or behaves differently while intercepting:
   around their code): the inner zone wins.
   - Setting `HttpOverrides.global` is fine: your overrides still apply underneath.
   - Setting `findProxy` on a client is also fine: Flutter Intercept ignores the assignment and prints a note.
-- **Dio `validateCertificate` pinning**: Dio checks the certificate it receives, which is the proxy's, so those
-  requests fail with `bad certificate` while intercepting. Turn interception off to test pinning.
-- **mTLS (client certificates)**: the proxy can't present your app's client certificate to the server.
-- **A custom `connectionFactory`** that ignores the proxy host and port bypasses the proxy.
-- **Throttling** doesn't slow down uploads or WebSocket messages. On WebSockets only block and fault rules apply (to the connection); mocks, breakpoints and mutations pass sockets through.
+- **Dio `validateCertificate` pinning**: Dio checks the certificate it receives, which is the proxy's. Add those
+  hosts to `flutterIntercept.tlsPassthrough`: they're then passed through undecrypted (listed, not readable).
+- **mTLS**: client certificates come from `flutterIntercept.clientCertificates`, not from the app's own code.
+- **A custom `connectionFactory`** that ignores the proxy host and port bypasses the proxy (a banner names the host).
+- **WebSockets**: block, fault and throttle rules apply; mocks, breakpoints and mutations pass sockets through.
 - **Long breakpoints and client timeouts**: if your app's own timeout fires while a request is paused (for
   example Dio's `receiveTimeout`), the app gives up. The exchange is then marked "gave up" and can't be resumed.
   Raise the timeout in debug builds if you need long pauses.
-- **Recordings** hold finished HTTP exchanges only: WebSocket, SSE and native-client traffic isn't saved or
-  replayed.
+- **Recordings** hold finished HTTP, WebSocket and SSE exchanges; native-client traffic and tunnels aren't saved.
+  WebSocket replay follows the order of the app's messages, not their content.
 - **Rewrite** body replacements are plain text (no regexes, up to 20 per body); binary bodies are left untouched.
 - **Shared rules** that could redirect or alter your traffic, and every shared script, don't run on a machine until
   they're approved there.
 - **Scripts** are synchronous, get 200 ms per call and no timers, network, files or modules. Bodies over 1 MB or
   binary bodies reach them as omitted. They don't apply to WebSockets.
 - **Screenshots** capture Flutter's own content (not the status bar or native dialogs) when taken through the debug
-  connection; on macOS desktop, web and physical iPhones they need that connection.
+  connection; Flutter Web uses the debug Chrome, physical iPhones `devicectl` when the debug connection can't.
 - **What the panel keeps**: bodies are shown up to 5 MB, after which they're marked truncated. Recorded traffic
   is cleared when the window reloads; rules are kept.
 
@@ -1309,6 +1408,12 @@ What isn't intercepted, or behaves differently while intercepting:
   rules and mock body files that look like they hold real credentials.
 - **Routing settings are yours.** The upstream proxy and agent settings are read from user settings only, and AI
   agents can only map requests to local servers.
+- **Client certificates are used for your app's traffic.** The proxy presents a configured certificate only to
+  matching hosts (`*` never crosses a dot except a leading `*.`), never to requests from other web pages in the debug
+  Chrome. Other programs on your Mac that use the proxy port directly could still use it, as with any local proxy;
+  configure certificates only on machines you control.
+- **TLS passthrough hosts get the app's bytes untouched**, including the opaque per-session `x-fi-id` request tag
+  used for "where did this request come from" (it identifies nothing else).
 - **Recordings stay on your machine.** They're saved in `.dart_tool/flutter_intercept/recordings/`; an
   unredacted recording is refused where git would track it.
 - **Only sessions you launch from VS Code** while interception is on.

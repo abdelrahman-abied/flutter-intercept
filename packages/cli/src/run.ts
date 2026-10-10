@@ -280,6 +280,13 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
         throw new SetupError(`physical iPhone: could not listen on ${lanHost}: ${(e as Error).message}`);
       }
       lanOpen = true;
+      // REVIEW-8 #12: in GitHub Actions, have the runner mask the token (and the Basic credential) in every log line,
+      // flutter's own output included (a failed build or -v can print the defines). The command lines themselves
+      // are consumed by the runner, not shown.
+      if (deps.env.GITHUB_ACTIONS === 'true') {
+        deps.out(`::add-mask::${token}`);
+        deps.out(`::add-mask::${Buffer.from(`flutter-intercept:${token}`).toString('base64')}`);
+      }
       proxyAddr = lanProxyAddress({ ...bound, token });
       proxy.on('lan-peer', (ip: string) => log(`iPhone connected from ${ip}; the LAN listener now accepts only that address`));
       log(`proxy on 127.0.0.1:${port}, device ${device.id} (${device.kind}) reaches it over the LAN at ${bound.host}:${bound.port} (token-protected, this run only)`);

@@ -235,3 +235,21 @@ package). `npm pack --dry-run`: `LICENSE`, `README.md`, `dist/cli.js` (1.8 MB, 0
 - **Release**: the `v0.8.0` tag must exist on the public repository for `uses: …@v0.8.0`; consider a moving `v0`
   tag later. Before publishing to npm, consider the third-party notices of the bundled dependencies (mockttp and
   its tree are MIT / Apache-2.0; esbuild keeps only `@license` comments).
+
+### REVIEW-8 fixes (#2, #12)
+
+- **#2:** the action no longer uploads the recording. A `record` path stays on the runner (output `record`); the new
+  input `upload-recording` (default `false`) uploads a redacted copy `<record>.redacted.json` instead
+  (`writeRedactedRecordingCopy` in outputs.ts, exported from the cli bundle for action.js: the recording is
+  validated, entries go through `recordedExchange(e, true)` (agent redaction, frames included), `redacted: true`),
+  with a `::warning::` that the original keeps the credentials and that replaying the copy misses requests whose bodies
+  held secrets. A stale copy is deleted before the run. `upload-recording` with a recording *name* only warns.
+  Tests: default inputs → `artifacts` is only the HAR / JUnit, no copy written; `upload-recording: true` → only the
+  copy is listed, and a bearer token, a password field and an access token in the original are absent from it.
+- **#12:** in GitHub Actions (`GITHUB_ACTIONS=true`) a LAN run prints `::add-mask::<token>` and `::add-mask::` of
+  base64(`flutter-intercept:<token>`) on stdout right after the listener opens, before flutter starts; tests check
+  those are the only lines that carry either value, and that nothing is emitted outside Actions. `har` / `junit` /
+  `record` inputs containing `* ? [ ] { } !` are refused (exit 2, `::error::`). `..` is still allowed (a literal
+  path; the workflow author chooses it). `upload-artifact@v7` stays tag-pinned: first-party `actions/*`, and a SHA
+  pin would need a bump process the repo doesn't have (no Dependabot by the owner's choice). README: credentials
+  warning for `record`, artifact visibility, no fork PRs on the iPhone runner.

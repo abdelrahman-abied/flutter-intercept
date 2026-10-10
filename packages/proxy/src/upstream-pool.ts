@@ -211,7 +211,8 @@ function installHook(): boolean {
       let plan: RequestPlan | undefined;
       try {
         plan = pool.plan?.(o?.connection, { protocol: o?.protocol, hostname: o?.hostname, port: o?.port });
-      } catch {
+      } catch (e) {
+        if ((e as { fiRefuse?: boolean })?.fiRefuse) throw e; // a refusal (REVIEW-8 #1): no upstream at all
         plan = undefined;
       }
       const out = requestView(agent, plan ?? {});

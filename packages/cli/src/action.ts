@@ -9,7 +9,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { displayCommand } from './command';
 
-/** Inputs the CLI step reads; `working-directory`, `artifact-name` and `upload-artifacts` are used by action.yml. */
+/** Inputs the CLI step reads (`upload-recording` by this entry itself); `working-directory`, `artifact-name` and
+ * `upload-artifacts` are used by action.yml. */
 export const CLI_INPUTS = [
   'device',
   'targets',
@@ -23,6 +24,7 @@ export const CLI_INPUTS = [
   'rules',
   'approve-shared-rules',
   'flutter-args',
+  'upload-recording',
 ] as const;
 export type CliInput = (typeof CLI_INPUTS)[number];
 export type ActionInputs = Partial<Record<CliInput, string>>;
@@ -71,8 +73,24 @@ function parseBool(name: string, value: string | undefined): boolean {
 export interface ActionPlan {
   /** Arguments for `flutter-intercept`. */
   argv: string[];
-  /** Output files (relative to the working directory) to upload: HAR, JUnit, a recording written to a path. */
-  artifacts: { har?: string; junit?: string; record?: string };
+  /**
+   * Output files (relative to the working directory) to upload: HAR (redacted), JUnit, and with `upload-recording`
+   * a redacted copy of a recording written to a path (REVIEW-8 #2). The unredacted recording is never uploaded.
+   */
+  artifacts: { har?: string; junit?: string; recordRedacted?: string };
+  /** The recording path (`record` when it names a file), kept local. */
+  record?: string;
+  /** Notes to print as workflow warnings. */
+  warnings: string[];
+}
+
+/** upload-artifact treats these as glob / exclusion syntax (REVIEW-8 #12): output paths must be literal. */
+const GLOB_CHARS = /[*?[\]{}!]/;
+
+/** `build/run.json` → `build/run.redacted.json`. */
+export function redactedCopyPath(record: string): string {
+  const ext = path.extname(record);
+  return `${ext ? record.slice(0, -ext.length) : record}.redacted${ext || '.json'}`;
 }
 
 const VALUE_INPUTS: [CliInput, string][] = [
@@ -96,6 +114,9 @@ export function actionPlan(inputs: ActionInputs): ActionPlan {
     const v = inputs[name];
     if (v === undefined) continue;
     if (/[\r\n\0]/.test(v)) throw new ActionInputError(`${name} must be a single line`);
+    if ((name === 'har' || name === 'junit' || name === 'record') && GLOB_CHARS.test(v)) {
+      throw new ActionInputError(`${name} must be a plain file path (no * ? [ ] { } !), got "${v}"`);
+    }
     // --name=value: a value starting with "-" can't be taken for an option
     argv.push(`${flag}=${v}`);
   }
@@ -108,10 +129,21 @@ export function actionPlan(inputs: ActionInputs): ActionPlan {
   const flutterArgs = splitList(inputs['flutter-args']);
   if (flutterArgs.length) argv.push('--', ...flutterArgs);
   const artifacts: ActionPlan['artifacts'] = {};
+  const warnings: string[] = [];
   if (inputs.har) artifacts.har = inputs.har;
   if (inputs.junit) artifacts.junit = inputs.junit;
-  if (inputs.record && looksLikePath(inputs.record)) artifacts.record = inputs.record;
-  return { argv, artifacts };
+  const record = inputs.record && looksLikePath(inputs.record) ? inputs.record : undefined;
+  if (parseBool('upload-recording', inputs['upload-recording'])) {
+    if (record) {
+      artifacts.recordRedacted = redactedCopyPath(record);
+      warnings.push(
+        `upload-recording: uploading a redacted copy (${artifacts.recordRedacted}); ${record} keeps the real credentials and bodies and is not uploaded. Replaying the redacted copy misses requests whose bodies held secrets.`,
+      );
+    } else {
+      warnings.push('upload-recording: set record to a .json path to upload a (redacted) copy of the recording');
+    }
+  }
+  return { argv, artifacts, ...(record ? { record } : {}), warnings };
 }
 
 /** `name<<delimiter\nvalue\ndelimiter\n` for $GITHUB_OUTPUT (multi-line safe; the delimiter is random). */
@@ -125,11 +157,16 @@ export function escapeCommandData(s: string): string {
   return s.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
 }
 
+export interface CliModule {
+  main(argv: string[]): Promise<number>;
+  writeRedactedRecordingCopy(src: string, dest: string): number;
+}
+
 export interface ActionDeps {
   cwd: string;
   log(line: string): void;
-  /** The CLI's `main` (dist/cli.js). */
-  loadCli(): { main(argv: string[]): Promise<number> };
+  /** The CLI bundle (dist/cli.js). */
+  loadCli(): CliModule;
 }
 
 export async function runAction(env: NodeJS.ProcessEnv, deps: ActionDeps): Promise<number> {
@@ -149,9 +186,23 @@ export async function runAction(env: NodeJS.ProcessEnv, deps: ActionDeps): Promi
   const files = Object.values(plan.artifacts).filter((p): p is string => !!p).map(abs);
   for (const f of files) if (/[\r\n]/.test(f)) throw new Error('output paths must be single lines');
   setOutput('artifacts', files.join('\n'));
-  for (const k of ['har', 'junit', 'record'] as const) setOutput(k, plan.artifacts[k] ? abs(plan.artifacts[k]!) : '');
+  setOutput('har', plan.artifacts.har ? abs(plan.artifacts.har) : '');
+  setOutput('junit', plan.artifacts.junit ? abs(plan.artifacts.junit) : '');
+  setOutput('record', plan.record ? abs(plan.record) : '');
+  for (const w of plan.warnings) deps.log(`::warning title=flutter-intercept::${escapeCommandData(w)}`);
   deps.log(displayCommand('flutter-intercept', plan.argv));
-  const code = await deps.loadCli().main(plan.argv);
+  const cli = deps.loadCli();
+  // a copy left from an earlier run must not be uploaded as this run's
+  if (plan.artifacts.recordRedacted) fs.rmSync(abs(plan.artifacts.recordRedacted), { force: true });
+  const code = await cli.main(plan.argv);
+  if (plan.record && plan.artifacts.recordRedacted && fs.existsSync(abs(plan.record))) {
+    try {
+      const n = cli.writeRedactedRecordingCopy(abs(plan.record), abs(plan.artifacts.recordRedacted));
+      deps.log(`redacted copy of the recording for upload: ${n} exchanges → ${abs(plan.artifacts.recordRedacted)}`);
+    } catch (e) {
+      deps.log(`::warning title=flutter-intercept::${escapeCommandData(`no redacted copy of the recording, nothing uploaded for it: ${(e as Error).message}`)}`);
+    }
+  }
   setOutput('exit-code', String(code));
   return code;
 }
@@ -168,7 +219,7 @@ if (require.main === module) {
     cwd: process.cwd(),
     log: (l) => process.stdout.write(`${l}\n`),
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    loadCli: () => require(path.join(__dirname, 'cli.js')) as { main(argv: string[]): Promise<number> },
+    loadCli: () => require(path.join(__dirname, 'cli.js')) as CliModule,
   }).then(
     (code) => process.exit(code),
     (e) => {

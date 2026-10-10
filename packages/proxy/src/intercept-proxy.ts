@@ -44,7 +44,7 @@ import {
 import { ReplayStore, requestBodyHash, type BodyKey } from './replay';
 import { framePayload, sseEventText, sseSchedule, wsScript, type TimedStep } from './replay-stream';
 import { createUpstreamAgents, isLoopbackHost, parseUpstreamProxy, retireAgents, type UpstreamAgents, type UpstreamProxyConfig, type UpstreamProxySpec } from './upstream-proxy';
-import { matchesHostPattern, normalizeHostname, parseHostPattern, splitHostPort, type HostPattern } from './hosts';
+import { matchesHostPattern, normalizeHostname, parseHostPattern, parseHostPatterns, splitHostPort, type HostPattern } from './hosts';
 import { openTunnelUpstream, relay } from './tunnel';
 import { isShaped, LinkQueue, type LinkShape } from './pace';
 import { detectGraphql, graphqlOperationNames } from './graphql';
@@ -220,6 +220,8 @@ interface Flow {
   replay?: ReplayEntry | 'deferred';
   /** Answer 502 with this text (e.g. an unusable Map Remote target). */
   localError?: string;
+  /** REVIEW-8 #1: answer 403 with this text — a web page's request to a client-certificate host. */
+  refused?: string;
   /** Hooked routes: the Host header to send when it isn't the URL's (preserveHost, a rewritten Host). */
   wantHost?: string;
   /** mockttp's timing events of the request (CONTRACTS §13.2 `requestMs`). */
@@ -473,6 +475,7 @@ export class InterceptProxy extends EventEmitter {
   private readonly scripts = new ScriptRunner();
   /** CONTRACTS §14.2: hostname patterns whose CONNECTs are tunnelled undecrypted. */
   private passthrough: HostPattern[] = [];
+  private passthroughProblems: string[] = [];
   /** The CONNECT hook is installed (start()). */
   private connectHook = false;
   /** Upstream sockets of open passthrough tunnels (destroyed by stop()). */
@@ -1025,23 +1028,23 @@ export class InterceptProxy extends EventEmitter {
   }
 
   /**
-   * CONTRACTS §14.2: CONNECTs to these hosts (hostname globs, optional `:port`, see src/hosts.ts) are tunnelled to
-   * the real server undecrypted: the app sees the server's own certificate (its pinning keeps working), each tunnel
-   * is one exchange (`kind: 'tunnel'`, method CONNECT, url `https://host:port/`, `tunnelBytes`), no headers / bodies.
-   * Only block and fault rules apply (after the TLS handshake, see src/tls-records.ts), plus the network profile.
-   * Throws on an invalid pattern (nothing changes then). Applies to CONNECTs from now on; open tunnels stay.
+   * CONTRACTS §14.2: CONNECTs to these hosts (host patterns, src/hosts.ts) are tunnelled to the real server
+   * undecrypted: the app sees the server's own certificate (its pinning keeps working), each tunnel is one exchange
+   * (`kind: 'tunnel'`, method CONNECT, url `https://host:port/`, `tunnelBytes`), no headers / bodies. Only block and
+   * fault rules apply (after the TLS handshake, see src/tls-records.ts), plus the network profile. Refused entries
+   * are dropped one by one and reported in `problems` (REVIEW-8 #4); the rest apply. Applies to CONNECTs from now on.
    */
-  setTlsPassthrough(hosts: string[] | undefined): void {
-    if (hosts !== undefined && hosts !== null && !Array.isArray(hosts)) throw new Error('TLS passthrough: expected a list of host names');
-    const parsed: HostPattern[] = [];
-    for (const h of hosts ?? []) {
-      try {
-        parsed.push(parseHostPattern(h));
-      } catch (e) {
-        throw new Error(`TLS passthrough: ${(e as Error).message}`);
-      }
-    }
-    this.passthrough = parsed;
+  setTlsPassthrough(hosts: string[] | undefined): { hosts: string[]; problems: string[] } {
+    const { patterns, problems } = parseHostPatterns(hosts);
+    this.passthrough = patterns;
+    // One sentence per refused entry, naming it (parseHostPattern's messages start with the quoted entry).
+    this.passthroughProblems = problems.map((x) => (x.problem.startsWith('"') ? x.problem : `"${x.host.slice(0, 100)}": ${x.problem}`));
+    return { hosts: patterns.map((p) => p.pattern), problems: this.passthroughProblems.slice() };
+  }
+
+  /** Why entries of the last setTlsPassthrough were refused (one sentence each, naming the entry). */
+  get tlsPassthroughProblems(): string[] {
+    return this.passthroughProblems.slice();
   }
 
   /** The TLS passthrough patterns in use. */
@@ -1742,6 +1745,8 @@ export class InterceptProxy extends EventEmitter {
     // Map Remote / request-header rewrites change the request itself, before the LAN deny rule (next matcher) and
     // the passthrough read it: the SSRF guard then checks the MAPPED target.
     if ((flow.map || flow.rewrite?.request) && !flow.fault && !flow.localError) this.applyRequestSide(req, flow);
+    const refused = this.forwards(flow) && !flow.deferred ? this.certRefusal(flow.map?.url ?? req.url, headers) : undefined;
+    if (refused) flow = { route: 'h1', ...(flow.rule ? { rule: flow.rule } : {}), refused };
     if (meta?.traceId) flow.traceId = meta.traceId;
     if (send) flow.send = send;
     // Keyed on the socket, like every LAN guard (also for requests inside a LAN CONNECT tunnel).
@@ -2078,8 +2083,14 @@ export class InterceptProxy extends EventEmitter {
     ex.responseBody = resBody;
     const upstreamError = res.tags?.find((t) => t.startsWith('passthrough-error:'));
     const ssrf = res.statusCode === 403 && resBody?.encoding === 'utf8' && resBody.text.includes(SSRF_MARKER);
+    const certRefused = res.statusCode === 403 && resBody?.encoding === 'utf8' && resBody.text.includes(CERT_REFUSAL_MARKER);
     if (ssrf) {
       this.fail(ex, resBody!.text.replace(/^Error: /, ''));
+    } else if (certRefused) {
+      // REVIEW-8 #1 backstop (requestPlan): refused before any upstream connection.
+      ex.error = resBody!.text.replace(/^Error: /, '');
+      delete ex.clientCertificate;
+      this.finish(ex, 'blocked');
     } else if (upstreamError || (flow.route === 'h2' && flow.fault !== 'truncate')) {
       // h2 still pending here = beforeResponse never ran: upstream failure or response too large.
       const cause = upstreamError?.slice('passthrough-error:'.length);
@@ -2177,6 +2188,7 @@ export class InterceptProxy extends EventEmitter {
         localError: resolved.localError,
       });
       if (tap) this.applyShaping(tap, flow);
+      if (this.forwards(flow)) flow.refused = this.certRefusal(flow.map?.url ?? req.url, req.headers as HeaderBag);
     }
     const ex = this.newExchange(req, flow);
     this.setRequestBody(ex, body);
@@ -2185,6 +2197,18 @@ export class InterceptProxy extends EventEmitter {
     const action = flow.action;
 
     if (flow.preflight) return this.answerPreflight(req, ex, flow);
+
+    if (flow.refused) {
+      this.track(ex, flow);
+      const headers: HeaderBag = { 'content-type': 'text/plain; charset=utf-8' };
+      const text = `Flutter Intercept: ${flow.refused}`;
+      ex.status = 403;
+      ex.responseHeaders = cleanHeaders(headers);
+      ex.responseBody = { text, encoding: 'utf8' };
+      ex.error = flow.refused;
+      this.finish(ex, 'blocked');
+      return { response: { statusCode: 403, statusMessage: STATUS_CODES[403], headers, rawBody: frameBody(Buffer.from(text, 'utf8'), headers) } };
+    }
 
     if (flow.fault && flow.fault !== 'truncate') return this.applyFault(ex, flow);
 
@@ -2783,6 +2807,10 @@ export class InterceptProxy extends EventEmitter {
       }
     } else if (m.rule) flow.rule = m.rule;
     if (flow.route === 'ws-pass') {
+      const refused = this.certRefusal(flow.map?.url ?? url, req.headers as HeaderBag);
+      if (refused) flow = { route: 'ws-local', ...(m.rule ? { rule: m.rule } : {}), refused };
+    }
+    if (flow.route === 'ws-pass') {
       // CONTRACTS §14.4: a throttle rule (or the throttle profile) paces the frames, each direction (watchWebSocket).
       const t = action?.kind === 'throttle' ? action : this.profile.kind === 'throttle' ? this.profile : undefined;
       if (t) {
@@ -2834,8 +2862,11 @@ export class InterceptProxy extends EventEmitter {
       if (th && up) {
         // Before mockttp's pipe starts (it is attached after this event): what the pipe sends to the app is paced
         // like a download, what it sends to the server like an upload.
-        paceWebSocket(ws, { latencyMs: th.latencyMs, kbps: th.kbps });
-        paceWebSocket(up, { latencyMs: th.latencyMs, kbps: th.uploadKbps });
+        const note = (text: string) => {
+          if (this.live.get(ex.id)?.ex === ex) ex.error = text;
+        };
+        paceWebSocket(ws, { latencyMs: th.latencyMs, kbps: th.kbps }, up, note);
+        paceWebSocket(up, { latencyMs: th.latencyMs, kbps: th.uploadKbps }, ws, note);
       }
       ws.on('message', (data, isBinary) => this.addFrame(ex, payloadFrame('send', isBinary ? 'binary' : 'text', toBuffer(data))));
       ws.on('ping', (d) => this.addFrame(ex, payloadFrame('send', 'ping', toBuffer(d))));
@@ -2929,6 +2960,20 @@ export class InterceptProxy extends EventEmitter {
     const { ex, flow } = live;
     const action = flow.action;
     const reset = () => resetOrDestroy(req as unknown as Parameters<typeof resetOrDestroy>[0]);
+    if (flow.refused) {
+      const body = Buffer.from(`Flutter Intercept: ${flow.refused}`, 'utf8');
+      ex.status = 403;
+      ex.error = flow.refused;
+      this.finish(ex, 'blocked');
+      socket.on('error', () => undefined);
+      socket.end(
+        Buffer.concat([
+          Buffer.from(`HTTP/1.1 403 Forbidden\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: ${body.length}\r\nconnection: close\r\n\r\n`, 'latin1'),
+          body,
+        ]),
+      );
+      return;
+    }
     if (flow.localError) {
       const body = Buffer.from(`Flutter Intercept: ${flow.localError}`, 'utf8');
       ex.status = 502;
@@ -3022,6 +3067,35 @@ export class InterceptProxy extends EventEmitter {
     return this.certFor(key.slice(0, i), Number(key.slice(i + 1)))?.options;
   }
 
+  /** Does this flow (as decided so far) send the request to a server? */
+  private forwards(flow: Flow): boolean {
+    if (flow.fault || flow.localError || flow.preflight || flow.refused || flow.replay) return false;
+    if (flow.route !== 'plain' && flow.route !== 'h1' && flow.route !== 'h2') return false;
+    const k = flow.action?.kind;
+    return k !== 'mock' && k !== 'block';
+  }
+
+  /**
+   * REVIEW-8 #1: a client certificate is presented for the app's traffic only. A request to a certificate host that
+   * carries an `Origin` other than a loopback one (http(s)://localhost / 127.0.0.1 / [::1], any port: the Flutter
+   * Web dev server) comes from a web page — a third-party frame, an ad, another site open in the debug Chrome — and is
+   * refused (403) before any upstream connection. Requests without `Origin` (dart:io, native) are the app's.
+   */
+  private certRefusal(url: string, headers: HeaderBag): string | undefined {
+    if (!this.certs.length) return undefined;
+    const origin = getHeader(headers, 'origin');
+    if (origin === undefined || isLoopbackOrigin(origin)) return undefined;
+    let u: URL;
+    try {
+      u = new URL(url);
+    } catch {
+      return undefined;
+    }
+    if (u.protocol !== 'https:' && u.protocol !== 'wss:') return undefined;
+    const port = Number(u.port) || 443;
+    return this.certFor(u.hostname, port) ? certRefusalText(u.hostname, origin) : undefined;
+  }
+
   /**
    * The pool asks before each upstream request of our rules (upstream-pool.ts): phase timings, upload pacing
    * (CONTRACTS §14.4), and the client certificate the connection presents (CONTRACTS §14.3).
@@ -3033,6 +3107,11 @@ export class InterceptProxy extends EventEmitter {
     const flow = live?.flow ?? this.flows.get(id);
     if (live && (target.protocol === 'https:' || target.protocol === 'wss:') && target.hostname) {
       const c = this.certFor(target.hostname, Number(target.port) || 443);
+      const origin = getHeader(live.ex.requestHeaders, 'origin');
+      if (c && origin !== undefined && !isLoopbackOrigin(origin)) {
+        // Backstop (REVIEW-8 #1): a request edited / scripted onto a certificate host after the flow was decided.
+        throw Object.assign(new Error(certRefusalText(target.hostname, origin)), { statusCode: 403, statusMessage: 'Forbidden', fiRefuse: true });
+      }
       if (c) live.ex.clientCertificate = c.host;
       else delete live.ex.clientCertificate;
     }
@@ -3854,29 +3933,75 @@ interface PacedWs {
   ping(data?: unknown, mask?: unknown, cb?: unknown): void;
   pong(data?: unknown, mask?: unknown, cb?: unknown): void;
   close(code?: number, reason?: unknown): void;
+  pause?(): void;
+  resume?(): void;
   once(event: 'close', l: () => void): unknown;
 }
+
+/**
+ * REVIEW-8 #6: a throttled WebSocket direction may hold this many bytes waiting for the simulated link; beyond it the
+ * sending side's socket is paused (TCP pushes back on the peer, as a real slow link would) until half of it drained.
+ */
+export const WS_THROTTLE_QUEUE_MAX = 8 * 1024 * 1024;
 
 const byteSize = (d: unknown): number =>
   typeof d === 'string' ? Buffer.byteLength(d) : Buffer.isBuffer(d) || d instanceof Uint8Array ? d.byteLength : d instanceof ArrayBuffer ? d.byteLength : Array.isArray(d) ? d.reduce((n: number, x) => n + byteSize(x), 0) : 0;
 
 /**
- * CONTRACTS §14.4: deliver what is sent on a `ws` socket through a LinkQueue (latency + bandwidth), in order —
- * messages, pings / pongs and the close. Anything due after the socket closed is dropped (its callback still runs).
+ * CONTRACTS §14.4: deliver what is sent on a `ws` socket (`target`) through a LinkQueue (latency + bandwidth), in
+ * order — messages, pings / pongs and the close. Anything due after the socket closed is dropped (its callback still
+ * runs). `source` is the socket whose messages the pipe forwards to `target`: it is paused while the queue is over
+ * WS_THROTTLE_QUEUE_MAX; without pause support the connection is closed (1013) with `onOverflow`'s note instead.
  */
-function paceWebSocket(w: unknown, shape: LinkShape): void {
+function paceWebSocket(target: unknown, shape: LinkShape, source: unknown, onOverflow: (note: string) => void): void {
   if (!isShaped(shape)) return;
-  const ws = w as PacedWs;
-  const q = new LinkQueue(shape);
+  const ws = target as PacedWs;
+  const src = source as PacedWs;
+  const q = new LinkQueue(shape, { lowWater: WS_THROTTLE_QUEUE_MAX / 2 });
   const send = ws.send.bind(ws);
   const ping = ws.ping.bind(ws);
   const pong = ws.pong.bind(ws);
   const close = ws.close.bind(ws);
   const open = () => ws.readyState === WebSocket.OPEN;
   const cbOf = (...a: unknown[]) => a.find((x) => typeof x === 'function') as ((e?: Error) => void) | undefined;
-  ws.send = (data, opts, cb) => q.push(byteSize(data), () => (open() ? send(data, opts, cb) : cbOf(opts, cb)?.()));
-  ws.ping = (data, mask, cb) => q.push(byteSize(data), () => (open() ? ping(data, mask, cb) : cbOf(mask, cb)?.()));
-  ws.pong = (data, mask, cb) => q.push(byteSize(data), () => (open() ? pong(data, mask, cb) : cbOf(mask, cb)?.()));
+  let paused = false;
+  let overflowed = false;
+  q.onDrain = () => {
+    if (paused) {
+      paused = false;
+      src.resume?.();
+    }
+  };
+  const check = () => {
+    if (paused || overflowed || q.queuedBytes <= WS_THROTTLE_QUEUE_MAX) return;
+    if (typeof src.pause === 'function' && typeof src.resume === 'function') {
+      paused = true;
+      src.pause();
+      return;
+    }
+    overflowed = true;
+    const mb = WS_THROTTLE_QUEUE_MAX / 1024 / 1024;
+    onOverflow(`The throttled WebSocket fell more than ${mb} MB behind; the connection was closed (1013).`);
+    q.close();
+    try {
+      close(1013, 'Throttle queue full');
+      src.close(1013, 'Throttle queue full');
+    } catch {
+      /* already closing */
+    }
+  };
+  ws.send = (data, opts, cb) => {
+    q.push(byteSize(data), () => (open() ? send(data, opts, cb) : cbOf(opts, cb)?.()));
+    check();
+  };
+  ws.ping = (data, mask, cb) => {
+    q.push(byteSize(data), () => (open() ? ping(data, mask, cb) : cbOf(mask, cb)?.()));
+    check();
+  };
+  ws.pong = (data, mask, cb) => {
+    q.push(byteSize(data), () => (open() ? pong(data, mask, cb) : cbOf(mask, cb)?.()));
+    check();
+  };
   ws.close = (code, reason) =>
     q.push(2 + byteSize(reason), () => {
       try {
@@ -3885,5 +4010,27 @@ function paceWebSocket(w: unknown, shape: LinkShape): void {
         close();
       }
     });
-  ws.once('close', () => q.close());
+  ws.once('close', () => {
+    q.close();
+    if (paused) src.resume?.();
+  });
+}
+
+/** `http(s)://localhost | 127.0.0.1 | [::1]` with any port: the Flutter Web dev server's own origin. */
+export function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const u = new URL(origin);
+    return (u.protocol === 'http:' || u.protocol === 'https:') && (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]');
+  } catch {
+    return false;
+  }
+}
+
+const CERT_REFUSAL_MARKER = 'Refused: a client certificate is configured';
+
+function certRefusalText(host: string, origin: string): string {
+  return (
+    `${CERT_REFUSAL_MARKER} for ${host.replace(/^\[|\]$/g, '')}, and this request comes from a web page ` +
+    `(Origin ${String(origin).slice(0, 200)}), not the app. Client certificates are only presented for the app's own requests.`
+  );
 }

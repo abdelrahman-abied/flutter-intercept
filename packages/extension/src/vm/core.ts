@@ -67,7 +67,7 @@ export interface VmCoreDeps extends VmHostDeps {
   nativeRouted?(): boolean;
   /** CONTRACTS §14.7: a routed native client rejected the proxy's certificate; the host should stop routing. Called once. */
   nativeRouteFailed?(client: string | undefined): void;
-  /** CONTRACTS §14.7: whether the proxy recorded this request (plain-http bypass check); undefined = can't tell. */
+  /** CONTRACTS §14.7: whether the proxy recorded this request (plain-http bypass check; routed native entries, REVIEW-8 #7); undefined = can't tell. */
   proxySaw?(q: BypassQuery): boolean | undefined;
   /** Clock (tests). */
   now?(): number;
@@ -301,6 +301,21 @@ export function createVmSessionCore(sessionId: string, deps: VmCoreDeps): VmSess
       /* ignore */
     }
     pushWarnings();
+  }
+
+  /**
+   * REVIEW-8 #7: a routed native request the proxy has no record of (the route was reverted meanwhile by another
+   * window, the user or a script) is imported after all. Without `proxySaw` the route is trusted.
+   */
+  function missedByProxy(e: ProfileEntry): boolean {
+    if (!deps.proxySaw) return false;
+    const ex = toExchange(e);
+    if (!ex) return false;
+    try {
+      return deps.proxySaw({ method: ex.method, url: ex.url, startedAt: ex.startedAt }) === false;
+    } catch {
+      return false;
+    }
   }
 
   function warnBypass(host: string, cause: Parameters<typeof bypassText>[1]): void {
@@ -573,7 +588,7 @@ export function createVmSessionCore(sessionId: string, deps: VmCoreDeps): VmSess
     if (!t && isPackageEntry(entry) && routed()) {
       // Routed through the proxy: a finished request is a proxy exchange already; only failures are imported.
       if (!isFinished(entry)) return false;
-      if (!entryError(entry)) {
+      if (!entryError(entry) && !missedByProxy(entry)) {
         remember(key, { done: true });
         return false;
       }

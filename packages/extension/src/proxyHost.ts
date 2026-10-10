@@ -30,7 +30,7 @@
  */
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
-import type { ClientCertificate, Exchange, InterceptProxyOptions, ReplayEntry, ReplayOptions, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
+import { parseHostPattern, type ClientCertificate, type Exchange, type InterceptProxyOptions, type ReplayEntry, type ReplayOptions, type Rule, type RuleAction, type SendRequest } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 import type { SessionWarning } from './ui/protocol';
 import type { VmHostDeps } from './vm/types';
@@ -79,7 +79,10 @@ export interface ProxyLike {
   /** The upstream proxy in use (`http://host:port`, never credentials). */
   readonly upstreamProxy?: { url: string; ignoreCertErrors: boolean };
   // CONTRACTS §14.2 / §14.3. Optional: older proxy builds lack them (the host then logs and shows a problem).
-  setTlsPassthrough?(hosts: string[]): void;
+  /** Newer builds return what they accepted (REVIEW-8 #4); older ones return nothing and throw on a bad pattern. */
+  setTlsPassthrough?(hosts: string[]): void | { hosts: string[]; problems: string[] };
+  /** The passthrough patterns in effect. */
+  readonly tlsPassthrough?: string[];
   setClientCertificates?(certs: ClientCertificate[]): void;
 }
 
@@ -123,9 +126,10 @@ const HOST_GLOB = /^(\*\.)?[a-z0-9_*]([a-z0-9_*.-]{0,251}[a-z0-9_*])?$/;
 const HOST_PORT = /^(?<host>[^:]+)(?::(?<port>\d{1,5}))?$/;
 
 /**
- * CONTRACTS §14.2: the `flutterIntercept.tlsPassthrough` setting → lower-case hostname globs (`api.example.com`,
- * `*.bank.example`, `*`), deduplicated, at most MAX_HOST_PATTERNS. Anything else (ports, schemes, paths, spaces) is
- * reported in `problems` and left out.
+ * CONTRACTS §14.2: the `flutterIntercept.tlsPassthrough` setting → lower-case host patterns as the proxy's own
+ * `parseHostPattern` accepts them (REVIEW-8 #4: one implementation, so host and proxy never disagree; it refuses `*`,
+ * `*.*`, `*.com`-like and wildcard-IP patterns), deduplicated, at most MAX_HOST_PATTERNS. A refused entry is reported
+ * in `problems` and dropped on its own; the rest still apply.
  */
 export function normalizeTlsPassthrough(input: unknown): { hosts: string[]; problems: string[] } {
   const hosts: string[] = [];
@@ -139,8 +143,16 @@ export function normalizeTlsPassthrough(input: unknown): { hosts: string[]; prob
     }
     const h = raw.trim().toLowerCase().replace(/\.+$/, '');
     if (!h) continue;
-    if (h.length > 253 || !HOST_GLOB.test(h) || h.includes('..')) {
-      problems.push(`flutterIntercept.tlsPassthrough: "${raw.replace(/[\r\n]+/g, ' ').slice(0, 100)}" is not a host name glob (e.g. api.example.com or *.example.com)`);
+    let why: string | undefined = h.length > 260 ? `"${h.slice(0, 100)}…" is too long` : undefined;
+    if (!why) {
+      try {
+        parseHostPattern(h);
+      } catch (e) {
+        why = (e instanceof Error ? e.message : String(e)).replace(/[\r\n]+/g, ' ').slice(0, 300);
+      }
+    }
+    if (why) {
+      problems.push(`flutterIntercept.tlsPassthrough: ${why}`);
       continue;
     }
     if (!hosts.includes(h)) hosts.push(h);
@@ -155,11 +167,26 @@ export function normalizeTlsPassthrough(input: unknown): { hosts: string[]; prob
 /**
  * CONTRACTS §14.6: VS Code's `http.noProxy` → the upstream proxy's `noProxy` list: lower-case `host`, `.suffix` /
  * `*.suffix` (the domain and its subdomains), `*` (everything), IP literals, each optionally `:port`; at most
- * MAX_HOST_PATTERNS. CIDR ranges and other forms are dropped (they go through the proxy).
+ * MAX_HOST_PATTERNS. CIDR ranges, `<local>` and other forms are dropped — those hosts go through the proxy — and
+ * (REVIEW-8 #12) listed in `dropped` so the user is told.
  */
+export function splitNoProxy(input: unknown): { hosts: string[]; dropped: string[] } {
+  const dropped: string[] = [];
+  const hosts = normalizeNoProxyInto(input, dropped);
+  return { hosts, dropped };
+}
+
+/** `splitNoProxy(input).hosts`. */
 export function normalizeNoProxy(input: unknown): string[] {
+  return normalizeNoProxyInto(input, []);
+}
+
+function normalizeNoProxyInto(input: unknown, dropped: string[]): string[] {
   if (!Array.isArray(input)) return [];
   const out: string[] = [];
+  const drop = (v: string) => {
+    if (dropped.length < 20 && !dropped.includes(v)) dropped.push(v.replace(/[\r\n]+/g, ' ').slice(0, 100));
+  };
   for (const raw of input) {
     if (typeof raw !== 'string') continue;
     for (const part of raw.split(/[\s,]+/)) {
@@ -174,12 +201,21 @@ export function normalizeNoProxy(input: unknown): string[] {
         p = v6[2] ? `[${v6[1]}]:${v6[2]}` : `[${v6[1]}]`;
       } else {
         const m = HOST_PORT.exec(p);
-        if (!m?.groups) continue;
+        if (!m?.groups) {
+          drop(part.trim());
+          continue;
+        }
         let host = m.groups.host;
         if (host.startsWith('.')) host = `*${host}`;
-        if (host.length > 253 || !HOST_GLOB.test(host) || host.includes('..') || host.slice(1).includes('*')) continue;
+        if (host.length > 253 || !HOST_GLOB.test(host) || host.includes('..') || host.slice(1).includes('*')) {
+          drop(part.trim());
+          continue;
+        }
         const port = m.groups.port;
-        if (port !== undefined && (Number(port) < 1 || Number(port) > 65535)) continue;
+        if (port !== undefined && (Number(port) < 1 || Number(port) > 65535)) {
+          drop(part.trim());
+          continue;
+        }
         p = port ? `${host}:${port}` : host;
       }
       if (!out.includes(p)) out.push(p);
@@ -194,7 +230,8 @@ export function normalizeNoProxy(input: unknown): string[] {
  * is empty, VS Code's `http.proxy` (user settings) is used with its `http.noProxy` hosts going direct.
  * `http.proxyStrictSSL: false` does NOT turn certificate checks off: only `ignoreCertErrors`
  * (`flutterIntercept.upstreamProxyIgnoreCertErrors`) does. Throws (readable) when OUR setting is invalid; a VS Code
- * proxy that can't be chained (https://, socks://, malformed) gives `problem` and no proxy (direct).
+ * proxy that can't be chained (https://, socks://, malformed) gives `problem` and no proxy (direct); `problem` with a
+ * `cfg` = some `http.noProxy` entries were dropped.
  */
 export function resolveUpstreamProxy(
   ours: { url?: string; ignoreCertErrors?: boolean },
@@ -215,9 +252,16 @@ export function resolveUpstreamProxy(
     return { problem: `VS Code's http.proxy is a ${scheme.replace(/:$/, '')}:// proxy, which Flutter Intercept can't chain to: the app's traffic goes direct. Set flutterIntercept.upstreamProxy to an http:// proxy to use one.` };
   }
   try {
-    const noProxy = normalizeNoProxy(vscodeProxy?.noProxy);
+    const { hosts: noProxy, dropped } = splitNoProxy(vscodeProxy?.noProxy);
     const cfg = checkUpstreamProxy({ url: vs, ...(ignore ? { ignoreCertErrors: true } : {}), ...(noProxy.length ? { noProxy } : {}) });
-    return { cfg, source: 'http.proxy' };
+    return {
+      cfg,
+      source: 'http.proxy',
+      // REVIEW-8 #12: say which http.noProxy entries we can't honour (they go through the proxy)
+      ...(dropped.length
+        ? { problem: `VS Code's http.noProxy entries ${dropped.map((d) => `"${d}"`).join(', ')} can't be used by Flutter Intercept (CIDR ranges, <local> and patterns other than host, .domain, *.domain or IP): requests to those hosts go through the proxy.` }
+        : {}),
+    };
   } catch (e) {
     return { problem: `VS Code's http.proxy can't be used by Flutter Intercept (${(e as Error).message.replace(/^upstreamProxy\.url/, 'it')}): the app's traffic goes direct.` };
   }
@@ -377,10 +421,14 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private upstreamSource?: UpstreamSource;
   // CONTRACTS §14
   private tlsHosts: string[] = [];
+  private tlsSettingProblems: string[] = [];
+  private setConfigWarningLater?: string;
   /** Loaded certificates (key material: re-applied after a restart, never logged or emitted). */
   private clientCerts: ClientCertificate[] = [];
   private clientCertStatus: ClientCertificateStatus[] = [];
   private tlsUnsupportedLogged = false;
+  /** REVIEW-8 #4 / #12: setting problems shown in Status.warnings (`upstream`, `tlsPassthrough`). */
+  private configWarnings = new Map<string, SessionWarning>();
   private certsUnsupportedLogged = false;
 
   constructor(private readonly opts: InterceptProxyHostOptions) {
@@ -452,7 +500,10 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
           }
         }
       }
-      if (this.tlsHosts.length) this.applyTlsPassthrough(proxy);
+      if (this.tlsHosts.length) {
+        const problems = this.applyTlsPassthrough(proxy);
+        if (problems.length || this.tlsSettingProblems.length) this.setConfigWarningLater = [...this.tlsSettingProblems, ...problems].join(' ');
+      }
       if (this.clientCerts.length) this.applyClientCertificates(proxy);
       this.applyReplay(proxy);
       if (this.profile.kind !== 'none') this.applyProfile(proxy); // a new proxy starts with none
@@ -463,6 +514,10 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       proxy.on('rule-spent', (ruleId, reason) => this.emit('rule-spent', ruleId, reason));
       proxy.on('rule-hit', (ruleId, used) => this.emit('rule-hit', ruleId, used));
       this.proxy = proxy;
+      if (this.setConfigWarningLater !== undefined) {
+        this.setConfigWarning('tlsPassthrough', this.setConfigWarningLater || undefined);
+        this.setConfigWarningLater = undefined;
+      }
       this.opts.log?.(`proxy listening on ${this.opts.host ?? '127.0.0.1'}:${proxy.port}${port !== first ? ` (port ${first} busy)` : ''}`);
       this.emit('state', true);
       return proxy.port;
@@ -781,6 +836,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     const r = resolveUpstreamProxy(ours, vs);
     this.setUpstreamProxy(r.cfg, r.source);
     if (r.problem) this.opts.log?.(r.problem);
+    this.setConfigWarning('upstream', r.problem);
     return { ...(r.source ? { source: r.source } : {}), ...(r.problem ? { problem: r.problem } : {}) };
   }
 
@@ -798,29 +854,52 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   setTlsPassthrough(input: unknown): { hosts: string[]; problems: string[] } {
     const r = normalizeTlsPassthrough(input);
     for (const p of r.problems) this.opts.log?.(p);
-    if (JSON.stringify(r.hosts) === JSON.stringify(this.tlsHosts)) return r;
+    this.tlsSettingProblems = r.problems;
+    const before = JSON.stringify(this.tlsPassthrough);
     this.tlsHosts = r.hosts;
-    if (this.proxy) this.applyTlsPassthrough(this.proxy);
-    this.emit('tlsPassthrough', this.tlsPassthrough);
-    return r;
+    const proxyProblems = this.proxy ? this.applyTlsPassthrough(this.proxy) : [];
+    const problems = [...r.problems, ...proxyProblems];
+    this.setConfigWarning('tlsPassthrough', problems.length ? problems.join(' ') : undefined);
+    if (JSON.stringify(this.tlsPassthrough) !== before) this.emit('tlsPassthrough', this.tlsPassthrough);
+    return { hosts: this.tlsPassthrough, problems };
   }
 
-  /** `Status.tlsPassthrough`: the hosts in use (a copy). */
+  /**
+   * `Status.tlsPassthrough`: the hosts actually in effect (REVIEW-8 #4) — what the running proxy reports, else what
+   * applies when it starts. A copy.
+   */
   get tlsPassthrough(): string[] {
-    return [...this.tlsHosts];
+    const live = this.proxy?.setTlsPassthrough ? this.proxy.tlsPassthrough : undefined;
+    return [...(Array.isArray(live) ? live : this.tlsHosts)];
   }
 
-  private applyTlsPassthrough(proxy: ProxyLike): void {
+  /** Applies the list; returns the proxy's problems (patterns it dropped or refused). */
+  private applyTlsPassthrough(proxy: ProxyLike): string[] {
     if (proxy.setTlsPassthrough) {
       try {
-        proxy.setTlsPassthrough([...this.tlsHosts]);
+        const r = proxy.setTlsPassthrough([...this.tlsHosts]);
+        const problems = r && Array.isArray(r.problems) ? r.problems.map((p) => `flutterIntercept.tlsPassthrough: ${String(p).slice(0, 300)}`) : [];
+        for (const p of problems) this.opts.log?.(p);
+        return problems;
       } catch (e) {
-        this.opts.log?.(`TLS passthrough not applied: ${e instanceof Error ? e.message : String(e)}`);
+        const msg = `TLS passthrough not applied (the previous list stays in effect): ${e instanceof Error ? e.message : String(e)}`;
+        this.opts.log?.(msg);
+        return [msg];
       }
     } else if (this.tlsHosts.length && !this.tlsUnsupportedLogged) {
       this.tlsUnsupportedLogged = true;
       this.opts.log?.('this proxy build cannot pass TLS through: flutterIntercept.tlsPassthrough is ignored');
     }
+    return [];
+  }
+
+  /** REVIEW-8 #4 / #12: one Status warning per setting with problems (undefined text = clear it). */
+  private setConfigWarning(key: 'upstream' | 'tlsPassthrough', text: string | undefined): void {
+    const before = JSON.stringify(this.warnings);
+    if (text) this.configWarnings.set(key, { id: `settings:${key}`, kind: 'other', text: text.replace(/[\r\n]+/g, ' ').slice(0, MAX_WARNING_TEXT) });
+    else this.configWarnings.delete(key);
+    const after = this.warnings;
+    if (JSON.stringify(after) !== before) this.emit('warnings', after);
   }
 
   /**
@@ -1019,7 +1098,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   get warnings(): SessionWarning[] {
     const seen = new Set<string>();
     const out: SessionWarning[] = [];
-    for (const list of [...this.sessionWarnings.values(), this.bodyWarnings]) {
+    for (const list of [...this.sessionWarnings.values(), this.bodyWarnings, [...this.configWarnings.values()]]) {
       for (const w of list) {
         if (seen.has(w.id)) continue;
         seen.add(w.id);

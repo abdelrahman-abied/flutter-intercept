@@ -282,6 +282,17 @@ describe('physical iPhone: LAN listener (CONTRACTS §7, §14.1)', () => {
     });
   }
 
+  it.skipIf(!lanIp)('no ::add-mask:: outside GitHub Actions, and the token is never printed', async () => {
+    const token = crypto.randomBytes(32).toString('base64url');
+    const f = fake((_a, c) => c.exit(0), IPHONE);
+    f.deps.lanAddress = async () => ({ address: lanIp!, iface: 'en0' });
+    f.deps.newToken = () => token;
+    expect((await runCli(base({ device: 'IPHONE' }), f.deps)).exitCode).toBe(0);
+    const printed = [...f.logs, ...f.out];
+    expect(printed.some((l) => l.startsWith('::add-mask::'))).toBe(false);
+    expect(printed.join('\n')).not.toContain(token);
+  });
+
   it('refuses without a LAN address, before anything starts', async () => {
     const f = fake((_a, c) => c.exit(0), IPHONE);
     f.deps.lanAddress = async () => undefined;
@@ -324,16 +335,20 @@ describe('physical iPhone: LAN listener (CONTRACTS §7, §14.1)', () => {
     }, IPHONE);
     f.deps.lanAddress = async () => ({ address: lanIp!, iface: 'en0' });
     f.deps.newToken = () => token;
+    f.deps.env = { GITHUB_ACTIONS: 'true' };
     const r = await runCli(base({ device: 'IPHONE', har: 'out/run.har', noRedact: true, record: 'out/rec.json', flutterArgs: ['-v'] }), f.deps);
 
     expect(seen).toEqual({ define: `flutter-intercept:${token}@${lanIp}:${lanPort}`, noAuth: 407, wrong: 407, ok: 201 });
     expect(r.exitCode).toBe(0);
-    const printed = [...f.logs, ...f.out].join('\n');
+    const b64 = Buffer.from(`flutter-intercept:${token}`).toString('base64');
+    // REVIEW-8 #12: in GitHub Actions the runner is told to mask the token and the Basic credential; those two
+    // commands (consumed by the runner, never shown) are the only lines that carry them
+    expect([...f.logs, ...f.out].filter((l) => l.includes(token) || l.includes(b64))).toEqual([`::add-mask::${token}`, `::add-mask::${b64}`]);
+    const printed = [...f.logs, ...f.out].filter((l) => !l.startsWith('::add-mask::')).join('\n');
     expect(printed).not.toContain(token);
     expect(printed).toContain(`--dart-define=FLUTTER_INTERCEPT_PROXY=flutter-intercept:***@${lanIp}:${lanPort}`);
     expect(f.logs.filter((l) => l.includes('Local Network'))).toHaveLength(1);
     expect(printed).toMatch(/flutter -v prints dart-define values/);
-    const b64 = Buffer.from(`flutter-intercept:${token}`).toString('base64');
     for (const out of ['out/run.har', 'out/rec.json']) {
       const text = fs.readFileSync(path.join(dir, out), 'utf8');
       expect(text).toContain('mocked.test/ok');

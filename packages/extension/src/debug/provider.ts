@@ -1,4 +1,3 @@
-import * as net from 'net';
 import * as vscode from 'vscode';
 import { ReverseTracker, withSoftTimeout } from '../adb';
 import { writeEntry } from '../entry/generator';
@@ -46,8 +45,6 @@ export interface PrepareDeps {
    * resolves undefined (or fails) falls back to `--proxy-server` (no fallback when the proxy stops).
    */
   webPac?: WebPacSource;
-  /** Free loopback TCP port for the web browser's remote debugging (web screenshots). Default: the OS picks one. */
-  freePort?: () => Promise<number>;
 }
 
 const defaultPac = new WeakMap<PrepareDeps, { pac: PacServer; port?: number }>();
@@ -67,34 +64,16 @@ function pacFor(deps: PrepareDeps, proxyPort: number): WebPacSource {
   return entry.pac;
 }
 
-/** A port the OS reports free on 127.0.0.1 (what flutter_tools does itself when it picks the browser's debug port). */
-export function freeLoopbackPort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.unref();
-    srv.once('error', reject);
-    srv.listen(0, '127.0.0.1', () => {
-      const port = (srv.address() as net.AddressInfo).port;
-      srv.close(() => resolve(port));
-    });
-  });
-}
-
-/** PAC URL + browser debug port for a web launch; each falls back to undefined (logged) when it can't be had. */
-async function webExtras(deps: PrepareDeps, proxyPort: number): Promise<{ webPacUrl?: string; webDebugPort?: number }> {
-  const out: { webPacUrl?: string; webDebugPort?: number } = {};
+/** PAC URL for a web launch; undefined (logged) when it can't be had → `--proxy-server`. */
+async function webExtras(deps: PrepareDeps, proxyPort: number): Promise<{ webPacUrl?: string }> {
   try {
-    out.webPacUrl = await withSoftTimeout(pacFor(deps, proxyPort).urlFor(proxyPort), 2000);
-    if (!out.webPacUrl) deps.log('Flutter Web: no PAC URL, using --proxy-server (no DIRECT fallback)');
+    const webPacUrl = await withSoftTimeout(pacFor(deps, proxyPort).urlFor(proxyPort), 2000);
+    if (!webPacUrl) deps.log('Flutter Web: no PAC URL, using --proxy-server (no DIRECT fallback)');
+    return { webPacUrl };
   } catch (e) {
     deps.log(`Flutter Web: PAC server unavailable (${(e as Error)?.message ?? e}), using --proxy-server (no DIRECT fallback)`);
+    return {};
   }
-  try {
-    out.webDebugPort = await withSoftTimeout((deps.freePort ?? freeLoopbackPort)(), 2000);
-  } catch (e) {
-    deps.log(`Flutter Web: no free debug port (${(e as Error)?.message ?? e}); web screenshots won't find the browser`);
-  }
-  return out;
 }
 
 export function readSettings(folder?: vscode.WorkspaceFolder): { enabled: boolean; port: number; webEnabled: boolean } {
@@ -132,7 +111,7 @@ function rewriteFor(
   selected: string | undefined,
   caCertPem: string,
   lan: { physicalIos?: boolean; lan?: LanOpening } = {},
-  web: { webPacUrl?: string; webDebugPort?: number } = {},
+  web: { webPacUrl?: string } = {},
 ): RewriteResult {
   const active = vscode.window.activeTextEditor?.document.uri;
   return rewriteDebugConfig(config, {
@@ -144,7 +123,6 @@ function rewriteFor(
     physicalIos: lan.physicalIos,
     lan: lan.lan,
     webPacUrl: web.webPacUrl,
-    webDebugPort: web.webDebugPort,
     settingsToolArgs: dartSettingsToolArgs(folder),
     captureSource: vscode.workspace.getConfiguration('flutterIntercept', folder?.uri).get<boolean>('captureSource', true),
     folder: folder?.uri.fsPath,
@@ -180,7 +158,7 @@ export async function prepareLaunch(
         const sdkHint = typeof config.flutterSdkPath === 'string' ? config.flutterSdkPath : vscode.workspace.getConfiguration('dart', folder?.uri).get<string>('flutterSdkPath');
         lanInfo = await prepareLan(deps.lan, typeof config.deviceId === 'string' ? config.deviceId : selected, deps.log, sdkHint || undefined);
       }
-      // Flutter Web (CONTRACTS §14.7): a PAC URL with DIRECT fallback and a known browser debug port.
+      // Flutter Web (CONTRACTS §14.7): a PAC URL with DIRECT fallback.
       const webLaunch = (result.kind === 'skip' && result.needsCa) || isWebDevice(selected);
       const web = webLaunch ? await webExtras(deps, port) : {};
       result = rewriteFor(folder, config, settings, port, selected, caCertPem, lanInfo, web);

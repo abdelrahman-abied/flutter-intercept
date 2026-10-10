@@ -33,6 +33,10 @@
     "./cors": {
       "types": "./dist/cors.d.ts",
       "default": "./dist/cors.js"
+    },
+    "./hosts": {
+      "types": "./dist/hosts.d.ts",
+      "default": "./dist/hosts.js"
     }
   },
   "typesVersions": {
@@ -54,6 +58,9 @@
       ],
       "cors": [
         "dist/cors.d.ts"
+      ],
+      "hosts": [
+        "dist/hosts.d.ts"
       ]
     }
   },

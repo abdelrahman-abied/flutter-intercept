@@ -9,7 +9,6 @@ import { PacServer, pacScript } from '../../src/debug/pacServer';
 function findProxy(script: string, url: string, host: string): string {
   const sandbox: Record<string, unknown> = {
     dnsDomainIs: (h: string, d: string) => h.endsWith(d),
-    shExpMatch: (s: string, p: string) => new RegExp(`^${p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`).test(s),
   };
   vm.runInNewContext(script, sandbox);
   return (sandbox.FindProxyForURL as (u: string, h: string) => string)(url, host);
@@ -32,7 +31,8 @@ describe('pacScript', () => {
     const s = pacScript(9123);
     // The script travels over HTTP (commas are fine there); only the flag value must be comma-free (rewrite tests).
     for (const host of ['localhost', 'app.localhost', '127.0.0.1', '127.1.2.3', '::1', '[::1]']) expect(findProxy(s, `http://${host}:5000/`, host)).toBe('DIRECT');
-    for (const host of ['jsonplaceholder.typicode.com', 'www.gstatic.com', '10.0.0.2', 'localhost.example.com']) {
+    // REVIEW-8 #3: DNS names that merely start with 127. are proxied (only IP literals go DIRECT).
+    for (const host of ['jsonplaceholder.typicode.com', 'www.gstatic.com', '10.0.0.2', 'localhost.example.com', '127.evil.example', '127.0.0.1.evil.example', '127.0.0.1x', 'x127.0.0.1']) {
       expect(findProxy(s, `https://${host}/`, host)).toBe('PROXY 127.0.0.1:9123; DIRECT');
     }
   });

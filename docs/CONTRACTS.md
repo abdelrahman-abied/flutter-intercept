@@ -1476,3 +1476,10 @@ counts per route and message-type changes. Agents: `save_recording` includes the
   trust the CA (**Save CA Certificate…**). iOS simulators can't be routed without changing the Mac's proxy; profile-mode
   isolates and `spawnUri` stay warn-only. Bypass detection watches main-isolate HTTP logging for 60 s after each main
   isolate start (all session when package:http_profile is loaded). Screenshots: VM route → `devicectl` → `idevicescreenshot`.
+- **REVIEW-8** (docs/REVIEW-8.md): host patterns from `@flutter-intercept/proxy/hosts` (label-bounded `*`); client
+  certificates refused for requests with a non-loopback `Origin`; TLS 1.3 early data cut; throttled WebSocket queues
+  ≤ 8 MB with backpressure; PAC loopback = literals and `localhost` only; no pinned DevTools port (process-verified
+  browser, app page only, `webLaunchUrl` from `flutter.forwardedEvent`); `setTlsPassthrough` returns `{hosts, problems}`;
+  client-certificate paths absolute / `~/` only; `nativeClients: "proxy"` user settings only; emulator routing records
+  with owner + heartbeat; action input `upload-recording` (default false, redacted copy).
+

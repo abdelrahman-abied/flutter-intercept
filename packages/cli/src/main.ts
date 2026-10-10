@@ -4,6 +4,9 @@
 import { HELP, parseArgs, UsageError } from './args';
 import { defaultDeps, runCli, SetupError } from './run';
 
+/** For the GitHub Action entry (dist/action.js loads this bundle): REVIEW-8 #2. */
+export { writeRedactedRecordingCopy } from './outputs';
+
 declare const __FI_CLI_VERSION__: string | undefined;
 export const VERSION = typeof __FI_CLI_VERSION__ === 'string' ? __FI_CLI_VERSION__ : 'dev';
 

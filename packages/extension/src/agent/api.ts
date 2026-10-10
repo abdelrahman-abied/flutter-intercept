@@ -62,6 +62,16 @@ function insideRedacted(path: string): boolean {
   return segs.slice(0, -1).some((s) => 'key' in s && isSensitiveField(s.key));
 }
 
+/** The throttle fields that are set (CONTRACTS §9.2; §14.4 `uploadKbps`). */
+function throttleFields(t: { latencyMs?: number; kbps?: number; uploadKbps?: number; dropRate?: number }): { latencyMs?: number; kbps?: number; uploadKbps?: number; dropRate?: number } {
+  return {
+    ...(t.latencyMs !== undefined ? { latencyMs: t.latencyMs } : {}),
+    ...(t.kbps !== undefined ? { kbps: t.kbps } : {}),
+    ...(t.uploadKbps !== undefined ? { uploadKbps: t.uploadKbps } : {}),
+    ...(t.dropRate !== undefined ? { dropRate: t.dropRate } : {}),
+  };
+}
+
 /** CONTRACTS §14.5: a recording's WebSocket / SSE stream and frame counts, when it has any. */
 function streamCounts(m: { streams?: number; frames?: number }): { streams?: number; frames?: number } {
   return {
@@ -946,12 +956,12 @@ export class AgentApi implements AgentTools {
   }
 
   private simulateNetwork(i: ToolInput<'simulate_network'>): ToolResult {
-    const custom = i.latencyMs !== undefined || i.kbps !== undefined || i.dropRate !== undefined;
+    const custom = i.latencyMs !== undefined || i.kbps !== undefined || i.uploadKbps !== undefined || i.dropRate !== undefined;
     const bad = (m: string) => new AgentToolError(m, 'invalid');
     if (i.fault && i.profile) throw bad('pass either profile or fault, not both');
     if (!i.fault && !i.profile) throw bad('profile is required (or fault together with a url)');
-    if (custom && i.profile !== 'custom') throw bad('latencyMs, kbps and dropRate are only used with profile "custom"');
-    if (i.profile === 'custom' && !custom) throw bad('profile "custom" needs latencyMs, kbps and/or dropRate');
+    if (custom && i.profile !== 'custom') throw bad('latencyMs, kbps, uploadKbps and dropRate are only used with profile "custom"');
+    if (i.profile === 'custom' && !custom) throw bad('profile "custom" needs latencyMs, kbps, uploadKbps and/or dropRate');
 
     if (i.url === undefined) {
       if (i.fault) throw bad('fault needs a url; to make every request fail use profile "offline"');
@@ -962,7 +972,7 @@ export class AgentApi implements AgentTools {
         i.profile === 'none' || i.profile === 'offline'
           ? { kind: i.profile }
           : i.profile === 'custom'
-            ? { kind: 'throttle', ...(i.latencyMs !== undefined ? { latencyMs: i.latencyMs } : {}), ...(i.kbps !== undefined ? { kbps: i.kbps } : {}), ...(i.dropRate !== undefined ? { dropRate: i.dropRate } : {}) }
+            ? { kind: 'throttle', ...throttleFields(i) }
             : presetProfile(i.profile as NetworkPresetId);
       if (!this.deps.host.setNetworkProfile) throw new AgentToolError('this version of the proxy cannot simulate network conditions', 'state');
       try {
@@ -981,11 +991,11 @@ export class AgentApi implements AgentTools {
       action = { kind: 'fault', fault };
       what = i.fault ? `fault ${fault}` : 'offline';
     } else if (i.profile === 'custom') {
-      action = { kind: 'throttle', ...(i.latencyMs !== undefined ? { latencyMs: i.latencyMs } : {}), ...(i.kbps !== undefined ? { kbps: i.kbps } : {}), ...(i.dropRate !== undefined ? { dropRate: i.dropRate } : {}) };
+      action = { kind: 'throttle', ...throttleFields(i) };
       what = describeProfile({ ...action, kind: 'throttle' });
     } else {
       const preset = NETWORK_PRESETS.find((x) => x.id === i.profile)!;
-      action = { kind: 'throttle', latencyMs: preset.latencyMs, ...(preset.kbps !== undefined ? { kbps: preset.kbps } : {}), ...(preset.dropRate !== undefined ? { dropRate: preset.dropRate } : {}) };
+      action = { kind: 'throttle', ...throttleFields(preset) };
       what = preset.label;
     }
     return this.insertRule({
@@ -1646,7 +1656,7 @@ export class AgentApi implements AgentTools {
           return { action: { kind: 'fault' as const, fault: st.fault }, ...count };
         case 'throttle':
           return {
-            action: { kind: 'throttle' as const, ...(st.latencyMs !== undefined ? { latencyMs: st.latencyMs } : {}), ...(st.kbps !== undefined ? { kbps: st.kbps } : {}), ...(st.dropRate !== undefined ? { dropRate: st.dropRate } : {}) },
+            action: { kind: 'throttle' as const, ...throttleFields(st) },
             ...count,
           };
         default:

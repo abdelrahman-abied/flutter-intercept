@@ -4,10 +4,11 @@
  * injected getter (VS Code secret storage), the workspace folders are passed in.
  *
  * - Entries: `{host, pfx}` (PKCS#12) or `{host, cert, key}` (PEM); `host` is a hostname glob with an optional `:port`.
- * - Paths: absolute, `~/…`, or relative to a workspace folder (the first folder where the file exists). A relative
- *   path must stay inside its folder after resolving symlinks (a repo can't point it elsewhere); every path must end
- *   at a regular file of at most MAX_CLIENT_CERT_FILE_BYTES. Opened non-blocking (a FIFO can't hang the host) and
- *   re-checked on the open descriptor (no swap between check and read).
+ * - Paths: absolute or `~/…` only (REVIEW-8 #9: a relative path would resolve inside whatever repository is open, so a
+ *   cloned repo could supply the certificate). Every path must end at a regular file of at most
+ *   MAX_CLIENT_CERT_FILE_BYTES. Opened non-blocking (a FIFO can't hang the host) and re-checked on the open descriptor
+ *   (no swap between check and read).
+ * - Host patterns are checked with the proxy's own `parseHostPattern` (REVIEW-8 #4), so host and proxy agree.
  * - Each certificate is tried with `tls.createSecureContext` (wrong / missing passphrase, mismatched key, garbage)
  *   so problems show before the first request.
  * - Problems are one sentence naming the host pattern and the field (`pfx` / `cert` / `key`), never a path, file
@@ -17,7 +18,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as tls from 'tls';
-import type { ClientCertificate } from '@flutter-intercept/proxy';
+import { parseHostPattern, type ClientCertificate } from '@flutter-intercept/proxy';
 
 export const MAX_CLIENT_CERT_FILE_BYTES = 1024 * 1024;
 export const MAX_CLIENT_CERTS = 50;
@@ -42,8 +43,8 @@ export interface ClientCertStatus {
 }
 
 export interface ClientCertLoadDeps {
-  /** Absolute paths of the workspace folders, in order (relative paths resolve against them). */
-  workspaceFolders: () => readonly string[];
+  /** Unused since REVIEW-8 #9 (relative paths are refused); accepted so existing callers keep compiling. */
+  workspaceFolders?: () => readonly string[];
   /** The stored passphrase for an entry (by host pattern), or undefined. Never logged. */
   getPassphrase: (host: string) => Promise<string | undefined> | string | undefined;
   /** Default: `tls.createSecureContext(cert)`; throws when the certificate can't be used. */
@@ -63,16 +64,21 @@ export interface ClientCertLoadResult {
   status: ClientCertStatus[];
 }
 
-const HOST = /^(\*\.)?[a-z0-9_*]([a-z0-9_*.-]{0,251}[a-z0-9_*])?(:\d{1,5})?$/;
+/** Why a host pattern is refused (the proxy's `parseHostPattern` message), or undefined when it is fine. */
+export function certHostProblem(v: unknown): string | undefined {
+  if (typeof v !== 'string' || !v.trim()) return 'host must be a host name pattern such as api.example.com or *.corp.example:8443';
+  if (v.trim().length > 260) return 'host is too long';
+  try {
+    parseHostPattern(v.trim().toLowerCase());
+    return undefined;
+  } catch (e) {
+    return (e instanceof Error ? e.message : String(e)).replace(/[\r\n]+/g, ' ').slice(0, 300);
+  }
+}
 
-/** A hostname glob with optional `:port`, lower-cased; undefined when invalid. */
+/** A host pattern with optional `:port`, lower-cased, as the proxy accepts it (REVIEW-8 #4); undefined when refused. */
 export function normalizeCertHost(v: unknown): string | undefined {
-  if (typeof v !== 'string') return undefined;
-  const h = v.trim().toLowerCase();
-  if (!h || h.length > 260 || !HOST.test(h) || h.includes('..')) return undefined;
-  const port = /:(\d+)$/.exec(h)?.[1];
-  if (port !== undefined && (Number(port) < 1 || Number(port) > 65535)) return undefined;
-  return h;
+  return certHostProblem(v) === undefined ? (v as string).trim().toLowerCase() : undefined;
 }
 
 class CertProblem extends Error {}
@@ -100,56 +106,28 @@ function reasonOf(e: unknown, hasPassphrase: boolean): string {
   return typeof code === 'string' && /^[A-Z0-9_]{1,80}$/.test(code) ? `it can't be used (${code})` : "it can't be used";
 }
 
-function expandPath(p: string, deps: ClientCertLoadDeps): { abs?: string; folder?: string; candidates?: { abs: string; folder: string }[] } {
-  if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) return { abs: path.join((deps.homeDir ?? os.homedir)(), p.slice(1)) };
-  if (path.isAbsolute(p)) return { abs: path.normalize(p) };
-  const folders = deps.workspaceFolders().filter((f) => typeof f === 'string' && path.isAbsolute(f));
-  return { candidates: folders.map((f) => ({ abs: path.resolve(f, p), folder: f })) };
-}
-
-function inside(child: string, parent: string): boolean {
-  const rel = path.relative(parent, child);
-  return rel === '' ? false : !rel.startsWith('..') && !path.isAbsolute(rel);
+/** Absolute or `~/` paths only (REVIEW-8 #9); undefined for anything relative. */
+function expandPath(p: string, deps: ClientCertLoadDeps): string | undefined {
+  if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) return path.join((deps.homeDir ?? os.homedir)(), p.slice(1));
+  if (path.isAbsolute(p)) return path.normalize(p);
+  return undefined;
 }
 
 /**
- * Reads one certificate file safely: realpath, inside its workspace folder for relative paths, a regular file ≤ 1 MB,
- * opened non-blocking and re-checked on the descriptor. Throws CertProblem with a path-free reason.
+ * Reads one certificate file safely: absolute / `~/` only, realpath, a regular file ≤ 1 MB, opened non-blocking and
+ * re-checked on the descriptor. Throws CertProblem with a path-free reason.
  */
 async function readCertFile(field: 'pfx' | 'cert' | 'key', raw: unknown, deps: ClientCertLoadDeps): Promise<Buffer> {
   if (typeof raw !== 'string' || !raw.trim()) throw new CertProblem(`its ${field} path is empty`);
   const p = raw.trim();
   if (p.length > 4096 || p.includes('\0')) throw new CertProblem(`its ${field} path is not a valid path`);
-  const where = expandPath(p, deps);
-  let target: { abs: string; folder?: string } | undefined;
-  if (where.abs) target = { abs: where.abs };
-  else {
-    if (!where.candidates?.length) throw new CertProblem(`its ${field} path is relative but no workspace folder is open (use an absolute path)`);
-    for (const c of where.candidates) {
-      try {
-        await fs.promises.lstat(c.abs);
-        target = c;
-        break;
-      } catch {
-        // try the next folder
-      }
-    }
-    if (!target) throw new CertProblem(`its ${field} file was not found`);
-  }
+  const abs = expandPath(p, deps);
+  if (!abs) throw new CertProblem(`its ${field} path is relative; use an absolute path (or ~/…): a relative path could pick up a file from a cloned repository`);
   let real: string;
   try {
-    real = await fs.promises.realpath(target.abs);
+    real = await fs.promises.realpath(abs);
   } catch {
     throw new CertProblem(`its ${field} file was not found`);
-  }
-  if (target.folder) {
-    let folderReal = target.folder;
-    try {
-      folderReal = await fs.promises.realpath(target.folder);
-    } catch {
-      // keep as given
-    }
-    if (!inside(real, folderReal)) throw new CertProblem(`its ${field} path leaves its workspace folder (directly or through a symbolic link); use an absolute path to a file you control`);
   }
   const st = await fs.promises.stat(real).catch(() => undefined);
   if (!st) throw new CertProblem(`its ${field} file was not found`);
@@ -219,11 +197,12 @@ export async function loadClientCertificates(setting: unknown, deps: ClientCertL
       continue;
     }
     const e = entry as Record<string, unknown>;
-    const host = normalizeCertHost(e.host);
-    if (!host) {
-      add(`(entry ${i + 1})`, 'host must be a host name glob such as api.example.com or *.corp.example:8443');
+    const hostProblem = certHostProblem(e.host);
+    if (hostProblem !== undefined) {
+      add(`(entry ${i + 1})`, `its host can't be used: ${hostProblem}`);
       continue;
     }
+    const host = (e.host as string).trim().toLowerCase();
     const hasPfx = e.pfx !== undefined && e.pfx !== '';
     const hasPem = (e.cert !== undefined && e.cert !== '') || (e.key !== undefined && e.key !== '');
     if (hasPfx === hasPem) {

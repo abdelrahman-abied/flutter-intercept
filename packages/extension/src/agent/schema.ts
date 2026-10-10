@@ -159,6 +159,7 @@ const sequenceStep = z.discriminatedUnion('kind', [
     kind: z.literal('throttle'),
     latencyMs: z.number().int().min(0).max(600_000).optional(),
     kbps: z.number().min(1).max(10_000_000).optional(),
+    uploadKbps: z.number().min(1).max(10_000_000).optional(),
     dropRate: z.number().min(0).max(1).optional(),
     count: stepCount,
   }),
@@ -307,10 +308,11 @@ export const toolSchemas = {
       .enum(NETWORK_PROFILES)
       .optional()
       .describe(
-        '"slow-3g" (+400 ms, 400 kbps), "fast-3g" (+150 ms, 1600 kbps), "flaky" (+200 ms, 20% of requests fail), "offline" (every request fails), "custom" (use latencyMs/kbps/dropRate), "none" (restore). Required unless `fault` is given.',
+        '"slow-3g" (+400 ms, 400 kbps down / 400 up), "fast-3g" (+150 ms, 1600 kbps down / 750 up), "flaky" (+200 ms, 20% of requests fail), "offline" (every request fails), "custom" (use latencyMs/kbps/uploadKbps/dropRate), "none" (restore). Required unless `fault` is given.',
       ),
     latencyMs: z.number().int().min(0).max(600_000).optional().describe('custom: added latency per request, ms.'),
     kbps: z.number().min(1).max(10_000_000).optional().describe('custom: response bandwidth, kilobits per second.'),
+    uploadKbps: z.number().min(1).max(10_000_000).optional().describe('custom: request (upload) bandwidth, kilobits per second; also paces WebSocket messages the app sends.'),
     dropRate: z.number().min(0).max(1).optional().describe('custom: share of requests that fail (0-1).'),
     url: url.optional().describe('Only affect requests matching this URL glob (adds a rule, inserted first). Omit to set the profile for ALL app traffic.'),
     method: method.optional(),
@@ -611,7 +613,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   simulate_network: {
     title: 'Simulate network conditions (all app traffic or matching requests)',
-    model: 'Simulate bad network conditions to test loading states, timeouts, retries and offline handling. Without url: set the profile for ALL app traffic: "slow-3g", "fast-3g", "flaky" (20% of requests fail), "offline" (every request fails), "custom" (latencyMs, kbps, dropRate), or "none" to restore normal speed (do this when done). With url (a glob; * matches any characters): add a rule, inserted first, that slows only matching requests with the given profile, or makes them fail with fault ("reset", "timeout", "truncate", "dns"); times / ttlMs remove the rule automatically, otherwise use remove_rule. Mocks and blocks still answer instantly. get_status shows the active profile; affected exchanges carry a "simulated" label.',
+    model: 'Simulate bad network conditions to test loading states, timeouts, retries and offline handling. Without url: set the profile for ALL app traffic: "slow-3g", "fast-3g", "flaky" (20% of requests fail), "offline" (every request fails), "custom" (latencyMs, kbps, uploadKbps, dropRate), or "none" to restore normal speed (do this when done). With url (a glob; * matches any characters): add a rule, inserted first, that slows only matching requests with the given profile, or makes them fail with fault ("reset", "timeout", "truncate", "dns"); times / ttlMs remove the rule automatically, otherwise use remove_rule. Mocks and blocks still answer instantly. get_status shows the active profile; affected exchanges carry a "simulated" label.',
     user: 'Throttle or break the network for the app or for matching requests.',
   },
   resend_request: {
@@ -689,7 +691,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   add_sequence: {
     title: 'Add a scenario (sequence) rule',
-    model: 'Make successive matching requests get different answers, to test retries, polling and recovery: steps [{kind:"mock", status:500, count:2}, {kind:"passthrough"}] fails the first two requests and lets the third reach the server. Step kinds: mock (status, body, headers, delayMs), block (status or reset), fault (reset, timeout, truncate, dns), throttle (latencyMs, kbps, dropRate), passthrough (the real server); count = how many requests each step answers (default 1). then: "last" (default) keeps the last step, "passthrough", or "loop". Mock steps have add_mock\'s limits (no HTML/JavaScript, no redirects off the request\'s origin). The rule is inserted first; remove it with remove_rule when done. The panel and rule-hit show which step answered.',
+    model: 'Make successive matching requests get different answers, to test retries, polling and recovery: steps [{kind:"mock", status:500, count:2}, {kind:"passthrough"}] fails the first two requests and lets the third reach the server. Step kinds: mock (status, body, headers, delayMs), block (status or reset), fault (reset, timeout, truncate, dns), throttle (latencyMs, kbps, uploadKbps, dropRate), passthrough (the real server); count = how many requests each step answers (default 1). then: "last" (default) keeps the last step, "passthrough", or "loop". Mock steps have add_mock\'s limits (no HTML/JavaScript, no redirects off the request\'s origin). The rule is inserted first; remove it with remove_rule when done. The panel and rule-hit show which step answered.',
     user: 'Add a rule whose answer changes from request to request.',
   },
   expire_token: {

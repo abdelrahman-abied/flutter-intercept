@@ -122,9 +122,6 @@ export function isUserProfileFlag(flag: string): boolean {
   return /^--user-data-dir(=|$)/.test(flag);
 }
 
-/** flutter run's own option for the browser's remote-debugging port (flutter_tools picks a free one without it). */
-export const WEB_DEBUG_PORT_FLAG = '--web-browser-debug-port';
-
 /** A PAC URL we accept for the browser: our loopback PAC server, nothing flutter_tools would split (no comma). */
 export function isOurPacUrl(url: unknown): url is string {
   return typeof url === 'string' && /^http:\/\/127\.0\.0\.1:\d{1,5}\/[A-Za-z0-9._~-]{1,100}\.pac$/.test(url);
@@ -136,8 +133,6 @@ export interface WebFlagOptions {
    * its network when the proxy stops mid-session. Absent = `--proxy-server` (no fallback).
    */
   pacUrl?: string;
-  /** Remote-debugging port to give the browser (`--web-browser-debug-port`), so web screenshots can find it. */
-  debugPort?: number;
 }
 
 /**
@@ -150,36 +145,10 @@ export function webInterceptFlags(proxyPort: number, caPin: string, opts: WebFla
   if (!Number.isInteger(proxyPort) || proxyPort <= 0 || proxyPort > 65535) throw new Error(`bad proxy port ${proxyPort}`);
   if (!/^[A-Za-z0-9+/]{43}=$/.test(caPin)) throw new Error('bad SPKI pin');
   if (opts.pacUrl !== undefined && !isOurPacUrl(opts.pacUrl)) throw new Error('bad PAC URL');
-  const d = opts.debugPort;
-  if (d !== undefined && (!Number.isInteger(d) || d <= 0 || d > 65535)) throw new Error(`bad debug port ${d}`);
   return [
     opts.pacUrl ? `${WEB_BROWSER_FLAG}=--proxy-pac-url=${opts.pacUrl}` : `${WEB_BROWSER_FLAG}=--proxy-server=http://${WEB_PROXY_HOST}:${proxyPort}`,
     `${WEB_BROWSER_FLAG}=--ignore-certificate-errors-spki-list=${caPin}`,
-    ...(d !== undefined ? [`${WEB_DEBUG_PORT_FLAG}=${d}`] : []),
   ];
-}
-
-/** The `--web-browser-debug-port` value in `args` (`=N` or `N` as the next arg), if valid. The last one wins. */
-export function webDebugPortArg(args: unknown): number | undefined {
-  const list = Array.isArray(args) ? (args as unknown[]).map(String) : [];
-  let found: number | undefined;
-  for (let i = 0; i < list.length; i++) {
-    let v: string | undefined;
-    if (list[i] === WEB_DEBUG_PORT_FLAG) v = list[i + 1];
-    else if (list[i].startsWith(`${WEB_DEBUG_PORT_FLAG}=`)) v = list[i].slice(WEB_DEBUG_PORT_FLAG.length + 1);
-    if (v !== undefined && /^\d{1,5}$/.test(v) && Number(v) > 0 && Number(v) <= 65535) found = Number(v);
-  }
-  return found;
-}
-
-/**
- * The debug Chrome's remote-debugging port of a (resolved) web session configuration — what web screenshots connect to
- * on 127.0.0.1 (src/web/screenshot.ts). Ours or the user's own `--web-browser-debug-port`; undefined for other sessions.
- */
-export function webBrowserDebugPortOf(config: unknown): number | undefined {
-  const c = config as DebugConfig | undefined;
-  if (!c || typeof c !== 'object' || (!isFlutterLaunchedBrowser(c.deviceId) && c[WEB_KEY] !== true)) return undefined;
-  return webDebugPortArg(c.toolArgs);
 }
 
 /** toolArgs without the exact entries in `ours` (what a previous web resolve recorded in WEB_FLAGS_KEY). */
@@ -239,8 +208,6 @@ export interface RewriteContext {
   webEnabled?: boolean;
   /** Loopback PAC URL for web sessions (DIRECT fallback, CONTRACTS §14.7); absent = `--proxy-server`. */
   webPacUrl?: string;
-  /** Free loopback port for the browser's remote debugging (web screenshots); ignored when the launch sets its own. */
-  webDebugPort?: number;
   /** fsPath of the active editor's file (only used in "before" mode when program is missing). */
   activeFile?: string;
   fs?: FsLike;
@@ -541,11 +508,7 @@ function webSession(config: DebugConfig, ctx: RewriteContext, original: string, 
   } catch (e) {
     return { kind: 'skip', reason: `web session: unreadable CA certificate (${(e as Error).message})` };
   }
-  const userDebugPort = webDebugPortArg(base) ?? webDebugPortArg(ctx.settingsToolArgs);
-  const flags = webInterceptFlags(ctx.proxyPort, pin, {
-    pacUrl: isOurPacUrl(ctx.webPacUrl) ? ctx.webPacUrl : undefined,
-    debugPort: userDebugPort === undefined ? ctx.webDebugPort : undefined,
-  });
+  const flags = webInterceptFlags(ctx.proxyPort, pin, { pacUrl: isOurPacUrl(ctx.webPacUrl) ? ctx.webPacUrl : undefined });
   if (isGeneratedEntry(config.program)) config.program = original; // e.g. rerun of a mobile session on Chrome
   config.toolArgs = [...base, ...flags];
   config[ORIGINAL_PROGRAM_KEY] = original;
