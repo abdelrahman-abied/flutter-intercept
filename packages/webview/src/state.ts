@@ -3,7 +3,8 @@
  * Side effects (posting ViewMsg to the host) live in the components / app shell.
  */
 import type {
-  ContractSummary, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit, Rule, RuleAction, SendDraft, SnippetFormat, Status,
+  AuthFlowSummary, ContractSummary, Exchange, HostMsg, NetworkProfile, RecordingSummary, RequestEdit, ResponseEdit, Rule, RuleAction, SendDraft,
+  SnippetFormat, Status,
 } from './protocol';
 import type { FaultKind, MutateOp } from '@flutter-intercept/proxy/types';
 import { compileMatcher } from '@flutter-intercept/proxy/rules';
@@ -13,6 +14,10 @@ import { checkPath } from './jsonpath';
 import { corsActionError } from './coverage';
 import { hasFrames } from './frames';
 import {
+  bodyFileError, checkMapTarget, describeRewrite, emptyRewriteForm, MAX_STEPS, rewriteError, rewriteFromForm, rewriteToForm, sequencePreview,
+  sortRecordings, stepCountError, togglePick, type PreviewStep, type RewriteForm, type SequenceThen, type StepAction, type StepKind,
+} from './scenarios';
+import {
   describeMatcherUrl, formatRemaining, headerValue, isAbsoluteUrl, isJsonContentType, isPaused, newId, statusClassOf,
   validateJson, type Headers, type JsonCheck, type StatusClass,
 } from './util';
@@ -20,7 +25,9 @@ import {
 /** Host `error` messages kept for the banner (newest last). */
 export const MAX_HOST_ERRORS = 5;
 
-export type View = 'traffic' | 'rules';
+/** CONTRACTS §12.7 adds Recordings and Auth flows. */
+export type View = 'traffic' | 'rules' | 'recordings' | 'auth';
+export const VIEWS: readonly View[] = ['traffic', 'rules', 'recordings', 'auth'];
 /** `messages` = WebSocket messages / SSE events (CONTRACTS §11.5), only for exchanges with a `kind`. */
 export type DetailTab = 'request' | 'response' | 'messages';
 
@@ -79,6 +86,11 @@ export interface State {
   pendingSelectId?: string;
   /** SessionWarning ids the user dismissed (CONTRACTS §11); pruned to the warnings the host still reports. */
   dismissedWarnings: string[];
+  /** CONTRACTS §12.7: saved recordings (newest first) and the (at most two) picked for a diff. */
+  recordings: RecordingSummary[];
+  recordingPicks: string[];
+  /** CONTRACTS §12.3: 401 → refresh → retry flows found by the host. */
+  authFlows: AuthFlowSummary[];
 }
 
 export const NEW_RULE = '__new__';
@@ -101,6 +113,9 @@ export function initialState(): State {
     splitPct: 55,
     contracts: {},
     dismissedWarnings: [],
+    recordings: [],
+    recordingPicks: [],
+    authFlows: [],
   };
 }
 
@@ -139,7 +154,9 @@ export type Action =
   | { type: 'patchComposer'; patch: Partial<RequestDraft> }
   | { type: 'closeComposer'; discard?: boolean }
   | { type: 'composerSending' }
-  | { type: 'dismissWarning'; id: string };
+  | { type: 'dismissWarning'; id: string }
+  | { type: 'pickRecording'; id: string }
+  | { type: 'clearRecordingPicks' };
 
 let noticeSeq = 0;
 let errorSeq = 0;
@@ -157,7 +174,7 @@ export function reducer(state: State, action: Action): State {
       return {
         ...state,
         filters: p.filters ? { ...EMPTY_FILTERS, ...p.filters } : state.filters,
-        view: p.view ?? state.view,
+        view: p.view && VIEWS.includes(p.view) ? p.view : state.view,
         detailTab: p.detailTab ?? state.detailTab,
         selectedId: p.selectedId ?? state.selectedId,
         splitPct: p.splitPct ?? state.splitPct,
@@ -290,6 +307,13 @@ export function reducer(state: State, action: Action): State {
     case 'dismissWarning':
       if (state.dismissedWarnings.includes(action.id)) return state;
       return { ...state, dismissedWarnings: [...state.dismissedWarnings, action.id] };
+
+    case 'pickRecording':
+      if (!state.recordings.some((r) => r.id === action.id)) return state;
+      return { ...state, recordingPicks: togglePick(state.recordingPicks, action.id) };
+
+    case 'clearRecordingPicks':
+      return state.recordingPicks.length ? { ...state, recordingPicks: [] } : state;
   }
 }
 
@@ -476,7 +500,16 @@ function applyHostMsg(state: State, msg: HostMsg): State {
       };
 
     case 'cleared':
-      return { ...state, exchanges: [], drafts: {}, resolving: {}, gaveUp: {}, contracts: {}, selectedId: undefined };
+      return { ...state, exchanges: [], drafts: {}, resolving: {}, gaveUp: {}, contracts: {}, authFlows: [], selectedId: undefined };
+
+    case 'recordings': {
+      const recordings = sortRecordings(msg.recordings);
+      const picks = state.recordingPicks.filter((id) => recordings.some((r) => r.id === id));
+      return { ...state, recordings, recordingPicks: picks.length === state.recordingPicks.length ? state.recordingPicks : picks };
+    }
+
+    case 'authFlows':
+      return { ...state, authFlows: msg.flows };
   }
 }
 
@@ -948,13 +981,16 @@ export const FAULT_LABEL: Record<FaultKind, string> = {
 
 export function describeAction(a: RuleAction): string {
   switch (a.kind) {
-    case 'mock': return `Mock ${a.status}${a.delayMs ? ` after ${a.delayMs} ms` : ''}`;
+    case 'mock': return `Mock ${a.status}${a.bodyFile ? ` from ${a.bodyFile}` : ''}${a.delayMs ? ` after ${a.delayMs} ms` : ''}`;
     case 'block': return a.mode === 'reset' ? 'Block (connection reset)' : `Block with ${a.status ?? 403}`;
     case 'breakpoint': return a.phase === 'both' ? 'Break on request + response' : `Break on ${a.phase}`;
     case 'throttle': return `Throttle (${describeProfile({ kind: 'throttle', latencyMs: a.latencyMs, kbps: a.kbps, dropRate: a.dropRate })})`;
     case 'fault': return `Fault: ${FAULT_LABEL[a.fault]}`;
     case 'mutate': return `Mutate: ${describeMutateOps(a.ops)}`;
     case 'cors': return describeCors(a);
+    case 'sequence': return `Sequence: ${sequencePreview(a.steps, a.then)}`;
+    case 'mapRemote': return `Map to ${a.to}${a.preserveHost ? ' (keep Host)' : ''}`;
+    case 'rewrite': return describeRewrite(a);
   }
 }
 
@@ -1035,7 +1071,36 @@ export function ruleDisplayName(r: Rule): string {
   return rest || matcherLabel(r.match);
 }
 
-export interface RuleForm {
+/**
+ * The editable fields of one action, shared by the rule itself and by each `sequence` step (CONTRACTS §12.3):
+ * the step editor reuses the rule's action editors.
+ */
+export interface ActionFields {
+  mockStatus: string;
+  mockHeaders: HeaderRow[];
+  mockBody: string;
+  mockDelayMs: string;
+  /** CONTRACTS §12.2: the body comes from a workspace file (`mock.bodyFile`). */
+  mockUseFile: boolean;
+  mockBodyFile: string;
+  blockMode: 'reset' | 'status';
+  blockStatus: string;
+  phase: 'request' | 'response' | 'both';
+  throttle: ThrottleFields;
+  fault: FaultKind;
+  mutateOps: MutateRow[];
+  corsOrigin: string;           // '' = echo the request's Origin
+  corsCredentials: boolean;
+  /** CONTRACTS §12.6 */
+  mapTo: string;
+  mapPreserveHost: boolean;
+  rewrite: RewriteForm;
+}
+
+/** One `sequence` step: an action (or the real server) answering `count` matching requests. */
+export interface StepForm extends ActionFields { kind: StepKind; count: string }
+
+export interface RuleForm extends ActionFields {
   id: string;
   isNew: boolean;
   enabled: boolean;
@@ -1043,25 +1108,16 @@ export interface RuleForm {
   method: string;               // '' = any
   url: string;
   kind: RuleAction['kind'];
-  mockStatus: string;
-  mockHeaders: HeaderRow[];
-  mockBody: string;
-  mockDelayMs: string;
-  blockMode: 'reset' | 'status';
-  blockStatus: string;
-  phase: 'request' | 'response' | 'both';
-  throttle: ThrottleFields;
-  fault: FaultKind;
-  mutateOps: MutateRow[];
   /** CONTRACTS §11: '' = any operation. */
   graphqlOperation: string;
-  corsOrigin: string;           // '' = echo the request's Origin
-  corsCredentials: boolean;
   times: string;                // '' = unlimited; 1–1000
   expiresIn: string;            // '' = never
   expiresUnit: ExpiryUnit;
   /** The rule's current expiresAt, kept as is until the user edits the "Expires in" field. */
   keepExpiresAt?: number;
+  /** CONTRACTS §12.3 (kind 'sequence'). */
+  steps: StepForm[];
+  seqThen: SequenceThen;
 }
 
 /** One `mutate` op as the editor holds it: `value` is JSON text (used for `set` only). */
@@ -1071,8 +1127,72 @@ export type ExpiryUnit = 's' | 'm' | 'h';
 export const EXPIRY_UNIT_MS: Record<ExpiryUnit, number> = { s: 1000, m: 60_000, h: 3_600_000 };
 export const MAX_EXPIRY_MS = 24 * 3_600_000;
 
+export function defaultActionFields(): ActionFields {
+  return {
+    mockStatus: '200',
+    mockHeaders: [{ name: 'content-type', value: 'application/json' }],
+    mockBody: '{\n  \n}',
+    mockDelayMs: '',
+    mockUseFile: false,
+    mockBodyFile: '',
+    blockMode: 'reset',
+    blockStatus: '403',
+    phase: 'both',
+    throttle: { latencyMs: '400', kbps: '', dropPct: '' },
+    fault: 'reset',
+    mutateOps: [{ path: '', op: 'null', value: '' }],
+    corsOrigin: '',
+    corsCredentials: false,
+    mapTo: '',
+    mapPreserveHost: false,
+    rewrite: emptyRewriteForm(),
+  };
+}
+
+export function newStep(kind: StepKind = 'mock', count = '1'): StepForm {
+  return { ...defaultActionFields(), kind, count };
+}
+
+/** A new sequence: the first request fails with 500, then the real server answers. */
+export function defaultSteps(): StepForm[] {
+  return [{ ...newStep('mock'), mockStatus: '500', mockBody: '{"error":"server_error"}' }, newStep('passthrough')];
+}
+
+/** Copies an action's settings into the fields (the other fields keep their defaults). */
+function fillActionFields<F extends ActionFields>(f: F, a: RuleAction | StepAction): F {
+  if (a.kind === 'mock') {
+    f.mockStatus = String(a.status);
+    f.mockHeaders = headersToRows(a.headers);
+    f.mockBody = a.body;
+    f.mockDelayMs = a.delayMs ? String(a.delayMs) : '';
+    if (a.bodyFile !== undefined) { f.mockUseFile = true; f.mockBodyFile = a.bodyFile; }
+  } else if (a.kind === 'block') {
+    f.blockMode = a.mode;
+    if (a.status !== undefined) f.blockStatus = String(a.status);
+  } else if (a.kind === 'breakpoint') {
+    f.phase = a.phase;
+  } else if (a.kind === 'throttle') {
+    f.throttle = throttleFieldsOf(a);
+  } else if (a.kind === 'fault') {
+    f.fault = a.fault;
+  } else if (a.kind === 'mutate') {
+    // valueJson (byte-exact text) wins over value, like on the proxy.
+    f.mutateOps = a.ops.map((o) => ({ path: o.path, op: o.op, value: o.op === 'set' ? o.valueJson ?? jsonText(o.value) : '' }));
+  } else if (a.kind === 'cors') {
+    f.corsOrigin = a.allowOrigin ?? '';
+    f.corsCredentials = !!a.allowCredentials;
+  } else if (a.kind === 'mapRemote') {
+    f.mapTo = a.to;
+    f.mapPreserveHost = !!a.preserveHost;
+  } else if (a.kind === 'rewrite') {
+    f.rewrite = rewriteToForm(a);
+  }
+  return f;
+}
+
 export function ruleToForm(rule?: Rule, now = Date.now()): RuleForm {
   const f: RuleForm = {
+    ...defaultActionFields(),
     id: rule?.id ?? newId('rule'),
     isNew: !rule,
     enabled: rule?.enabled ?? true,
@@ -1080,22 +1200,12 @@ export function ruleToForm(rule?: Rule, now = Date.now()): RuleForm {
     method: rule?.match.method?.toUpperCase() ?? '',
     url: rule?.match.url ?? '',
     kind: rule?.action.kind ?? 'mock',
-    mockStatus: '200',
-    mockHeaders: [{ name: 'content-type', value: 'application/json' }],
-    mockBody: '{\n  \n}',
-    mockDelayMs: '',
-    blockMode: 'reset',
-    blockStatus: '403',
-    phase: 'both',
-    throttle: { latencyMs: '400', kbps: '', dropPct: '' },
-    fault: 'reset',
-    mutateOps: [{ path: '', op: 'null', value: '' }],
     graphqlOperation: rule?.match.graphqlOperation ?? '',
-    corsOrigin: '',
-    corsCredentials: false,
     times: rule?.times !== undefined ? String(rule.times) : '',
     expiresIn: '',
     expiresUnit: 'm',
+    steps: defaultSteps(),
+    seqThen: 'last',
   };
   if (rule?.expiresAt !== undefined) {
     f.keepExpiresAt = rule.expiresAt;
@@ -1103,54 +1213,101 @@ export function ruleToForm(rule?: Rule, now = Date.now()): RuleForm {
     if (left > 0) f.expiresIn = String(Math.max(1, Math.ceil(left / 60_000)));
   }
   const a = rule?.action;
-  if (a?.kind === 'mock') {
-    f.mockStatus = String(a.status);
-    f.mockHeaders = headersToRows(a.headers);
-    f.mockBody = a.body;
-    f.mockDelayMs = a.delayMs ? String(a.delayMs) : '';
-  } else if (a?.kind === 'block') {
-    f.blockMode = a.mode;
-    if (a.status !== undefined) f.blockStatus = String(a.status);
-  } else if (a?.kind === 'breakpoint') {
-    f.phase = a.phase;
-  } else if (a?.kind === 'throttle') {
-    f.throttle = throttleFieldsOf(a);
-  } else if (a?.kind === 'fault') {
-    f.fault = a.fault;
-  } else if (a?.kind === 'mutate') {
-    // valueJson (byte-exact text) wins over value, like on the proxy.
-    f.mutateOps = a.ops.map((o) => ({ path: o.path, op: o.op, value: o.op === 'set' ? o.valueJson ?? jsonText(o.value) : '' }));
-  } else if (a?.kind === 'cors') {
-    f.corsOrigin = a.allowOrigin ?? '';
-    f.corsCredentials = !!a.allowCredentials;
+  if (a?.kind === 'sequence') {
+    f.steps = a.steps.map((s) => fillActionFields(newStep(s.action.kind, String(s.count ?? 1)), s.action));
+    f.seqThen = a.then ?? 'last';
+  } else if (a) {
+    fillActionFields(f, a);
   }
   return f;
 }
 
 export type RuleFormField =
   | 'url' | 'method' | 'mockStatus' | 'mockDelayMs' | 'blockStatus' | 'mockHeaders'
-  | 'latencyMs' | 'kbps' | 'dropPct' | 'throttle' | 'times' | 'expiresIn' | 'mutate' | 'graphqlOperation' | 'cors';
+  | 'latencyMs' | 'kbps' | 'dropPct' | 'throttle' | 'times' | 'expiresIn' | 'mutate' | 'graphqlOperation' | 'cors'
+  | 'mockBodyFile' | 'mapTo' | 'rewrite' | 'sequence' | 'count';
 
-export interface RuleFormValidation {
+/** Validation of one action's fields (the rule's, or one sequence step's). */
+export interface ActionValidation {
   errors: Partial<Record<RuleFormField, string>>;
-  urlHint: string;
   json?: JsonCheck;
   /** Per mutate row: what is wrong with it (path or value), if anything. */
   opErrors?: (string | undefined)[];
 }
 
+export interface RuleFormValidation extends ActionValidation {
+  urlHint: string;
+  /** kind 'sequence': per step. */
+  stepChecks?: ActionValidation[];
+}
+
 const isStatus = (s: string) => /^\d{3}$/.test(s.trim()) && +s >= 100 && +s <= 599;
 
+/** Field errors of an action; `kind` is the rule's or the step's kind. */
+export function validateActionFields(kind: RuleAction['kind'] | StepKind, f: ActionFields): ActionValidation {
+  const errors: ActionValidation['errors'] = {};
+  let json: JsonCheck | undefined;
+  let opErrors: (string | undefined)[] | undefined;
+  if (kind === 'cors') {
+    const c = corsActionError(f.corsOrigin, f.corsCredentials);
+    if (c) errors.cors = c;
+  } else if (kind === 'mock') {
+    if (!isStatus(f.mockStatus)) errors.mockStatus = '100–599';
+    if (f.mockDelayMs.trim() && !/^\d+$/.test(f.mockDelayMs.trim())) errors.mockDelayMs = 'Milliseconds, whole number';
+    if (f.mockHeaders.some((r) => r.name.trim() && !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(r.name.trim()))) {
+      errors.mockHeaders = 'Invalid header name';
+    }
+    if (f.mockUseFile) {
+      const e = bodyFileError(f.mockBodyFile);
+      if (e) errors.mockBodyFile = e;
+    } else {
+      const ct = headerValue(rowsToRecord(f.mockHeaders), 'content-type');
+      if (isJsonContentType(ct) && f.mockBody.trim()) json = validateJson(f.mockBody);
+    }
+  } else if (kind === 'block' && f.blockMode === 'status' && !isStatus(f.blockStatus)) {
+    errors.blockStatus = '100–599';
+  } else if (kind === 'throttle') {
+    const t = checkThrottle(f.throttle);
+    if (t.errors.latencyMs) errors.latencyMs = t.errors.latencyMs;
+    if (t.errors.kbps) errors.kbps = t.errors.kbps;
+    if (t.errors.dropPct) errors.dropPct = t.errors.dropPct;
+    if (t.errors.all) errors.throttle = t.errors.all;
+  } else if (kind === 'mutate') {
+    opErrors = f.mutateOps.map(mutateRowError);
+    const first = opErrors.findIndex(Boolean);
+    if (!f.mutateOps.length) errors.mutate = 'Add at least one change.';
+    else if (first >= 0) errors.mutate = `Change ${first + 1}: ${opErrors[first]}`;
+  } else if (kind === 'mapRemote') {
+    const m = checkMapTarget(f.mapTo);
+    if (m.error) errors.mapTo = m.error;
+  } else if (kind === 'rewrite') {
+    const r = rewriteError(f.rewrite);
+    if (r) errors.rewrite = r;
+  }
+  return { errors, json, opErrors };
+}
+
+/** The first error of an action, as one line ("Status: 100–599"). */
+export function firstActionError(v: ActionValidation): string | undefined {
+  const e = v.errors;
+  if (e.count) return e.count;
+  if (e.mockStatus) return `Status: ${e.mockStatus}`;
+  if (e.mockDelayMs) return `Delay: ${e.mockDelayMs}`;
+  if (e.blockStatus) return `Status: ${e.blockStatus}`;
+  const first = Object.values(e).find(Boolean);
+  return first;
+}
+
 export function validateRuleForm(f: RuleForm): RuleFormValidation {
-  const errors: RuleFormValidation['errors'] = {};
   let urlHint = 'Glob on the full URL — * matches any characters, e.g. https://api.example.com/users/*';
   const url = f.url.trim();
-  if (!url) errors.url = 'Required. Use * to match every URL.';
+  const head: ActionValidation['errors'] = {};
+  if (!url) head.url = 'Required. Use * to match every URL.';
   else {
     const p = describeMatcherUrl(url);
     if (p.kind === 'any') urlHint = 'Matches every URL.';
     else if (p.kind === 'regex') {
-      if (p.error) errors.url = `Invalid regular expression: ${p.error}`;
+      if (p.error) head.url = `Invalid regular expression: ${p.error}`;
       else urlHint = `Regular expression /${p.source}/${p.flags} tested against the full URL (g/y flags ignored)`;
     } else if (!url.includes('*') && !/^https?:\/\//i.test(url)) {
       urlHint = 'Glob without * must equal the full URL (scheme included). Add * to match a prefix or part.';
@@ -1158,37 +1315,23 @@ export function validateRuleForm(f: RuleForm): RuleFormValidation {
       urlHint = 'Case-sensitive glob on the full URL — * matches any characters, including /.';
     }
   }
-  if (f.method.trim() && !/^[A-Za-z]+$/.test(f.method.trim())) errors.method = 'Letters only, e.g. GET';
+  if (f.method.trim() && !/^[A-Za-z]+$/.test(f.method.trim())) head.method = 'Letters only, e.g. GET';
   const op = f.graphqlOperation.trim();
-  if (op && !/^[_A-Za-z][_0-9A-Za-z]*$/.test(op)) errors.graphqlOperation = 'A GraphQL operation name: letters, digits and _, e.g. getUser';
-  if (f.kind === 'cors') {
-    const c = corsActionError(f.corsOrigin, f.corsCredentials);
-    if (c) errors.cors = c;
-  }
-  let json: JsonCheck | undefined;
-  if (f.kind === 'mock') {
-    if (!isStatus(f.mockStatus)) errors.mockStatus = '100–599';
-    if (f.mockDelayMs.trim() && !/^\d+$/.test(f.mockDelayMs.trim())) errors.mockDelayMs = 'Milliseconds, whole number';
-    if (f.mockHeaders.some((r) => r.name.trim() && !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(r.name.trim()))) {
-      errors.mockHeaders = 'Invalid header name';
-    }
-    const ct = headerValue(rowsToRecord(f.mockHeaders), 'content-type');
-    if (isJsonContentType(ct) && f.mockBody.trim()) json = validateJson(f.mockBody);
-  } else if (f.kind === 'block' && f.blockMode === 'status' && !isStatus(f.blockStatus)) {
-    errors.blockStatus = '100–599';
-  } else if (f.kind === 'throttle') {
-    const t = checkThrottle(f.throttle);
-    if (t.errors.latencyMs) errors.latencyMs = t.errors.latencyMs;
-    if (t.errors.kbps) errors.kbps = t.errors.kbps;
-    if (t.errors.dropPct) errors.dropPct = t.errors.dropPct;
-    if (t.errors.all) errors.throttle = t.errors.all;
-  }
-  let opErrors: (string | undefined)[] | undefined;
-  if (f.kind === 'mutate') {
-    opErrors = f.mutateOps.map(mutateRowError);
-    const first = opErrors.findIndex(Boolean);
-    if (!f.mutateOps.length) errors.mutate = 'Add at least one change.';
-    else if (first >= 0) errors.mutate = `Change ${first + 1}: ${opErrors[first]}`;
+  if (op && !/^[_A-Za-z][_0-9A-Za-z]*$/.test(op)) head.graphqlOperation = 'A GraphQL operation name: letters, digits and _, e.g. getUser';
+
+  const action = f.kind === 'sequence' ? { errors: {} } as ActionValidation : validateActionFields(f.kind, f);
+  const errors: RuleFormValidation['errors'] = { ...head, ...action.errors };
+  let stepChecks: ActionValidation[] | undefined;
+  if (f.kind === 'sequence') {
+    stepChecks = f.steps.map((s) => {
+      const v = validateActionFields(s.kind, s);
+      const c = stepCountError(s.count);
+      return c ? { ...v, errors: { ...v.errors, count: c } } : v;
+    });
+    const bad = stepChecks.findIndex((v) => Object.keys(v.errors).length > 0);
+    if (!f.steps.length) errors.sequence = 'Add at least one step.';
+    else if (f.steps.length > MAX_STEPS) errors.sequence = `At most ${MAX_STEPS} steps.`;
+    else if (bad >= 0) errors.sequence = `Step ${bad + 1}: ${firstActionError(stepChecks[bad])}`;
   }
   const times = f.times.trim();
   if (times && (!isInt(times) || +times < 1 || +times > 1000)) errors.times = 'Whole number 1–1000 (empty = every request)';
@@ -1197,7 +1340,7 @@ export function validateRuleForm(f: RuleForm): RuleFormValidation {
     const ms = Number(exp) * EXPIRY_UNIT_MS[f.expiresUnit];
     if (!/^\d+(\.\d+)?$/.test(exp) || !(ms >= 1000) || ms > MAX_EXPIRY_MS) errors.expiresIn = 'Between 1 second and 24 hours (empty = never)';
   }
-  return { errors, urlHint, json, opErrors };
+  return { errors, urlHint, json: action.json, opErrors: action.opErrors, stepChecks };
 }
 
 /** Why a mutate row can't be saved, if it can't. */
@@ -1217,34 +1360,68 @@ export function jsonText(v: unknown): string {
   try { return JSON.stringify(v) ?? ''; } catch { return ''; }
 }
 
-export function formToRule(f: RuleForm, now = Date.now()): Rule {
-  let action: RuleAction;
-  if (f.kind === 'mock') {
-    const headers = rowsToFlatRecord(f.mockHeaders);
-    action = { kind: 'mock', status: Number(f.mockStatus), body: f.mockBody };
-    if (Object.keys(headers).length) action.headers = headers;
-    if (f.mockDelayMs.trim() && Number(f.mockDelayMs) > 0) action.delayMs = Number(f.mockDelayMs);
-  } else if (f.kind === 'block') {
-    action = f.blockMode === 'reset' ? { kind: 'block', mode: 'reset' } : { kind: 'block', mode: 'status', status: Number(f.blockStatus) };
-  } else if (f.kind === 'throttle') {
-    action = { kind: 'throttle', ...checkThrottle(f.throttle).value };
-  } else if (f.kind === 'fault') {
-    action = { kind: 'fault', fault: f.fault };
-  } else if (f.kind === 'mutate') {
-    action = {
-      kind: 'mutate',
-      // valueJson keeps the literal text (1.0 stays a double for Dart); value is for hosts without valueJson.
-      ops: f.mutateOps.map((r): MutateOp => (r.op === 'set'
-        ? { path: r.path.trim(), op: 'set', value: JSON.parse(r.value), valueJson: r.value.trim() }
-        : { path: r.path.trim(), op: r.op })),
-    };
-  } else if (f.kind === 'cors') {
-    action = { kind: 'cors' };
-    if (f.corsOrigin.trim()) action.allowOrigin = f.corsOrigin.trim();
-    if (f.corsCredentials) action.allowCredentials = true;
-  } else {
-    action = { kind: 'breakpoint', phase: f.phase };
+/** The action the fields describe. `kind` 'sequence' is built by formToRule (it needs the steps). */
+export function fieldsToAction(kind: Exclude<RuleAction['kind'], 'sequence'>, f: ActionFields): Exclude<RuleAction, { kind: 'sequence' }>;
+export function fieldsToAction(kind: StepKind, f: ActionFields): StepAction;
+export function fieldsToAction(kind: Exclude<RuleAction['kind'], 'sequence'> | StepKind, f: ActionFields): Exclude<RuleAction, { kind: 'sequence' }> | StepAction {
+  switch (kind) {
+    case 'mock': {
+      const headers = rowsToFlatRecord(f.mockHeaders);
+      const action: Extract<RuleAction, { kind: 'mock' }> = { kind: 'mock', status: Number(f.mockStatus), body: f.mockBody };
+      if (Object.keys(headers).length) action.headers = headers;
+      if (f.mockDelayMs.trim() && Number(f.mockDelayMs) > 0) action.delayMs = Number(f.mockDelayMs);
+      if (f.mockUseFile && f.mockBodyFile.trim()) action.bodyFile = f.mockBodyFile.trim();
+      return action;
+    }
+    case 'block':
+      return f.blockMode === 'reset' ? { kind: 'block', mode: 'reset' } : { kind: 'block', mode: 'status', status: Number(f.blockStatus) };
+    case 'throttle':
+      return { kind: 'throttle', ...checkThrottle(f.throttle).value };
+    case 'fault':
+      return { kind: 'fault', fault: f.fault };
+    case 'mutate':
+      return {
+        kind: 'mutate',
+        // valueJson keeps the literal text (1.0 stays a double for Dart); value is for hosts without valueJson.
+        ops: f.mutateOps.map((r): MutateOp => (r.op === 'set'
+          ? { path: r.path.trim(), op: 'set', value: JSON.parse(r.value), valueJson: r.value.trim() }
+          : { path: r.path.trim(), op: r.op })),
+      };
+    case 'cors': {
+      const action: Extract<RuleAction, { kind: 'cors' }> = { kind: 'cors' };
+      if (f.corsOrigin.trim()) action.allowOrigin = f.corsOrigin.trim();
+      if (f.corsCredentials) action.allowCredentials = true;
+      return action;
+    }
+    case 'mapRemote':
+      return f.mapPreserveHost ? { kind: 'mapRemote', to: f.mapTo.trim(), preserveHost: true } : { kind: 'mapRemote', to: f.mapTo.trim() };
+    case 'rewrite':
+      return rewriteFromForm(f.rewrite);
+    case 'passthrough':
+      return { kind: 'passthrough' };
+    case 'breakpoint':
+      return { kind: 'breakpoint', phase: f.phase };
   }
+}
+
+/** The sequence preview line for the editor; steps that don't validate yet still get a label. */
+export function stepsPreview(steps: StepForm[], then: SequenceThen): string {
+  return sequencePreview(steps.map((s): PreviewStep => {
+    const count = /^\d+$/.test(s.count.trim()) && +s.count > 0 ? +s.count : 1;
+    if (s.kind === 'mock') return { action: { kind: 'passthrough' }, count, label: isStatus(s.mockStatus) ? s.mockStatus.trim() : '?' };
+    if (s.kind === 'mutate') return { action: { kind: 'mutate', ops: [] }, count };
+    return { action: fieldsToAction(s.kind, s), count };
+  }), then);
+}
+
+export function formToRule(f: RuleForm, now = Date.now()): Rule {
+  const action: RuleAction = f.kind === 'sequence'
+    ? {
+      kind: 'sequence',
+      steps: f.steps.map((s) => ({ action: fieldsToAction(s.kind, s), count: s.count.trim() ? Number(s.count.trim()) : 1 })),
+      ...(f.seqThen !== 'last' ? { then: f.seqThen } : {}),
+    }
+    : fieldsToAction(f.kind, f);
   const rule: Rule = { id: f.id, enabled: f.enabled, match: { url: f.url.trim() }, action };
   if (f.name.trim()) rule.name = f.name.trim();
   if (f.method.trim()) rule.match.method = f.method.trim().toUpperCase();

@@ -179,6 +179,7 @@ describe('read tools', () => {
       networkProfile: { kind: 'none', label: 'No throttling' },
       browserInternalHidden: 0,
       warnings: [],
+      sharedRules: 0, // CONTRACTS §12
     });
   });
 

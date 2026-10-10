@@ -1,4 +1,5 @@
 import type * as http from 'http';
+import { STATUS_CODES } from 'http';
 import type * as stream from 'stream';
 import { BODY_CAP_BYTES } from './body';
 import { ResponseShaper, type Shaping } from './shaper';
@@ -39,6 +40,8 @@ export interface HeadPatch {
   set?: Record<string, string>;
   /** Send the head now instead of with the first body chunk (event streams: the app sees it at once). */
   flush?: boolean;
+  /** Replace the status (and its reason phrase): a rewrite rule (CONTRACTS §12.6). */
+  status?: number;
 }
 
 export interface Tap {
@@ -215,6 +218,10 @@ function attach(id: string, req: http.IncomingMessage, raw: http.ServerResponse,
             if (a.length > hi || patched !== undefined) a[hi] = patched;
           }
           flush = !!patch.flush;
+          if (patch.status !== undefined) {
+            a[0] = patch.status;
+            if (typeof a[1] === 'string') a[1] = STATUS_CODES[patch.status] ?? 'Unknown';
+          }
         }
       } catch {
         /* never break the response */

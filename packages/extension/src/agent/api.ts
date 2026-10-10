@@ -5,18 +5,20 @@
  */
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import type { Body, Exchange, Matcher, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest, StackFrame } from '@flutter-intercept/proxy';
+import type { Body, Exchange, Matcher, ReplayEntry, ReplayOptions, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest, StackFrame } from '@flutter-intercept/proxy';
 import { describeProfile, NETWORK_PRESETS, presetProfile, type NetworkPresetId, type NetworkProfile } from '@flutter-intercept/proxy/network';
 import { compileMatcher } from '@flutter-intercept/proxy/rules';
 import { toSnippet } from '../codegen/snippets';
 import type { CodegenService } from '../codegen/types';
 import type { ContractResult, ContractService } from '../contract/types';
-import { fixtureApi, readOnlyReason, sanitizeSendHeaders, validateEdit, validateRule } from '../ui/controller';
+import type { AuthAnalysis } from '../analysis/types';
+import type { RecordingService } from '../recordings/types';
+import { checkMapTarget, expireTokenRule, fixtureApi, isRecordable, readOnlyReason, sanitizeSendHeaders, validateEdit, validateRule } from '../ui/controller';
 import type { SessionWarning } from '../ui/protocol';
 import { buildHar, writeHar } from './har';
 import { pathError, select } from './paths';
 import { corsPolicyShort, urlGlobHasHost } from './corsPolicy';
-import { isSensitiveField, REDACTED, redactBodyText, redactFrameText, redactHeaders, redactQueryString, redactSecretValues, redactText, redactUrl } from './redact';
+import { isSensitiveField, isSensitiveHeader, REDACTED, redactBodyText, redactFrameText, redactHeaders, redactQueryString, redactSecretValues, redactText, redactUrl } from './redact';
 import { parsePath, type PathSegment } from '@flutter-intercept/proxy/jsonpath';
 import {
   contractForAgent,
@@ -33,7 +35,7 @@ import {
   routeOf,
   testPackageFor,
 } from './samples';
-import { parseToolInput, ToolInput, TRIGGER_WINDOW_MS } from './schema';
+import { MAX_DIFF_ENTRIES, parseToolInput, ToolInput, TRIGGER_WINDOW_MS } from './schema';
 import { bodyShape } from './shape';
 import { AgentAccess, AgentTools, AgentToolError, AppLauncher, isWriteTool, ToolName, ToolResult } from './types';
 
@@ -81,6 +83,11 @@ export interface AgentApiDeps {
     readonly networkProfile?: NetworkProfile;
     /** CONTRACTS §11.4 (InterceptProxyHost.warnings): traffic that is not intercepted. Optional on older builds. */
     readonly warnings?: SessionWarning[];
+    // CONTRACTS §12.4 (InterceptProxyHost). Optional: without them replay_recording answers a clear error.
+    readonly replay?: { id?: string; recording: string; fallback: 'passthrough' | 'fail' };
+    setReplay?(entries: ReplayEntry[] | undefined, opts?: ReplayOptions, meta?: { id?: string; name: string }): void;
+    /** REVIEW-6 #1 (InterceptProxyHost.upstreamProxyInfo): `host:port` of the upstream proxy, never credentials. */
+    readonly upstreamProxyInfo?: { display: string; ignoreCertErrors: boolean };
   };
   /**
    * CONTRACTS §9.4: resolves `package:` / `file:` frames to files (src/source/resolve.ts `resolveFrames` bound
@@ -111,6 +118,70 @@ export interface AgentApiDeps {
   codegen?: CodegenService;
   /** The app's pubspec `name` (fixture imports). */
   appPackageName?(): string | undefined;
+  // ---- CONTRACTS §12.7 (v0.6.0). Optional: without them the tools answer with a clear "not available" error.
+  /** Recordings (src/recordings/store.ts). */
+  recordings?: RecordingService;
+  /** A recording was saved or replay started/stopped: `controller.refreshRecordings()` (the panel's list). */
+  recordingsChanged?(): void;
+  /** Auth-flow analysis (src/analysis/auth.ts `analyzeAuth`). */
+  analyzeAuth?(exchanges: Exchange[]): AuthAnalysis;
+}
+
+/** Loopback targets agents may map to (CONTRACTS §12.7). */
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/**
+ * REVIEW-6 #4: headers agents may not set with add_rewrite (request or response): redirects and refreshes, cookies,
+ * the browser's security policy (CSP, CORS), and the forwarding / override headers servers use to build links
+ * (reset-link poisoning) or pick the method.
+ */
+export const AGENT_REWRITE_FORBIDDEN =
+  /^(location|refresh|set-cookie|set-cookie2|content-security-policy(-report-only)?|access-control-.*|x-forwarded-.*|forwarded|host|x-host|x-original-url|x-rewrite-url|x-original-host|x-http-method-override|x-http-method|x-method-override)$/i;
+/** REVIEW-6 #4: content types a browser runs (Flutter Web's debug Chrome trusts our CA): agents can't serve them. */
+const ACTIVE_CONTENT = /html|javascript|ecmascript|svg|xhtml/i;
+const LOOKS_HTML = /^\s*(<!doctype\s+html|<html|<head|<body|<script|<svg|<iframe)/i;
+const SCRIPTISH = /<\s*(script|iframe|object|embed|base|meta|link|form)\b|javascript:|\bon[a-z]+\s*=/i;
+
+/** `https://api.example.com` for a glob whose scheme and host are literal, else undefined. */
+export function globOrigin(glob: string): string | undefined {
+  const m = /^(https?):\/\/([^/?#]+)/i.exec(glob.trim());
+  if (!m || m[2].includes('*')) return undefined;
+  try {
+    return new URL(`${m[1]}://${m[2]}`).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * REVIEW-6 #4: why an agent mock (or mock step) must not be served, or undefined. HTML / JavaScript / SVG content
+ * (by content-type, or an untyped body that looks like HTML) is refused; a 3xx `Location` must stay on the match URL's
+ * own origin (relative locations do) or go to loopback — dart:io follows redirects and re-sends custom credential
+ * headers and the query to the new host.
+ */
+export function agentMockRefusal(matchUrl: string, status: number, headers: Record<string, string> | undefined, body: string): string | undefined {
+  const get = (name: string) => Object.entries(headers ?? {}).find(([k]) => k.toLowerCase() === name)?.[1];
+  const ct = get('content-type');
+  if (ct !== undefined && ACTIVE_CONTENT.test(ct)) return `content-type "${ct.slice(0, 100)}" is refused for agents: a browser would run it (HTML, JavaScript or SVG)`;
+  if (ct === undefined && LOOKS_HTML.test(body)) return 'the body looks like HTML; agents can only mock data responses (set a content-type such as application/json or text/plain)';
+  if (status >= 300 && status <= 399) {
+    const loc = get('location');
+    if (loc !== undefined) {
+      const base = globOrigin(matchUrl) ?? 'https://same-origin.invalid';
+      let target: URL;
+      try {
+        target = new URL(loc.trim(), base);
+      } catch {
+        return `location "${loc.slice(0, 100)}" is not a valid URL`;
+      }
+      const sameOrigin = target.origin === new URL(base).origin;
+      const loopback = (target.protocol === 'http:' || target.protocol === 'https:') && LOOPBACK_HOSTS.has(target.hostname.toLowerCase());
+      if (!sameOrigin && !loopback) {
+        return `a ${status} redirect to ${target.protocol === 'http:' || target.protocol === 'https:' ? target.origin : JSON.stringify(loc.slice(0, 100))} is refused for agents: redirects must stay on the request's own origin${globOrigin(matchUrl) ? ` (${globOrigin(matchUrl)})` : ' (use a relative location, or a url with a literal host)'} or go to localhost`;
+      }
+    }
+  }
+  return undefined;
 }
 
 type StatusFilter = number | '1xx' | '2xx' | '3xx' | '4xx' | '5xx' | 'error' | undefined;
@@ -237,7 +308,7 @@ export class AgentApi implements AgentTools {
       case 'list_paused':
         return this.listPaused();
       case 'list_rules':
-        return { rules: this.deps.host.getRules() };
+        return { rules: this.deps.host.getRules().map((r) => this.ruleView(r)) };
       case 'export_har':
         return this.exportHar(input as ToolInput<'export_har'>);
       case 'add_mock':
@@ -284,6 +355,25 @@ export class AgentApi implements AgentTools {
         return this.getFrames(input as ToolInput<'get_frames'>);
       case 'add_cors_rule':
         return this.addCorsRule(input as ToolInput<'add_cors_rule'>);
+      // CONTRACTS §12.7
+      case 'list_recordings':
+        return this.listRecordings();
+      case 'diff_recordings':
+        return this.diffRecordings(input as ToolInput<'diff_recordings'>);
+      case 'get_auth_flows':
+        return this.getAuthFlows(input as ToolInput<'get_auth_flows'>);
+      case 'save_recording':
+        return this.saveRecording(input as ToolInput<'save_recording'>);
+      case 'replay_recording':
+        return this.replayRecording(input as ToolInput<'replay_recording'>);
+      case 'add_sequence':
+        return this.addSequence(input as ToolInput<'add_sequence'>);
+      case 'expire_token':
+        return this.expireToken(input as ToolInput<'expire_token'>);
+      case 'add_map_remote':
+        return this.addMapRemote(input as ToolInput<'add_map_remote'>);
+      case 'add_rewrite':
+        return this.addRewrite(input as ToolInput<'add_rewrite'>);
       default:
         throw new AgentToolError(`unknown tool ${String(tool)}`, 'invalid');
     }
@@ -404,7 +494,52 @@ export class AgentApi implements AgentTools {
       // REVIEW-5 #6: what list / wait / assert hide by default.
       browserInternalHidden: all.filter((e) => e.browserInternal).length,
       warnings: (this.deps.host.warnings ?? []).map((w) => ({ kind: w.kind, text: w.text, ...(w.sessionId ? { sessionId: w.sessionId } : {}) })),
+      // CONTRACTS §12
+      ...this.replayView(),
+      sharedRules: this.deps.host.getRules().filter((r) => r.shared).length,
+      // REVIEW-6 #1: pass-through traffic goes via this proxy (host:port only).
+      ...(this.deps.host.upstreamProxyInfo
+        ? { upstreamProxy: this.deps.host.upstreamProxyInfo.display, ...(this.deps.host.upstreamProxyInfo.ignoreCertErrors ? { upstreamProxyInsecure: true } : {}) }
+        : {}),
     };
+  }
+
+  private replayView(): { replaying?: Record<string, unknown> } {
+    const r = this.deps.host.replay;
+    return r ? { replaying: { ...(r.id !== undefined ? { id: r.id } : {}), name: r.recording, fallback: r.fallback } } : {};
+  }
+
+  /**
+   * A rule as agents see it: with redaction on, credential-carrying header values in mock headers and rewrite
+   * setHeaders read "[redacted]" and a map target is shown like a redacted URL (shared rules may carry them).
+   */
+  private ruleView(rule: Rule): Rule {
+    if (!this.redact) return rule;
+    const headers = (h: Record<string, string> | undefined) =>
+      h ? Object.fromEntries(Object.entries(h).map(([k, v]) => [k, isSensitiveHeader(k) ? REDACTED : redactSecretValues(v, true)])) : h;
+    const spec = <T extends { setHeaders?: Record<string, string>; replaceBody?: { find: string; replace: string; all?: boolean }[] }>(s: T | undefined): T | undefined =>
+      s
+        ? {
+            ...s,
+            ...(s.setHeaders ? { setHeaders: headers(s.setHeaders) } : {}),
+            ...(s.replaceBody ? { replaceBody: s.replaceBody.map((r) => ({ ...r, find: redactSecretValues(r.find, true), replace: redactSecretValues(r.replace, true) })) } : {}),
+          }
+        : s;
+    const action = (a: RuleAction | { kind: 'passthrough' }): RuleAction | { kind: 'passthrough' } => {
+      switch (a.kind) {
+        case 'mock':
+          return a.headers ? { ...a, headers: headers(a.headers) } : a;
+        case 'mapRemote':
+          return { ...a, to: redactUrl(a.to) };
+        case 'rewrite':
+          return { ...a, ...(a.request ? { request: spec(a.request) } : {}), ...(a.response ? { response: spec(a.response) } : {}) };
+        case 'sequence':
+          return { ...a, steps: a.steps.map((s) => ({ ...s, action: action(s.action) as typeof s.action })) };
+        default:
+          return a;
+      }
+    };
+    return { ...rule, action: action(rule.action) as RuleAction };
   }
 
   private listRequests(i: ToolInput<'list_requests'>): ToolResult {
@@ -542,6 +677,8 @@ export class AgentApi implements AgentTools {
     const isJson = typeof i.body !== 'string';
     const headers: Record<string, string> = { ...(i.headers ?? {}) };
     if (isJson && !Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')) headers['content-type'] = 'application/json';
+    const why = agentMockRefusal(i.url, i.status, headers, isJson ? '' : (i.body as string));
+    if (why) throw new AgentToolError(`add_mock refused: ${why}`, 'invalid');
     return this.insertRule({
       id: this.newId(),
       enabled: true,
@@ -582,6 +719,12 @@ export class AgentApi implements AgentTools {
 
   private removeRule(i: ToolInput<'remove_rule'>): ToolResult {
     const rules = this.deps.host.getRules();
+    if (rules.find((r) => r.id === i.ruleId)?.shared) {
+      throw new AgentToolError(
+        `rule "${i.ruleId}" is a shared rule from .vscode/flutter-intercept.json (committed with the project); agents can't change that file — ask the user to edit it or un-share the rule in the Flutter Intercept panel`,
+        'invalid',
+      );
+    }
     const next = rules.filter((r) => r.id !== i.ruleId);
     if (next.length === rules.length) return { removed: false };
     this.deps.applyRules(next);
@@ -1261,6 +1404,259 @@ export class AgentApi implements AgentTools {
       name: this.label(undefined, `${base} ${policy}`),
       match: this.match(i),
       action: { kind: 'cors', ...(i.allowOrigin !== undefined ? { allowOrigin: i.allowOrigin } : {}), ...(i.allowCredentials !== undefined ? { allowCredentials: i.allowCredentials } : {}) },
+      ...this.spending(i),
+    });
+  }
+
+  // ------------------------------------------------------------------ v0.6.0 (CONTRACTS §12.7)
+
+  private recordingsOrThrow(): RecordingService {
+    if (!this.deps.recordings) throw new AgentToolError('recordings are not available (no Flutter project folder is open)', 'state');
+    return this.deps.recordings;
+  }
+
+  private async loadRecording(id: string) {
+    try {
+      return await this.recordingsOrThrow().load(id);
+    } catch (e) {
+      if (e instanceof AgentToolError) throw e;
+      throw new AgentToolError(`no recording "${id}" (see list_recordings): ${(e as Error)?.message ?? String(e)}`, 'not_found');
+    }
+  }
+
+  private changed(): void {
+    try {
+      this.deps.recordingsChanged?.();
+    } catch {
+      // the panel refresh never breaks a tool call
+    }
+  }
+
+  /** A path inside the project as project-relative, otherwise undefined (never an absolute path, REVIEW-3 #4). */
+  private projectPath(p: string | undefined): string | undefined {
+    const root = this.deps.projectRoot();
+    if (!p || !root) return undefined;
+    const rel = path.relative(root, p);
+    return rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel.split(path.sep).join('/') : undefined;
+  }
+
+  private async listRecordings(): Promise<ToolResult> {
+    const list = await this.recordingsOrThrow().list();
+    return {
+      recordings: list.map((m) => ({ id: m.id, name: m.name, createdAt: m.createdAt, exchanges: m.exchanges, redacted: m.redacted })),
+      ...this.replayView(),
+    };
+  }
+
+  private async saveRecording(i: ToolInput<'save_recording'>): Promise<ToolResult> {
+    const svc = this.recordingsOrThrow();
+    const keep = this.filter({ url: i.url, sinceMs: i.sinceMs });
+    const list = this.deps.host.getExchanges().filter((e) => isRecordable(e) && keep(e));
+    if (!list.length) {
+      throw new AgentToolError(`no finished HTTP request${i.url ? ` matches ${i.url}` : ' is recorded'}${i.sinceMs !== undefined ? ' since sinceMs' : ''} (WebSocket, SSE and native-client traffic is not recorded)`, 'not_found');
+    }
+    // Agents save redacted unless they ask otherwise (the user's panel default is unredacted).
+    const meta = await svc.save(i.name, list, { redact: i.redact });
+    this.changed();
+    const where = this.projectPath(meta.path);
+    return { id: meta.id, name: meta.name, exchanges: meta.exchanges, redacted: meta.redacted, ...(where ? { path: where } : {}) };
+  }
+
+  private async replayRecording(i: ToolInput<'replay_recording'>): Promise<ToolResult> {
+    const host = this.deps.host;
+    if (!host.setReplay) throw new AgentToolError('this version of the proxy cannot replay recordings', 'state');
+    if (i.id === undefined) {
+      const was = host.replay;
+      host.setReplay(undefined);
+      this.changed();
+      return { replaying: false, ...(was ? { stopped: was.recording } : {}) };
+    }
+    const svc = this.recordingsOrThrow();
+    const rec = await this.loadRecording(i.id);
+    const entries = svc.toReplay(rec);
+    if (!entries.length) throw new AgentToolError(`recording "${rec.id}" has no responses to replay`, 'invalid');
+    try {
+      host.setReplay(entries, { fallback: i.fallback, matchTemplates: true }, { id: rec.id, name: rec.name });
+    } catch (e) {
+      throw new AgentToolError((e as Error).message, 'state');
+    }
+    this.changed();
+    return {
+      replaying: true,
+      id: rec.id,
+      name: rec.name,
+      entries: entries.length,
+      fallback: i.fallback,
+      ...(rec.redacted ? { note: 'this recording was saved redacted: replayed secrets (tokens, cookies) read "[redacted]"' } : {}),
+    };
+  }
+
+  /** Details are always redacted (CONTRACTS §12.7), whatever the setting. */
+  private async diffRecordings(i: ToolInput<'diff_recordings'>): Promise<ToolResult> {
+    if (i.a === i.b) throw new AgentToolError('pass two different recordings', 'invalid');
+    const svc = this.recordingsOrThrow();
+    const [a, b] = [await this.loadRecording(i.a), await this.loadRecording(i.b)];
+    const all = svc.diff(a, b);
+    const entries = all.slice(0, MAX_DIFF_ENTRIES).map((d) => ({ route: redactText(d.route), change: d.change, detail: redactText(d.detail) }));
+    return {
+      a: { id: a.id, name: a.name, exchanges: a.exchanges },
+      b: { id: b.id, name: b.name, exchanges: b.exchanges },
+      entries,
+      total: all.length,
+      ...(all.length > entries.length ? { more: all.length - entries.length } : {}),
+      ...(all.length ? {} : { note: 'no differences by route, status, JSON shape, body values, call counts or timing' }),
+    };
+  }
+
+  private getAuthFlows(i: ToolInput<'get_auth_flows'>): ToolResult {
+    if (!this.deps.analyzeAuth) throw new AgentToolError('auth-flow analysis is not available in this build of Flutter Intercept', 'state');
+    const keep = this.filter({ sinceMs: i.sinceMs });
+    const list = this.deps.host.getExchanges().filter(keep);
+    const byId = new Map(list.map((e) => [e.id, e]));
+    let flows: AuthAnalysis['flows'];
+    try {
+      flows = this.deps.analyzeAuth(list).flows;
+    } catch (e) {
+      throw new AgentToolError(`auth-flow analysis failed: ${(e as Error)?.message ?? String(e)}`, 'internal');
+    }
+    const shown = flows.slice(-50);
+    return {
+      flows: shown.map((f) => ({
+        steps: f.steps.map((s) => {
+          const e = byId.get(s.exchangeId);
+          return {
+            exchangeId: s.exchangeId,
+            role: s.role,
+            at: s.at,
+            ...(e ? { method: e.method, url: this.url(e.url), ...(e.status !== undefined ? { status: e.status } : {}) } : {}),
+          };
+        }),
+        ...(f.stampede ? { stampede: f.stampede } : {}),
+        ...(f.problem ? { problem: this.text(f.problem) } : {}),
+      })),
+      total: flows.length,
+      ...(flows.length ? {} : { note: 'no 401/403 followed by a refresh call was recorded; expire_token makes the next request(s) get 401' }),
+    };
+  }
+
+  private addSequence(i: ToolInput<'add_sequence'>): ToolResult {
+    const steps = i.steps.map((st, n) => {
+      const count = st.count !== undefined ? { count: st.count } : {};
+      switch (st.kind) {
+        case 'mock': {
+          const isJson = st.body !== undefined && typeof st.body !== 'string';
+          const headers: Record<string, string> = { ...(st.headers ?? {}) };
+          if (isJson && !Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')) headers['content-type'] = 'application/json';
+          const body = st.body === undefined ? '' : isJson ? JSON.stringify(st.body) : (st.body as string);
+          const why = agentMockRefusal(i.url, st.status, headers, isJson ? '' : body);
+          if (why) throw new AgentToolError(`add_sequence refused (step ${n + 1}): ${why}`, 'invalid');
+          return { action: { kind: 'mock' as const, status: st.status, ...(Object.keys(headers).length ? { headers } : {}), body, ...(st.delayMs !== undefined ? { delayMs: st.delayMs } : {}) }, ...count };
+        }
+        case 'block':
+          return { action: st.mode === 'reset' ? { kind: 'block' as const, mode: 'reset' as const } : { kind: 'block' as const, mode: 'status' as const, status: st.status }, ...count };
+        case 'fault':
+          return { action: { kind: 'fault' as const, fault: st.fault }, ...count };
+        case 'throttle':
+          return {
+            action: { kind: 'throttle' as const, ...(st.latencyMs !== undefined ? { latencyMs: st.latencyMs } : {}), ...(st.kbps !== undefined ? { kbps: st.kbps } : {}), ...(st.dropRate !== undefined ? { dropRate: st.dropRate } : {}) },
+            ...count,
+          };
+        default:
+          return { action: { kind: 'passthrough' as const }, ...count };
+      }
+    });
+    const summary = i.steps.map((st) => `${st.kind === 'mock' ? st.status : st.kind}${st.count && st.count > 1 ? `×${st.count}` : ''}`).join(' → ');
+    const fallback = `sequence ${i.method ?? '*'} ${i.url}${opLabel(i)}: ${summary}`;
+    return this.insertRule({
+      id: this.newId(),
+      enabled: true,
+      name: this.label(i.name, fallback.length > 300 ? `${fallback.slice(0, 299)}…` : fallback),
+      match: this.match(i),
+      action: { kind: 'sequence', steps, then: i.then },
+    });
+  }
+
+  private expireToken(i: ToolInput<'expire_token'>): ToolResult {
+    let rule: Rule;
+    try {
+      rule = expireTokenRule(this.newId(), i.url, i.count, { namePrefix: AGENT_RULE_PREFIX });
+    } catch (e) {
+      throw new AgentToolError((e as Error).message, 'invalid');
+    }
+    return { ...this.insertRule(rule), count: i.count, match: rule.match.url };
+  }
+
+  /** CONTRACTS §12.7: agents may only map to loopback targets (local backends), and never match-all. */
+  private addMapRemote(i: ToolInput<'add_map_remote'>): ToolResult {
+    if (!urlGlobHasHost(i.url)) {
+      throw new AgentToolError(`add_map_remote needs a url with a host, e.g. "https://api.example.com/*" (got ${JSON.stringify(i.url.slice(0, 100))})`, 'invalid');
+    }
+    let to: URL;
+    try {
+      to = checkMapTarget(i.to, 'to');
+    } catch (e) {
+      throw new AgentToolError((e as Error).message, 'invalid');
+    }
+    if (!LOOPBACK_HOSTS.has(to.hostname.toLowerCase())) {
+      throw new AgentToolError(
+        `agents can only map requests to a local server (localhost, 127.0.0.1 or [::1]); got ${JSON.stringify(to.hostname.slice(0, 100))}. Mapping to another host can be set up by the user in the Flutter Intercept panel.`,
+        'invalid',
+      );
+    }
+    return this.insertRule({
+      id: this.newId(),
+      enabled: true,
+      name: this.label(undefined, `map ${i.method ?? '*'} ${i.url} → ${to.origin}`),
+      match: this.match(i),
+      action: { kind: 'mapRemote', to: i.to },
+    });
+  }
+
+  /**
+   * CONTRACTS §12.7: no request headers whose names match the redaction rules (an agent must not inject or replace
+   * credentials), no "[redacted]" values, and — while redaction is on — no body find/replace: a conditional
+   * replacement is an oracle for redacted values (a matching `find` changes what the agent then sees).
+   */
+  private addRewrite(i: ToolInput<'add_rewrite'>): ToolResult {
+    const bad = (m: string) => new AgentToolError(m, 'invalid');
+    if (!urlGlobHasHost(i.url)) throw bad(`add_rewrite needs a url with a host, e.g. "https://api.example.com/*" (got ${JSON.stringify(i.url.slice(0, 100))})`);
+    if (!i.request && !i.response) throw bad('pass request and/or response changes');
+    const hasRedacted = (v: string) => v.includes(REDACTED) || v.includes(encodeURIComponent(REDACTED));
+    for (const [side, spec] of [['request', i.request], ['response', i.response]] as const) {
+      if (!spec) continue;
+      for (const [name, value] of Object.entries(spec.setHeaders ?? {})) {
+        if (side === 'request' && isSensitiveHeader(name)) {
+          throw bad(`request.setHeaders: "${name}" carries credentials, which agents can't set (they only see them redacted); the user can add such a rewrite in the panel`);
+        }
+        if (AGENT_REWRITE_FORBIDDEN.test(name.trim())) {
+          throw bad(`${side}.setHeaders: agents can't set "${name}" (redirect, cookie, browser security policy or forwarding headers); the user can add such a rewrite in the panel`);
+        }
+        if (side === 'response' && name.trim().toLowerCase() === 'content-type' && ACTIVE_CONTENT.test(value)) {
+          throw bad(`response.setHeaders: content-type "${value.slice(0, 100)}" is refused for agents: a browser would run it (HTML, JavaScript or SVG)`);
+        }
+        if (hasRedacted(value)) throw bad(`${side}.setHeaders "${name}": "[redacted]" is a placeholder, not a value`);
+      }
+      if (spec.replaceBody?.length) {
+        if (side === 'request') {
+          throw bad('request.replaceBody is not available to agents: changing what the real server receives (callback URLs, e-mail addresses, amounts) needs the user; use resend_request with an edited body to try a different payload');
+        }
+        if (spec.replaceBody.some((r) => SCRIPTISH.test(r.replace))) throw bad('response.replaceBody: the replacement looks like markup or script, which agents may not inject');
+        if (this.redact) {
+          throw bad(`${side}.replaceBody is not available to agents while secrets are redacted (a find/replace could reveal redacted values); use add_mutation to change JSON fields`);
+        }
+        for (const r of spec.replaceBody) if (hasRedacted(r.find) || hasRedacted(r.replace)) throw bad(`${side}.replaceBody: "[redacted]" is a placeholder, not a value`);
+      }
+    }
+    const strip = <T extends object>(o: T | undefined): T | undefined => (o && Object.keys(o).length ? o : undefined);
+    const request = strip(i.request);
+    const response = strip(i.response);
+    if (!request && !response) throw bad('pass request and/or response changes');
+    return this.insertRule({
+      id: this.newId(),
+      enabled: true,
+      name: this.label(i.name, `rewrite ${i.method ?? '*'} ${i.url}${opLabel(i)}`),
+      match: this.match(i),
+      action: { kind: 'rewrite', ...(request ? { request } : {}), ...(response ? { response } : {}) },
       ...this.spending(i),
     });
   }

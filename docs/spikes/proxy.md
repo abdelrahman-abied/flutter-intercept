@@ -876,6 +876,176 @@ evil origins through the proxy, quoting, browser-internal host list); several CO
 no default credentials, quoted values). Suite: **318 passing**; bundle smoke test passes (the ws hook installs in
 the minified bundle).
 
+## v0.6.0 additions (CONTRACTS §12.3, §12.4, §12.6, 2026-10-10)
+
+**Routing stays one decision per request.** `matchRule()` now returns the *applied action*: a rule's own action, or
+for a `sequence` rule the current step's (`undefined` = pass through). `Flow.action` replaced every
+`flow.rule?.action` read, so `decide()` picks the route from the step that answers *this* request: a passthrough
+step after mock steps streams (`plain`), a mutate step buffers (`h2`), a mock step answers on `h1`. Deferred GraphQL
+decisions (`onRequest`) resolve the step the same way. `responseHookFrom` treats a sequence as needing the response
+hook when any step does, and a rewrite rule when it has response body replacements.
+
+**Sequence (§12.3).**
+- One position per rule id, advanced only when a request is *counted* (the same place `times` is spent).
+- The position survives `setRules` unless the rule's `match` or `action` changed (JSON signature; the name doesn't
+  count). `resetSequences(ids?)` resets all of them, or only the given ids.
+- Step selection is a pure helper (`pickSequenceStep` in `/rules`). `count` < 1 or non-numeric counts as 1. After
+  the steps, `then` decides: `last` (the default) repeats the last step, `passthrough` sends to the server with step
+  -1, `loop` wraps around.
+- A `breakpoint` or `sequence` step passes through, with a note in `error`. `ruleProblem` reports it, and also an
+  empty sequence.
+- `'rule-hit'` is `(ruleId, used, step)` for sequence rules. `used` is the `times` count if the rule has `times`,
+  otherwise its sequence position. `step` is 0-based, -1 = after the steps.
+- `times` / `expiresAt` spend the whole rule. Exchanges get `simulated: "Sequence step 2/3"` (combined with a
+  throttle label) or `"Sequence done: passed through"`.
+- Sequence rules don't apply to WebSocket upgrades: they pass through with the usual note.
+
+**Map Remote (§12.6).**
+- `mapRemoteUrl` (pure, `/rules`) works out the target:
+  - an origin-only `to` (path `/`, no query) swaps the origin and keeps path + query;
+  - otherwise `to` replaces what the glob matched literally (the text before its first `*`), and the rest is
+    appended (with one `/` between). For example `https://api.x/v1/*` → `http://localhost:8080/api/v2` turns
+    `/v1/users/7?a` into `/api/v2/users/7?a`;
+  - a rule with no `*` maps the exact URL to exactly `to`;
+  - a /regex/ or a glob that names no path keeps the request path behind `to`'s path.
+- The scheme family follows the request (ws(s) ↔ http(s)). A target with credentials, a fragment or another scheme
+  is refused: the app gets 502 "Map Remote rule: …" and the exchange is `error`.
+- **How:** `decide()` rewrites the mockttp request itself, synchronously:
+  - `url`, `protocol`, `path`, `destination`, and the raw + object headers;
+  - this runs in the first route matcher, so mockttp's other matchers and the passthrough already see the mapped
+    target;
+  - it is therefore the **LAN deny rule's matcher that checks the mapped target** (tested: a LAN client whose rule
+    maps to `127.0.0.1` or `localhost` gets 403, and so does a GraphQL-scoped one, which `forwardChanges`
+    re-checks explicitly because it is decided later);
+  - the guarded agents then check the address actually connected to.
+  Map Remote runs on the streaming `plain` route (tested: an SSE stream's first event arrives early).
+- **Host header:**
+  - plain route: `Host` is put in the raw headers (`to`'s host, or the original with `preserveHost`);
+  - hooked routes: mockttp derives Host from the URL, and `onRequest` returns another one only when needed
+    (`wantHost`).
+  - Known noise: a *GraphQL-scoped* rule with `preserveHost` makes mockttp `console.warn` once per request
+    ("URL and host header mismatched"); harmless.
+- Upstream TLS is verified as usual (`ignoreUpstreamCertErrors` by host name). Tested strict 502 vs. an allowed
+  host.
+- The exchange keeps the app's URL (`Flow.originalUrl`). It records the headers actually sent and
+  `simulated: "Mapped to <origin>"`.
+- The network profile applies: offline → dns fault, throttle label first.
+- **WebSockets:** mockttp makes `req.url` read-only for upgrades (`defineProperty` without `writable`). So the
+  `ws-pass` step gets an own `handle` (like `ws-local`). It calls the impl's `connectUpstream(destination, mappedUrl,
+  req, rawHeaders, …)`: same agents, same TLS options, frames still recorded. `start()`-time behaviour is
+  unchanged for unmapped upgrades. If mockttp's layout changes, the upgrade fails with a note, never unmapped.
+  LAN upgrades keep the connect-time guard on the mapped destination.
+
+**Rewrite (§12.6).**
+- **Request headers** are set / removed in `decide()` (raw pairs edited in place, case and order kept), so any
+  route can carry them.
+- **Response status / headers:** on streaming routes, through the tap's head hook. `HeadPatch` gained `status`, and
+  the reason phrase follows it. On a buffered route they are applied in `onResponse`.
+- **Body replacement** is literal: `find` / `replace`, first match or `all`, at most 20 in order, empty `find`
+  ignored. It runs on the strictly decoded text (BOM kept), is re-encoded with the same content-encoding (async for
+  responses) and re-framed. Integrity headers are dropped for responses.
+  - A request body replacement routes `h1`, a response one `h2` (≤ 32 MB, like mutate).
+  - A streamed or > 5 MB request body skips only the body part, with a note; headers and status still apply.
+  - A body that isn't UTF-8 or can't be decoded is forwarded untouched, with a note.
+  - Replacements that found nothing are counted in `error`.
+- Framing / hop-by-hop / internal headers (`content-length`, `transfer-encoding`, `content-encoding`, `connection`,
+  `te`, `upgrade`, `x-fi-*`…) can't be rewritten. Invalid names or values are ignored. A request `host` set by a
+  rewrite is honoured through the same Host logic as Map Remote.
+- `simulated: "Rewritten: request headers, status 503, response body"`.
+
+**Replay (§12.4, `src/replay.ts`).** `setReplay(entries | undefined, {fallback, matchTemplates, name?})`.
+- Returns the number of usable entries; invalid entries are skipped. Invalid options throw.
+- `replay` getter for status.
+- **Matching:** rules first. Then the exact group (method + normalised URL), then with `matchTemplates` the template
+  group (method + origin + `pathTemplate(path)`, query ignored; `/rules` exports `pathTemplate` / `routeTemplate` /
+  `isIdSegment`, same id rules as the extension's codegen `routeTemplate`).
+- **Body hash:** inside a group, an entry with `requestBodyHash` matches only a request whose decoded body hashes
+  the same. The hash is hex sha256 of the decoded bytes — content-encoding removed, base64 decoded — and none for an
+  empty or truncated body, exactly like the recorder. Entries without a hash match any body.
+- **Order:** responses are served in recorded order per (tier, key, hash), then the last repeats.
+- **Bodies:** a request whose candidates need its body is routed `h1` with `replay: 'deferred'` and decided in
+  `onRequest`. A chunked or > 5 MB body can only match unhashed entries.
+- **Answer:** recorded status and headers (framing / hop-by-hop dropped). The body is re-framed:
+  - if the entry still carries a `content-encoding` and the bytes don't already decode with it, they are encoded
+    (async);
+  - bytes that do decode are sent as they are (zstd / stacked encodings the recorder kept raw);
+  - otherwise the content-length is exact.
+  The exchange is `mocked` with `simulated: "Replayed from <name>"`, and a truncated recorded body is noted.
+- **Fallback `fail`:** a `dns`-fault flow (closed inside the tunnel; CONNECT itself succeeds, so dart:io has no
+  DIRECT to fall back to). Tested with the real Dart client: 0 hits on the server. WebSocket upgrades fail the same
+  way. Fallback `passthrough` = an ordinary pass-through (profile applies).
+
+**Upstream proxy (§12.6, `src/upstream-proxy.ts`).**
+- **Why our own agents:** mockttp's `proxyConfig` path builds `https-proxy-agent` / `pac-proxy-agent`, which the
+  bundle stubs out, and it would bypass the shared pool. Instead the pool's `getAgent` hook returns our agents:
+  - **plain http:** `ProxiedHttpAgent`. Keep-alive connections to the proxy carry absolute-form requests. mockttp's
+    headers are rendered in the `ClientRequest` constructor, so `addRequest` rewrites the stored request line and
+    adds `Proxy-Authorization`;
+  - **https:** `TunnelHttpsAgent`. A CONNECT per upstream connection (pooled keep-alive afterwards), then TLS
+    inside it with mockttp's options: strict unless `ignoreUpstreamCertErrors` for that host, or the upstream
+    proxy's `ignoreCertErrors`;
+  - **ws / wss:** CONNECT tunnels.
+- Credentials in the URL become Basic `Proxy-Authorization`; the getter never shows them.
+- Only `http://host:port` is accepted. Pointing it at this proxy throws (loop).
+- `setUpstreamProxy` takes effect for new connections. Old agents are retired: idle sockets close now, busy ones
+  when done.
+- Unreachable proxy / refused CONNECT → 502 with "The upstream proxy http://… is unreachable / refused CONNECT …".
+- Emulator host aliases (10.0.2.2) still mean this machine.
+- **LAN clients:** per-gate upstream agents with a guard that **resolves and checks the final target** (the §7
+  rules: loopback, own addresses, other interfaces' routes). The tunnel then CONNECTs to **that exact IP**, so the
+  upstream proxy can't be steered by its own resolution or by rebinding.
+  - The proxy's own address may be local (Charles on loopback).
+  - Plain-HTTP LAN requests are sent absolute-form **to the checked IP**, with the original Host header (REVIEW-6
+    #11, below).
+  - Tested:
+    - a LAN client through the upstream proxy: http works, https CONNECTs to the LAN IP;
+    - `127.0.0.1` and a map to `localhost` give 403 with nothing at the proxy;
+    - the guarded agents refuse `127.0.0.1` / `localhost` before contacting the proxy.
+  - Gate agents are destroyed on `closeLan`.
+- Upstream TLS failures stay strict through the tunnel (502), and `ignoreCertErrors: true` fixes it (tested).
+
+**REVIEW-6 fixes (P).**
+- **#3 (MED) body-replacement budget:**
+  - the output may be at most **min(64 MB, max(4 × input, input + 1 MB))** (`rewriteOutputBudget`);
+  - before each replacement the occurrences are counted with `indexOf`, and the count stops the moment
+    `bytes + count × (replace − find bytes)` would pass the budget. So `replace` length × occurrences is bounded
+    without building anything;
+  - over budget → the body is forwarded unchanged, with "…the replacements would make it larger than N MB…; it was
+    forwarded unchanged." This applies to request and response;
+  - the code yields to the event loop between replacements.
+  Reviewer's case (4.5 KB JSON with 2000 `"` and a 200 KB `replace` with `all`; 4 parallel requests): bodies
+  unchanged, 4 notes, RSS growth < 100 MB asserted (was +1.9 GB, 410 MB per body).
+- **#10 loopback bypass:**
+  - The upstream-proxy agents connect **directly** to loopback targets, like `NO_PROXY=localhost,127.0.0.0/8,::1`:
+    `localhost`, `*.localhost`, a trailing dot, 127/8, ::1, IPv4-mapped forms and `0.0.0.0` / `::`
+    (`isLoopbackHost`). The same goes for the emulator aliases `10.0.2.2` / `10.0.3.2` while `rewriteLocalhost` is on
+    (connected to 127.0.0.1, TLS identity still checked against the alias name).
+  - The decision is made on the address actually connected to, so a Map Remote to loopback bypasses it too, even with
+    `preserveHost`.
+  - LAN agents never bypass: their guard refuses loopback first.
+  - Tested: six direct URLs (http / https × 127.0.0.1 / localhost / alias) and a Map Remote to `localhost`, with
+    nothing at the proxy, while a non-loopback name still goes through it.
+- **#11 rebinding:** for LAN plain HTTP the absolute-form request line names **the IP the guard checked**
+  (`GET http://<ip>:<port>/…`), and Host keeps the name. The upstream proxy has nothing to resolve, which closes the
+  window.
+  - Node renders the head early: in the constructor for array headers, and into `outputData` once `end()` runs while
+    the guard is still checking. So the agent rewrites the request line in `_header` or in the queued first chunk,
+    and fails the request if it can find neither.
+  - Unit test: a guard pinning `rebind.attacker.test` → 127.0.0.1. The proxy sees `GET http://127.0.0.1:<port>/x?y=1`,
+    and the server sees `Host: rebind.attacker.test:<port>`.
+- **#12 self-loop check:**
+  - normalised: trailing dots stripped, IPv4-mapped IPv6 folded (`normalizeIp`), any loopback / unspecified address,
+    this proxy's host, and the machine's LAN addresses on our port;
+  - refused: `localhost.`, `[::ffff:127.0.0.1]`, `[::1]`, `127.1.2.3`, `0.0.0.0` (tested).
+- New getter `upstreamProxyDisplay` (`host:port`, never credentials).
+
+**Tests:** `test/v6.test.ts` (31 after REVIEW-6: pure helpers, sequence, Map Remote incl. WebSocket and HTTPS strictness, rewrite incl.
+gzip / br / binary / chunked upload, replay incl. hashes / templates / fail / encodings, upstream proxy with a tiny
+local proxy: absolute-form + CONNECT, auth, runtime switch, strict TLS, WebSockets, unreachable), 3 in
+`test/lan.test.ts` (mapped-target SSRF, LAN via upstream proxy, guarded upstream agents), 3 real-Dart tests in
+`test/dart.test.ts` (Map Remote over HTTPS, replay `fail` without DIRECT fallback, 401-then-passthrough sequence).
+Suite: **356 passing** (incl. the REVIEW-6 tests above: v6 31, LAN +1). Bundle smoke test (`npm run test:bundle`) passes. New files: `src/{replay,template,upstream-proxy}.ts`.
+
 ## Open issues
 
 - LAN mode: **IPv4 only** (per contract). The SSRF rule is route-based and macOS-only
@@ -935,3 +1105,12 @@ the minified bundle).
     after 1.5 s" / "…reset after 300.0 s"). Please confirm or adjust §9.2.
 12. **(v0.3.0) `setNetworkProfile` throws** on an invalid profile (unknown kind, negative values, `dropRate`
     outside 0–1); the host should surface it as an `error`.
+13. **(v0.6.0) `ReplayOptions.name?: string`** — used for `simulated: "Replayed from <name>"` (accepted today as an extra
+    field of `setReplay`'s options). `setReplay` returns the number of usable entries; `replay` getter for status.
+14. **(v0.6.0) `'rule-hit'` gains a third argument `step`** for sequence rules (0-based, -1 = after the steps); `used` is the
+    sequence position for sequence rules without `times`. `resetSequences(ruleIds?: string[])` takes optional ids.
+15. **(v0.6.0) Map Remote:** a `to` whose path is `/` (no query) is an origin mapping; anything else is a prefix that
+    replaces the glob's literal prefix. `to` without http(s)/ws(s), with credentials or a fragment → 502 + `error`.
+16. **(v0.6.0)** `setUpstreamProxy(cfg | undefined)` throws on a non-`http://host:port` URL or one pointing at this proxy;
+    getter `upstreamProxy` (no credentials). `WEBSOCKET_ACTIONS` includes `mapRemote` (ruleProblem updated).
+

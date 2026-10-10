@@ -1,10 +1,11 @@
 // Pure, dependency-free rule helpers (type-only imports). The webview imports this module
 // (`@flutter-intercept/proxy/rules`) so its preview can never disagree with the proxy.
-import type { Exchange, Matcher, Rule, RuleAction } from './types';
+import type { Exchange, Matcher, Rule, RuleAction, SequenceStep } from './types';
 import { graphqlOperationNames } from './graphql';
 
 export { detectGraphql, graphqlOperationNames, scanOperations } from './graphql';
 export type { GraphqlDetection, GraphqlOperationRef, GraphqlRequest } from './graphql';
+export { isIdSegment, pathTemplate, routeTemplate } from './template';
 
 /**
  * `body` (the decoded request body text) matters only for matchers with `graphqlOperation` (CONTRACTS §11.2);
@@ -287,8 +288,8 @@ export function findRule(rules: CompiledRule[], method: string, url: string, bod
   return undefined;
 }
 
-/** Rule actions that apply to a WebSocket upgrade (CONTRACTS §11.1); the others pass it through. */
-export const WEBSOCKET_ACTIONS: ReadonlySet<RuleAction['kind']> = new Set(['block', 'fault']);
+/** Rule actions that apply to a WebSocket upgrade (CONTRACTS §11.1, §12.6); the others pass it through. */
+export const WEBSOCKET_ACTIONS: ReadonlySet<RuleAction['kind']> = new Set(['block', 'fault', 'mapRemote']);
 
 /**
  * Why a rule can't do what it says, for rule editors and agent tools (undefined = fine). Today: a rule whose
@@ -297,6 +298,8 @@ export const WEBSOCKET_ACTIONS: ReadonlySet<RuleAction['kind']> = new Set(['bloc
  * GraphQL subscription is inside the frames, not in the upgrade request).
  */
 export function ruleProblem(rule: Pick<Rule, 'match' | 'action'>): string | undefined {
+  const own = actionProblem(rule.action);
+  if (own) return own;
   const url = (rule.match?.url ?? '').trim();
   if (!/^wss?:\/\//i.test(url)) return undefined;
   const kind = rule.action?.kind;
@@ -307,7 +310,7 @@ export function ruleProblem(rule: Pick<Rule, 'match' | 'action'>): string | unde
     return 'The truncate fault does not apply to WebSockets; use reset, timeout or dns.';
   }
   if (kind && !WEBSOCKET_ACTIONS.has(kind)) {
-    return `${kind[0].toUpperCase()}${kind.slice(1)} rules do not apply to WebSocket connections (only block and fault do).`;
+    return `${kind[0].toUpperCase()}${kind.slice(1)} rules do not apply to WebSocket connections (only block, fault and mapRemote do).`;
   }
   return undefined;
 }
@@ -412,4 +415,153 @@ function sseEventText(f: { event?: string; id?: string; text?: string }): string
   if (f.id !== undefined) out += `id: ${f.id}\n`;
   for (const line of (f.text ?? '').split('\n')) out += `data: ${line}\n`;
   return `${out}\n`;
+}
+
+// ---------------------------------------------------------------- v0.6.0 (CONTRACTS §12.3, §12.6)
+
+/** Actions a sequence step may not use. */
+const NOT_A_STEP: ReadonlySet<string> = new Set(['sequence', 'breakpoint']);
+/** At most this many literal body replacements per rewrite side (CONTRACTS §12.6). */
+export const MAX_BODY_REPLACEMENTS = 20;
+
+/** What a sequence step does: an action, or `undefined` = the real server (`passthrough`). */
+export type StepAction = Exclude<SequenceStep['action'], { kind: 'passthrough' }> | undefined;
+
+export interface PickedStep {
+  /** The action to apply (`undefined` = pass through to the real server). */
+  action: StepAction;
+  /** 0-based index of the step that answers, or -1 after the steps with `then: 'passthrough'` (or no steps). */
+  index: number;
+  /** Set when the step's action is not allowed (`breakpoint` / `sequence`): it passes through instead. */
+  invalid?: string;
+}
+
+/** `count` of a step: a positive integer, default 1. */
+export function stepCount(s: SequenceStep | undefined): number {
+  const c = Number(s?.count ?? 1);
+  return Number.isFinite(c) && c >= 1 ? Math.floor(c) : 1;
+}
+
+/**
+ * The step that answers the `n`-th (0-based) matching request of a sequence rule. Each step answers `count`
+ * requests in order; afterwards `then`: `last` (default) keeps the last step, `passthrough` sends everything to
+ * the real server, `loop` starts again at the first step.
+ */
+export function pickSequenceStep(a: { steps?: SequenceStep[]; then?: 'last' | 'passthrough' | 'loop' }, n: number): PickedStep {
+  const steps = Array.isArray(a.steps) ? a.steps : [];
+  if (steps.length === 0) return { action: undefined, index: -1 };
+  const total = steps.reduce((t, s) => t + stepCount(s), 0);
+  let k = Math.max(0, Math.floor(n));
+  if (k >= total) {
+    if (a.then === 'passthrough') return { action: undefined, index: -1 };
+    if (a.then === 'loop') k %= total;
+    else k = total - 1;
+  }
+  let index = 0;
+  for (; index < steps.length - 1; index++) {
+    const c = stepCount(steps[index]);
+    if (k < c) break;
+    k -= c;
+  }
+  const action = steps[index]?.action;
+  if (!action || typeof action !== 'object' || action.kind === 'passthrough') return { action: undefined, index };
+  if (NOT_A_STEP.has(action.kind)) {
+    return { action: undefined, index, invalid: `Sequence step ${index + 1} (${action.kind}) is not allowed; the request was passed through.` };
+  }
+  return { action: action as StepAction, index };
+}
+
+/** The literal part of a glob before its first `*` (undefined for a /regex/ or a match-all). */
+function globPrefix(pattern: string): string | undefined {
+  const p = (pattern ?? '').trim();
+  if (p === '' || p === '*' || REGEX_LITERAL.test(p)) return undefined;
+  const star = p.indexOf('*');
+  return star < 0 ? p : p.slice(0, star);
+}
+
+const WS_TO_HTTP: Record<string, string> = { 'ws:': 'http:', 'wss:': 'https:' };
+const HTTP_TO_WS: Record<string, string> = { 'http:': 'ws:', 'https:': 'wss:' };
+
+/** Parse a Map Remote target (`to`): an absolute http(s) / ws(s) URL without credentials or fragment. */
+export function parseMapTarget(to: string): URL {
+  let t: URL;
+  try {
+    t = new URL(String(to ?? '').trim());
+  } catch {
+    throw new Error(`Map Remote target is not a URL: ${JSON.stringify(String(to ?? '')).slice(0, 200)}`);
+  }
+  if (!['http:', 'https:', 'ws:', 'wss:'].includes(t.protocol)) throw new Error(`Map Remote target must be http(s)://, got ${t.protocol}`);
+  if (!t.hostname) throw new Error('Map Remote target has no host');
+  if (t.username || t.password) throw new Error('Map Remote target must not contain credentials');
+  if (t.hash) throw new Error('Map Remote target must not contain a #fragment');
+  return t;
+}
+
+/**
+ * Where a Map Remote rule sends a request (CONTRACTS §12.6). `to` is either an origin
+ * (`https://staging.example.com`: only the origin changes, path and query are kept) or a URL prefix
+ * (`http://localhost:8080/api/v2`): it replaces the part of the URL the rule's glob matched literally — the text
+ * before its first `*` (for `https://api.example.com/v1/*` that is `https://api.example.com/v1/`) — and the rest
+ * (path + query) is appended. A /regex/ or match-all rule replaces the origin and puts the prefix's path in front
+ * of the request path. The scheme family follows the request: a ws(s):// request maps to ws(s)://. Throws on an
+ * invalid target.
+ */
+export function mapRemoteUrl(original: string, matchUrl: string, to: string): string {
+  const t = parseMapTarget(to);
+  const o = new URL(original);
+  const isWs = o.protocol === 'ws:' || o.protocol === 'wss:';
+  const proto = isWs ? (HTTP_TO_WS[t.protocol] ?? t.protocol) : (WS_TO_HTTP[t.protocol] ?? t.protocol);
+  const origin = `${proto}//${t.host}`;
+  const originOnly = (t.pathname === '/' || t.pathname === '') && !t.search;
+  if (originOnly) return `${origin}${o.pathname}${o.search}`;
+  const base = `${origin}${t.pathname}${t.search}`;
+  const originalOrigin = `${o.protocol}//${o.host}`;
+  let prefix = globPrefix(matchUrl);
+  if (prefix !== undefined && !original.startsWith(prefix)) prefix = undefined;
+  // Never less than the origin (a glob like `https://api.*` names no path to replace).
+  if (prefix === undefined || prefix.length <= originalOrigin.length) prefix = `${originalOrigin}/`;
+  const rest = original.slice(prefix.length);
+  if (rest === '') return base;
+  if (rest.startsWith('?')) return t.search ? `${base}&${rest.slice(1)}` : `${base}${rest}`;
+  if (base.endsWith('/') && rest.startsWith('/')) return base + rest.slice(1);
+  if (prefix.endsWith('/') && !base.endsWith('/') && !rest.startsWith('/')) return `${base}/${rest}`;
+  return base + rest;
+}
+
+/** Problems with an action's own settings (v0.6.0 actions), for rule editors and agent tools. */
+function actionProblem(a: RuleAction | undefined): string | undefined {
+  if (!a || typeof a !== 'object') return undefined;
+  if (a.kind === 'sequence') {
+    if (!Array.isArray(a.steps) || a.steps.length === 0) return 'A sequence needs at least one step.';
+    for (let i = 0; i < a.steps.length; i++) {
+      const s = a.steps[i]?.action;
+      if (!s || typeof s !== 'object') return `Sequence step ${i + 1} has no action.`;
+      if (NOT_A_STEP.has(s.kind)) return `Sequence step ${i + 1}: ${s.kind} can't be a step.`;
+      if (s.kind !== 'passthrough') {
+        const inner = actionProblem(s as RuleAction);
+        if (inner) return `Sequence step ${i + 1}: ${inner}`;
+      }
+    }
+    return undefined;
+  }
+  if (a.kind === 'mapRemote') {
+    try {
+      parseMapTarget(a.to);
+    } catch (e) {
+      return (e as Error).message;
+    }
+    return undefined;
+  }
+  if (a.kind === 'rewrite') {
+    for (const side of [a.request, a.response]) {
+      const r = side?.replaceBody;
+      if (!r) continue;
+      if (r.length > MAX_BODY_REPLACEMENTS) return `At most ${MAX_BODY_REPLACEMENTS} body replacements per side.`;
+      if (r.some((x) => typeof x?.find !== 'string' || x.find === '')) return 'A body replacement needs non-empty text to find.';
+    }
+    const st = a.response?.status;
+    if (st !== undefined && (!Number.isInteger(st) || st < 200 || st > 599)) return `Rewrite status must be 200–599, got ${st}.`;
+    return undefined;
+  }
+  return undefined;
 }

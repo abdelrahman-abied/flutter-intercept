@@ -3,6 +3,7 @@ import * as https from 'https';
 import * as tls from 'tls';
 import * as zlib from 'zlib';
 import { once } from 'events';
+import * as net from 'net';
 import type { AddressInfo } from 'net';
 import { generateCACertificate } from 'mockttp';
 import { InterceptProxy, type Exchange, type ExchangeState, type InterceptProxyOptions } from '../src';
@@ -226,4 +227,68 @@ export async function settled(proxy: InterceptProxy, timeoutMs = 3000): Promise<
     if (!all.some((e) => e.state === 'pending') || Date.now() > until) return all;
     await sleep(5);
   }
+}
+
+export interface TinyProxy {
+  url: string;
+  port: number;
+  seen: string[];
+  close(): Promise<void>;
+}
+
+/** Names the tiny proxy resolves itself (to 127.0.0.1): targets that are not loopback for the proxy under test. */
+const FAKE_NAME = /\.example\.invalid$/i;
+const tinyResolve = (host: string) => (FAKE_NAME.test(host) ? '127.0.0.1' : host);
+
+/**
+ * A minimal HTTP proxy: absolute-form forwarding and CONNECT tunnels; optional Basic auth. `*.example.invalid`
+ * resolves to 127.0.0.1 here (only here), so tests can reach local servers by a non-loopback name.
+ */
+export async function startTinyProxy(auth?: string): Promise<TinyProxy> {
+  const seen: string[] = [];
+  const sockets = new Set<net.Socket>();
+  const server = http.createServer((req, res) => {
+    if (auth && req.headers['proxy-authorization'] !== auth) return void res.writeHead(407).end();
+    seen.push(`${req.method} ${req.url}`);
+    const u = new URL(req.url!);
+    const headers = { ...req.headers };
+    delete headers['proxy-authorization'];
+    const out = http.request({ host: tinyResolve(u.hostname), port: u.port, path: u.pathname + u.search, method: req.method, headers }, (r) => {
+      res.writeHead(r.statusCode!, r.headers);
+      r.pipe(res);
+    });
+    out.on('error', () => res.writeHead(502).end());
+    req.pipe(out);
+  });
+  server.on('connection', (s) => {
+    sockets.add(s);
+    s.on('close', () => sockets.delete(s));
+  });
+  server.on('connect', (req, socket: net.Socket, head) => {
+    if (auth && req.headers['proxy-authorization'] !== auth) return void socket.end('HTTP/1.1 407 Proxy Authentication Required\r\ncontent-length: 0\r\n\r\n');
+    seen.push(`CONNECT ${req.url}`);
+    const i = req.url!.lastIndexOf(':');
+    const t = net.connect(Number(req.url!.slice(i + 1)), tinyResolve(req.url!.slice(0, i).replace(/^\[|\]$/g, '')), () => {
+      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head.length) t.write(head);
+      t.pipe(socket);
+      socket.pipe(t);
+    });
+    sockets.add(t);
+    t.on('close', () => sockets.delete(t));
+    t.on('error', () => socket.destroy());
+    socket.on('error', () => t.destroy());
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const port = (server.address() as AddressInfo).port;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    port,
+    seen,
+    async close() {
+      for (const s of sockets) s.destroy();
+      await new Promise((r) => server.close(r));
+    },
+  };
 }

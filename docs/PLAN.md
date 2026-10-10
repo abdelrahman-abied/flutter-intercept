@@ -125,3 +125,14 @@ Contract: CONTRACTS §11. Same rules as before.
 | H host + agent | `src/agent/**`, `src/ui/controller.ts`, `src/proxyHost.ts`, their tests, `test/integration/suite/agent.ts` |
 | W webview | `packages/webview/**` except `protocol.ts` |
 | lead | contract, `extension.ts`, extension `package.json`, docs, device E2E, review |
+
+## v0.6.0 — Teams & scenarios (started 2026-10-10, branch `feature/0.6.0`)
+Contract: CONTRACTS §12. Same rules as before.
+| Agent | Owns |
+|---|---|
+| P proxy | `sequence`, `mapRemote`, `rewrite`, `setReplay`, `upstreamProxy` — `packages/proxy/**` except `types.ts`/`network.ts` |
+| S shared rules | `src/rules/**` (shared file, approval gate, bodyFile), its tests |
+| R recordings | `src/recordings/**`, `src/analysis/**`, their tests |
+| H host + agent | `src/agent/**`, `src/ui/controller.ts`, `src/proxyHost.ts`, their tests, `test/integration/suite/agent.ts` |
+| W webview | `packages/webview/**` except `protocol.ts` |
+| lead | contract, `extension.ts`, extension `package.json`, docs, E2E, review |

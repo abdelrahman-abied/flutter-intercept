@@ -116,7 +116,9 @@ export interface Matcher {
 }
 
 export type RuleAction =
-  | { kind: 'mock'; status: number; headers?: Record<string, string>; body: string; delayMs?: number }
+  | { kind: 'mock'; status: number; headers?: Record<string, string>; body: string; delayMs?: number;
+      /** CONTRACTS §12.2: workspace-relative file whose content is the body (the host resolves it into `body`). */
+      bodyFile?: string }
   | { kind: 'block'; mode: 'reset' | 'status'; status?: number } // reset = connection reset
   | { kind: 'breakpoint'; phase: 'request' | 'response' | 'both' }
   // CONTRACTS §9.2. throttle passes through to the real server, slowed; dropRate 0–1 = share reset instead.
@@ -126,7 +128,28 @@ export type RuleAction =
   | { kind: 'mutate'; ops: MutateOp[] }
   // CONTRACTS §11: pass through, but answer CORS preflights locally and add CORS headers to the response
   // (development only — the real server's CORS policy is NOT fixed by this).
-  | { kind: 'cors'; allowOrigin?: string; allowCredentials?: boolean };
+  | { kind: 'cors'; allowOrigin?: string; allowCredentials?: boolean }
+  // CONTRACTS §12.3–12.5 (v0.6.0)
+  /** Steps applied to successive matching requests ("first 500, then 200"). */
+  | { kind: 'sequence'; steps: SequenceStep[]; then?: 'last' | 'passthrough' | 'loop' }
+  /** Forward to another server (origin, or URL prefix replacing the matched prefix); the app sees the original URL. */
+  | { kind: 'mapRemote'; to: string; preserveHost?: boolean }
+  /** Change headers / status / body text of the real request or response (literal find/replace, no regex). */
+  | { kind: 'rewrite'; request?: RewriteSpec; response?: RewriteSpec & { status?: number } };
+
+export interface SequenceStep {
+  /** Any action except `sequence` and `breakpoint`; `{kind:'passthrough'}` = the real server. */
+  action: Exclude<RuleAction, { kind: 'sequence' } | { kind: 'breakpoint' }> | { kind: 'passthrough' };
+  /** How many matching requests this step answers (default 1). */
+  count?: number;
+}
+
+export interface RewriteSpec {
+  setHeaders?: Record<string, string>;
+  removeHeaders?: string[];
+  /** Literal replacements on the decoded text body, applied in order (≤ 20). */
+  replaceBody?: { find: string; replace: string; all?: boolean }[];
+}
 
 /**
  * One change to a JSON response body. `path` is the JSON path subset of `@flutter-intercept/proxy/jsonpath`
@@ -157,6 +180,8 @@ export interface Rule {
   times?: number;
   /** Epoch ms after which the rule is spent. */
   expiresAt?: number;
+  /** CONTRACTS §12.1: comes from the shared `.vscode/flutter-intercept.json` (read-only in place; edit the file). */
+  shared?: true;
   /** Read-only, set by the host for rules with `times`: matching requests so far. Never persisted; ignored by setRules. */
   used?: number;
 }
@@ -211,4 +236,25 @@ export interface InterceptProxyOptions {
   rewriteLocalhost?: boolean;
   /** CONTRACTS §11: keep at most this many frames per WebSocket / SSE exchange (newest kept). Default 500. */
   maxFramesPerExchange?: number;
+  /** CONTRACTS §12.6: chain to another proxy (Charles, Burp, a corporate proxy): `http://host:port`. */
+  upstreamProxy?: { url: string; ignoreCertErrors?: boolean };
+}
+
+/** CONTRACTS §12.4: one recorded response to replay. */
+export interface ReplayEntry {
+  method: string;
+  url: string;                     // absolute, as recorded
+  status: number;
+  headers: Record<string, string | string[]>;
+  body?: Body;
+  requestBodyHash?: string;        // sha256 of the decoded request body, to tell POSTs apart
+}
+
+export interface ReplayOptions {
+  /** What unmatched requests do: go to the real server, or fail like offline (demo mode). */
+  fallback: 'passthrough' | 'fail';
+  /** Match on the URL path template too (`/users/42` ≈ `/users/7`) when no exact URL matches. */
+  matchTemplates?: boolean;
+  /** Recording name for the `simulated` label ("Replayed from <name>"). */
+  name?: string;
 }

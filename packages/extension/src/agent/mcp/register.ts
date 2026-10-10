@@ -57,11 +57,21 @@ async function getOrCreateToken(secrets: vscode.SecretStorage): Promise<string> 
   return token;
 }
 
+/**
+ * REVIEW-6 #1: agent settings come from the USER settings only (scope `application`, and read via `inspect` because
+ * older hosts / Cursor may ignore the scope): a repo's .vscode/settings.json must not open the MCP server, change
+ * its port or raise agent access.
+ */
+export function userAgentSetting<T>(c: Pick<vscode.WorkspaceConfiguration, 'inspect'>, key: string, fallback: T): T {
+  const v = c.inspect<T>(key)?.globalValue;
+  return v === undefined ? fallback : v;
+}
+
 function agentConfig() {
   const c = vscode.workspace.getConfiguration('flutterIntercept.agent');
-  const port = c.get<number>('mcpPort', DEFAULT_MCP_PORT);
+  const port = userAgentSetting<number>(c, 'mcpPort', DEFAULT_MCP_PORT);
   return {
-    access: c.get<string>('access', 'readWrite'),
+    access: userAgentSetting<string>(c, 'access', 'readWrite'),
     port: Number.isInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_MCP_PORT,
   };
 }

@@ -3,6 +3,7 @@ import { AppContext, useApp } from '../context';
 import type { Host } from '../host';
 import type { HostMsg, Status } from '../protocol';
 import { agentLine } from '../util';
+import { FALLBACK_LABEL, pendingApprovalText, INSECURE_TITLE, SHARED_FILE, UPSTREAM_TITLE } from '../scenarios';
 import {
   filterExchanges, findExchange, hasActiveFilters, hiddenBrowserCount, initialState, isProfileActive, pausedCount, profileLabel, reducer,
   toPersisted, visibleWarnings, type Persisted, type State,
@@ -11,6 +12,8 @@ import { Button, useNow } from './bits';
 import { DetailPane } from './DetailPane';
 import { Composer } from './Editors';
 import { Icon } from './Icon';
+import { AuthFlowsView } from './AuthFlowsView';
+import { RecordingsView } from './RecordingsView';
 import { RulesView } from './RulesView';
 import { Toolbar } from './Toolbar';
 import { TrafficList } from './TrafficList';
@@ -68,9 +71,14 @@ export function App({ host }: { host: Host }) {
         <Toolbar />
         <HostErrorBar />
         <NoticeBar />
+        <ReplayBar />
+        <SharedRulesBanner />
         <WarningsBar />
         <main class="content">
-          {state.view === 'traffic' ? <TrafficView /> : <RulesView />}
+          {state.view === 'traffic' ? <TrafficView />
+            : state.view === 'rules' ? <RulesView />
+            : state.view === 'recordings' ? <RecordingsView />
+            : <AuthFlowsView />}
         </main>
         <StatusLine />
       </div>
@@ -202,6 +210,17 @@ function StatusLine() {
           LAN open for iPhone · {status.lan.host}:{status.lan.port}
         </span>
       )}
+      {status.upstreamProxy && (
+        <span class="upstream-status" title={UPSTREAM_TITLE(status.upstreamProxy)}>
+          via upstream proxy {status.upstreamProxy}
+          {status.upstreamProxyInsecure && <span class="insecure" title={INSECURE_TITLE}> · certificate checks OFF</span>}
+        </span>
+      )}
+      {status.replay && (
+        <span class="replay-status" title={`Answering requests from the recording “${status.replay.recording}”; unmatched requests ${FALLBACK_LABEL[status.replay.fallback]}.`}>
+          Replaying {status.replay.recording}
+        </span>
+      )}
       {status.agent && <AgentStatusItem agent={status.agent} />}
     </footer>
   );
@@ -259,6 +278,56 @@ function WarningsBar() {
           <Button kind="icon" title="Dismiss this warning" onClick={() => dispatch({ type: 'dismissWarning', id: w.id })}><Icon name="close" /></Button>
         </div>
       ))}
+    </div>
+  );
+}
+
+/** CONTRACTS §12.4: replay mode is easy to forget — a clear bar with Stop while it is on. */
+export function ReplayBar() {
+  const { state, post } = useApp();
+  const r = state.status.replay;
+  if (!r) return null;
+  return (
+    <div class="replay-bar" role="status" aria-label="Replay">
+      <Icon name="play" />
+      <span class="replay-text">
+        <strong>Replaying “{r.recording}”</strong> — matching requests are answered from the recording (rules still win);
+        unmatched requests {FALLBACK_LABEL[r.fallback]}.
+      </span>
+      <span class="spacer" />
+      <Button kind="primary" title="Stop replaying: requests go to the real server again" onClick={() => post({ type: 'replayRecording' })}>
+        <Icon name="stop" /> Stop replay
+      </Button>
+    </div>
+  );
+}
+
+/**
+ * CONTRACTS §12.1 approval gate: shared rules that map traffic to another host or set request headers are held
+ * back until the user approves this file content. Approving asks once more, naming the file.
+ */
+export function SharedRulesBanner() {
+  const { state, post } = useApp();
+  const sr = state.status.sharedRules;
+  if (!sr || sr.pendingApproval <= 0) return null;
+  const file = sr.file ?? SHARED_FILE;
+  return (
+    <div class="approval-banner" role="alert" aria-label="Shared rules awaiting approval">
+      <div class="approval-line">
+        <span class="warning-icon" aria-hidden="true">⚠</span>
+        <span class="approval-text">{pendingApprovalText(sr)}</span>
+        <span class="spacer" />
+        <Button onClick={() => post({ type: 'openSharedRules' })} title={`Open ${file} in the editor`}>Review file</Button>
+        <Button kind="primary" onClick={() => post({ type: 'approveSharedRules' })}
+          title={`Run the held-back rules for this content of ${file} (VS Code asks to confirm; a later change to the file asks again)`}>
+          Approve…
+        </Button>
+      </div>
+      {sr.pending && sr.pending.length > 0 && (
+        <ul class="approval-list" aria-label="Held-back rules">
+          {sr.pending.map((p, i) => <li key={i}><strong>{p.name}</strong> — {p.reason}</li>)}
+        </ul>
+      )}
     </div>
   );
 }

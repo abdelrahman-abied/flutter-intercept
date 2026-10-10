@@ -66,6 +66,19 @@
           "default": true,
           "description": "Record where in your code each request was made (a stack trace sent out of band to the proxy), so you can jump from a request to its source line. Takes effect on the next launch. Flutter sessions only (plain Dart programs always record)."
         },
+        "flutterIntercept.upstreamProxy": {
+          "type": "string",
+          "default": "",
+          "pattern": "^$|^http://[^\\s/@]+(:\\d+)?/?$",
+          "description": "Send intercepted traffic on through another HTTP proxy (for example Charles or Burp at http://127.0.0.1:8888, or a corporate proxy). Empty = connect to servers directly.",
+          "scope": "machine"
+        },
+        "flutterIntercept.upstreamProxyIgnoreCertErrors": {
+          "type": "boolean",
+          "default": false,
+          "description": "Accept any certificate from servers reached through the upstream proxy. Needed only when that proxy decrypts HTTPS itself (Charles, Burp). Leave off otherwise.",
+          "scope": "machine"
+        },
         "flutterIntercept.web.enabled": {
           "type": "boolean",
           "default": true,
@@ -107,19 +120,22 @@
             "AI agents can only read traffic.",
             "No access for AI agents."
           ],
-          "description": "What AI agents (Copilot agent mode, Claude Code, Cursor, other MCP clients) may do."
+          "description": "What AI agents (Copilot agent mode, Claude Code, Cursor, other MCP clients) may do.",
+          "scope": "application"
         },
         "flutterIntercept.agent.redactSecrets": {
           "type": "boolean",
           "default": true,
-          "description": "Hide Authorization, cookies, API keys, tokens and passwords from AI agents (tool results and HAR exports). The app always receives the real values."
+          "description": "Hide Authorization, cookies, API keys, tokens and passwords from AI agents (tool results and HAR exports). The app always receives the real values.",
+          "scope": "application"
         },
         "flutterIntercept.agent.mcpPort": {
           "type": "number",
           "default": 47823,
           "minimum": 1024,
           "maximum": 65535,
-          "description": "Port of the local MCP server for AI agents (listens on 127.0.0.1 only). If it is busy, the next free port is used."
+          "description": "Port of the local MCP server for AI agents (listens on 127.0.0.1 only). If it is busy, the next free port is used.",
+          "scope": "application"
         }
       }
     },
@@ -953,12 +969,93 @@
         ]
       },
       {
+        "name": "flutter_intercept_list_recordings",
+        "displayName": "Flutter Intercept: List traffic recordings",
+        "toolReferenceName": "interceptListRecordings",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "List saved traffic recordings.",
+        "modelDescription": "List the saved traffic recordings (id, name, createdAt, number of exchanges, whether secrets were redacted) and which one is being replayed, if any. Recordings are made with save_recording or from the traffic panel and live in the project's .dart_tool/flutter_intercept/recordings/ (not committed).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_diff_recordings",
+        "displayName": "Flutter Intercept: Compare two recordings",
+        "toolReferenceName": "interceptDiffRecordings",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Compare two traffic recordings.",
+        "modelDescription": "Compare two recordings route by route (method + path template such as GET /users/{id}): routes added or removed, status changes, JSON shape changes (keys added/removed, type changes), how many body values changed (values are never shown), call-count changes and responses more than 2x slower. Use it to see what a backend or app change did to the traffic: save a recording before and after, then diff them (a = before, b = after). Details are redacted.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "a": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "The earlier / baseline recording."
+            },
+            "b": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "The recording to compare with it."
+            }
+          },
+          "required": [
+            "a",
+            "b"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_get_auth_flows",
+        "displayName": "Flutter Intercept: Analyse token refresh flows",
+        "toolReferenceName": "interceptGetAuthFlows",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Show 401 → token refresh → retry flows.",
+        "modelDescription": "Find the app's token refresh flows in the recorded traffic: each 401/403, the refresh call(s) that followed and the retried request(s), with a stampede warning when the app sent several refresh calls for one expiry within 2 s, and a problem when the retry never happened or got 401 again. Steps carry exchange ids, method, redacted URL and status (read them with get_request). Combine with expire_token to test the refresh logic: expire_token, trigger the flow, then get_auth_flows.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "sinceMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Only exchanges that started at or after this time (epoch milliseconds)."
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
         "name": "flutter_intercept_add_mock",
         "displayName": "Flutter Intercept: Add mock rule",
         "toolReferenceName": "interceptAddMock",
         "canBeReferencedInPrompt": true,
         "userDescription": "Add a rule that answers matching requests with a fake response.",
-        "modelDescription": "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins. Pass times (e.g. 1 = only the next request, to test a retry) or ttlMs to have it removed automatically; otherwise remove it with remove_rule when done. GraphQL: all operations share one URL, so pass graphqlOperation (e.g. \"GetUser\") to mock just that operation (list_requests shows the names).",
+        "modelDescription": "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins. Pass times (e.g. 1 = only the next request, to test a retry) or ttlMs to have it removed automatically; otherwise remove it with remove_rule when done. GraphQL: all operations share one URL, so pass graphqlOperation (e.g. \"GetUser\") to mock just that operation (list_requests shows the names). Refused: HTML / JavaScript / SVG content types (or an untyped HTML body), and 3xx redirects whose location leaves the request's own origin (except to localhost).",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1731,6 +1828,585 @@
             "allowCredentials": {
               "description": "Also allow credentials (cookies): Access-Control-Allow-Credentials: true. Default false. Not allowed with allowOrigin \"*\".",
               "type": "boolean"
+            },
+            "times": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "description": "Apply the rule to the first N matching requests only (1-1000); it is then removed automatically."
+            },
+            "ttlMs": {
+              "type": "integer",
+              "minimum": 1000,
+              "maximum": 86400000,
+              "description": "Remove the rule automatically after this many milliseconds (1000-86400000)."
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Optional label; it is shown as \"[agent] <name>\" in the rules list."
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_save_recording",
+        "displayName": "Flutter Intercept: Save a traffic recording",
+        "toolReferenceName": "interceptSaveRecording",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Save the recorded traffic as a recording.",
+        "modelDescription": "Save the finished HTTP exchanges (optionally only those matching url / since sinceMs; WebSocket, SSE and read-only native-client traffic is not recorded) as a named recording under the project's .dart_tool/flutter_intercept/recordings/. Secrets are saved as \"[redacted]\" unless you pass redact: false. Use recordings to replay a backend state offline (replay_recording) or to compare traffic before and after a change (diff_recordings). Returns {id, name, exchanges}.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100,
+              "description": "A name for the recording, e.g. \"checkout happy path\"."
+            },
+            "url": {
+              "description": "Only exchanges whose URL matches this glob. Omit for every finished HTTP request.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
+            },
+            "sinceMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Only exchanges that started at or after this time (epoch milliseconds)."
+            },
+            "redact": {
+              "default": true,
+              "description": "Save secrets (auth headers, cookies, tokens) as \"[redacted]\" (default true). Replays of a redacted recording send \"[redacted]\" values to the app.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_replay_recording",
+        "displayName": "Flutter Intercept: Replay a recording",
+        "toolReferenceName": "interceptReplayRecording",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Answer requests from a saved recording (or stop replaying).",
+        "modelDescription": "Answer the app's requests from a saved recording instead of the real server: the same method + URL (and request body) gets the recorded response; several recorded responses for one request are served in order; requests whose path differs only in ids (/users/42 vs /users/7) match by path template. Rules still win. fallback decides what unmatched requests do: \"passthrough\" (real server, default) or \"fail\" (like offline — a fully offline demo). Replayed exchanges carry simulated: \"Replayed from <name>\". Call it without id to stop replaying (do this when done); get_status / list_recordings show what is being replayed.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "Recording to replay. Omit to stop replaying.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "fallback": {
+              "default": "passthrough",
+              "description": "Requests the recording has no answer for: \"passthrough\" (go to the real server) or \"fail\" (fail like offline, for a fully offline demo).",
+              "type": "string",
+              "enum": [
+                "passthrough",
+                "fail"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_add_sequence",
+        "displayName": "Flutter Intercept: Add a scenario (sequence) rule",
+        "toolReferenceName": "interceptAddSequence",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Add a rule whose answer changes from request to request.",
+        "modelDescription": "Make successive matching requests get different answers, to test retries, polling and recovery: steps [{kind:\"mock\", status:500, count:2}, {kind:\"passthrough\"}] fails the first two requests and lets the third reach the server. Step kinds: mock (status, body, headers, delayMs), block (status or reset), fault (reset, timeout, truncate, dns), throttle (latencyMs, kbps, dropRate), passthrough (the real server); count = how many requests each step answers (default 1). then: \"last\" (default) keeps the last step, \"passthrough\", or \"loop\". Mock steps have add_mock's limits (no HTML/JavaScript, no redirects off the request's origin). The rule is inserted first; remove it with remove_rule when done. The panel and rule-hit show which step answered.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL glob on the full URL; * matches any characters (e.g. \"https://api.example.com/v1/users*\", \"*/users/*\"). Matched against the URL as you see it (redacted query values read \"[redacted]\")."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "graphqlOperation": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "pattern": "^[_A-Za-z][_0-9A-Za-z]*$",
+              "description": "Only GraphQL requests with this operation name (exact, case-sensitive), e.g. \"GetUser\". The url glob still applies (usually the GraphQL endpoint, e.g. \"*/graphql\")."
+            },
+            "steps": {
+              "minItems": 1,
+              "maxItems": 50,
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "mock"
+                      },
+                      "status": {
+                        "default": 200,
+                        "type": "integer",
+                        "minimum": 100,
+                        "maximum": 599
+                      },
+                      "headers": {
+                        "description": "Response headers. content-type defaults to application/json when body is an object.",
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string"
+                        },
+                        "additionalProperties": {
+                          "type": "string"
+                        }
+                      },
+                      "body": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "propertyNames": {
+                              "type": "string"
+                            },
+                            "additionalProperties": {}
+                          },
+                          {
+                            "type": "array",
+                            "items": {}
+                          }
+                        ],
+                        "description": "Response body: text, or a JSON object/array (sent as JSON)."
+                      },
+                      "delayMs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
+                      "count": {
+                        "description": "How many successive matching requests this step answers (1-1000, default 1).",
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "block"
+                      },
+                      "mode": {
+                        "default": "status",
+                        "type": "string",
+                        "enum": [
+                          "status",
+                          "reset"
+                        ]
+                      },
+                      "status": {
+                        "default": 403,
+                        "type": "integer",
+                        "minimum": 100,
+                        "maximum": 599
+                      },
+                      "count": {
+                        "description": "How many successive matching requests this step answers (1-1000, default 1).",
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "fault"
+                      },
+                      "fault": {
+                        "type": "string",
+                        "enum": [
+                          "reset",
+                          "timeout",
+                          "truncate",
+                          "dns"
+                        ]
+                      },
+                      "count": {
+                        "description": "How many successive matching requests this step answers (1-1000, default 1).",
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "fault"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "throttle"
+                      },
+                      "latencyMs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600000
+                      },
+                      "kbps": {
+                        "type": "number",
+                        "minimum": 1,
+                        "maximum": 10000000
+                      },
+                      "dropRate": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "count": {
+                        "description": "How many successive matching requests this step answers (1-1000, default 1).",
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "passthrough"
+                      },
+                      "count": {
+                        "description": "How many successive matching requests this step answers (1-1000, default 1).",
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "description": "What successive matching requests get, in order (1-50 steps), e.g. [{kind:\"mock\", status:500, count:2}, {kind:\"passthrough\"}]."
+            },
+            "then": {
+              "default": "last",
+              "description": "After the last step: \"last\" keeps answering with the last step (default), \"passthrough\" lets requests reach the server, \"loop\" starts over.",
+              "type": "string",
+              "enum": [
+                "last",
+                "passthrough",
+                "loop"
+              ]
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Optional label; it is shown as \"[agent] <name>\" in the rules list."
+            }
+          },
+          "required": [
+            "url",
+            "steps"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_expire_token",
+        "displayName": "Flutter Intercept: Expire the auth token",
+        "toolReferenceName": "interceptExpireToken",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Make matching requests fail with 401 \"token expired\" for a while.",
+        "modelDescription": "Simulate an expired access token: the next count (default 1) requests matching url get 401 {\"error\":\"token_expired\"}; after that the real server answers again. Use it to test the app's token refresh: expire_token on the authenticated API, trigger a request, then get_auth_flows (did it refresh once and retry?) or assert_traffic. Inserted first; remove it with remove_rule when done.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL glob of the authenticated request(s) whose token should look expired, e.g. \"https://api.example.com/v1/*\"."
+            },
+            "count": {
+              "default": 1,
+              "description": "How many matching requests get 401 before the real server answers again (1-1000, default 1).",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_add_map_remote",
+        "displayName": "Flutter Intercept: Map requests to a local server",
+        "toolReferenceName": "interceptAddMapRemote",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Send matching requests to a local server instead.",
+        "modelDescription": "Redirect matching requests to a local backend (http://localhost:<port>, 127.0.0.1 or [::1], optionally with a path prefix): the path and query after the matched URL are kept, the app still sees the original URL, and exchanges carry simulated: \"Mapped to <origin>\". Requests keep their headers (including credentials), so map only to your own local server. Agents can only map to loopback targets; the user can map elsewhere from the panel. The url must name a host. Inserted first; remove it with remove_rule when done.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL glob WITH a host of the requests to redirect, e.g. \"https://api.example.com/*\"."
+            },
+            "to": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "description": "Loopback target origin or URL prefix: http://localhost:<port>, http://127.0.0.1:<port> or http://[::1]:<port> (optionally with a path prefix). Other hosts are refused for agents."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            }
+          },
+          "required": [
+            "url",
+            "to"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_add_rewrite",
+        "displayName": "Flutter Intercept: Add a rewrite rule",
+        "toolReferenceName": "interceptAddRewrite",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Add a rule that changes headers, status or body text of real requests or responses.",
+        "modelDescription": "Let matching requests reach the real server but change them on the way: request {setHeaders, removeHeaders, replaceBody} before forwarding, response {status, setHeaders, removeHeaders, replaceBody} before the app gets it. replaceBody is a literal find/replace on the decoded text (1-20 replacements, no regex). Use it for feature flags in headers, forcing a status, or patching a response text. Refused: setting request headers that carry credentials (Authorization, Cookie, *token*, *session*, *api-key* …); setting Location, Refresh, Set-Cookie, Content-Security-Policy, Access-Control-*, X-Forwarded-*, Forwarded, Host or method-override headers, or an HTML/JavaScript content-type; \"[redacted]\" values; request.replaceBody; markup or script in replacements; and — while secrets are redacted — response replaceBody (a find/replace could reveal redacted values); use add_mutation for JSON fields. The url must name a host. Inserted first; times / ttlMs remove it automatically, otherwise use remove_rule.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL glob WITH a host, e.g. \"https://api.example.com/v1/*\"."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "graphqlOperation": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "pattern": "^[_A-Za-z][_0-9A-Za-z]*$",
+              "description": "Only GraphQL requests with this operation name (exact, case-sensitive), e.g. \"GetUser\". The url glob still applies (usually the GraphQL endpoint, e.g. \"*/graphql\")."
+            },
+            "request": {
+              "type": "object",
+              "properties": {
+                "setHeaders": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "description": "Headers to set (replacing any existing value)."
+                },
+                "removeHeaders": {
+                  "maxItems": 50,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
+                },
+                "replaceBody": {
+                  "minItems": 1,
+                  "maxItems": 20,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "find": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 10240,
+                        "description": "Literal text to find (no regex)."
+                      },
+                      "replace": {
+                        "type": "string",
+                        "maxLength": 65536,
+                        "description": "Replacement text (at most 64 KB; all find + replace texts of a rule at most 256 KB)."
+                      },
+                      "all": {
+                        "description": "Replace every occurrence (default: the first only).",
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "find",
+                      "replace"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "description": "Literal find/replace on the decoded text body, applied in order (1-20). Non-text bodies are left untouched."
+                }
+              },
+              "additionalProperties": false,
+              "description": "Changes to the request before it is forwarded to the real server."
+            },
+            "response": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "integer",
+                  "minimum": 100,
+                  "maximum": 599
+                },
+                "setHeaders": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "description": "Headers to set (replacing any existing value)."
+                },
+                "removeHeaders": {
+                  "maxItems": 50,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
+                },
+                "replaceBody": {
+                  "minItems": 1,
+                  "maxItems": 20,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "find": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 10240,
+                        "description": "Literal text to find (no regex)."
+                      },
+                      "replace": {
+                        "type": "string",
+                        "maxLength": 65536,
+                        "description": "Replacement text (at most 64 KB; all find + replace texts of a rule at most 256 KB)."
+                      },
+                      "all": {
+                        "description": "Replace every occurrence (default: the first only).",
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "find",
+                      "replace"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "description": "Literal find/replace on the decoded text body, applied in order (1-20). Non-text bodies are left untouched."
+                }
+              },
+              "additionalProperties": false,
+              "description": "Changes to the real server's response before the app gets it."
             },
             "times": {
               "type": "integer",

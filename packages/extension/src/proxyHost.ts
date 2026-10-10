@@ -14,10 +14,13 @@
  * - CONTRACTS §11.4: forwards `record` / `update` (read-only exchanges from the app's HTTP profile) and keeps the
  *   per-session `SessionWarning`s (`setWarnings`, `warnings`, event 'warnings'); `vmHostDeps()` hands both to
  *   the VM watcher (src/vm/**).
+ * - CONTRACTS §12: forwards `setReplay` (state kept for `Status.replay`), `resetSequences` and the upstream proxy
+ *   (all re-applied after a restart); resolves `mock.bodyFile` (also inside sequence steps) through an injected
+ *   resolver before rules reach the proxy — a rule whose file can't be read is skipped and reported as a warning.
  */
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
-import type { Exchange, InterceptProxyOptions, Rule, SendRequest } from '@flutter-intercept/proxy';
+import type { Exchange, InterceptProxyOptions, ReplayEntry, ReplayOptions, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 import type { SessionWarning } from './ui/protocol';
 import type { VmHostDeps } from './vm/types';
@@ -59,6 +62,63 @@ export interface ProxyLike {
   update?(id: string, patch: Partial<Exchange>): void;
   // CONTRACTS §11.3: while a web session runs, the browser's own traffic is marked `browserInternal`.
   setWebSessionActive?(active: boolean): void;
+  // CONTRACTS §12. Optional: older proxy builds lack them. `name` (the recording's) is for `simulated` labels.
+  setReplay?(entries: ReplayEntry[] | undefined, opts: ReplayOptions & { name?: string }): void;
+  resetSequences?(): void;
+  setUpstreamProxy?(cfg: UpstreamProxy | undefined): void;
+  /** The upstream proxy in use (`http://host:port`, never credentials). */
+  readonly upstreamProxy?: { url: string; ignoreCertErrors: boolean };
+}
+
+/** REVIEW-6 #1: `host:port` of an upstream proxy URL — never user info, path or query. */
+export function upstreamDisplay(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    const u = new URL(url);
+    return `${u.hostname}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/** CONTRACTS §12.6: `InterceptProxyOptions.upstreamProxy`. */
+export type UpstreamProxy = NonNullable<InterceptProxyOptions['upstreamProxy']>;
+
+/** CONTRACTS §12.4: what is being replayed (`Status.replay` + the recording id). */
+export interface ReplayState {
+  id?: string;
+  recording: string;
+  fallback: ReplayOptions['fallback'];
+  entries: number;
+}
+
+/** Validates the upstream proxy setting: `http://host:port` (no path, query or credentials in the log). */
+export function checkUpstreamProxy(cfg: unknown): UpstreamProxy | undefined {
+  if (cfg === undefined || cfg === null) return undefined;
+  if (typeof cfg !== 'object' || Array.isArray(cfg)) throw new Error('upstreamProxy must be an object {url, ignoreCertErrors?}');
+  const { url, ignoreCertErrors } = cfg as Record<string, unknown>;
+  if (typeof url !== 'string' || !url.trim()) throw new Error('upstreamProxy.url must be a URL such as http://127.0.0.1:8888');
+  let u: URL;
+  try {
+    u = new URL(url.trim());
+  } catch {
+    throw new Error('upstreamProxy.url must be a URL such as http://127.0.0.1:8888');
+  }
+  if (u.protocol !== 'http:') throw new Error('upstreamProxy.url must be an http:// proxy URL (HTTPS goes through it with CONNECT)');
+  if ((u.pathname && u.pathname !== '/') || u.search || u.hash) throw new Error('upstreamProxy.url must be just http://host:port');
+  if (ignoreCertErrors !== undefined && typeof ignoreCertErrors !== 'boolean') throw new Error('upstreamProxy.ignoreCertErrors must be a boolean');
+  return { url: url.trim(), ...(ignoreCertErrors === true ? { ignoreCertErrors: true } : {}) };
+}
+
+/** Does this rule (or one of its sequence steps) take its mock body from a file? */
+export function bodyFilesOf(rule: Rule): string[] {
+  const out: string[] = [];
+  const visit = (a: RuleAction | { kind: 'passthrough' }) => {
+    if (a.kind === 'mock' && typeof a.bodyFile === 'string' && a.bodyFile) out.push(a.bodyFile);
+    if (a.kind === 'sequence') for (const s of a.steps ?? []) visit(s.action as RuleAction);
+  };
+  if (rule.action) visit(rule.action);
+  return out;
 }
 
 /** CONTRACTS §11.4: bounds for what the VM layer may put into Status.warnings. */
@@ -119,7 +179,8 @@ export interface InterceptProxyHostOptions {
 /**
  * Events: 'exchange' (Exchange), 'removed' (string[]), 'state' (running: boolean),
  * 'lan' ({host, port} | undefined — never the token), 'rule-spent' (ruleId, reason), 'rule-hit' (ruleId, used),
- * 'warnings' (SessionWarning[], the full current list — after every change).
+ * 'warnings' (SessionWarning[], the full current list — after every change), 'replay' (ReplayState | undefined),
+ * 'upstream' ({display, ignoreCertErrors} | undefined).
  * Rules, the network profile and the app package names are kept here so they survive restarts and
  * apply from the first request.
  */
@@ -142,6 +203,15 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private readonly sessionWarnings = new Map<string, SessionWarning[]>();
   private recordUnsupportedLogged = false;
   private webSessionActive = false;
+  // CONTRACTS §12
+  /** What the proxy actually got: `rules` with file-backed bodies resolved (rules whose file failed are left out). */
+  private proxyRules: Rule[] = [];
+  private rulesGen = 0;
+  private rulesApplied: Promise<void> = Promise.resolve();
+  private bodyResolver?: (path: string) => Promise<string>;
+  private bodyWarnings: SessionWarning[] = [];
+  private replayState?: ReplayState & { list: ReplayEntry[]; opts: ReplayOptions };
+  private upstream?: UpstreamProxy;
 
   constructor(private readonly opts: InterceptProxyHostOptions) {
     super();
@@ -187,6 +257,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         host: this.opts.host ?? '127.0.0.1',
         ...(ca ? { ca } : {}),
         ...(rewrite !== undefined ? { rewriteLocalhost: rewrite } : {}),
+        ...(this.upstream ? { upstreamProxy: this.upstream } : {}),
       });
       try {
         await proxy.start();
@@ -195,7 +266,9 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         if (isAddrInUse(e)) continue;
         throw e;
       }
-      proxy.setRules(this.rules);
+      proxy.setRules(this.proxyRules);
+      if (this.upstream) proxy.setUpstreamProxy?.(this.upstream);
+      this.applyReplay(proxy);
       if (this.profile.kind !== 'none') this.applyProfile(proxy); // a new proxy starts with none
       if (this.appPackages.length) proxy.setAppPackages?.(this.appPackages);
       if (this.webSessionActive) proxy.setWebSessionActive?.(true);
@@ -312,9 +385,183 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     }
   }
 
+  /**
+   * The rules as authored (what `getRules` returns, persisted and shown). The proxy gets them with every
+   * `mock.bodyFile` resolved into `body` (CONTRACTS §12.2): synchronously when no rule uses a file, otherwise once
+   * the files are read (`rulesReady()`); a rule whose file can't be read is left out and reported in `warnings`.
+   */
   setRules(rules: Rule[]): void {
     this.rules = rules;
-    this.proxy?.setRules(rules);
+    this.applyRules();
+  }
+
+  /** Resolves when the latest `setRules` / body-file refresh reached the proxy. */
+  rulesReady(): Promise<void> {
+    return this.rulesApplied;
+  }
+
+  /** CONTRACTS §12.2: reads a workspace-relative body file (SharedRulesService.resolveBodyFile). */
+  setBodyFileResolver(resolve: ((path: string) => Promise<string>) | undefined): void {
+    this.bodyResolver = resolve;
+    if (this.rules.some((r) => bodyFilesOf(r).length)) this.applyRules();
+  }
+
+  /** A body file changed (or every one, without `path`): re-reads the rules that use it. */
+  refreshBodyFiles(path?: string): void {
+    if (this.rules.some((r) => (path === undefined ? bodyFilesOf(r).length > 0 : bodyFilesOf(r).includes(path)))) this.applyRules();
+  }
+
+  private applyRules(): void {
+    const gen = ++this.rulesGen;
+    const rules = this.rules;
+    if (!rules.some((r) => bodyFilesOf(r).length)) {
+      this.proxyRules = rules;
+      this.proxy?.setRules(rules);
+      this.setBodyWarnings([]);
+      this.rulesApplied = Promise.resolve();
+      return;
+    }
+    this.rulesApplied = this.resolveBodies(rules).then(
+      ({ resolved, problems }) => {
+        if (gen !== this.rulesGen) return;
+        this.proxyRules = resolved;
+        this.proxy?.setRules(resolved);
+        this.setBodyWarnings(problems);
+      },
+      (e: unknown) => this.opts.log?.(`applying rules failed: ${e instanceof Error ? e.message : String(e)}`),
+    );
+  }
+
+  private async resolveBodies(rules: Rule[]): Promise<{ resolved: Rule[]; problems: SessionWarning[] }> {
+    const cache = new Map<string, Promise<string>>();
+    const read = (p: string): Promise<string> => {
+      if (!this.bodyResolver) return Promise.reject(new Error('file-backed mock bodies are not available'));
+      let r = cache.get(p);
+      if (!r) cache.set(p, (r = this.bodyResolver(p)));
+      return r;
+    };
+    const resolveAction = async (a: RuleAction): Promise<RuleAction> => {
+      if (a.kind === 'mock' && a.bodyFile) {
+        const { bodyFile, ...rest } = a;
+        const text = await read(bodyFile);
+        if (typeof text !== 'string') throw new Error(`body file ${bodyFile} is not text`);
+        return { ...rest, body: text };
+      }
+      if (a.kind === 'sequence') {
+        const steps = await Promise.all(a.steps.map(async (s) => (s.action.kind === 'mock' && s.action.bodyFile ? { ...s, action: (await resolveAction(s.action)) as typeof s.action } : s)));
+        return { ...a, steps };
+      }
+      return a;
+    };
+    const resolved: Rule[] = [];
+    const problems: SessionWarning[] = [];
+    for (const rule of rules) {
+      if (!bodyFilesOf(rule).length) {
+        resolved.push(rule);
+        continue;
+      }
+      try {
+        resolved.push({ ...rule, action: await resolveAction(rule.action) });
+      } catch (e) {
+        const label = rule.name?.trim() || rule.id;
+        const why = e instanceof Error ? e.message : String(e);
+        problems.push({ id: `bodyFile:${rule.id}`, kind: 'other', text: `Rule "${label}" is skipped: its mock body file can't be used (${why}).`.replace(/[\r\n]+/g, ' ').slice(0, MAX_WARNING_TEXT) });
+        this.opts.log?.(`rule ${rule.id} skipped: body file: ${why}`);
+      }
+    }
+    return { resolved, problems };
+  }
+
+  private setBodyWarnings(list: SessionWarning[]): void {
+    if (JSON.stringify(list) === JSON.stringify(this.bodyWarnings)) return;
+    const before = JSON.stringify(this.warnings);
+    this.bodyWarnings = list.slice(0, MAX_WARNINGS_PER_SESSION);
+    const after = this.warnings;
+    if (JSON.stringify(after) !== before) this.emit('warnings', after);
+  }
+
+  // ------------------------------------------------------------------ CONTRACTS §12.4 replay, §12.3, §12.6
+
+  /** What is being replayed, if anything (never the entries). */
+  get replay(): ReplayState | undefined {
+    const r = this.replayState;
+    return r ? { ...(r.id !== undefined ? { id: r.id } : {}), recording: r.recording, fallback: r.fallback, entries: r.entries } : undefined;
+  }
+
+  /**
+   * Starts (entries) or stops (undefined) answering requests from a recording; kept and re-applied when the proxy
+   * restarts. Throws when the running proxy build can't replay. Emits 'replay' with the new state.
+   */
+  setReplay(entries: ReplayEntry[] | undefined, opts: ReplayOptions = { fallback: 'passthrough' }, meta: { id?: string; name: string } = { name: 'recording' }): void {
+    if (!entries) {
+      const had = !!this.replayState;
+      this.replayState = undefined;
+      this.proxy?.setReplay?.(undefined, { fallback: 'passthrough' });
+      if (had) this.emit('replay', undefined);
+      return;
+    }
+    if (this.proxy && !this.proxy.setReplay) throw new Error('This proxy build cannot replay recordings.');
+    const fallback = opts.fallback === 'fail' ? 'fail' : 'passthrough';
+    this.replayState = {
+      ...(meta.id !== undefined ? { id: meta.id } : {}),
+      recording: meta.name,
+      fallback,
+      entries: entries.length,
+      list: entries,
+      opts: { fallback, ...(opts.matchTemplates !== undefined ? { matchTemplates: opts.matchTemplates } : {}) },
+    };
+    if (this.proxy) this.applyReplay(this.proxy);
+    this.emit('replay', this.replay);
+  }
+
+  private applyReplay(proxy: ProxyLike): void {
+    const r = this.replayState;
+    if (!r) return;
+    if (!proxy.setReplay) {
+      this.opts.log?.('this proxy build cannot replay recordings: replay stopped');
+      this.replayState = undefined;
+      this.emit('replay', undefined);
+      return;
+    }
+    proxy.setReplay(r.list, { ...r.opts, name: r.recording });
+  }
+
+  /** CONTRACTS §12.3: restart every sequence rule at its first step (no-op on older proxy builds). */
+  resetSequences(): void {
+    this.proxy?.resetSequences?.();
+  }
+
+  /** CONTRACTS §12.6: chain pass-through traffic to another proxy (undefined = direct). Kept across restarts. */
+  setUpstreamProxy(cfg: UpstreamProxy | undefined): void {
+    const next = checkUpstreamProxy(cfg);
+    if (JSON.stringify(next) === JSON.stringify(this.upstream)) return;
+    this.upstream = next;
+    const proxy = this.proxy;
+    if (proxy) {
+      if (proxy.setUpstreamProxy) proxy.setUpstreamProxy(next);
+      else this.opts.log?.('this proxy build cannot change the upstream proxy while running: it applies when the proxy restarts');
+    }
+    this.emit('upstream', this.upstreamProxyInfo);
+  }
+
+  get upstreamProxy(): UpstreamProxy | undefined {
+    return this.upstream;
+  }
+
+  /**
+   * REVIEW-6 #1: what Status / get_status show — `host:port` of the upstream proxy in use (what the running proxy
+   * reports, else the stored setting), never credentials; `ignoreCertErrors` = upstream TLS checks are off.
+   */
+  get upstreamProxyInfo(): { display: string; ignoreCertErrors: boolean } | undefined {
+    const live = this.proxy?.upstreamProxy;
+    const src = live ?? (this.upstream ? { url: this.upstream.url, ignoreCertErrors: this.upstream.ignoreCertErrors === true } : undefined);
+    const display = upstreamDisplay(src?.url);
+    return src && display ? { display, ignoreCertErrors: src.ignoreCertErrors === true } : undefined;
+  }
+
+  /** `Status.upstreamProxy`: `host:port`, or undefined when traffic goes direct. */
+  get upstreamProxyDisplay(): string | undefined {
+    return this.upstreamProxyInfo?.display;
   }
 
   getRules(): Rule[] {
@@ -450,11 +697,11 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     if (JSON.stringify(after) !== before) this.emit('warnings', after);
   }
 
-  /** Every session's warnings, deduplicated by id (first wins). */
+  /** Every session's warnings and the rules' body-file problems, deduplicated by id (first wins). */
   get warnings(): SessionWarning[] {
     const seen = new Set<string>();
     const out: SessionWarning[] = [];
-    for (const list of this.sessionWarnings.values()) {
+    for (const list of [...this.sessionWarnings.values(), this.bodyWarnings]) {
       for (const w of list) {
         if (seen.has(w.id)) continue;
         seen.add(w.id);

@@ -183,3 +183,32 @@ describe('real Dart HttpClient through the proxy', () => {
     expect(ex.error).toMatch(/TLS handshake/);
   });
 });
+
+describe('real Dart HttpClient: v0.6.0 (CONTRACTS §12)', () => {
+  it('Map Remote over HTTPS: a host that does not exist answers from the mapped server', async () => {
+    proxy.setRules([{ id: 'm', enabled: true, match: { url: 'https://api.example.invalid/*' }, action: { kind: 'mapRemote', to: up.httpsUrl } }]);
+    const r = await run('https://api.example.invalid/json');
+    expect(r).toMatchObject({ code: 0, status: 200, body: '{"hello":"world"}' });
+    expect((await settled(proxy))[0]).toMatchObject({ url: 'https://api.example.invalid/json', state: 'completed', simulated: `Mapped to ${up.httpsUrl}` });
+  }, 60_000);
+
+  it('replay with fallback fail: an unrecorded HTTPS request fails, with no DIRECT fallback to the real server', async () => {
+    proxy.setReplay([{ method: 'GET', url: `${up.httpsUrl}/json`, status: 200, headers: { 'content-type': 'application/json' }, body: { text: '{"replayed":true}', encoding: 'utf8' } }], { fallback: 'fail', name: 'demo' });
+    expect(await run(`${up.httpsUrl}/json`)).toMatchObject({ code: 0, status: 200, body: '{"replayed":true}' });
+    const miss = await run(`${up.httpsUrl}/echo`);
+    expect(miss.status).toBeUndefined();
+    expect(miss.error).toMatch(/HttpException|Connection/);
+    expect(up.hits).toEqual([]);
+    expect((await settled(proxy)).map((e) => [e.state, e.simulated])).toEqual([
+      ['mocked', 'Replayed from demo'],
+      ['blocked', 'Not in the recording "demo" (replay: fail)'],
+    ]);
+  }, 60_000);
+
+  it('sequence "expire token": 401 once, then the real server', async () => {
+    proxy.setRules([{ id: 'x', enabled: true, match: { url: `${up.httpsUrl}/json` }, action: { kind: 'sequence', steps: [{ action: { kind: 'mock', status: 401, body: '{"error":"token_expired"}' } }, { action: { kind: 'passthrough' } }] } }]);
+    expect(await run(`${up.httpsUrl}/json`)).toMatchObject({ status: 401, body: '{"error":"token_expired"}' });
+    expect(await run(`${up.httpsUrl}/json`)).toMatchObject({ status: 200, body: '{"hello":"world"}' });
+    expect(up.hits).toEqual(['GET /json']);
+  }, 60_000);
+});

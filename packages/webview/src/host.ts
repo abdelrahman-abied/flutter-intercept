@@ -19,7 +19,7 @@ export interface Host {
   onMessage(listener: (msg: HostMsg) => void): () => void;
 }
 
-const HOST_TYPES = new Set(['snapshot', 'exchange', 'rules', 'status', 'removed', 'error', 'cleared', 'sent', 'contract']);
+const HOST_TYPES = new Set(['snapshot', 'exchange', 'rules', 'status', 'removed', 'error', 'cleared', 'sent', 'contract', 'recordings', 'authFlows']);
 
 export function isHostMsg(data: unknown): data is HostMsg {
   return typeof data === 'object' && data !== null && HOST_TYPES.has((data as { type?: unknown }).type as string);

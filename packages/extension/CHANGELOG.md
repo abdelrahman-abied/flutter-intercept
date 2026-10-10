@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.6.0
+
+### Teams and scenarios
+
+**Shared rules in the repo**
+- Rules can live in `.vscode/flutter-intercept.json` and be committed with your project; **Share** moves a rule there.
+  Teammates get them on their next pull. Shared rules run before your personal ones and can't be edited by accident
+  in the panel.
+- Rules from the repo that could send your app's requests elsewhere or change what it receives (Map Remote to
+  another host, request rewrites, redirects, HTML/JS responses, CORS) are held until you approve them, one by one,
+  in a dialog that shows exactly what each does. A rule that changes later is held again.
+- Mock bodies can come from a file (**Body from file**), edited like any other file. Secrets are refused when sharing
+  or writing body files.
+
+**Scenarios**
+- **Sequence** rules answer successive requests differently: "first 500, then 200", "two timeouts, then the real
+  server".
+- **Expire token…** on a request: the next N calls get 401, then the real server — test your token refresh.
+- The **Auth flows** view shows 401 → refresh → retry timelines and warns about refresh stampedes (several refresh
+  calls for one expiry).
+
+**Record and replay**
+- **Recordings**: save the current traffic, replay it as mocks (fall back to the real server, or fail like offline
+  for demo mode), and diff two recordings side by side (status, JSON shape, call count and timing changes).
+  Recordings stay in `.dart_tool` and are refused unredacted where git would track them.
+
+**Map Remote, rewrite, upstream proxy**
+- **Map Remote** sends matching requests to another server (staging, a local backend) while the app keeps its URLs.
+- **Rewrite** sets or removes headers, changes the status, or replaces text in bodies.
+- `flutterIntercept.upstreamProxy` chains Flutter Intercept to Charles, Burp or a corporate proxy (user settings
+  only; shown in the panel). Local traffic never goes through it.
+
+### Agent API
+- New tools: `save_recording`, `list_recordings`, `replay_recording`, `diff_recordings`, `add_sequence`,
+  `expire_token`, `add_map_remote` (local servers only), `add_rewrite`, `get_auth_flows`.
+
+### Security
+- Settings that could route traffic or widen agent access (`upstreamProxy*`, `agent.*`) are read from your user
+  settings only, never from a workspace's `.vscode/settings.json`.
+
 ## 0.5.0
 
 ### Coverage: Web, WebSockets, SSE, GraphQL, native clients

@@ -15,18 +15,31 @@ import { resetOrDestroy } from 'mockttp/dist/util/socket-util';
 import type { RequestMatcher } from 'mockttp/dist/rules/matchers';
 import type { CompletedBody, CompletedRequest, OngoingRequest, TlsHandshakeFailure } from 'mockttp';
 
+import { isUtf8 } from 'buffer';
 import {
   BODY_CAP_BYTES,
   cleanHeaders,
   decodeForDisplay,
+  decodeStrict,
   deleteHeader,
   frameBody,
   frameBodyAsync,
   getHeader,
   normalizedEncoding,
+  setHeader,
   type HeaderBag,
 } from './body';
-import { compileRules, isInvalidMatcher, WEBSOCKET_ACTIONS, type CompiledRule } from './rules';
+import {
+  compileRules,
+  isInvalidMatcher,
+  mapRemoteUrl,
+  MAX_BODY_REPLACEMENTS,
+  pickSequenceStep,
+  WEBSOCKET_ACTIONS,
+  type CompiledRule,
+} from './rules';
+import { ReplayStore, requestBodyHash, type BodyKey } from './replay';
+import { createUpstreamAgents, isLoopbackHost, parseUpstreamProxy, retireAgents, type UpstreamAgents, type UpstreamProxyConfig, type UpstreamProxySpec } from './upstream-proxy';
 import { detectGraphql, graphqlOperationNames } from './graphql';
 import {
   allowedOrigin,
@@ -62,8 +75,10 @@ import {
   lanIPv4Addresses,
   lanTargetDenial,
   lanTesting,
+  normalizeIp,
   onComboConnection,
   refuse,
+  resolveCheckedTarget,
   RESPONSE_407,
   SSRF_MARKER,
 } from './lan';
@@ -78,11 +93,27 @@ import type {
   Frame,
   InterceptProxyOptions,
   MutateOp,
+  ReplayEntry,
+  ReplayOptions,
   RequestEdit,
   ResponseEdit,
+  RewriteSpec,
   Rule,
+  RuleAction,
   SendRequest,
 } from './types';
+
+/** The action a request gets: the rule's, or the current sequence step's (undefined = pass through). */
+type Applied = Exclude<RuleAction, { kind: 'sequence' }> | undefined;
+type RewriteAction = Extract<RuleAction, { kind: 'rewrite' }>;
+
+interface RewriteFlow {
+  request?: RewriteSpec;
+  response?: RewriteSpec & { status?: number };
+  /** Body replacements to apply (false when the body can't be held: streamed / too large). */
+  reqBody: boolean;
+  resBody: boolean;
+}
 
 type CallbackRequestResult = mockttp.requestSteps.CallbackRequestResult;
 type CallbackResponseResult = mockttp.requestSteps.CallbackResponseResult;
@@ -147,6 +178,24 @@ interface Flow {
   preflight?: boolean;
   /** A cors rule: add CORS headers to the real response (CONTRACTS §11.3). */
   corsPatch?: CorsOptions;
+  // CONTRACTS §12 (v0.6.0)
+  /** The action applied: the rule's, or the current sequence step's; undefined = pass through. */
+  action?: Applied;
+  /** Sequence rules: the step that answers (0-based; -1 = after the steps, passed through). */
+  step?: number;
+  /** The URL the app asked for, when Map Remote sends the request elsewhere (recorded as the exchange URL). */
+  originalUrl?: string;
+  /** Map Remote: the URL the request goes to and the Host header it carries. */
+  map?: { url: string; host: string };
+  rewrite?: RewriteFlow;
+  /** Map / request-header rewrites were applied to the request in decide() (else onRequest applies them). */
+  reqApplied?: boolean;
+  /** Replay: the recorded response to answer with, or 'deferred' (the request body hash is needed first). */
+  replay?: ReplayEntry | 'deferred';
+  /** Answer 502 with this text (e.g. an unusable Map Remote target). */
+  localError?: string;
+  /** Hooked routes: the Host header to send when it isn't the URL's (preserveHost, a rewritten Host). */
+  wantHost?: string;
 }
 
 /** Recording state of a WebSocket / event stream. */
@@ -175,6 +224,10 @@ interface MatchOptions {
 
 interface MatchResult {
   rule?: Rule;
+  /** The action for this request (a sequence rule's current step); undefined = pass through. */
+  action?: Applied;
+  /** Sequence rules: the step (see Flow.step). */
+  step?: number;
   /** A GraphQL-scoped rule needs the body to decide. */
   deferred?: boolean;
   /** …and some candidate from there on needs the response hook (response breakpoint / mutate). */
@@ -357,6 +410,14 @@ export class InterceptProxy extends EventEmitter {
   private readonly records = new Set<string>();
   /** A Flutter Web session is running: tag the browser's own requests (CONTRACTS §11.3). */
   private webSession = false;
+  /** Sequence position per rule id, with the rule content it belongs to (CONTRACTS §12.3). */
+  private readonly seq = new Map<string, { sig: string; n: number }>();
+  /** Replay mode (CONTRACTS §12.4). */
+  private replayStore?: ReplayStore;
+  /** CONTRACTS §12.6: pass-through traffic goes via this HTTP proxy. */
+  private upstreamSpec?: UpstreamProxySpec;
+  /** Upstream-proxy agents for LAN sockets, per gate (they check the final target). */
+  private readonly lanUpstream = new WeakMap<LanGate, UpstreamAgents>();
 
   constructor(private readonly opts: InterceptProxyOptions) {
     super();
@@ -366,6 +427,7 @@ export class InterceptProxy extends EventEmitter {
     this.breakpointTimeoutMs = opts.breakpointTimeoutMs ?? DEFAULT_BREAKPOINT_TIMEOUT_MS;
     const mf = opts.maxFramesPerExchange ?? DEFAULT_MAX_FRAMES;
     this.maxFrames = Number.isFinite(mf) ? Math.max(0, Math.floor(mf)) : DEFAULT_MAX_FRAMES;
+    if (opts.upstreamProxy) this.upstreamSpec = parseUpstreamProxy(opts.upstreamProxy);
   }
 
   /** Actual port after start() (0 before). */
@@ -513,9 +575,21 @@ export class InterceptProxy extends EventEmitter {
     const localWsStep = Object.assign(new RejectWebSocketStep(500), {
       handle: (req: OngoingRequest, socket: net.Socket) => this.onWsLocal(req, socket),
     });
+    // Map Remote on an upgrade (CONTRACTS §12.6): mockttp makes req.url read-only for websockets, so the mapped
+    // target is handed to the step's own connectUpstream (same agents, TLS options and recording hook).
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const proxy = this;
+    const passWsStep = Object.assign(new PassThroughWebSocketStep(connection), {
+      handle: function (this: any, req: OngoingRequest, socket: net.Socket, head: Buffer, options: unknown) {
+        const impl = Object.getPrototypeOf(this);
+        const map = proxy.flows.get(req.id)?.map;
+        if (!map) return impl.handle.call(this, req, socket, head, options);
+        return proxy.connectWsMapped(this, req, socket, head, options, map);
+      },
+    });
     await (server as unknown as { addWebSocketRules: (...r: unknown[]) => Promise<unknown> }).addWebSocketRules(
       { matchers: [wsRoute('ws-local')], completionChecker: new Always(), steps: [localWsStep] },
-      { matchers: [wsRoute('ws-pass')], completionChecker: new Always(), steps: [new PassThroughWebSocketStep(connection)] },
+      { matchers: [wsRoute('ws-pass')], completionChecker: new Always(), steps: [passWsStep] },
     );
     // A 'response' listener makes mockttp consume (and, past maxBodySize, discard) its internal
     // copy of each response; without a consumer that copy would grow without bound. We record
@@ -569,6 +643,12 @@ export class InterceptProxy extends EventEmitter {
           if (gate.closed) {
             throw Object.assign(new Error(`${SSRF_MARKER}: LAN mode is off.`), { statusCode: 403, statusMessage: 'Forbidden' });
           }
+          const up = this.lanUpstreamAgents(gate);
+          if (up) {
+            if (protocol === 'https:') return up.https;
+            if (protocol === 'http:' || protocol === undefined) return up.http;
+            return up.ws(protocol === 'wss:');
+          }
           if (protocol === 'https:') return gate.agents.https;
           if (protocol === 'http:' || protocol === undefined) return gate.agents.http;
           return gate.wsAgent(protocol === 'wss:');
@@ -582,6 +662,15 @@ export class InterceptProxy extends EventEmitter {
     this.server = server;
     this.pool = pool;
     this._port = server.port;
+    if (this.upstreamSpec) {
+      try {
+        this.checkUpstreamLoop(this.upstreamSpec);
+      } catch (e) {
+        await this.stop();
+        throw e;
+      }
+      pool.setUpstream(this.upstreamSpec);
+    }
     this.sendAgent = new http.Agent({ keepAlive: true });
   }
 
@@ -667,6 +756,12 @@ export class InterceptProxy extends EventEmitter {
     const gate = this.lanGate;
     this.lanGate = undefined;
     await gate?.close();
+    const up = gate && this.lanUpstream.get(gate);
+    if (up) {
+      this.lanUpstream.delete(gate);
+      up.http.destroy();
+      up.https.destroy();
+    }
   }
 
   private onLanDenied(req: CompletedRequest): mockttp.requestSteps.CallbackResponseResult {
@@ -675,8 +770,9 @@ export class InterceptProxy extends EventEmitter {
     // A plain-route exchange already exists (its tap records the 403 as 'error'); hooked routes
     // never reached their hooks, so record those here.
     if (!this.live.has(req.id)) {
+      const url = this.flows.get(req.id)?.originalUrl ?? req.url;
       this.flows.delete(req.id);
-      this.recordBlocked(req.method, req.url, reason);
+      this.recordBlocked(req.method, url, reason);
     }
     return {
       statusCode: 403,
@@ -717,6 +813,10 @@ export class InterceptProxy extends EventEmitter {
     const ids = new Set(rules.map((r) => r.id));
     for (const id of [...this.hits.keys()]) if (!ids.has(id)) this.hits.delete(id);
     for (const id of [...this.spentFired]) if (!ids.has(id)) this.spentFired.delete(id);
+    // Sequence positions (CONTRACTS §12.3) survive setRules unless the rule's match or action changed.
+    const sigs = new Map<string, string>();
+    for (const { rule } of this.compiled) if (rule.action?.kind === 'sequence') sigs.set(rule.id, sequenceSig(rule));
+    for (const [id, st] of [...this.seq]) if (sigs.get(id) !== st.sig) this.seq.delete(id);
     const now = Date.now();
     for (const { rule } of this.compiled) {
       const reason = this.spentReason(rule, now);
@@ -751,6 +851,94 @@ export class InterceptProxy extends EventEmitter {
 
   get networkProfile(): NetworkProfile {
     return { ...this.profile };
+  }
+
+  /**
+   * CONTRACTS §12.3: start sequence rules from their first step again (all, or the given rule ids). Positions
+   * also reset when a rule's match or action changes in setRules.
+   */
+  resetSequences(ruleIds?: string[]): void {
+    if (!ruleIds) this.seq.clear();
+    else for (const id of ruleIds) this.seq.delete(id);
+  }
+
+  /**
+   * CONTRACTS §12.4: answer requests from a recording (undefined = stop). Rules are checked first; a request no
+   * rule matches is answered from the entries — exact method + URL (+ request body hash when the entry has one),
+   * then, with `matchTemplates`, method + origin + path template — several responses for one key in order, then
+   * the last repeats. Unmatched requests: `passthrough` (the real server) or `fail` (closed like the offline
+   * profile's DNS fault). Replayed exchanges end `mocked` with `simulated: "Replayed from <name>"`. Invalid entries
+   * are skipped; returns how many are used. Throws on invalid options. Applies to requests that arrive from now on.
+   */
+  setReplay(entries: ReplayEntry[] | undefined, opts?: ReplayOptions & { name?: string }): number {
+    if (entries === undefined || entries === null) {
+      this.replayStore = undefined;
+      return 0;
+    }
+    if (!Array.isArray(entries)) throw new Error('Replay entries must be an array');
+    const fallback = opts?.fallback ?? 'passthrough';
+    if (fallback !== 'passthrough' && fallback !== 'fail') throw new Error(`Invalid replay fallback: ${String(fallback)}`);
+    this.replayStore = new ReplayStore(entries, { ...opts, fallback });
+    return this.replayStore.size;
+  }
+
+  /** Replay mode, if on. */
+  get replay(): { name?: string; entries: number; fallback: ReplayOptions['fallback']; matchTemplates: boolean } | undefined {
+    const r = this.replayStore;
+    return r ? { ...(r.name ? { name: r.name } : {}), entries: r.size, fallback: r.fallback, matchTemplates: r.matchTemplates } : undefined;
+  }
+
+  /**
+   * CONTRACTS §12.6: send pass-through traffic via another HTTP proxy (CONNECT for HTTPS / WebSockets), or
+   * directly again (undefined). Requests in flight finish on their connections; new ones use the new setting.
+   * Upstream TLS stays verified unless `ignoreCertErrors` (a MITM proxy such as Charles). LAN clients keep the §7
+   * SSRF guard on the final target. Throws on an invalid URL or one that points at this proxy.
+   */
+  setUpstreamProxy(cfg: UpstreamProxyConfig | undefined): void {
+    const spec = cfg ? parseUpstreamProxy(cfg) : undefined;
+    if (spec && this.server) this.checkUpstreamLoop(spec);
+    this.upstreamSpec = spec;
+    this.pool?.setUpstream(spec);
+  }
+
+  /** `host:port` of the upstream proxy in use, for status lines (never credentials). */
+  get upstreamProxyDisplay(): string | undefined {
+    const s = this.upstreamSpec;
+    return s ? s.label.replace(/^http:\/\//, '') : undefined;
+  }
+
+  /** The upstream proxy in use (`http://host:port`, never credentials). */
+  get upstreamProxy(): { url: string; ignoreCertErrors: boolean } | undefined {
+    const s = this.upstreamSpec;
+    return s ? { url: s.label, ignoreCertErrors: s.ignoreCertErrors } : undefined;
+  }
+
+  private checkUpstreamLoop(spec: UpstreamProxySpec): void {
+    // Normalised (REVIEW-6 #12): `localhost.`, `[::ffff:127.0.0.1]`, 127/8, ::1, 0.0.0.0 all mean this machine.
+    const host = normalizeIp(spec.host.replace(/\.+$/, ''));
+    const self = isLoopbackHost(spec.host) || host === this.lanGate?.address?.host || host === normalizeIp(this.host) || lanIPv4Addresses().includes(host);
+    const ours = [this._port, this.lanGate?.address?.port].filter((p): p is number => !!p);
+    if (self && ours.includes(spec.port)) {
+      throw new Error(`Upstream proxy ${spec.label} is Flutter Intercept itself; that would loop`);
+    }
+  }
+
+  /** Upstream-proxy agents for a LAN gate's sockets: the final target is resolved and checked before CONNECT. */
+  private lanUpstreamAgents(gate: LanGate): UpstreamAgents | undefined {
+    const spec = this.upstreamSpec;
+    const have = this.lanUpstream.get(gate);
+    if (have && have.spec === spec) return have;
+    retireAgents(have);
+    if (!spec) {
+      this.lanUpstream.delete(gate);
+      return undefined;
+    }
+    const agents = createUpstreamAgents(spec, (host, port) => {
+      if (gate.closed) return Promise.reject(Object.assign(new Error(`${SSRF_MARKER}: LAN mode is off.`), { statusCode: 403 }));
+      return resolveCheckedTarget(host, port, gate.host);
+    });
+    this.lanUpstream.set(gate, agents);
+    return agents;
   }
 
   /**
@@ -927,7 +1115,8 @@ export class InterceptProxy extends EventEmitter {
   override on(event: 'removed', listener: (ids: string[]) => void): this;
   override on(event: 'lan-peer', listener: (ip: string) => void): this;
   override on(event: 'rule-spent', listener: (ruleId: string, reason: 'times' | 'expired') => void): this;
-  override on(event: 'rule-hit', listener: (ruleId: string, used: number) => void): this;
+  /** `step`: sequence rules only (CONTRACTS §12.3), 0-based index of the step that answered, -1 = after the steps. */
+  override on(event: 'rule-hit', listener: (ruleId: string, used: number, step?: number) => void): this;
   override on(event: string | symbol, listener: (...args: any[]) => void): this;
   override on(event: string | symbol, listener: (...args: any[]) => void): this {
     return super.on(event, listener);
@@ -1060,11 +1249,13 @@ export class InterceptProxy extends EventEmitter {
 
   /** A new exchange for a request, with what the flow knows (rule, simulation, initiator). */
   private newExchange(req: { id: string; method: string; url: string; headers: HeaderBag; timingEvents?: { startTime?: number } }, flow: Flow): Exchange {
+    // Map Remote: the exchange keeps the URL the app asked for (CONTRACTS §12.6); `simulated` names the target.
+    const url = flow.originalUrl ?? req.url;
     return {
       id: req.id,
       startedAt: req.timingEvents?.startTime ?? Date.now(),
       method: req.method,
-      url: req.url,
+      url,
       requestHeaders: cleanHeaders(req.headers),
       state: 'pending',
       ...(flow.rule ? { matchedRuleId: flow.rule.id } : {}),
@@ -1073,8 +1264,8 @@ export class InterceptProxy extends EventEmitter {
       ...(flow.send ? { initiator: flow.send.initiator } : {}),
       ...(flow.send?.resentFrom !== undefined ? { resentFrom: flow.send.resentFrom } : {}),
       ...(flow.viaLan ? { viaLan: true as const } : {}),
-      ...graphqlOf(req.method, req.url, req.headers),
-      ...(this.webSession && !flow.send && !flow.viaLan && !flow.traceId && isBrowserInternal(req.url, req.headers)
+      ...graphqlOf(req.method, url, req.headers),
+      ...(this.webSession && !flow.send && !flow.viaLan && !flow.traceId && isBrowserInternal(url, req.headers)
         ? { browserInternal: true as const }
         : {}),
     };
@@ -1194,14 +1385,33 @@ export class InterceptProxy extends EventEmitter {
           continue;
         }
       }
-      if (o.count && rule.times !== undefined) {
-        const n = (this.hits.get(rule.id) ?? 0) + 1;
-        this.hits.set(rule.id, n);
-        const id = rule.id;
-        process.nextTick(() => this.emit('rule-hit', id, n)); // host shows "N of M left" (Rule.used)
-        if (n >= rule.times) this.markSpent(rule.id, 'times');
+      // CONTRACTS §12.3: a sequence rule answers with its current step (the position advances when counted).
+      let action: Applied;
+      let step: number | undefined;
+      if (rule.action?.kind === 'sequence') {
+        let st = this.seq.get(rule.id);
+        if (!st) this.seq.set(rule.id, (st = { sig: sequenceSig(rule), n: 0 }));
+        const pick = pickSequenceStep(rule.action, st.n);
+        if (o.count) st.n++;
+        action = pick.action;
+        step = pick.index;
+        if (pick.invalid) note ??= pick.invalid;
+      } else {
+        action = rule.action;
       }
-      return { rule, note };
+      if (o.count && (rule.times !== undefined || step !== undefined)) {
+        let used = this.seq.get(rule.id)?.n ?? 0;
+        if (rule.times !== undefined) {
+          used = (this.hits.get(rule.id) ?? 0) + 1;
+          this.hits.set(rule.id, used);
+          if (used >= rule.times) this.markSpent(rule.id, 'times');
+        }
+        const id = rule.id;
+        // host shows "N of M left" (Rule.used); sequences also report the step (0-based, -1 = after the steps).
+        if (step === undefined) process.nextTick(() => this.emit('rule-hit', id, used));
+        else process.nextTick(() => this.emit('rule-hit', id, used, step));
+      }
+      return { rule, action, step, note };
     }
     return { note };
   }
@@ -1211,8 +1421,7 @@ export class InterceptProxy extends EventEmitter {
     for (let i = from; i < this.compiled.length; i++) {
       const { rule, base } = this.compiled[i];
       if (!rule.enabled || this.spentReason(rule, now) || !base(method, url)) continue;
-      const a = rule.action;
-      if (a.kind === 'mutate' || (a.kind === 'breakpoint' && a.phase !== 'request')) return true;
+      if (needsResponseHook(rule.action)) return true;
     }
     return false;
   }
@@ -1296,21 +1505,28 @@ export class InterceptProxy extends EventEmitter {
     // here (the rule isn't spent by it). Otherwise the OPTIONS request is matched like any other.
     const asked = preflightMethod(req.method, headers);
     if (asked) {
-      const pre = this.matchRule(asked, req.url, { count: false, ignoreGraphql: true }).rule;
-      const a = pre?.action;
+      const pm = this.matchRule(asked, req.url, { count: false, ignoreGraphql: true });
+      const pre = pm.rule;
+      const a = pm.action;
       if (pre && a && (a.kind === 'mock' || a.kind === 'block' || a.kind === 'cors')) {
         const o = a.kind === 'cors' ? corsOptions(a) : {};
         // Only for an origin the proxy may allow (loopback, or the cors rule's allowOrigin): otherwise the
         // server answers its own preflight (REVIEW-5 #3).
-        if (allowedOrigin(headers, o)) flow = { route: 'h1', rule: pre, preflight: true, ...(a.kind === 'cors' ? { corsPatch: o } : {}) };
+        if (allowedOrigin(headers, o)) flow = { route: 'h1', rule: pre, action: a, preflight: true, ...(a.kind === 'cors' ? { corsPatch: o } : {}) };
       }
     }
     if (!flow) {
       const m = this.matchRule(req.method, req.url, { count: true, headers });
-      flow = m.deferred
-        ? { route: m.needsResponseHook ? 'h2' : 'h1', deferred: true, ...(m.note ? { note: m.note } : {}) }
-        : this.flowFor(headers, m.rule, m.note);
+      if (m.deferred) flow = { route: m.needsResponseHook ? 'h2' : 'h1', deferred: true, ...(m.note ? { note: m.note } : {}) };
+      else if (!m.rule && this.replayStore) {
+        // CONTRACTS §12.4: rules first, then the recording.
+        const body: BodyKey = !hasRequestBody(headers) ? {} : bodyLimitReason(headers) ? 'unreadable' : 'unknown';
+        flow = this.replayFlow(req.method, req.url, headers, body, m.note);
+      } else flow = this.flowFor(req.url, headers, m.rule, m.action, m.note, m.step);
     }
+    // Map Remote / request-header rewrites change the request itself, before the LAN deny rule (next matcher) and
+    // the passthrough read it: the SSRF guard then checks the MAPPED target.
+    if ((flow.map || flow.rewrite?.request) && !flow.fault && !flow.localError) this.applyRequestSide(req, flow);
     if (meta?.traceId) flow.traceId = meta.traceId;
     if (send) flow.send = send;
     // Keyed on the socket, like every LAN guard (also for requests inside a LAN CONNECT tunnel).
@@ -1326,24 +1542,47 @@ export class InterceptProxy extends EventEmitter {
     return flow;
   }
 
-  /** The flow for a chosen rule (or none): its route, plus the network profile and drop rate. */
-  private flowFor(headers: HeaderBag, rule: Rule | undefined, note?: string): Flow {
-    const action = rule?.action;
+  /**
+   * The flow for a chosen rule (or none) and the action it applies (a sequence rule's current step; undefined =
+   * pass through): its route, plus the network profile and drop rate.
+   */
+  private flowFor(url: string, headers: HeaderBag, rule: Rule | undefined, action: Applied, note?: string, step?: number): Flow {
     let flow: Flow;
     let dropRate: number | undefined;
-    if (!rule || !action) {
-      flow = { route: 'plain' };
+    if (!action) {
+      flow = rule ? { route: 'plain', rule } : { route: 'plain' };
     } else if (action.kind === 'fault') {
       // truncate forwards and cuts the response (streaming route); the others never reach the server.
-      flow = { route: action.fault === 'truncate' ? 'plain' : 'h1', rule, fault: action.fault, simulated: FAULT_LABELS[action.fault] };
+      flow = { route: action.fault === 'truncate' ? 'plain' : 'h1', rule, action, fault: action.fault, simulated: FAULT_LABELS[action.fault] };
     } else if (action.kind === 'throttle') {
-      flow = { route: 'plain', rule, throttle: { latencyMs: action.latencyMs, kbps: action.kbps }, simulated: throttleLabel(action) };
+      flow = { route: 'plain', rule, action, throttle: { latencyMs: action.latencyMs, kbps: action.kbps }, simulated: throttleLabel(action) };
       dropRate = action.dropRate;
     } else if (action.kind === 'cors') {
       // Streams like a pass-through; the taps patch the response head (CONTRACTS §11.3).
-      flow = { route: 'plain', rule, corsPatch: corsOptions(action) };
+      flow = { route: 'plain', rule, action, corsPatch: corsOptions(action) };
+    } else if (action.kind === 'mapRemote') {
+      // Streams like a pass-through, to another server (CONTRACTS §12.6).
+      try {
+        const target = mapRemoteUrl(url, rule?.match.url ?? '', action.to);
+        const t = new URL(target);
+        const host = action.preserveHost ? (getHeader(headers, 'host') ?? new URL(url).host) : t.host;
+        flow = { route: 'plain', rule, action, map: { url: target, host }, originalUrl: url, simulated: `Mapped to ${t.origin}` };
+      } catch (e) {
+        flow = { route: 'h1', rule, action, localError: `Map Remote rule${rule?.name ? ` "${rule.name}"` : ''}: ${(e as Error).message}` };
+      }
+    } else if (action.kind === 'rewrite') {
+      const rw = rewriteFlow(action);
+      let route: Route = rw.resBody ? 'h2' : rw.reqBody ? 'h1' : 'plain';
+      let why: string | undefined;
+      if ((rw.reqBody || rw.resBody) && (why = bodyLimitReason(headers))) {
+        // A hooked route would buffer the request body: only headers / status are rewritten.
+        rw.reqBody = rw.resBody = false;
+        route = 'plain';
+        note ??= `Rewrite rule: body replacement skipped: ${why} (headers and status were still rewritten).`;
+      }
+      flow = { route, rule, action, rewrite: rw, simulated: rewriteLabel(rw) };
     } else if (action.kind !== 'breakpoint' && action.kind !== 'mutate') {
-      flow = { route: 'h1', rule };
+      flow = { route: 'h1', rule, action };
     } else {
       // Breakpoints and mutate rules run on hooked routes, where mockttp buffers the request body
       // before forwarding it. Only do that when the size is known and small; mockttp would otherwise
@@ -1352,28 +1591,94 @@ export class InterceptProxy extends EventEmitter {
       const why = bodyLimitReason(headers);
       flow = why
         ? { route: 'plain', rule, note: `${what} skipped: ${why}, so it was passed through unedited.` }
-        : { route: action.kind === 'breakpoint' && action.phase === 'request' ? 'h1' : 'h2', rule };
+        : { route: action.kind === 'breakpoint' && action.phase === 'request' ? 'h1' : 'h2', rule, action };
     }
     if (note && !flow.note) flow.note = note;
 
-    // The network profile: everything that would reach the network (no rule, breakpoints, mutate, cors and
-    // throttle rules — whose own settings win over a throttle profile). Mock / block / fault rules answer as set.
+    // The network profile: everything that would reach the network (no rule, breakpoints, mutate, cors, map,
+    // rewrite and throttle rules — whose own settings win over a throttle profile). Mock / block / fault answer as set.
+    const k = action?.kind;
     const reachesNetwork =
-      !action || action.kind === 'breakpoint' || action.kind === 'mutate' || action.kind === 'throttle' || action.kind === 'cors';
+      !action || k === 'breakpoint' || k === 'mutate' || k === 'throttle' || k === 'cors' || k === 'mapRemote' || k === 'rewrite';
     const p = this.profile;
-    if (reachesNetwork && p.kind === 'offline') {
+    if (reachesNetwork && !flow.localError && p.kind === 'offline') {
       flow = { route: 'h1', rule, fault: 'dns', simulated: describeProfile(p) };
       dropRate = undefined;
-    } else if (reachesNetwork && p.kind === 'throttle' && action?.kind !== 'throttle') {
+    } else if (reachesNetwork && !flow.localError && p.kind === 'throttle' && k !== 'throttle') {
       flow.throttle = { latencyMs: p.latencyMs, kbps: p.kbps };
-      flow.simulated = describeProfile(p);
+      flow.simulated = flow.simulated ? `${describeProfile(p)} · ${flow.simulated}` : describeProfile(p);
       dropRate = p.dropRate;
     }
     if (dropRate && dropRate > 0 && Math.random() < dropRate) {
       // Reset instead (after the latency, like a flaky link), never forwarded.
       flow = { route: 'h1', rule, fault: 'drop', throttle: { latencyMs: flow.throttle?.latencyMs }, simulated: `${flow.simulated ?? 'Throttle'}: dropped` };
     }
+    if (step !== undefined && rule?.action.kind === 'sequence') {
+      flow.step = step;
+      const n = rule.action.steps?.length ?? 0;
+      const label = step < 0 ? 'Sequence done: passed through' : `Sequence step ${step + 1}/${n}`;
+      flow.simulated = flow.simulated ? `${label} · ${flow.simulated}` : label;
+    }
     return flow;
+  }
+
+  /** No rule matched while replaying (CONTRACTS §12.4): the recorded response, or the fallback. */
+  private replayFlow(method: string, url: string, headers: HeaderBag, body: BodyKey, note?: string): Flow {
+    const store = this.replayStore!;
+    const hit = store.lookup(method, url, body, true);
+    if (hit === 'needs-body') return { route: 'h1', replay: 'deferred', ...(note ? { note } : {}) };
+    if (hit) return { route: 'h1', replay: hit.entry, simulated: `Replayed from ${store.name ?? 'a recording'}`, ...(note ? { note } : {}) };
+    if (store.fallback === 'fail') {
+      // Like the offline profile: closed without a response inside the tunnel, so dart:io has no DIRECT to fall back to.
+      return { route: 'h1', fault: 'dns', simulated: `Not in the recording${store.name ? ` "${store.name}"` : ''} (replay: fail)`, ...(note ? { note } : {}) };
+    }
+    return this.flowFor(url, headers, undefined, undefined, note);
+  }
+
+  /**
+   * Map Remote and request-header rewrites, applied to the request itself (decide(), synchronously, before the LAN
+   * deny rule's matcher and before the passthrough reads method, URL, destination and headers). On hooked routes
+   * the Host header is left to mockttp (it derives it from the URL) and onRequest returns a different one if needed.
+   */
+  private applyRequestSide(req: OngoingRequest, flow: Flow): void {
+    const r = req as unknown as {
+      url: string;
+      protocol: string;
+      path: string;
+      destination: { hostname: string; port: number };
+      rawHeaders: Array<[string, string]>;
+      headers: HeaderBag;
+    };
+    if (flow.map) {
+      const t = new URL(flow.map.url);
+      try {
+        r.url = t.href;
+        r.protocol = t.protocol.slice(0, -1);
+        r.path = `${t.pathname}${t.search}`;
+        r.destination = { hostname: t.hostname.replace(/^\[|\]$/g, ''), port: Number(t.port) || (t.protocol === 'https:' ? 443 : 80) };
+      } catch {
+        /* checked below */
+      }
+      if (r.url !== t.href) {
+        flow.localError = 'Map Remote could not change the request target (incompatible mockttp version).';
+        flow.route = 'h1';
+        return;
+      }
+    }
+    let pairs = (Array.isArray(r.rawHeaders) ? r.rawHeaders : []).slice();
+    if (flow.rewrite?.request) pairs = rewritePairs(pairs, rewriteSets(flow.rewrite.request));
+    const urlHost = new URL(r.url).host;
+    const want = rewriteHostOf(flow.rewrite?.request) ?? flow.map?.host ?? pairValue(pairs, 'host') ?? urlHost;
+    // Plain route: the raw headers are forwarded as they are. Hooked routes: mockttp sets Host from the URL unless
+    // beforeRequest returns another one (onRequest does, from wantHost).
+    const send = flow.route === 'plain' ? want : urlHost;
+    if (flow.route !== 'plain' && want !== urlHost) flow.wantHost = want;
+    if (pairValue(pairs, 'host') !== send) pairs = rewritePairs(pairs, { remove: ['host'], set: [['Host', send]] });
+    r.rawHeaders = pairs;
+    const obj = pairsToObject(pairs);
+    for (const k of Object.keys(r.headers)) if (!(k in obj)) delete r.headers[k];
+    Object.assign(r.headers, obj);
+    flow.reqApplied = true;
   }
 
   /** Record from the passive taps: request body, response completion (except finished h1/h2 hooks). */
@@ -1431,7 +1736,24 @@ export class InterceptProxy extends EventEmitter {
         ex.cors = { ...ex.cors, patched: true };
       }
     }
-    if (isEventStream(getHeader(headers, 'content-type')) && status >= 200 && status < 300) {
+    // A rewrite rule's response status / headers on a streaming route (CONTRACTS §12.6; buffered ones: onResponse).
+    const rr = flow.rewrite?.response;
+    if (rr && !flow.rewrite!.resBody) {
+      const sets = rewriteSets(rr, true);
+      if (sets.remove.length || sets.set.length) {
+        const set: Record<string, string> = {};
+        for (const [k, v] of Object.entries(patch?.set ?? {})) if (!sets.remove.includes(k.toLowerCase())) set[k] = v;
+        for (const [k, v] of sets.set) set[k] = v;
+        patch = { ...patch, remove: [...(patch?.remove ?? []), ...sets.remove], set };
+        shown = Object.fromEntries(Object.entries(shown).filter(([k]) => !sets.remove.includes(k.toLowerCase())));
+        Object.assign(shown, Object.fromEntries(sets.set.map(([k, v]) => [k.toLowerCase(), v])));
+      }
+      if (rr.status !== undefined && validRewriteStatus(rr.status)) {
+        patch = { ...patch, status: rr.status };
+        status = rr.status;
+      }
+    }
+    if (isEventStream(getHeader(shown, 'content-type')) && status >= 200 && status < 300) {
       this.startSse(live, tap, status, shown);
       patch = { ...patch, flush: true };
     }
@@ -1575,36 +1897,71 @@ export class InterceptProxy extends EventEmitter {
   // ---------------------------------------------------------------- hooked paths (h1 / h2)
 
   private async onRequest(req: CompletedRequest): Promise<CallbackRequestResult | void> {
-    const flow: Flow = this.flows.get(req.id) ?? { route: 'h1', rule: this.matchRule(req.method, req.url, { count: false }).rule };
+    let flow = this.flows.get(req.id);
+    if (!flow) {
+      const m = this.matchRule(req.method, req.url, { count: false });
+      flow = { route: 'h1', rule: m.rule, action: m.action };
+    }
     const tap = getTap(req.id);
     // For breakpoints / deferred GraphQL rules the body is complete (≤ 5 MB); for mock/block it may be a capped prefix.
     const body = tap
       ? await decodeForDisplay(captured(tap.req), getHeader(req.headers, 'content-encoding'), isComplete(tap.req))
       : await decodeForDisplay(req.body.buffer, getHeader(req.headers, 'content-encoding'), true);
+    const bodyKey = (): BodyKey => (body?.truncated ? 'unreadable' : { hash: requestBodyHash(body) });
+    let resolved: Flow | undefined;
     if (flow.deferred) {
       // CONTRACTS §11.2: choose the rule now that the operation name can be read.
       const text = body && body.encoding === 'utf8' && !body.truncated ? body.text : undefined;
       const m = this.matchRule(req.method, req.url, { count: true, body: () => text });
-      const r = this.flowFor(req.headers as HeaderBag, m.rule, m.note ?? flow.note);
+      const note = m.note ?? flow.note;
+      resolved =
+        !m.rule && this.replayStore
+          ? this.replayFlow(req.method, req.url, req.headers as HeaderBag, bodyKey(), note)
+          : this.flowFor(req.url, req.headers as HeaderBag, m.rule, m.action, note, m.step);
+    } else if (flow.replay === 'deferred') {
+      // CONTRACTS §12.4: the recording has responses for this URL that depend on the request body.
+      resolved = this.replayFlow(req.method, req.url, req.headers as HeaderBag, bodyKey(), flow.note);
+    }
+    if (resolved) {
       flow.deferred = false;
       Object.assign(flow, {
-        rule: r.rule,
-        note: r.note,
-        fault: r.fault,
-        throttle: r.throttle,
-        simulated: r.simulated,
-        corsPatch: r.corsPatch,
+        rule: resolved.rule,
+        action: resolved.action,
+        step: resolved.step,
+        note: resolved.note,
+        fault: resolved.fault,
+        throttle: resolved.throttle,
+        simulated: resolved.simulated,
+        corsPatch: resolved.corsPatch,
+        map: resolved.map,
+        originalUrl: resolved.originalUrl,
+        rewrite: resolved.rewrite,
+        replay: resolved.replay === 'deferred' ? undefined : resolved.replay,
+        localError: resolved.localError,
       });
       if (tap) this.applyShaping(tap, flow);
     }
-    const rule = flow.rule;
     const ex = this.newExchange(req, flow);
     this.setRequestBody(ex, body);
-    const action = rule?.action;
+    const action = flow.action;
 
     if (flow.preflight) return this.answerPreflight(req, ex, flow);
 
     if (flow.fault && flow.fault !== 'truncate') return this.applyFault(ex, flow);
+
+    if (flow.localError) {
+      this.track(ex, flow);
+      const text = `Flutter Intercept: ${flow.localError}`;
+      const headers: HeaderBag = { 'content-type': 'text/plain; charset=utf-8' };
+      const rawBody = frameBody(Buffer.from(text, 'utf8'), headers);
+      ex.status = 502;
+      ex.responseHeaders = cleanHeaders(headers);
+      ex.responseBody = { text, encoding: 'utf8' };
+      this.fail(ex, flow.localError);
+      return { response: { statusCode: 502, statusMessage: STATUS_CODES[502], headers, rawBody } };
+    }
+
+    if (flow.replay && flow.replay !== 'deferred') return this.answerReplay(ex, flow, flow.replay);
 
     if (action?.kind === 'mock') {
       this.track(ex, flow);
@@ -1662,7 +2019,108 @@ export class InterceptProxy extends EventEmitter {
 
     this.track(ex, flow);
     if (!(await this.latency(ex, flow))) return { response: 'close' };
+    if (flow.map || flow.rewrite?.request || flow.wantHost) return this.forwardChanges(req, ex, flow, body);
     return undefined;
+  }
+
+  /**
+   * Map Remote / rewrite on a hooked route (CONTRACTS §12.6): what decide() couldn't do — a rule chosen only now
+   * (GraphQL scope), a Host header other than the URL's, request body replacements.
+   */
+  private async forwardChanges(req: CompletedRequest, ex: Exchange, flow: Flow, body: Body | undefined): Promise<CallbackRequestResult | undefined> {
+    const result: CallbackRequestResult = {};
+    let headers: HeaderBag | undefined;
+    let urlHost = new URL(req.url).host;
+    if (!flow.reqApplied) {
+      // Decided in beforeRequest: nothing was applied to the request yet.
+      if (flow.map) {
+        if (flow.viaLan) {
+          // The LAN deny rule saw the original URL: check the mapped target now (CONTRACTS §7).
+          const gate = lanGateOf((req as unknown as { socket?: unknown }).socket);
+          const reason = await lanTargetDenial(flow.map.url, gate?.host);
+          if (reason || !gate || gate.closed) {
+            const text = reason ?? `${SSRF_MARKER}: LAN mode is off.`;
+            ex.status = 403;
+            ex.responseBody = { text, encoding: 'utf8' };
+            this.fail(ex, text);
+            return { response: { statusCode: 403, statusMessage: 'Forbidden', headers: { 'content-type': 'text/plain; charset=utf-8', connection: 'close' }, body: text } };
+          }
+        }
+        result.url = flow.map.url;
+        urlHost = new URL(flow.map.url).host;
+      }
+      let pairs = Object.entries(req.headers as HeaderBag).flatMap(([k, v]) =>
+        v === undefined ? [] : (Array.isArray(v) ? v : [v]).map((x) => [k, x] as [string, string]),
+      );
+      if (flow.rewrite?.request) pairs = rewritePairs(pairs, rewriteSets(flow.rewrite.request));
+      headers = pairsToObject(pairs);
+      const want = rewriteHostOf(flow.rewrite?.request) ?? flow.map?.host ?? urlHost;
+      if (want !== urlHost) flow.wantHost = want;
+    }
+    if (flow.wantHost) {
+      headers ??= { ...(req.headers as HeaderBag) };
+      setHeader(headers, 'host', flow.wantHost);
+    }
+    const replace = flow.rewrite?.reqBody ? flow.rewrite.request?.replaceBody : undefined;
+    if (replace?.length) {
+      headers ??= { ...(req.headers as HeaderBag) };
+      const out = await replaceInBody(req.body.buffer, getHeader(headers, 'content-encoding'), replace);
+      if (out.kind === 'skipped') ex.error = `Rewrite rule: request body not changed: ${out.reason}; it was forwarded unchanged.`;
+      else {
+        result.rawBody = frameBody(out.decoded, headers);
+        this.setRequestBody(ex, await decodeForDisplay(out.decoded, undefined, true));
+        if (out.unmatched) ex.error = `Rewrite rule: ${out.unmatched} request body replacement(s) found nothing.`;
+      }
+    }
+    if (headers) {
+      if (getHeader(headers, 'host') === urlHost) deleteHeader(headers, 'host'); // mockttp derives it from the URL
+      result.headers = headers;
+      const recorded: HeaderBag = { ...headers };
+      if (!getHeader(recorded, 'host')) recorded.host = urlHost;
+      ex.requestHeaders = cleanHeaders(recorded);
+      this.emitChange(ex);
+    }
+    return Object.keys(result).length ? result : undefined;
+  }
+
+  /** A replayed response (CONTRACTS §12.4): re-framed for the recorded headers, state 'mocked'. */
+  private async answerReplay(ex: Exchange, flow: Flow, entry: ReplayEntry): Promise<CallbackRequestResult> {
+    this.track(ex, flow);
+    const headers: HeaderBag = {};
+    for (const [k, v] of Object.entries(entry.headers ?? {})) {
+      if (!HTTP_TOKEN.test(k) || REPLAY_DROPPED_HEADERS.has(k.toLowerCase())) continue;
+      const vals = (Array.isArray(v) ? v : [v]).filter((x) => typeof x === 'string' && !/[\r\n\0]/.test(x));
+      if (vals.length) headers[k] = vals.length === 1 ? vals[0] : vals;
+    }
+    this.addCorsToLocalResponse(ex, headers);
+    const b = entry.body;
+    const bytes = !b ? Buffer.alloc(0) : b.encoding === 'base64' ? Buffer.from(b.text, 'base64') : Buffer.from(b.text, 'utf8');
+    let rawBody: Buffer;
+    let decoded: Buffer = bytes;
+    const enc = getHeader(headers, 'content-encoding');
+    if (enc && bytes.length) {
+      // A recorded body is normally decoded text, but encodings the recorder can't decode (zstd, stacked) were kept
+      // as the wire bytes: send those as they are, encode the others.
+      let wire = false;
+      try {
+        decoded = await decodeStrict(bytes, enc, RESPONSE_PAUSE_LIMIT_BYTES);
+        wire = true;
+      } catch {
+        decoded = bytes;
+      }
+      if (wire) {
+        rawBody = bytes;
+        deleteHeader(headers, 'transfer-encoding');
+        setHeader(headers, 'content-length', String(bytes.length));
+      } else rawBody = await frameBodyAsync(bytes, headers);
+    } else rawBody = frameBody(bytes, headers);
+    ex.status = entry.status;
+    ex.responseHeaders = cleanHeaders(headers);
+    ex.responseBody = await decodeForDisplay(decoded, undefined, true);
+    if (b?.truncated) ex.error = 'The recorded response body was cut at 5 MB; the app got that part only.';
+    if (isEventStream(getHeader(headers, 'content-type'))) this.setSseFrames(ex, decoded);
+    this.finish(ex, 'mocked');
+    return { response: { statusCode: entry.status, statusMessage: STATUS_CODES[entry.status], headers, rawBody } };
   }
 
   /** A CORS preflight answered locally for a mock / block / cors rule (CONTRACTS §11.3). */
@@ -1759,7 +2217,7 @@ export class InterceptProxy extends EventEmitter {
     ex.responseBody = await decodeForDisplay(res.body.buffer, getHeader(res.headers, 'content-encoding'), true);
 
     let result: CallbackResponseMessageResult | undefined;
-    const action = flow.rule?.action;
+    const action = flow.action;
     if (action?.kind === 'breakpoint' && action.phase !== 'request') {
       const decision = this.pause(ex, 'response');
       this.emitChange(ex);
@@ -1773,6 +2231,9 @@ export class InterceptProxy extends EventEmitter {
     } else if (action?.kind === 'mutate') {
       result = await this.applyMutation(res, ex, action.ops);
       if (!this.live.has(ex.id) || ex.state !== 'pending') return 'close'; // the app left meanwhile
+    } else if (flow.rewrite?.response) {
+      result = await this.applyRewriteResponse(res, ex, flow.rewrite);
+      if (!this.live.has(ex.id) || ex.state !== 'pending') return 'close';
     } else if (flow.corsPatch && isCorsRequest(ex.method, ex.url, ex.requestHeaders)) {
       // A GraphQL-scoped cors rule resolved on the buffered route: patch the head here.
       const set = corsResponseHeaders(ex.requestHeaders, Object.keys(res.headers), getHeader(res.headers, 'vary'), flow.corsPatch);
@@ -1813,6 +2274,40 @@ export class InterceptProxy extends EventEmitter {
     ex.simulated = ex.simulated ? `${ex.simulated} · ${outcome.label}` : outcome.label;
     if (outcome.unmatched.length) ex.error = `Mutate rule: nothing matched ${outcome.unmatched.join(', ')} (the other changes were applied).`;
     return { headers, rawBody };
+  }
+
+  /** A rewrite rule on a buffered response (CONTRACTS §12.6): status, headers, literal body replacements. */
+  private async applyRewriteResponse(res: PassThroughResponse, ex: Exchange, rw: RewriteFlow): Promise<CallbackResponseMessageResult | undefined> {
+    const spec = rw.response!;
+    const result: CallbackResponseMessageResult = {};
+    if (spec.status !== undefined && validRewriteStatus(spec.status) && spec.status !== res.statusCode) {
+      result.statusCode = spec.status;
+      result.statusMessage = STATUS_CODES[spec.status] ?? 'Unknown';
+      ex.status = spec.status;
+    }
+    const sets = rewriteSets(spec, true);
+    const replace = rw.resBody ? spec.replaceBody : undefined;
+    if (!sets.remove.length && !sets.set.length && !replace?.length) return Object.keys(result).length ? result : undefined;
+    const headers = pairsToObject(rewritePairs(headerPairs(res.headers as HeaderBag), sets));
+    let rawBody: Buffer = res.body.buffer;
+    if (replace?.length) {
+      const out = await replaceInBody(res.body.buffer, getHeader(res.headers as HeaderBag, 'content-encoding'), replace);
+      if (out.kind === 'skipped') ex.error = `Rewrite rule: response body not changed: ${out.reason}; it was forwarded unchanged.`;
+      else {
+        for (const h of ['content-md5', 'digest', 'content-digest', 'repr-digest']) deleteHeader(headers, h);
+        rawBody = await frameBodyAsync(out.decoded, headers);
+        ex.responseBody = await decodeForDisplay(out.decoded, undefined, true);
+        if (out.unmatched) ex.error = `Rewrite rule: ${out.unmatched} response body replacement(s) found nothing.`;
+      }
+    }
+    if (rawBody === res.body.buffer) {
+      deleteHeader(headers, 'transfer-encoding');
+      setHeader(headers, 'content-length', String(rawBody.length));
+    }
+    result.headers = headers;
+    result.rawBody = rawBody;
+    ex.responseHeaders = cleanHeaders(headers);
+    return result;
   }
 
   private async applyRequestEdit(
@@ -1909,11 +2404,24 @@ export class InterceptProxy extends EventEmitter {
     const url = toWsUrl(req.url);
     const meta = this.reqMeta.get(req);
     const m = this.matchRule(req.method, url, { count: true, ws: true });
-    const action = m.rule?.action;
+    const action = m.action;
     let flow: Flow = { route: 'ws-pass' };
-    if (action?.kind === 'block') flow = { route: 'ws-local', rule: m.rule };
-    else if (action?.kind === 'fault') flow = { route: 'ws-local', rule: m.rule, fault: action.fault, simulated: FAULT_LABELS[action.fault] };
-    else if (this.profile.kind === 'offline') flow = { route: 'ws-local', fault: 'dns', simulated: describeProfile(this.profile) };
+    if (action?.kind === 'block') flow = { route: 'ws-local', rule: m.rule, action };
+    else if (action?.kind === 'fault') flow = { route: 'ws-local', rule: m.rule, action, fault: action.fault, simulated: FAULT_LABELS[action.fault] };
+    else if (this.profile.kind === 'offline') flow = { route: 'ws-local', rule: m.rule, fault: 'dns', simulated: describeProfile(this.profile) };
+    else if (action?.kind === 'mapRemote') {
+      // CONTRACTS §12.6: the upgrade goes to the mapped server (connectWsMapped); LAN clients keep the connect-time guard.
+      try {
+        const target = mapRemoteUrl(url, m.rule?.match.url ?? '', action.to);
+        const t = new URL(target);
+        const host = action.preserveHost ? (getHeader(req.headers as HeaderBag, 'host') ?? new URL(url).host) : t.host;
+        flow = { route: 'ws-pass', rule: m.rule, action, map: { url: target, host }, originalUrl: url, simulated: `Mapped to ${t.origin}` };
+      } catch (e) {
+        flow = { route: 'ws-local', rule: m.rule, action, localError: `Map Remote rule: ${(e as Error).message}` };
+      }
+    } else if (!m.rule && this.replayStore?.fallback === 'fail') {
+      flow = { route: 'ws-local', fault: 'dns', simulated: 'Not in the recording (replay: fail)' };
+    } else if (m.rule) flow.rule = m.rule;
     if (m.note) flow.note = m.note;
     if (meta?.traceId) flow.traceId = meta.traceId;
     if (lanGateOf((req as unknown as { socket?: unknown }).socket)) flow.viaLan = true;
@@ -2033,8 +2541,21 @@ export class InterceptProxy extends EventEmitter {
       return;
     }
     const { ex, flow } = live;
-    const action = flow.rule?.action;
+    const action = flow.action;
     const reset = () => resetOrDestroy(req as unknown as Parameters<typeof resetOrDestroy>[0]);
+    if (flow.localError) {
+      const body = Buffer.from(`Flutter Intercept: ${flow.localError}`, 'utf8');
+      ex.status = 502;
+      this.fail(ex, flow.localError);
+      socket.on('error', () => undefined);
+      socket.end(
+        Buffer.concat([
+          Buffer.from(`HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: ${body.length}\r\nconnection: close\r\n\r\n`, 'latin1'),
+          body,
+        ]),
+      );
+      return;
+    }
     if (flow.fault === 'timeout') {
       const appLeft = await new Promise<boolean>((resolve) => {
         const timer = setTimeout(() => settle(false), this.breakpointTimeoutMs);
@@ -2080,6 +2601,25 @@ export class InterceptProxy extends EventEmitter {
       .join('\r\n')}\r\n\r\n`;
     socket.on('error', () => undefined);
     socket.end(Buffer.concat([Buffer.from(head, 'latin1'), body]));
+  }
+
+  /**
+   * Map Remote for a WebSocket upgrade: mockttp's PassThroughWebSocketStep, but connected to the mapped target
+   * (its connectUpstream takes the destination and URL explicitly; req.url is read-only for upgrades).
+   */
+  private async connectWsMapped(step: any, req: OngoingRequest, socket: net.Socket, head: Buffer, options: unknown, map: { url: string; host: string }): Promise<void> {
+    if (typeof step?.connectUpstream !== 'function' || typeof step?.initializeWsServer !== 'function') {
+      const live = this.live.get(req.id);
+      if (live) this.fail(live.ex, 'Map Remote could not be applied to this WebSocket (incompatible mockttp version).');
+      socket.destroy();
+      return;
+    }
+    step.initializeWsServer();
+    const t = new URL(map.url);
+    const destination = { hostname: t.hostname.replace(/^\[|\]$/g, ''), port: Number(t.port) || (t.protocol === 'wss:' ? 443 : 80) };
+    const raw = (req as unknown as { rawHeaders: Array<[string, string]> }).rawHeaders;
+    const rawHeaders = rewritePairs(Array.isArray(raw) ? raw.slice() : [], { remove: ['host'], set: [['Host', map.host]] });
+    await step.connectUpstream(destination, map.url, req, rawHeaders, socket, head, options);
   }
 
   private onTlsError(f: TlsHandshakeFailure): void {
@@ -2236,4 +2776,183 @@ function validateProfile(p: NetworkProfile): NetworkProfile {
     ...(kbps ? { kbps } : {}),
     ...(dropRate !== undefined ? { dropRate } : {}),
   };
+}
+
+// ---------------------------------------------------------------- v0.6.0 helpers (CONTRACTS §12)
+
+/** Identity of a sequence rule's content: its position resets when this changes. */
+function sequenceSig(rule: Rule): string {
+  try {
+    return JSON.stringify([rule.match, rule.action]);
+  } catch {
+    return String(Math.random());
+  }
+}
+
+/** Could this action need the buffered response hook (h2)? */
+function needsResponseHook(a: RuleAction | undefined): boolean {
+  if (!a) return false;
+  if (a.kind === 'mutate' || (a.kind === 'breakpoint' && a.phase !== 'request')) return true;
+  if (a.kind === 'rewrite') return !!a.response?.replaceBody?.length;
+  if (a.kind === 'sequence') return (a.steps ?? []).some((s) => s?.action?.kind !== 'passthrough' && needsResponseHook(s?.action as RuleAction));
+  return false;
+}
+
+/** Headers a rewrite can't set or remove: framing, hop-by-hop and internal ones (the proxy manages them). */
+const REWRITE_SKIPPED = new Set([
+  'content-length',
+  'transfer-encoding',
+  'content-encoding',
+  'connection',
+  'keep-alive',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'upgrade',
+  'host', // request: handled with Map Remote's Host logic (rewriteHostOf)
+  TRACE_HEADER,
+  SEND_HEADER,
+]);
+
+/** Headers a replayed response doesn't carry over: the proxy frames the body itself. */
+const REPLAY_DROPPED_HEADERS = new Set(['content-length', 'transfer-encoding', 'connection', 'keep-alive', 'proxy-connection', 'trailer', 'upgrade']);
+
+interface HeaderSets {
+  /** Lower-case names removed (set names are removed too, before being added). */
+  remove: string[];
+  set: Array<[string, string]>;
+}
+
+const validHeaderValue = (v: unknown): v is string => typeof v === 'string' && !/[\r\n\0]/.test(v);
+
+/** The valid header changes of a RewriteSpec (invalid names / values and managed headers are ignored). */
+function rewriteSets(spec: RewriteSpec | undefined, _response = false): HeaderSets {
+  const remove = new Set<string>();
+  const set: Array<[string, string]> = [];
+  for (const n of spec?.removeHeaders ?? []) {
+    const l = String(n).trim().toLowerCase();
+    if (HTTP_TOKEN.test(l) && !REWRITE_SKIPPED.has(l)) remove.add(l);
+  }
+  for (const [k, v] of Object.entries(spec?.setHeaders ?? {})) {
+    const l = k.trim().toLowerCase();
+    if (!HTTP_TOKEN.test(l) || REWRITE_SKIPPED.has(l) || !validHeaderValue(v)) continue;
+    set.push([k.trim(), v]);
+  }
+  return { remove: [...remove], set };
+}
+
+/** A Host header set by a request rewrite (CONTRACTS §12.6), if valid. */
+function rewriteHostOf(spec: RewriteSpec | undefined): string | undefined {
+  for (const [k, v] of Object.entries(spec?.setHeaders ?? {})) {
+    if (k.trim().toLowerCase() === 'host' && validHeaderValue(v) && v.trim()) return v.trim();
+  }
+  return undefined;
+}
+
+function rewritePairs(pairs: Array<[string, string]>, sets: HeaderSets): Array<[string, string]> {
+  const drop = new Set([...sets.remove, ...sets.set.map(([k]) => k.toLowerCase())]);
+  const out = pairs.filter(([k]) => !drop.has(String(k).toLowerCase()));
+  for (const p of sets.set) out.push([p[0], p[1]]);
+  return out;
+}
+
+function pairValue(pairs: Array<[string, string]>, name: string): string | undefined {
+  return pairs.find(([k]) => String(k).toLowerCase() === name)?.[1];
+}
+
+function pairsToObject(pairs: Array<[string, string]>): HeaderBag {
+  const out: HeaderBag = {};
+  for (const [k, v] of pairs) {
+    const l = String(k).toLowerCase();
+    const prev = out[l];
+    out[l] = prev === undefined ? v : Array.isArray(prev) ? [...prev, v] : [prev, v];
+  }
+  return out;
+}
+
+function headerPairs(h: HeaderBag): Array<[string, string]> {
+  return Object.entries(h).flatMap(([k, v]) => (v === undefined ? [] : (Array.isArray(v) ? v : [v]).map((x) => [k, x] as [string, string])));
+}
+
+const validRewriteStatus = (s: unknown): s is number => Number.isInteger(s) && (s as number) >= 200 && (s as number) <= 599;
+
+function rewriteFlow(a: RewriteAction): RewriteFlow {
+  const ok = (r: RewriteSpec['replaceBody']) => (r ?? []).some((x) => typeof x?.find === 'string' && x.find !== '');
+  return {
+    ...(a.request ? { request: a.request } : {}),
+    ...(a.response ? { response: a.response } : {}),
+    reqBody: ok(a.request?.replaceBody),
+    resBody: ok(a.response?.replaceBody),
+  };
+}
+
+function rewriteLabel(rw: RewriteFlow): string {
+  const parts: string[] = [];
+  const rq = rw.request;
+  const rs = rw.response;
+  if (rq && (rewriteSets(rq).remove.length || rewriteSets(rq).set.length || rewriteHostOf(rq))) parts.push('request headers');
+  if (rw.reqBody) parts.push('request body');
+  if (rs?.status !== undefined && validRewriteStatus(rs.status)) parts.push(`status ${rs.status}`);
+  if (rs && (rewriteSets(rs, true).remove.length || rewriteSets(rs, true).set.length)) parts.push('response headers');
+  if (rw.resBody) parts.push('response body');
+  return parts.length ? `Rewritten: ${parts.join(', ')}` : 'Rewrite (nothing to change)';
+}
+
+type ReplaceOutcome = { kind: 'skipped'; reason: string } | { kind: 'done'; decoded: Buffer; unmatched: number };
+
+/** Most a body replacement may produce (REVIEW-6 #3), whatever the input. */
+export const REWRITE_OUTPUT_MAX_BYTES = 64 * MB;
+
+/** The output budget for a body of `input` bytes: ≤ 64 MB and ≤ max(4 × input, input + 1 MB). */
+export function rewriteOutputBudget(input: number): number {
+  return Math.min(REWRITE_OUTPUT_MAX_BYTES, Math.max(4 * input, input + MB));
+}
+
+const yieldToLoop = () => new Promise<void>((r) => setImmediate(r));
+
+/**
+ * Literal find / replace on a complete body's decoded UTF-8 text (≤ MAX_BODY_REPLACEMENTS, in order). Bounded
+ * (REVIEW-6 #3): before each replacement the result size is computed from the occurrences (counting stops as soon
+ * as it would pass the budget), and a body that would grow past `rewriteOutputBudget` is left unchanged. Yields to
+ * the event loop between replacements.
+ */
+async function replaceInBody(raw: Buffer, contentEncoding: string | undefined, list: NonNullable<RewriteSpec['replaceBody']>): Promise<ReplaceOutcome> {
+  let decoded: Buffer;
+  try {
+    decoded = await decodeStrict(raw, contentEncoding, RESPONSE_PAUSE_LIMIT_BYTES);
+  } catch (e) {
+    return { kind: 'skipped', reason: `it could not be decoded (${(e as Error).message})` };
+  }
+  if (!isUtf8(decoded)) return { kind: 'skipped', reason: 'it is not UTF-8 text' };
+  const budget = rewriteOutputBudget(decoded.length);
+  const bom = decoded.length >= 3 && decoded[0] === 0xef && decoded[1] === 0xbb && decoded[2] === 0xbf;
+  let text = decoded.subarray(bom ? 3 : 0).toString('utf8');
+  let bytes = decoded.length;
+  let unmatched = 0;
+  for (const r of list.slice(0, MAX_BODY_REPLACEMENTS)) {
+    if (typeof r?.find !== 'string' || r.find === '' || typeof r.replace !== 'string') continue;
+    await yieldToLoop();
+    const growth = Buffer.byteLength(r.replace, 'utf8') - Buffer.byteLength(r.find, 'utf8');
+    let count = 0;
+    for (let at = text.indexOf(r.find); at >= 0; at = text.indexOf(r.find, at + r.find.length)) {
+      count++;
+      if (growth > 0 && bytes + count * growth > budget) {
+        return {
+          kind: 'skipped',
+          reason:
+            `the replacements would make it larger than ${(budget / MB).toFixed(1)} MB ` +
+            `(at most 4 × its size or +1 MB, and never over ${REWRITE_OUTPUT_MAX_BYTES / MB} MB)`,
+        };
+      }
+      if (!r.all) break;
+    }
+    if (!count) {
+      unmatched++;
+      continue;
+    }
+    text = r.all ? text.split(r.find).join(r.replace) : text.replace(r.find, () => r.replace);
+    bytes += count * growth;
+  }
+  const out = Buffer.from(text, 'utf8');
+  return { kind: 'done', decoded: bom ? Buffer.concat([decoded.subarray(0, 3), out]) : out, unmatched };
 }

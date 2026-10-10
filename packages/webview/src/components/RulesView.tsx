@@ -1,29 +1,48 @@
-import { useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Rule } from '../protocol';
-import type { FaultKind } from '@flutter-intercept/proxy/types';
-import { CORS_DEV_NOTE } from '../coverage';
 import {
-  compileExchangeMatcher, countMatches, deleteRule, describeAction, FAULT_LABEL, formToRule, isAgentRule, moveRule, NEW_RULE, ruleBudget, ruleDisplayName,
-  ruleHits, ruleLabel, ruleStats, ruleToForm, toggleRule, upsertRule, validateRuleForm, type MutateRow, type RuleForm, type ThrottleFields,
+  canMoveRule, isShared, needsApproval, SHARED_FILE, suggestBodyFile,
+} from '../scenarios';
+import {
+  compileExchangeMatcher, countMatches, deleteRule, describeAction, formToRule, isAgentRule, moveRule, NEW_RULE, ruleBudget, ruleDisplayName,
+  ruleHits, ruleLabel, ruleStats, ruleToForm, toggleRule, upsertRule, validateRuleForm, type RuleForm,
 } from '../state';
 import { formatTime } from '../util';
+import { ActionEditor, SequenceEditor } from './ActionEditor';
 import { AgentBadge, Button, useNow } from './bits';
-import { BodyEditor, HeadersEditor } from './Editors';
 import { Icon } from './Icon';
+
+export { MutateOpsEditor } from './ActionEditor';
+
+const SHARED_TITLE =
+  `Shared with your team: this rule comes from ${SHARED_FILE}, committed with the project. It runs before your ` +
+  'personal rules. Edit the file to change it, or Unshare it to make it a personal rule again.';
 
 export function RulesView() {
   const { state, dispatch, post } = useApp();
   const { rules } = state;
   const stats = useMemo(() => ruleStats(rules, state.exchanges), [rules, state.exchanges]);
   const [dragFrom, setDragFrom] = useState<number | null>(null);
+  const [sharing, setSharing] = useState<string | undefined>();
   const now = useNow(rules.some((r) => r.expiresAt !== undefined));
+  const sr = state.status.sharedRules;
 
+  // setRules carries the whole list, shared rules unchanged: the host writes the shared file only when they differ
+  // (CONTRACTS §12.1) — the panel never changes them in place (read-only; Share / Unshare move them).
   const commit = (next: Rule[], notice?: string, undoable = false) => {
     dispatch({ type: 'setRules', rules: next, notice, undoable });
     post({ type: 'setRules', rules: next });
   };
-  const move = (from: number, to: number) => commit(moveRule(rules, from, to));
+  const move = (from: number, to: number) => { if (canMoveRule(rules, from, to)) commit(moveRule(rules, from, to)); };
+  const share = (r: Rule, shared: boolean) => {
+    setSharing(undefined);
+    post({ type: 'shareRule', id: r.id, shared });
+    dispatch({
+      type: 'notice', short: true,
+      text: shared ? `Moving “${ruleLabel(r)}” to ${sr?.file ?? SHARED_FILE}…` : `Moving “${ruleLabel(r)}” back to your personal rules…`,
+    });
+  };
 
   return (
     <div class={`rules-view${state.editingRuleId ? ' has-editor' : ''}`}>
@@ -37,6 +56,20 @@ export function RulesView() {
             <Icon name="plus" /> Add rule
           </Button>
         </div>
+        {sr && (sr.problems.length > 0 || sr.count > 0) && (
+          <div class="shared-info" aria-label="Shared rules file">
+            {sr.count > 0 && (
+              <div class="hint">
+                {sr.count} shared rule{sr.count === 1 ? '' : 's'} from <code>{sr.file ?? SHARED_FILE}</code> run first.
+              </div>
+            )}
+            {sr.problems.length > 0 && (
+              <ul class="msg warn shared-problems" aria-label="Problems with the shared rules file">
+                {sr.problems.map((p, i) => <li key={i}>{p}</li>)}
+              </ul>
+            )}
+          </div>
+        )}
         {rules.length === 0 ? (
           <div class="empty small">
             <p>No rules yet.</p>
@@ -48,11 +81,13 @@ export function RulesView() {
               const s = stats[i];
               const shadowed = r.enabled && s.matches > s.wins;
               const budget = ruleBudget(r, ruleHits(r, state.exchanges), now);
+              const shared = isShared(r);
+              const approval = sharing === r.id ? needsApproval(r.action) : undefined;
               return (
                 <li
                   key={r.id}
-                  class={`rule-item${r.enabled ? '' : ' disabled'}${state.editingRuleId === r.id ? ' editing' : ''}${dragFrom === i ? ' dragging' : ''}`}
-                  draggable
+                  class={`rule-item${r.enabled ? '' : ' disabled'}${shared ? ' shared' : ''}${state.editingRuleId === r.id ? ' editing' : ''}${dragFrom === i ? ' dragging' : ''}`}
+                  draggable={!shared}
                   onDragStart={(e) => { setDragFrom(i); e.dataTransfer?.setData('text/plain', String(i)); }}
                   onDragOver={(e) => e.preventDefault()}
                   onDrop={(e) => { e.preventDefault(); if (dragFrom !== null) move(dragFrom, i); setDragFrom(null); }}
@@ -63,48 +98,77 @@ export function RulesView() {
                     if (e.key === 'ArrowDown') { e.preventDefault(); move(i, i + 1); }
                   }}
                 >
-                  <span class="rule-grip" title="Drag to reorder (or Alt+↑/↓)"><Icon name="grip" /></span>
-                  <span class="rule-order" title={`Evaluated ${ordinal(i + 1)}`}>{i + 1}</span>
-                  <input type="checkbox" checked={r.enabled} aria-label={`Enable rule ${ruleLabel(r)}`}
-                    onChange={() => commit(toggleRule(rules, r.id))} />
-                  <div class="rule-main" onDblClick={() => dispatch({ type: 'editRule', id: r.id })}>
-                    <div class="rule-name">
-                      <span class={`badge kind kind-${r.action.kind}`}>{r.action.kind}</span>
-                      {isAgentRule(r) && <AgentBadge />}
-                      <span class="rule-title">{ruleDisplayName(r)}</span>
-                      {budget && (
-                        <span class={`badge rule-budget${budget.spent ? ' spent' : ''}`}
-                          title={[
-                            r.times !== undefined ? `Applies to the first ${r.times} matching request${r.times === 1 ? '' : 's'} (counted from the exchanges listed), then is removed.` : '',
-                            r.expiresAt !== undefined ? `Removed at ${formatTime(r.expiresAt).slice(0, 8)}.` : '',
-                          ].filter(Boolean).join(' ')}>
-                          {budget.text}
+                  <div class="rule-line">
+                    <span class={`rule-grip${shared ? ' locked' : ''}`} title={shared ? 'Shared rules keep the order of the file' : 'Drag to reorder (or Alt+↑/↓)'}>
+                      <Icon name="grip" />
+                    </span>
+                    <span class="rule-order" title={`Evaluated ${ordinal(i + 1)}`}>{i + 1}</span>
+                    <input type="checkbox" checked={r.enabled} aria-label={`Enable rule ${ruleLabel(r)}`} disabled={shared}
+                      title={shared ? `Shared rule: enable or disable it in ${sr?.file ?? SHARED_FILE}` : undefined}
+                      onChange={() => commit(toggleRule(rules, r.id))} />
+                    <div class="rule-main" onDblClick={() => dispatch({ type: 'editRule', id: r.id })}>
+                      <div class="rule-name">
+                        <span class={`badge kind kind-${r.action.kind}`}>{r.action.kind}</span>
+                        {shared && <span class="badge shared-badge" title={SHARED_TITLE}>shared</span>}
+                        {isAgentRule(r) && <AgentBadge />}
+                        <span class="rule-title">{ruleDisplayName(r)}</span>
+                        {budget && (
+                          <span class={`badge rule-budget${budget.spent ? ' spent' : ''}`}
+                            title={[
+                              r.times !== undefined ? `Applies to the first ${r.times} matching request${r.times === 1 ? '' : 's'} (counted from the exchanges listed), then is removed.` : '',
+                              r.expiresAt !== undefined ? `Removed at ${formatTime(r.expiresAt).slice(0, 8)}.` : '',
+                            ].filter(Boolean).join(' ')}>
+                            {budget.text}
+                          </span>
+                        )}
+                      </div>
+                      <div class="rule-sub">
+                        <code>{r.match.method?.toUpperCase() ?? 'ANY'} {r.match.url}</code>
+                        {r.match.graphqlOperation && (
+                          <span class="badge mini gql-badge" title={`Only the GraphQL operation “${r.match.graphqlOperation}” (exact name)`}>
+                            op {r.match.graphqlOperation}
+                          </span>
+                        )}
+                        <span title={describeAction(r.action)}> → {describeAction(r.action)}</span>
+                        <span class={`rule-stat${shadowed ? ' warn' : ''}`}
+                          title={shadowed ? 'An earlier enabled rule matches some of these first' : 'Matches among the exchanges currently listed'}>
+                          {' · '}matches {s.matches}
+                          {shadowed && `, ${s.matches - s.wins} taken by an earlier rule`}
                         </span>
-                      )}
+                      </div>
                     </div>
-                    <div class="rule-sub">
-                      <code>{r.match.method?.toUpperCase() ?? 'ANY'} {r.match.url}</code>
-                      {r.match.graphqlOperation && (
-                        <span class="badge mini gql-badge" title={`Only the GraphQL operation “${r.match.graphqlOperation}” (exact name)`}>
-                          op {r.match.graphqlOperation}
-                        </span>
+                    <div class="rule-buttons">
+                      {shared ? (
+                        <Button class="share-btn" title="Move this rule out of the shared file into your personal rules" onClick={() => share(r, false)}>
+                          Unshare
+                        </Button>
+                      ) : (
+                        <Button class="share-btn" pressed={sharing === r.id}
+                          title={`Share with your team: moves this rule into ${sr?.file ?? SHARED_FILE}, committed with the project`}
+                          onClick={() => setSharing(sharing === r.id ? undefined : r.id)}>
+                          Share
+                        </Button>
                       )}
-                      <span> → {describeAction(r.action)}</span>
-                      <span class={`rule-stat${shadowed ? ' warn' : ''}`}
-                        title={shadowed ? 'An earlier enabled rule matches some of these first' : 'Matches among the exchanges currently listed'}>
-                        {' · '}matches {s.matches}
-                        {shadowed && `, ${s.matches - s.wins} taken by an earlier rule`}
+                      <Button kind="icon" title="Move up" disabled={!canMoveRule(rules, i, i - 1)} onClick={() => move(i, i - 1)}><Icon name="up" /></Button>
+                      <Button kind="icon" title="Move down" disabled={!canMoveRule(rules, i, i + 1)} onClick={() => move(i, i + 1)}><Icon name="down" /></Button>
+                      <Button kind="icon" title={shared ? 'View' : 'Edit'} onClick={() => dispatch({ type: 'editRule', id: r.id })}><Icon name="edit" /></Button>
+                      <Button kind="icon" title={shared ? 'Shared rule: Unshare it first, or remove it from the file' : 'Delete'} disabled={shared}
+                        onClick={() => commit(deleteRule(rules, r.id), `Deleted rule “${ruleLabel(r)}”.`, true)}>
+                        <Icon name="clear" />
+                      </Button>
+                    </div>
+                  </div>
+                  {sharing === r.id && (
+                    <div class="confirm share-confirm" role="alertdialog" aria-label="Share this rule?">
+                      <span>
+                        Move “{ruleLabel(r)}” into <code>{sr?.file ?? SHARED_FILE}</code>? The file is committed with your code,
+                        so everyone on the project gets this rule — check it holds no tokens or personal data.
+                        {approval && ` Teammates will have to approve it before it runs: ${approval}.`}
                       </span>
+                      <Button kind="primary" onClick={() => share(r, true)}>Share</Button>
+                      <Button onClick={() => setSharing(undefined)}>Cancel</Button>
                     </div>
-                  </div>
-                  <div class="rule-buttons">
-                    <Button kind="icon" title="Move up" disabled={i === 0} onClick={() => move(i, i - 1)}><Icon name="up" /></Button>
-                    <Button kind="icon" title="Move down" disabled={i === rules.length - 1} onClick={() => move(i, i + 1)}><Icon name="down" /></Button>
-                    <Button kind="icon" title="Edit" onClick={() => dispatch({ type: 'editRule', id: r.id })}><Icon name="edit" /></Button>
-                    <Button kind="icon" title="Delete" onClick={() => commit(deleteRule(rules, r.id), `Deleted rule “${ruleLabel(r)}”.`, true)}>
-                      <Icon name="clear" />
-                    </Button>
-                  </div>
+                  )}
                 </li>
               );
             })}
@@ -115,6 +179,7 @@ export function RulesView() {
         <RuleEditor
           key={state.editingRuleId}
           rule={state.editingRuleId === NEW_RULE ? undefined : rules.find((r) => r.id === state.editingRuleId)}
+          sharedFile={sr?.file}
           onSave={(rule, isNew) => {
             commit(upsertRule(rules, rule), isNew ? `Added rule “${ruleLabel(rule)}” at position ${rules.length + 1}.` : undefined);
             dispatch({ type: 'editRule', id: undefined });
@@ -132,17 +197,26 @@ function ordinal(n: number): string {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
-export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r: Rule, isNew: boolean) => void; onCancel: () => void }) {
-  const { state } = useApp();
+
+const KIND_RADIOS: readonly [RuleForm['kind'], string][] = [
+  ['mock', 'Mock response'], ['block', 'Block'], ['breakpoint', 'Breakpoint'], ['throttle', 'Throttle'], ['fault', 'Fault'],
+  ['mutate', 'Mutate JSON'], ['cors', 'CORS (dev only)'], ['sequence', 'Sequence'], ['mapRemote', 'Map remote'], ['rewrite', 'Rewrite'],
+];
+
+export function RuleEditor({ rule, sharedFile, onSave, onCancel }: {
+  rule?: Rule; sharedFile?: string; onSave: (r: Rule, isNew: boolean) => void; onCancel: () => void;
+}) {
+  const { state, post } = useApp();
   const [form, setForm] = useState<RuleForm>(() => ruleToForm(rule));
   const [confirmJson, setConfirmJson] = useState(false);
+  const readOnly = !!rule && isShared(rule);
   const set = (patch: Partial<RuleForm>) => {
     setForm((f) => ({ ...f, ...patch }));
     if ('mockBody' in patch) setConfirmJson(false);
   };
   const v = validateRuleForm(form);
   const hasErrors = Object.keys(v.errors).length > 0;
-  const jsonBad = form.kind === 'mock' && v.json && !v.json.ok ? v.json : undefined;
+  const jsonBad = form.kind === 'mock' && !form.mockUseFile && v.json && !v.json.ok ? v.json : undefined;
   const preview = useMemo(() => {
     if (v.errors.url) return undefined;
     return countMatches({
@@ -158,229 +232,146 @@ export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r
     return [...ops].sort();
   }, [form.url, form.method, state.exchanges, v.errors.url]);
   const showGql = !!form.graphqlOperation || knownOps.length > 0 || /graphql/i.test(form.url);
+  // mockBody is the file's content (resolved by the host) only while the path is the one the rule was saved with.
+  const savedFile = rule?.action.kind === 'mock' ? rule.action.bodyFile : undefined;
+
+  // The host answers a refused / failed openBodyFile with an `error` message: show the next one in the editor too.
+  const [fileError, setFileError] = useState<{ after: number; message?: string }>();
+  const lastErrorId = state.hostErrors.at(-1)?.id ?? 0;
+  useEffect(() => {
+    if (!fileError || fileError.message) return;
+    const e = state.hostErrors.find((x) => x.id > fileError.after);
+    if (e) setFileError({ ...fileError, message: e.message });
+  }, [state.hostErrors]);
+  useEffect(() => setFileError(undefined), [form.mockBodyFile, form.mockUseFile]);
+  const openBodyFile = (path: string, createWith?: string) => {
+    setFileError({ after: lastErrorId });
+    post(createWith === undefined ? { type: 'openBodyFile', path } : { type: 'openBodyFile', path, create: { content: createWith } });
+  };
 
   const save = (force = false) => {
-    if (hasErrors) return;
+    if (hasErrors || readOnly) return;
     if (jsonBad && !force) { setConfirmJson(true); return; }
     onSave(formToRule(form), form.isNew);
   };
 
-  const radio = <K extends 'kind' | 'blockMode' | 'phase' | 'fault'>(key: K, value: RuleForm[K], label: string) => (
-    <label class="radio">
-      <input type="radio" name={key} checked={form[key] === value} onChange={() => set({ [key]: value } as Partial<RuleForm>)} />
-      {label}
-    </label>
-  );
-  const setThrottle = (patch: Partial<ThrottleFields>) => set({ throttle: { ...form.throttle, ...patch } });
-  const throttleField = (key: keyof ThrottleFields, label: string, placeholder: string) => (
-    <label class="field small-field">
-      <span>{label}</span>
-      <input value={form.throttle[key]} inputMode="numeric" placeholder={placeholder} aria-invalid={!!v.errors[key]}
-        onInput={(e) => setThrottle({ [key]: (e.target as HTMLInputElement).value })} />
-    </label>
-  );
-
   return (
-    <form class="rule-editor" aria-label={form.isNew ? 'New rule' : 'Edit rule'}
+    <form class={`rule-editor${readOnly ? ' read-only' : ''}`} aria-label={form.isNew ? 'New rule' : readOnly ? 'Shared rule' : 'Edit rule'}
       onSubmit={(e) => { e.preventDefault(); save(); }}
       onKeyDown={(e) => { if (e.key === 'Escape') onCancel(); }}>
       <div class="re-head">
-        <h3>{form.isNew ? 'New rule' : 'Edit rule'}</h3>
+        <h3>{form.isNew ? 'New rule' : readOnly ? 'Shared rule' : 'Edit rule'}</h3>
         <span class="spacer" />
-        <label class="check"><input type="checkbox" checked={form.enabled} onChange={() => set({ enabled: !form.enabled })} /> Enabled</label>
+        {!readOnly && (
+          <label class="check"><input type="checkbox" checked={form.enabled} onChange={() => set({ enabled: !form.enabled })} /> Enabled</label>
+        )}
       </div>
-
-      <label class="field">
-        <span>Name <span class="muted">(optional)</span></span>
-        <input value={form.name} placeholder="e.g. Empty cart" onInput={(e) => set({ name: (e.target as HTMLInputElement).value })} />
-      </label>
-
-      <fieldset>
-        <legend>Match</legend>
-        <div class="field-row">
-          <label class="field method-field">
-            <span>Method</span>
-            <input list="fi-rule-methods" value={form.method} placeholder="any" spellcheck={false}
-              aria-invalid={!!v.errors.method} onInput={(e) => set({ method: (e.target as HTMLInputElement).value })} />
-            <datalist id="fi-rule-methods">{['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].map((m) => <option key={m} value={m} />)}</datalist>
-          </label>
-          <label class="field grow">
-            <span>URL</span>
-            <input class="mono" value={form.url} placeholder="https://api.example.com/users/*  or  /\/users\/\d+$/" spellcheck={false}
-              aria-invalid={!!v.errors.url} onInput={(e) => set({ url: (e.target as HTMLInputElement).value })} />
-          </label>
+      {readOnly && (
+        <div class="msg info shared-note" role="note">
+          <span class="badge shared-badge">shared</span> This rule comes from <code>{sharedFile ?? SHARED_FILE}</code>, committed
+          with the project — it is read-only here. Edit that file to change it (the panel follows), or Unshare it in the
+          list to make it a personal rule.
         </div>
-        {v.errors.method && <div class="msg error">{v.errors.method}</div>}
-        {v.errors.url && form.url.trim()
-          ? <div class="msg error">{v.errors.url}</div>
-          : <div class="hint">{v.errors.url ? `${v.errors.url} ${v.urlHint}` : v.urlHint}</div>}
-        {showGql && (
-          <>
-            <label class="field">
-              <span>GraphQL operation <span class="muted">(optional)</span></span>
-              <input class="mono" list="fi-rule-ops" value={form.graphqlOperation} placeholder="any operation, e.g. getUser" spellcheck={false}
-                aria-invalid={!!v.errors.graphqlOperation} onInput={(e) => set({ graphqlOperation: (e.target as HTMLInputElement).value })} />
-              <datalist id="fi-rule-ops">{knownOps.map((o) => <option key={o} value={o} />)}</datalist>
-            </label>
-            {v.errors.graphqlOperation
-              ? <div class="msg error">{v.errors.graphqlOperation}</div>
-              : <div class="hint">Exact, case-sensitive operation name. The proxy reads the request body (up to 5 MB) to check it before routing.</div>}
-          </>
-        )}
-        {preview !== undefined && (
-          <div class="hint">Matches {preview} of the {state.exchanges.length} exchanges currently listed.</div>
-        )}
-      </fieldset>
-
-      <fieldset>
-        <legend>Action</legend>
-        <div class="radios">
-          {radio('kind', 'mock', 'Mock response')}
-          {radio('kind', 'block', 'Block')}
-          {radio('kind', 'breakpoint', 'Breakpoint')}
-          {radio('kind', 'throttle', 'Throttle')}
-          {radio('kind', 'fault', 'Fault')}
-          {radio('kind', 'mutate', 'Mutate JSON')}
-          {radio('kind', 'cors', 'CORS (dev only)')}
-        </div>
-
-        {form.kind === 'mock' && (
-          <>
-            <div class="field-row">
-              <label class="field small-field">
-                <span>Status</span>
-                <input value={form.mockStatus} inputMode="numeric" aria-invalid={!!v.errors.mockStatus}
-                  onInput={(e) => set({ mockStatus: (e.target as HTMLInputElement).value })} />
-              </label>
-              <label class="field small-field">
-                <span>Delay (ms)</span>
-                <input value={form.mockDelayMs} inputMode="numeric" placeholder="0" aria-invalid={!!v.errors.mockDelayMs}
-                  onInput={(e) => set({ mockDelayMs: (e.target as HTMLInputElement).value })} />
-              </label>
-            </div>
-            {v.errors.mockStatus && <div class="msg error">Status: {v.errors.mockStatus}</div>}
-            {v.errors.mockDelayMs && <div class="msg error">Delay: {v.errors.mockDelayMs}</div>}
-            <div class="field-label">Headers</div>
-            <HeadersEditor rows={form.mockHeaders} onChange={(mockHeaders) => set({ mockHeaders })} />
-            {v.errors.mockHeaders && <div class="msg error">{v.errors.mockHeaders}</div>}
-            <div class="field-label">Body</div>
-            <BodyEditor label="Mock body" value={form.mockBody} json={v.json} rows={10} onInput={(mockBody) => set({ mockBody })} />
-          </>
-        )}
-
-        {form.kind === 'block' && (
-          <>
-            <div class="radios">
-              {radio('blockMode', 'reset', 'Connection reset (app sees a network error)')}
-              {radio('blockMode', 'status', 'Respond with status')}
-            </div>
-            {form.blockMode === 'status' && (
-              <label class="field small-field">
-                <span>Status</span>
-                <input value={form.blockStatus} inputMode="numeric" aria-invalid={!!v.errors.blockStatus}
-                  onInput={(e) => set({ blockStatus: (e.target as HTMLInputElement).value })} />
-              </label>
-            )}
-            {v.errors.blockStatus && <div class="msg error">Status: {v.errors.blockStatus}</div>}
-          </>
-        )}
-
-        {form.kind === 'breakpoint' && (
-          <div class="radios">
-            {radio('phase', 'request', 'Pause request')}
-            {radio('phase', 'response', 'Pause response')}
-            {radio('phase', 'both', 'Both')}
-          </div>
-        )}
-
-        {form.kind === 'throttle' && (
-          <>
-            <div class="hint">Forwards to the real server, slowed down. “Fail” resets that share of the requests.</div>
-            <div class="field-row">
-              {throttleField('latencyMs', 'Latency (ms)', '0')}
-              {throttleField('kbps', 'Bandwidth (kbps)', 'unlimited')}
-              {throttleField('dropPct', 'Fail (%)', '0')}
-            </div>
-            {(['latencyMs', 'kbps', 'dropPct', 'throttle'] as const).map((k) => v.errors[k] && <div key={k} class="msg error">{v.errors[k]}</div>)}
-          </>
-        )}
-
-        {form.kind === 'cors' && (
-          <>
-            <div class="field-row">
-              <label class="field grow">
-                <span>Allow origin</span>
-                <input class="mono" value={form.corsOrigin} placeholder="e.g. http://localhost:5000 (empty = localhost origins only)" spellcheck={false}
-                  aria-invalid={!!v.errors.cors} onInput={(e) => set({ corsOrigin: (e.target as HTMLInputElement).value })} />
-              </label>
-            </div>
-            <label class="check">
-              <input type="checkbox" checked={form.corsCredentials} onChange={() => set({ corsCredentials: !form.corsCredentials })} />
-              Allow credentials (cookies) — off by default; only with a named origin
-            </label>
-            {v.errors.cors && <div class="msg error">{v.errors.cors}</div>}
-            <div class="msg warn cors-dev-note">{CORS_DEV_NOTE}</div>
-          </>
-        )}
-
-        {form.kind === 'fault' && (
-          <>
-            <div class="radios">
-              {(Object.keys(FAULT_LABEL) as FaultKind[]).map((k) => radio('fault', k, FAULT_LABEL[k][0].toUpperCase() + FAULT_LABEL[k].slice(1)))}
-            </div>
-            <div class="hint">
-              {form.fault === 'dns' ? 'The app sees a failed host lookup, as when offline.'
-                : form.fault === 'timeout' ? 'The request is held unanswered until the app gives up (its own timeout).'
-                : form.fault === 'truncate' ? 'Forwards to the server, then cuts the response body mid-way.'
-                : 'The connection is reset once it is up — the app sees a network error.'}
-            </div>
-          </>
-        )}
-      </fieldset>
-
-      {form.kind === 'mutate' && (
-        <fieldset>
-          <legend>Changes to the response</legend>
-          <div class="hint">
-            Forwards to the real server, then changes the JSON response before the app gets it — e.g. null a field to
-            reproduce “Null is not a subtype of String”. Paths: <code>$.user.avatar_url</code>, <code>$.items[0].id</code>,{' '}
-            <code>$.items[*].price</code>, <code>$['odd key']</code>. A non-JSON response is passed through unchanged.
-          </div>
-          <MutateOpsEditor rows={form.mutateOps} errors={v.opErrors} onChange={(mutateOps) => set({ mutateOps })} />
-          {v.errors.mutate && <div class="msg error">{v.errors.mutate}</div>}
-        </fieldset>
       )}
 
-      <fieldset>
-        <legend>Lifetime</legend>
-        <div class="field-row">
-          <label class="field lifetime-field">
-            <span>Only first N requests</span>
-            <input value={form.times} inputMode="numeric" placeholder="every" aria-invalid={!!v.errors.times}
-              onInput={(e) => set({ times: (e.target as HTMLInputElement).value })} />
-          </label>
-          <label class="field lifetime-field">
-            <span>Expires in</span>
-            <input value={form.expiresIn} inputMode="decimal" placeholder="never" aria-invalid={!!v.errors.expiresIn}
-              onInput={(e) => set({ expiresIn: (e.target as HTMLInputElement).value, keepExpiresAt: undefined })} />
-          </label>
-          <label class="field">
-            <span class="sr-only">Unit</span>
-            <select aria-label="Expiry unit" value={form.expiresUnit}
-              onChange={(e) => set({ expiresUnit: (e.target as HTMLSelectElement).value as RuleForm['expiresUnit'], keepExpiresAt: undefined })}>
-              <option value="s">seconds</option>
-              <option value="m">minutes</option>
-              <option value="h">hours</option>
-            </select>
-          </label>
-        </div>
-        {v.errors.times && <div class="msg error">{v.errors.times}</div>}
-        {v.errors.expiresIn && <div class="msg error">{v.errors.expiresIn}</div>}
-        <div class="hint">
-          {form.keepExpiresAt !== undefined
-            ? `Expires at ${formatTime(form.keepExpiresAt).slice(0, 8)} — change the field to reset it.`
-            : 'A spent or expired rule is removed automatically, so a temporary mock never lingers.'}
-        </div>
+      <fieldset class="re-body" disabled={readOnly}>
+        <label class="field">
+          <span>Name <span class="muted">(optional)</span></span>
+          <input value={form.name} placeholder="e.g. Empty cart" onInput={(e) => set({ name: (e.target as HTMLInputElement).value })} />
+        </label>
+
+        <fieldset>
+          <legend>Match</legend>
+          <div class="field-row">
+            <label class="field method-field">
+              <span>Method</span>
+              <input list="fi-rule-methods" value={form.method} placeholder="any" spellcheck={false}
+                aria-invalid={!!v.errors.method} onInput={(e) => set({ method: (e.target as HTMLInputElement).value })} />
+              <datalist id="fi-rule-methods">{['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].map((m) => <option key={m} value={m} />)}</datalist>
+            </label>
+            <label class="field grow">
+              <span>URL</span>
+              <input class="mono" value={form.url} placeholder="https://api.example.com/users/*  or  /\/users\/\d+$/" spellcheck={false}
+                aria-invalid={!!v.errors.url} onInput={(e) => set({ url: (e.target as HTMLInputElement).value })} />
+            </label>
+          </div>
+          {v.errors.method && <div class="msg error">{v.errors.method}</div>}
+          {v.errors.url && form.url.trim()
+            ? <div class="msg error">{v.errors.url}</div>
+            : <div class="hint">{v.errors.url ? `${v.errors.url} ${v.urlHint}` : v.urlHint}</div>}
+          {showGql && (
+            <>
+              <label class="field">
+                <span>GraphQL operation <span class="muted">(optional)</span></span>
+                <input class="mono" list="fi-rule-ops" value={form.graphqlOperation} placeholder="any operation, e.g. getUser" spellcheck={false}
+                  aria-invalid={!!v.errors.graphqlOperation} onInput={(e) => set({ graphqlOperation: (e.target as HTMLInputElement).value })} />
+                <datalist id="fi-rule-ops">{knownOps.map((o) => <option key={o} value={o} />)}</datalist>
+              </label>
+              {v.errors.graphqlOperation
+                ? <div class="msg error">{v.errors.graphqlOperation}</div>
+                : <div class="hint">Exact, case-sensitive operation name. The proxy reads the request body (up to 5 MB) to check it before routing.</div>}
+            </>
+          )}
+          {preview !== undefined && (
+            <div class="hint">Matches {preview} of the {state.exchanges.length} exchanges currently listed.</div>
+          )}
+        </fieldset>
+
+        <fieldset>
+          <legend>Action</legend>
+          <div class="radios">
+            {KIND_RADIOS.map(([kind, label]) => (
+              <label key={kind} class="radio">
+                <input type="radio" name="kind" checked={form.kind === kind} onChange={() => set({ kind })} />
+                {label}
+              </label>
+            ))}
+          </div>
+          {form.kind === 'sequence' ? (
+            <div class="hint">Different answers for successive requests — set the steps below.</div>
+          ) : (
+            <ActionEditor kind={form.kind} f={form} v={v} uid="rule" set={set}
+              bodyFile={{ suggest: () => suggestBodyFile(form.name, form.url), knownContent: !!savedFile && savedFile === form.mockBodyFile.trim(),
+                open: openBodyFile, error: fileError?.message,
+              }} />
+          )}
+        </fieldset>
+
+        {form.kind === 'sequence' && (
+          <SequenceEditor steps={form.steps} then={form.seqThen} checks={v.stepChecks} error={v.errors.sequence} onChange={set} />
+        )}
+
+        <fieldset>
+          <legend>Lifetime</legend>
+          <div class="field-row">
+            <label class="field lifetime-field">
+              <span>Only first N requests</span>
+              <input value={form.times} inputMode="numeric" placeholder="every" aria-invalid={!!v.errors.times}
+                onInput={(e) => set({ times: (e.target as HTMLInputElement).value })} />
+            </label>
+            <label class="field lifetime-field">
+              <span>Expires in</span>
+              <input value={form.expiresIn} inputMode="decimal" placeholder="never" aria-invalid={!!v.errors.expiresIn}
+                onInput={(e) => set({ expiresIn: (e.target as HTMLInputElement).value, keepExpiresAt: undefined })} />
+            </label>
+            <label class="field">
+              <span class="sr-only">Unit</span>
+              <select aria-label="Expiry unit" value={form.expiresUnit}
+                onChange={(e) => set({ expiresUnit: (e.target as HTMLSelectElement).value as RuleForm['expiresUnit'], keepExpiresAt: undefined })}>
+                <option value="s">seconds</option>
+                <option value="m">minutes</option>
+                <option value="h">hours</option>
+              </select>
+            </label>
+          </div>
+          {v.errors.times && <div class="msg error">{v.errors.times}</div>}
+          {v.errors.expiresIn && <div class="msg error">{v.errors.expiresIn}</div>}
+          <div class="hint">
+            {form.keepExpiresAt !== undefined
+              ? `Expires at ${formatTime(form.keepExpiresAt).slice(0, 8)} — change the field to reset it.`
+              : 'A spent or expired rule is removed automatically, so a temporary mock never lingers.'}
+          </div>
+        </fieldset>
       </fieldset>
 
       {confirmJson && jsonBad && (
@@ -392,48 +383,15 @@ export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r
       )}
 
       <div class="re-actions">
-        <Button kind="primary" type="submit" disabled={hasErrors}>{form.isNew ? 'Add rule' : 'Save'}</Button>
-        <Button onClick={onCancel}>Cancel</Button>
+        {readOnly ? (
+          <Button kind="primary" onClick={onCancel}>Close</Button>
+        ) : (
+          <>
+            <Button kind="primary" type="submit" disabled={hasErrors}>{form.isNew ? 'Add rule' : 'Save'}</Button>
+            <Button onClick={onCancel}>Cancel</Button>
+          </>
+        )}
       </div>
     </form>
-  );
-}
-
-const OP_LABEL: Record<MutateRow['op'], string> = { null: 'make null', delete: 'remove', set: 'set to' };
-
-/** The `mutate` op list: path, op and (for set) a JSON value per row. */
-export function MutateOpsEditor({ rows, errors, onChange }: {
-  rows: MutateRow[]; errors?: (string | undefined)[]; onChange: (rows: MutateRow[]) => void;
-}) {
-  const update = (i: number, patch: Partial<MutateRow>) => onChange(rows.map((r, k) => (k === i ? { ...r, ...patch } : r)));
-  return (
-    <div class="mutate-ops">
-      {rows.map((r, i) => {
-        const err = errors?.[i];
-        return (
-          <div class="mo-row" key={i}>
-            <div class="mo-line">
-              <input class="mo-path mono" aria-label={`Path of change ${i + 1}`} placeholder="$.user.avatar_url" spellcheck={false}
-                value={r.path} aria-invalid={!!err && err.startsWith('Path')}
-                onInput={(e) => update(i, { path: (e.target as HTMLInputElement).value })} />
-              <select aria-label={`Change ${i + 1}`} value={r.op}
-                onChange={(e) => update(i, { op: (e.target as HTMLSelectElement).value as MutateRow['op'] })}>
-                {(Object.keys(OP_LABEL) as MutateRow['op'][]).map((op) => <option key={op} value={op}>{OP_LABEL[op]}</option>)}
-              </select>
-              {r.op === 'set' && (
-                <input class="mo-value mono" aria-label={`JSON value of change ${i + 1}`} placeholder='"42"' spellcheck={false}
-                  value={r.value} aria-invalid={!!err && err.startsWith('Value')}
-                  onInput={(e) => update(i, { value: (e.target as HTMLInputElement).value })} />
-              )}
-              <Button kind="icon" title={`Remove change ${i + 1}`} disabled={rows.length === 1}
-                onClick={() => onChange(rows.filter((_, k) => k !== i))}>
-                <Icon name="close" />
-              </Button>
-            </div>
-          </div>
-        );
-      })}
-      <button type="button" class="link" onClick={() => onChange([...rows, { path: '', op: 'null', value: '' }])}>+ Add change</button>
-    </div>
   );
 }

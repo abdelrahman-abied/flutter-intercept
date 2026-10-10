@@ -52,6 +52,11 @@ export const MAX_MUTATE_OPS = 20;
 // CONTRACTS §11.5
 export const EXCHANGE_KINDS = ['http', 'websocket', 'sse'] as const;
 export const MAX_FRAMES_PER_CALL = 500;
+// CONTRACTS §12.7
+export const MAX_SEQUENCE_STEPS = 50;
+export const MAX_REWRITE_HEADERS = 50;
+export const MAX_REWRITE_REPLACEMENTS = 20;
+export const MAX_DIFF_ENTRIES = 200;
 
 const includeBrowserInternal = z
   .boolean()
@@ -127,6 +132,65 @@ const requestEditSchema = z
     body: z.string().optional().describe('New body text. Omit to keep the original body.'),
   })
   .describe('Changes to the recorded request. Omit to send it unchanged.');
+
+// ---- CONTRACTS §12.7
+const recordingId = z.string().min(1).max(200).describe('A recording id (from list_recordings or save_recording).');
+const stepCount = z.number().int().min(1).max(1000).optional().describe('How many successive matching requests this step answers (1-1000, default 1).');
+const mockBody = z
+  .union([z.string(), z.record(z.string(), z.unknown()), z.array(z.unknown())])
+  .describe('Response body: text, or a JSON object/array (sent as JSON).');
+const sequenceStep = z.discriminatedUnion('kind', [
+  z.strictObject({
+    kind: z.literal('mock'),
+    status: z.number().int().min(100).max(599).default(200),
+    headers: headerMap.optional().describe('Response headers. content-type defaults to application/json when body is an object.'),
+    body: mockBody.optional(),
+    delayMs: z.number().int().min(0).max(600_000).optional(),
+    count: stepCount,
+  }),
+  z.strictObject({
+    kind: z.literal('block'),
+    mode: z.enum(['status', 'reset']).default('status'),
+    status: z.number().int().min(100).max(599).default(403),
+    count: stepCount,
+  }),
+  z.strictObject({ kind: z.literal('fault'), fault: z.enum(FAULT_KINDS), count: stepCount }),
+  z.strictObject({
+    kind: z.literal('throttle'),
+    latencyMs: z.number().int().min(0).max(600_000).optional(),
+    kbps: z.number().min(1).max(10_000_000).optional(),
+    dropRate: z.number().min(0).max(1).optional(),
+    count: stepCount,
+  }),
+  z.strictObject({ kind: z.literal('passthrough'), count: stepCount }),
+]);
+const rewriteHeaders = z.record(z.string(), z.string()).describe('Headers to set (replacing any existing value).');
+const replaceBody = z
+  .array(
+    z.strictObject({
+      find: z.string().min(1).max(10 * 1024).describe('Literal text to find (no regex).'),
+      replace: z.string().max(64 * 1024).describe('Replacement text (at most 64 KB; all find + replace texts of a rule at most 256 KB).'),
+      all: z.boolean().optional().describe('Replace every occurrence (default: the first only).'),
+    }),
+  )
+  .min(1)
+  .max(MAX_REWRITE_REPLACEMENTS)
+  .describe('Literal find/replace on the decoded text body, applied in order (1-20). Non-text bodies are left untouched.');
+const rewriteRequest = z
+  .strictObject({
+    setHeaders: rewriteHeaders.optional(),
+    removeHeaders: z.array(z.string().min(1).max(200)).max(MAX_REWRITE_HEADERS).optional(),
+    replaceBody: replaceBody.optional(),
+  })
+  .describe('Changes to the request before it is forwarded to the real server.');
+const rewriteResponse = z
+  .strictObject({
+    status: z.number().int().min(100).max(599).optional(),
+    setHeaders: rewriteHeaders.optional(),
+    removeHeaders: z.array(z.string().min(1).max(200)).max(MAX_REWRITE_HEADERS).optional(),
+    replaceBody: replaceBody.optional(),
+  })
+  .describe("Changes to the real server's response before the app gets it.");
 
 export const toolSchemas = {
   get_status: z.strictObject({}),
@@ -337,6 +401,60 @@ export const toolSchemas = {
     ttlMs: ttlMs.optional(),
     name: ruleName.optional(),
   }),
+  // CONTRACTS §12.7
+  list_recordings: z.strictObject({}),
+  diff_recordings: z.strictObject({ a: recordingId.describe('The earlier / baseline recording.'), b: recordingId.describe('The recording to compare with it.') }),
+  get_auth_flows: z.strictObject({ sinceMs: sinceMs.optional() }),
+  save_recording: z.strictObject({
+    name: z.string().trim().min(1).max(100).describe('A name for the recording, e.g. "checkout happy path".'),
+    url: url.optional().describe('Only exchanges whose URL matches this glob. Omit for every finished HTTP request.'),
+    sinceMs: sinceMs.optional(),
+    redact: z
+      .boolean()
+      .default(true)
+      .describe('Save secrets (auth headers, cookies, tokens) as "[redacted]" (default true). Replays of a redacted recording send "[redacted]" values to the app.'),
+  }),
+  replay_recording: z.strictObject({
+    id: recordingId.optional().describe('Recording to replay. Omit to stop replaying.'),
+    fallback: z
+      .enum(['passthrough', 'fail'])
+      .default('passthrough')
+      .describe('Requests the recording has no answer for: "passthrough" (go to the real server) or "fail" (fail like offline, for a fully offline demo).'),
+  }),
+  add_sequence: z.strictObject({
+    url,
+    method: method.optional(),
+    graphqlOperation: ruleGraphql.optional(),
+    steps: z.array(sequenceStep).min(1).max(MAX_SEQUENCE_STEPS).describe('What successive matching requests get, in order (1-50 steps), e.g. [{kind:"mock", status:500, count:2}, {kind:"passthrough"}].'),
+    then: z
+      .enum(['last', 'passthrough', 'loop'])
+      .default('last')
+      .describe('After the last step: "last" keeps answering with the last step (default), "passthrough" lets requests reach the server, "loop" starts over.'),
+    name: ruleName.optional(),
+  }),
+  expire_token: z.strictObject({
+    url: url.describe('URL glob of the authenticated request(s) whose token should look expired, e.g. "https://api.example.com/v1/*".'),
+    count: z.number().int().min(1).max(1000).default(1).describe('How many matching requests get 401 before the real server answers again (1-1000, default 1).'),
+  }),
+  add_map_remote: z.strictObject({
+    url: url.describe('URL glob WITH a host of the requests to redirect, e.g. "https://api.example.com/*".'),
+    to: z
+      .string()
+      .min(1)
+      .max(2048)
+      .describe('Loopback target origin or URL prefix: http://localhost:<port>, http://127.0.0.1:<port> or http://[::1]:<port> (optionally with a path prefix). Other hosts are refused for agents.'),
+    method: method.optional(),
+  }),
+  add_rewrite: z.strictObject({
+    url: url.describe('URL glob WITH a host, e.g. "https://api.example.com/v1/*".'),
+    method: method.optional(),
+    graphqlOperation: ruleGraphql.optional(),
+    request: rewriteRequest.optional(),
+    response: rewriteResponse.optional(),
+    times: times.optional(),
+    ttlMs: ttlMs.optional(),
+    name: ruleName.optional(),
+  }),
 } satisfies Record<ToolName, z.ZodType>;
 
 export type ToolInput<T extends ToolName> = z.output<(typeof toolSchemas)[T]>;
@@ -407,7 +525,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   add_mock: {
     title: 'Add mock rule',
-    model: "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins. Pass times (e.g. 1 = only the next request, to test a retry) or ttlMs to have it removed automatically; otherwise remove it with remove_rule when done. GraphQL: all operations share one URL, so pass graphqlOperation (e.g. \"GetUser\") to mock just that operation (list_requests shows the names).",
+    model: "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins. Pass times (e.g. 1 = only the next request, to test a retry) or ttlMs to have it removed automatically; otherwise remove it with remove_rule when done. GraphQL: all operations share one URL, so pass graphqlOperation (e.g. \"GetUser\") to mock just that operation (list_requests shows the names). Refused: HTML / JavaScript / SVG content types (or an untyped HTML body), and 3xx redirects whose location leaves the request's own origin (except to localhost).",
     user: 'Add a rule that answers matching requests with a fake response.',
   },
   add_block: {
@@ -516,6 +634,52 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
     model:
       'Flutter Web development only: let matching requests reach the real server, but answer the browser\'s CORS preflight (OPTIONS) locally and add Access-Control-Allow-Origin (default: the request\'s Origin; or allowOrigin), allow-methods/headers and optionally Allow-Credentials to the real response, so the app can be developed while the backend\'s CORS setup is wrong. By default only loopback pages (the Flutter Web dev server on localhost) are allowed, without credentials; pass allowOrigin / allowCredentials only when needed. The url must name a host. The real server is NOT changed: the same requests still fail in production until the backend sends the headers itself, so report the actual problem (get_request shows cors.problem). allowOrigin "*" cannot be combined with allowCredentials. Inserted first; times / ttlMs remove it automatically, otherwise use remove_rule.',
     user: 'Add a development-only rule that adds CORS headers to matching responses.',
+  },
+  // CONTRACTS §12.7
+  list_recordings: {
+    title: 'List traffic recordings',
+    model: 'List the saved traffic recordings (id, name, createdAt, number of exchanges, whether secrets were redacted) and which one is being replayed, if any. Recordings are made with save_recording or from the traffic panel and live in the project\'s .dart_tool/flutter_intercept/recordings/ (not committed).',
+    user: 'List saved traffic recordings.',
+  },
+  diff_recordings: {
+    title: 'Compare two recordings',
+    model: 'Compare two recordings route by route (method + path template such as GET /users/{id}): routes added or removed, status changes, JSON shape changes (keys added/removed, type changes), how many body values changed (values are never shown), call-count changes and responses more than 2x slower. Use it to see what a backend or app change did to the traffic: save a recording before and after, then diff them (a = before, b = after). Details are redacted.',
+    user: 'Compare two traffic recordings.',
+  },
+  get_auth_flows: {
+    title: 'Analyse token refresh flows',
+    model: 'Find the app\'s token refresh flows in the recorded traffic: each 401/403, the refresh call(s) that followed and the retried request(s), with a stampede warning when the app sent several refresh calls for one expiry within 2 s, and a problem when the retry never happened or got 401 again. Steps carry exchange ids, method, redacted URL and status (read them with get_request). Combine with expire_token to test the refresh logic: expire_token, trigger the flow, then get_auth_flows.',
+    user: 'Show 401 → token refresh → retry flows.',
+  },
+  save_recording: {
+    title: 'Save a traffic recording',
+    model: 'Save the finished HTTP exchanges (optionally only those matching url / since sinceMs; WebSocket, SSE and read-only native-client traffic is not recorded) as a named recording under the project\'s .dart_tool/flutter_intercept/recordings/. Secrets are saved as "[redacted]" unless you pass redact: false. Use recordings to replay a backend state offline (replay_recording) or to compare traffic before and after a change (diff_recordings). Returns {id, name, exchanges}.',
+    user: 'Save the recorded traffic as a recording.',
+  },
+  replay_recording: {
+    title: 'Replay a recording',
+    model: 'Answer the app\'s requests from a saved recording instead of the real server: the same method + URL (and request body) gets the recorded response; several recorded responses for one request are served in order; requests whose path differs only in ids (/users/42 vs /users/7) match by path template. Rules still win. fallback decides what unmatched requests do: "passthrough" (real server, default) or "fail" (like offline — a fully offline demo). Replayed exchanges carry simulated: "Replayed from <name>". Call it without id to stop replaying (do this when done); get_status / list_recordings show what is being replayed.',
+    user: 'Answer requests from a saved recording (or stop replaying).',
+  },
+  add_sequence: {
+    title: 'Add a scenario (sequence) rule',
+    model: 'Make successive matching requests get different answers, to test retries, polling and recovery: steps [{kind:"mock", status:500, count:2}, {kind:"passthrough"}] fails the first two requests and lets the third reach the server. Step kinds: mock (status, body, headers, delayMs), block (status or reset), fault (reset, timeout, truncate, dns), throttle (latencyMs, kbps, dropRate), passthrough (the real server); count = how many requests each step answers (default 1). then: "last" (default) keeps the last step, "passthrough", or "loop". Mock steps have add_mock\'s limits (no HTML/JavaScript, no redirects off the request\'s origin). The rule is inserted first; remove it with remove_rule when done. The panel and rule-hit show which step answered.',
+    user: 'Add a rule whose answer changes from request to request.',
+  },
+  expire_token: {
+    title: 'Expire the auth token',
+    model: 'Simulate an expired access token: the next count (default 1) requests matching url get 401 {"error":"token_expired"}; after that the real server answers again. Use it to test the app\'s token refresh: expire_token on the authenticated API, trigger a request, then get_auth_flows (did it refresh once and retry?) or assert_traffic. Inserted first; remove it with remove_rule when done.',
+    user: 'Make matching requests fail with 401 "token expired" for a while.',
+  },
+  add_map_remote: {
+    title: 'Map requests to a local server',
+    model: 'Redirect matching requests to a local backend (http://localhost:<port>, 127.0.0.1 or [::1], optionally with a path prefix): the path and query after the matched URL are kept, the app still sees the original URL, and exchanges carry simulated: "Mapped to <origin>". Requests keep their headers (including credentials), so map only to your own local server. Agents can only map to loopback targets; the user can map elsewhere from the panel. The url must name a host. Inserted first; remove it with remove_rule when done.',
+    user: 'Send matching requests to a local server instead.',
+  },
+  add_rewrite: {
+    title: 'Add a rewrite rule',
+    model: 'Let matching requests reach the real server but change them on the way: request {setHeaders, removeHeaders, replaceBody} before forwarding, response {status, setHeaders, removeHeaders, replaceBody} before the app gets it. replaceBody is a literal find/replace on the decoded text (1-20 replacements, no regex). Use it for feature flags in headers, forcing a status, or patching a response text. Refused: setting request headers that carry credentials (Authorization, Cookie, *token*, *session*, *api-key* …); setting Location, Refresh, Set-Cookie, Content-Security-Policy, Access-Control-*, X-Forwarded-*, Forwarded, Host or method-override headers, or an HTML/JavaScript content-type; "[redacted]" values; request.replaceBody; markup or script in replacements; and — while secrets are redacted — response replaceBody (a find/replace could reveal redacted values); use add_mutation for JSON fields. The url must name a host. Inserted first; times / ttlMs remove it automatically, otherwise use remove_rule.',
+    user: 'Add a rule that changes headers, status or body text of real requests or responses.',
   },
 };
 

@@ -141,7 +141,66 @@ export function invocationMessage(tool: ToolName, input: unknown): string {
       return `Reading the frames of ${plain(i.id)}${typeof i.since === 'number' ? ` from #${i.since}` : ''}`;
     case 'add_cors_rule':
       return `Adding a development-only CORS rule for ${m}${plain(i.url)}`;
+    // CONTRACTS §12.7
+    case 'list_recordings':
+      return 'Listing traffic recordings';
+    case 'diff_recordings':
+      return `Comparing recordings ${plain(i.a)} and ${plain(i.b)}`;
+    case 'get_auth_flows':
+      return 'Analysing token refresh flows';
+    case 'save_recording':
+      return `Saving ${i.url ? `${plain(i.url)} traffic` : 'the recorded traffic'} as "${plain(i.name)}"`;
+    case 'replay_recording':
+      return i.id ? `Replaying recording ${plain(i.id)}` : 'Stopping replay';
+    case 'add_sequence':
+      return `Adding a ${Array.isArray(i.steps) ? `${i.steps.length}-step ` : ''}scenario for ${m}${plain(i.url)}`;
+    case 'expire_token':
+      return `Expiring the token for ${plain(i.url)}`;
+    case 'add_map_remote':
+      return `Mapping ${m}${plain(i.url)} to ${plain(i.to)}`;
+    case 'add_rewrite':
+      return `Adding a rewrite rule for ${m}${plain(i.url)}`;
   }
+}
+
+/** "500 ×2, then the real server" for add_sequence's steps. */
+function stepsText(steps: unknown, then: unknown): string {
+  if (!Array.isArray(steps) || !steps.length) return 'no steps';
+  const one = (raw: unknown): string => {
+    const st = obj(raw);
+    const n = typeof st.count === 'number' && st.count > 1 ? ` ×${st.count}` : '';
+    switch (st.kind) {
+      case 'mock':
+        return `mock **${st.status ?? 200}**${n}`;
+      case 'block':
+        return `${st.mode === 'reset' ? 'connection reset' : `block **${st.status ?? 403}**`}${n}`;
+      case 'fault':
+        return `${code(st.fault ?? '?')} fault${n}`;
+      case 'throttle':
+        return `throttled${n}`;
+      case 'passthrough':
+        return `the real server${n}`;
+      default:
+        return code(st.kind ?? '?');
+    }
+  };
+  const parts = steps.slice(0, 8).map(one);
+  const more = steps.length > 8 ? `, and ${steps.length - 8} more step(s)` : '';
+  const after = then === 'loop' ? '; then it starts over' : then === 'passthrough' ? '; then the real server answers' : '; the last step keeps answering';
+  return `${parts.join(', then ')}${more}${after}`;
+}
+
+/** What a rewrite changes, for the confirmation (header names, never values beyond 60 chars). */
+function rewriteText(side: string, spec: unknown): string | undefined {
+  const r = obj(spec);
+  const parts: string[] = [];
+  if (r.status !== undefined) parts.push(`status → **${r.status}**`);
+  const set = obj(r.setHeaders);
+  const names = Object.keys(set);
+  if (names.length) parts.push(`set ${names.slice(0, 6).map((k) => `${code(k)}: ${code(String(set[k]).length > 60 ? `${String(set[k]).slice(0, 60)}…` : set[k])}`).join(', ')}${names.length > 6 ? ` and ${names.length - 6} more` : ''}`);
+  if (Array.isArray(r.removeHeaders) && r.removeHeaders.length) parts.push(`remove ${r.removeHeaders.slice(0, 6).map(code).join(', ')}${r.removeHeaders.length > 6 ? ' …' : ''}`);
+  if (Array.isArray(r.replaceBody) && r.replaceBody.length) parts.push(`${r.replaceBody.length} body text replacement(s)`);
+  return parts.length ? `${side}: ${parts.join('; ')}` : undefined;
 }
 
 /** "null `$.a`, set `$.b`" for a mutation's ops. */
@@ -302,6 +361,45 @@ export function confirmationText(tool: ToolName, input: unknown, ruleName?: stri
           `For ${target(i)}: answer the browser's CORS preflight locally and add CORS headers to the real responses${named}${spendText(i)}.\n\n` +
           `${corsPolicyText(origin ? code(origin) : undefined, origin, i.allowCredentials === true)}\n\n` +
           "Development only: the real server's CORS policy is **not** changed, so the same requests still fail without Flutter Intercept. Inserted as the first rule.",
+      };
+    }
+    // CONTRACTS §12.7: confirmations name the targets.
+    case 'save_recording':
+      return {
+        title: 'Save a traffic recording',
+        message:
+          `Save ${i.url ? `the finished requests matching ${code(i.url)}` : 'every finished HTTP request'}${typeof i.sinceMs === 'number' ? ` since ${new Date(i.sinceMs).toISOString()}` : ''} as recording ${code(i.name ?? '?')} ` +
+          `in the project's \`.dart_tool/flutter_intercept/recordings/\`${i.redact === false ? ', **with secrets unredacted** (real tokens and cookies are written to the file)' : ' (secrets redacted)'}.`,
+      };
+    case 'replay_recording':
+      return i.id
+        ? {
+            title: 'Replay a recording',
+            message: `Answer the app's requests from recording ${code(i.id)} instead of the real server. Requests it has no answer for ${i.fallback === 'fail' ? '**fail like offline**' : 'go to the real server'}. Until replay is stopped.`,
+          }
+        : { title: 'Stop replaying', message: 'Stop answering requests from a recording: the real server answers again.' };
+    case 'add_sequence':
+      return {
+        title: 'Add a scenario rule',
+        message: `For ${target(i)}, successive requests get: ${stepsText(i.steps, i.then)}${named}.\n\nInserted as the first rule.`,
+      };
+    case 'expire_token':
+      return {
+        title: 'Expire the auth token',
+        message: `The next **${typeof i.count === 'number' ? i.count : 1}** request(s) matching ${code(i.url ?? '*')} get **401** \`{"error":"token_expired"}\`; then the real server answers again. Inserted as the first rule.`,
+      };
+    case 'add_map_remote':
+      return {
+        title: 'Map requests to a local server',
+        message:
+          `Send ${target(i)} to ${code(i.to ?? '?')} instead of the real server${named}. ` +
+          'The requests keep their headers, **including credentials** (Authorization, cookies), so only map to a local server you trust. Inserted as the first rule.',
+      };
+    case 'add_rewrite': {
+      const parts = [rewriteText('Request', i.request), rewriteText('Response', i.response)].filter(Boolean);
+      return {
+        title: 'Add a rewrite rule',
+        message: `For ${target(i)}: forward to the real server, but change ${parts.length ? parts.join('. ') : 'nothing'}${named}${spendText(i)}.\n\nInserted as the first rule.`,
       };
     }
     default:

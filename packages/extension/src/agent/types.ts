@@ -21,6 +21,10 @@ export const READ_TOOLS = [
   'assert_traffic',
   // CONTRACTS §11.5
   'get_frames',
+  // CONTRACTS §12.7
+  'list_recordings',
+  'diff_recordings',
+  'get_auth_flows',
 ] as const;
 
 export const WRITE_TOOLS = [
@@ -41,6 +45,13 @@ export const WRITE_TOOLS = [
   'add_mutation',
   // CONTRACTS §11.5
   'add_cors_rule',
+  // CONTRACTS §12.7
+  'save_recording',
+  'replay_recording',
+  'add_sequence',
+  'expire_token',
+  'add_map_remote',
+  'add_rewrite',
 ] as const;
 
 export type ReadToolName = (typeof READ_TOOLS)[number];

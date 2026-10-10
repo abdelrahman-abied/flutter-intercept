@@ -26,14 +26,16 @@ describe('agent section content', () => {
     const lines = AGENT_SECTION.split('\n');
     expect(lines[0]).toBe(SECTION_START);
     expect(lines.at(-1)).toBe(SECTION_END);
-    expect(lines.length).toBeLessThanOrEqual(50);
+    expect(lines.length).toBeLessThanOrEqual(60);
     const known = new Set<string>([...READ_TOOLS, ...WRITE_TOOLS]);
     const mentioned = [...AGENT_SECTION.matchAll(/`([a-z]+(?:_[a-z]+)+)`/g)].map((m) => m[1]);
     expect(mentioned.length).toBeGreaterThan(10);
     for (const name of mentioned) expect(known, `unknown tool ${name}`).toContain(name);
     for (const must of ['launch_app', 'wait_for_request', 'get_request', 'add_mock', 'remove_rule', 'add_breakpoint',
       'list_paused', 'resume_request', 'clear_requests', 'get_request_source', 'get_body_shape', 'simulate_network', 'resend_request',
-      'check_contract', 'add_mutation', 'generate_model', 'generate_fixture_test', 'assert_traffic']) expect(mentioned).toContain(must);
+      'check_contract', 'add_mutation', 'generate_model', 'generate_fixture_test', 'assert_traffic',
+      // CONTRACTS §12.7
+      'add_sequence', 'expire_token', 'get_auth_flows', 'save_recording', 'replay_recording', 'diff_recordings', 'add_map_remote', 'add_rewrite']) expect(mentioned).toContain(must);
     expect(AGENT_SECTION).toContain('`times: 1`'); // CONTRACTS §9.5: times/ttlMs cleanup
     expect(AGENT_SECTION).toContain('`ttlMs`');
     expect(AGENT_SECTION).toContain('delayMs');

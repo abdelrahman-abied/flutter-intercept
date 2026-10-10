@@ -116,7 +116,8 @@ describe('redactBodyText', () => {
 
 describe('REVIEW-4 #9: credential-looking values, whatever the key', () => {
   const JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
-  const OPAQUE = ['sk', 'live', '51HxQwErTy9UiOp2AsDfGh3JkLzXcVbNm'].join('_');
+  // Opaque, provider-neutral token (built at runtime so no scanner mistakes it for a real key): 34 chars, mixed case + digits.
+  const OPAQUE = ['Qw7rTy9Ui', 'Op2AsDfGh3', 'JkLzXcVbNm', '51HxRe'].join('');
 
   it('detects JWTs, Bearer/Basic credentials and long mixed tokens; keeps hashes, UUIDs, ids and prose', () => {
     expect(redactSecretValues(JWT, true)).toBe(REDACTED);

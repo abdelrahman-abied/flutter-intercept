@@ -12,6 +12,10 @@
  * v0.5.0 (MCP door, the demo's coverage batch against local WebSocket / SSE servers): get_frames on the WebSocket echo (both directions, binary
  * summarised, paging) and the SSE stream, list_requests kind / graphqlOperation, a mock matched by graphqlOperation
  * (a decoy for another operation never matches), get_status warnings for the background isolates (cleared on stop).
+ * v0.6.0 (MCP door, CONTRACTS §12.7): expire_token on users/1 (401, then the real 200 after the count) and add_sequence
+ * on users/3 (500, then passthrough) across two hot restarts, a recording of each run and diff_recordings between them
+ * (status changes), replay_recording with fallback "fail" (users/1 answered from the recording without any rule, an
+ * unrecorded endpoint fails), get_auth_flows, and add_map_remote of users/1 to a local server started by the suite.
  *
  * Two paths, chosen automatically:
  *  - "lm":     the extension registered `flutter_intercept_*` (lead wiring + package.json
@@ -797,6 +801,139 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
         client = undefined;
         await dartCfg.update('flutterRunAdditionalArgs', runArgsBefore, vscode.ConfigurationTarget.Global).then(undefined, () => undefined);
         await servers?.close().catch(() => undefined);
+      }
+      out.ms = Date.now() - t0;
+      results.push(out);
+      console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+    }
+
+    // v0.6.0 (CONTRACTS §12.7) over MCP: scenarios, recordings, replay, diff, map remote.
+    for (const dev of devices) {
+      const out: RunOutcome = { name: `AGENT ${dev} v0.6.0 over MCP: expire_token, add_sequence, save/replay/diff recordings, add_map_remote`, output: '', proxyHits: [], failures: [], ms: 0 };
+      const f = out.failures;
+      const t0 = Date.now();
+      let sessionId: string | undefined;
+      const ruleIds: string[] = [];
+      const notes: string[] = [];
+      const TODOS1 = 'https://jsonplaceholder.typicode.com/todos/1';
+      const USERS_GLOB = 'https://jsonplaceholder.typicode.com/users/*';
+      // The local backend for add_map_remote: answers every path with a recognisable user (never echoes headers).
+      const mapped: { path: string; host?: string }[] = [];
+      const local = http.createServer((req, res) => {
+        mapped.push({ path: req.url ?? '', host: req.headers.host });
+        res.writeHead(200, { 'content-type': 'application/json' }).end('{"id":1,"name":"Mapped Local","email":"local@example.com"}');
+      });
+      /** Hot restart, then the first finished request to `url` that started after it. */
+      const restartAndWait = async (urls: string[]): Promise<{ at: number; got: Record<string, any> }> => {
+        const at = Date.now();
+        const h = await mcpCall('hot_restart', { sessionId });
+        if (h.isError) throw new Error(`hot_restart: ${h.text.slice(0, 200)}`);
+        const got: Record<string, any> = {};
+        for (const u of urls) {
+          const w = await mcpCall('wait_for_request', { url: u, method: 'GET', sinceMs: at, timeoutMs: 120_000 });
+          if (w.isError || w.result.timedOut) throw new Error(`wait_for_request ${u}: ${w.text.slice(0, 200)}`);
+          got[u] = w.result;
+        }
+        return { at, got };
+      };
+      try {
+        await new Promise<void>((resolve) => local.listen(0, '127.0.0.1', resolve));
+        const localPort = (local.address() as AddressInfo).port;
+        client = await connect();
+        const since = Date.now();
+        const l = await mcpCall('launch_app', { deviceId: dev });
+        sessionId = l.result.sessionId;
+        if (l.isError || !sessionId) throw new Error(`launch_app: ${l.text.slice(0, 200)}`);
+        const w0 = await mcpCall('wait_for_request', { url: USERS1, method: 'GET', sinceMs: since, timeoutMs: 120_000 });
+        if (w0.isError || w0.result.timedOut || w0.result.status !== 200) throw new Error(`first users/1: ${w0.text.slice(0, 200)}`);
+
+        // Scenario rules: users/1 gets one 401 (expired token), users/3 one 500; then the real server answers.
+        const et = await mcpCall('expire_token', { url: USERS1, count: 1 });
+        if (et.isError || !et.result.ruleId) throw new Error(`expire_token: ${et.text.slice(0, 200)}`);
+        ruleIds.push(et.result.ruleId);
+        const sq = await mcpCall('add_sequence', { url: USERS3, method: 'GET', steps: [{ kind: 'mock', status: 500, body: { error: 'boom' } }, { kind: 'passthrough' }], then: 'last' });
+        if (sq.isError || !sq.result.ruleId) throw new Error(`add_sequence: ${sq.text.slice(0, 200)}`);
+        ruleIds.push(sq.result.ruleId);
+
+        const run1 = await restartAndWait([USERS1, USERS3]);
+        const u1a = run1.got[USERS1];
+        const u3a = run1.got[USERS3];
+        if (u1a.status !== 401 || u1a.matchedRuleId !== et.result.ruleId) f.push(`expire_token: first users/1 after restart ${u1a.status} ${u1a.state} rule=${u1a.matchedRuleId}`);
+        if (u3a.status !== 500 || u3a.matchedRuleId !== sq.result.ruleId) f.push(`add_sequence: first users/3 after restart ${u3a.status} ${u3a.state} rule=${u3a.matchedRuleId}`);
+        await sleep(3000); // the rest of the batch
+        const recA = await mcpCall('save_recording', { name: `fi suite ${dev} expired`, url: USERS_GLOB, sinceMs: run1.at });
+        if (recA.isError || !recA.result.id || recA.result.redacted !== true) f.push(`save_recording A: ${recA.text.slice(0, 200)}`);
+        const flows = await mcpCall('get_auth_flows', { sinceMs: run1.at });
+        if (flows.isError) f.push(`get_auth_flows: ${flows.text.slice(0, 200)}`);
+        notes.push(`auth flows: ${flows.result.total ?? '?'}`);
+
+        const run2 = await restartAndWait([USERS1, USERS3]);
+        const u1b = run2.got[USERS1];
+        const u3b = run2.got[USERS3];
+        if (u1b.status !== 200 || u1b.state !== 'completed') f.push(`expire_token: after the count users/1 ${u1b.status} ${u1b.state} (expected the real 200)`);
+        if (u3b.status !== 200 || u3b.state !== 'completed') f.push(`add_sequence: then passthrough users/3 ${u3b.status} ${u3b.state} (expected the real 200)`);
+        notes.push(`users/1 401→${u1b.status}, users/3 500→${u3b.status}`);
+        await sleep(3000);
+        const recB = await mcpCall('save_recording', { name: `fi suite ${dev} healthy`, url: USERS_GLOB, sinceMs: run2.at });
+        if (recB.isError || !recB.result.id) f.push(`save_recording B: ${recB.text.slice(0, 200)}`);
+        for (const id of ruleIds.splice(0)) {
+          const rm = await mcpCall('remove_rule', { ruleId: id });
+          if (rm.isError || rm.result.removed !== true) f.push(`remove_rule ${id}: ${rm.text.slice(0, 200)}`);
+        }
+
+        // Diff: the status changes of users/1 and users/3 between the two runs.
+        const d = await mcpCall('diff_recordings', { a: recA.result.id, b: recB.result.id });
+        const statusChanges = ((d.result.entries ?? []) as any[]).filter((x) => x.change === 'status');
+        if (d.isError || !statusChanges.some((x) => /401/.test(x.detail)) || !statusChanges.some((x) => /500/.test(x.detail))) f.push(`diff_recordings: ${d.text.slice(0, 400)}`);
+        notes.push(`diff: ${(d.result.entries ?? []).map((x: any) => `${x.route} ${x.change} ${x.detail}`).join(' | ').slice(0, 200)}`);
+        const lr = await mcpCall('list_recordings');
+        if (lr.isError || ![recA.result.id, recB.result.id].every((id) => (lr.result.recordings ?? []).some((r: any) => r.id === id))) f.push(`list_recordings: ${lr.text.slice(0, 300)}`);
+
+        // Replay the healthy run with fallback "fail": users/1 (no rule) comes from the recording, todos/1 fails.
+        const rp = await mcpCall('replay_recording', { id: recB.result.id, fallback: 'fail' });
+        if (rp.isError || rp.result.replaying !== true) throw new Error(`replay_recording: ${rp.text.slice(0, 200)}`);
+        const st = await mcpCall('get_status');
+        if (st.result.replaying?.id !== recB.result.id) f.push(`get_status replaying: ${JSON.stringify(st.result.replaying)}`);
+        const run3 = await restartAndWait([USERS1]);
+        const u1c = run3.got[USERS1];
+        if (u1c.status !== 200 || u1c.state !== 'mocked' || !/Replayed/.test(u1c.simulated ?? '') || u1c.matchedRuleId) f.push(`replayed users/1: ${JSON.stringify(u1c).slice(0, 300)}`);
+        const todo = await mcpCall('wait_for_request', { url: TODOS1, method: 'GET', sinceMs: run3.at, timeoutMs: 60_000 });
+        if (todo.isError || todo.result.timedOut || todo.result.state === 'completed' || todo.result.state === 'mocked') f.push(`fallback fail: unrecorded todos/1 ${todo.text.slice(0, 200)}`);
+        notes.push(`replay: users/1 ${u1c.state} "${u1c.simulated ?? ''}", todos/1 ${todo.result.state}`);
+        const stop = await mcpCall('replay_recording', {});
+        if (stop.isError || stop.result.replaying !== false) f.push(`stop replay: ${stop.text.slice(0, 200)}`);
+
+        // Map remote: users/1 goes to the suite's local server (loopback is the only target agents may use).
+        const refused = await mcpCall('add_map_remote', { url: USERS1, to: 'https://example.com' });
+        if (!refused.isError || !/local server/.test(refused.text)) f.push(`add_map_remote to a public host was not refused: ${refused.text.slice(0, 200)}`);
+        const mr = await mcpCall('add_map_remote', { url: USERS1, method: 'GET', to: `http://127.0.0.1:${localPort}` });
+        if (mr.isError || !mr.result.ruleId) throw new Error(`add_map_remote: ${mr.text.slice(0, 200)}`);
+        ruleIds.push(mr.result.ruleId);
+        const run4 = await restartAndWait([USERS1]);
+        const u1d = run4.got[USERS1];
+        const g = await mcpCall('get_request', { id: u1d.id, includeBodies: true });
+        if (g.isError || !JSON.stringify(g.result.responseBody ?? '').includes('Mapped Local') || !/Mapped to/.test(g.result.simulated ?? '')) f.push(`mapped users/1: ${g.text.slice(0, 300)}`);
+        if (!mapped.some((m) => m.path.includes('/users/1'))) f.push(`the local server got no /users/1: ${JSON.stringify(mapped).slice(0, 200)}`);
+        notes.push(`map remote: ${g.result.state} "${g.result.simulated ?? ''}", local server saw ${mapped.map((m) => `${m.path} (Host ${m.host})`).join(', ')}`);
+        for (const id of ruleIds.splice(0)) {
+          const rm = await mcpCall('remove_rule', { ruleId: id });
+          if (rm.isError || rm.result.removed !== true) f.push(`remove_rule ${id}: ${rm.text.slice(0, 200)}`);
+        }
+        const s2 = await mcpCall('stop_app', { sessionId });
+        if (s2.isError || s2.result.stopped !== 1) f.push(`stop_app: ${s2.text.slice(0, 200)}`);
+        else sessionId = undefined;
+        out.output = notes.join('; ');
+      } catch (e) {
+        f.push(`exception: ${(e as Error).message}`);
+        out.output = notes.join('; ');
+      } finally {
+        for (const id of ruleIds) await mcpCall('remove_rule', { ruleId: id }).catch(() => undefined);
+        await mcpCall('replay_recording', {}).catch(() => undefined);
+        if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
+        await client?.close().catch(() => undefined);
+        client = undefined;
+        local.closeAllConnections?.();
+        await new Promise<void>((resolve) => local.close(() => resolve()));
       }
       out.ms = Date.now() - t0;
       results.push(out);

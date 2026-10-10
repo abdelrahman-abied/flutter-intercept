@@ -15,6 +15,13 @@ export interface Status {
   networkProfile?: NetworkProfile;
   /** CONTRACTS §11: things the user should know about the running sessions (e.g. background isolates). */
   warnings?: SessionWarning[];
+  /** CONTRACTS §12: replay mode (recording name) and shared-rules file state. */
+  replay?: { recording: string; fallback: 'passthrough' | 'fail' };
+  sharedRules?: { file?: string; count: number; problems: string[]; pendingApproval: number; pending?: { name: string; reason: string }[] };
+  /** CONTRACTS §12.6 / REVIEW-6 #1: the upstream proxy in use (`host:port`, never credentials). */
+  upstreamProxy?: string;
+  /** REVIEW-6 #1: the upstream proxy is used with certificate checks off (flutterIntercept.upstreamProxyIgnoreCertErrors). */
+  upstreamProxyInsecure?: true;
 }
 
 export interface AgentStatus {
@@ -35,7 +42,10 @@ export type HostMsg =
   | { type: 'cleared' }
   | { type: 'sent'; id: string } // CONTRACTS §9.3: after a successful 'send'
   // CONTRACTS §10.5
-  | { type: 'contract'; results: ContractSummary[] };
+  | { type: 'contract'; results: ContractSummary[] }
+  // CONTRACTS §12.7
+  | { type: 'recordings'; recordings: RecordingSummary[] }
+  | { type: 'authFlows'; flows: AuthFlowSummary[] };
 
 // webview → host
 export type ViewMsg =
@@ -56,7 +66,17 @@ export type ViewMsg =
   | { type: 'openViolation'; id: string; index: number }               // opens the model field's line
   | { type: 'mutateField'; id: string; path: string; op: 'null' | 'delete' | 'set'; value?: unknown; valueJson?: string } // rule inserted FIRST; valueJson = byte-exact JSON text
   | { type: 'generateModel'; id: string }                              // host opens untitled Dart model(s)
-  | { type: 'generateFixture'; id: string };                           // host opens untitled fixture + test
+  | { type: 'generateFixture'; id: string }                            // host opens untitled fixture + test
+  // CONTRACTS §12.7
+  | { type: 'shareRule'; id: string; shared: boolean }                 // move a rule into / out of .vscode/flutter-intercept.json
+  | { type: 'approveSharedRules' }                                     // approve held-back shared rules (map remote / rewrite)
+  | { type: 'saveRecording'; name: string; ids?: string[]; redact?: boolean } // default: every finished HTTP exchange shown
+  | { type: 'replayRecording'; id?: string; fallback?: 'passthrough' | 'fail' } // id undefined = stop replaying
+  | { type: 'diffRecordings'; a: string; b: string }                   // host opens vscode.diff
+  | { type: 'deleteRecording'; id: string }
+  | { type: 'expireToken'; url: string; count: number }                // preset: sequence [401 × count, passthrough]
+  | { type: 'openSharedRules' }                                        // opens .vscode/flutter-intercept.json
+  | { type: 'openBodyFile'; path: string; create?: { content: string } }; // opens a mock body file (creates it, never overwrites)
 
 export type SnippetFormat = 'curl' | 'dart_http' | 'dio';
 export interface SendDraft { method: string; url: string; headers?: Record<string, string | string[]>; body?: string }
@@ -77,4 +97,12 @@ export interface SessionWarning {
   kind: 'background-isolate' | 'native-client' | 'web' | 'other';
   text: string;         // one sentence, e.g. "Requests from background isolate \"worker\" are not intercepted."
   sessionId?: string;
+}
+
+/** CONTRACTS §12.7 */
+export interface RecordingSummary { id: string; name: string; createdAt: number; exchanges: number; redacted: boolean }
+export interface AuthFlowSummary {
+  steps: { exchangeId: string; role: 'unauthorized' | 'refresh' | 'retry' | 'other' }[];
+  stampede?: { refreshCalls: number; windowMs: number };
+  problem?: string;
 }

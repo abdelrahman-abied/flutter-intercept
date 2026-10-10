@@ -3,6 +3,7 @@
 import { execFile, execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as http from 'http';
+import * as https from 'https';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
@@ -17,9 +18,11 @@ import {
   lanTesting,
   normalizeIp,
   proxyAuthOk,
+  resolveCheckedTarget,
   SsrfError,
 } from '../src/lan';
-import { inState, nextExchange, settled, startProxy, startUpstream, type Upstream } from './helpers';
+import { createUpstreamAgents, parseUpstreamProxy } from '../src/upstream-proxy';
+import { inState, nextExchange, settled, startProxy, startTinyProxy, startUpstream, type Upstream } from './helpers';
 
 const LAN_IP = lanIPv4Addresses()[0];
 const TOKEN = 'k3Jr7QW1yFv0dE2s9pX8aB4cN6mZ5tLhGqUoRiYeWnA'; // 43 chars, like base64url(32 bytes)
@@ -70,6 +73,61 @@ describe('LAN helpers (unit)', () => {
     const fine = (_h: string, _o: any, cb: any) => cb(null, '93.184.216.34', 4);
     const res = await new Promise<unknown[]>((r) => guardedLookup(fine, 443)('ok.example', {}, (...a: unknown[]) => r(a)));
     expect(res).toEqual([null, '93.184.216.34', 4]);
+  });
+
+  it('upstream-proxy agents with a LAN guard refuse forbidden final targets before contacting the proxy (v0.6.0)', async () => {
+    await expect(resolveCheckedTarget('127.0.0.1', 80)).rejects.toBeInstanceOf(SsrfError);
+    await expect(resolveCheckedTarget('localhost', 80)).rejects.toBeInstanceOf(SsrfError);
+    const tiny = await startTinyProxy();
+    try {
+      const agents = createUpstreamAgents(parseUpstreamProxy({ url: tiny.url }), (h, p) => resolveCheckedTarget(h, p));
+      const tryGet = (agent: http.Agent, mod: typeof http | typeof https, url: string) =>
+        new Promise<string>((resolve) => {
+          const req = mod.get(url, { agent: agent as https.Agent }, () => resolve('connected'));
+          req.on('error', (e) => resolve(e.message));
+        });
+      expect(await tryGet(agents.http, http, 'http://127.0.0.1:9/x')).toMatch(/blocked a LAN client's request/);
+      expect(await tryGet(agents.https, https, 'https://localhost:9/x')).toMatch(/blocked a LAN client's request/);
+      expect(tiny.seen).toEqual([]);
+      agents.http.destroy();
+      agents.https.destroy();
+    } finally {
+      await tiny.close();
+    }
+  });
+
+  it('REVIEW-6 #11: plain http via an upstream proxy is sent to the CHECKED IP (Host keeps the name), never re-resolved by the proxy', async () => {
+    const tiny = await startTinyProxy();
+    const svc = http.createServer((req, res) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ host: req.headers.host, url: req.url })));
+    svc.listen(0, '127.0.0.1');
+    await new Promise((r) => svc.once('listening', r));
+    const port = (svc.address() as net.AddressInfo).port;
+    try {
+      const checked: string[] = [];
+      // A guard that pins `rebind.attacker.test` to the address it checked (here a local test service).
+      const agents = createUpstreamAgents(parseUpstreamProxy({ url: tiny.url }), async (h) => {
+        checked.push(h);
+        return '127.0.0.1';
+      });
+      const body = await new Promise<string>((resolve, reject) => {
+        http
+          .get({ host: 'rebind.attacker.test', port, path: '/x?y=1', agent: agents.http }, (r) => {
+            let t = '';
+            r.on('data', (d) => (t += d));
+            r.on('end', () => resolve(t));
+          })
+          .on('error', reject);
+      });
+      expect(checked).toEqual(['rebind.attacker.test']);
+      expect(tiny.seen).toEqual([`GET http://127.0.0.1:${port}/x?y=1`]); // the proxy never sees the name
+      expect(JSON.parse(body)).toEqual({ host: `rebind.attacker.test:${port}`, url: '/x?y=1' });
+      agents.http.destroy();
+      agents.https.destroy();
+    } finally {
+      svc.closeAllConnections();
+      await new Promise((r) => svc.close(r));
+      await tiny.close();
+    }
   });
 
   it('GuardedHttpAgent refuses IP-literal forbidden targets without connecting', async () => {
@@ -264,6 +322,84 @@ describe.skipIf(!LAN_IP)(`LAN mode on ${LAN_IP ?? '(no LAN IPv4)'}`, () => {
     const ex = await settled(proxy);
     expect(ex.map((e) => e.state)).toEqual(targets.map(() => 'error'));
     expect(ex[1].error).toMatch(/localhost \(127\.0\.0\.1\): loopback/);
+  });
+
+  it('Map Remote (v0.6.0): the SSRF guard checks the MAPPED target; an allowed target works', async () => {
+    const otherPort = new URL(other.httpUrl).port;
+    proxy.setRules([
+      { id: 'evil', enabled: true, match: { url: 'http://looks-public.example.com/*' }, action: { kind: 'mapRemote', to: `http://127.0.0.1:${otherPort}` } },
+      { id: 'evil2', enabled: true, match: { url: 'http://alias.example.com/*' }, action: { kind: 'mapRemote', to: `http://localhost:${otherPort}` } },
+      // GraphQL-scoped: decided in beforeRequest, after the deny rule saw the original URL
+      { id: 'gql', enabled: true, match: { url: 'http://gql.example.com/*', graphqlOperation: 'Q' }, action: { kind: 'mapRemote', to: `http://127.0.0.1:${otherPort}` } },
+      { id: 'ok', enabled: true, match: { url: 'http://fine.example.com/*' }, action: { kind: 'mapRemote', to: up.httpUrl } },
+    ]);
+    for (const url of ['http://looks-public.example.com/json', 'http://alias.example.com/json']) {
+      const r = await lanGet(lanPort, url);
+      expect(r.status, url).toBe(403);
+      expect(r.text).toMatch(/blocked a LAN client's request/);
+    }
+    const gql = await new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const body = JSON.stringify({ query: 'query Q { a }', operationName: 'Q' });
+      const req = http.request(
+        { host: LAN_IP, port: lanPort, method: 'POST', path: 'http://gql.example.com/graphql', agent: false,
+          headers: { host: 'gql.example.com', 'proxy-authorization': auth(), 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } },
+        (res) => {
+          let t = '';
+          res.on('data', (d) => (t += d));
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, text: t }));
+        },
+      );
+      req.on('error', reject);
+      req.end(body);
+    });
+    expect(gql.status).toBe(403);
+    expect(gql.text).toMatch(/blocked a LAN client's request/);
+    const ok = await lanGet(lanPort, 'http://fine.example.com/json');
+    expect(ok).toEqual({ status: 200, text: '{"hello":"world"}' });
+    expect(other.hits).toEqual([]);
+    const ex = await settled(proxy);
+    expect(ex.map((e) => [e.url, e.state])).toEqual([
+      ['http://looks-public.example.com/json', 'error'],
+      ['http://alias.example.com/json', 'error'],
+      ['http://gql.example.com/graphql', 'error'],
+      ['http://fine.example.com/json', 'completed'],
+    ]);
+  });
+
+  it('upstream proxy (v0.6.0): LAN traffic goes through it, checked on the final target; local targets stay refused', async () => {
+    const tiny = await startTinyProxy();
+    try {
+      proxy.setUpstreamProxy({ url: tiny.url }); // on loopback: the proxy itself may be local, its targets may not
+      const a = await lanGet(lanPort, `${up.httpUrl}/json`);
+      expect(a).toEqual({ status: 200, text: '{"hello":"world"}' });
+      const otherPort = new URL(other.httpUrl).port;
+      expect((await lanGet(lanPort, `http://127.0.0.1:${otherPort}/json`)).status).toBe(403);
+      proxy.setRules([{ id: 'm', enabled: true, match: { url: 'http://x.example.com/*' }, action: { kind: 'mapRemote', to: `http://localhost:${otherPort}` } }]);
+      expect((await lanGet(lanPort, 'http://x.example.com/json')).status).toBe(403);
+      // HTTPS: CONNECT through the upstream proxy goes to the checked IP
+      const text = await new Promise<string>((resolve, reject) => {
+        const c = http.request({ host: LAN_IP, port: lanPort, method: 'CONNECT', path: new URL(up.httpsUrl).host, headers: { 'proxy-authorization': auth() } });
+        c.on('connect', (res, socket) => {
+          if (res.statusCode !== 200) return reject(new Error(`CONNECT ${res.statusCode}`));
+          const t = tls.connect({ socket, rejectUnauthorized: false, servername: 'localhost' });
+          http
+            .get({ path: '/json', headers: { host: new URL(up.httpsUrl).host }, createConnection: () => t }, (r) => {
+              let b = '';
+              r.on('data', (d) => (b += d));
+              r.on('end', () => resolve(`${r.statusCode} ${b}`));
+            })
+            .on('error', reject);
+        });
+        c.on('error', reject);
+        c.end();
+      });
+      expect(text).toBe('200 {"hello":"world"}');
+      expect(tiny.seen).toEqual([`GET ${up.httpUrl}/json`, `CONNECT ${new URL(up.httpsUrl).host}`]);
+      expect(other.hits).toEqual([]);
+    } finally {
+      proxy.setUpstreamProxy(undefined);
+      await tiny.close();
+    }
   });
 
   it('SSRF: CONNECT to a local target is refused before tunnelling (403, recorded)', async () => {

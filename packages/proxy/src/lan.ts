@@ -301,6 +301,27 @@ export async function precheckTarget(hostIn: string, port: number, listenerHost?
 }
 
 /**
+ * The address a LAN client's upstream connection must go to, checked (CONTRACTS §12.6: through an upstream
+ * proxy the final target is resolved HERE and the tunnel goes to this exact IP, so neither the proxy's own
+ * resolution nor DNS rebinding can reach a forbidden address). Rejects with SsrfError.
+ */
+export async function resolveCheckedTarget(hostIn: string, port: number, listenerHost?: string): Promise<string> {
+  const host = hostIn.replace(/^\[|\]$/g, '');
+  if (net.isIP(host)) {
+    checkIp(host, host, port, listenerHost);
+    return host;
+  }
+  const lower = host.toLowerCase().replace(/\.$/, '');
+  if ((lower === 'localhost' || lower.endsWith('.localhost')) && !lanTesting.allowTarget?.('127.0.0.1', port)) {
+    throw new SsrfError(host, '127.0.0.1', 'loopback');
+  }
+  const addrs = await dns.promises.lookup(host, { all: true, verbatim: true });
+  if (!addrs.length) throw new Error(`${host} did not resolve`);
+  for (const a of addrs) checkIp(host, a.address, port, listenerHost);
+  return addrs[0].address;
+}
+
+/**
  * Why a LAN client's request must be refused (403), or undefined. Uses the URL the CLIENT asked
  * for (before mockttp's "localhost means the client's machine" rewrite), resolving names.
  */

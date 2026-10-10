@@ -8,7 +8,19 @@ export {
   isSafeRegexSource,
   ruleProblem,
   RuleFromExchangeError,
+  // v0.6.0 (CONTRACTS §12)
+  pickSequenceStep,
+  mapRemoteUrl,
+  parseMapTarget,
+  pathTemplate,
+  routeTemplate,
+  isIdSegment,
+  MAX_BODY_REPLACEMENTS,
 } from './rules';
+export type { PickedStep, StepAction } from './rules';
+export { requestBodyHash } from './replay';
+export { parseUpstreamProxy } from './upstream-proxy';
+export type { UpstreamProxyConfig } from './upstream-proxy';
 export { detectGraphql, graphqlOperationNames, scanOperations } from './graphql';
 export type { GraphqlDetection, GraphqlOperationRef, GraphqlRequest } from './graphql';
 export { diagnoseCors, isPreflight, isCorsRequest, preflightResponseHeaders, corsResponseHeaders } from './cors';
@@ -31,6 +43,10 @@ export type {
   GraphqlInfo,
   CorsInfo,
   MutateOp,
+  SequenceStep,
+  RewriteSpec,
+  ReplayEntry,
+  ReplayOptions,
   SendRequest,
   SourceInfo,
   StackFrame,

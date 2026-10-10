@@ -159,12 +159,52 @@ export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string
 export const EXPORT_DIR = path.join('.dart_tool', 'flutter_intercept', 'exports');
 
 /** Writes `har` to `<projectRoot>/.dart_tool/flutter_intercept/exports/<timestamp>.har`; returns the path. */
+/**
+ * REVIEW-6 #9: `<root>/<rel>` as a real directory INSIDE the project: every existing component is `lstat`ed (a
+ * symlink or a non-directory is refused, so a repo can't point `.dart_tool/…` at a tracked or synced folder) and
+ * realpath-checked; missing ones are created one at a time (never `recursive`). Returns the real path.
+ */
+export async function ensureDirInside(root: string, rel: string): Promise<string> {
+  const realRoot = await fs.promises.realpath(root);
+  let cur = realRoot;
+  for (const seg of rel.split(/[\\/]+/).filter(Boolean)) {
+    if (seg === '.' || seg === '..') throw new Error(`refusing to write outside the project (${rel})`);
+    const next = path.join(cur, seg);
+    let st: fs.Stats;
+    try {
+      st = await fs.promises.lstat(next);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+      try {
+        await fs.promises.mkdir(next);
+      } catch (m) {
+        if ((m as NodeJS.ErrnoException).code !== 'EEXIST') throw m;
+      }
+      st = await fs.promises.lstat(next);
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      throw new Error(`refusing to write into ${path.relative(realRoot, next) || seg}: it is ${st.isSymbolicLink() ? 'a symbolic link' : 'not a folder'} (the export must stay inside the project)`);
+    }
+    const real = await fs.promises.realpath(next);
+    if (real !== next) throw new Error(`refusing to write into ${path.relative(realRoot, next)}: it resolves outside the project`);
+    cur = next;
+  }
+  return cur;
+}
+
 export async function writeHar(projectRoot: string, har: Record<string, unknown>, now: Date = new Date()): Promise<string> {
-  const dir = path.join(projectRoot, EXPORT_DIR);
-  await fs.promises.mkdir(dir, { recursive: true });
+  const dir = await ensureDirInside(projectRoot, EXPORT_DIR);
   const stamp = now.toISOString().replace(/[:.]/g, '-');
-  let file = path.join(dir, `${stamp}.har`);
-  for (let n = 2; fs.existsSync(file); n++) file = path.join(dir, `${stamp}-${n}.har`);
-  await fs.promises.writeFile(file, JSON.stringify(har, null, 2), 'utf8');
-  return file;
+  const text = JSON.stringify(har, null, 2);
+  for (let n = 1; ; n++) {
+    const name = n === 1 ? `${stamp}.har` : `${stamp}-${n}.har`;
+    try {
+      // `wx`: never follows or replaces an existing entry (file or symlink planted in the folder).
+      await fs.promises.writeFile(path.join(dir, name), text, { encoding: 'utf8', flag: 'wx' });
+      // Reported under the project path as given (every component below it was checked to be a real folder).
+      return path.join(projectRoot, EXPORT_DIR, name);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST' || n >= 1000) throw e;
+    }
+  }
 }

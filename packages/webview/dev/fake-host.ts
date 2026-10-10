@@ -36,14 +36,27 @@
  * and counted), a closed one and an abnormally closed one, a live SSE stream, and session warnings (background
  * isolate, native client), and the browser's own traffic (`browserInternal`, hidden by default). ?coverage=0
  * turns all of it off; the dev bar's "+ws" opens another WebSocket and "warn" adds a warning.
+ *
+ * v0.6.0 (CONTRACTS §12): shared rules (`shared: true`, kept first; setRules writes them only when they differ) from a
+ * fake `.vscode/flutter-intercept.json` with a problem line and one Map Remote rule held back for approval
+ * (`approveSharedRules` releases it; sharing a rule that maps elsewhere or sets request headers is held back too);
+ * `sequence` rules advance per rule (counters reset when the rule changes), `mapRemote` / `rewrite` / mock
+ * `bodyFile` are simulated; recordings (two preset, save / delete / diff, replay with the fallback: recorded routes
+ * come back `mocked` "Replayed from …", others pass through or fail like offline); `expireToken` inserts the preset
+ * sequence; any 401 from the API starts a fake token refresh (1 call, or a 3-call stampede) + retry, reported as
+ * `authFlows` (a retry that gets 401 again is a problem). Dev bar: "401 flow" forces a stampede, "pending" holds
+ * back another shared rule. ?replay=1 starts replaying the first recording; ?upstream=127.0.0.1:8888 shows the
+ * upstream-proxy indicator (REVIEW-6 #1); "Create file" with a secret-looking body is refused like the host does.
  */
 import type {
-  Body, ContractSummary, CorsInfo, Frame, GraphqlInfo, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit, Rule, SendDraft, Status, ViewMsg,
+  AuthFlowSummary, Body, ContractSummary, CorsInfo, Frame, GraphqlInfo, Exchange, HostMsg, NetworkProfile, RecordingSummary, RequestEdit, ResponseEdit,
+  Rule, RuleAction, SendDraft, Status, ViewMsg,
 } from '../src/protocol';
 import type { MutateOp, SourceInfo, StackFrame } from '@flutter-intercept/proxy/types';
 import { applyOps } from '@flutter-intercept/proxy/jsonpath';
 import { parsePath, formatPath } from '../src/jsonpath';
 import { describeMutateOps } from '../src/state';
+import { bodySecretHint, isRecordable, needsApproval, SHARED_FILE, type StepAction } from '../src/scenarios';
 import { matches, ruleFromExchange } from '@flutter-intercept/proxy/rules';
 import { describeProfile, presetProfile, type NetworkPresetId } from '@flutter-intercept/proxy/network';
 
@@ -67,7 +80,43 @@ const PNG_16PX = 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAABlklEQVR42g3LQQ
 let seq = 0;
 let exchanges: Exchange[] = [];
 let status: Status = { proxyRunning: true, port: 8899, interceptEnabled: true, sessions: 1 };
+// CONTRACTS §12.1: shared rules from the (fake) committed file run first.
+const FAKE_FILES: Record<string, string> = {
+  '.vscode/flutter-intercept/mocks/flags.json': '{\n  "newCheckout": true,\n  "darkMode": true,\n  "source": "shared mock file"\n}',
+};
+const JSON_CT = { 'content-type': 'application/json' };
 let rules: Rule[] = [
+  {
+    id: 'shared_checkout_503', enabled: true, shared: true, name: 'Checkout: first call 503, then the real server',
+    match: { method: 'GET', url: 'https://api.shop.example.com/v1/checkout*' },
+    action: { kind: 'sequence', steps: [{ action: { kind: 'mock', status: 503, headers: JSON_CT, body: '{"error":"maintenance"}' }, count: 1 }, { action: { kind: 'passthrough' } }] },
+  },
+  {
+    id: 'shared_flags_file', enabled: true, shared: true, name: 'Feature flags (team mock file)',
+    match: { method: 'GET', url: 'https://api.shop.example.com/v1/flags' },
+    action: { kind: 'mock', status: 200, headers: JSON_CT, body: FAKE_FILES['.vscode/flutter-intercept/mocks/flags.json'], bodyFile: '.vscode/flutter-intercept/mocks/flags.json' },
+  },
+  {
+    id: 'rule_seq_profile', enabled: true, name: 'Profile save: 500, then 200 twice, then real server',
+    match: { method: 'PUT', url: 'https://api.shop.example.com/v1/profile' },
+    action: {
+      kind: 'sequence', then: 'passthrough',
+      steps: [
+        { action: { kind: 'mock', status: 500, headers: JSON_CT, body: '{"error":"server_error"}' }, count: 1 },
+        { action: { kind: 'mock', status: 200, headers: JSON_CT, body: '{"saved":true}' }, count: 2 },
+      ],
+    },
+  },
+  {
+    id: 'rule_rewrite_cdn', enabled: true, name: 'CDN: no caching',
+    match: { method: 'GET', url: 'https://cdn.shop.example.com/*' },
+    action: { kind: 'rewrite', response: { setHeaders: { 'cache-control': 'no-store' }, removeHeaders: ['etag'] } },
+  },
+  {
+    id: 'rule_map_local', enabled: false, name: 'v2 API → local backend',
+    match: { url: 'https://api.shop.example.com/v2/*' },
+    action: { kind: 'mapRemote', to: 'http://localhost:8080' },
+  },
   {
     id: 'rule_bp_cart', enabled: true, name: 'Inspect cart writes',
     match: { method: 'POST', url: 'https://api.shop.example.com/v1/cart/*' },
@@ -104,6 +153,73 @@ let rules: Rule[] = [
     action: { kind: 'fault', fault: 'dns' }, times: 3, expiresAt: Date.now() + 10 * 60_000,
   },
 ];
+/** Shared rules held back until approved (CONTRACTS §12.1 approval gate). */
+let pendingShared: Rule[] = [{
+  id: 'shared_search_staging', enabled: true, shared: true, name: 'Search → staging',
+  match: { method: 'GET', url: 'https://api.shop.example.com/v1/search*' },
+  action: { kind: 'mapRemote', to: 'https://staging.shop.example.com' },
+}];
+const SHARED_PROBLEMS = ['Rule 5 (“Legacy redirect”) skipped: match.url is required.'];
+const isSharedRule = (r: Rule) => r.shared === true;
+function syncSharedStatus() {
+  status = {
+    ...status,
+    sharedRules: {
+      file: SHARED_FILE, count: rules.filter(isSharedRule).length, problems: SHARED_PROBLEMS, pendingApproval: pendingShared.length,
+      pending: pendingShared.map((r) => ({ name: r.name ?? r.match.url, reason: needsApproval(r.action) ?? 'needs approval' })),
+    },
+  };
+}
+/** Shared rules first (file order), then personal ones. */
+const ordered = (shared: Rule[], personal: Rule[]) => [...shared, ...personal];
+
+/** Sequence position per rule id; reset when the rule's match / action changes (CONTRACTS §12.3). */
+const seqCount = new Map<string, number>();
+const seqSig = new Map<string, string>();
+function resetChangedSequences() {
+  for (const r of rules) {
+    const sig = JSON.stringify([r.match, r.action]);
+    if (seqSig.get(r.id) !== sig) { seqSig.set(r.id, sig); seqCount.delete(r.id); }
+  }
+}
+function sequenceStep(rule: Rule, a: Extract<RuleAction, { kind: 'sequence' }>): { action: StepAction; note: string } {
+  const n = seqCount.get(rule.id) ?? 0;
+  seqCount.set(rule.id, n + 1);
+  const counts = a.steps.map((st) => Math.max(1, st.count ?? 1));
+  const total = counts.reduce((x, y) => x + y, 0);
+  let k = n;
+  if (k >= total) {
+    if (a.then === 'passthrough') return { action: { kind: 'passthrough' }, note: 'Sequence done → real server' };
+    if (a.then === 'loop') k %= total;
+    else return { action: a.steps[a.steps.length - 1].action, note: `Sequence step ${a.steps.length}/${a.steps.length} (repeats)` };
+  }
+  for (let i = 0; i < counts.length; i++) {
+    if (k < counts[i]) return { action: a.steps[i].action, note: `Sequence step ${i + 1}/${a.steps.length}` };
+    k -= counts[i];
+  }
+  return { action: { kind: 'passthrough' }, note: 'Sequence done → real server' };
+}
+
+// CONTRACTS §12.4: recordings and replay.
+let recordings: RecordingSummary[] = [
+  { id: 'rec_checkout', name: 'Checkout happy path', createdAt: Date.now() - 5 * 86_400_000, exchanges: 42, redacted: false },
+  { id: 'rec_staging', name: 'Staging before deploy', createdAt: Date.now() - 2 * 3_600_000, exchanges: 118, redacted: true },
+];
+/** Routes the fake recordings contain. */
+const recorded = (e: Pick<Exchange, 'method' | 'url'>) =>
+  (e.method === 'GET' && /api\.shop\.example\.com\/v1\/(products|feed|flags|me|cart)/.test(e.url)) || /\/graphql$/.test(e.url);
+
+// CONTRACTS §12.3: auth flows (the host's analysis, faked from what the simulated app does).
+let authFlows: AuthFlowSummary[] = [];
+const retryOf = new Map<string, AuthFlowSummary>();
+const flowStarted = new Set<string>();
+let booted = false;
+let flowTimer: ReturnType<typeof setTimeout> | undefined;
+function sendFlows() {
+  if (flowTimer !== undefined) return;
+  flowTimer = setTimeout(() => { flowTimer = undefined; send({ type: 'authFlows', flows: authFlows }); }, 150);
+}
+
 /** Rule hit counts by id (the proxy keeps them across setRules; dropped when the id disappears). */
 const hits = new Map<string, number>();
 const isSpent = (r: Rule) => (r.times !== undefined && (hits.get(r.id) ?? 0) >= r.times) || (r.expiresAt !== undefined && r.expiresAt <= Date.now());
@@ -138,6 +254,8 @@ function onViewMsg(msg: ViewMsg) {
     case 'ready':
       send({ type: 'snapshot', exchanges, rules, status });
       sendContracts(exchanges);
+      send({ type: 'recordings', recordings });
+      send({ type: 'authFlows', flows: authFlows });
       break;
     case 'resume': {
       const p = paused.get(msg.id);
@@ -160,12 +278,21 @@ function onViewMsg(msg: ViewMsg) {
       break;
     }
     case 'setRules':
-      rules = msg.rules;
+      // Like the host: the list is [...shared, ...personal]; shared rules that differ would be written to the file.
+      {
+        const sharedIn = msg.rules.filter(isSharedRule);
+        const current = rules.filter(isSharedRule);
+        const changed = JSON.stringify(sharedIn) !== JSON.stringify(current);
+        if (changed) console.info(`[fake-host] would write ${SHARED_FILE} with ${sharedIn.length} rules`);
+        rules = ordered(changed ? sharedIn : current, msg.rules.filter((r) => !isSharedRule(r)));
+      }
+      resetChangedSequences();
       send({ type: 'rules', rules });
       break;
     case 'clear':
       // In-flight exchanges stay (like the proxy); the host follows 'cleared' with a fresh snapshot.
       exchanges = exchanges.filter((e) => e.state === 'pending' || paused.has(e.id));
+      authFlows = [];
       send({ type: 'cleared' });
       send({ type: 'snapshot', exchanges, rules, status });
       sendContracts(exchanges);
@@ -237,6 +364,94 @@ function onViewMsg(msg: ViewMsg) {
     case 'generateFixture':
       console.info(`[fake-host] would open untitled editors: ${msg.type} for ${msg.id}`);
       break;
+    // ---------------------------------------------------------------- CONTRACTS §12.7
+    case 'shareRule': {
+      const r = rules.find((x) => x.id === msg.id);
+      if (!r) { send({ type: 'error', message: 'No such rule' }); break; }
+      const others = rules.filter((x) => x.id !== r.id);
+      const shared = others.filter(isSharedRule);
+      const personal = others.filter((x) => !isSharedRule(x));
+      if (msg.shared) {
+        const moved: Rule = { ...r, shared: true };
+        if (needsApproval(moved.action)) {
+          pendingShared = [...pendingShared, moved]; // a teammate (and this window, after a reload) must approve it
+          rules = ordered(shared, personal);
+        } else {
+          rules = ordered([...shared, moved], personal);
+        }
+        console.info(`[fake-host] would write ${SHARED_FILE} with ${shared.length + 1} rules`);
+      } else {
+        const { shared: _drop, ...rest } = r;
+        rules = ordered(shared, [rest, ...personal]);
+      }
+      syncSharedStatus();
+      send({ type: 'rules', rules });
+      send({ type: 'status', status });
+      break;
+    }
+    case 'approveSharedRules':
+      rules = ordered([...rules.filter(isSharedRule), ...pendingShared], rules.filter((r) => !isSharedRule(r)));
+      pendingShared = [];
+      syncSharedStatus();
+      resetChangedSequences();
+      send({ type: 'rules', rules });
+      send({ type: 'status', status });
+      break;
+    case 'openSharedRules':
+      console.info(`[fake-host] would open ${SHARED_FILE}`);
+      break;
+    case 'openBodyFile':
+      if (msg.create && bodySecretHint(msg.create.content)) {
+        send({ type: 'error', message: `Not written: the body contains ${bodySecretHint(msg.create.content)}. Replace it with a placeholder, then create ${msg.path}.` });
+        break;
+      }
+      if (msg.create && !(msg.path in FAKE_FILES)) FAKE_FILES[msg.path] = msg.create.content;
+      if (!(msg.path in FAKE_FILES)) send({ type: 'error', message: `${msg.path} does not exist — use “Create file”.` });
+      else console.info(`[fake-host] would open ${msg.path}`);
+      break;
+    case 'saveRecording': {
+      const count = msg.ids?.length ?? exchanges.filter(isRecordable).length;
+      const id = `rec_${Date.now().toString(36)}`;
+      recordings = [{ id, name: msg.name, createdAt: Date.now(), exchanges: count, redacted: !!msg.redact }, ...recordings];
+      console.info(`[fake-host] saved .dart_tool/flutter_intercept/recordings/${id}.json (${count} exchanges${msg.redact ? ', redacted' : ''})`);
+      send({ type: 'recordings', recordings });
+      break;
+    }
+    case 'replayRecording': {
+      if (!msg.id) { delete status.replay; status = { ...status }; send({ type: 'status', status }); break; }
+      const rec = recordings.find((r) => r.id === msg.id);
+      if (!rec) { send({ type: 'error', message: 'That recording no longer exists.' }); break; }
+      status = { ...status, replay: { recording: rec.name, fallback: msg.fallback ?? 'passthrough' } };
+      send({ type: 'status', status });
+      break;
+    }
+    case 'diffRecordings': {
+      const a = recordings.find((r) => r.id === msg.a);
+      const b = recordings.find((r) => r.id === msg.b);
+      if (!a || !b || a === b) send({ type: 'error', message: 'Pick two different recordings to compare.' });
+      else console.info(`[fake-host] would open vscode.diff: ${a.name} ↔ ${b.name}`);
+      break;
+    }
+    case 'deleteRecording': {
+      const rec = recordings.find((r) => r.id === msg.id);
+      recordings = recordings.filter((r) => r.id !== msg.id);
+      if (rec && status.replay?.recording === rec.name) { delete status.replay; status = { ...status }; send({ type: 'status', status }); }
+      send({ type: 'recordings', recordings });
+      break;
+    }
+    case 'expireToken': {
+      const rule: Rule = {
+        id: `rule_expire_${Date.now().toString(36)}`, enabled: true, name: `Expire token: ${msg.url}`, match: { url: msg.url },
+        action: {
+          kind: 'sequence',
+          steps: [{ action: { kind: 'mock', status: 401, headers: JSON_CT, body: '{"error":"token_expired"}' }, count: msg.count }, { action: { kind: 'passthrough' } }],
+        },
+      };
+      rules = ordered(rules.filter(isSharedRule), [rule, ...rules.filter((r) => !isSharedRule(r))]);
+      resetChangedSequences();
+      send({ type: 'rules', rules });
+      break;
+    }
     case 'setNetworkProfile':
       status = { ...status, networkProfile: msg.profile.kind === 'none' ? undefined : msg.profile };
       if (!status.networkProfile) delete status.networkProfile;
@@ -289,6 +504,7 @@ function update(ex: Exchange, patch: Partial<Exchange>): Exchange {
   for (const k of Object.keys(next) as (keyof Exchange)[]) if (next[k] === undefined) delete next[k];
   exchanges = exchanges.map((e) => (e.id === ex.id ? next : e));
   send({ type: 'exchange', exchange: next });
+  watchAuth(next);
   if (next.state !== 'pending' && !next.state.startsWith('paused')) setTimeout(() => sendContracts([next]), 30);
   return next;
 }
@@ -521,10 +737,22 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
     if (isSpent(rule)) setTimeout(removeSpentRules, opts.instant ? 0 : 50);
   }
   const later = (ms: number, fn: () => void) => (opts.instant ? fn() : setTimeout(fn, ms));
-  const a = rule?.action;
+  let a: RuleAction | StepAction | undefined = rule?.action;
+  let seqNote: string | undefined;
+  if (a?.kind === 'sequence') {
+    const step = sequenceStep(rule!, a);
+    seqNote = step.note;
+    a = step.action;
+  }
+  if (a?.kind === 'passthrough') a = undefined;
+  // CONTRACTS §12.4: replay answers what no rule handled; unmatched requests pass through or fail like offline.
+  const replay = !rule && !t.native && !t.browser && status.replay
+    ? recorded(ex) ? 'hit' : status.replay.fallback === 'fail' ? 'fail' : undefined
+    : undefined;
 
   // Network profile (global) + throttle rule: what would reach the network is slowed or failed.
-  const reachesNetwork = !a || a.kind === 'breakpoint' || a.kind === 'throttle' || a.kind === 'mutate' || a.kind === 'cors';
+  const reachesNetwork = !replay && (!a || a.kind === 'breakpoint' || a.kind === 'throttle' || a.kind === 'mutate' || a.kind === 'cors'
+    || a.kind === 'mapRemote' || a.kind === 'rewrite');
   if (t.cors) {
     // A `cors` rule answers the preflight / adds the headers; a mock answers the preflight itself (CONTRACTS §11.3).
     ex.cors = a?.kind === 'cors' || (a?.kind === 'mock' && t.cors.preflight)
@@ -534,6 +762,12 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
   const profile: NetworkProfile = status.networkProfile ?? { kind: 'none' };
   let latency = rnd(...t.latency);
   const simulated: string[] = [];
+  if (seqNote) simulated.push(seqNote);
+  if (a?.kind === 'mapRemote') {
+    let origin = a.to;
+    try { origin = new URL(a.to).origin; } catch { /* keep */ }
+    simulated.push(`Mapped to ${origin}`);
+  }
   let drop = 0;
   let kbps: number | undefined;
   if (reachesNetwork && profile.kind === 'throttle') {
@@ -572,6 +806,16 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
       };
       if (t.method === 'OPTIONS') { resp.status = 204; resp.responseHeaders['access-control-allow-methods'] = 'GET, POST'; }
     }
+    if (a?.kind === 'rewrite' && a.response) {
+      const r = a.response;
+      const h: Record<string, string | string[]> = { ...resp.responseHeaders };
+      for (const n of r.removeHeaders ?? []) for (const k of Object.keys(h)) if (k.toLowerCase() === n.toLowerCase()) delete h[k];
+      Object.assign(h, r.setHeaders ?? {});
+      resp.responseHeaders = h;
+      if (r.status !== undefined) resp.status = r.status;
+      if (body?.encoding === 'utf8') for (const x of r.replaceBody ?? []) body = { ...body, text: x.all ? body.text.split(x.find).join(x.replace) : body.text.replace(x.find, x.replace) };
+      resp.simulated = [ex.simulated, 'Rewritten'].filter(Boolean).join(' + ');
+    }
     if (a?.kind === 'mutate') {
       const m = mutateBody(body, a.ops);
       body = m.body;
@@ -599,9 +843,19 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
     state: 'blocked', error, durationMs: after, simulated: ex.simulated ? `${ex.simulated} → ${label}` : label,
   }));
 
-  if (a?.kind === 'mock') {
-    later(a.delayMs ?? 5, () => update(ex, {
-      state: 'mocked', status: a.status, responseHeaders: a.headers ?? {}, responseBody: { text: a.body, encoding: 'utf8' }, durationMs: a.delayMs ?? 5,
+  if (replay === 'hit') {
+    later(5, () => update(ex, {
+      state: 'mocked', status: t.status === 'error' ? 200 : t.status, responseHeaders: t.resHeaders ?? {}, responseBody: t.resBody?.(), durationMs: 5,
+      simulated: `Replayed from ${status.replay?.recording ?? 'a recording'}`,
+    }));
+  } else if (replay === 'fail') {
+    fail('Not in the recording — failing like offline (replay demo mode)', 'Replay: not recorded');
+  } else if (a?.kind === 'mock') {
+    const m = a;
+    const text = m.bodyFile !== undefined ? FAKE_FILES[m.bodyFile] ?? m.body : m.body;
+    later(m.delayMs ?? 5, () => update(ex, {
+      state: 'mocked', status: m.status, responseHeaders: m.headers ?? {}, responseBody: { text, encoding: 'utf8' }, durationMs: m.delayMs ?? 5,
+      ...(ex.simulated ? { simulated: ex.simulated } : {}),
     }));
   } else if (a?.kind === 'block') {
     later(2, () => update(ex, a.mode === 'reset'
@@ -982,3 +1236,94 @@ function sendContracts(list: Exchange[]) {
   }
   if (results.length) send({ type: 'contract', results });
 }
+
+// ---------------------------------------------------------------- token refresh flows (CONTRACTS §12.3)
+
+const ORDERS: Template = {
+  weight: 0, src: { http: 'dio', chain: [['OrdersApi.list', 'data/orders_api.dart', 18], ['OrdersPage.initState', 'ui/orders_page.dart', 33]] },
+  method: 'GET', url: () => 'https://api.shop.example.com/v1/orders', reqHeaders: { ...UA, ...AUTH },
+  status: 200, resHeaders: JSON_RES, resBody: () => json({ orders: [{ id: 'o_1', total: 42.5 }] }), latency: [40, 160],
+};
+const REFRESH: Template = {
+  weight: 0, src: { http: 'dio', chain: [['AuthInterceptor.onError', 'data/auth_interceptor.dart', 41]] },
+  method: 'POST', url: () => 'https://api.shop.example.com/v1/auth/refresh', reqHeaders: { ...UA, 'content-type': 'application/json' },
+  reqBody: () => json({ refreshToken: 'rt_dev' }), status: 200, resHeaders: JSON_RES,
+  resBody: () => json({ accessToken: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiJ9.bmV3', expiresIn: 3600 }), latency: [60, 160],
+};
+function isFinal(e: Exchange) { return e.state !== 'pending' && !e.state.startsWith('paused'); }
+
+/** The fake app's reaction to a 401: refresh (once, or three times at once — the stampede), then retry. */
+function startAuthFlow(unauth: Exchange, opts: { refreshes?: number; retryFails?: boolean } = {}) {
+  flowStarted.add(unauth.id);
+  const flow: AuthFlowSummary = { steps: [{ exchangeId: unauth.id, role: 'unauthorized' }] };
+  authFlows = [...authFlows, flow].slice(-30);
+  const n = opts.refreshes ?? (random() < 0.35 ? 3 : 1);
+  const instant = !booted;
+  for (let i = 0; i < n; i++) {
+    const id = simulate(REFRESH, instant ? { instant, startedAt: unauth.startedAt + 30 + i * 25 } : {});
+    flow.steps.push({ exchangeId: id, role: 'refresh' });
+  }
+  if (n >= 2) flow.stampede = { refreshCalls: n, windowMs: 2000 };
+  const retry = () => {
+    const fails = opts.retryFails ?? random() < 0.15;
+    const t: Template = {
+      weight: 0, method: unauth.method, url: () => unauth.url, reqHeaders: { ...unauth.requestHeaders, ...AUTH },
+      status: fails ? 401 : 200, resHeaders: JSON_RES, latency: [40, 160],
+      resBody: () => (fails ? json({ error: 'token_expired' }) : json({ ok: true, retried: true })),
+    };
+    const id = simulate(t, instant ? { instant, startedAt: unauth.startedAt + 400 } : {});
+    flow.steps.push({ exchangeId: id, role: 'retry' });
+    retryOf.set(id, flow);
+    watchAuth(find(id)!);
+    sendFlows();
+  };
+  if (instant) retry(); else setTimeout(retry, 350);
+  sendFlows();
+}
+
+function watchAuth(e: Exchange) {
+  if (!isFinal(e) || e.status !== 401) return;
+  const flow = retryOf.get(e.id);
+  if (flow) {
+    if (!flow.problem) {
+      flow.problem = 'The retried request got 401 again — the refreshed token was not used, or the server rejected it.';
+      authFlows = [...authFlows];
+      sendFlows();
+    }
+    return;
+  }
+  if (!booted || flowStarted.has(e.id) || !/api\.shop\.example\.com\/v1\//.test(e.url) || /\/auth\//.test(e.url)) return;
+  flowStarted.add(e.id);
+  setTimeout(() => startAuthFlow(e), 30);
+}
+
+function wireV6() {
+  document.getElementById('dev-auth')?.addEventListener('click', () => {
+    const id = simulate({ ...ORDERS, status: 401, resBody: () => json({ error: 'token_expired' }) });
+    flowStarted.add(id);
+    setTimeout(() => { const e = find(id); if (e) startAuthFlow(e, { refreshes: 3 }); }, 200);
+  });
+  document.getElementById('dev-pending')?.addEventListener('click', () => {
+    pendingShared = [...pendingShared, {
+      id: `shared_rw_${Date.now().toString(36)}`, enabled: true, shared: true, name: 'Add debug header',
+      match: { url: 'https://api.shop.example.com/*' }, action: { kind: 'rewrite', request: { setHeaders: { 'x-debug': '1' } } },
+    }];
+    syncSharedStatus();
+    send({ type: 'status', status });
+  });
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wireV6);
+else wireV6();
+
+// Two flows to start with: a 3-call refresh stampede, and a clean one.
+if (params.get('empty') !== '1') {
+  for (const refreshes of [3, 1]) {
+    const id = simulate({ ...ORDERS, status: 401, resBody: () => json({ error: 'token_expired' }) }, { instant: true, startedAt: Date.now() - (refreshes === 3 ? 60_000 : 20_000) });
+    startAuthFlow(find(id)!, { refreshes, retryFails: false });
+  }
+}
+syncSharedStatus();
+resetChangedSequences();
+if (params.get('upstream')) status = { ...status, upstreamProxy: params.get('upstream')!, ...(params.get('insecure') === '1' ? { upstreamProxyInsecure: true as const } : {}) };
+if (params.get('replay') === '1') status = { ...status, replay: { recording: recordings[0].name, fallback: 'passthrough' } };
+booted = true;

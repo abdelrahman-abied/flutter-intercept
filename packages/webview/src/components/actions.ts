@@ -6,6 +6,7 @@ import type { MutateOp } from '@flutter-intercept/proxy/types';
 import { canResend, describeMutateOp, resendRequest, SNIPPET_FORMATS, SNIPPET_LABEL, unsendableBody } from '../state';
 import { corsRuleFor, isNative, NATIVE_READ_ONLY, routeGlob } from '../coverage';
 import { splitUrl } from '../util';
+import { expireTokenLabel } from '../scenarios';
 import type { MenuItem } from './bits';
 
 export interface ExchangeActions {
@@ -30,6 +31,8 @@ export interface ExchangeActions {
   off: { mock?: string; block?: string; breakpoint?: string; edit?: string; generate?: string };
   /** CONTRACTS §11.3: insert a dev-only `cors` rule for this route FIRST (undoable); credentials only if asked. */
   addCorsRule: (credentials: boolean) => void;
+  /** CONTRACTS §12.3 preset: the next `count` requests to `url` get 401 token_expired, then pass through. */
+  expireToken: (url: string, count: number) => void;
 }
 
 const WS_NO_MOCK = 'Mock rules don\'t apply to WebSocket upgrades — block it or add a fault instead';
@@ -127,6 +130,11 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
     });
     post({ type: 'setRules', rules });
   };
+  const expireToken = (url: string, count: number) => {
+    if (isNative(ex)) return;
+    dispatch({ type: 'awaitRule', kind: 'sequence', label: expireTokenLabel(url, count) });
+    post({ type: 'expireToken', url, count });
+  };
   const modelOff = off.generate ?? generateModelDisabled(ex);
   const fixtureOff = off.generate ?? generateFixtureDisabled(ex);
   const copyItems: MenuItem[] = SNIPPET_FORMATS.map((f) => ({ label: `Copy as ${SNIPPET_LABEL[f]}`, onSelect: () => copy(f) }));
@@ -147,6 +155,6 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
   ];
   return {
     copy, resend, editAndResend, openSource, createRule, mutateField, pickModel, openViolation, generateModel, generateFixture,
-    copyItems, generateItems, menuItems, resendDisabled, off, addCorsRule,
+    copyItems, generateItems, menuItems, resendDisabled, off, addCorsRule, expireToken,
   };
 }

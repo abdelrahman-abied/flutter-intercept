@@ -28,7 +28,12 @@ import { createContractService, DONT_CHECK } from './contract/service';
 import { openFrame } from './source/open';
 import { createVmWatcher } from './vm';
 import { checkSourcePath, packageRootsFor, resolveFrames } from './source/resolve';
-import { InterceptController, validateRules } from './ui/controller';
+import { InterceptController, validateRule, validateRules } from './ui/controller';
+import { analyzeAuth } from './analysis/auth';
+import { createRecordingService } from './recordings/store';
+import { disposeRecordingDiffs, openRecordingDiff } from './recordings/vscodeDiff';
+import { createSharedRulesService } from './rules/service';
+import { checkUpstreamProxy } from './proxyHost';
 import { TrafficViewProvider, VIEW_ID } from './ui/view';
 
 export const RULES_KEY = 'flutterIntercept.rules';
@@ -195,6 +200,45 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   const contract = createContractService({ workspaceState: context.workspaceState, log });
   context.subscriptions.push(contract);
   const codegen = createCodegenService();
+  // CONTRACTS §12: shared rules in the repo, recordings, auth flows, upstream proxy.
+  const shared = createSharedRulesService({ workspaceState: context.workspaceState, validateRule, log });
+  context.subscriptions.push(shared);
+  proxyHost.setBodyFileResolver((p) => shared.resolveBodyFile(p));
+  context.subscriptions.push(shared.onDidChangeBodyFile((p) => proxyHost.refreshBodyFiles(p)));
+  const recordings = createRecordingService({ root: () => flutterProjectRoot() });
+  context.subscriptions.push({ dispose: disposeRecordingDiffs });
+  const applyUpstreamProxy = () => {
+    // REVIEW-6 #1: user settings only — a cloned repo's .vscode/settings.json must not route the app's traffic.
+    const url = (userSetting<string>('upstreamProxy') ?? '').trim();
+    try {
+      proxyHost.setUpstreamProxy(url ? checkUpstreamProxy({ url, ignoreCertErrors: userSetting<boolean>('upstreamProxyIgnoreCertErrors') === true }) : undefined);
+    } catch (e) {
+      const msg = `Flutter Intercept: ignoring flutterIntercept.upstreamProxy: ${(e as Error).message}`;
+      log(msg);
+      void vscode.window.showWarningMessage(msg);
+    }
+  };
+  applyUpstreamProxy();
+  // A cloned repo must not silently route the app's authenticated traffic elsewhere (CONTRACTS §12.1).
+  const sharedDeps = {
+    state: () => shared.state(),
+    save: (rules: Rule[]) => shared.save(rules),
+    removeShared: (id: string) => shared.removeShared(id),
+    pendingReasons: () => shared.pendingReasons(),
+    approvePending: async () => {
+      // REVIEW-6 #6: approve exactly the rules shown (the service refuses if they changed meanwhile).
+      const snap = shared.pendingSnapshot();
+      if (!snap.items.length) return;
+      const shown = snap.items.slice(0, 20).map((i) => `• ${i.name} (${i.match}) in ${i.folder}: ${i.reason}`);
+      if (snap.items.length > shown.length) shown.push(`…and ${snap.items.length - shown.length} more (open the file to review them).`);
+      const ok = await vscode.window.showWarningMessage(
+        `Approve ${snap.items.length} shared Flutter Intercept rule${snap.items.length === 1 ? '' : 's'}?`,
+        { modal: true, detail: `${shown.join('\n')}\n\nOnly approve rules from people you trust: they can send your app's requests, with its credentials, to another server or change what it receives.` },
+        'Approve',
+      );
+      if (ok === 'Approve') await shared.approvePending(snap.hash);
+    },
+  };
   // CONTRACTS §11.4: background-isolate warnings and read-only native-client traffic from the app's HTTP profile.
   const vm = createVmWatcher({
     ...proxyHost.vmHostDeps(log),
@@ -240,10 +284,48 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     openUntitled: (files) => openUntitled(files),
     projectRoot: () => flutterProjectRoot(),
     appPackageName: () => appPackageNames(flutterProjectRoots())[0],
+    shared: sharedDeps,
+    openSharedRules: async () => {
+      const file = shared.files()[0];
+      if (!file) throw new Error('No Flutter project folder is open.');
+      if (!fs.existsSync(file.path)) await shared.save(shared.fileRules()); // creates an empty shared file
+      await vscode.window.showTextDocument(vscode.Uri.file(file.path), { preview: false });
+    },
+    openBodyFile: async (bodyFile, create) => {
+      const abs = shared.bodyFilePath(bodyFile);
+      if (!abs) throw new Error(`Not a valid body file path: ${bodyFile}`);
+      const roots = (vscode.workspace.workspaceFolders ?? []).map((f) => fs.realpathSync(f.uri.fsPath));
+      const inside = (p: string) => roots.some((r) => p === r || p.startsWith(r + path.sep));
+      if (create && !fs.existsSync(abs)) {
+        // REVIEW-6 #5: never write what looks like live credentials into the repo.
+        const secret = shared.checkBodyFileContent(create.content);
+        if (secret) throw new Error(secret);
+        // REVIEW-6 #7: never create anything outside the workspace or through a symlink, never overwrite.
+        const root = roots.find((r) => abs.startsWith(r + path.sep));
+        if (!root) throw new Error('The body file must be inside the workspace.');
+        let dir = root;
+        for (const seg of path.relative(root, path.dirname(abs)).split(path.sep).filter(Boolean)) {
+          dir = path.join(dir, seg);
+          if (fs.existsSync(dir)) {
+            if (fs.lstatSync(dir).isSymbolicLink() || !fs.statSync(dir).isDirectory()) throw new Error(`Refusing to create the body file through ${path.relative(root, dir)} (not a plain folder).`);
+          } else fs.mkdirSync(dir);
+        }
+        fs.writeFileSync(abs, create.content, { flag: 'wx' });
+      }
+      const real = checkSourcePath(abs, roots); // resolves symlinks; throws outside the workspace
+      if (!inside(real)) throw new Error('The body file must be inside the workspace.');
+      await vscode.window.showTextDocument(vscode.Uri.file(real), { preview: false });
+    },
+    recordings,
+    openDiff: (a, b) => openRecordingDiff(a, b),
+    analyzeAuth: (ex) => analyzeAuth(ex),
   });
+  void shared.ready.then(() => controller.setSharedRules(shared.state().rules));
   context.subscriptions.push(
+    shared.onDidChange((st) => controller.setSharedRules(st.rules)),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('flutterIntercept.contractCheck')) controller.recheckContracts();
+      if (e.affectsConfiguration('flutterIntercept.upstreamProxy') || e.affectsConfiguration('flutterIntercept.upstreamProxyIgnoreCertErrors')) applyUpstreamProxy();
     }),
   );
   async function pickModel(ex: Exchange): Promise<string | undefined | null> {
@@ -273,11 +355,11 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
 
   // AI agents (CONTRACTS §8): one AgentApi behind two front doors, Copilot tools and a local MCP server.
   const agentSettings = (): { access: AgentAccess; redactSecrets: boolean; interceptEnabled: boolean } => {
-    const cfg = vscode.workspace.getConfiguration('flutterIntercept');
-    const access = cfg.get<string>('agent.access', 'readWrite');
+    // User settings only (REVIEW-6 #1): a workspace must not widen agent access or turn redaction off.
+    const access = userSetting<string>('agent.access') ?? 'readWrite';
     return {
       access: access === 'readOnly' || access === 'off' ? access : 'readWrite',
-      redactSecrets: cfg.get<boolean>('agent.redactSecrets', true),
+      redactSecrets: userSetting<boolean>('agent.redactSecrets') !== false,
       interceptEnabled: readSettings().enabled,
     };
   };
@@ -292,6 +374,9 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     launcher,
     projectRoot: () => flutterProjectRoot(),
     resolveFrames: (frames) => resolveFrames(frames, flutterProjectRoots()),
+    recordings,
+    recordingsChanged: () => void controller.refreshRecordings(),
+    analyzeAuth: (ex) => analyzeAuth(ex),
     contract,
     contractResult: (id) => controller.contractResult(id),
     codegen,
@@ -526,6 +611,11 @@ function substituteCommonVariables(config: vscode.DebugConfiguration, folder?: v
 
 /** The workspace folder holding the Flutter project (pubspec.yaml at its root or one level down). */
 /** Every Flutter/Dart project root in the workspace (folders with a pubspec.yaml, or their direct children). */
+/** A flutterIntercept setting from the user's own settings only (never workspace / folder values). */
+function userSetting<T>(key: string): T | undefined {
+  return vscode.workspace.getConfiguration('flutterIntercept').inspect<T>(key)?.globalValue;
+}
+
 function flutterProjectRoots(): string[] {
   const roots: string[] = [];
   for (const f of vscode.workspace.workspaceFolders ?? []) {

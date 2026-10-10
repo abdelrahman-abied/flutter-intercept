@@ -1,6 +1,7 @@
 import * as http from 'http';
 import * as https from 'https';
 import * as tls from 'tls';
+import { createUpstreamAgents, retireAgents, type UpstreamAgents, type UpstreamProxySpec } from './upstream-proxy';
 
 /*
  * Upstream connection pooling across client connections.
@@ -60,6 +61,8 @@ interface Pool {
   rewrite: boolean;
   /** Set while LAN mode is on: LAN-originated requests get SSRF-guarded agents. */
   lan?: LanUpstream;
+  /** CONTRACTS §12.6: pass-through traffic goes via this HTTP proxy. */
+  upstream?: UpstreamAgents;
 }
 
 export interface LanUpstream {
@@ -98,6 +101,13 @@ function installHook(): boolean {
       // which check the address actually connected to (DNS rebinding).
       const lanAgent = pool?.lan?.agentFor(o.connection, o.protocol);
       if (lanAgent) return lanAgent;
+      // An upstream proxy (CONTRACTS §12.6): every pooled request and upgrade goes through it.
+      const up = pool?.upstream;
+      if (up) {
+        if (o.protocol === 'https:') return up.https;
+        if (o.protocol === 'http:' || o.protocol === undefined) return up.http;
+        if (o.protocol === 'ws:' || o.protocol === 'wss:') return up.ws(o.protocol === 'wss:');
+      }
       if (pool && !o.tryHttp2 && !o.connection?.destroyed) {
         if (o.protocol === 'https:') return pool.https;
         if (o.protocol === 'http:' || o.protocol === undefined) return pool.http;
@@ -119,6 +129,9 @@ export interface UpstreamPool {
   proxyConfig: ProxySettingCallback;
   readonly active: boolean;
   setLan(lan: LanUpstream | undefined): void;
+  /** Route pass-through traffic via an HTTP proxy (undefined = direct). Connections in use finish first. */
+  setUpstream(spec: UpstreamProxySpec | undefined): void;
+  readonly upstream: UpstreamProxySpec | undefined;
   destroy(): void;
 }
 
@@ -138,10 +151,22 @@ export function createUpstreamPool(opts: { rewriteLocalhost?: boolean } = {}): U
     setLan(lan) {
       pool.lan = lan;
     },
+    setUpstream(spec) {
+      retireAgents(pool.upstream);
+      pool.upstream = spec ? createUpstreamAgents(spec, undefined, rewrite ? (h) => HOST_ALIASES[h] : undefined) : undefined;
+    },
+    get upstream() {
+      return pool.upstream?.spec;
+    },
     destroy() {
       pools.delete(proxyConfig);
       pool.http.destroy();
       pool.https.destroy();
+      if (pool.upstream) {
+        pool.upstream.http.destroy();
+        pool.upstream.https.destroy();
+        pool.upstream = undefined;
+      }
     },
   };
 }

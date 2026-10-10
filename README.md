@@ -51,6 +51,8 @@ Intercept skips all of that:
 | **Generate code** | Dart models and fixture tests from recorded traffic. |
 | **Web, WebSockets, SSE, GraphQL** | Flutter Web on Chrome (with CORS help), WebSocket messages, SSE events, GraphQL operation names. |
 | **Native clients** | cupertino_http / cronet_http requests listed read-only; a banner for background isolates. |
+| **Team rules & scenarios** | Rules shared through the repo (with an approval gate), sequences like "500 then 200", expire-token tests, auth-flow timelines. |
+| **Record & replay** | Save traffic, replay it as mocks (offline demos), diff two recordings; Map Remote, rewrites, upstream proxy. |
 | **Rules** | Glob or `/regex/` URL matching plus method. First match wins. Saved per workspace. |
 | **Theme-aware** | Follows your VS Code theme: light, dark and high contrast. |
 

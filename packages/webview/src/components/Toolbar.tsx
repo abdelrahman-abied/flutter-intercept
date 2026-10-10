@@ -7,6 +7,7 @@ import {
   profileForChoice, profileLabel, throttleFieldsOf, type ProfileChoice, type ThrottleFields,
 } from '../state';
 import { STATUS_CLASSES } from '../util';
+import { authAlerts, INSECURE_TITLE, UPSTREAM_TITLE } from '../scenarios';
 import { Button } from './bits';
 import { Icon } from './Icon';
 
@@ -18,6 +19,7 @@ export function Toolbar() {
   const paused = pausedCount(state.exchanges);
   const filterErrors = parseFilter(filters.text).errors;
   const browserHidden = hiddenBrowserCount(state.exchanges, filters);
+  const alerts = authAlerts(state.authFlows);
   const anyBrowser = filters.showBrowser || browserHidden > 0 || state.exchanges.some((e) => e.browserInternal);
 
   return (
@@ -30,6 +32,20 @@ export function Toolbar() {
         <button type="button" role="tab" class="seg-btn" aria-selected={view === 'rules'}
           onClick={() => dispatch({ type: 'setView', view: 'rules' })}>
           Rules{state.rules.length ? <span class="count">{state.rules.filter((r) => r.enabled).length}/{state.rules.length}</span> : null}
+        </button>
+        <button type="button" role="tab" class="seg-btn" aria-selected={view === 'recordings'}
+          title={status.replay ? `Replaying “${status.replay.recording}”` : 'Save, replay and compare traffic'}
+          onClick={() => dispatch({ type: 'setView', view: 'recordings' })}>
+          Recordings
+          {status.replay
+            ? <span class="count replay-count" aria-label="replaying">▶</span>
+            : state.recordings.length ? <span class="count">{state.recordings.length}</span> : null}
+        </button>
+        <button type="button" role="tab" class="seg-btn" aria-selected={view === 'auth'}
+          title={alerts ? `${alerts} token refresh flow${alerts === 1 ? '' : 's'} need attention (stampede or failed retry)` : 'Token refresh flows (401 → refresh → retry)'}
+          onClick={() => dispatch({ type: 'setView', view: 'auth' })}>
+          Auth
+          {alerts ? <span class="count warn-count">{alerts}</span> : state.authFlows.length ? <span class="count">{state.authFlows.length}</span> : null}
         </button>
       </div>
 
@@ -106,6 +122,13 @@ export function Toolbar() {
       <span class="sep" aria-hidden="true" />
       <NetworkPicker profile={status.networkProfile} onSet={(profile) => post({ type: 'setNetworkProfile', profile })} />
 
+      {status.upstreamProxy && (
+        <span class={`upstream-chip${status.upstreamProxyInsecure ? ' insecure' : ''}`}
+          title={status.upstreamProxyInsecure ? `${UPSTREAM_TITLE(status.upstreamProxy)}\n\n${INSECURE_TITLE}` : UPSTREAM_TITLE(status.upstreamProxy)}>
+          <span class="dot" aria-hidden="true" />via upstream proxy {status.upstreamProxy}
+          {status.upstreamProxyInsecure && <strong class="insecure-text"> · certificate checks OFF</strong>}
+        </span>
+      )}
       <span class="spacer" />
       {paused > 0 && (
         <button type="button" class="paused-alert" onClick={() => dispatch({ type: 'showPaused' })}

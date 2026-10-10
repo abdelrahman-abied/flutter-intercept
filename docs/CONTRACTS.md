@@ -1086,3 +1086,95 @@ Plan: docs/ROADMAP.md §4 (0.5.0), owners in docs/PLAN.md "v0.5.0". Types alread
 - `browserInternal` only for the Google browser-service host list. A web launch with the user's own
   `--user-data-dir` is not intercepted.
 - VM import: bodies only with known lengths ≤ 1 MB; every field validated; `isOurProxy(host, port)` dep.
+
+## 12. v0.6.0 additions — Teams & scenarios (2026-10-10)
+
+Plan: docs/ROADMAP.md §4 (0.6.0), owners in docs/PLAN.md "v0.6.0". Types already in code:
+`packages/proxy/src/types.ts` (`mock.bodyFile`, `sequence`, `mapRemote`, `rewrite`, `SequenceStep`, `RewriteSpec`,
+`Rule.shared`, `upstreamProxy`, `ReplayEntry`, `ReplayOptions`), `packages/extension/src/{rules,recordings,analysis}/types.ts`,
+both `protocol.ts` (§12.7 messages, `Status.replay`, `Status.sharedRules`).
+
+### 12.1 Shared rules in the repo (`src/rules/**`)
+- `.vscode/flutter-intercept.json` `{ "version": 1, "rules": [...] }` in the Flutter project's workspace folder,
+  committed with the code. Its rules carry `shared: true`, run **before** personal rules (workspaceState), are
+  validated like any rule (invalid ones skipped with a problem line, never "match-all"), and are watched (edits,
+  git checkouts). A broken file keeps the last good rules and shows the problem. Workspace trust is required (the
+  extension already doesn't run in Restricted Mode).
+- **Approval gate**: shared `mapRemote` rules whose target is not loopback, and shared `rewrite` rules that set
+  request headers, are held in `pendingApproval` until the user approves that file content (remembered by content
+  hash in workspaceState) — a cloned repo must not silently route the app's authenticated traffic elsewhere.
+- "Share" moves a personal rule into the file (and back); writes keep the file's other content and formatting
+  where possible (2-space JSON, stable key order).
+
+### 12.2 File-backed mocks
+`mock.bodyFile` = workspace-relative path (inside the workspace, realpath-checked, regular file ≤ 5 MB). The host
+reads it into `body` before handing rules to the proxy and re-applies on change; a missing file → the rule is
+skipped with a problem shown. The editor offers "Edit body in a file" (creates `.vscode/flutter-intercept/mocks/<name>.json`).
+
+### 12.3 Scenarios and auth flows
+- `sequence` (proxy): steps answer successive matching requests (`count` each, default 1); afterwards `then`:
+  `last` (keep the last step, default), `passthrough`, or `loop`. Counters per rule id, reset when the rule changes
+  or on `resetSequences()`; `rule-hit` reports the step. Steps can't be `breakpoint`/`sequence`.
+- **Expire token** preset (`expireToken {url, count}`): sequence `[mock 401 {"error":"token_expired"} × count,
+  passthrough]`, named "Expire token: …".
+- **Auth analysis** (`src/analysis/**`, pure): from exchanges, find 401/403 → refresh call(s) (POST/GET to a URL
+  matching /(refresh|token|oauth|auth)/i or the same origin's auth endpoints) → retried request(s); `stampede` when
+  ≥ 2 refresh calls follow one expiry within 2 s; `problem` when the retry is missing or gets 401 again. The host
+  pushes `authFlows` to the panel (debounced) and agents can read them.
+
+### 12.4 Record → replay
+- `RecordingService` (`src/recordings/**`): save finished HTTP exchanges (not WebSocket/SSE/vm-profile) to
+  `.dart_tool/flutter_intercept/recordings/<id>.json` (gitignored location; unredacted by default because replay
+  needs real bodies; `redact: true` option), list / load / delete / export.
+- Proxy `setReplay(entries: ReplayEntry[] | undefined, opts: ReplayOptions)`: while set, a request is answered from
+  the recording — exact method + URL (+ request body hash for bodies), then (with `matchTemplates`) method + path
+  template; several recorded responses for one key are served in order and the last repeats.
+  `ReplayEntry.requestBodyHash` = lowercase hex sha256 of the **decoded** request body bytes (utf8 text as UTF-8,
+  base64 decoded), omitted for empty/truncated bodies; `toReplay` strips framing headers, the proxy re-frames. Rules still win
+  (they are checked first). Unmatched: `passthrough` or `fail` (like offline). Exchanges answered by replay end
+  `mocked` with `simulated: "Replayed from <name>"`.
+
+### 12.5 Diff two recordings
+`RecordingService.diff(a, b)` by route (method + path template): added / removed routes, status changes, JSON
+shape changes (keys added/removed, type changes), body value changes (count only), call-count changes, timing
+(> 2× slower). `diffText` gives a normalised text for `vscode.diff` (bodies pretty-printed, volatile headers such
+as date / set-cookie values / request ids dropped).
+
+### 12.6 Map Remote, rewrite, upstream proxy (proxy)
+- `mapRemote {to}`: `to` is an origin (`https://staging.example.com`) or URL prefix; the request is forwarded there
+  (path/query kept after the matched prefix), `Host` from `to` unless `preserveHost`; upstream TLS verified as
+  usual; the app sees the original URL; `simulated: "Mapped to <origin>"`. LAN clients keep the §7 SSRF guard on
+  the **mapped** target.
+- `rewrite`: request headers set/removed before forwarding; response status/headers set/removed; literal body
+  find/replace (decoded text, ≤ 20 replacements, re-framed like edits; non-text bodies untouched with a note).
+- `upstreamProxy` option (setting `flutterIntercept.upstreamProxy`): all pass-through traffic goes via that HTTP
+  proxy (CONNECT for HTTPS); `ignoreCertErrors` only when the user sets it (needed for MITM proxies like Charles).
+
+### 12.7 UI and agents
+- Webview: rule editor for `sequence` (step list), `mapRemote`, `rewrite`, `bodyFile`; a "Shared" badge and
+  Share toggle; a banner when shared rules await approval (button → `approveSharedRules`); Recordings view (save
+  current traffic, replay with fallback choice, diff two, delete), a clear "Replaying <name>" status indicator;
+  "Auth flows" view (timeline of 401 → refresh → retry, stampede warning); "Expire token" action on a request.
+- Agent tools: `save_recording {name, url?, sinceMs?, redact?}` (W), `list_recordings` (R),
+  `replay_recording {id?, fallback?}` (W; omit id = stop), `diff_recordings {a, b}` (R; entries, redacted details),
+  `add_sequence {url, method?, steps, then?, name?}` (W), `expire_token {url, count?}` (W),
+  `add_map_remote {url, to, method?}` (W; **agents may only map to loopback targets** — local backends),
+  `add_rewrite {...}` (W; agents can't set request headers whose names match the redaction rules),
+  `get_auth_flows {sinceMs?}` (R). Globs only, redacted views, confirmations name targets.
+- Added while building: view → host `openSharedRules` (opens the shared file) and `openBodyFile {path, create?}`
+  (opens a mock body file inside the workspace, creating it only if missing); `Status.sharedRules.pending`
+  lists each held rule's name and reason (the approval modal shows the same text).
+
+### 12.8 As built (proxy, v0.6.0)
+- `setReplay(entries | undefined, {fallback, matchTemplates, name?}) → number` of usable entries; `replay` getter.
+  Fallback `fail` closes inside the tunnel (no DIRECT fallback). Entries keep `content-encoding` when their bytes
+  are still encoded (zstd / stacked encodings are recorded raw); otherwise the proxy encodes as needed.
+- `'rule-hit' (ruleId, used, step?)` — `step` for sequences (0-based, -1 = after the steps); `resetSequences(ids?)`.
+- `mapRemote.to` with path `/` and no query = origin mapping; otherwise a prefix replacing the text before the rule
+  glob's first `*`. Mapping happens before every other check (the LAN SSRF guard sees the mapped target);
+  WebSocket upgrades are mapped too. `WEBSOCKET_ACTIONS` includes `mapRemote`.
+- `setUpstreamProxy` accepts only `http://host:port` (not this proxy); credentials in the URL become Basic proxy
+  auth and are never shown. Residual: plain-HTTP LAN traffic via an upstream proxy is checked, then sent by name
+  (small DNS-rebinding window); HTTPS is pinned to the checked IP.
+- New exports: `pickSequenceStep`, `mapRemoteUrl`, `parseMapTarget`, `pathTemplate`, `routeTemplate`, `isIdSegment`,
+  `MAX_BODY_REPLACEMENTS`, `requestBodyHash`, `parseUpstreamProxy`, `UpstreamProxyConfig`.

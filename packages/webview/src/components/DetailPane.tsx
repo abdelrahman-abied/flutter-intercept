@@ -11,6 +11,7 @@ import { AgentBadge, Button, CoverageBadges, MenuButton, PauseTimer, StateBadge,
 import { CORS_DEV_NOTE, isNative, NATIVE_READ_ONLY, requestOrigin, routeGlob, sentCookies } from '../coverage';
 import { frameTotal, hasFrames } from '../frames';
 import { FramesView } from './FramesView';
+import { expireTokenError, expireTokenLabel } from '../scenarios';
 import { PauseEditor } from './Editors';
 import { Icon } from './Icon';
 import { BodyView, HeadersTable, type TreeFieldActions } from './Viewers';
@@ -32,6 +33,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
   const create = actions.createRule;
   const sentBy = initiatorLabel(ex);
   const original = ex.resentFrom ? findExchange(state, ex.resentFrom) : undefined;
+  const [expiring, setExpiring] = useState(false);
 
   return (
     <section class="detail" ref={paneRef} tabIndex={-1} aria-label="Exchange details"
@@ -59,6 +61,10 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             title={actions.off.block ?? 'Create a rule that blocks requests like this one'}>Block this</Button>
           <Button onClick={() => create('breakpoint')} disabled={!!actions.off.breakpoint}
             title={actions.off.breakpoint ?? 'Create a breakpoint rule that pauses requests like this one'}>Break on this</Button>
+          <Button onClick={() => setExpiring(!expiring)} pressed={expiring} disabled={isNative(ex)}
+            title={isNative(ex) ? NATIVE_READ_ONLY : 'Make the next request(s) like this one get 401 token_expired — test how the app refreshes its token'}>
+            Expire token…
+          </Button>
           <span class="sep" aria-hidden="true" />
           <MenuButton label="Copy request as" title="Copy this request as code (cURL, Dart http, Dio)" items={actions.copyItems}>
             <Icon name="copy" /> Copy as… <Icon name="chevronDown" />
@@ -108,6 +114,10 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             )}
           </span>
         </div>
+        {expiring && !isNative(ex) && (
+          <ExpireTokenForm key={ex.id} url={ex.url} onCancel={() => setExpiring(false)}
+            onSubmit={(url, count) => { setExpiring(false); actions.expireToken(url, count); }} />
+        )}
         {ex.source && <SourceSection ex={ex} onOpen={actions.openSource} />}
         {isNative(ex) && (
           <div class="msg info native-note" role="note">
@@ -255,6 +265,44 @@ export function CorsSection({ ex, onAddRule }: { ex: Exchange; onAddRule?: (cred
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * CONTRACTS §12.3 "Expire token" preset: the host adds a rule (first) that answers the next `count` requests to
+ * `url` with 401 {"error":"token_expired"}, then lets them through — the app's refresh shows up under Auth.
+ */
+export function ExpireTokenForm({ url: initialUrl, onSubmit, onCancel }: {
+  url: string; onSubmit: (url: string, count: number) => void; onCancel: () => void;
+}) {
+  const [url, setUrl] = useState(() => routeGlob(initialUrl));
+  const [count, setCount] = useState('1');
+  const error = expireTokenError(url, count);
+  const n = Number(count.trim());
+  return (
+    <form class="expire-token" aria-label="Expire token"
+      onSubmit={(e) => { e.preventDefault(); if (!error) onSubmit(url.trim(), n); }}
+      onKeyDown={(e) => { if (e.key === 'Escape') { e.preventDefault(); onCancel(); } }}>
+      <div class="field-row">
+        <label class="field grow">
+          <span>Requests to</span>
+          <input class="mono" value={url} spellcheck={false} aria-invalid={!url.trim()}
+            onInput={(e) => setUrl((e.target as HTMLInputElement).value)} />
+        </label>
+        <label class="field small-field">
+          <span>How many</span>
+          <input value={count} inputMode="numeric" aria-label="Number of requests that get 401" aria-invalid={!!error && !!url.trim()}
+            onInput={(e) => setCount((e.target as HTMLInputElement).value)} />
+        </label>
+      </div>
+      {error
+        ? <div class="msg error">{error}</div>
+        : <div class="hint">Glob on the full URL. Then: {expireTokenLabel(url.trim(), n)} Widen it (e.g. <code>https://api.example.com/*</code>) to expire every call.</div>}
+      <div class="re-actions">
+        <Button kind="primary" type="submit" disabled={!!error}>Expire token</Button>
+        <Button onClick={onCancel}>Cancel</Button>
+      </div>
+    </form>
   );
 }
 
