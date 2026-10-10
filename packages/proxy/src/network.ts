@@ -5,7 +5,7 @@
 export type NetworkProfile =
   | { kind: 'none' }
   | { kind: 'offline' }
-  | { kind: 'throttle'; preset?: NetworkPresetId; latencyMs?: number; kbps?: number; dropRate?: number };
+  | { kind: 'throttle'; preset?: NetworkPresetId; latencyMs?: number; kbps?: number; dropRate?: number; uploadKbps?: number };
 
 export type NetworkPresetId = 'slow-3g' | 'fast-3g' | 'flaky';
 

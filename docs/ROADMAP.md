@@ -115,6 +115,7 @@ below. Same way of working: contract first, parallel owners, independent securit
 | **Multipart redaction** | multipart bodies are only partly redacted (pre-existing) | S | Parse parts; redact secret-named fields and file contents for agents. |
 | **VS Code `http.proxy` as the default upstream** | since REVIEW-7 #14 the app's traffic ignores it | S | Owner decision: use it when `flutterIntercept.upstreamProxy` is empty (user settings only). |
 | **Idle pooled connections** | keep-alive to real hosts is new inside VS Code (REVIEW-7 #14) | S | Watch item: idle timeout / retry on a stale socket if flaky failures appear. |
+| **Android Studio plugin** | users asked; VS Code only today | L | Later: IntelliJ plugin reusing the proxy (bundled Node sidecar) and the webview (JCEF); the new part is hooking Flutter run configurations. Not in 0.8.0. |
 
 ## 5. Spikes and decisions before building
 - Dio's async stack depth for request → source (0.3).

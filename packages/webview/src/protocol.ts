@@ -36,6 +36,9 @@ export interface Status {
   replay?: { recording: string; fallback: 'passthrough' | 'fail' };                          // CONTRACTS §12
   sharedRules?: { file?: string; count: number; problems: string[]; pendingApproval: number; pending?: { name: string; reason: string }[] }; // CONTRACTS §12
   upstreamProxy?: string;               // REVIEW-6 #1: host:port of the upstream proxy in use (never credentials)
+  upstreamProxySource?: 'flutterIntercept' | 'http.proxy'; // CONTRACTS §14.6
+  tlsPassthrough?: string[];            // CONTRACTS §14.2: hosts passed through undecrypted (tunnels)
+  clientCertificates?: { host: string; problem?: string }[]; // CONTRACTS §14.3 (never key material)
   upstreamProxyInsecure?: true;         // REVIEW-6 #1: upstream certificate checks are off
 }
 export interface AgentStatus { access: string; mcpUrl?: string; clients: number; lastCall?: { tool: string; at: number } }
@@ -94,7 +97,7 @@ export interface ContractSummary {
 /** CONTRACTS §11: a session-level warning shown as a banner (dismissable per id). */
 export interface SessionWarning {
   id: string;           // stable, e.g. "isolate:<sessionId>:<isolateName>"
-  kind: 'background-isolate' | 'native-client' | 'web' | 'other';
+  kind: 'background-isolate' | 'native-client' | 'web' | 'bypass' | 'other';
   text: string;         // one sentence, e.g. "Requests from background isolate \"worker\" are not intercepted."
   sessionId?: string;
 }

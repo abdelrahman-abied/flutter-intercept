@@ -158,3 +158,16 @@ simulator, macOS), web 6/6. Independent review: docs/REVIEW-7.md, all 14 finding
 (0.3.0 → 0.7.0 in one fast-forward) for the Marketplace release; push, Open VSX and Marketplace publishing are the
 owner's steps. Next: docs/ROADMAP.md §4 "Next / considered" (proposed 0.8.0).
 
+## v0.8.0 — Next / considered (started 2026-10-10, branch `feature/0.8.0`)
+Contract: CONTRACTS §14. Same rules as before.
+| Agent | Owns |
+|---|---|
+| P proxy | TLS passthrough, mTLS, upload / WebSocket throttling, idle pool + retry, WS/SSE replay — `packages/proxy/**` except `types.ts`/`network.ts` |
+| C cli | GitHub Action (`action.yml` at the repo root), physical iPhones in CI, npm-ready package — `packages/cli/**` except `src/types.ts` |
+| V vm + native | native-clients spike, isolates profile/spawnUri spike, bypass detection, iPhone screenshots — `src/vm/**`, `src/screenshot/**`, `src/adb.ts`, `src/iosDevices.ts`, `samples/demo_app/lib/**`, `test/integration/suite/devices.ts`, spike docs |
+| B web | PAC fallback, web-server notice, web screenshots via CDP — `src/debug/**`, `samples/web_app/**`, `test/integration/suite/web.ts`, docs/spikes/web.md |
+| R recordings + export | WS/SSE recordings, diff, `toReplay`; OpenAPI `securitySchemes` — `src/recordings/**`, `src/export/**` |
+| H host + agent | `http.proxy` default, client certificates (files, secret storage), passthrough setting, multipart redaction, agent tool updates — `src/agent/**`, `src/ui/controller.ts`, `src/proxyHost.ts` |
+| W webview | tunnels, cert / passthrough status, upload throttle fields, WS/SSE recordings UI — `packages/webview/**` except `protocol.ts` |
+| lead | contract, types, `extension.ts`, extension `package.json`, docs, E2E, review |
+

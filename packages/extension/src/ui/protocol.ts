@@ -22,6 +22,12 @@ export interface Status {
   upstreamProxy?: string;
   /** REVIEW-6 #1: the upstream proxy is used with certificate checks off (flutterIntercept.upstreamProxyIgnoreCertErrors). */
   upstreamProxyInsecure?: true;
+  /** CONTRACTS §14.6: where `upstreamProxy` came from (`http.proxy` = VS Code's setting, used when ours is empty). */
+  upstreamProxySource?: 'flutterIntercept' | 'http.proxy';
+  /** CONTRACTS §14.2: hosts whose TLS is passed through undecrypted (listed as tunnels). */
+  tlsPassthrough?: string[];
+  /** CONTRACTS §14.3: configured client certificates (host pattern + whether it loaded; never paths' contents or passphrases). */
+  clientCertificates?: { host: string; problem?: string }[];
 }
 
 export interface AgentStatus {
@@ -104,7 +110,7 @@ export interface ContractSummary {
 /** CONTRACTS §11: a session-level warning shown as a banner (dismissable per id). */
 export interface SessionWarning {
   id: string;           // stable, e.g. "isolate:<sessionId>:<isolateName>"
-  kind: 'background-isolate' | 'native-client' | 'web' | 'other';
+  kind: 'background-isolate' | 'native-client' | 'web' | 'bypass' | 'other'; // bypass: CONTRACTS §14.7
   text: string;         // one sentence, e.g. "Requests from background isolate \"worker\" are not intercepted."
   sessionId?: string;
 }

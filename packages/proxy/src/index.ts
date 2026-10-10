@@ -56,6 +56,7 @@ export type {
   Timings,
   ScriptRequest,
   ScriptResponse,
+  ClientCertificate,
 } from './types';
 export { NETWORK_PRESETS, NO_PROFILE, presetProfile, describeProfile } from './network';
 export type { NetworkProfile, NetworkPreset, NetworkPresetId } from './network';

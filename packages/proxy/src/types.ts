@@ -44,8 +44,9 @@ export interface Exchange {
   /** Set when the client came through the LAN listener (physical iPhone, CONTRACTS §7). */
   viaLan?: true;
   // CONTRACTS §11 (v0.5.0)
-  /** absent = plain HTTP. websocket = an upgraded connection; sse = a text/event-stream response. */
-  kind?: 'websocket' | 'sse';
+  /** absent = plain HTTP. websocket = an upgraded connection; sse = a text/event-stream response.
+   * tunnel (CONTRACTS §14.2) = a TLS connection passed through undecrypted (`tlsPassthrough` host): no headers/bodies. */
+  kind?: 'websocket' | 'sse' | 'tunnel';
   /** WebSocket messages / SSE events, oldest first; the newest `maxFramesPerExchange` are kept. */
   frames?: Frame[];
   /** Frames dropped (oldest) beyond the cap. */
@@ -66,6 +67,11 @@ export interface Exchange {
   timings?: Timings;
   /** Lines a `script` rule logged with `context.log` (≤ 20 lines × 500 chars), plus its error if it threw. */
   scriptLog?: string[];
+  // CONTRACTS §14 (v0.8.0)
+  /** kind `tunnel`: bytes each way (app → server = sent). */
+  tunnelBytes?: { sent: number; received: number };
+  /** A client certificate was presented upstream (mTLS, CONTRACTS §14.3): the configured host pattern, never the key. */
+  clientCertificate?: string;
 }
 
 /**
@@ -151,7 +157,9 @@ export type RuleAction =
   | { kind: 'block'; mode: 'reset' | 'status'; status?: number } // reset = connection reset
   | { kind: 'breakpoint'; phase: 'request' | 'response' | 'both' }
   // CONTRACTS §9.2. throttle passes through to the real server, slowed; dropRate 0–1 = share reset instead.
-  | { kind: 'throttle'; latencyMs?: number; kbps?: number; dropRate?: number }
+  | { kind: 'throttle'; latencyMs?: number; kbps?: number; dropRate?: number;
+      /** CONTRACTS §14.4: upload bandwidth (request bodies, WebSocket messages the app sends). */
+      uploadKbps?: number }
   | { kind: 'fault'; fault: FaultKind }
   // CONTRACTS §10.2: the real response, with JSON fields changed (reproduce "Null is not a subtype…").
   | { kind: 'mutate'; ops: MutateOp[] }
@@ -291,6 +299,21 @@ export interface InterceptProxyOptions {
   maxFramesPerExchange?: number;
   /** CONTRACTS §12.6: chain to another proxy (Charles, Burp, a corporate proxy): `http://host:port`. */
   upstreamProxy?: { url: string; ignoreCertErrors?: boolean };
+  /** CONTRACTS §14.2: hosts (globs on the hostname, e.g. `*.bank.example`) whose TLS is passed through undecrypted. */
+  tlsPassthrough?: string[];
+  /** CONTRACTS §14.3: client certificates presented to matching servers (mTLS). */
+  clientCertificates?: ClientCertificate[];
+}
+
+/** CONTRACTS §14.3: one client certificate for upstream mTLS. Key material never leaves the proxy (not in exchanges / events). */
+export interface ClientCertificate {
+  /** Hostname glob (`api.example.com`, `*.corp.example`), optionally `:port`. */
+  host: string;
+  /** PKCS#12 bytes, or PEM cert + key. */
+  pfx?: Buffer;
+  cert?: string;
+  key?: string;
+  passphrase?: string;
 }
 
 /** CONTRACTS §12.4: one recorded response to replay. */
@@ -301,6 +324,9 @@ export interface ReplayEntry {
   headers: Record<string, string | string[]>;
   body?: Body;
   requestBodyHash?: string;        // sha256 of the decoded request body, to tell POSTs apart
+  /** CONTRACTS §14.5: a recorded WebSocket / SSE exchange, replayed as a scripted server from `frames`. */
+  kind?: 'websocket' | 'sse';
+  frames?: Frame[];
 }
 
 export interface ReplayOptions {

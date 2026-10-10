@@ -1365,3 +1365,79 @@ screenshot}/types.ts`, `rules/types.ts` (`resolveScriptFile`), `vm/types.ts` (`b
   world-writable / foreign-owned rules files refused (exit 2). The proxy sends requests carrying its own agents to
   `node:http(s)` so VS Code's `http.proxySupport` patch can't replace them (REVIEW-7 #14): pass-through traffic
   ignores VS Code's `http.proxy`; use `flutterIntercept.upstreamProxy`.
+
+## 14. v0.8.0 additions — Next / considered (2026-10-10)
+
+Plan: docs/ROADMAP.md §4 "Next / considered", owners in docs/PLAN.md "v0.8.0". Types already in code:
+`packages/proxy/src/types.ts` (`Exchange.kind 'tunnel'`, `tunnelBytes`, `clientCertificate`, throttle `uploadKbps`,
+`tlsPassthrough`, `clientCertificates`, `ClientCertificate`, `ReplayEntry.kind/frames`), `network.ts` (`uploadKbps`),
+both `protocol.ts` (`Status.upstreamProxySource/tlsPassthrough/clientCertificates`, `SessionWarning` kind `bypass`).
+Spikes first where marked; a spike that fails ships documentation, not a flaky path.
+
+### 14.1 CI: GitHub Action, physical iPhones, npm-ready CLI (`packages/cli`, `action.yml`)
+- A composite **GitHub Action** at the repo root (`action.yml`, usable as `uses: abdelrahman-abied/flutter-intercept@v0.8.0`):
+  inputs `working-directory`, `device`, `targets`, `har`, `record`, `assert`, `junit`, `replay`, `network-profile`,
+  `rules`, `approve-shared-rules`, `flutter-args`; builds the CLI from the action's own checkout (no npm), runs `test`,
+  uploads HAR / JUnit / recording with `actions/upload-artifact`, fails on assertion failures. Examples for macOS and
+  the Android emulator in packages/cli/README.md.
+- **Physical iPhones in CI mode** (`test -d <udid>`): reuse the proxy's LAN listener (CONTRACTS §7: bind the default-route
+  IPv4 only, per-run token, device lock, LAN SSRF guard) and the entry's `user:token@host` define; refuse when no
+  LAN address; print the Local Network / firewall notes once. Security review item.
+- **npm-ready**: `packages/cli/package.json` publishable (name decided by the owner, default `flutter-intercept-cli`;
+  `files`, `bin`, `engines`, `repository`, `license`; `prepublishOnly` builds); a test asserts `npm pack --dry-run`
+  contains only `dist/cli.js`, README, LICENSE, package.json. **Not published** (owner).
+
+### 14.2 TLS passthrough hosts (proxy + host + webview)
+For hosts whose certificate the app pins itself (Dio `validateCertificate`, native pinning): setting
+`flutterIntercept.tlsPassthrough` (string[] of hostname globs) → `InterceptProxy.setTlsPassthrough(hosts)`. A CONNECT to a
+matching host is tunnelled to the real server **without** decryption (no MITM): one `Exchange` per tunnel, `kind:
+'tunnel'`, `method: 'CONNECT'`, `url: https://host:port/`, `tunnelBytes`, timings up to the tunnel opening, state
+`completed` / `error`. Rules never apply (only `block` and faults on the CONNECT, like WebSockets). LAN clients keep the
+§7 guard; upstream proxy chaining applies (CONNECT through it). Webview: `tunnel` rows (lock icon, "not decrypted"),
+status shows the host list. Agents: `list_requests kind:"tunnel"`; `get_request` explains.
+
+### 14.3 mTLS client certificates (proxy + host)
+Setting `flutterIntercept.clientCertificates` (user settings only): `[{host, pfx} | {host, cert, key}]` with workspace
+or absolute file paths; passphrases in secret storage (command **Set Client Certificate Passphrase…**). The host reads
+the files (≤ 1 MB, regular files, no symlink tricks) and calls `setClientCertificates()`. The proxy presents the first
+matching certificate on upstream TLS (`host` glob + optional port), sets `Exchange.clientCertificate = <pattern>`. Load
+problems show in `Status.clientCertificates[].problem`; key material never reaches events, logs, agents or the webview.
+
+### 14.4 Throttle uploads and WebSocket messages (proxy)
+`throttle.uploadKbps` / profile `uploadKbps` pace request bodies upstream; latency and both bandwidths apply to
+WebSocket frames (each direction) and SSE events. Presets gain upload values (Slow 3G 400/400, Fast 3G 1600/750).
+
+### 14.5 WebSocket / SSE recordings (recordings + proxy replay)
+`RecordingService` saves finished WebSocket / SSE exchanges with their frames (redaction as for agents when
+`redact`); `toReplay` emits `ReplayEntry {kind, frames}`. Proxy replay: **SSE** → answer with the recorded head and the
+events at their recorded relative times (capped at 5 s gaps); **WebSocket** → accept the upgrade locally and act as a
+scripted server: send the recorded server frames that preceded the first client frame, then after each client frame
+the server frames that followed it in the recording (timing kept, gaps ≤ 5 s); close like the recording. Diff: frame
+counts per route and message-type changes. Agents: `save_recording` includes them.
+
+### 14.6 Small items
+- **VS Code `http.proxy` as default upstream** (host): when `flutterIntercept.upstreamProxy` is empty, use VS Code's
+  `http.proxy` from **user** settings (plus `http.noProxy` hosts direct; `http.proxyStrictSSL: false` ≠ ignore cert
+  errors — keep strict unless `upstreamProxyIgnoreCertErrors`). `Status.upstreamProxySource`.
+- **Idle pooled connections** (proxy): idle timeout 30 s on pooled upstream sockets; a request that fails on a reused
+  socket before any response byte (ECONNRESET / EPIPE) is retried once on a new connection (idempotent methods only).
+- **OpenAPI `securitySchemes`** (export): bearer / basic / apiKey (header or query) inferred from header and query
+  names seen, referenced per operation; values never included.
+- **Multipart redaction** (agent redact): parse `multipart/form-data` (boundary from content-type, ≤ 5 MB): secret-named
+  fields → `[redacted]`, file parts → `[file <name>, N bytes]`.
+
+### 14.7 Coverage spikes (vm + web)
+- **Native clients: mock / block** (spike, docs/spikes/native-proxy.md): route `cupertino_http` / `cronet_http` /
+  `ok_http` through the proxy without app code — Android emulator global proxy (`adb shell settings put global
+  http_proxy`, reverted on session end) + CA trust options; iOS simulator (`xcrun simctl keychain <udid>
+  add-root-cert`) + proxy route. Ship only non-invasive, automatically reverted steps behind setting value
+  `flutterIntercept.nativeClients: "proxy"` (debug, emulator / simulator only); otherwise document.
+- **Background isolates in profile mode / `Isolate.spawnUri`** (spike): any reliable install path; else document.
+- **Bypass detection**: main-isolate dart:io traffic in the HTTP profile that never reached the proxy (no `x-fi-id`, not
+  ours) → `SessionWarning {kind: 'bypass'}` naming the host ("requests to api.example.com bypass the proxy — an
+  `HttpOverrides` zone or a custom `connectionFactory` in the app"), once per host per session.
+- **Screenshots on physical iPhones** (`idevicescreenshot` when installed, else the VM route) and **Flutter Web**
+  (Chrome DevTools Protocol on the debug Chrome flutter_tools started: `Page.captureScreenshot`, loopback only).
+- **Flutter Web DIRECT fallback**: replace `--proxy-server` with `--proxy-pac-url=data:…` returning
+  `PROXY 127.0.0.1:<port>; DIRECT` (loopback still bypassed) if Chrome honours it for a temp profile; `web-server` device:
+  a one-time notice with the manual browser flags (never automatic).
