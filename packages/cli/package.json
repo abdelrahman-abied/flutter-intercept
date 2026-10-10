@@ -1,6 +1,6 @@
 {
   "name": "flutter-intercept-cli",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Headless Flutter Intercept for CI: run Flutter integration tests through a local MITM proxy with shared mock rules, replay, network profiles and traffic assertions. No app code changes.",
   "keywords": [
     "flutter",
