@@ -45,7 +45,10 @@ export type HostMsg =
   | { type: 'contract'; results: ContractSummary[] }
   // CONTRACTS §12.7
   | { type: 'recordings'; recordings: RecordingSummary[] }
-  | { type: 'authFlows'; flows: AuthFlowSummary[] };
+  | { type: 'authFlows'; flows: AuthFlowSummary[] }
+  // CONTRACTS §13.7
+  | { type: 'select'; id: string }                                     // focus this exchange (from a notification's "Show")
+  | { type: 'exported'; format: ExportFormat; path: string };          // after a successful 'export'
 
 // webview → host
 export type ViewMsg =
@@ -76,7 +79,14 @@ export type ViewMsg =
   | { type: 'deleteRecording'; id: string }
   | { type: 'expireToken'; url: string; count: number }                // preset: sequence [401 × count, passthrough]
   | { type: 'openSharedRules' }                                        // opens .vscode/flutter-intercept.json
-  | { type: 'openBodyFile'; path: string; create?: { content: string } }; // opens a mock body file (creates it, never overwrites)
+  | { type: 'openBodyFile'; path: string; create?: { content: string } } // opens a mock body file (creates it, never overwrites)
+  // CONTRACTS §13.7
+  | { type: 'export'; format: ExportFormat; ids?: string[] }           // host asks redact or not, then a save dialog; ids default = all shown HTTP
+  | { type: 'openInNewWindow' }                                        // opens the panel as an editor in its own window
+  | { type: 'openScriptFile'; path: string; create?: { content: string } }; // like openBodyFile, for script rules (.js)
+
+/** CONTRACTS §13.5 */
+export type ExportFormat = 'openapi' | 'postman' | 'har';
 
 export type SnippetFormat = 'curl' | 'dart_http' | 'dio';
 export interface SendDraft { method: string; url: string; headers?: Record<string, string | string[]>; body?: string }

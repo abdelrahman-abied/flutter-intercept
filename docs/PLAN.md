@@ -136,3 +136,17 @@ Contract: CONTRACTS §12. Same rules as before.
 | H host + agent | `src/agent/**`, `src/ui/controller.ts`, `src/proxyHost.ts`, their tests, `test/integration/suite/agent.ts` |
 | W webview | `packages/webview/**` except `protocol.ts` |
 | lead | contract, `extension.ts`, extension `package.json`, docs, E2E, review |
+
+## v0.7.0 — Later / considered (started 2026-10-10, branch `feature/0.7.0`)
+Contract: CONTRACTS §13. Same rules as before (disjoint files, no `npm install`, random ports, findings and
+contract change requests in `docs/spikes/<topic>.md`).
+| Agent | Owns |
+|---|---|
+| P proxy | timings, `script` action + worker runner (`src/script.ts`) — `packages/proxy/**` except `types.ts`/`network.ts` |
+| S rules | `src/rules/**`: `script.file` resolution, approval of shared scripts, script templates; its tests |
+| E export + notify | `src/export/**`, `src/notify/**` (pure + injected-deps glue), their tests |
+| V vm + screenshot | background-isolate interception spike, `src/vm/**`, `src/entry/**` (template v5), `src/screenshot/**`, their tests, `samples/demo_app/lib/**`, `test/integration/suite/devices.ts`, docs/spikes/{background-isolates,screenshot}.md |
+| C cli | `packages/cli/**` (except `src/types.ts`), docs/spikes/ci.md |
+| H host + agent | `src/agent/**` (new tools, Windsurf, HAR timings, script views), `src/ui/controller.ts`, `src/proxyHost.ts`, their tests, `test/integration/suite/agent.ts` |
+| W webview | `packages/webview/**` except `protocol.ts` |
+| lead | contract, types, `extension.ts`, extension `package.json`, `src/ui/view.ts` + new `src/ui/panel.ts` (own window), Open VSX, docs, E2E, review |

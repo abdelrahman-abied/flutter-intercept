@@ -61,6 +61,35 @@ export interface Exchange {
   browserInternal?: true;
   /** Human label when a throttle / fault / network profile affected it (e.g. "Slow 3G: +400 ms, 400 kbps"). */
   simulated?: string;
+  // CONTRACTS §13 (v0.7.0)
+  /** Where the time went; set as phases complete. Absent for vm-profile captures without timing data. */
+  timings?: Timings;
+  /** Lines a `script` rule logged with `context.log` (≤ 20 lines × 500 chars), plus its error if it threw. */
+  scriptLog?: string[];
+}
+
+/**
+ * CONTRACTS §13.2: phase durations in ms (HAR-compatible). Each field is set only when that phase happened;
+ * `dnsMs` / `connectMs` / `tlsMs` only on a NEW upstream connection (`reused` otherwise).
+ */
+export interface Timings {
+  /** startedAt → the proxy had the whole request from the app (headers + body). */
+  requestMs?: number;
+  /** Time held at breakpoints (request + response). */
+  pausedMs?: number;
+  /** Delay added by a mock `delayMs`, throttle latency or network profile. */
+  delayMs?: number;
+  dnsMs?: number;
+  connectMs?: number;
+  tlsMs?: number;
+  /** The upstream connection was reused (keep-alive pool): no dns / connect / tls. */
+  reused?: true;
+  /** Writing the request to the server. */
+  sendMs?: number;
+  /** Request written → response headers from the server (time to first byte). */
+  waitMs?: number;
+  /** Response headers → last body byte from the server. */
+  receiveMs?: number;
 }
 
 export interface Frame {
@@ -135,11 +164,17 @@ export type RuleAction =
   /** Forward to another server (origin, or URL prefix replacing the matched prefix); the app sees the original URL. */
   | { kind: 'mapRemote'; to: string; preserveHost?: boolean }
   /** Change headers / status / body text of the real request or response (literal find/replace, no regex). */
-  | { kind: 'rewrite'; request?: RewriteSpec; response?: RewriteSpec & { status?: number } };
+  | { kind: 'rewrite'; request?: RewriteSpec; response?: RewriteSpec & { status?: number } }
+  // CONTRACTS §13.4 (v0.7.0)
+  /**
+   * Run JavaScript hooks (`onRequest` / `onResponse`, see ScriptRequest) on matching traffic. `code` is the
+   * source; with `file` (workspace-relative `.js`) the host reads the file into `code`, like `mock.bodyFile`.
+   */
+  | { kind: 'script'; code: string; file?: string };
 
 export interface SequenceStep {
-  /** Any action except `sequence` and `breakpoint`; `{kind:'passthrough'}` = the real server. */
-  action: Exclude<RuleAction, { kind: 'sequence' } | { kind: 'breakpoint' }> | { kind: 'passthrough' };
+  /** Any action except `sequence`, `breakpoint` and `script`; `{kind:'passthrough'}` = the real server. */
+  action: Exclude<RuleAction, { kind: 'sequence' } | { kind: 'breakpoint' } | { kind: 'script' }> | { kind: 'passthrough' };
   /** How many matching requests this step answers (default 1). */
   count?: number;
 }
@@ -184,6 +219,24 @@ export interface Rule {
   shared?: true;
   /** Read-only, set by the host for rules with `times`: matching requests so far. Never persisted; ignored by setRules. */
   used?: number;
+}
+
+/** CONTRACTS §13.4: what a script's `onRequest(request, context)` receives and may return (edited). */
+export interface ScriptRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string | string[]>;
+  /** Decoded text body; absent when empty, binary or larger than 1 MB (`bodyOmitted`). */
+  body?: string;
+  bodyOmitted?: true;
+}
+
+/** CONTRACTS §13.4: what `onResponse(response, request, context)` receives and may return; also a local answer. */
+export interface ScriptResponse {
+  status: number;
+  headers: Record<string, string | string[]>;
+  body?: string;
+  bodyOmitted?: true;
 }
 
 /** CONTRACTS §9.2 `InterceptProxy.send`. */

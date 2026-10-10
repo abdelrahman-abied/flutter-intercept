@@ -15,7 +15,8 @@ export interface SharedRulesState {
   rules: Rule[];                 // validated, each with `shared: true`
   /** Readable problems with the file (parse errors, invalid rules skipped). */
   problems: string[];
-  /** Rules held back until the user approves them (mapRemote / rewrite to other hosts, CONTRACTS §12.1). */
+  /** Rules held back until the user approves them (mapRemote / rewrite to other hosts, CONTRACTS §12.1; every
+   * `script` rule, CONTRACTS §13.4 — the approved hash covers the script file contents too). */
   pendingApproval: Rule[];
 }
 
@@ -29,4 +30,9 @@ export interface SharedRulesService {
   /** Resolves `mock.bodyFile` (workspace-relative, inside the workspace only) to text; watched for changes. */
   resolveBodyFile(path: string): Promise<string>;
   onDidChangeBodyFile(listener: (path: string) => void): { dispose(): void };
+  /**
+   * CONTRACTS §13.4: resolves `script.file` (workspace-relative `.js`, inside the workspace, regular file ≤ 256 KB)
+   * to its source; watched like body files (onDidChangeBodyFile fires for it too).
+   */
+  resolveScriptFile(path: string): Promise<string>;
 }

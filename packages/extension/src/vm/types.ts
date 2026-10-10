@@ -19,6 +19,11 @@ export interface VmHostDeps {
   /** Session warnings for Status.warnings (replace the full set for this session). */
   setWarnings(sessionId: string, warnings: import('../ui/protocol').SessionWarning[]): void;
   log(msg: string): void;
+  /**
+   * CONTRACTS §13.3: setting `flutterIntercept.backgroundIsolates` — `"intercept"` installs the entry's overrides in
+   * new isolates of intercepted sessions (debug mode); `"warn"` only warns (v0.5.0 behaviour). Read on each isolate.
+   */
+  backgroundIsolates?(): 'intercept' | 'warn';
 }
 
 export interface VmWatcher {

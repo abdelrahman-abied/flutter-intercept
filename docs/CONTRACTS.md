@@ -1178,3 +1178,129 @@ as date / set-cookie values / request ids dropped).
   (small DNS-rebinding window); HTTPS is pinned to the checked IP.
 - New exports: `pickSequenceStep`, `mapRemoteUrl`, `parseMapTarget`, `pathTemplate`, `routeTemplate`, `isIdSegment`,
   `MAX_BODY_REPLACEMENTS`, `requestBodyHash`, `parseUpstreamProxy`, `UpstreamProxyConfig`.
+
+## 13. v0.7.0 additions — Later / considered, all of it (2026-10-10)
+
+Plan: docs/ROADMAP.md §4 "Later / considered" + 0.5.0's background-isolate interception, owners in docs/PLAN.md
+"v0.7.0". Types already in code: `packages/proxy/src/types.ts` (`Exchange.timings/scriptLog`, `Timings`, RuleAction
+`script`, `ScriptRequest`, `ScriptResponse`), both `protocol.ts` (§13.7), `packages/extension/src/{export,notify,
+screenshot}/types.ts`, `rules/types.ts` (`resolveScriptFile`), `vm/types.ts` (`backgroundIsolates`),
+`packages/cli/src/types.ts`. Spikes first where marked.
+
+### 13.1 Panel in its own window (lead)
+- Commands `flutterIntercept.openInEditor` (the same UI as an editor tab, `WebviewPanel`, one at a time, revealed if
+  open) and `flutterIntercept.openInNewWindow` (opens it, then `workbench.action.moveEditorToNewWindow`; VS Code
+  ≥ 1.85 — feature-detect the command and fall back to the editor tab with a note). View → host `openInNewWindow`.
+- Every webview attaches to the one `InterceptController` (several sinks already supported). The editor copy renders
+  without the `fi-panel` body class (full height, wider layout). Same CSP and resource roots as the view.
+
+### 13.2 Timing waterfall (proxy + webview + agents)
+- Proxy fills `Exchange.timings` (`Timings`, ms, integers ≥ 0) as phases finish; `startedAt + durationMs` stays the
+  total. `requestMs`: from mockttp's `timingEvents` (start → body received). Upstream phases come from **our** pooled
+  agents (upstream-pool.ts): `dnsMs` (socket `lookup`), `connectMs` (`connect`), `tlsMs` (`secureConnect`) on a new
+  socket, `reused: true` on a pooled one; `sendMs` (request write finished), `waitMs` (→ response headers),
+  `receiveMs` (→ last body byte). LAN-guarded and upstream-proxy agents report what they can (missing fields stay
+  absent, never guessed). `pausedMs` sums breakpoint holds; `delayMs` = mock delay / throttle latency / profile.
+  Mocked / blocked / replayed exchanges have only `requestMs` / `delayMs` / `pausedMs`. WebSocket: phases up to the
+  101. vm-profile captures: from the profile's events when present.
+- Webview: a waterfall column in the traffic list (bar = offset + duration on the visible time range, coloured by
+  phase, tooltip with numbers) that can be hidden; a "Timing" section in the detail pane (phase bars + ms + "reused
+  connection"). HAR (`export_har`, panel export) maps to HAR `timings` (`blocked` = requestMs + pausedMs + delayMs,
+  `dns`, `connect` incl. TLS, `ssl`, `send`, `wait`, `receive`; -1 when unknown).
+- Agents: `get_request` includes `timings`; `list_requests` gains `slowerThanMs?`; `assert_traffic` already has
+  `maxDurationMs`.
+
+### 13.3 Background isolates — interception (vm + entry, spike first)
+- **Spike** (docs/spikes/background-isolates.md): new isolates in a debug session start paused (Dart-Code sets
+  `pause_isolates_on_start`); can we hold them (DDS `requirePermissionToResume(onPauseStart: true)` over a direct
+  VM-service WebSocket, or the DAP's own pause handling) and `evaluate` a top-level entry function in the isolate
+  before it runs? `compute` / `Isolate.run` / `Isolate.spawn` (same program) vs `spawnUri` (other program: warn only).
+  Must never leave an isolate paused (resume on every error path, 2 s budget per isolate).
+- Template v5 (amends §9.1): the entry exposes `@pragma('vm:entry-point') void flutterInterceptInstall()` — installs
+  the same `HttpOverrides` (proxy, CA trust, trace) in the calling isolate; idempotent; no-op without the define.
+- Setting `flutterIntercept.backgroundIsolates`: `"intercept"` (default if the spike works, debug mode only) |
+  `"warn"`. Installed → no warning, a log line; failed / spawnUri / profile mode → the v0.5.0 warning.
+
+### 13.4 JavaScript scripting hooks (proxy + rules + webview)
+- Rule action `{kind:'script', code, file?}`. The script defines either or both:
+  `function onRequest(request, context)` → return an edited `ScriptRequest` (forwarded), `{ response:
+  ScriptResponse }` (answered locally, like a mock; state `mocked`), or `undefined` (unchanged);
+  `function onResponse(response, request, context)` → an edited `ScriptResponse` or `undefined`.
+  `context = { ruleId, exchangeId, log(...args) }`; log lines go to `Exchange.scriptLog` (≤ 20 × 500 chars).
+- Execution (proxy, `src/script.ts`): one `worker_threads` Worker per InterceptProxy, started lazily while any
+  script rule is set, created from source (`eval: true`, no extra bundle file), `resourceLimits` (64 MB old space);
+  each script compiled once in its own `vm` context (`codeGeneration: {strings: false, wasm: false}`, no `require`,
+  `process`, timers, `fetch`, `import()` — only plain JS builtins); synchronous hooks only; 200 ms per call (vm
+  `timeout`), a 1 s watchdog terminates and restarts the worker. Inputs and results cross as JSON (structured clone),
+  are validated like edits (`validateEdit` rules: status 100–599, header names/values, body ≤ 5 MB) and re-framed
+  like edits. Bodies over 1 MB or binary → `body` absent, `bodyOmitted: true` (a returned body then replaces it).
+- A hook that throws, times out or returns something invalid → the app gets `502`, state `error`, `error` =
+  "Script <rule name>: <message>", the message also in `scriptLog`. Not applied to WebSocket upgrades (refused at
+  validation) or vm-profile captures. Not a security sandbox: scripts are trusted code.
+- Trust (rules + host): personal script rules are the user's own. **Every shared script rule needs approval**
+  (§12.1 gate; the approved hash covers the script file contents). `script.file`: workspace-relative `.js`, inside
+  the workspace (realpath-checked), regular file ≤ 256 KB; changes re-resolve (and re-hold a shared rule). Editor
+  "Edit script in a file" creates `.vscode/flutter-intercept/scripts/<name>.js` from a template.
+- **Agents can't create, edit or read scripts**: no agent tool adds them; agent views of a script rule show
+  `{kind:'script', file?}` without `code`; `scriptLog` is redacted like bodies.
+
+### 13.5 OpenAPI / Postman export (pure `src/export/**`)
+- `toOpenApi`: OpenAPI 3.1 JSON — `servers` from origins (several → one per origin, paths shared when templates
+  agree), paths from `routeTemplate` (id-like segments → `{id}` / `{id2}` path params, `schema` from the observed
+  values), query params seen (required when present in every sample), request and response bodies per status with
+  JSON schemas inferred from all samples (`codegen/infer.ts` shapes → JSON Schema: types, `required` = present in
+  every sample, nullable via `type: [..., "null"]`), one redacted example each, `operationId` from method + path.
+  GraphQL: one path, operations listed in the description. Non-JSON bodies: media type only.
+- `toPostman`: Collection v2.1 — a folder per host, one request per route (the latest sample), `{{baseUrl}}`
+  variables per origin, headers and bodies redacted (sensitive header values → `{{<name>}}` variables, declared
+  empty in `variable`), saved example responses.
+- Redaction: agents follow `agent.redactSecrets` (like HAR); the panel / command asks "Redact secrets
+  (recommended)" vs "Keep values" every time. Commands `flutterIntercept.exportOpenApi` / `exportPostman` / the panel
+  menu → save dialog (default `<project>/<name>.openapi.json` / `.postman_collection.json`); agents write under
+  `.dart_tool/flutter_intercept/exports/` like `export_har`.
+
+### 13.6 Error notifications (pure policy `src/notify/**` + host)
+- Setting `flutterIntercept.notifications`: `"errors"` (default: state `error`, status ≥ 500) | `"all"` (also 4xx) |
+  `"off"`. Counted: app traffic only — not editor/agent sends, browser-internal, mocked/blocked/replayed/scripted
+  answers or simulated faults (the user asked for those). Each exchange at most once.
+- Not while the panel (any copy) is visible and focused-window; at most one notice per 10 s, failures inside the
+  window grouped ("3 requests failed — latest: GET /users/42 → 500"). Buttons: "Show" (reveals the panel, host → view
+  `select`) and "Turn off" (sets the setting to `off` in user settings).
+
+### 13.7 Messages (amends §4)
+- host → view: `select {id}`, `exported {format, path}`. view → host: `export {format, ids?}`, `openInNewWindow`,
+  `openScriptFile {path, create?}` (like `openBodyFile`, `.js` only, creates only if missing).
+
+### 13.8 Agent API additions (amends §8)
+- `export_openapi {url?, method?, sinceMs?, title?}` (R) and `export_postman {…}` (R) → `{path, exchanges, routes,
+  notes}`; redacted per setting.
+- `take_screenshot {sessionId?}` (R, **confirmed** like a write: "Take a screenshot of <device>?") → MCP image
+  content (PNG) + `{path, width?, height?, takenAt, method, recentRequests: [≤ 10 summaries from the 5 s before]}`.
+  Setting `flutterIntercept.agent.screenshots` (default true) disables it. Implementation `src/screenshot/**`:
+  **spike** the VM service (`_flutter.screenshot` / a `ext.flutter.*` route through `callService`) first; fallbacks
+  `adb -s <id> exec-out screencap -p`, `xcrun simctl io <udid> screenshot <file>`; macOS / physical iOS / web →
+  clear "not supported" unless the VM path works. Saved under `.dart_tool/flutter_intercept/screenshots/` (inside
+  the project, realpath-checked, ≤ 16 MB). Args are arrays (no shell); device ids validated.
+- Windsurf: `connectAgent` gains "Windsurf" (copies an `mcp_config.json` snippet with `serverUrl` + `headers`), and the
+  instructions command / README mention it. Rules with `script` are listed without code; agents can't add them.
+
+### 13.9 Headless / CI mode (`packages/cli`, spike first)
+- **Spike** (docs/spikes/ci.md): `flutter test <generated entry wrapping integration_test/x_test.dart> -d <device>`
+  (the entry imports the test file and calls its `main`) on macOS desktop, Android emulator and iOS simulator; or
+  `flutter drive` if `flutter test` refuses the generated path. The entry is the same template (§9.1/§13.3), proxy
+  via `--dart-define=FLUTTER_INTERCEPT_PROXY=…`.
+- `flutter-intercept test [targets…] [options] [-- flutter args]` (`CliOptions`): creates a run CA in a temp dir
+  (0700; never trusted system-wide; deleted afterwards), starts `InterceptProxy` on 127.0.0.1, applies the shared
+  rules file (rules needing approval are skipped with a printed reason unless `--approve-shared-rules`), optional
+  replay / network profile, runs flutter (inherits stdio), then writes `--har` / `--record` / `--junit` and checks
+  `--assert` (the `assert_traffic` logic, reused). Exit code per `CliResult`. Prints a summary table. Ctrl-C stops
+  flutter and the proxy cleanly. Android emulator → `10.0.2.2`; physical Android → `adb reverse` (removed after);
+  physical iOS refused (LAN mode is editor-only).
+- Reuses vscode-free modules from packages/extension/src by relative import (entry generator, CA, rules core,
+  recordings, assertion core, HAR); anything that needs `vscode` stays out (esbuild bundle must not contain it — a
+  test asserts that). Not published to npm (the owner decides); docs show `node packages/cli/dist/cli.js`.
+
+### 13.10 Open VSX (ops, lead)
+- `package.json` script `publish:ovsx` (`npx ovsx publish flutter-intercept.vsix`, token from `OVSX_PAT`, run by the
+  owner only). Metadata checked for Open VSX (license file, repository, icon, no proposed APIs); `Dart-Code.dart-code`
+  exists there. README "Install" mentions Open VSX (Cursor, Windsurf, VSCodium).

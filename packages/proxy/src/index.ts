@@ -50,6 +50,9 @@ export type {
   SendRequest,
   SourceInfo,
   StackFrame,
+  Timings,
+  ScriptRequest,
+  ScriptResponse,
 } from './types';
 export { NETWORK_PRESETS, NO_PROFILE, presetProfile, describeProfile } from './network';
 export type { NetworkProfile, NetworkPreset, NetworkPresetId } from './network';

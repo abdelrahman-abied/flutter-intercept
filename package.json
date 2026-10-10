@@ -1,7 +1,7 @@
 {
   "name": "flutter-intercept-monorepo",
   "private": true,
-  "workspaces": ["packages/proxy", "packages/webview", "packages/extension"],
+  "workspaces": ["packages/proxy", "packages/webview", "packages/extension", "packages/cli"],
   "scripts": {
     "build": "npm run build -ws --if-present",
     "test": "npm test -ws --if-present"
