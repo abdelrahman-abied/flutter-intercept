@@ -3,7 +3,8 @@ import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Exchange } from '../protocol';
 import { clientGaveUp, findExchange, initiatorLabel, isAgentRule, ruleDisplayName } from '../state';
-import type { Rule } from '../protocol';
+import type { ContractSummary, Rule } from '../protocol';
+import { contractBadgeTitle, contractStatus } from '../contract';
 import { bodyByteLength, formatBytes, formatDuration, isPaused, shortFrameLocation, splitUrl } from '../util';
 import { useExchangeActions } from './actions';
 import { AgentBadge, MenuList, PauseTimer, StateBadge, StatusText } from './bits';
@@ -104,7 +105,7 @@ export function TrafficList({ list, onOpen }: { list: Exchange[]; onOpen: () => 
   for (let i = start; i < end; i++) {
     const ex = list[i];
     rows.push(<Row key={ex.id} ex={ex} selected={ex.id === state.selectedId} gaveUp={clientGaveUp(state, ex)}
-      agentRule={ex.matchedRuleId ? agentRules.get(ex.matchedRuleId) : undefined}
+      agentRule={ex.matchedRuleId ? agentRules.get(ex.matchedRuleId) : undefined} contract={state.contracts[ex.id]}
       onSelect={() => dispatch({ type: 'select', id: ex.id })} onOpen={onOpen}
       onMenu={(x, y) => { dispatch({ type: 'select', id: ex.id }); setMenu({ id: ex.id, x, y }); }} />);
   }
@@ -149,14 +150,15 @@ function RowMenu({ ex, at, onClose }: { ex: Exchange; at: { x: number; y: number
   return <MenuList label={`Actions for ${ex.method} ${ex.url}`} items={actions.menuItems} at={at} onClose={onClose} />;
 }
 
-function Row({ ex, selected, gaveUp, agentRule, onSelect, onOpen, onMenu }: {
-  ex: Exchange; selected: boolean; gaveUp: boolean; agentRule?: Rule; onSelect: () => void; onOpen: () => void;
+function Row({ ex, selected, gaveUp, agentRule, contract, onSelect, onOpen, onMenu }: {
+  ex: Exchange; selected: boolean; gaveUp: boolean; agentRule?: Rule; contract?: ContractSummary; onSelect: () => void; onOpen: () => void;
   onMenu: (x: number, y: number) => void;
 }) {
   const sentBy = initiatorLabel(ex);
   const app = ex.source?.appFrame !== undefined ? ex.source.frames[ex.source.appFrame] : undefined;
   const { host, path } = splitUrl(ex.url);
   const size = bodyByteLength(ex.responseBody);
+  const cs = contractStatus(contract);
   return (
     <div
       id={`ex-${ex.id}`}
@@ -178,6 +180,9 @@ function Row({ ex, selected, gaveUp, agentRule, onSelect, onOpen, onMenu }: {
         {agentRule && <AgentBadge title={`Matched agent rule “${ruleDisplayName(agentRule)}”`} />}
         {sentBy && <span class="badge mini sent-badge" title={sentBy}>{ex.resentFrom ? 'resent' : 'sent'}</span>}
         {ex.simulated && <span class="badge mini sim-badge" title={`Simulated: ${ex.simulated}`}>sim</span>}
+        {(cs === 'error' || cs === 'warning') && (
+          <span class={`badge mini contract-badge cb-${cs}`} title={contractBadgeTitle(contract!)}>model</span>
+        )}
       </span>
     </div>
   );

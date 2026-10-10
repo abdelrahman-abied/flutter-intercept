@@ -119,7 +119,7 @@ input, select, textarea {
 input, select { height: 24px; }
 input::placeholder, textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
 input:focus, select:focus, textarea:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
-input[aria-invalid='true'], textarea.invalid {
+input[aria-invalid='true'], textarea[aria-invalid='true'], textarea.invalid {
   border-color: var(--vscode-inputValidation-errorBorder);
   outline-color: var(--vscode-inputValidation-errorBorder);
 }
@@ -809,3 +809,51 @@ textarea.code-input {
 body.vscode-high-contrast .row.selected,
 body.vscode-high-contrast .rule-item.editing { outline: 1px dashed var(--fi-hc-active); outline-offset: -1px; }
 body.vscode-high-contrast .row:hover { outline: 1px dotted var(--fi-hc-active); outline-offset: -1px; }
+
+/* ------------------------------------------------------------------ v0.4.0: model check, field mutations */
+
+.kind-mutate { background: var(--vscode-charts-green); color: var(--vscode-editor-background); }
+
+/* Row badge: loud for errors, quiet (outlined) for warnings. */
+.contract-badge.cb-error { background: var(--vscode-errorForeground); color: var(--vscode-editor-background); }
+.contract-badge.cb-warning { background: transparent; color: var(--vscode-editorWarning-foreground, var(--fi-warn)); border: 1px solid var(--vscode-editorWarning-foreground, var(--fi-warn)); }
+.contract-badge.cb-ok { background: transparent; color: var(--fi-ok); border: 1px solid var(--fi-ok); }
+
+.contract { margin: 8px 0 2px; padding: 4px 8px; border-left: 3px solid var(--fi-border); font-size: 12px; display: flex; flex-direction: column; gap: 2px; }
+.contract.contract-unchecked { flex-direction: row; align-items: center; flex-wrap: wrap; gap: 6px; }
+.contract.contract-error { border-color: var(--vscode-errorForeground); }
+.contract.contract-warning { border-color: var(--vscode-editorWarning-foreground, var(--fi-warn)); }
+.contract.contract-ok { border-color: var(--fi-ok); }
+.contract-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.contract-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--fi-muted); }
+.contract-model { font-weight: 600; }
+.violations { list-style: none; margin: 2px 0 0; padding: 0; max-height: 220px; overflow: auto; }
+.viol-btn {
+  display: flex; flex-wrap: wrap; gap: 2px 8px; align-items: baseline; width: 100%; padding: 2px 4px; text-align: left;
+  border: 1px solid transparent; background: none; color: inherit; font: inherit; cursor: pointer;
+}
+.viol-btn:hover { background: var(--vscode-list-hoverBackground); }
+.viol-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.viol-sev { font-size: 10px; text-transform: uppercase; font-weight: 600; min-width: 52px; }
+.viol-error .viol-sev { color: var(--vscode-errorForeground); }
+.viol-warning .viol-sev { color: var(--vscode-editorWarning-foreground, var(--fi-warn)); }
+.viol-path { color: var(--vscode-textLink-foreground); }
+.viol-exp { color: var(--fi-muted); }
+
+/* JSON tree: field rows are focusable menu targets; model-check findings are underlined. */
+.json-tree.with-fields:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.j-row[data-path]:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; background: var(--vscode-list-focusBackground, var(--vscode-list-hoverBackground)); }
+.j-mark > .j-key, .j-mark > .j-idx { text-decoration: underline wavy; text-underline-offset: 3px; }
+.j-mark-error > .j-key, .j-mark-error > .j-idx { text-decoration-color: var(--vscode-errorForeground); }
+.j-mark-warning > .j-key, .j-mark-warning > .j-idx { text-decoration-color: var(--vscode-editorWarning-foreground, var(--fi-warn)); }
+.j-hint { margin-left: auto; color: var(--fi-muted); }
+.j-edit { margin: 2px 0 4px 16px; font-family: var(--vscode-font-family); font-size: 12px; }
+.j-edit-line { display: flex; gap: 4px; align-items: flex-start; }
+.j-edit-path { flex: none; padding-top: 3px; color: var(--fi-muted); }
+.j-edit-input { flex: 1; min-width: 80px; resize: vertical; }
+
+.mutate-ops { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+.mo-row { width: 100%; }
+.mo-line { display: flex; gap: 4px; align-items: center; width: 100%; }
+.mo-path { flex: 1 1 45%; min-width: 0; }
+.mo-value { flex: 1 1 30%; min-width: 0; }

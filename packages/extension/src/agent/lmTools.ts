@@ -126,7 +126,34 @@ export function invocationMessage(tool: ToolName, input: unknown): string {
         : `Setting the network profile to ${plain(i.profile)}`;
     case 'resend_request':
       return `Resending request ${plain(i.id)}`;
+    case 'check_contract':
+      return i.id ? `Checking request ${plain(i.id)} against the Dart models` : `Checking ${i.url ? `${m}${plain(i.url)}` : 'recent JSON responses'} against the Dart models`;
+    case 'generate_model':
+      return `Generating Dart models from ${i.id ? `request ${plain(i.id)}` : `${m}${plain(i.url)}`} and its route's samples`;
+    case 'generate_fixture_test':
+      return `Generating a fixture test from ${Array.isArray(i.ids) ? `${i.ids.length} request(s)` : plain(i.url)}`;
+    case 'assert_traffic':
+      return `Checking traffic for ${m}${plain(i.url)}${Number(i.withinMs) > 0 ? ` (waiting up to ${Math.round(Math.min(Number(i.withinMs), 120_000) / 1000)} s)` : ''}`;
+    case 'add_mutation':
+      return `Adding response mutation for ${m}${plain(i.url)}`;
   }
+}
+
+/** "null `$.a`, set `$.b`" for a mutation's ops. */
+function opsText(ops: unknown): string {
+  if (!Array.isArray(ops) || !ops.length) return 'no changes';
+  const parts = ops.slice(0, 5).map((o) => {
+    const op = obj(o);
+    const p = code(op.path ?? '?');
+    if (op.op === 'null') return `set ${p} to **null**`;
+    if (op.op === 'delete') return `**remove** ${p}`;
+    if (op.op === 'set') {
+      const v = typeof op.valueJson === 'string' ? op.valueJson : (JSON.stringify(op.value) ?? 'undefined');
+      return `set ${p} to ${code(v.length > 60 ? `${v.slice(0, 60)}…` : v)}`;
+    }
+    return code(op.op ?? '?');
+  });
+  return parts.join(', ') + (ops.length > 5 ? ` and ${ops.length - 5} more` : '');
 }
 
 /** Human text for a simulate_network profile / fault. */
@@ -255,6 +282,13 @@ export function confirmationText(tool: ToolName, input: unknown, ruleName?: stri
         message: `Send **${method}** ${code(target)} (recorded request ${code(i.id)}) again to the real server, with the original request's credentials.${extra}${note}`,
       };
     }
+    case 'add_mutation':
+      return {
+        title: 'Add a response mutation rule',
+        message:
+          `For ${target(i)}: forward to the real server, then ${opsText(i.ops)} in the JSON response before the app gets it${named}${spendText(i)}.\n\n` +
+          'Inserted as the first rule.',
+      };
     default:
       return { title: 'Flutter Intercept', message: invocationMessage(tool, input) };
   }

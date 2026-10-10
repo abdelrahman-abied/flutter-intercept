@@ -29,6 +29,13 @@ describe('tool schemas', () => {
     expect(parseToolInput('simulate_network', { profile: 'slow-3g' })).toEqual({ profile: 'slow-3g' });
     expect(parseToolInput('resend_request', { id: 'x' })).toEqual({ id: 'x' });
     expect(parseToolInput('add_block', { url: '*', times: 2, ttlMs: 5000 })).toMatchObject({ times: 2, ttlMs: 5000 });
+    // CONTRACTS §10.6
+    expect(parseToolInput('check_contract', {})).toEqual({ limit: 20 });
+    expect(parseToolInput('generate_model', { id: 'x' })).toEqual({ id: 'x' });
+    expect(parseToolInput('generate_fixture_test', { ids: ['x'] })).toEqual({ ids: ['x'] });
+    expect(parseToolInput('assert_traffic', { url: '*', expect: {} })).toEqual({ url: '*', withinMs: 0, expect: {} });
+    expect(parseToolInput('assert_traffic', { url: '*', expect: { json: [{ path: '$.a', equals: null }] } }).expect.json).toEqual([{ path: '$.a', equals: null }]);
+    expect(parseToolInput('add_mutation', { url: '*', ops: [{ path: '$.a', op: 'set', value: { b: 1 } }] })).toEqual({ url: '*', ops: [{ path: '$.a', op: 'set', value: { b: 1 } }] });
   });
 
   it.each<[Parameters<typeof parseToolInput>[0], unknown, RegExp]>([
@@ -60,6 +67,21 @@ describe('tool schemas', () => {
     ['resend_request', { id: 'x', edit: { status: 200 } }, /edit/],
     ['add_mock', { url: '*', body: 'x', times: 1001 }, /times/],
     ['add_breakpoint', { url: '*', ttlMs: 86_400_001 }, /ttlMs/],
+    ['check_contract', { limit: 51 }, /limit/],
+    ['check_contract', { model: 'not a class' }, /model/],
+    ['generate_model', { style: 'built_value' }, /style/],
+    ['generate_fixture_test', { ids: [] }, /ids/],
+    ['generate_fixture_test', { url: '*', name: 'Get User' }, /name/],
+    ['assert_traffic', { url: '*' }, /expect/],
+    ['assert_traffic', { url: '*', withinMs: 120_001, expect: {} }, /withinMs/],
+    ['assert_traffic', { url: '*', expect: { count: { min: -1 } } }, /min/],
+    ['assert_traffic', { url: '*', expect: { order: ['*'] } }, /order/],
+    ['assert_traffic', { url: '*', expect: { json: [{ path: '$.a', type: 'date' }] } }, /type/],
+    ['assert_traffic', { url: '*', expect: { bogus: 1 } }, /bogus|Unrecognized/i],
+    ['add_mutation', { url: '*', ops: [] }, /ops/],
+    ['add_mutation', { url: '*', ops: [{ path: '$.a', op: 'rename' }] }, /op/],
+    ['add_mutation', { url: '*', ops: [{ path: '', op: 'null' }] }, /path/],
+    ['add_mutation', { url: '*', ops: Array.from({ length: 21 }, () => ({ path: '$.a', op: 'null' })) }, /ops/],
   ])('%s rejects %j', (tool, input, re) => {
     expect(() => parseToolInput(tool, input)).toThrow(re);
   });

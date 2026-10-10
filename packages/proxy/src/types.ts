@@ -75,7 +75,26 @@ export type RuleAction =
   | { kind: 'breakpoint'; phase: 'request' | 'response' | 'both' }
   // CONTRACTS §9.2. throttle passes through to the real server, slowed; dropRate 0–1 = share reset instead.
   | { kind: 'throttle'; latencyMs?: number; kbps?: number; dropRate?: number }
-  | { kind: 'fault'; fault: FaultKind };
+  | { kind: 'fault'; fault: FaultKind }
+  // CONTRACTS §10.2: the real response, with JSON fields changed (reproduce "Null is not a subtype…").
+  | { kind: 'mutate'; ops: MutateOp[] };
+
+/**
+ * One change to a JSON response body. `path` is the JSON path subset of `@flutter-intercept/proxy/jsonpath`
+ * (`$.user.avatar_url`, `$.items[0].id`, `$.items[*].price`, `$['odd key']`). `set` = replace with `value`
+ * (any JSON, e.g. `"42"` to retype a number as a string); `null` = set to null; `delete` = remove the key /
+ * array element.
+ */
+export interface MutateOp {
+  path: string;
+  op: 'null' | 'delete' | 'set';
+  value?: unknown;
+  /**
+   * For `set`: the new value as JSON text, written into the body byte-exact (`1.0` stays a double for Dart,
+   * ints past 2^53 stay exact). Wins over `value` when both are present; must parse as JSON.
+   */
+  valueJson?: string;
+}
 
 export type FaultKind = 'reset' | 'timeout' | 'truncate' | 'dns';
 

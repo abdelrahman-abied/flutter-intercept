@@ -180,3 +180,120 @@ export async function decodeForDisplay(
   if (!decoded) return bufferToBody(raw, cap, !rawComplete);
   return bufferToBody(decoded.buf, cap, !rawComplete || decoded.overflow);
 }
+
+// ---------- strict, bounded full decoding (mutate rules) ----------
+
+type StrictDecoder = () => import('stream').Transform;
+
+function strictDecoder(enc: string): StrictDecoder | undefined {
+  switch (enc) {
+    case 'gzip':
+    case 'x-gzip':
+      return () => zlib.createGunzip();
+    case 'deflate':
+      return () => zlib.createInflate();
+    case 'br':
+      return () => zlib.createBrotliDecompress();
+    case 'zstd': {
+      const make = (zlib as unknown as { createZstdDecompress?: () => import('stream').Transform }).createZstdDecompress;
+      return make ? () => make() : undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
+function inflateAll(raw: Buffer, make: StrictDecoder, limit: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const z = make();
+    const out: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    const done = (e?: Error) => {
+      if (settled) return;
+      settled = true;
+      z.removeAllListeners('data');
+      z.destroy();
+      if (e) reject(e);
+      else resolve(Buffer.concat(out, size));
+    };
+    z.on('data', (c: Buffer) => {
+      out.push(c);
+      size += c.length;
+      if (size > limit) done(Object.assign(new Error(`larger than ${Math.round(limit / 1024 / 1024)} MB decoded`), { code: 'E_FI_TOO_LARGE' }));
+    });
+    z.on('end', () => done());
+    z.on('error', (e: Error) => done(e));
+    z.end(raw);
+  });
+}
+
+/**
+ * Decode a COMPLETE body per Content-Encoding (stacked encodings undone in reverse order). Unlike
+ * decodeForDisplay it fails on corrupt or truncated data and on output past `limit` (error code
+ * 'E_FI_TOO_LARGE'), and on an unsupported encoding. `deflate` also accepts raw deflate.
+ */
+export async function decodeStrict(raw: Buffer, contentEncoding: string | undefined, limit: number): Promise<Buffer> {
+  let buf = raw;
+  for (const enc of encodingList(contentEncoding).reverse()) {
+    const make = strictDecoder(enc);
+    if (!make) throw new Error(`unsupported content-encoding "${enc}"`);
+    try {
+      buf = await inflateAll(buf, make, limit);
+    } catch (e) {
+      if (enc !== 'deflate' || (e as { code?: string }).code === 'E_FI_TOO_LARGE') throw e;
+      buf = await inflateAll(buf, () => zlib.createInflateRaw(), limit);
+    }
+  }
+  if (buf.length > limit) {
+    throw Object.assign(new Error(`larger than ${Math.round(limit / 1024 / 1024)} MB`), { code: 'E_FI_TOO_LARGE' });
+  }
+  return buf;
+}
+
+// ---------- async re-encoding (mutate rules, REVIEW-4 #4) ----------
+
+type AsyncCodec = (buf: Buffer, cb: (e: Error | null, out: Buffer) => void) => void;
+
+function asyncEncoder(enc: string): AsyncCodec | undefined {
+  switch (enc) {
+    case 'gzip':
+    case 'x-gzip':
+      return (b, cb) => zlib.gzip(b, cb);
+    case 'deflate':
+      return (b, cb) => zlib.deflate(b, cb);
+    case 'br':
+      // Quality 4, not the default 11: 11 took 17 s for 18 MB (REVIEW-4 #4); 4 is close in size, ~100× faster.
+      return (b, cb) => zlib.brotliCompress(b, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4, [zlib.constants.BROTLI_PARAM_SIZE_HINT]: b.length } }, cb);
+    case 'zstd': {
+      const z = (zlib as unknown as { zstdCompress?: (b: Buffer, cb: (e: Error | null, out: Buffer) => void) => void }).zstdCompress;
+      return z ? (b, cb) => z(b, cb) : undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Like frameBody, but compresses on libuv's thread pool (zlib async APIs) instead of the event loop,
+ * brotli at quality 4. Unsupported encodings: the header is dropped and identity is sent.
+ */
+export async function frameBodyAsync(decoded: Buffer, headers: HeaderBag): Promise<Buffer> {
+  let out: Buffer | undefined = decoded;
+  for (const enc of encodingList(getHeader(headers, 'content-encoding'))) {
+    const codec = asyncEncoder(enc);
+    if (!codec) {
+      out = undefined;
+      break;
+    }
+    const input: Buffer = out!;
+    out = await new Promise<Buffer>((resolve, reject) => codec(input, (e, b) => (e ? reject(e) : resolve(b))));
+  }
+  if (out === undefined) {
+    deleteHeader(headers, 'content-encoding');
+    out = decoded;
+  }
+  deleteHeader(headers, 'transfer-encoding');
+  setHeader(headers, 'content-length', String(out.length));
+  return out;
+}

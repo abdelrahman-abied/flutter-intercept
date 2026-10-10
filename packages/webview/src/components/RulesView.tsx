@@ -4,7 +4,7 @@ import type { Rule } from '../protocol';
 import type { FaultKind } from '@flutter-intercept/proxy/types';
 import {
   countMatches, deleteRule, describeAction, FAULT_LABEL, formToRule, isAgentRule, moveRule, NEW_RULE, ruleBudget, ruleDisplayName,
-  ruleHits, ruleLabel, ruleStats, ruleToForm, toggleRule, upsertRule, validateRuleForm, type RuleForm, type ThrottleFields,
+  ruleHits, ruleLabel, ruleStats, ruleToForm, toggleRule, upsertRule, validateRuleForm, type MutateRow, type RuleForm, type ThrottleFields,
 } from '../state';
 import { formatTime } from '../util';
 import { AgentBadge, Button, useNow } from './bits';
@@ -210,6 +210,7 @@ export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r
           {radio('kind', 'breakpoint', 'Breakpoint')}
           {radio('kind', 'throttle', 'Throttle')}
           {radio('kind', 'fault', 'Fault')}
+          {radio('kind', 'mutate', 'Mutate JSON')}
         </div>
 
         {form.kind === 'mock' && (
@@ -288,6 +289,19 @@ export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r
         )}
       </fieldset>
 
+      {form.kind === 'mutate' && (
+        <fieldset>
+          <legend>Changes to the response</legend>
+          <div class="hint">
+            Forwards to the real server, then changes the JSON response before the app gets it — e.g. null a field to
+            reproduce “Null is not a subtype of String”. Paths: <code>$.user.avatar_url</code>, <code>$.items[0].id</code>,{' '}
+            <code>$.items[*].price</code>, <code>$['odd key']</code>. A non-JSON response is passed through unchanged.
+          </div>
+          <MutateOpsEditor rows={form.mutateOps} errors={v.opErrors} onChange={(mutateOps) => set({ mutateOps })} />
+          {v.errors.mutate && <div class="msg error">{v.errors.mutate}</div>}
+        </fieldset>
+      )}
+
       <fieldset>
         <legend>Lifetime</legend>
         <div class="field-row">
@@ -333,5 +347,44 @@ export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r
         <Button onClick={onCancel}>Cancel</Button>
       </div>
     </form>
+  );
+}
+
+const OP_LABEL: Record<MutateRow['op'], string> = { null: 'make null', delete: 'remove', set: 'set to' };
+
+/** The `mutate` op list: path, op and (for set) a JSON value per row. */
+export function MutateOpsEditor({ rows, errors, onChange }: {
+  rows: MutateRow[]; errors?: (string | undefined)[]; onChange: (rows: MutateRow[]) => void;
+}) {
+  const update = (i: number, patch: Partial<MutateRow>) => onChange(rows.map((r, k) => (k === i ? { ...r, ...patch } : r)));
+  return (
+    <div class="mutate-ops">
+      {rows.map((r, i) => {
+        const err = errors?.[i];
+        return (
+          <div class="mo-row" key={i}>
+            <div class="mo-line">
+              <input class="mo-path mono" aria-label={`Path of change ${i + 1}`} placeholder="$.user.avatar_url" spellcheck={false}
+                value={r.path} aria-invalid={!!err && err.startsWith('Path')}
+                onInput={(e) => update(i, { path: (e.target as HTMLInputElement).value })} />
+              <select aria-label={`Change ${i + 1}`} value={r.op}
+                onChange={(e) => update(i, { op: (e.target as HTMLSelectElement).value as MutateRow['op'] })}>
+                {(Object.keys(OP_LABEL) as MutateRow['op'][]).map((op) => <option key={op} value={op}>{OP_LABEL[op]}</option>)}
+              </select>
+              {r.op === 'set' && (
+                <input class="mo-value mono" aria-label={`JSON value of change ${i + 1}`} placeholder='"42"' spellcheck={false}
+                  value={r.value} aria-invalid={!!err && err.startsWith('Value')}
+                  onInput={(e) => update(i, { value: (e.target as HTMLInputElement).value })} />
+              )}
+              <Button kind="icon" title={`Remove change ${i + 1}`} disabled={rows.length === 1}
+                onClick={() => onChange(rows.filter((_, k) => k !== i))}>
+                <Icon name="close" />
+              </Button>
+            </div>
+          </div>
+        );
+      })}
+      <button type="button" class="link" onClick={() => onChange([...rows, { path: '', op: 'null', value: '' }])}>+ Add change</button>
+    </div>
   );
 }

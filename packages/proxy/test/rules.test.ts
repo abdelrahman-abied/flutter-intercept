@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { compileMatcher, matches, ruleFromExchange, RuleFromExchangeError } from '../src';
-import { compileRules, findRule, isInvalidMatcher } from '../src/rules';
+import { compileRules, findRule, isInvalidMatcher, isSafeRegexSource, simplifyRegexSource } from '../src/rules';
 import type { Exchange, Rule } from '../src';
 
 describe('matcher', () => {
@@ -35,6 +35,64 @@ describe('matcher', () => {
     expect(compileMatcher({ url: '/(/' })('GET', 'https://a/(')).toBe(false);
     expect(isInvalidMatcher({ url: '/(/' })).toBe(true);
     expect(isInvalidMatcher({ url: '/ok/' })).toBe(false);
+  });
+
+  it('REVIEW-4 #2: globs match in linear time (the reviewer\'s *a*a*a*a*b on 218 chars, and 16 stars on 8 KB)', () => {
+    const url = 'a'.repeat(218);
+    const m = compileMatcher({ url: '*a*a*a*a*b' });
+    let t0 = performance.now();
+    expect(m('GET', url)).toBe(false);
+    expect(performance.now() - t0).toBeLessThan(5); // was 22.9 s
+    const long = `https://x.io/${'a/'.repeat(4000)}`;
+    t0 = performance.now();
+    expect(compileMatcher({ url: '*/'.repeat(16) + '*x' })('GET', long)).toBe(false);
+    expect(performance.now() - t0).toBeLessThan(5);
+    // semantics unchanged
+    const g = (p: string, u: string) => compileMatcher({ url: p })('GET', u);
+    expect(g('*a*a*a*a*b', 'xaaaab')).toBe(true);
+    expect(g('a*', 'a')).toBe(true);
+    expect(g('*a', 'a')).toBe(true);
+    expect(g('a*a', 'a')).toBe(false); // first and last literal can't share the char
+    expect(g('a*a', 'aa')).toBe(true);
+    expect(g('**', 'anything')).toBe(true);
+    expect(g('https://h/*/x*', 'https://h/a/b/x?q')).toBe(true);
+    expect(g('https://h/*/x*', 'https://h/x')).toBe(false);
+    expect(g('exact', 'exact')).toBe(true);
+    expect(g('exact', 'exactly')).toBe(false);
+    expect(g('*\n*', 'a\nb')).toBe(true);
+  });
+
+  it('REVIEW-4 #2: unsafe regexes are refused (never match, reported as invalid); safe ones keep working', () => {
+    for (const src of ['(.+)+Z', '(a*)*', '(a|a)*', '(a+){2}', '(foo|bar)+', '(a)\\1', '(?<n>a)\\k<n>', 'a.*.*x', '\\w+\\d*', 'a.*b.*c', '[^/]+x[^/]+', '\\d+a\\d+b\\d+', 'x'.repeat(300)]) {
+      expect(isSafeRegexSource(src), src).toBe(false);
+      expect(isInvalidMatcher({ url: `/${src}/` }), src).toBe(true);
+    }
+    const t0 = performance.now();
+    expect(compileMatcher({ url: '/(.+)+Z/' })('GET', 'a'.repeat(40))).toBe(false);
+    expect(performance.now() - t0).toBeLessThan(5);
+    for (const src of ['\\/users\\/\\d+$', 'v\\d+\\/users\\/\\d+', '(\\d+)?x', '(foo|bar)', '(ab){2,}', '[a-z]+\\/[0-9]+', '^https:\\/\\/api\\.x\\.com\\/.*', 'x{', '(?:a|b)c']) {
+      expect(isSafeRegexSource(src), src).toBe(true);
+      expect(isInvalidMatcher({ url: `/${src}/` }), src).toBe(false);
+    }
+    // leading / trailing .* are dropped (same result for test()), so the usual way of writing it is accepted
+    expect(simplifyRegexSource('.*users.*')).toBe('users');
+    expect(simplifyRegexSource('.*a.*b')).toBe('a.*b');
+    expect(simplifyRegexSource('\\.*')).toBe('\\.*'); // escaped dot stays
+    expect(simplifyRegexSource('^.*x.*$')).toBe('^.*x.*$');
+    expect(isInvalidMatcher({ url: '/.*users.*/' })).toBe(false);
+    expect(compileMatcher({ url: '/.*users.*/' })('GET', 'https://a/users/1')).toBe(true);
+    expect(compileMatcher({ url: '/.*users.*/' })('GET', 'https://a/orders')).toBe(false);
+  });
+
+  it('REVIEW-4 #11: patterns are compiled once (cached by pattern)', () => {
+    const p = `/cache-${Math.random()}/`;
+    const spy = vi.spyOn(globalThis, 'RegExp');
+    try {
+      for (let i = 0; i < 50; i++) matches({ url: p }, 'GET', 'https://a/');
+      expect(spy.mock.calls.filter((c) => String(c[0]).startsWith('cache-')).length).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('method is case-insensitive; undefined = any', () => {

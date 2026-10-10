@@ -23,11 +23,20 @@
  * deadline, a client that gives up while paused → 'error' (late resume ignored), invalid edit → 'error'
  * message and the exchange stays paused, clear keeps in-flight exchanges and is followed by a snapshot,
  * createRuleFromExchange uses the proxy's ruleFromExchange and inserts the rule first.
+ *
+ * v0.4.0 (CONTRACTS §10): completed JSON exchanges get a fake `contract` result from a tiny model table (Product,
+ * ProductPage, CartSummary, User; products sometimes come back with `image: null` → an error) — also re-sent after
+ * every snapshot. `mutate` rules change the JSON response like the proxy (and set `simulated`); `mutateField`
+ * inserts such a rule first; `pickModel` cycles the route through the models (then "don't check") and re-checks;
+ * `openViolation` / `generateModel` / `generateFixture` only log (the webview shows its own notice).
  */
 import type {
-  Body, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit, Rule, SendDraft, Status, ViewMsg,
+  Body, ContractSummary, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit, Rule, SendDraft, Status, ViewMsg,
 } from '../src/protocol';
-import type { SourceInfo, StackFrame } from '@flutter-intercept/proxy/types';
+import type { MutateOp, SourceInfo, StackFrame } from '@flutter-intercept/proxy/types';
+import { applyOps } from '@flutter-intercept/proxy/jsonpath';
+import { parsePath, formatPath } from '../src/jsonpath';
+import { describeMutateOps } from '../src/state';
 import { matches, ruleFromExchange } from '@flutter-intercept/proxy/rules';
 import { describeProfile, presetProfile, type NetworkPresetId } from '@flutter-intercept/proxy/network';
 
@@ -78,6 +87,11 @@ let rules: Rule[] = [
     action: { kind: 'throttle', latencyMs: 1200, kbps: 256 },
   },
   {
+    id: 'rule_mutate_image', enabled: true, name: 'Product image → null (first 4)',
+    match: { method: 'GET', url: 'https://api.shop.example.com/v1/products/*' },
+    action: { kind: 'mutate', ops: [{ path: '$.image', op: 'null' }] }, times: 4,
+  },
+  {
     id: 'rule_fault_reco', enabled: true, name: 'Recommendations: DNS failure (first 3)',
     match: { url: 'https://api.shop.example.com/v1/recommendations*' },
     action: { kind: 'fault', fault: 'dns' }, times: 3, expiresAt: Date.now() + 10 * 60_000,
@@ -116,6 +130,7 @@ function onViewMsg(msg: ViewMsg) {
   switch (msg.type) {
     case 'ready':
       send({ type: 'snapshot', exchanges, rules, status });
+      sendContracts(exchanges);
       break;
     case 'resume': {
       const p = paused.get(msg.id);
@@ -146,6 +161,7 @@ function onViewMsg(msg: ViewMsg) {
       exchanges = exchanges.filter((e) => e.state === 'pending' || paused.has(e.id));
       send({ type: 'cleared' });
       send({ type: 'snapshot', exchanges, rules, status });
+      sendContracts(exchanges);
       break;
     case 'setInterceptEnabled':
       status = { ...status, interceptEnabled: msg.enabled };
@@ -181,6 +197,39 @@ function onViewMsg(msg: ViewMsg) {
       navigator.clipboard?.writeText(`// ${msg.format} (dev harness: always cURL)\n${curl}`).catch(() => {});
       break;
     }
+    case 'mutateField': {
+      const ex = find(msg.id);
+      if (!ex) { send({ type: 'error', message: 'No such exchange' }); break; }
+      try { parsePath(msg.path); } catch (e) { send({ type: 'error', message: `Invalid path ${msg.path}: ${(e as Error).message}` }); break; }
+      const base = ruleFromExchange(ex, 'breakpoint', `rule_${Date.now().toString(36)}`);
+      const op: MutateOp = msg.op === 'set'
+        ? { path: msg.path, op: 'set', value: msg.value, ...(msg.valueJson !== undefined ? { valueJson: msg.valueJson } : {}) }
+        : { path: msg.path, op: msg.op };
+      rules = [{ ...base, name: describeMutateOps([op]), action: { kind: 'mutate', ops: [op] } }, ...rules];
+      send({ type: 'rules', rules });
+      break;
+    }
+    case 'pickModel': {
+      // Stands in for the host's QuickPick: next model in the table, then "Don't check this route", then back.
+      const ex = find(msg.id);
+      if (!ex) break;
+      const route = routeKey(ex);
+      const order = [...Object.keys(TOP_MODELS), null];
+      const cur = userChoice.has(route) ? order.indexOf(userChoice.get(route)!) : -1;
+      userChoice.set(route, order[(cur + 1) % order.length]);
+      console.info(`[fake-host] ${route} → ${userChoice.get(route) ?? "don't check"}`);
+      sendContracts(exchanges.filter((e) => routeKey(e) === route));
+      break;
+    }
+    case 'openViolation': {
+      const v = contractOf(find(msg.id))?.violations[msg.index];
+      console.info(v ? `[fake-host] would open the model field ${v.field} (${v.path})` : '[fake-host] no such violation');
+      break;
+    }
+    case 'generateModel':
+    case 'generateFixture':
+      console.info(`[fake-host] would open untitled editors: ${msg.type} for ${msg.id}`);
+      break;
     case 'setNetworkProfile':
       status = { ...status, networkProfile: msg.profile.kind === 'none' ? undefined : msg.profile };
       if (!status.networkProfile) delete status.networkProfile;
@@ -233,6 +282,7 @@ function update(ex: Exchange, patch: Partial<Exchange>): Exchange {
   for (const k of Object.keys(next) as (keyof Exchange)[]) if (next[k] === undefined) delete next[k];
   exchanges = exchanges.map((e) => (e.id === ex.id ? next : e));
   send({ type: 'exchange', exchange: next });
+  if (next.state !== 'pending' && !next.state.startsWith('paused')) setTimeout(() => sendContracts([next]), 30);
   return next;
 }
 
@@ -334,7 +384,8 @@ const JSON_RES = { 'content-type': 'application/json; charset=utf-8', 'content-e
 const product = (id: number) => ({
   id, name: pick(['Desk lamp', 'Espresso cup', 'Wool socks', 'USB-C cable', 'Notebook', 'Backpack']),
   price: { amount: rnd(199, 9999) / 100, currency: 'EUR' }, inStock: random() > 0.2,
-  tags: ['home', 'sale'].slice(0, rnd(0, 2)), rating: Math.round(random() * 50) / 10, image: `https://cdn.shop.example.com/img/${id}.png`,
+  tags: ['home', 'sale'].slice(0, rnd(0, 2)), rating: Math.round(random() * 50) / 10,
+  image: random() < 0.015 ? null : `https://cdn.shop.example.com/img/${id}.png`, // the backend bug the model check catches
 });
 
 const TEMPLATES: Template[] = [
@@ -417,7 +468,7 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
   const a = rule?.action;
 
   // Network profile (global) + throttle rule: what would reach the network is slowed or failed.
-  const reachesNetwork = !a || a.kind === 'breakpoint' || a.kind === 'throttle';
+  const reachesNetwork = !a || a.kind === 'breakpoint' || a.kind === 'throttle' || a.kind === 'mutate';
   const profile: NetworkProfile = status.networkProfile ?? { kind: 'none' };
   let latency = rnd(...t.latency);
   const simulated: string[] = [];
@@ -449,10 +500,17 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
       update(cur, { state: 'error', error: t.error, durationMs: latency });
       return;
     }
-    const body = t.resBody?.();
+    let body = t.resBody?.();
+    const resp: Partial<Exchange> = { status: t.status, responseHeaders: t.resHeaders ?? {} };
+    if (a?.kind === 'mutate') {
+      const m = mutateBody(body, a.ops);
+      body = m.body;
+      if (m.error) resp.error = m.error;
+      else resp.simulated = [ex.simulated, `Mutated: ${describeMutateOps(a.ops)}`].filter(Boolean).join(' + ');
+    }
+    resp.responseBody = body;
     const bytes = body ? (body.encoding === 'base64' ? body.text.length * 0.75 : body.text.length) : 0;
     const transfer = kbps ? Math.round((bytes * 8) / kbps) : 0;
-    const resp: Partial<Exchange> = { status: t.status, responseHeaders: t.resHeaders ?? {}, responseBody: body };
     if (rule?.action.kind === 'breakpoint' && rule.action.phase !== 'request') {
       pause(cur, 'response', resp, (edit) => {
         const p = find(id) ?? cur;
@@ -623,3 +681,107 @@ function wire() {
 }
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire);
 else wire();
+
+// ---------------------------------------------------------------- contract check + mutate (CONTRACTS §10)
+
+/** Applies mutate ops to a JSON body like the proxy; a non-JSON body passes unchanged with a note. */
+function mutateBody(body: Body | undefined, ops: MutateOp[]): { body?: Body; error?: string } {
+  if (!body || body.encoding !== 'utf8') return { body, error: 'Mutate rule: the response is not JSON — forwarded unchanged' };
+  let root: unknown;
+  try { root = JSON.parse(body.text); } catch { return { body, error: 'Mutate rule: the response is not valid JSON — forwarded unchanged' }; }
+  // Dev only: valueJson is applied through JSON.parse (the real proxy splices the text byte-exact).
+  const plain = ops.map((o) => (o.valueJson !== undefined ? { path: o.path, op: o.op, value: JSON.parse(o.valueJson) } : o));
+  return { body: { text: JSON.stringify(applyOps(root, plain).value), encoding: 'utf8' } };
+}
+
+type WireType = 'int' | 'double' | 'String' | 'bool' | { model: string } | { list: WireType } | { enumOf: string[] };
+interface WireField { key: string; field: string; type: WireType; nullable?: boolean }
+const f = (key: string, type: WireType, nullable = false, field = key): WireField => ({ key, field, type, nullable });
+const MODELS: Record<string, WireField[]> = {
+  Product: [f('id', 'int'), f('name', 'String'), f('price', { model: 'Price' }), f('inStock', 'bool'), f('image', 'String'),
+    f('rating', 'double'), f('tags', { list: 'String' }), f('description', 'String', true)],
+  Price: [f('amount', 'double'), f('currency', 'String')],
+  ProductPage: [f('page', 'int'), f('total', 'int'), f('items', { list: { model: 'Product' } })],
+  CartSummary: [f('cartId', 'String', false, 'id'), f('items', 'int', false, 'itemCount'), f('total', { model: 'Price' })],
+  User: [f('id', 'int'), f('name', 'String'), f('email', 'String'), f('roles', { list: 'String' }), f('plan', { enumOf: ['free', 'pro'] }),
+    f('address', { model: 'Address' }, true)],
+  Address: [f('city', 'String'), f('zip', 'String', true)],
+};
+/** Models a route can be mapped to (the QuickPick's list). */
+const TOP_MODELS: Record<string, true> = { Product: true, ProductPage: true, CartSummary: true, User: true };
+const API: { method: string; path: RegExp; model: string; via: ContractSummary['via'] }[] = [
+  { method: 'GET', path: /^\/v1\/products\/\d+$/, model: 'Product', via: 'retrofit' },
+  { method: 'GET', path: /^\/v1\/products$/, model: 'ProductPage', via: 'retrofit' },
+  { method: 'POST', path: /^\/v1\/cart\/items$/, model: 'CartSummary', via: 'source' },
+  { method: 'GET', path: /^\/v1\/me$/, model: 'User', via: 'retrofit' },
+];
+/** "GET /v1/products/{id}" → model name, or null = don't check (the host keeps this in workspaceState). */
+const userChoice = new Map<string, string | null>();
+const contracts = new Map<string, ContractSummary>();
+
+function pathOf(e: Exchange): string { try { return new URL(e.url).pathname; } catch { return e.url; } }
+function routeKey(e: Exchange): string { return `${e.method} ${pathOf(e).replace(/\/\d+(?=\/|$)/g, '/{id}')}`; }
+const typeName = (t: WireType): string =>
+  typeof t === 'string' ? t : 'model' in t ? t.model : 'list' in t ? `List<${typeName(t.list)}>` : 'enum';
+const actualName = (v: unknown): string =>
+  v === undefined ? 'missing' : v === null ? 'null' : Array.isArray(v) ? 'List' : typeof v === 'number' ? (Number.isInteger(v) ? 'int' : 'double')
+    : typeof v === 'string' ? 'String' : typeof v === 'boolean' ? 'bool' : 'Map';
+
+function checkValue(v: unknown, t: WireType, path: string, field: string, nullable: boolean, out: ContractSummary['violations']) {
+  if (out.length >= 50) return;
+  const bad = (message: string, severity: 'error' | 'warning' = 'error') =>
+    out.push({ path, field, expected: `${typeName(t)}${nullable ? '?' : ''}`, actual: actualName(v), severity, message });
+  if (v === undefined || v === null) {
+    if (!nullable) bad(`${v === undefined ? 'Key is missing' : 'Value is null'} → Null is not a subtype of ${typeName(t)}`);
+    return;
+  }
+  if (t === 'int') { if (typeof v !== 'number' || !Number.isInteger(v)) bad(`${actualName(v)} is not a subtype of int`); return; }
+  if (t === 'double') { if (typeof v !== 'number') bad(`${actualName(v)} is not a subtype of num`); return; }
+  if (t === 'String') { if (typeof v !== 'string') bad(`${actualName(v)} is not a subtype of String`); return; }
+  if (t === 'bool') { if (typeof v !== 'boolean') bad(`${actualName(v)} is not a subtype of bool`); return; }
+  if ('enumOf' in t) {
+    if (typeof v !== 'string') bad(`${actualName(v)} is not a subtype of String`);
+    else if (!t.enumOf.includes(v)) bad(`"${v}" is not one of ${t.enumOf.join(', ')} — decoded as unknownEnumValue`, 'warning');
+    return;
+  }
+  if ('list' in t) {
+    if (!Array.isArray(v)) { bad(`${actualName(v)} is not a subtype of List<dynamic>`); return; }
+    v.forEach((item, i) => checkValue(item, t.list, formatPath([...parsePath(path), { index: i }]), field, false, out));
+    return;
+  }
+  if (typeof v !== 'object' || Array.isArray(v)) { bad(`${actualName(v)} is not a subtype of Map<String, dynamic>`); return; }
+  for (const fl of MODELS[t.model] ?? []) {
+    checkValue((v as Record<string, unknown>)[fl.key], fl.type, formatPath([...parsePath(path), { key: fl.key }]), fl.field, !!fl.nullable, out);
+  }
+}
+
+function checkExchange(e: Exchange): ContractSummary | undefined {
+  const ct = String(e.responseHeaders?.['content-type'] ?? '');
+  if (e.status === undefined || !/json/.test(ct) || e.responseBody?.encoding !== 'utf8') return undefined;
+  const route = routeKey(e);
+  const chosen = userChoice.get(route);
+  if (chosen === null) return { id: e.id, checked: false, via: 'user', violations: [], reason: `You chose not to check ${route}.` };
+  const api = API.find((x) => x.method === e.method && x.path.test(pathOf(e)));
+  const model = chosen ?? api?.model;
+  const via: ContractSummary['via'] = chosen ? 'user' : api?.via ?? 'none';
+  if (!model) return { id: e.id, checked: false, via: 'none', violations: [], reason: `No Retrofit or Chopper method matches ${route}.` };
+  if (e.status >= 400) return { id: e.id, checked: false, model, via, violations: [], reason: `Error responses (${e.status}) aren't checked against ${model}.` };
+  let json: unknown;
+  try { json = JSON.parse(e.responseBody.text); } catch { return { id: e.id, checked: false, model, via, violations: [], reason: 'The body is not valid JSON.' }; }
+  const violations: ContractSummary['violations'] = [];
+  checkValue(json, { model }, '$', model, false, violations);
+  return { id: e.id, checked: true, model, via, violations };
+}
+
+function contractOf(e: Exchange | undefined): ContractSummary | undefined { return e && contracts.get(e.id); }
+
+function sendContracts(list: Exchange[]) {
+  const results: ContractSummary[] = [];
+  for (const e of list) {
+    const r = checkExchange(e);
+    if (!r) continue;
+    contracts.set(e.id, r);
+    results.push(r);
+  }
+  if (results.length) send({ type: 'contract', results });
+}

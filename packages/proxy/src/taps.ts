@@ -16,7 +16,7 @@ import { ResponseShaper, type Shaping } from './shaper';
  *    When the flow sets `shaping` (throttle / network profile / truncate fault), the response bytes go
  *    through a ResponseShaper (src/shaper.ts) on their way to the app, and only delivered bytes are kept.
  * 2. buffer-utils#streamToBuffer — mockttp calls it WITHOUT a size limit only to buffer an upstream
- *    response for beforeResponse (our response breakpoints). We cap that at
+ *    response for beforeResponse (our response breakpoints and mutate rules). We cap that at
  *    RESPONSE_PAUSE_LIMIT_BYTES: above it the upstream is destroyed and the app gets a 502 that says
  *    why, instead of the extension host buffering an arbitrarily large body.
  */
@@ -215,8 +215,8 @@ function limitedStreamToBuffer(input: stream.Readable, limit: number): Promise<B
         const mb = Math.round(limit / 1024 / 1024);
         const e = Object.assign(
           new Error(
-            `Flutter Intercept: the response is larger than ${mb} MB, too large to hold at a response breakpoint. ` +
-              'It was failed instead of buffered; narrow the breakpoint rule to pause it.',
+            `Flutter Intercept: the response is larger than ${mb} MB, too large to hold at a response breakpoint ` +
+              'or for a mutate rule. It was failed instead of buffered; narrow the rule so it skips this response.',
           ),
           { code: 'E_FI_RESPONSE_TOO_LARGE', statusCode: 502, statusMessage: 'Response too large to pause' },
         );

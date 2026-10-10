@@ -190,7 +190,9 @@ describe('read tools', () => {
     const all = (await api.call('list_requests', {})) as { items: { id: string }[]; total: number };
     expect(all.items.map((i) => i.id)).toEqual([d.id, b.id, c.id, a.id]);
     expect(((await api.call('list_requests', { url: 'https://api.example.com/users/*' })) as { total: number }).total).toBe(2);
-    expect(((await api.call('list_requests', { url: '/users\\/\\d$/' })) as { total: number }).total).toBe(1);
+    // REVIEW-4 #2: globs only
+    await rejects(api.call('list_requests', { url: '/users\\/\\d$/' }), 'invalid', /globs .*regex\/ patterns are not accepted/);
+    await rejects(api.call('list_requests', { url: '*'.repeat(17) }), 'invalid', /at most 16/);
     expect(((await api.call('list_requests', { method: 'post' })) as { items: { id: string }[] }).items.map((i) => i.id)).toEqual([b.id]);
     expect(((await api.call('list_requests', { status: '4xx' })) as { items: { id: string }[] }).items.map((i) => i.id)).toEqual([c.id]);
     expect(((await api.call('list_requests', { status: 201 })) as { items: { id: string }[] }).items.map((i) => i.id)).toEqual([b.id]);

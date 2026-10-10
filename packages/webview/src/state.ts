@@ -3,12 +3,13 @@
  * Side effects (posting ViewMsg to the host) live in the components / app shell.
  */
 import type {
-  Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit, Rule, RuleAction, SendDraft, SnippetFormat, Status,
+  ContractSummary, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit, Rule, RuleAction, SendDraft, SnippetFormat, Status,
 } from './protocol';
-import type { FaultKind } from '@flutter-intercept/proxy/types';
+import type { FaultKind, MutateOp } from '@flutter-intercept/proxy/types';
 import { compileMatcher, matches } from '@flutter-intercept/proxy/rules';
 import { describeProfile, NETWORK_PRESETS, presetProfile, type NetworkPresetId } from '@flutter-intercept/proxy/network';
 import { matchesFilter, parseFilter } from './filter';
+import { checkPath } from './jsonpath';
 import {
   describeMatcherUrl, formatRemaining, headerValue, isAbsoluteUrl, isJsonContentType, isPaused, newId, statusClassOf,
   validateJson, type Headers, type JsonCheck, type StatusClass,
@@ -62,7 +63,10 @@ export interface State {
   gaveUp: Record<string, true>;         // seen paused, then turned 'error': the client hung up
   hostErrors: HostError[];              // non-blocking banner
   editingRuleId?: string;               // rule id, or NEW_RULE
-  awaitingRule?: { kind: RuleAction['kind']; knownIds: string[] };
+  /** A rule the host is about to create (createRuleFromExchange / mutateField); `label` = the notice text. */
+  awaitingRule?: { kind: RuleAction['kind']; knownIds: string[]; label?: string };
+  /** Contract-check results by exchange id (CONTRACTS §10.5); dropped with the exchange. */
+  contracts: Record<string, ContractSummary>;
   notice?: Notice;
   splitPct: number;                     // list width in the side-by-side layout
   composer?: Composer;
@@ -88,6 +92,7 @@ export function initialState(): State {
     gaveUp: {},
     hostErrors: [],
     splitPct: 55,
+    contracts: {},
   };
 }
 
@@ -117,7 +122,7 @@ export type Action =
   | { type: 'resolving'; id: string }
   | { type: 'setRules'; rules: Rule[]; notice?: string; undoable?: boolean }
   | { type: 'editRule'; id?: string }
-  | { type: 'awaitRule'; kind: RuleAction['kind'] }
+  | { type: 'awaitRule'; kind: RuleAction['kind']; label?: string }
   | { type: 'notice'; text?: string; short?: boolean }
   | { type: 'dismissErrors' }
   | { type: 'setSplit'; pct: number }
@@ -158,7 +163,7 @@ export function reducer(state: State, action: Action): State {
     }
 
     case 'move': {
-      const list = filterExchanges(state.exchanges, state.filters);
+      const list = filterExchanges(state.exchanges, state.filters, state.contracts);
       if (!list.length) return state;
       const cur = state.selectedId ? list.findIndex((e) => e.id === state.selectedId) : -1;
       let idx: number;
@@ -190,7 +195,7 @@ export function reducer(state: State, action: Action): State {
       if (!paused.length) return state;
       const cur = paused.findIndex((e) => e.id === state.selectedId);
       const ex = paused[(cur + 1) % paused.length];
-      const visible = filterExchanges(state.exchanges, state.filters).some((e) => e.id === ex.id);
+      const visible = filterExchanges(state.exchanges, state.filters, state.contracts).some((e) => e.id === ex.id);
       return {
         ...state,
         view: 'traffic',
@@ -238,7 +243,7 @@ export function reducer(state: State, action: Action): State {
       return { ...state, editingRuleId: action.id, view: action.id ? 'rules' : state.view };
 
     case 'awaitRule':
-      return { ...state, awaitingRule: { kind: action.kind, knownIds: state.rules.map((r) => r.id) } };
+      return { ...state, awaitingRule: { kind: action.kind, knownIds: state.rules.map((r) => r.id), label: action.label } };
 
     case 'notice':
       return { ...state, notice: action.text ? notice(action.text, undefined, action.short) : undefined };
@@ -298,6 +303,7 @@ function applyHostMsg(state: State, msg: HostMsg): State {
         drafts: pruneDrafts(state.drafts, byId),
         resolving: {},
         gaveUp: pick(state.gaveUp, byId),
+        contracts: pick(state.contracts, byId),
       };
       if (state.editingRuleId && state.editingRuleId !== NEW_RULE && !msg.rules.some((r) => r.id === state.editingRuleId)) {
         next.editingRuleId = undefined;
@@ -380,7 +386,10 @@ function applyHostMsg(state: State, msg: HostMsg): State {
         if (created) {
           next.awaitingRule = undefined;
           const label = describeAction(created.action);
-          if (state.awaitingRule.kind === 'mock') {
+          if (state.awaitingRule.label) {
+            // mutateField: the host inserted it first; Undo restores the list without it.
+            next.notice = notice(`Rule added: ${state.awaitingRule.label}`, msg.rules.filter((r) => r.id !== created.id));
+          } else if (state.awaitingRule.kind === 'mock') {
             // A mock is only useful once its body is edited: open it straight away.
             next.view = 'rules';
             next.editingRuleId = created.id;
@@ -395,6 +404,13 @@ function applyHostMsg(state: State, msg: HostMsg): State {
 
     case 'status':
       return { ...state, status: msg.status };
+
+    case 'contract': {
+      if (!msg.results.length) return state;
+      const contracts = { ...state.contracts };
+      for (const r of msg.results) contracts[r.id] = r;
+      return { ...state, contracts };
+    }
 
     case 'removed': {
       if (!msg.ids.length) return state;
@@ -412,6 +428,7 @@ function applyHostMsg(state: State, msg: HostMsg): State {
         drafts: drop(state.drafts),
         resolving: drop(state.resolving),
         gaveUp: drop(state.gaveUp),
+        contracts: drop(state.contracts),
         selectedId: state.selectedId && gone.has(state.selectedId) ? undefined : state.selectedId,
       };
     }
@@ -426,7 +443,7 @@ function applyHostMsg(state: State, msg: HostMsg): State {
       };
 
     case 'cleared':
-      return { ...state, exchanges: [], drafts: {}, resolving: {}, gaveUp: {}, selectedId: undefined };
+      return { ...state, exchanges: [], drafts: {}, resolving: {}, gaveUp: {}, contracts: {}, selectedId: undefined };
   }
 }
 
@@ -487,7 +504,7 @@ export function hasActiveFilters(f: Filters): boolean {
  * The text box speaks the filter language in ./filter (free words match the URL, m: s: t: body: h: state:
  * src:, -negation); it is AND-ed with the method / status-class / paused-only controls.
  */
-export function filterExchanges(exchanges: Exchange[], f: Filters): Exchange[] {
+export function filterExchanges(exchanges: Exchange[], f: Filters, contracts?: Record<string, ContractSummary>): Exchange[] {
   if (!hasActiveFilters(f)) return exchanges;
   const parsed = parseFilter(f.text);
   const method = f.method.toUpperCase();
@@ -498,7 +515,7 @@ export function filterExchanges(exchanges: Exchange[], f: Filters): Exchange[] {
       const c = statusClassOf(e);
       if (!c || !f.statusClasses.includes(c)) return false;
     }
-    return parsed.empty || matchesFilter(e, parsed);
+    return parsed.empty || matchesFilter(e, parsed, { contracts });
   });
 }
 
@@ -866,7 +883,33 @@ export function describeAction(a: RuleAction): string {
     case 'breakpoint': return a.phase === 'both' ? 'Break on request + response' : `Break on ${a.phase}`;
     case 'throttle': return `Throttle (${describeProfile({ kind: 'throttle', latencyMs: a.latencyMs, kbps: a.kbps, dropRate: a.dropRate })})`;
     case 'fault': return `Fault: ${FAULT_LABEL[a.fault]}`;
+    case 'mutate': return `Mutate: ${describeMutateOps(a.ops)}`;
   }
+}
+
+const MAX_VALUE_TEXT = 40;
+
+const shortText = (t: string) => (t.length > MAX_VALUE_TEXT ? `${t.slice(0, MAX_VALUE_TEXT - 1)}…` : t);
+
+/** JSON text of a `set` value, shortened for one-line labels. */
+export function shortJson(v: unknown): string {
+  let t: string;
+  try { t = JSON.stringify(v) ?? 'undefined'; } catch { t = String(v); }
+  return shortText(t);
+}
+
+/** "$.avatar_url → null", "$.id removed", "$.age = \"42\"". */
+export function describeMutateOp(op: MutateOp): string {
+  if (op.op === 'null') return `${op.path} → null`;
+  if (op.op === 'delete') return `${op.path} removed`;
+  return `${op.path} = ${op.valueJson !== undefined ? shortText(op.valueJson) : shortJson(op.value)}`;
+}
+
+/** The first two ops, then "+N more". */
+export function describeMutateOps(ops: MutateOp[]): string {
+  if (!ops.length) return 'no changes';
+  const head = ops.slice(0, 2).map(describeMutateOp).join(', ');
+  return ops.length > 2 ? `${head} +${ops.length - 2} more` : head;
 }
 
 /** How often a rule was used, judged from the exchanges listed (the proxy keeps the real count). */
@@ -927,12 +970,16 @@ export interface RuleForm {
   phase: 'request' | 'response' | 'both';
   throttle: ThrottleFields;
   fault: FaultKind;
+  mutateOps: MutateRow[];
   times: string;                // '' = unlimited; 1–1000
   expiresIn: string;            // '' = never
   expiresUnit: ExpiryUnit;
   /** The rule's current expiresAt, kept as is until the user edits the "Expires in" field. */
   keepExpiresAt?: number;
 }
+
+/** One `mutate` op as the editor holds it: `value` is JSON text (used for `set` only). */
+export interface MutateRow { path: string; op: MutateOp['op']; value: string }
 
 export type ExpiryUnit = 's' | 'm' | 'h';
 export const EXPIRY_UNIT_MS: Record<ExpiryUnit, number> = { s: 1000, m: 60_000, h: 3_600_000 };
@@ -956,6 +1003,7 @@ export function ruleToForm(rule?: Rule, now = Date.now()): RuleForm {
     phase: 'both',
     throttle: { latencyMs: '400', kbps: '', dropPct: '' },
     fault: 'reset',
+    mutateOps: [{ path: '', op: 'null', value: '' }],
     times: rule?.times !== undefined ? String(rule.times) : '',
     expiresIn: '',
     expiresUnit: 'm',
@@ -980,18 +1028,23 @@ export function ruleToForm(rule?: Rule, now = Date.now()): RuleForm {
     f.throttle = throttleFieldsOf(a);
   } else if (a?.kind === 'fault') {
     f.fault = a.fault;
+  } else if (a?.kind === 'mutate') {
+    // valueJson (byte-exact text) wins over value, like on the proxy.
+    f.mutateOps = a.ops.map((o) => ({ path: o.path, op: o.op, value: o.op === 'set' ? o.valueJson ?? jsonText(o.value) : '' }));
   }
   return f;
 }
 
 export type RuleFormField =
   | 'url' | 'method' | 'mockStatus' | 'mockDelayMs' | 'blockStatus' | 'mockHeaders'
-  | 'latencyMs' | 'kbps' | 'dropPct' | 'throttle' | 'times' | 'expiresIn';
+  | 'latencyMs' | 'kbps' | 'dropPct' | 'throttle' | 'times' | 'expiresIn' | 'mutate';
 
 export interface RuleFormValidation {
   errors: Partial<Record<RuleFormField, string>>;
   urlHint: string;
   json?: JsonCheck;
+  /** Per mutate row: what is wrong with it (path or value), if anything. */
+  opErrors?: (string | undefined)[];
 }
 
 const isStatus = (s: string) => /^\d{3}$/.test(s.trim()) && +s >= 100 && +s <= 599;
@@ -1032,6 +1085,13 @@ export function validateRuleForm(f: RuleForm): RuleFormValidation {
     if (t.errors.dropPct) errors.dropPct = t.errors.dropPct;
     if (t.errors.all) errors.throttle = t.errors.all;
   }
+  let opErrors: (string | undefined)[] | undefined;
+  if (f.kind === 'mutate') {
+    opErrors = f.mutateOps.map(mutateRowError);
+    const first = opErrors.findIndex(Boolean);
+    if (!f.mutateOps.length) errors.mutate = 'Add at least one change.';
+    else if (first >= 0) errors.mutate = `Change ${first + 1}: ${opErrors[first]}`;
+  }
   const times = f.times.trim();
   if (times && (!isInt(times) || +times < 1 || +times > 1000)) errors.times = 'Whole number 1–1000 (empty = every request)';
   const exp = f.expiresIn.trim();
@@ -1039,7 +1099,24 @@ export function validateRuleForm(f: RuleForm): RuleFormValidation {
     const ms = Number(exp) * EXPIRY_UNIT_MS[f.expiresUnit];
     if (!/^\d+(\.\d+)?$/.test(exp) || !(ms >= 1000) || ms > MAX_EXPIRY_MS) errors.expiresIn = 'Between 1 second and 24 hours (empty = never)';
   }
-  return { errors, urlHint, json };
+  return { errors, urlHint, json, opErrors };
+}
+
+/** Why a mutate row can't be saved, if it can't. */
+export function mutateRowError(r: MutateRow): string | undefined {
+  const p = checkPath(r.path);
+  if (p) return `Path: ${p}`;
+  if (r.op === 'set') {
+    if (!r.value.trim()) return 'Value: enter JSON, e.g. "text", 42, null, {"a":1}';
+    const j = validateJson(r.value);
+    if (!j.ok) return `Value is not valid JSON (column ${j.column}): ${j.message}`;
+  }
+  return undefined;
+}
+
+/** JSON text for an editor field. */
+export function jsonText(v: unknown): string {
+  try { return JSON.stringify(v) ?? ''; } catch { return ''; }
 }
 
 export function formToRule(f: RuleForm, now = Date.now()): Rule {
@@ -1055,6 +1132,14 @@ export function formToRule(f: RuleForm, now = Date.now()): Rule {
     action = { kind: 'throttle', ...checkThrottle(f.throttle).value };
   } else if (f.kind === 'fault') {
     action = { kind: 'fault', fault: f.fault };
+  } else if (f.kind === 'mutate') {
+    action = {
+      kind: 'mutate',
+      // valueJson keeps the literal text (1.0 stays a double for Dart); value is for hosts without valueJson.
+      ops: f.mutateOps.map((r): MutateOp => (r.op === 'set'
+        ? { path: r.path.trim(), op: 'set', value: JSON.parse(r.value), valueJson: r.value.trim() }
+        : { path: r.path.trim(), op: r.op })),
+    };
   } else {
     action = { kind: 'breakpoint', phase: f.phase };
   }

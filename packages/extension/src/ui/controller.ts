@@ -11,12 +11,20 @@
  * CONTRACTS §9.3/9.4: `sent` after `send`; `status` after `setNetworkProfile`; `openSource` / `copySnippet`
  * go through injected deps (no reply on success, `error` on failure); a `rule-spent` event from the host
  * removes that rule (persisted + `rules` broadcast).
+ *
+ * CONTRACTS §10.5: `rules` after `mutateField`; `contract` results (batched with `exchange` updates) for every
+ * finished JSON exchange while checking is on, and for the current snapshot on `ready`; `pickModel`,
+ * `openViolation`, `generateModel`, `generateFixture` go through injected deps (`error` on failure).
  */
 import type { Exchange, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 import { ruleFromExchange } from '@flutter-intercept/proxy/rules';
+import { pathError } from '../agent/paths';
+import { decodeJson, decodeSample, defaultFixtureName, FINAL_STATES, defaultModelName, fixtureApiFor, fixtureSamples, isCheckable, modelSamples, redactExchange, routeOf, testPackageFor } from '../agent/samples';
 import { SNIPPET_FORMATS, toSnippet } from '../codegen/snippets';
-import type { AgentStatus, HostMsg, SendDraft, SnippetFormat, Status, ViewMsg } from './protocol';
+import type { CodegenService, FixtureApi, GeneratedFile } from '../codegen/types';
+import type { ContractResult, ContractService } from '../contract/types';
+import type { AgentStatus, ContractSummary, HostMsg, SendDraft, SnippetFormat, Status, ViewMsg } from './protocol';
 
 export type Sink = (msg: HostMsg) => void;
 
@@ -61,6 +69,66 @@ export interface ControllerDeps {
   openSource?: (exchange: Exchange, frameIndex: number) => Promise<unknown>;
   /** Writes the user's clipboard (`vscode.env.clipboard.writeText`). */
   copyToClipboard?: (text: string) => Promise<unknown>;
+
+  // ---- CONTRACTS §10 (v0.4.0). All optional: without them the matching features answer with an `error`.
+  /** The contract checker (src/contract/service.ts). */
+  contract?: ContractService;
+  /** Setting `flutterIntercept.contractCheck` (default true). Call `recheckContracts()` when it changes. */
+  contractCheckEnabled?: () => boolean;
+  /** Every new contract result (the lead updates the diagnostics). */
+  onContractResult?: (result: ContractResult) => void;
+  /** Results dropped: exchanges evicted / cleared, proxy restarted, models changed, checking turned off. */
+  onContractRemoved?: (exchangeIds: string[]) => void;
+  /** Native model QuickPick for `pickModel`: a model name, undefined = "Don't check this route" (forget), null = cancelled. */
+  pickModel?: (exchange: Exchange) => Promise<string | undefined | null>;
+  /** Opens `file` (absolute) at the 1-based `line` (`openViolation`). */
+  openLocation?: (file: string, line: number) => Promise<unknown>;
+  /** Code generation (src/codegen/service.ts). */
+  codegen?: CodegenService;
+  /** Opens each generated file in an untitled editor. */
+  openUntitled?: (files: GeneratedFile[]) => Promise<unknown>;
+  /** The Flutter project's root (style detection). */
+  projectRoot?: () => string | undefined;
+  /** The app's pubspec `name` (fixture imports). */
+  appPackageName?: () => string | undefined;
+  /** Delay before queued checks start (default 150 ms) and how many run at once (default 2). */
+  contractDebounceMs?: number;
+  contractConcurrency?: number;
+}
+
+/** CONTRACTS §10.5: the panel's view of a contract result (no file paths). */
+export function contractSummary(r: ContractResult): ContractSummary {
+  return {
+    id: r.exchangeId,
+    checked: r.checked,
+    ...(r.model ? { model: r.model } : {}),
+    via: r.via,
+    violations: r.violations.map((v) => ({ path: v.path, field: v.field, expected: v.expected, actual: v.actual, severity: v.severity, message: v.message })),
+    ...(r.reason ? { reason: r.reason } : {}),
+  };
+}
+
+const CONTRACT_OFF = 'Contract check is off (setting flutterIntercept.contractCheck).';
+
+/**
+ * CONTRACTS §10.4: the Retrofit/Chopper interface a mocktail fixture test mocks, from the contract service's
+ * endpoint index. Undefined (the generator then falls back to MockClient) without a service or a match.
+ */
+export async function fixtureApi(
+  contract: ContractService | undefined,
+  exchanges: Exchange[],
+  root: string | undefined,
+  packageName: string | undefined,
+  log?: (msg: string) => void,
+): Promise<FixtureApi | undefined> {
+  if (!contract) return undefined;
+  try {
+    const [endpoints, models] = await Promise.all([contract.endpoints(), contract.models()]);
+    return fixtureApiFor(endpoints, exchanges, models, { root, packageName });
+  } catch (e) {
+    log?.(`fixture API lookup failed: ${e instanceof Error ? e.message : String(e)}`);
+    return undefined;
+  }
 }
 
 /** Kinds `createRuleFromExchange` can build (throttle/fault rules come from the rule editor). */
@@ -144,6 +212,65 @@ function checkBody(v: unknown, where: string): void {
   if (v.length > MAX_TEXT) fail(where, 'body is too large');
 }
 
+export const MAX_MUTATE_OPS = 20;
+const MAX_MUTATE_VALUE_CHARS = 1024 * 1024;
+const MUTATE_OPS = new Set(['null', 'delete', 'set']);
+
+/**
+ * CONTRACTS §10.2: 1–20 ops; path valid (jsonpath.ts), op null|delete|set; `set` needs `value` (a JSON value) or
+ * `valueJson` (JSON text, byte-exact, wins over `value`), each ≤ 1 MB.
+ */
+function checkMutateOps(ops: unknown, where: string): void {
+  if (!Array.isArray(ops) || ops.length < 1 || ops.length > MAX_MUTATE_OPS) fail(where, `ops must be a list of 1–${MAX_MUTATE_OPS} changes`);
+  ops.forEach((op, i) => {
+    const ow = `${where}.ops[${i}]`;
+    if (!isObj(op)) fail(ow, 'must be an object');
+    onlyKeys(op, ['path', 'op', 'value', 'valueJson'], ow);
+    const bad = pathError(op.path);
+    if (bad) fail(ow, bad);
+    if (typeof op.op !== 'string' || !MUTATE_OPS.has(op.op)) fail(ow, 'op must be "null", "delete" or "set"');
+    if (op.op !== 'set') {
+      if (op.value !== undefined || op.valueJson !== undefined) fail(ow, `value / valueJson are only used with op "set"`);
+      return;
+    }
+    if (op.valueJson !== undefined) {
+      if (typeof op.valueJson !== 'string') fail(ow, 'valueJson must be a string of JSON text');
+      if (op.valueJson.length > MAX_MUTATE_VALUE_CHARS) fail(ow, 'valueJson must be at most 1 MB');
+      try {
+        JSON.parse(op.valueJson);
+      } catch {
+        fail(ow, 'valueJson must be valid JSON text (e.g. "1.0", "12345678901234567890", "\\"text\\"")');
+      }
+    }
+    if (op.value === undefined) {
+      if (op.valueJson === undefined) fail(ow, 'op "set" needs a value (or valueJson)');
+      return;
+    }
+    let text: string | undefined;
+    try {
+      text = JSON.stringify(op.value);
+    } catch {
+      text = undefined;
+    }
+    if (typeof text !== 'string' || !isJsonValue(op.value)) fail(ow, 'value must be a JSON value (string, number, boolean, null, array or object)');
+    if (text.length > MAX_MUTATE_VALUE_CHARS) fail(ow, 'value must be at most 1 MB as JSON');
+  });
+}
+
+/** Plain JSON only: no functions, symbols, bigints, NaN/Infinity, class instances or cycles (depth ≤ 200). */
+function isJsonValue(v: unknown, depth = 0): boolean {
+  if (depth > 200) return false;
+  if (v === null || typeof v === 'string' || typeof v === 'boolean') return true;
+  if (typeof v === 'number') return Number.isFinite(v);
+  if (Array.isArray(v)) return v.every((x) => isJsonValue(x, depth + 1));
+  if (typeof v === 'object') {
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) return false;
+    return Object.values(v as Record<string, unknown>).every((x) => isJsonValue(x, depth + 1));
+  }
+  return false;
+}
+
 export function validateRule(raw: unknown, where = 'rule'): Rule {
   if (!isObj(raw)) fail(where, 'must be an object');
   // `used` is display-only (CONTRACTS §9.2 rule-hit): accepted so the webview can round-trip rules, then dropped.
@@ -191,6 +318,10 @@ export function validateRule(raw: unknown, where = 'rule'): Rule {
     case 'fault':
       onlyKeys(a, ['kind', 'fault'], aw);
       if (typeof a.fault !== 'string' || !FAULTS.has(a.fault)) fail(aw, 'fault must be "reset", "timeout", "truncate" or "dns"');
+      break;
+    case 'mutate':
+      onlyKeys(a, ['kind', 'ops'], aw);
+      checkMutateOps(a.ops, aw);
       break;
     default:
       fail(aw, `unknown kind ${JSON.stringify(a.kind)}`);
@@ -309,6 +440,15 @@ export class InterceptController {
   private readonly paused = new Set<string>();
   private sessions = 0;
   private pausedListeners: ((count: number) => void)[] = [];
+  // CONTRACTS §10.5 contract checks: cached per exchange id, queued, run a few at a time.
+  private readonly contractResults = new Map<string, ContractResult>();
+  private readonly contractQueue = new Map<string, Exchange>();
+  private readonly contractRunning = new Set<string>();
+  private readonly pendingContract = new Map<string, ContractSummary>();
+  private contractTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Bumped whenever cached results become stale; results of older checks are dropped. */
+  private contractGen = 0;
+  private readonly modelsSub?: { dispose(): void };
   /** Test hook: every message sent, by type. */
   readonly sentCounts: Record<string, number> = {};
   readyCount = 0;
@@ -321,11 +461,13 @@ export class InterceptController {
       this.pending.clear();
       this.rulesDirty = false;
       this.used.clear(); // hit counts belong to the proxy instance
+      this.dropContracts(undefined);
       this.recomputePaused(deps.host.getExchanges());
       this.broadcast(this.snapshot());
     });
     deps.host.on('rule-spent', (ruleId) => this.onRuleSpent(ruleId));
     deps.host.on('rule-hit', (ruleId, used) => this.onRuleHit(ruleId, used));
+    this.modelsSub = deps.contract?.onDidChangeModels(() => this.recheckContracts());
   }
 
   attach(sink: Sink): () => void {
@@ -388,11 +530,19 @@ export class InterceptController {
     if (!msg || typeof msg !== 'object' || typeof (msg as { type?: unknown }).type !== 'string') return;
     try {
       switch (msg.type) {
-        case 'ready':
+        case 'ready': {
           this.readyCount++;
           this.flush();
           this.send(reply, this.snapshot());
+          const current = this.deps.host.getExchanges();
+          const results = current.flatMap((e) => {
+            const r = this.contractResults.get(e.id);
+            return r ? [contractSummary(r)] : [];
+          });
+          if (results.length) this.send(reply, { type: 'contract', results });
+          for (const e of current) this.maybeCheck(e);
           return;
+        }
         case 'resume': {
           const id = checkId(msg.id, 'resume');
           const ex = this.deps.host.getExchanges().find((e) => e.id === id);
@@ -464,6 +614,29 @@ export class InterceptController {
         case 'setNetworkProfile':
           this.setNetworkProfile(msg.profile);
           return;
+        case 'pickModel':
+          await this.pickModel(this.exchangeOrThrow(checkId(msg.id, 'pickModel')));
+          return;
+        case 'openViolation': {
+          const id = checkId(msg.id, 'openViolation');
+          const r = this.contractResults.get(id);
+          if (!r) throw new Error('This request has no contract check result (yet).');
+          if (!isInt(msg.index, 0, Math.max(0, r.violations.length - 1)) || !r.violations.length) fail('openViolation', 'index is out of range');
+          const v = r.violations[msg.index];
+          if (!v.file) throw new Error(`The source file of model ${v.model} is unknown.`);
+          if (!this.deps.openLocation) throw new Error('Opening files is not available in this editor.');
+          await this.deps.openLocation(v.file, v.line ?? 1);
+          return;
+        }
+        case 'mutateField':
+          this.mutateField(this.exchangeOrThrow(checkId(msg.id, 'mutateField')), msg);
+          return;
+        case 'generateModel':
+          await this.generateModel(this.exchangeOrThrow(checkId(msg.id, 'generateModel')));
+          return;
+        case 'generateFixture':
+          await this.generateFixture(this.exchangeOrThrow(checkId(msg.id, 'generateFixture')));
+          return;
         default:
           return;
       }
@@ -478,6 +651,8 @@ export class InterceptController {
   clear(): void {
     this.deps.host.clear();
     this.pending.clear();
+    const left = new Set(this.deps.host.getExchanges().map((e) => e.id));
+    this.dropContracts([...this.contractResults.keys(), ...this.contractQueue.keys(), ...this.pendingContract.keys()].filter((id) => !left.has(id)));
     this.recomputePaused(this.deps.host.getExchanges());
     this.broadcast({ type: 'cleared' });
     this.broadcast(this.snapshot());
@@ -504,7 +679,194 @@ export class InterceptController {
   dispose(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
+    if (this.contractTimer) clearTimeout(this.contractTimer);
+    this.contractTimer = undefined;
+    this.contractQueue.clear();
+    this.contractGen++;
+    this.modelsSub?.dispose();
     this.sinks.clear();
+  }
+
+  // ------------------------------------------------------------------ CONTRACTS §10 (v0.4.0)
+
+  /** The cached contract result of an exchange (also used by the agent API). */
+  contractResult(id: string): ContractResult | undefined {
+    return this.contractResults.get(id);
+  }
+
+  private get contractOn(): boolean {
+    return !!this.deps.contract && (this.deps.contractCheckEnabled?.() ?? true);
+  }
+
+  /**
+   * Drops every cached result (models changed, the user mapped a route, or the setting changed) and checks the
+   * current exchanges again; with checking off, tells the panel the results are gone.
+   */
+  recheckContracts(): void {
+    const ids = [...this.contractResults.keys()];
+    this.contractGen++;
+    this.contractQueue.clear();
+    this.contractResults.clear();
+    this.pendingContract.clear();
+    if (ids.length) this.deps.onContractRemoved?.(ids);
+    if (!this.contractOn) {
+      if (ids.length) this.broadcast({ type: 'contract', results: ids.map((id) => ({ id, checked: false, via: 'none', violations: [], reason: CONTRACT_OFF })) });
+      return;
+    }
+    for (const e of this.deps.host.getExchanges()) this.maybeCheck(e);
+  }
+
+  /** Forgets results (all with `undefined`) — eviction, clear, proxy restart. */
+  private dropContracts(ids: string[] | undefined): void {
+    const dropped: string[] = [];
+    if (ids === undefined) {
+      this.contractGen++;
+      dropped.push(...this.contractResults.keys());
+      this.contractResults.clear();
+      this.contractQueue.clear();
+      this.pendingContract.clear();
+    } else {
+      for (const id of new Set(ids)) {
+        if (this.contractResults.delete(id)) dropped.push(id);
+        this.contractQueue.delete(id);
+        this.pendingContract.delete(id);
+      }
+    }
+    if (dropped.length) this.deps.onContractRemoved?.(dropped);
+  }
+
+  /** Queues a finished JSON exchange for checking (once per id). */
+  private maybeCheck(e: Exchange): void {
+    if (!this.contractOn || !isCheckable(e)) return;
+    if (this.contractResults.has(e.id) || this.contractRunning.has(e.id)) return;
+    this.contractQueue.set(e.id, e);
+    if (!this.contractTimer) this.contractTimer = setTimeout(() => this.pumpContracts(), this.deps.contractDebounceMs ?? 150);
+  }
+
+  private pumpContracts(): void {
+    this.contractTimer = undefined;
+    const limit = Math.max(1, this.deps.contractConcurrency ?? 2);
+    while (this.contractRunning.size < limit && this.contractQueue.size) {
+      const [id, e] = this.contractQueue.entries().next().value as [string, Exchange];
+      this.contractQueue.delete(id);
+      this.contractRunning.add(id);
+      void this.runCheck(e, this.contractGen);
+    }
+  }
+
+  private async runCheck(e: Exchange, gen: number, opts?: { model?: string }): Promise<ContractResult | undefined> {
+    let result: ContractResult;
+    try {
+      result = await this.deps.contract!.check(e, opts);
+    } catch (err) {
+      result = { exchangeId: e.id, checked: false, via: 'none', violations: [], reason: `the check failed: ${err instanceof Error ? err.message : String(err)}` };
+    } finally {
+      this.contractRunning.delete(e.id);
+    }
+    try {
+      if (gen !== this.contractGen || !this.deps.host.getExchanges().some((x) => x.id === e.id)) return undefined;
+      this.contractResults.set(e.id, result);
+      this.pendingContract.set(e.id, contractSummary(result));
+      try {
+        this.deps.onContractResult?.(result);
+      } catch (err) {
+        this.deps.log?.(`onContractResult failed: ${String(err)}`);
+      }
+      if (!this.timer) this.timer = setTimeout(() => this.flush(), this.deps.throttleMs ?? 50);
+      return result;
+    } finally {
+      // Yield to the event loop between checks (REVIEW-4 #5): a re-check of many exchanges never runs as one microtask chain.
+      if (this.contractQueue.size && !this.contractTimer) this.contractTimer = setTimeout(() => this.pumpContracts(), 0);
+    }
+  }
+
+  private async pickModel(ex: Exchange): Promise<void> {
+    if (!this.deps.contract) throw new Error('Contract checking is not available.');
+    if (!this.deps.pickModel) throw new Error('Choosing a model is not available in this editor.');
+    const choice = await this.deps.pickModel(ex);
+    if (choice === null) return;
+    await this.deps.contract.remember(ex, choice);
+    // The choice applies to the whole route: every cached result may be stale.
+    if (this.contractOn) {
+      this.recheckContracts();
+      return;
+    }
+    // Checking is off: still answer the user's explicit choice for this exchange.
+    const r = await this.runCheck(ex, this.contractGen);
+    if (r) this.flush();
+  }
+
+  private mutateField(ex: Exchange, msg: { path?: unknown; op?: unknown; value?: unknown; valueJson?: unknown }): void {
+    if (typeof msg.op !== 'string' || !['null', 'delete', 'set'].includes(msg.op)) fail('mutateField', 'op must be "null", "delete" or "set"');
+    const bad = pathError(msg.path);
+    if (bad) fail('mutateField', bad);
+    const op = msg.op as 'null' | 'delete' | 'set';
+    // The proxy builds the match (and an empty mutate action) like every rule from an exchange; we fill the op.
+    const base = ruleFromExchange(ex, 'mutate', this.newRuleId());
+    let pathname = ex.url.split(/[?#]/)[0];
+    try {
+      pathname = new URL(ex.url).pathname;
+    } catch {
+      // keep the raw path
+    }
+    const setValue = op === 'set' ? { ...(msg.value !== undefined ? { value: msg.value } : {}), ...(msg.valueJson !== undefined ? { valueJson: msg.valueJson as string } : {}) } : {};
+    const rule = validateRule({
+      ...base,
+      enabled: true,
+      name: `${op} ${String(msg.path)} ${ex.method} ${pathname}`.slice(0, 500),
+      action: { kind: 'mutate', ops: [{ path: msg.path as string, op, ...setValue }] },
+    });
+    this.applyRules([rule, ...this.deps.host.getRules()]);
+  }
+
+  private codegenOrThrow(): { codegen: CodegenService; open: (files: GeneratedFile[]) => Promise<unknown> } {
+    if (!this.deps.codegen || !this.deps.openUntitled) throw new Error('Code generation is not available in this editor.');
+    return { codegen: this.deps.codegen, open: this.deps.openUntitled };
+  }
+
+  private async generateModel(ex: Exchange): Promise<void> {
+    const { codegen, open } = this.codegenOrThrow();
+    const json = decodeSample(ex.responseBody);
+    if (!json.ok) throw new Error(`Can't generate a model from this response: ${json.reason}.`);
+    const template = (p: string) => codegen.routeTemplate(p);
+    const route = routeOf(ex, template);
+    const samples = modelSamples(this.deps.host.getExchanges(), ex, template).flatMap((s) => {
+      const d = decodeSample(s.responseBody);
+      return d.ok ? [d.value] : [];
+    });
+    const root = this.deps.projectRoot?.();
+    const files = codegen.generateModels({
+      samples: samples.length ? samples : [json.value],
+      rootName: defaultModelName(route.template),
+      style: root ? codegen.detectModelStyle(root) : 'plain',
+      source: `${ex.method.toUpperCase()} ${route.origin}${route.template}`,
+    });
+    if (!files.length) throw new Error('No model could be generated from this response.');
+    await open(files);
+  }
+
+  private async generateFixture(ex: Exchange): Promise<void> {
+    const { codegen, open } = this.codegenOrThrow();
+    if (ex.status === undefined || !FINAL_STATES.has(ex.state)) throw new Error('This request has no finished response to turn into a fixture.');
+    const template = (p: string) => codegen.routeTemplate(p);
+    const route = routeOf(ex, template);
+    // Fixtures are committed to the repo: always the REDACTED view (CONTRACTS §10.1).
+    const raw = fixtureSamples(this.deps.host.getExchanges(), ex, template);
+    const root = this.deps.projectRoot?.();
+    const pkg = this.deps.appPackageName?.();
+    const style = root ? codegen.detectFixtureStyle(root) : 'mock_client';
+    const api = style === 'mocktail' ? await fixtureApi(this.deps.contract, raw, root, pkg, this.deps.log) : undefined;
+    const testPackage = testPackageFor(root);
+    const files = codegen.generateFixtureTest({
+      exchanges: raw.map(redactExchange),
+      style,
+      name: defaultFixtureName(ex.method, route.template),
+      ...(pkg ? { packageName: pkg } : {}),
+      ...(api ? { api } : {}),
+      ...(testPackage ? { testPackage } : {}),
+    });
+    if (!files.length) throw new Error('No fixture could be generated from this request.');
+    await open(files);
   }
 
   private exchangeOrThrow(id: string): Exchange {
@@ -546,10 +908,12 @@ export class InterceptController {
     if (this.paused.size !== before) this.firePaused();
     this.pending.set(e.id, e);
     if (!this.timer) this.timer = setTimeout(() => this.flush(), this.deps.throttleMs ?? 50);
+    this.maybeCheck(e);
   }
 
   private onRemoved(ids: string[]): void {
     this.flush();
+    this.dropContracts(ids);
     let changed = false;
     for (const id of ids) changed = this.paused.delete(id) || changed;
     if (changed) this.firePaused();
@@ -563,10 +927,17 @@ export class InterceptController {
       this.rulesDirty = false;
       this.broadcast({ type: 'rules', rules: this.rulesView() });
     }
-    if (this.pending.size === 0) return;
-    const batch = [...this.pending.values()];
-    this.pending.clear();
-    for (const exchange of batch) this.broadcast({ type: 'exchange', exchange });
+    if (this.pending.size) {
+      const batch = [...this.pending.values()];
+      this.pending.clear();
+      for (const exchange of batch) this.broadcast({ type: 'exchange', exchange });
+    }
+    // After the exchanges, so the panel already knows every id a result refers to.
+    if (this.pendingContract.size) {
+      const results = [...this.pendingContract.values()];
+      this.pendingContract.clear();
+      this.broadcast({ type: 'contract', results });
+    }
   }
 
   private recomputePaused(all: Exchange[]): void {

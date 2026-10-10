@@ -14,6 +14,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'api/catalog_api.dart';
 import 'api/local_api.dart';
 import 'api/orders_api.dart';
+import 'api/users_api.dart';
 import 'pinned_roots.dart';
 
 /// --dart-define=APP_SETS_OVERRIDES=true : the app installs its own
@@ -95,6 +96,9 @@ final _dio = Dio(_dioOptions())..httpClientAdapter = _dioAdapter();
 final _catalog = CatalogApi(Dio(_dioOptions())
   ..httpClientAdapter = _dioAdapter()
   ..interceptors.addAll([DemoClientHeaderInterceptor(), DemoAuthInterceptor()]));
+
+// Retrofit + json_serializable models (lib/models): the app's own view of the API contract.
+final _users = UsersApi(Dio(_dioOptions())..httpClientAdapter = _dioAdapter());
 
 final _httpClient = _customClient ? IOClient(appHttpClient()) : http.Client();
 final _orders = OrdersApi(_httpClient);
@@ -192,6 +196,20 @@ Future<void> ordersCreate() => _timed('orders_create', () async {
       return (r.statusCode, r.body);
     });
 
+Future<void> retrofitUser() => _timed('retrofit_user', () async {
+      // Throws (ERR "type 'Null' is not a subtype of type 'String' …") when the response breaks
+      // the model, e.g. after "Make null in next responses" on `email`.
+      final r = await _users.getUser(3);
+      final u = r.data;
+      return (r.response.statusCode ?? -1, {
+        'id': u.id,
+        'handle': u.handle,
+        'email': u.email,
+        'city': u.address.city,
+        'tier': u.tier.name,
+      });
+    });
+
 Future<void> localHealth() => _timed('local_health', () async {
       final r = await fetchLocalHealth(_httpClient);
       return (r.statusCode, r.body);
@@ -218,6 +236,7 @@ Future<void> runBatch() async {
     prefs(),
     catalogAlbum(),
     ordersCreate(),
+    retrofitUser(),
     if (localPort > 0) localHealth(),
     if (evilUrl.isNotEmpty) attack(),
   ]);
@@ -269,6 +288,7 @@ class DemoApp extends StatelessWidget {
               ('http GET plain http://', httpPlain),
               ('Dio GET album (interceptors)', catalogAlbum),
               ('http POST order', ordersCreate),
+              ('Retrofit GET user (models)', retrofitUser),
               if (localPort > 0) ('GET host server /health', localHealth),
             ])
               Padding(

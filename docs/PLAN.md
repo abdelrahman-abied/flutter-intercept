@@ -103,3 +103,14 @@ change requests go there too — only the lead edits CONTRACTS.md, extension.ts,
 | H host + agent | WP2 snippets, WP3/5 host messages, WP7 agent tools, all new agent tools | `src/agent/**`, `src/codegen/**`, `src/ui/{controller,view}.ts`, `src/proxyHost.ts`, their unit tests, `test/integration/suite/agent.ts` |
 | W webview | WP4 search, WP2 copy menu, WP3 composer, WP1 "Open source", WP5 profile picker + rule editor, WP7 times/ttl | `packages/webview/**` (except `protocol.ts`: lead) |
 | lead | contract, wiring, packaging | CONTRACTS, PLAN, `extension.ts`, extension `package.json`, README/CHANGELOG, device E2E, security review of trace channel + rewrite |
+
+## v0.4.0 — "Your models vs the real API" (started 2026-10-09, branch `feature/0.4.0`)
+Contract: CONTRACTS §10 (types already in code). Same rules as v0.3.0.
+| Agent | Owns |
+|---|---|
+| P proxy | `mutate` action, `jsonpath.ts` (implement the stub) — `packages/proxy/**` except `types.ts`/`network.ts` |
+| C contract | `src/contract/**` except `types.ts` (parser, indexes, mapping, checker, diagnostics, service), its tests; demo app models + Retrofit API + committed `*.g.dart` (`samples/demo_app/**` except the iOS project file) |
+| G codegen | `src/codegen/**` except `types.ts` and `snippets.ts` (models, fixtures, routeTemplate, service), its tests |
+| H host + agent | `src/agent/**` (new tools, MCP resources + prompts), `src/ui/controller.ts`, `src/proxyHost.ts`, their tests, `test/integration/suite/agent.ts` |
+| W webview | `packages/webview/**` except `protocol.ts` |
+| lead | contract, `extension.ts`, extension `package.json`, docs, device E2E, review |

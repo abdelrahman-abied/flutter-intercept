@@ -1,14 +1,16 @@
 import type { Ref } from 'preact';
-import { useState } from 'preact/hooks';
+import { useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Exchange } from '../protocol';
 import { canResend, clientGaveUp, describeAction, findExchange, initiatorLabel, isAgentRule, ruleDisplayName } from '../state';
 import { formatDuration, formatTime, fullFrameLocation, isFrameworkFrame, isPaused, shortFrameLocation } from '../util';
-import { useExchangeActions } from './actions';
+import { normalizePath } from '../jsonpath';
+import { useExchangeActions, type ExchangeActions } from './actions';
+import { ContractSection } from './ContractSection';
 import { AgentBadge, Button, MenuButton, PauseTimer, StateBadge, StatusText } from './bits';
 import { PauseEditor } from './Editors';
 import { Icon } from './Icon';
-import { BodyView, HeadersTable } from './Viewers';
+import { BodyView, HeadersTable, type TreeFieldActions } from './Viewers';
 
 const PAUSE_TEXT = {
   'paused-request': 'Paused before the request reaches the server. Edit it and resume, or abort.',
@@ -60,6 +62,9 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             title={canResend(ex) ? 'Edit method, URL, headers or body, then send it through the proxy' : 'Wait until the exchange has finished'}>
             <Icon name="edit" /> Edit and resend
           </Button>
+          <MenuButton label="Generate" title="Generate a Dart model or a test fixture from this exchange" items={actions.generateItems}>
+            Generate… <Icon name="chevronDown" />
+          </MenuButton>
           <span class="detail-facts">
             {formatTime(ex.startedAt)}
             {ex.durationMs !== undefined && ` · ${formatDuration(ex.durationMs)}`}
@@ -129,7 +134,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
       </div>
 
       <div class="tab-body" role="tabpanel">
-        {tab === 'request' ? <RequestTab ex={ex} /> : <ResponseTab ex={ex} />}
+        {tab === 'request' ? <RequestTab ex={ex} /> : <ResponseTab ex={ex} actions={actions} />}
       </div>
     </section>
   );
@@ -147,7 +152,19 @@ function RequestTab({ ex }: { ex: Exchange }) {
   );
 }
 
-function ResponseTab({ ex }: { ex: Exchange }) {
+const MOCKED_NOTE = 'This response came from a mock rule, not the server — edit the mock instead.';
+
+function ResponseTab({ ex, actions }: { ex: Exchange; actions: ExchangeActions }) {
+  const { state } = useApp();
+  const result = state.contracts[ex.id];
+  const fields = useMemo<TreeFieldActions>(() => {
+    const marks = new Map<string, { severity: 'error' | 'warning'; message: string }>();
+    for (const v of result?.violations ?? []) {
+      const k = normalizePath(v.path);
+      if (!marks.has(k) || v.severity === 'error') marks.set(k, { severity: v.severity, message: v.message });
+    }
+    return { mutate: actions.mutateField, marks, disabled: ex.state === 'mocked' ? MOCKED_NOTE : undefined };
+  }, [result, ex.id, ex.state]);
   if (ex.state === 'paused-response') return <PauseEditor key={ex.id + ex.state} ex={ex} />;
   if (ex.status === undefined) {
     const why: Record<string, string> = {
@@ -161,10 +178,11 @@ function ResponseTab({ ex }: { ex: Exchange }) {
   }
   return (
     <>
+      <ContractSection ex={ex} result={result} onPick={actions.pickModel} onOpen={actions.openViolation} />
       <h4 class="section-title">Headers</h4>
       <HeadersTable headers={ex.responseHeaders} />
       <h4 class="section-title">Body</h4>
-      <BodyView body={ex.responseBody} headers={ex.responseHeaders} />
+      <BodyView body={ex.responseBody} headers={ex.responseHeaders} fields={fields} />
     </>
   );
 }

@@ -40,6 +40,23 @@ and the traffic shows up.
 - In profile builds Dio requests get no call site, and columns are missing (AOT stacks are shorter).
 - Turn it off with `flutterIntercept.captureSource`.
 
+**Model check: your models vs the real API**
+- Every JSON response is checked against your json_serializable / freezed models — the generated
+  `_$UserFromJson` in `*.g.dart`, which is exactly what runs on it.
+- A field that would make `fromJson` throw (a `null` in a non-nullable field, a string where an `int` belongs,
+  an unknown enum value) is shown on the request and as an error on that field in your model file.
+- Requests are matched to models through Retrofit / Chopper declarations or the call stack; pick one yourself
+  with **Check against a model…**. Turn it off with `flutterIntercept.contractCheck`.
+
+**Break a field on purpose**
+- Right-click a field in a response: **Make null in next responses**, **Remove from next responses** or
+  **Change value…**. Or add a **Mutate JSON** rule. The real response reaches your app with that change.
+
+**Generate code**
+- **Generate Dart model** (freezed, json_serializable or plain, matching your project) from every recorded
+  sample of a route, and **Generate test fixture** (JSON fixtures + a http_mock_adapter / MockClient / mocktail
+  test). Both open as unsaved editors.
+
 **Copy and resend**
 - **Copy as cURL**, **Copy as Dart (http)** or **Copy as Dio** from the detail pane or a row's right-click menu.
 - **Resend** a request unchanged, or **Edit and resend** it. The new request is listed with a link to the original.
@@ -75,7 +92,8 @@ and the traffic shows up.
 
 **Rules**
 - Each rule matches on method plus URL. The URL is a glob such as `https://api.example.com/users/*` or a
-  `/regex/`.
+  `/regex/`. Regexes that could take very long on a long URL (nested repeats like `(.+)+`, backreferences) are
+  refused and the rule shows as invalid; AI agents can only use globs.
 - Rules run top to bottom and the first enabled match wins. The list shows which rules are shadowed by an
   earlier one.
 - Reorder, enable/disable, delete with undo. Rules are saved per workspace.
@@ -185,7 +203,15 @@ Cursor, and any client that speaks MCP (Model Context Protocol).
 | Find the file and line that sent a request | `get_request_source` |
 | See the structure of a large JSON body without reading it | `get_body_shape` |
 | Slow down or cut off the network (everything, or one URL) | `simulate_network` |
-| Send a recorded request again, optionally edited (only to servers the app already used) | `resend_request` |
+| Send a recorded request again, optionally edited (same server only) | `resend_request` |
+| Check responses against your Dart models | `check_contract` |
+| Generate a Dart model or a fixture test from recorded traffic | `generate_model`, `generate_fixture_test` |
+| Check traffic with pass/fail expectations (status, count, order, JSON paths, duration) | `assert_traffic` |
+| Change fields in real JSON responses (null, remove, set) | `add_mutation` |
+
+Over MCP there are also resources (`intercept://exchange/{id}`, `intercept://paused`, `intercept://rules`,
+`intercept://contract/{id}`) and prompts (`debug-failing-request`, `test-error-states`, `verify-change`,
+`build-api-layer-from-traffic`).
 
 `get_request` can also return the request as a cURL, Dart http or Dio snippet. `add_mock`, `add_block` and
 `add_breakpoint` take `times` and `ttlMs`, so rules an agent adds can clean themselves up.
@@ -251,6 +277,7 @@ Running the command again updates it in place, and the rest of the file is left 
 | `flutterIntercept.agent.access` | `readWrite` | What AI agents may do: `readWrite`, `readOnly` or `off`. See [Use with AI agents](#use-with-ai-agents). |
 | `flutterIntercept.agent.redactSecrets` | `true` | Show secrets (auth headers, cookies, tokens, passwords) to agents as `[redacted]`. |
 | `flutterIntercept.captureSource` | `true` | Record which line of your code made each request (see [Where a request came from](#features)). Applies at the next launch. Flutter sessions only: plain Dart programs can't take the setting (the Dart VM rejects `--dart-define`) and always record. |
+| `flutterIntercept.contractCheck` | `true` | Check JSON responses against your json_serializable / freezed models and show fields that would make `fromJson` throw. |
 | `flutterIntercept.rewriteLocalhost` | `true` | Requests to `10.0.2.2` / `10.0.3.2` (the emulator's names for your Mac) go to your Mac's `localhost`. Never applies to iPhones. |
 | `flutterIntercept.agent.mcpPort` | `47823` | Port of the local MCP server for agents. If it's busy, the next free port is used. |
 

@@ -11,6 +11,8 @@
  *   state:paused        exchange state (prefix ok: paused → paused-request + paused-response),
  *                       plus `simulated`, `resent`, `sent` (sent from the editor or an agent)
  *   src:api.dart        a source frame's uri contains it
+ *   contract:error      model check result (CONTRACTS §10.5): error | warning (worst is a warning) | ok |
+ *                       unchecked (no result, or the host could not check it); prefix ok, comma = any of
  *   -token              negates any of the above
  *
  * Tokens are AND-ed. A token with an empty value (`m:` while typing) is ignored; a token with an invalid
@@ -19,7 +21,8 @@
  * Performance: lowercased body text is cached per Body object (WeakMap), so a keystroke never
  * re-lowercases multi-MB bodies; the parsed filter is cached per text.
  */
-import type { Body, Exchange, ExchangeState } from './protocol';
+import type { Body, ContractSummary, Exchange, ExchangeState } from './protocol';
+import { CONTRACT_STATUSES, contractStatus, type ContractStatus } from './contract';
 import { headerValue, isJsonContentType, statusClassOf } from './util';
 
 export type ContentClass = 'json' | 'html' | 'image' | 'text' | 'xml' | 'binary' | 'other';
@@ -31,19 +34,21 @@ const STATES: readonly ExchangeState[] = [
 /** Extra `state:` values that are not ExchangeState names. */
 const STATE_EXTRAS = ['simulated', 'resent', 'sent'] as const;
 
-export const FILTER_KEYS = ['m', 's', 't', 'body', 'h', 'state', 'src'] as const;
+export const FILTER_KEYS = ['m', 's', 't', 'body', 'h', 'state', 'src', 'contract'] as const;
 type Key = (typeof FILTER_KEYS)[number];
 const ALIASES: Record<string, Key> = {
   m: 'm', method: 'm', s: 's', status: 's', t: 't', type: 't', body: 'body', h: 'h', header: 'h',
-  state: 'state', is: 'state', src: 'src', source: 'src',
+  state: 'state', is: 'state', src: 'src', source: 'src', contract: 'contract', model: 'contract',
 };
 
 export const FILTER_HINT =
   'Filter: words match the URL · m:POST · s:404 s:4xx s:error · t:json|html|image|text|xml|binary|other · ' +
   'body:token body:"a phrase" · h:name h:name=value · state:paused|mocked|blocked|error|simulated|resent · ' +
-  'src:file.dart · -token negates';
+  'src:file.dart · contract:error|warning|ok|unchecked · -token negates';
 
-type Pred = (e: Exchange) => boolean;
+/** What a filter can see besides the exchange itself. */
+export interface FilterContext { contracts?: Record<string, ContractSummary> }
+type Pred = (e: Exchange, ctx: FilterContext) => boolean;
 interface Term { pred: Pred; negate: boolean; cost: number }
 
 export interface ParsedFilter {
@@ -175,7 +180,7 @@ function statusPred(raw: string): Pred | string {
       return true;
     });
   }
-  return preds.length === 1 ? preds[0] : (e) => preds.some((p) => p(e));
+  return preds.length === 1 ? preds[0] : (e, x) => preds.some((p) => p(e, x));
 }
 
 function contentPred(raw: string): Pred | string {
@@ -201,7 +206,17 @@ function statePred(raw: string): Pred | string {
       if (x === 'sent') preds.push((e) => !!e.initiator);
     }
   }
-  return preds.length === 1 ? preds[0] : (e) => preds.some((p) => p(e));
+  return preds.length === 1 ? preds[0] : (e, x) => preds.some((p) => p(e, x));
+}
+
+function contractPred(raw: string): Pred | string {
+  const wanted = new Set<ContractStatus>();
+  for (const v of raw.toLowerCase().split(',').filter(Boolean)) {
+    const hits = CONTRACT_STATUSES.filter((c) => c.startsWith(v));
+    if (!hits.length) return `contract:${raw} — use ${CONTRACT_STATUSES.join(', ')}`;
+    hits.forEach((c) => wanted.add(c));
+  }
+  return (e, x) => wanted.has(contractStatus(x.contracts?.[e.id]));
 }
 
 function compileToken(t: RawToken): { pred: Pred; cost: number } | string | undefined {
@@ -244,6 +259,10 @@ function compileToken(t: RawToken): { pred: Pred; cost: number } | string | unde
         cost: 2,
       };
     }
+    case 'contract': {
+      const p = contractPred(value);
+      return typeof p === 'string' ? p : { pred: p, cost: 0 };
+    }
     case 'body': {
       const v = value.toLowerCase();
       return { pred: (e) => lowerBodyText(e.requestBody).includes(v) || lowerBodyText(e.responseBody).includes(v), cost: 9 };
@@ -273,7 +292,7 @@ export function parseFilter(text: string): ParsedFilter {
   return parsed;
 }
 
-export function matchesFilter(e: Exchange, p: ParsedFilter): boolean {
-  for (const t of p.terms) if (t.pred(e) === t.negate) return false;
+export function matchesFilter(e: Exchange, p: ParsedFilter, ctx: FilterContext = {}): boolean {
+  for (const t of p.terms) if (t.pred(e, ctx) === t.negate) return false;
   return true;
 }

@@ -1,7 +1,7 @@
 # demo_app
 
 Plain Flutter networking demo used by Flutter Intercept's device checks. It has
-**no interception code**: Dio + package:http + shared_preferences only.
+**no interception code**: Dio + package:http + shared_preferences (+ Retrofit / json_serializable) only.
 
 On startup (and on hot restart) it fires one batch and prints greppable lines:
 
@@ -15,6 +15,14 @@ Labels: `dio_user` (Dio GET /users/1), `http_todo` (http GET /todos/1), `dio_pos
 Request → source checks (0.3.0): `catalog_album` (Dio with an interceptor and a `QueuedInterceptor`,
 `lib/api/catalog_api.dart`), `orders_create` (package:http POST worth resending, `lib/api/orders_api.dart`),
 `local_health` (host-machine server, `lib/api/local_api.dart`; only with `LOCAL_PORT`).
+Contract check (0.4.0): `retrofit_user` (Retrofit `UsersApi.getUser(3)` → GET /users/3, decoded into the
+json_serializable models in `lib/models/`). Real data matches the models (no violations). To see a
+violation, "Make null in next responses" on `email` (or `mutate` `$.email` → null): the app prints
+`retrofit_user ERR type 'Null' is not a subtype of type 'String' in type cast` and the extension flags
+`final String email;` in `lib/models/user.dart`. Setting `$.tier` to an unknown string gives a warning
+(decoded as `UserTier.unknown`). `UsersApi.getTodos` (a `List<Todo>` endpoint) is declared but not called.
+The generated `*.g.dart` files are committed (they are parser fixtures too); after editing a model or the
+API run `dart run build_runner build --delete-conflicting-outputs`.
 
 Targets: `lib/main.dart` (prod), `lib/main_dev.dart` (dev flavor entry).
 

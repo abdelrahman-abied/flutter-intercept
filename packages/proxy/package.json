@@ -25,6 +25,10 @@
     "./source": {
       "types": "./dist/source.d.ts",
       "default": "./dist/source.js"
+    },
+    "./jsonpath": {
+      "types": "./dist/jsonpath.d.ts",
+      "default": "./dist/jsonpath.js"
     }
   },
   "typesVersions": {
@@ -40,6 +44,9 @@
       ],
       "source": [
         "dist/source.d.ts"
+      ],
+      "jsonpath": [
+        "dist/jsonpath.d.ts"
       ]
     }
   },

@@ -5,11 +5,16 @@
 import { z } from 'zod';
 import { READ_TOOLS, ToolName, WRITE_TOOLS } from './types';
 
+/** REVIEW-4 #2: agents pass globs only (a `/regex/` could freeze the extension host); at most MAX_GLOB_STARS `*`. */
+export const MAX_GLOB_STARS = 16;
+const REGEX_LITERAL = /^\/(.+)\/([a-z]*)$/s;
 const url = z
   .string()
   .min(1)
   .max(8192)
-  .describe('URL to match: a glob on the full URL where * matches any characters (e.g. "https://api.example.com/v1/users*"), or /regex/flags.');
+  .refine((v) => !REGEX_LITERAL.test(v.trim()), 'URL patterns are globs on the full URL (* matches any characters); /regex/ patterns are not accepted')
+  .refine((v) => (v.match(/\*/g)?.length ?? 0) <= MAX_GLOB_STARS, `at most ${MAX_GLOB_STARS} * in a URL glob`)
+  .describe('URL glob on the full URL; * matches any characters (e.g. "https://api.example.com/v1/users*", "*/users/*"). Matched against the URL as you see it (redacted query values read "[redacted]").');
 const method = z
   .string()
   .regex(/^[A-Za-z]+$/, 'an HTTP method name such as GET or POST')
@@ -39,6 +44,49 @@ export const NETWORK_PROFILES = ['none', 'offline', 'slow-3g', 'fast-3g', 'flaky
 export const FAULT_KINDS = ['reset', 'timeout', 'truncate', 'dns'] as const;
 
 export const EXCHANGE_STATES = ['pending', 'paused-request', 'paused-response', 'completed', 'mocked', 'blocked', 'aborted', 'error'] as const;
+// CONTRACTS §10.4 / §10.6
+export const MODEL_STYLES = ['freezed', 'json_serializable', 'plain'] as const;
+export const FIXTURE_STYLES = ['http_mock_adapter', 'mock_client', 'mocktail'] as const;
+export const JSON_TYPES = ['string', 'number', 'integer', 'boolean', 'null', 'object', 'array'] as const;
+export const MAX_MUTATE_OPS = 20;
+
+const jsonPath = z
+  .string()
+  .min(1)
+  .max(1000)
+  .describe('JSON path into the response body: "$.user.avatar_url", "$.items[0].id", "$.items[*].price" ([*] = every element), "$[\'odd key\']". No filters or "..".');
+
+const mutateOp = z
+  .strictObject({
+    path: jsonPath,
+    op: z.enum(['null', 'delete', 'set']).describe('"null" sets the field to null, "delete" removes the key (or array element), "set" replaces it with `value`.'),
+    value: z.unknown().optional().describe('With op "set": the new JSON value, e.g. "42" to send a number as a string. Max 1 MB.'),
+    valueJson: z
+      .string()
+      .max(1024 * 1024)
+      .optional()
+      .describe(
+        'With op "set", instead of value: the new value as JSON text, written byte-exact. Use it when the exact number form matters: "1.0" (a double, which Dart parses as double, not int), integers beyond 2^53 ("12345678901234567890"), "1e3". Wins over value.',
+      ),
+  })
+  .describe('One change to the JSON response body.');
+
+const dartName = z
+  .string()
+  .regex(/^[A-Za-z][A-Za-z0-9_]*$/, 'a Dart identifier such as User or user_profile')
+  .max(100);
+
+const jsonAssertion = z
+  .strictObject({
+    path: jsonPath,
+    exists: z.boolean().optional().describe('true: the path selects at least one value; false: it selects nothing. Default true when neither equals nor type is given.'),
+    equals: z
+      .unknown()
+      .optional()
+      .describe('Every selected value deep-equals this JSON value. Compared with what get_request shows: a secret field only equals "[redacted]".'),
+    type: z.enum(JSON_TYPES).optional().describe('Every selected value has this JSON type ("integer" = a whole number).'),
+  })
+  .describe('An assertion on the JSON response body of every matched request.');
 
 const editSchema = z
   .strictObject({
@@ -155,7 +203,7 @@ export const toolSchemas = {
     latencyMs: z.number().int().min(0).max(600_000).optional().describe('custom: added latency per request, ms.'),
     kbps: z.number().min(1).max(10_000_000).optional().describe('custom: response bandwidth, kilobits per second.'),
     dropRate: z.number().min(0).max(1).optional().describe('custom: share of requests that fail (0-1).'),
-    url: url.optional().describe('Only affect requests matching this URL glob or /regex/ (adds a rule, inserted first). Omit to set the profile for ALL app traffic.'),
+    url: url.optional().describe('Only affect requests matching this URL glob (adds a rule, inserted first). Omit to set the profile for ALL app traffic.'),
     method: method.optional(),
     fault: z
       .enum(FAULT_KINDS)
@@ -166,6 +214,75 @@ export const toolSchemas = {
     name: ruleName.optional(),
   }),
   resend_request: z.strictObject({ id, edit: requestEditSchema.optional() }),
+  // CONTRACTS §10.6
+  check_contract: z.strictObject({
+    id: id.optional().describe('Check this one exchange. Omit to check the latest matching JSON responses.'),
+    url: url.optional(),
+    method: method.optional(),
+    sinceMs: sinceMs.optional(),
+    model: dartName.optional().describe('Check against this Dart model class (e.g. "User") instead of the one found automatically.'),
+    limit: z.number().int().min(1).max(50).default(20).describe('Max exchanges to check when no id is given (newest first), 1-50.'),
+  }),
+  generate_model: z.strictObject({
+    id: id.optional().describe('A recorded exchange; every recorded response of the same method + route (e.g. GET /users/{id}) is used as a sample.'),
+    url: url.optional().describe('Or: the newest matching JSON response picks the route; all its recorded samples are used.'),
+    name: dartName.optional().describe('Root class name (default: from the URL, e.g. "User" for /users/{id}).'),
+    style: z.enum(MODEL_STYLES).optional().describe("Code style. Default: the project's own (freezed > json_serializable > plain, from pubspec.yaml)."),
+  }),
+  generate_fixture_test: z.strictObject({
+    ids: z.array(id).min(1).max(20).optional().describe('Recorded exchanges to turn into fixtures (1-20).'),
+    url: url.optional().describe('Or: the newest (up to 20) finished exchanges matching this URL.'),
+    style: z.enum(FIXTURE_STYLES).optional().describe("Test style. Default: the project's own dev_dependencies (http_mock_adapter > mocktail > mock_client)."),
+    name: z
+      .string()
+      .regex(/^[a-z][a-z0-9_]*$/, 'snake_case, e.g. get_user')
+      .max(60)
+      .optional()
+      .describe('snake_case base name for the files (default: from the first request, e.g. "get_user").'),
+  }),
+  assert_traffic: z.strictObject({
+    url: url.describe('Requests to check: a glob on the full URL; * matches any characters.'),
+    method: method.optional(),
+    sinceMs: sinceMs
+      .optional()
+      .describe('Only requests that started at or after this time (epoch ms). Default: the start of the latest launch_app/hot_restart if within the last 120 s, otherwise all recorded traffic.'),
+    withinMs: z
+      .number()
+      .int()
+      .min(0)
+      .max(120_000)
+      .default(0)
+      .describe('Wait up to this long (max 120000) for the expected requests. 0 = check what is recorded now. With count.max or count.exact the whole window is observed.'),
+    expect: z
+      .strictObject({
+        status: statusFilter.optional().describe('Every matched request has this status: a code, a class ("2xx".."5xx") or "error".'),
+        count: z
+          .strictObject({
+            min: z.number().int().min(0).max(1000).optional(),
+            max: z.number().int().min(0).max(1000).optional(),
+            exact: z.number().int().min(0).max(1000).optional(),
+          })
+          .optional()
+          .describe('How many matching requests. Default: at least one.'),
+        order: z
+          .array(url)
+          .min(2)
+          .max(20)
+          .optional()
+          .describe('URL globs that must have been requested in this order (each one starting after the previous one), among all requests since sinceMs.'),
+        json: z.array(jsonAssertion).min(1).max(20).optional(),
+        maxDurationMs: z.number().int().min(0).max(600_000).optional().describe('Every matched request finished within this many ms.'),
+      })
+      .describe('What must hold. Every given expectation is checked.'),
+  }),
+  add_mutation: z.strictObject({
+    url,
+    method: method.optional(),
+    ops: z.array(mutateOp).min(1).max(MAX_MUTATE_OPS).describe('Changes applied in order to the real JSON response (1-20).'),
+    times: times.optional(),
+    ttlMs: ttlMs.optional(),
+    name: ruleName.optional(),
+  }),
 } satisfies Record<ToolName, z.ZodType>;
 
 export type ToolInput<T extends ToolName> = z.output<(typeof toolSchemas)[T]>;
@@ -206,7 +323,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   list_requests: {
     title: 'List HTTP requests',
-    model: "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob or /regex/, method, status (code, class like \"4xx\", or \"error\"), state or start time. Returns ids; call get_request for headers and bodies. Secrets are redacted.",
+    model: "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state or start time. Returns ids; call get_request for headers and bodies. Secrets are redacted.",
     user: 'List recorded HTTP requests.',
   },
   get_request: {
@@ -296,13 +413,43 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   simulate_network: {
     title: 'Simulate network conditions (all app traffic or matching requests)',
-    model: 'Simulate bad network conditions to test loading states, timeouts, retries and offline handling. Without url: set the profile for ALL app traffic: "slow-3g", "fast-3g", "flaky" (20% of requests fail), "offline" (every request fails), "custom" (latencyMs, kbps, dropRate), or "none" to restore normal speed (do this when done). With url (glob or /regex/): add a rule, inserted first, that slows only matching requests with the given profile, or makes them fail with fault ("reset", "timeout", "truncate", "dns"); times / ttlMs remove the rule automatically, otherwise use remove_rule. Mocks and blocks still answer instantly. get_status shows the active profile; affected exchanges carry a "simulated" label.',
+    model: 'Simulate bad network conditions to test loading states, timeouts, retries and offline handling. Without url: set the profile for ALL app traffic: "slow-3g", "fast-3g", "flaky" (20% of requests fail), "offline" (every request fails), "custom" (latencyMs, kbps, dropRate), or "none" to restore normal speed (do this when done). With url (a glob; * matches any characters): add a rule, inserted first, that slows only matching requests with the given profile, or makes them fail with fault ("reset", "timeout", "truncate", "dns"); times / ttlMs remove the rule automatically, otherwise use remove_rule. Mocks and blocks still answer instantly. get_status shows the active profile; affected exchanges carry a "simulated" label.',
     user: 'Throttle or break the network for the app or for matching requests.',
   },
   resend_request: {
     title: 'Resend a request',
     model: 'Send a recorded request again through the proxy, optionally edited (method, url, headers, body), without involving the app — e.g. to check a fix on the backend or try a different payload. Only for an app request that reached the real server unchanged (state "completed", no rule matched it, not from a physical device over LAN), and only to that request\'s own origin: edit.url may change path and query, never scheme, host or port. Anything else is refused with the reason. Omitted fields keep the original, including secret headers you only see as "[redacted]"; a "[redacted]" value in edit.headers (or the query) is replaced by the original. Rules and the network profile apply. Returns {id, sinceMs}: the new exchange starts "pending"; wait for it with wait_for_request (same url, that sinceMs) or check get_request(id).',
     user: 'Send a recorded request again, optionally edited.',
+  },
+  check_contract: {
+    title: 'Check responses against the Dart models',
+    model:
+      "Check recorded JSON responses against the app's own Dart models — exactly what the generated fromJson (json_serializable / freezed *.g.dart) would do with them. Finds the fields that would make parsing throw (error: a null or missing non-nullable field, a string where an int is expected, an unknown enum value) or are suspicious (warning). Pass id for one exchange, or url/method/sinceMs for the latest matching ones; model forces a model class. Each result says which model was used and how it was found (via: retrofit/chopper annotations, the request's stack trace, or the user's choice), or checked:false with the reason (no model mapped, not JSON, …). Violations give the JSON path, the model field, expected vs actual type and the model file:line (project-relative). Use it when the app shows a parse error (\"type 'Null' is not a subtype of type 'String'\") or after changing a model.",
+    user: 'Check JSON responses against the Dart models.',
+  },
+  generate_model: {
+    title: 'Generate Dart models from traffic',
+    model:
+      "Generate Dart model classes from the app's recorded JSON responses: every recorded sample of the same method + route is merged (a field missing in some samples becomes optional, a field seen null becomes nullable, int+double becomes double), nested objects get their own classes. Style follows the project (freezed, json_serializable or plain fromJson/toJson) unless style is given. Returns {files: [{path, content}], samples, route}: nothing is written, so write the files yourself (paths are suggestions relative to the project) and run build_runner for freezed/json_serializable. Secret field values are redacted before inference. Make the app call the endpoint a few times with different data first for better nullability.",
+    user: 'Generate Dart models from recorded responses.',
+  },
+  generate_fixture_test: {
+    title: 'Generate a fixture test from traffic',
+    model:
+      "Turn recorded exchanges into a test: one JSON fixture file per response under test/fixtures/ plus a test file that serves them with the project's mocking library (http_mock_adapter for Dio, package:http's MockClient, or mocktail for a Retrofit interface). Pass ids or a url glob. Returns {files: [{path, content}]} without writing them; adjust the generated test to call your repository/service and assert what matters. Always built from the redacted view: secrets appear as \"[redacted]\".",
+    user: 'Generate JSON fixtures and a test from recorded requests.',
+  },
+  assert_traffic: {
+    title: 'Assert on recorded traffic',
+    model:
+      'Check in one call that the app made the expected requests: matching url (glob; * matches any characters) and method since sinceMs (default: the latest launch_app/hot_restart, else all recorded traffic), with expect: status (code, "2xx".., "error"), count {min, max, exact} (default: at least one), order (URL globs requested in that order), json assertions on every matched response ({path: "$.items[0].id", exists | equals | type}), maxDurationMs. withinMs waits (event-driven, max 120 s) for the requests to arrive; it never hangs. Returns {pass, matched, ids, failures: [readable reasons]}. Failure texts name the request, path and expectation but never echo response values; equals compares with the redacted view (a secret only equals "[redacted]"). Use it as the final check of a change instead of reading bodies by hand.',
+    user: 'Check that expected requests and responses happened.',
+  },
+  add_mutation: {
+    title: 'Add response mutation rule',
+    model:
+      "Let matching requests reach the real server, then change its JSON response before the app gets it: ops [{path: \"$.user.avatar_url\", op: \"null\"}, {path: \"$.items[*].price\", op: \"set\", value: \"9.99\"}, {path: \"$.email\", op: \"delete\"}]. For an exact number form use valueJson (JSON text written byte-exact) instead of value: \"1.0\" to send a double (an int-typed Dart field then throws), integers beyond 2^53. Use it to reproduce or test how the app handles a null/missing/mistyped field from the backend (e.g. \"Null is not a subtype of String\") without mocking the whole response. Non-JSON responses pass unchanged. The rule is inserted first; times (e.g. 1) or ttlMs remove it automatically, otherwise use remove_rule. Affected exchanges carry a \"simulated\" label; check_contract shows what the models make of them.",
+    user: 'Add a rule that changes fields of real JSON responses.',
   },
 };
 

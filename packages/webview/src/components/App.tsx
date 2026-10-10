@@ -79,7 +79,7 @@ export function App({ host }: { host: Host }) {
 
 function TrafficView() {
   const { state, dispatch } = useApp();
-  const list = useMemo(() => filterExchanges(state.exchanges, state.filters), [state.exchanges, state.filters]);
+  const list = useMemo(() => filterExchanges(state.exchanges, state.filters, state.contracts), [state.exchanges, state.filters, state.contracts]);
   const selected = state.selectedId ? findExchange(state, state.selectedId) : undefined;
   const composing = !!state.composer?.open;
   const detailRef = useRef<HTMLElement>(null);
@@ -164,8 +164,8 @@ function EmptyState() {
 
 function StatusLine() {
   const { state } = useApp();
-  const { status, exchanges, filters, connected } = state;
-  const shown = useMemo(() => filterExchanges(exchanges, filters).length, [exchanges, filters]);
+  const { status, exchanges, filters, connected, contracts } = state;
+  const shown = useMemo(() => filterExchanges(exchanges, filters, contracts).length, [exchanges, filters, contracts]);
   const paused = pausedCount(exchanges);
   return (
     <footer class="statusline" role="status" aria-live="polite">

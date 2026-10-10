@@ -230,3 +230,8 @@ export function formatJson(text: string, indent = '  '): string | undefined {
   }
   return out.join('') + (text.endsWith('\n') ? '\n' : '');
 }
+
+/** The decoded text of a raw JSON string token (`"a\"b"` → `a"b`). */
+export function decodeJsonString(raw: string): string {
+  try { return JSON.parse(raw) as string; } catch { return raw.slice(1, -1); }
+}

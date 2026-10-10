@@ -6,6 +6,9 @@
  * hot_restart → the restarted app prints the mocked body → remove_rule → stop_app.
  * v0.3.0 (MCP door): get_request_source, get_body_shape, get_request snippets, resend_request (and its origin
  * refusal), simulate_network (global profile + url-scoped fault with times:1), add_mock with ttlMs.
+ * v0.4.0 (MCP door): check_contract on the demo's Retrofit/json_serializable User (clean, then with add_mutation
+ * nulling the required email → error at $.email), assert_traffic pass + fail, generate_model,
+ * generate_fixture_test, MCP resources (list, templates, read) and prompts (list, get).
  *
  * Two paths, chosen automatically:
  *  - "lm":     the extension registered `flutter_intercept_*` (lead wiring + package.json
@@ -28,6 +31,8 @@ import { activateBoth, freePort, outputOf, registerOutputTracker, RunOutcome, sl
 const SECRETS = ['demo-secret-123', 'demo-key-456'];
 
 const USERS1 = 'https://jsonplaceholder.typicode.com/users/1';
+// The demo's Retrofit request (label retrofit_user) has its own endpoint, so the users/1 cases above only see dio_user.
+const USERS3 = 'https://jsonplaceholder.typicode.com/users/3';
 
 function globToRegExp(glob: string): RegExp {
   return new RegExp('^' + glob.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
@@ -418,6 +423,164 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
       } finally {
         if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
         await mcpCall('simulate_network', { profile: 'none' }).catch(() => undefined);
+        await client?.close().catch(() => undefined);
+        client = undefined;
+      }
+      out.ms = Date.now() - t0;
+      results.push(out);
+      console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+    }
+
+    // v0.4.0 (CONTRACTS §10.6) over MCP: the demo's Retrofit `UsersApi.getUser` → json_serializable `User`
+    // (label retrofit_user). check_contract on the real response (clean), add_mutation nulls the required
+    // `email` → the app's fromJson throws and check_contract reports an error at $.email in lib/models/user.dart;
+    // assert_traffic pass + fail; generate_model / generate_fixture_test; resources and prompts.
+    for (const dev of devices) {
+      const out: RunOutcome = { name: `AGENT ${dev} v0.4.0 over MCP: check_contract, add_mutation, assert_traffic, codegen, resources, prompts`, output: '', proxyHits: [], failures: [], ms: 0 };
+      const f = out.failures;
+      const t0 = Date.now();
+      let sessionId: string | undefined;
+      let ruleId: string | undefined;
+      const notes: string[] = [];
+      const noAbsolute = (what: string, text: string) => {
+        if (text.includes(process.env.HOME ?? '/Users/') || /"file":\s*"\//.test(text)) f.push(`${what} leaks an absolute path: ${text.slice(0, 300)}`);
+      };
+      try {
+        client = await connect();
+        const since = Date.now();
+        const l = await mcpCall('launch_app', { deviceId: dev });
+        sessionId = l.result.sessionId;
+        if (l.isError || !sessionId) throw new Error(`launch_app: ${l.text.slice(0, 200)}`);
+        // retrofit_user: GET users/3 through UsersApi.getUser.
+        const both = await mcpCall('assert_traffic', { url: USERS3, method: 'GET', sinceMs: since, withinMs: 120_000, expect: { count: { min: 1 }, status: 200 } });
+        if (both.isError || !both.result.pass) throw new Error(`assert_traffic (startup): ${both.text.slice(0, 300)}`);
+        const id = both.result.ids.at(-1) as string;
+
+        // check_contract on the real response: mapped to User (Retrofit annotations or the stack trace), no errors.
+        let cc: any;
+        for (let i = 0; i < 20; i++) {
+          cc = await mcpCall('check_contract', { id });
+          if (!cc.isError && cc.result.results?.[0]?.checked) break;
+          await sleep(250); // the model index may still be building
+        }
+        const r0 = cc.result.results?.[0];
+        if (cc.isError || !r0?.checked || r0.model !== 'User' || !['retrofit', 'source'].includes(r0.via) || r0.errors !== 0) f.push(`check_contract (clean): ${cc.text.slice(0, 400)}`);
+        noAbsolute('check_contract', cc.text);
+        notes.push(`clean: ${r0?.model} via ${r0?.via}, ${r0?.errors} errors`);
+
+        // generate_model from the recorded samples of GET /users/{id}.
+        const gm = await mcpCall('generate_model', { id });
+        const files = (gm.result.files ?? []) as { path: string; content: string }[];
+        const dart = files.map((x) => x.content).join('\n');
+        const balanced = (o: string, c: string) => dart.split(o).length === dart.split(c).length;
+        if (gm.isError || !files.length || !/class User\b/.test(dart) || !/fromJson/.test(dart) || !/email/.test(dart) || !balanced('{', '}') || !balanced('(', ')')) {
+          f.push(`generate_model: ${gm.text.slice(0, 400)}`);
+        }
+        if (files.some((x) => !/^[\w./-]+\.dart$/.test(x.path) || x.path.startsWith('/'))) f.push(`generate_model paths: ${files.map((x) => x.path).join(', ')}`);
+        notes.push(`model: ${files.map((x) => x.path).join(', ')} (${gm.result.samples} samples, ${gm.result.style})`);
+
+        // generate_fixture_test: JSON fixture + test file, redacted.
+        const gf = await mcpCall('generate_fixture_test', { ids: [id] });
+        const ff = (gf.result.files ?? []) as { path: string; content: string }[];
+        const fixture = ff.find((x) => x.path.endsWith('.json'));
+        const test = ff.find((x) => x.path.endsWith('_test.dart'));
+        if (gf.isError || !fixture || !test || !/void main\(/.test(test.content)) f.push(`generate_fixture_test: ${gf.text.slice(0, 400)}`);
+        else {
+          try {
+            JSON.parse(fixture.content);
+          } catch {
+            f.push(`fixture is not JSON: ${fixture.content.slice(0, 200)}`);
+          }
+        }
+
+        // add_mutation: null the required email of users/3 → retrofit_user's fromJson throws.
+        const mu = await mcpCall('add_mutation', { url: USERS3, method: 'GET', ops: [{ path: '$.email', op: 'null' }], name: 'email null' });
+        ruleId = mu.result.ruleId;
+        if (mu.isError || !ruleId) throw new Error(`add_mutation: ${mu.text.slice(0, 200)}`);
+        const r = (await mcpCall('list_rules')).result.rules.find((x: Rule) => x.id === ruleId);
+        if (!r || r.action?.kind !== 'mutate' || !r.name?.startsWith('[agent] ')) f.push(`mutate rule: ${JSON.stringify(r)}`);
+        const session = sessions.get(sessionId!);
+        const from = session ? outputOf(session).length : 0;
+        const restartAt = Date.now();
+        const h = await mcpCall('hot_restart', { sessionId });
+        if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+        const mutated = await mcpCall('assert_traffic', {
+          url: USERS3,
+          method: 'GET',
+          sinceMs: restartAt,
+          withinMs: 90_000,
+          expect: { count: { min: 1 }, status: 200, json: [{ path: '$.email', type: 'null' }, { path: '$.username', type: 'string' }] },
+        });
+        if (mutated.isError || !mutated.result.pass) f.push(`assert_traffic (mutated, should pass): ${mutated.text.slice(0, 400)}`);
+        if (session) {
+          await waitFor(() => /DEMO_RESULT retrofit_user ERR/.test(outputOf(session).slice(from)) || undefined, 60_000, 250).catch(() =>
+            f.push(`retrofit_user did not fail on the mutated response: ${outputOf(session).slice(from).split(/\r?\n/).filter((x) => x.includes('retrofit_user')).join(' | ').slice(0, 300)}`),
+          );
+        }
+        const mid = (mutated.result.ids ?? []).at(-1) as string | undefined;
+        const g = mid ? (await mcpCall('get_request', { id: mid, includeBodies: false })).result : undefined;
+        if (!g?.simulated) f.push(`mutated exchange has no simulated label: ${JSON.stringify(g).slice(0, 200)}`);
+        const cm = mid ? await mcpCall('check_contract', { id: mid }) : undefined;
+        const r1 = cm?.result.results?.[0];
+        const v = (r1?.violations ?? []).find((x: any) => x.path === '$.email');
+        if (!cm || cm.isError || !r1?.checked || !(r1.errors >= 1) || !v || v.severity !== 'error' || v.field !== 'email' || v.file !== 'lib/models/user.dart' || !(v.line > 0)) {
+          f.push(`check_contract (mutated) should report $.email: ${cm?.text.slice(0, 500)}`);
+        }
+        if (cm) noAbsolute('check_contract (mutated)', cm.text);
+        notes.push(`mutated: ${v?.message ?? '?'} @ ${v?.file}:${v?.line}`);
+
+        // assert_traffic failure: readable, and never echoes response values.
+        const bad = await mcpCall('assert_traffic', {
+          url: USERS3,
+          method: 'GET',
+          sinceMs: restartAt,
+          expect: { status: 404, count: { exact: 2 }, json: [{ path: '$.username', equals: 'nobody' }, { path: '$.missing' }] },
+        });
+        const ft = (bad.result.failures ?? []).join('\n');
+        if (bad.isError || bad.result.pass !== false || !/expected 404/.test(ft) || !/\$\.username does not equal/.test(ft) || !/\$\.missing not found/.test(ft) || !/count: expected exactly 2/.test(ft)) {
+          f.push(`assert_traffic (should fail): ${bad.text.slice(0, 500)}`);
+        }
+        if (/Bret|Sincere@april\.biz|Leanne|Samantha|Nathan@yesenia\.net|Clementine/.test(bad.text)) f.push(`assert_traffic failure echoes response values: ${ft.slice(0, 300)}`);
+
+        // Resources and prompts (same redacted views as the tools).
+        const res = await client.listResources();
+        const uris = res.resources.map((x) => x.uri);
+        if (!uris.includes('intercept://rules') || !uris.includes('intercept://paused') || !uris.some((u) => u.startsWith('intercept://exchange/'))) f.push(`resources/list: ${uris.slice(0, 5).join(', ')}`);
+        const tpl = (await client.listResourceTemplates()).resourceTemplates.map((x) => x.uriTemplate).sort();
+        if (tpl.join(' ') !== 'intercept://contract/{id} intercept://exchange/{id}') f.push(`resources/templates/list: ${tpl.join(', ')}`);
+        const read = async (uri: string) => {
+          const c = (await client!.readResource({ uri })).contents[0] as { text?: string };
+          allOutputs.push(c.text ?? '');
+          return JSON.parse(c.text ?? 'null');
+        };
+        // dio_user (users/1) carries the demo's secret headers: the resource view must redact them.
+        const dioId = (await mcpCall('list_requests', { url: USERS1, method: 'GET', limit: 1 })).result.items?.[0]?.id as string;
+        const exr = await read(`intercept://exchange/${encodeURIComponent(dioId)}`);
+        if (exr?.id !== dioId || !/"authorization":\s*"\[redacted\]"/i.test(JSON.stringify(exr.requestHeaders ?? {}))) f.push(`read exchange: ${JSON.stringify(exr).slice(0, 300)}`);
+        const rr = await read('intercept://rules');
+        if (!rr?.rules?.some((x: Rule) => x.id === ruleId)) f.push(`read rules: ${JSON.stringify(rr).slice(0, 200)}`);
+        if (mid) {
+          const cr = await read(`intercept://contract/${encodeURIComponent(mid)}`);
+          if (!cr?.results?.[0]?.violations?.some((x: any) => x.path === '$.email')) f.push(`read contract: ${JSON.stringify(cr).slice(0, 300)}`);
+        }
+        const prompts = (await client.listPrompts()).prompts.map((x) => x.name).sort();
+        if (prompts.join(' ') !== 'build-api-layer-from-traffic debug-failing-request test-error-states verify-change') f.push(`prompts/list: ${prompts.join(', ')}`);
+        const pr = await client.getPrompt({ name: 'test-error-states', arguments: { url: USERS1 } });
+        const ptext = String((pr.messages[0]?.content as { text?: string })?.text ?? '');
+        if (!ptext.includes(USERS1) || !/add_mutation/.test(ptext)) f.push(`prompts/get: ${ptext.slice(0, 200)}`);
+
+        const rm = await mcpCall('remove_rule', { ruleId });
+        if (rm.isError || rm.result.removed !== true) f.push(`remove_rule: ${rm.text.slice(0, 200)}`);
+        else ruleId = undefined;
+        const s2 = await mcpCall('stop_app', { sessionId });
+        if (s2.isError || s2.result.stopped !== 1) f.push(`stop_app: ${s2.text.slice(0, 200)}`);
+        else sessionId = undefined;
+        out.output = notes.join('; ');
+      } catch (e) {
+        f.push(`exception: ${(e as Error).message}`);
+      } finally {
+        if (ruleId) await mcpCall('remove_rule', { ruleId }).catch(() => undefined);
+        if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
         await client?.close().catch(() => undefined);
         client = undefined;
       }

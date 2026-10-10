@@ -866,3 +866,106 @@ Rule validation (`validateRule`) accepts `throttle`, `fault`, `times` (int 1–1
   `remove_rule`, `abort_request`, `clear_requests`, `stop_app`; false otherwise. `destructiveHint: true` for
   `resend_request` and `simulate_network` (REVIEW-3 #7: it adds a rule per call with `url`; offline cuts the app off).
 - Instructions (`instructions.ts`) mention `get_request_source`, `get_body_shape` and `times`/`ttlMs` cleanup.
+
+## 10. v0.4.0 additions — "Your models vs the real API" (2026-10-09)
+
+Plan: docs/ROADMAP.md §4 (0.4.0), owners in docs/PLAN.md "v0.4.0". Types are already in code:
+`packages/proxy/src/types.ts` (`mutate`, `MutateOp`), `packages/proxy/src/jsonpath.ts` (signatures),
+`packages/extension/src/contract/types.ts`, `packages/extension/src/codegen/types.ts`, both `protocol.ts`.
+No new npm dependencies (no tree-sitter): Dart is read with careful hand-written scanners.
+
+### 10.1 Principles
+- The **wire contract is `_$XFromJson` in `*.g.dart`** (json_serializable; freezed delegates to it), not the
+  model class: it already has renamed keys (`json['avatar_url']`), nullability (`as String?`), defaults, nested
+  `X.fromJson`, `$enumDecode(_$RoleEnumMap, …)`, `DateTime.parse`, `(… as num).toDouble()`, list/map maps.
+  Anything we can't model (custom `fromJson`, `JsonConverter`s) becomes `{kind:'unknown'}` and is never flagged.
+- Everything agents read stays redacted (§8); codegen and fixtures use the redacted view.
+- The checker never blocks traffic: it runs after an exchange completes, off the hot path, cached per exchange.
+
+### 10.2 Proxy: `mutate` rule action
+`{ kind: 'mutate'; ops: MutateOp[] }` — forwards to the real server, then changes the JSON response before the
+app gets it (`null` / `delete` / `set` at a `jsonpath.ts` path; `[*]` expands). Buffered like a response
+breakpoint (h2 route, ≤ 32 MB), re-framed (content-length / encoding) like edits. Non-JSON or unparsable body →
+forwarded unchanged with a note in `Exchange.error` (state stays `completed`). Sets `Exchange.simulated` to e.g.
+`Mutated: $.avatar_url → null`; `matchedRuleId` as usual. Counts toward `times`. Under the network profile it
+behaves like any pass-through. `jsonpath.ts` is dependency-free and shared with the webview and the agent API.
+Measured semantics (docs/spikes/proxy.md v0.4.0): `set` may create a missing last object key, `null` / `delete`
+never create; ops that match nothing are reported in `error` on a `completed` exchange; applies to any status
+(error bodies too); output is compact JSON with **number literals kept byte-exact** (`1.0` stays a double for
+Dart; ints past 2^53 stay exact); body > 32 MB decoded → forwarded unchanged with a note, but > 32 MB **on the
+wire** still fails with the response-breakpoint 502 (mockttp buffers before `beforeResponse`). Chunked or > 5 MB
+request bodies skip the rule with a note, like breakpoints. `ruleFromExchange(e, 'mutate', id)` returns
+`{kind:'mutate', ops: []}` for the host to fill.
+`MutateOp.valueJson?: string` (and `mutateField.valueJson`): the `set` value as JSON text, written byte-exact; wins
+over `value`; must parse. UIs and agents send it whenever the literal matters (`1.0`, big ints).
+
+### 10.3 Extension: contract check (`src/contract/**`)
+- **Model index**: scan the workspace's `**/*.g.dart` (excluding `.dart_tool`, `build`, pub cache), parse every
+  `_$XFromJson` + enum maps into `WireModel`s, link each to its `part of` owner for `sourceFile`/lines; cached by
+  mtime; a FileSystemWatcher refreshes it (`onDidChangeModels`).
+- **API index**: Retrofit (`@RestApi(baseUrl:)`, `@GET('/users/{id}')`, `Future<User>`, `HttpResponse<User>`,
+  `List<User>`) and Chopper (`@ChopperApi(baseUrl:)`, `@Get(path:)`, `Response<User>`) declarations.
+- **Mapping request → model**, first that applies: (1) `user` choice saved in workspaceState
+  (`METHOD originless-url-template → model`); (2) `source`: an `Exchange.source` frame in a `*.g.dart` Retrofit
+  `_XApi.method` / Chopper `_$XService.method` → that endpoint's model; (3) `retrofit`/`chopper`: method + path
+  template match of the URL (longest/most literal match wins; baseUrl when known); else `none`.
+- **Check**: walk the JSON with the model (lists, maps, nested models, enums, DateTime strings, num→double,
+  int that is a double = error, `dynamic`/`unknown` = skip). `error` = `fromJson` would throw; `warning` = would
+  not throw but is suspicious (unknown enum with `unknownEnumValue`, extra keys are NOT reported). Stops after 50.
+- **Diagnostics**: a `DiagnosticCollection` ("Flutter Intercept contract") on the model field's line in
+  `sourceFile` (fallback: the `.g.dart`): `avatar_url is null in GET /users/42 → Null is not a subtype of
+  String`. Cleared when the exchange is evicted / traffic cleared / the model file changes. Setting
+  `flutterIntercept.contractCheck` (bool, default true).
+
+### 10.4 Extension: codegen (`src/codegen/**`, pure)
+- `generateModels`: merge every sample (field in some samples only → optional; seen null → nullable; int+double →
+  double; mixed → dynamic), nested objects → their own classes (singularised list item names), emit in the
+  project's style (freezed `@freezed` + `fromJson` factory; json_serializable `@JsonSerializable()` + `@JsonKey(name:)`
+  for non-camel keys; plain = hand-written `fromJson`/`toJson`). Dart-safe identifiers, reserved words handled.
+- `generateFixtureTest`: one JSON file per exchange under `test/fixtures/` + one test file using the style's API
+  (http_mock_adapter `DioAdapter.onGet(...).reply`, `package:http/testing` `MockClient`, or mocktail of the
+  Retrofit interface). Redacted bodies; `[redacted]` stays visible as a value.
+- `ApiEndpoint` carries `className`, `importUri`, `params: ApiParam[]`, `returnType` (contract agent fills them);
+  `ContractService.endpoints()` lists them; `FixtureGenInput.api` / `testPackage` let mocktail stub the real
+  Retrofit interface. JSON samples are decoded with `src/codegen/json.ts` `parseJsonSample` (keeps `1.0` a double).
+- `routeTemplate`: numeric, UUID, long hex, base64-ish segments → `{id}` (named from the previous segment when
+  it is a plural noun: `/users/42` → `/users/{userId}` is NOT done — always `{id}`, `{id2}` … for simplicity).
+
+### 10.5 Extension ↔ webview (amends §4)
+```ts
+// host → webview
+| { type: 'contract'; results: ContractSummary[] }   // after each check (batched, throttled)
+// webview → host
+| { type: 'pickModel'; id }                          // native QuickPick of models (+ "Don't check this route")
+| { type: 'openViolation'; id; index }               // open model field line
+| { type: 'mutateField'; id; path; op; value?; valueJson? } // rule {match: like ruleFromExchange, action: mutate[op]} FIRST
+| { type: 'generateModel'; id }                      // all recorded samples of the route → untitled editor(s)
+| { type: 'generateFixture'; id }                    // fixture JSON + test → untitled editors
+```
+Host obligations: `contract` for every completed JSON exchange when checking is on (and on `ready`, for the
+current snapshot); `rules` after `mutateField`; `error` on failures. The JSON tree's field context menu offers
+"Make null in next responses", "Remove from next responses", "Change value…".
+
+### 10.6 Agent API additions (amends §8)
+| Tool | R/W | Input | Output |
+|---|---|---|---|
+| `check_contract` | R | `{id?, url?, method?, sinceMs?, model?, limit?=20}` | `{results: ContractResult[]}` (paths project-relative) — one exchange by id, or the latest matching exchanges |
+| `generate_model` | R | `{id? \| url?, name?, style?}` | `{files: GeneratedFile[], samples: n}` (not written: the agent writes them) |
+| `generate_fixture_test` | R | `{ids? \| url?, style?, name?}` | `{files: GeneratedFile[]}` — redacted always |
+| `assert_traffic` | R | `{url, method?, sinceMs?, withinMs?=0 (≤120000), expect: {status?, count?: {min?, max?, exact?}, order?: string[] (url globs in order), json?: {path, exists?, equals?, type?}[], maxDurationMs?}}` | `{pass, matched, failures: string[]}` — waits up to `withinMs` for `count`/presence, never hangs |
+| `add_mutation` | W | `{url, method?, ops: MutateOp[], times?, ttlMs?, name?}` | `{ruleId}` inserted FIRST, `[agent] ` name |
+- MCP **resources**: `intercept://exchange/{id}` (the `get_request` view, JSON), `intercept://paused`,
+  `intercept://rules`, `intercept://contract/{id}`; listed via a resource template. **Prompts**:
+  `debug-failing-request {id?}`, `test-error-states {url}`, `verify-change {description}`,
+  `build-api-layer-from-traffic {urlPrefix}` — short, tool-oriented instructions. Change notifications only if
+  the installed SDK supports them cleanly (MCP 2026-07-28 replaces `resources/subscribe`; never build on Sampling).
+- Annotations: the new R tools `readOnlyHint: true`; `add_mutation` like `add_mock`.
+
+### 10.7 REVIEW-4 amendments
+- Agent URL patterns are **globs only** (no `/regex/`, ≤ 16 `*`), matched against the **redacted** URL when
+  redaction is on (every filter, `assert_traffic` url + `order`). Agent rules that pin a sensitive query value
+  are refused. User rules may still use `/regex/` if `isSafeRegexSource` accepts it (else: invalid, never matches).
+- `matches` / globs are linear-time; compiled matchers are memoised (`@flutter-intercept/proxy/rules`).
+- `selectPath(root, path, {limit?})` throws past 10 000 results; `applyOps(root, ops, {maxTargets?, maxWork?, inPlace?})`.
+- Contract index: regular files only, 1 MB per file, 64 MB total; `part of` only relative inside the workspace.
+- Redaction also by value: JWTs, Bearer/Basic credentials, long opaque tokens (§8 list extended).

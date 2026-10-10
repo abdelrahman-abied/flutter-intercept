@@ -11,6 +11,11 @@
  *   2^53, `1.0`, exponent forms and formatting all survive byte for byte). Text that isn't valid JSON
  *   falls back to a regex on `"name": "value"` pairs. `application/x-www-form-urlencoded` bodies are
  *   redacted like a query string.
+ * - REVIEW-4 #9: VALUES that look like credentials are redacted whatever their key or header name: JWTs
+ *   (`eyJ….….…`, also inside longer text), the credential after `Bearer` / `Basic` (≥ 16 chars with a digit), and whole values that are
+ *   long opaque tokens (≥ 32 chars of [A-Za-z0-9_-.~+/=] with upper case, lower case AND digits — so hex
+ *   hashes, UUIDs and ordinary ids are kept). Applied to header values, query values, path segments, JSON
+ *   string values and (JWT / Bearer only) any other text body.
  */
 
 export const REDACTED = '[redacted]';
@@ -27,13 +32,39 @@ export function isSensitiveField(name: string): boolean {
   return FIELD.test(name);
 }
 
+const JWT = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g;
+const AUTH_SCHEME = /\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+\/=-]{16,})/gi;
+const OPAQUE = /^[A-Za-z0-9_\-.~+/=]{32,}$/;
+
+/** A whole value that is a long opaque token (mixed upper, lower and digits; see the header). */
+export function isOpaqueToken(v: string): boolean {
+  return OPAQUE.test(v) && /[A-Z]/.test(v) && /[a-z]/.test(v) && /\d/.test(v);
+}
+
+/**
+ * `text` with credential-looking values blanked (REVIEW-4 #9). `whole` = the text is one value (a header,
+ * query or JSON string value), so a long opaque token as the entire value is redacted too.
+ */
+export function redactSecretValues(text: string, whole = false): string {
+  if (whole && isOpaqueToken(text)) return REDACTED;
+  if (!text.includes('eyJ') && !/bearer|basic/i.test(text)) return text;
+  // a credential after the scheme has a digit (prose like "basic informational" is kept)
+  return text.replace(JWT, REDACTED).replace(AUTH_SCHEME, (m, scheme: string, sp: string, cred: string) => (/\d/.test(cred) ? `${scheme}${sp}${REDACTED}` : m));
+}
+
 export type Headers = Record<string, string | string[]>;
 
 export function redactHeaders(headers: Headers | undefined): Headers | undefined {
   if (!headers) return headers;
   const out: Headers = {};
   for (const [k, v] of Object.entries(headers)) {
-    out[k] = isSensitiveHeader(k) ? (Array.isArray(v) ? v.map(() => REDACTED) : REDACTED) : v;
+    out[k] = isSensitiveHeader(k)
+      ? Array.isArray(v)
+        ? v.map(() => REDACTED)
+        : REDACTED
+      : Array.isArray(v)
+        ? v.map((x) => redactSecretValues(x, true))
+        : redactSecretValues(v, true);
   }
   return out;
 }
@@ -53,18 +84,48 @@ export function redactQueryString(qs: string): string {
       } catch {
         // keep raw
       }
-      return isSensitiveField(key) ? `${rawKey}=${REDACTED}` : part;
+      if (isSensitiveField(key)) return `${rawKey}=${REDACTED}`;
+      if (eq === -1) return part;
+      const rawValue = part.slice(eq + 1);
+      let value = rawValue;
+      try {
+        value = decodeURIComponent(rawValue.replace(/\+/g, ' '));
+      } catch {
+        // keep raw
+      }
+      return redactSecretValues(value, true) !== value ? `${rawKey}=${REDACTED}` : part;
     })
     .join('&');
 }
 
+/** Path segments that are JWTs / opaque tokens (e.g. `/reset/eyJ…`) → "[redacted]". */
+function redactPath(p: string): string {
+  return p
+    .split('/')
+    .map((seg) => {
+      let v = seg;
+      try {
+        v = decodeURIComponent(seg);
+      } catch {
+        // keep raw
+      }
+      return redactSecretValues(v, true) !== v ? REDACTED : seg;
+    })
+    .join('/');
+}
+
 export function redactUrl(url: string): string {
   const q = url.indexOf('?');
-  if (q === -1) return url;
+  const hash0 = url.indexOf('#');
+  const pathEnd = q !== -1 ? q : hash0 !== -1 ? hash0 : url.length;
+  // keep scheme://authority as is; redact the path segments
+  const auth = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i.exec(url)?.[0] ?? '';
+  const head = auth + redactPath(url.slice(auth.length, pathEnd));
+  if (q === -1) return head + url.slice(pathEnd);
   const hash = url.indexOf('#', q);
   const query = hash === -1 ? url.slice(q + 1) : url.slice(q + 1, hash);
   const tail = hash === -1 ? '' : url.slice(hash);
-  return `${url.slice(0, q + 1)}${redactQueryString(query)}${tail}`;
+  return `${head}?${redactQueryString(query)}${tail}`;
 }
 
 // ------------------------------------------------------------------ lossless JSON redaction
@@ -187,8 +248,17 @@ export function redactJsonText(text: string): string {
       }
     }
     const start = i;
-    if (c === '"') str();
-    else if (((NUM.lastIndex = i), NUM.test(text))) i = NUM.lastIndex;
+    if (c === '"') {
+      const raw = str();
+      if (redact) {
+        out += `"${REDACTED}"`;
+        return;
+      }
+      const decoded = JSON.parse(raw) as string;
+      const cleaned = redactSecretValues(decoded, true);
+      out += cleaned === decoded ? raw : JSON.stringify(cleaned);
+      return;
+    } else if (((NUM.lastIndex = i), NUM.test(text))) i = NUM.lastIndex;
     else if (text.startsWith('true', i)) i += 4;
     else if (text.startsWith('false', i)) i += 5;
     else if (text.startsWith('null', i)) i += 4;
@@ -213,7 +283,7 @@ const PAIR = /("((?:[^"\\]|\\.)*)"\s*:\s*)("(?:[^"\\]|\\.)*"|-?\d[\d.eE+-]*|true
 
 /** Fallback for text that isn't valid JSON: redact `"name": value` pairs by regex. */
 export function redactJsonLikeText(text: string): string {
-  return text.replace(PAIR, (whole, prefix: string, name: string) => (isSensitiveField(name) ? `${prefix}"${REDACTED}"` : whole));
+  return redactSecretValues(text.replace(PAIR, (whole, prefix: string, name: string) => (isSensitiveField(name) ? `${prefix}"${REDACTED}"` : whole)));
 }
 
 function headerValue(headers: Headers | undefined, name: string): string | undefined {
@@ -234,5 +304,6 @@ export function redactBodyText(text: string, headers?: Headers): string {
       return redactJsonLikeText(text);
     }
   }
-  return text.includes('"') ? redactJsonLikeText(text) : text;
+  // text, multipart, GraphQL strings …: JWTs and Bearer credentials anywhere (REVIEW-4 #9)
+  return text.includes('"') ? redactJsonLikeText(text) : redactSecretValues(text);
 }

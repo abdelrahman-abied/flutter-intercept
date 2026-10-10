@@ -31,7 +31,9 @@ export type HostMsg =
   | { type: 'removed'; ids: string[] }
   | { type: 'error'; message: string }
   | { type: 'cleared' }
-  | { type: 'sent'; id: string }; // CONTRACTS §9.3: after a successful 'send'
+  | { type: 'sent'; id: string } // CONTRACTS §9.3: after a successful 'send'
+  // CONTRACTS §10.5
+  | { type: 'contract'; results: ContractSummary[] };
 
 // webview → host
 export type ViewMsg =
@@ -46,7 +48,23 @@ export type ViewMsg =
   | { type: 'send'; request: SendDraft; resentFrom?: string }
   | { type: 'openSource'; id: string; frame?: number }
   | { type: 'copySnippet'; id: string; format: SnippetFormat }
-  | { type: 'setNetworkProfile'; profile: NetworkProfile };
+  | { type: 'setNetworkProfile'; profile: NetworkProfile }
+  // CONTRACTS §10.5
+  | { type: 'pickModel'; id: string }                                  // host shows a model QuickPick, remembers, re-checks
+  | { type: 'openViolation'; id: string; index: number }               // opens the model field's line
+  | { type: 'mutateField'; id: string; path: string; op: 'null' | 'delete' | 'set'; value?: unknown; valueJson?: string } // rule inserted FIRST; valueJson = byte-exact JSON text
+  | { type: 'generateModel'; id: string }                              // host opens untitled Dart model(s)
+  | { type: 'generateFixture'; id: string };                           // host opens untitled fixture + test
 
 export type SnippetFormat = 'curl' | 'dart_http' | 'dio';
 export interface SendDraft { method: string; url: string; headers?: Record<string, string | string[]>; body?: string }
+
+/** CONTRACTS §10.5: the contract check of one exchange, as the panel shows it. */
+export interface ContractSummary {
+  id: string;
+  checked: boolean;
+  model?: string;
+  via: 'retrofit' | 'chopper' | 'source' | 'user' | 'none';
+  violations: { path: string; field: string; expected: string; actual: string; severity: 'error' | 'warning'; message: string }[];
+  reason?: string;
+}

@@ -66,6 +66,11 @@
           "default": true,
           "description": "Record where in your code each request was made (a stack trace sent out of band to the proxy), so you can jump from a request to its source line. Takes effect on the next launch. Flutter sessions only (plain Dart programs always record)."
         },
+        "flutterIntercept.contractCheck": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check JSON responses against your json_serializable / freezed models (their generated *.g.dart) and show fields that would make fromJson throw, such as a null in a non-nullable field."
+        },
         "flutterIntercept.rewriteLocalhost": {
           "type": "boolean",
           "default": true,
@@ -177,7 +182,7 @@
         "toolReferenceName": "interceptListRequests",
         "canBeReferencedInPrompt": true,
         "userDescription": "List recorded HTTP requests.",
-        "modelDescription": "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob or /regex/, method, status (code, class like \"4xx\", or \"error\"), state or start time. Returns ids; call get_request for headers and bodies. Secrets are redacted.",
+        "modelDescription": "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state or start time. Returns ids; call get_request for headers and bodies. Secrets are redacted.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -185,7 +190,7 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 8192,
-              "description": "URL to match: a glob on the full URL where * matches any characters (e.g. \"https://api.example.com/v1/users*\"), or /regex/flags."
+              "description": "URL glob on the full URL; * matches any characters (e.g. \"https://api.example.com/v1/users*\", \"*/users/*\"). Matched against the URL as you see it (redacted query values read \"[redacted]\")."
             },
             "method": {
               "type": "string",
@@ -312,7 +317,7 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 8192,
-              "description": "URL to match: a glob on the full URL where * matches any characters (e.g. \"https://api.example.com/v1/users*\"), or /regex/flags."
+              "description": "URL glob on the full URL; * matches any characters (e.g. \"https://api.example.com/v1/users*\", \"*/users/*\"). Matched against the URL as you see it (redacted query values read \"[redacted]\")."
             },
             "method": {
               "type": "string",
@@ -432,7 +437,7 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 8192,
-              "description": "URL to match: a glob on the full URL where * matches any characters (e.g. \"https://api.example.com/v1/users*\"), or /regex/flags."
+              "description": "URL glob on the full URL; * matches any characters (e.g. \"https://api.example.com/v1/users*\", \"*/users/*\"). Matched against the URL as you see it (redacted query values read \"[redacted]\")."
             },
             "method": {
               "type": "string",
@@ -536,6 +541,320 @@
         ]
       },
       {
+        "name": "flutter_intercept_check_contract",
+        "displayName": "Flutter Intercept: Check responses against the Dart models",
+        "toolReferenceName": "interceptCheckContract",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Check JSON responses against the Dart models.",
+        "modelDescription": "Check recorded JSON responses against the app's own Dart models — exactly what the generated fromJson (json_serializable / freezed *.g.dart) would do with them. Finds the fields that would make parsing throw (error: a null or missing non-nullable field, a string where an int is expected, an unknown enum value) or are suspicious (warning). Pass id for one exchange, or url/method/sinceMs for the latest matching ones; model forces a model class. Each result says which model was used and how it was found (via: retrofit/chopper annotations, the request's stack trace, or the user's choice), or checked:false with the reason (no model mapped, not JSON, …). Violations give the JSON path, the model field, expected vs actual type and the model file:line (project-relative). Use it when the app shows a parse error (\"type 'Null' is not a subtype of type 'String'\") or after changing a model.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "Check this one exchange. Omit to check the latest matching JSON responses.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL glob on the full URL; * matches any characters (e.g. \"https://api.example.com/v1/users*\", \"*/users/*\"). Matched against the URL as you see it (redacted query values read \"[redacted]\")."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "sinceMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Only exchanges that started at or after this time (epoch milliseconds)."
+            },
+            "model": {
+              "description": "Check against this Dart model class (e.g. \"User\") instead of the one found automatically.",
+              "type": "string",
+              "maxLength": 100,
+              "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+            },
+            "limit": {
+              "default": 20,
+              "description": "Max exchanges to check when no id is given (newest first), 1-50.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_generate_model",
+        "displayName": "Flutter Intercept: Generate Dart models from traffic",
+        "toolReferenceName": "interceptGenerateModel",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Generate Dart models from recorded responses.",
+        "modelDescription": "Generate Dart model classes from the app's recorded JSON responses: every recorded sample of the same method + route is merged (a field missing in some samples becomes optional, a field seen null becomes nullable, int+double becomes double), nested objects get their own classes. Style follows the project (freezed, json_serializable or plain fromJson/toJson) unless style is given. Returns {files: [{path, content}], samples, route}: nothing is written, so write the files yourself (paths are suggestions relative to the project) and run build_runner for freezed/json_serializable. Secret field values are redacted before inference. Make the app call the endpoint a few times with different data first for better nullability.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "A recorded exchange; every recorded response of the same method + route (e.g. GET /users/{id}) is used as a sample.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "url": {
+              "description": "Or: the newest matching JSON response picks the route; all its recorded samples are used.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
+            },
+            "name": {
+              "description": "Root class name (default: from the URL, e.g. \"User\" for /users/{id}).",
+              "type": "string",
+              "maxLength": 100,
+              "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+            },
+            "style": {
+              "description": "Code style. Default: the project's own (freezed > json_serializable > plain, from pubspec.yaml).",
+              "type": "string",
+              "enum": [
+                "freezed",
+                "json_serializable",
+                "plain"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_generate_fixture_test",
+        "displayName": "Flutter Intercept: Generate a fixture test from traffic",
+        "toolReferenceName": "interceptGenerateFixtureTest",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Generate JSON fixtures and a test from recorded requests.",
+        "modelDescription": "Turn recorded exchanges into a test: one JSON fixture file per response under test/fixtures/ plus a test file that serves them with the project's mocking library (http_mock_adapter for Dio, package:http's MockClient, or mocktail for a Retrofit interface). Pass ids or a url glob. Returns {files: [{path, content}]} without writing them; adjust the generated test to call your repository/service and assert what matters. Always built from the redacted view: secrets appear as \"[redacted]\".",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "ids": {
+              "description": "Recorded exchanges to turn into fixtures (1-20).",
+              "minItems": 1,
+              "maxItems": 20,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              }
+            },
+            "url": {
+              "description": "Or: the newest (up to 20) finished exchanges matching this URL.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
+            },
+            "style": {
+              "description": "Test style. Default: the project's own dev_dependencies (http_mock_adapter > mocktail > mock_client).",
+              "type": "string",
+              "enum": [
+                "http_mock_adapter",
+                "mock_client",
+                "mocktail"
+              ]
+            },
+            "name": {
+              "description": "snake_case base name for the files (default: from the first request, e.g. \"get_user\").",
+              "type": "string",
+              "maxLength": 60,
+              "pattern": "^[a-z][a-z0-9_]*$"
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_assert_traffic",
+        "displayName": "Flutter Intercept: Assert on recorded traffic",
+        "toolReferenceName": "interceptAssertTraffic",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Check that expected requests and responses happened.",
+        "modelDescription": "Check in one call that the app made the expected requests: matching url (glob; * matches any characters) and method since sinceMs (default: the latest launch_app/hot_restart, else all recorded traffic), with expect: status (code, \"2xx\".., \"error\"), count {min, max, exact} (default: at least one), order (URL globs requested in that order), json assertions on every matched response ({path: \"$.items[0].id\", exists | equals | type}), maxDurationMs. withinMs waits (event-driven, max 120 s) for the requests to arrive; it never hangs. Returns {pass, matched, ids, failures: [readable reasons]}. Failure texts name the request, path and expectation but never echo response values; equals compares with the redacted view (a secret only equals \"[redacted]\"). Use it as the final check of a change instead of reading bodies by hand.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "Requests to check: a glob on the full URL; * matches any characters."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "sinceMs": {
+              "description": "Only requests that started at or after this time (epoch ms). Default: the start of the latest launch_app/hot_restart if within the last 120 s, otherwise all recorded traffic.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "withinMs": {
+              "default": 0,
+              "description": "Wait up to this long (max 120000) for the expected requests. 0 = check what is recorded now. With count.max or count.exact the whole window is observed.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 120000
+            },
+            "expect": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "description": "Every matched request has this status: a code, a class (\"2xx\"..\"5xx\") or \"error\".",
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    {
+                      "type": "string",
+                      "enum": [
+                        "1xx",
+                        "2xx",
+                        "3xx",
+                        "4xx",
+                        "5xx",
+                        "error"
+                      ]
+                    }
+                  ]
+                },
+                "count": {
+                  "description": "How many matching requests. Default: at least one.",
+                  "type": "object",
+                  "properties": {
+                    "min": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 1000
+                    },
+                    "max": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 1000
+                    },
+                    "exact": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 1000
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "order": {
+                  "description": "URL globs that must have been requested in this order (each one starting after the previous one), among all requests since sinceMs.",
+                  "minItems": 2,
+                  "maxItems": 20,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8192,
+                    "description": "URL glob on the full URL; * matches any characters (e.g. \"https://api.example.com/v1/users*\", \"*/users/*\"). Matched against the URL as you see it (redacted query values read \"[redacted]\")."
+                  }
+                },
+                "json": {
+                  "minItems": 1,
+                  "maxItems": 20,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000,
+                        "description": "JSON path into the response body: \"$.user.avatar_url\", \"$.items[0].id\", \"$.items[*].price\" ([*] = every element), \"$['odd key']\". No filters or \"..\"."
+                      },
+                      "exists": {
+                        "description": "true: the path selects at least one value; false: it selects nothing. Default true when neither equals nor type is given.",
+                        "type": "boolean"
+                      },
+                      "equals": {
+                        "description": "Every selected value deep-equals this JSON value. Compared with what get_request shows: a secret field only equals \"[redacted]\"."
+                      },
+                      "type": {
+                        "description": "Every selected value has this JSON type (\"integer\" = a whole number).",
+                        "type": "string",
+                        "enum": [
+                          "string",
+                          "number",
+                          "integer",
+                          "boolean",
+                          "null",
+                          "object",
+                          "array"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "path"
+                    ],
+                    "additionalProperties": false,
+                    "description": "An assertion on the JSON response body of every matched request."
+                  }
+                },
+                "maxDurationMs": {
+                  "description": "Every matched request finished within this many ms.",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 600000
+                }
+              },
+              "additionalProperties": false,
+              "description": "What must hold. Every given expectation is checked."
+            }
+          },
+          "required": [
+            "url",
+            "expect"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
         "name": "flutter_intercept_add_mock",
         "displayName": "Flutter Intercept: Add mock rule",
         "toolReferenceName": "interceptAddMock",
@@ -549,7 +868,7 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 8192,
-              "description": "URL to match: a glob on the full URL where * matches any characters (e.g. \"https://api.example.com/v1/users*\"), or /regex/flags."
+              "description": "URL glob on the full URL; * matches any characters (e.g. \"https://api.example.com/v1/users*\", \"*/users/*\"). Matched against the URL as you see it (redacted query values read \"[redacted]\")."
             },
             "method": {
               "type": "string",
@@ -642,7 +961,7 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 8192,
-              "description": "URL to match: a glob on the full URL where * matches any characters (e.g. \"https://api.example.com/v1/users*\"), or /regex/flags."
+              "description": "URL glob on the full URL; * matches any characters (e.g. \"https://api.example.com/v1/users*\", \"*/users/*\"). Matched against the URL as you see it (redacted query values read \"[redacted]\")."
             },
             "method": {
               "type": "string",
@@ -709,7 +1028,7 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 8192,
-              "description": "URL to match: a glob on the full URL where * matches any characters (e.g. \"https://api.example.com/v1/users*\"), or /regex/flags."
+              "description": "URL glob on the full URL; * matches any characters (e.g. \"https://api.example.com/v1/users*\", \"*/users/*\"). Matched against the URL as you see it (redacted query values read \"[redacted]\")."
             },
             "method": {
               "type": "string",
@@ -1002,7 +1321,7 @@
         "toolReferenceName": "interceptSimulateNetwork",
         "canBeReferencedInPrompt": true,
         "userDescription": "Throttle or break the network for the app or for matching requests.",
-        "modelDescription": "Simulate bad network conditions to test loading states, timeouts, retries and offline handling. Without url: set the profile for ALL app traffic: \"slow-3g\", \"fast-3g\", \"flaky\" (20% of requests fail), \"offline\" (every request fails), \"custom\" (latencyMs, kbps, dropRate), or \"none\" to restore normal speed (do this when done). With url (glob or /regex/): add a rule, inserted first, that slows only matching requests with the given profile, or makes them fail with fault (\"reset\", \"timeout\", \"truncate\", \"dns\"); times / ttlMs remove the rule automatically, otherwise use remove_rule. Mocks and blocks still answer instantly. get_status shows the active profile; affected exchanges carry a \"simulated\" label.",
+        "modelDescription": "Simulate bad network conditions to test loading states, timeouts, retries and offline handling. Without url: set the profile for ALL app traffic: \"slow-3g\", \"fast-3g\", \"flaky\" (20% of requests fail), \"offline\" (every request fails), \"custom\" (latencyMs, kbps, dropRate), or \"none\" to restore normal speed (do this when done). With url (a glob; * matches any characters): add a rule, inserted first, that slows only matching requests with the given profile, or makes them fail with fault (\"reset\", \"timeout\", \"truncate\", \"dns\"); times / ttlMs remove the rule automatically, otherwise use remove_rule. Mocks and blocks still answer instantly. get_status shows the active profile; affected exchanges carry a \"simulated\" label.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1037,7 +1356,7 @@
               "maximum": 1
             },
             "url": {
-              "description": "Only affect requests matching this URL glob or /regex/ (adds a rule, inserted first). Omit to set the profile for ALL app traffic.",
+              "description": "Only affect requests matching this URL glob (adds a rule, inserted first). Omit to set the profile for ALL app traffic.",
               "type": "string",
               "minLength": 1,
               "maxLength": 8192
@@ -1145,6 +1464,99 @@
           },
           "required": [
             "id"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_add_mutation",
+        "displayName": "Flutter Intercept: Add response mutation rule",
+        "toolReferenceName": "interceptAddMutation",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Add a rule that changes fields of real JSON responses.",
+        "modelDescription": "Let matching requests reach the real server, then change its JSON response before the app gets it: ops [{path: \"$.user.avatar_url\", op: \"null\"}, {path: \"$.items[*].price\", op: \"set\", value: \"9.99\"}, {path: \"$.email\", op: \"delete\"}]. For an exact number form use valueJson (JSON text written byte-exact) instead of value: \"1.0\" to send a double (an int-typed Dart field then throws), integers beyond 2^53. Use it to reproduce or test how the app handles a null/missing/mistyped field from the backend (e.g. \"Null is not a subtype of String\") without mocking the whole response. Non-JSON responses pass unchanged. The rule is inserted first; times (e.g. 1) or ttlMs remove it automatically, otherwise use remove_rule. Affected exchanges carry a \"simulated\" label; check_contract shows what the models make of them.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL glob on the full URL; * matches any characters (e.g. \"https://api.example.com/v1/users*\", \"*/users/*\"). Matched against the URL as you see it (redacted query values read \"[redacted]\")."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "ops": {
+              "minItems": 1,
+              "maxItems": 20,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "description": "JSON path into the response body: \"$.user.avatar_url\", \"$.items[0].id\", \"$.items[*].price\" ([*] = every element), \"$['odd key']\". No filters or \"..\"."
+                  },
+                  "op": {
+                    "type": "string",
+                    "enum": [
+                      "null",
+                      "delete",
+                      "set"
+                    ],
+                    "description": "\"null\" sets the field to null, \"delete\" removes the key (or array element), \"set\" replaces it with `value`."
+                  },
+                  "value": {
+                    "description": "With op \"set\": the new JSON value, e.g. \"42\" to send a number as a string. Max 1 MB."
+                  },
+                  "valueJson": {
+                    "description": "With op \"set\", instead of value: the new value as JSON text, written byte-exact. Use it when the exact number form matters: \"1.0\" (a double, which Dart parses as double, not int), integers beyond 2^53 (\"12345678901234567890\"), \"1e3\". Wins over value.",
+                    "type": "string",
+                    "maxLength": 1048576
+                  }
+                },
+                "required": [
+                  "path",
+                  "op"
+                ],
+                "additionalProperties": false,
+                "description": "One change to the JSON response body."
+              },
+              "description": "Changes applied in order to the real JSON response (1-20)."
+            },
+            "times": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "description": "Apply the rule to the first N matching requests only (1-1000); it is then removed automatically."
+            },
+            "ttlMs": {
+              "type": "integer",
+              "minimum": 1000,
+              "maximum": 86400000,
+              "description": "Remove the rule automatically after this many milliseconds (1000-86400000)."
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Optional label; it is shown as \"[agent] <name>\" in the rules list."
+            }
+          },
+          "required": [
+            "url",
+            "ops"
           ],
           "additionalProperties": false
         },

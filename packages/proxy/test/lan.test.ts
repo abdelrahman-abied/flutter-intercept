@@ -229,6 +229,20 @@ describe.skipIf(!LAN_IP)(`LAN mode on ${LAN_IP ?? '(no LAN IPv4)'}`, () => {
     expect(ex).toMatchObject({ state: 'completed', url: `${up.httpUrl}/echo` });
   });
 
+  it('mutate rule (v0.4.0): applies to LAN clients; the SSRF guard still refuses local targets first', async () => {
+    proxy.setRules([{ id: 'mut', enabled: true, match: { url: '*' }, action: { kind: 'mutate', ops: [{ path: '$.hello', op: 'null' }] } }]);
+    const r = await lanGet(lanPort, `${up.httpUrl}/json`);
+    expect(r).toEqual({ status: 200, text: '{"hello":null}' });
+    const denied = await lanGet(lanPort, `http://127.0.0.1:${new URL(other.httpUrl).port}/json`);
+    expect(denied.status).toBe(403);
+    expect(other.hits).toEqual([]);
+    const ex = await settled(proxy);
+    expect(ex.map((e) => [e.state, e.viaLan, e.simulated])).toEqual([
+      ['completed', true, 'Mutated: $.hello → null'],
+      ['error', true, undefined],
+    ]);
+  });
+
   it('SSRF: loopback, localhost, ::1, the LAN IP itself and link-local are refused (403, recorded as error)', async () => {
     const otherPort = new URL(other.httpUrl).port;
     const targets = [

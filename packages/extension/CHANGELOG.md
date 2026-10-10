@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.0
+
+### Your models vs the real API
+
+**Model check**
+- Every JSON response is checked against your json_serializable / freezed models, using the generated
+  `_$UserFromJson` in `*.g.dart` (the code that actually runs on it), so renamed keys, nullability, defaults,
+  enums, nested models and lists are exactly what your app expects.
+- A field that would make `fromJson` throw shows as an error on that field in your model file, for example
+  `email is null in GET /users/1 → type 'Null' is not a subtype of type 'String' in type cast`, and as a
+  badge plus a **Model check** section on the request.
+- Requests are matched to models through your Retrofit or Chopper API declarations, the call stack, or your
+  own choice (**Check against a model…**). Filter with `contract:error`.
+- Setting `flutterIntercept.contractCheck`.
+
+**Break a field on purpose**
+- Right-click any field in a response: **Make null in next responses**, **Remove from next responses** or
+  **Change value…**. The real response arrives with that change, so you can reproduce the crash and test the fix.
+  Numbers keep their exact form (`1.0` stays a double).
+- New rule action **Mutate JSON** for the same, with several changes per rule.
+
+**Generate code from traffic**
+- **Generate Dart model** from a response: every recorded sample of that route is merged (fields seen only
+  sometimes become optional, `null` makes them nullable), in your project's style (freezed, json_serializable
+  or plain).
+- **Generate test fixture**: the recorded responses as JSON fixtures plus a test using http_mock_adapter,
+  `package:http` `MockClient` or mocktail of your Retrofit interface. Secrets are always redacted.
+
+### Agent API
+- New tools: `check_contract`, `generate_model`, `generate_fixture_test`, `assert_traffic` (pass/fail checks
+  on status, count, order, JSON paths and duration) and `add_mutation`.
+- MCP resources (`intercept://exchange/{id}`, `intercept://paused`, `intercept://rules`,
+  `intercept://contract/{id}`) and prompts (`debug-failing-request`, `test-error-states`, `verify-change`,
+  `build-api-layer-from-traffic`).
+
 ## 0.3.0
 
 ### Where did this request come from?

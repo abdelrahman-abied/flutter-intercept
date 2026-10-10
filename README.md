@@ -46,6 +46,9 @@ Intercept skips all of that:
 | **Copy and resend** | Copy as cURL, Dart http or Dio. Resend a request, or edit it first. |
 | **Bad networks** | Offline, Slow 3G, Flaky or custom, for your app only. Throttle and fault rules per endpoint. |
 | **Search** | `m:POST s:4xx body:"token" src:login_page.dart` and friends. |
+| **Model check** | Each JSON response is checked against your json_serializable / freezed models; fields that would crash `fromJson` are flagged in your model file. |
+| **Break a field** | Make a field null, remove it or change it in real responses to reproduce crashes. |
+| **Generate code** | Dart models and fixture tests from recorded traffic. |
 | **Rules** | Glob or `/regex/` URL matching plus method. First match wins. Saved per workspace. |
 | **Theme-aware** | Follows your VS Code theme: light, dark and high contrast. |
 

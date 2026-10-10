@@ -14,6 +14,11 @@ export const READ_TOOLS = [
   // CONTRACTS §9.5
   'get_request_source',
   'get_body_shape',
+  // CONTRACTS §10.6
+  'check_contract',
+  'generate_model',
+  'generate_fixture_test',
+  'assert_traffic',
 ] as const;
 
 export const WRITE_TOOLS = [
@@ -30,6 +35,8 @@ export const WRITE_TOOLS = [
   // CONTRACTS §9.5
   'simulate_network',
   'resend_request',
+  // CONTRACTS §10.6
+  'add_mutation',
 ] as const;
 
 export type ReadToolName = (typeof READ_TOOLS)[number];

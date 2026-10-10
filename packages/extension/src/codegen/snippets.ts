@@ -134,7 +134,7 @@ function toCurl(req: SnippetRequest): string {
 
 // ------------------------------------------------------------------ Dart
 
-/** A Dart single-quoted string literal with everything escaped (`$` included). */
+/** A Dart single-quoted string literal with everything escaped (`$`, controls and invisible/bidi characters included). */
 export function dartString(s: string): string {
   let out = "'";
   for (const ch of s) {
@@ -145,11 +145,14 @@ export function dartString(s: string): string {
     else if (ch === '\n') out += '\\n';
     else if (ch === '\r') out += '\\r';
     else if (ch === '\t') out += '\\t';
-    else if (c < 0x20 || c === 0x7f) out += `\\u{${c.toString(16)}}`;
+    else if (INVISIBLE_CHAR.test(ch)) out += `\\u{${c.toString(16)}}`; // controls, bidi, zero-width … (REVIEW-4 #10)
     else out += ch;
   }
   return out + "'";
 }
+
+/** Control (Cc), format (Cf: bidi, zero-width, BOM …) and line/paragraph separator characters. */
+const INVISIBLE_CHAR = /^[\p{Cc}\p{Cf}\u2028\u2029]$/u;
 
 /** A readable body literal: a raw multi-line string when that is lossless, else an escaped one. */
 export function dartBodyLiteral(s: string): string {
@@ -158,8 +161,7 @@ export function dartBodyLiteral(s: string): string {
     !s.includes("'''") &&
     !s.endsWith("'") &&
     !/^[ \t]*\n/.test(s) && // a leading blank line would be stripped by Dart
-    // eslint-disable-next-line no-control-regex
-    !/[\x00-\x08\x0b-\x1f\x7f]/.test(s);
+    !/[\p{Cc}\p{Cf}\u2028\u2029]/u.test(s.replace(/[\t\n]/g, '')); // invisible characters need escapes
   return rawOk ? `r'''${s}'''` : dartString(s);
 }
 

@@ -231,7 +231,15 @@ describe('texts', () => {
       'This changes the origin from `https://api.example.com`, so the call will be refused.',
     );
     expect(confirmationText('resend_request', { id: 'e1' }).message).toContain('was not found');
-    expect(invocationMessage('get_body_shape', { id: 'e1' })).toBe('Reading the response body structure of e1');
+    expect(invocationMessage('get_body_shape', { id: 'e1' })).toBe('Reading the response body structure of e1');    // CONTRACTS §10.6
+    expect(
+      confirmationText('add_mutation', { url: '*/users/*', method: 'get', ops: [{ path: '$.avatar_url', op: 'null' }, { path: '$.id', op: 'set', value: '42' }, { path: '$.x`y', op: 'delete' }], times: 1 }).message,
+    ).toBe(
+      'For GET `*/users/*`: forward to the real server, then set `$.avatar_url` to **null**, set `$.id` to `"42"`, **remove** `$.x y` in the JSON response before the app gets it (only the next matching request; then removed automatically).\n\nInserted as the first rule.',
+    );
+    expect(invocationMessage('assert_traffic', { url: '*/a', method: 'post', withinMs: 5000 })).toBe('Checking traffic for POST */a (waiting up to 5 s)');
+    expect(invocationMessage('check_contract', { id: 'e1' })).toBe('Checking request e1 against the Dart models');
+    expect(invocationMessage('generate_fixture_test', { ids: ['a', 'b'] })).toBe('Generating a fixture test from 2 request(s)');
   });
 
   it('formatResult is pretty when small and compact when large', () => {

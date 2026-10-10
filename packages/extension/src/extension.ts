@@ -22,8 +22,11 @@ import { lanAddressForIphone } from './lanAddress';
 import { LanNetworkWatcher, netFingerprint } from './lanWatch';
 import { LanLifecycle } from './lanLifecycle';
 import { InterceptProxyHost } from './proxyHost';
+import { createCodegenService } from './codegen/service';
+import type { GeneratedFile } from './codegen/types';
+import { createContractService, DONT_CHECK } from './contract/service';
 import { openFrame } from './source/open';
-import { packageRootsFor, resolveFrames } from './source/resolve';
+import { checkSourcePath, packageRootsFor, resolveFrames } from './source/resolve';
 import { InterceptController, validateRules } from './ui/controller';
 import { TrafficViewProvider, VIEW_ID } from './ui/view';
 
@@ -172,6 +175,12 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     await cfg.update('enabled', enabled, target);
   };
 
+  // CONTRACTS §10: models vs the real API. The controller runs the checks; the service owns diagnostics.
+  const contract = createContractService({ workspaceState: context.workspaceState, log });
+  context.subscriptions.push(contract);
+  const codegen = createCodegenService();
+  const contractCheckEnabled = () => vscode.workspace.getConfiguration('flutterIntercept').get<boolean>('contractCheck', true);
+
   const controller = new InterceptController({
     host: proxyHost,
     saveRules: (rules) => context.workspaceState.update(RULES_KEY, rules),
@@ -190,7 +199,52 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       await openFrame(resolved, { allowedRoots: [...workspace, ...packageRootsFor(roots)] });
     },
     copyToClipboard: (text) => Promise.resolve(vscode.env.clipboard.writeText(text)),
+    contract,
+    contractCheckEnabled,
+    onContractRemoved: (ids) => contract.forget(ids),
+    pickModel: (ex) => pickModel(ex),
+    openLocation: async (file, line) => {
+      // REVIEW-4 #3: model files come from workspace scans that may follow `part of` paths; open only
+      // workspace and package files (same guard as "Open source", REVIEW-3 #3).
+      const workspace = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+      const safe = checkSourcePath(file, [...workspace, ...packageRootsFor(flutterProjectRoots())]);
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(safe));
+      const pos = new vscode.Position(Math.max(0, line - 1), 0);
+      await vscode.window.showTextDocument(doc, { selection: new vscode.Range(pos, pos), preview: true });
+    },
+    codegen,
+    openUntitled: (files) => openUntitled(files),
+    projectRoot: () => flutterProjectRoot(),
+    appPackageName: () => appPackageNames(flutterProjectRoots())[0],
   });
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('flutterIntercept.contractCheck')) controller.recheckContracts();
+    }),
+  );
+  async function pickModel(ex: Exchange): Promise<string | undefined | null> {
+    const models = await contract.models();
+    type Item = vscode.QuickPickItem & { value: string | undefined };
+    const items: Item[] = [
+      ...models.map((m) => ({ label: m.name, description: vscode.workspace.asRelativePath(m.file), value: m.name })),
+      ...models.map((m) => ({ label: `List<${m.name}>`, description: 'a JSON array of these', value: `List<${m.name}>` })),
+      { label: "$(circle-slash) Don't check this route", value: DONT_CHECK },
+      { label: '$(discard) Forget my choice (map automatically)', value: undefined },
+    ];
+    const picked = await vscode.window.showQuickPick(items, {
+      title: `Check ${ex.method} ${ex.url.split('?')[0]} against…`,
+      placeHolder: models.length ? 'Model (from your *.g.dart files)' : 'No json_serializable / freezed models found in this workspace',
+      matchOnDescription: true,
+    });
+    return picked ? picked.value : null;
+  }
+  async function openUntitled(files: GeneratedFile[]): Promise<void> {
+    for (const f of files) {
+      const doc = await vscode.workspace.openTextDocument({ content: f.content, language: f.path.endsWith('.json') ? 'json' : 'dart' });
+      await vscode.window.showTextDocument(doc, { preview: false });
+    }
+    if (files.length) void vscode.window.showInformationMessage(`Flutter Intercept: generated ${files.map((f) => f.path).join(', ')} — save them where you want them.`);
+  }
   const view = new TrafficViewProvider(context.extensionUri, controller);
 
   // AI agents (CONTRACTS §8): one AgentApi behind two front doors, Copilot tools and a local MCP server.
@@ -214,6 +268,10 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     launcher,
     projectRoot: () => flutterProjectRoot(),
     resolveFrames: (frames) => resolveFrames(frames, flutterProjectRoots()),
+    contract,
+    contractResult: (id) => controller.contractResult(id),
+    codegen,
+    appPackageName: () => appPackageNames(flutterProjectRoots())[0],
     version,
   });
   // CONTRACTS §9.2: the app's own packages decide which stack frame is the call site.

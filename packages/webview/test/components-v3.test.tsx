@@ -93,11 +93,12 @@ describe('copy as code (WP2)', () => {
     expect($('.row.selected')!.id).toBe('ex-x2');
     expect(Array.from(menu.querySelectorAll('[role="menuitem"]')).map((b) => b.textContent)).toEqual([
       'Copy as cURL', 'Copy as Dart (http)', 'Copy as Dio', 'Resend', 'Edit and resend…', 'Mock this', 'Block this', 'Break on this',
+      'Generate Dart model', 'Generate test fixture',
     ]);
     await key(menu, 'ArrowDown');
     expect(document.activeElement?.textContent).toBe('Copy as Dart (http)');
     await key(menu, 'End');
-    expect(document.activeElement?.textContent).toBe('Break on this');
+    expect(document.activeElement?.textContent).toBe('Generate test fixture');
     await key(menu, 'Escape');
     expect($('.menu')).toBeNull();
 

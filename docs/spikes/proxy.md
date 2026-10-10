@@ -264,6 +264,7 @@ the passthrough code, so stubbing it would save little and risk a lot), the @pec
 | Mock / block | ≤ 5 MB of the request body | The request body preview is truncated. The response is the mock either way. The server is never contacted |
 | Request breakpoint (`request`/`both`) | request body ≤ **5 MB, known length** | **Breakpoint skipped**: passed through unedited and streamed. The exchange keeps `matchedRuleId` and `error` = "Breakpoint skipped: the request body (40.0 MB) is over the 5 MB pause limit…" or "…streamed (unknown length)…", on a non-error state. Applies to chunked uploads and `content-length` > 5 MB |
 | Response breakpoint (`response`/`both`) | upstream response ≤ **32 MB** | The app gets **502** with "Flutter Intercept: the response is larger than 32 MB, too large to hold at a response breakpoint…". The exchange is `error`. The upstream is destroyed, never buffered |
+| Mutate rule (v0.4.0) | upstream response ≤ **32 MB**, decoded ≤ 32 MB | Wire > 32 MB: the same **502** as a response breakpoint. Decoded > 32 MB: forwarded unchanged with a note |
 | Response breakpoint, 5–32 MB | full body (for forwarding) | Pauses. **Body edit refused** (`resume` throws "larger than 5 MB… only shown in part"), but status/headers edits work and the original bytes are forwarded |
 
 **Measured** with `node --expose-gc scripts/memory-large.cjs` (420 MB per scenario; client and
@@ -655,6 +656,79 @@ Dart client). Changes to how we patch / use mockttp:
 
 Tests: `test/source.test.ts` (14), `test/v3.test.ts` (27), `test/faults.test.ts` (18, real Dart), and 5 LAN
 tests in `test/lan.test.ts`. Suite: **174 passing**.
+
+## v0.4.0 additions (CONTRACTS §10.2, 2026-10-09)
+
+- **`jsonpath.ts`** (dependency-free, `@flutter-intercept/proxy/jsonpath`): `$`, `.name` (any run of chars other
+  than `. [ ] ' " *` / whitespace, so `$.avatar-url` works), `['k']` / `["k"]` with JSON escapes, `[n]`, `[*]`
+  (`.*` accepted as a synonym). Errors name the position and say what is unsupported (filters, slices, unions,
+  negative indexes, `..`). `[n]` selects array elements only; keys select own properties of plain objects only
+  (`__proto__` is an ordinary key, never the prototype). `applyOps` deep-copies once, applies ops in order, counts
+  places per op; `null`/`delete` change existing places only, `set` also creates a missing last object key;
+  array deletes are grouped per array and spliced from the end; deleting `$` throws.
+- **`mutate` routing**: like a response breakpoint (`h2`: beforeRequest + beforeResponse, response buffered by
+  mockttp ≤ 32 MB through our `streamToBuffer` cap). The request side needs the same guard as breakpoints
+  (mockttp buffers the request body on hooked routes): chunked or > 5 MB request bodies → `plain` route, rule
+  skipped with a note. The network profile treats it as pass-through (`offline` → dns fault; throttle → latency +
+  kbps on the mutated body; `simulated` = `Fast 3G · Mutated: …`). `times` counts at match time, like every rule.
+- **Body pipeline** (`src/mutate.ts`): strict full decode (`decodeStrict` in body.ts: gzip / deflate incl. raw
+  deflate / br / zstd, stacked encodings, fails on corrupt or truncated data, ≤ 32 MB decoded) → must be UTF-8 →
+  BOM stripped and re-added → parse → `applyOps` → write → `frameBody` (same encoding, exact content-length, no
+  transfer-encoding) like `applyResponseEdit`; `content-md5` / `digest` / `content-digest` / `repr-digest`
+  dropped. Anything that can't be mutated (empty, not UTF-8, invalid JSON, undecodable, > 32 MB decoded, bad
+  path / op, nothing matched) is forwarded byte for byte, state `completed`, note in `error`
+  ("Mutate rule not applied: …; the response was forwarded unchanged."). Partially matching rules apply and note
+  the paths that matched nothing. `simulated` lists up to 3 ops that changed something.
+- **Number-preserving JSON** (`src/json-text.ts`): `JSON.parse` + `JSON.stringify` would rewrite numbers the ops
+  never touched — `1.0` → `1` (Dart then reads an int and `as double` throws: a bug the real API doesn't have)
+  and integers past 2^53 lose digits. A small hand-written parser keeps every literal whose JS value doesn't
+  print back identically as a `RawNumber` and writes it verbatim (`JSON.rawJSON` / reviver `context.source`
+  would do this natively but VS Code 1.90's Node 20 lacks both). Nesting capped at 1000. Same as `JSON.parse`
+  otherwise, including integer-like keys being listed first and compact output (pretty-printing is not kept).
+  Cost on an 18.6 MB body (Node 26): parse 150 ms, ops 45 ms, write 200 ms (JSON.parse alone: 64 ms) — it runs
+  on the event loop, so a 32 MB mutation stalls the proxy for ~0.7 s.
+- **`MutateOp.valueJson`** (the `set` value as JSON text): the mutate rule parses it with the same
+  number-preserving parser, so `"2.0"` reaches Dart as a double and `"12345678901234567890"` stays exact (with
+  `value: 2.0` — a JS number — Dart gets an int: measured, `type 'int' is not a subtype of type 'double'`). It wins
+  over `value`; invalid JSON is a bad op ("Mutate rule not applied: … invalid valueJson …"). The label shows it as
+  written. `applyOps` in jsonpath.ts accepts it too (same precedence and errors) but reads it with `JSON.parse`,
+  so there it is not byte-exact — fine for previews / assertions, which compare values.
+- **Limits**: an upstream body over 32 MB on the wire still fails with the breakpoint's 502 (message now names
+  mutate rules too). Forwarding it unchanged is not possible with mockttp 4.6: `beforeResponse` only exists
+  after `streamToBuffer`, and an override can only be a complete buffer, not a stream.
+- Real Dart (`test/fixtures/mutate_client.dart`, reads the body like a json_serializable model): with
+  `$.avatar_url → null` the app gets `type 'Null' is not a subtype of type 'String' in type cast` for identity,
+  gzip and chunked upstreams over HTTPS, while `price: 1.0` stays a double and `id: 9007199254740993` stays
+  exact. dart:io only auto-decompresses gzip, so br / zstd / deflate are covered with the Node client.
+
+- **REVIEW-4 fixes (P).**
+  - **#2 URL matching** (`rules.ts`, shared with the webview): globs are no longer RegExps. Literal parts
+    split on `*` are matched by prefix, suffix and `indexOf` in order (greedy leftmost is exact for `*`-only
+    globs): O(n·m), the reviewer's `*a*a*a*a*b` on 218 chars takes < 0.1 ms (was 22.9 s). `/regex/` stays for
+    rules but must pass `isSafeRegexSource` (exported), a syntax-only check: ≤ 256 chars; no backreferences;
+    no repeated group that contains a quantifier or `|` (`(.+)+`, `(a*)*`, `(a|a)*`, `(foo|bar)+`); no two
+    unbounded quantified atoms in a row (`.*.*`, `\w+\d*`); at most 2 unbounded quantifiers, at most 1 of them
+    on a wide atom (`.`, `\S`, `\W`, `\D`, `[^…]`). Leading/trailing `.*` are dropped first
+    (`simplifyRegexSource`, exported; same result for `test()`), so `/.*users.*/` is fine. Refused regexes
+    never match and `isInvalidMatcher` reports them. Why the counts: unanchored, k unbounded quantifiers cost
+    up to n^(k+1) — measured `.*a.*a.*b` 439 ms on 218 chars, `.*a.*b` 1.2 s on 2048. Residual: narrow
+    overlapping atoms on an unusual URL (`\d+1\d+x` on 2048 digits ≈ 1 s). Bounded repeats (`{1,100}`) are
+    the escape hatch. Compiled URL tests are cached by pattern (≤ 1000, cleared when full; REVIEW-4 #11).
+  - **#4 mutate budget**: the parser stops at 2 M values (RangeError → "too large to change"); `applyOps`
+    takes `{maxTargets, maxWork, inPlace}` (defaults 1 M places, 64 MB of places × value JSON size) and
+    throws before writing an op over budget; mutate uses `inPlace` (no deep copy of its own parse) and
+    yields to the event loop between parse / apply / write; the writer caps its output at 64 MB and builds
+    64 KB chunks instead of one array entry per token. Re-encoding after a mutation keeps the original
+    `content-encoding` but runs on libuv's pool (`frameBodyAsync`: zlib async APIs, brotli at quality 4
+    instead of 11). Edits from a breakpoint still use the sync path (human-paced). Measured (Node 26): 32 MB
+    of `[{},…]` → refused in 130 ms total, max event-loop gap 97 ms (was 1.9 s, +3.1 GB); a 15 MB realistic
+    list mutated in 494 ms, max gap 325 ms.
+  - **#8 `selectPath`**: nodes carry parent links; concrete paths are built only for results; it throws past
+    `SELECT_LIMIT` (10 000) results (`opts.limit` to raise it), and any walk step (also in `applyOps`) past
+    1 M places. The reviewer's 300-segment `[*]` case runs in well under 1 s (was 4.3 s / 4.3 GB).
+
+Tests: `test/jsonpath.test.ts` (30), `test/mutate.test.ts` (31, 4 with the real Dart client), 3 REVIEW-4
+tests in `test/rules.test.ts`, 1 LAN test in `test/lan.test.ts`.
 
 ## Open issues
 

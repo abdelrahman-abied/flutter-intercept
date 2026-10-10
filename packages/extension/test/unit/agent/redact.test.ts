@@ -9,7 +9,10 @@ import {
   redactJsonText,
   redactQueryString,
   redactUrl,
+  isOpaqueToken,
+  redactSecretValues,
 } from '../../../src/agent/redact';
+import { redactExchange, redactJsonValue } from '../../../src/agent/samples';
 
 describe('headers', () => {
   it.each([
@@ -108,5 +111,37 @@ describe('redactBodyText', () => {
     expect(Date.now() - t0).toBeLessThan(3000);
     expect(out).not.toContain('"t1"');
     expect(out.length).toBeGreaterThan(1_000_000);
+  });
+});
+
+describe('REVIEW-4 #9: credential-looking values, whatever the key', () => {
+  const JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+  const OPAQUE = ['sk', 'live', '51HxQwErTy9UiOp2AsDfGh3JkLzXcVbNm'].join('_');
+
+  it('detects JWTs, Bearer/Basic credentials and long mixed tokens; keeps hashes, UUIDs, ids and prose', () => {
+    expect(redactSecretValues(JWT, true)).toBe(REDACTED);
+    expect(redactSecretValues(`see ${JWT} here`)).toBe(`see ${REDACTED} here`);
+    expect(redactSecretValues('Bearer abcdef0123456789xyz')).toBe(`Bearer ${REDACTED}`);
+    expect(redactSecretValues('basic information about our basic plan')).toBe('basic information about our basic plan');
+    expect(isOpaqueToken(OPAQUE)).toBe(true);
+    for (const keep of ['da39a3ee5e6b4b0d3255bfef95601890afd80709', '123e4567-e89b-12d3-a456-426614174000', '12345678', 'https://example.com/a/very/long/path/with/many/segments']) {
+      expect(redactSecretValues(keep, true)).toBe(keep);
+    }
+  });
+
+  it('in JSON bodies under any key (byte-exact elsewhere), headers, query values, URL paths and text bodies', () => {
+    const body = `{"access": "${JWT}", "jwt":{"v":"${OPAQUE}"}, "n": 1.0, "msg": "Bearer abcdef0123456789xyz", "sha": "da39a3ee5e6b4b0d3255bfef95601890afd80709"}`;
+    expect(redactJsonText(body)).toBe(`{"access": "${REDACTED}", "jwt":{"v":"${REDACTED}"}, "n": 1.0, "msg": "Bearer ${REDACTED}", "sha": "da39a3ee5e6b4b0d3255bfef95601890afd80709"}`);
+    expect(redactHeaders({ 'x-id-jwt': JWT, 'x-forwarded': `Bearer ${OPAQUE}`, etag: '"abc123"' })).toEqual({ 'x-id-jwt': REDACTED, 'x-forwarded': `Bearer ${REDACTED}`, etag: '"abc123"' });
+    expect(redactQueryString(`code=${OPAQUE}&page=2`)).toBe(`code=${REDACTED}&page=2`);
+    expect(redactUrl(`https://a.example/reset/${JWT}?x=1#f`)).toBe(`https://a.example/reset/${REDACTED}?x=1#f`);
+    expect(redactBodyText(`--b\r\nContent-Disposition: form-data; name="id_jwt"\r\n\r\n${JWT}\r\n--b--`, { 'content-type': 'multipart/form-data; boundary=b' })).not.toContain(JWT);
+    expect(redactBodyText(`query { me } # Bearer abcdef0123456789xyz`, { 'content-type': 'text/plain' })).toBe(`query { me } # Bearer ${REDACTED}`);
+  });
+
+  it('decoded values and fixtures (redactExchange) too', () => {
+    expect(redactJsonValue({ refresh: JWT, list: [OPAQUE, 'ok'] })).toEqual({ refresh: REDACTED, list: [REDACTED, 'ok'] });
+    const r = redactExchange({ id: 'e', startedAt: 1, method: 'POST', url: 'https://a/login', requestHeaders: {}, state: 'completed', status: 200, responseHeaders: { 'content-type': 'application/json' }, responseBody: { text: `{"access":"${JWT}","bearer":"${OPAQUE}"}`, encoding: 'utf8' } });
+    expect(r.responseBody!.text).toBe(`{"access":"${REDACTED}","bearer":"${REDACTED}"}`);
   });
 });

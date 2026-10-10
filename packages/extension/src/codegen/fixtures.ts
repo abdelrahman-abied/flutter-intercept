@@ -1,0 +1,561 @@
+/**
+ * Fixture tests from recorded traffic (CONTRACTS §10.4). Pure.
+ *
+ * One fixture per exchange with a response body: `test/fixtures/<name>_<n>.json` (n = 1-based position in
+ * `exchanges`). JSON bodies are re-indented without touching a literal (`[redacted]` stays as it is); any
+ * other body (HTML, text, truncated JSON, binary) becomes a JSON *string* fixture so every fixture loads the
+ * same way. The test file `test/<name>_test.dart` loads them with `fixture('<name>_<n>.json')` (relative to
+ * the package root, where `flutter test` runs) and uses the style's API:
+ * - `http_mock_adapter`: a `DioAdapter` on a `Dio` that accepts every status; `onGet(...).reply`.
+ * - `mock_client`: `package:http/testing.dart` `MockClient` that checks method + URL.
+ * - `mocktail`: a `Mock` of the Retrofit interface in `api` (when given), each recorded request stubbed on
+ *   the matching method (`thenAnswer` with the fixture decoded into the return type; non-2xx → a
+ *   `DioException` like Retrofit throws). Without a usable interface it falls back to `mock_client`.
+ * Bodies come from the caller already redacted (CONTRACTS §8).
+ */
+import type { Exchange } from '@flutter-intercept/proxy';
+import type { ApiEndpoint } from '../contract/types';
+import { dartBodyLiteral, dartString } from './snippets';
+import { parseJsonSample, prettyJson } from './json';
+import { snakeCase } from './naming';
+import { commentText, jsonSafe } from './text';
+import type { FixtureGenInput, GeneratedFile } from './types';
+
+type FixtureKind = 'json' | 'string' | 'empty';
+
+interface Case {
+  n: number;
+  method: string;
+  url: string;
+  status: number;
+  label: string; // "GET /users/42 → 200"
+  fixture?: string; // file name under test/fixtures
+  kind: FixtureKind;
+  contentType?: string;
+  requestBody?: string; // utf8 request body to send
+  notes: string[];
+}
+
+const HEADER_NOTE = '// Bodies are redacted: "[redacted]" marks a value that held a secret.';
+
+function headerValue(h: Record<string, string | string[]> | undefined, name: string): string | undefined {
+  for (const [k, v] of Object.entries(h ?? {})) if (k.toLowerCase() === name) return Array.isArray(v) ? v[0] : v;
+  return undefined;
+}
+
+function pathOf(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.pathname + u.search;
+  } catch {
+    return url;
+  }
+}
+
+function baseName(name: string): string {
+  return snakeCase(name) || 'recorded';
+}
+
+interface Prepared {
+  cases: Case[];
+  skipped: string[]; // comment lines for exchanges without a response
+  files: GeneratedFile[];
+}
+
+function prepare(input: FixtureGenInput): Prepared {
+  const base = baseName(input.name);
+  const cases: Case[] = [];
+  const skipped: string[] = [];
+  const files: GeneratedFile[] = [];
+  const labels = new Map<string, number>();
+  input.exchanges.forEach((ex, i) => {
+    const n = i + 1;
+    const method = ex.method.toUpperCase();
+    const where = `${method} ${pathOf(ex.url)}`;
+    if (ex.status === undefined) {
+      skipped.push(commentText(`// Not included: ${where} has no response (${ex.state}${ex.error ? `: ${ex.error.slice(0, 200)}` : ''}).`));
+      return;
+    }
+    const notes: string[] = [];
+    let kind: FixtureKind = 'empty';
+    let content: string | undefined;
+    const body = ex.responseBody;
+    if (body && body.encoding === 'base64') {
+      kind = 'string';
+      content = JSON.stringify(`[binary ${Buffer.from(body.text, 'base64').length} bytes]`);
+      notes.push('// The response body is binary: the fixture only says how big it was.');
+    } else if (body && body.text.length) {
+      try {
+        content = prettyJson(body.text);
+        kind = 'json';
+      } catch {
+        kind = 'string';
+        content = JSON.stringify(body.text);
+      }
+      if (body.truncated) notes.push('// The response body was truncated when it was recorded (larger than 5 MB).');
+    }
+    let label = `${where} → ${ex.status}`;
+    const seen = labels.get(label) ?? 0;
+    labels.set(label, seen + 1);
+    if (seen) label += ` (#${seen + 1})`;
+    let fixture: string | undefined;
+    if (content !== undefined) {
+      fixture = `${base}_${n}.json`;
+      files.push({ path: `test/fixtures/${fixture}`, content: jsonSafe(content) + '\n' });
+    }
+    let requestBody: string | undefined;
+    const rb = ex.requestBody;
+    if (rb && rb.encoding === 'base64') notes.push(`// The request body was binary (${Buffer.from(rb.text, 'base64').length} bytes) and is not sent here.`);
+    else if (rb && rb.text.length) requestBody = rb.text;
+    cases.push({ n, method, url: ex.url, status: ex.status, label, fixture, kind, contentType: headerValue(ex.responseHeaders, 'content-type'), requestBody, notes });
+  });
+  return { cases, skipped, files };
+}
+
+
+function header(input: FixtureGenInput, extra: string[] = []): string[] {
+  const n = input.exchanges.length;
+  return [`// Generated by Flutter Intercept from ${n} recorded exchange${n === 1 ? '' : 's'}.`, HEADER_NOTE, ...extra];
+}
+
+function imports(list: string[]): string[] {
+  const dart = list.filter((i) => i.startsWith('dart:')).sort();
+  const pkg = [...new Set(list.filter((i) => !i.startsWith('dart:')))].sort();
+  const out = dart.map((i) => `import '${i}';`);
+  if (dart.length && pkg.length) out.push('');
+  out.push(...pkg.map((i) => (i.startsWith('//') ? i : `import '${i}';`)));
+  return out;
+}
+
+const FIXTURE_LOADER = [
+  '/// A recorded body from test/fixtures (tests run from the package root).',
+  'dynamic fixture(String name) =>',
+  "    jsonDecode(File('test/fixtures/$name').readAsStringSync());",
+];
+
+function testPkg(opts: FixtureGenInput): string {
+  return opts.testPackage === 'test' ? 'package:test/test.dart' : 'package:flutter_test/flutter_test.dart';
+}
+
+/** `{'content-type': …}` value for a string fixture: the recorded type, else text/plain. */
+function textType(c: Case): string {
+  return c.contentType && !/json/i.test(c.contentType) ? c.contentType : 'text/plain';
+}
+
+export function generateFixtureTest(input: FixtureGenInput): GeneratedFile[] {
+  const prepared = prepare(input);
+  let content: string;
+  if (input.style === 'http_mock_adapter') content = dioAdapterTest(input, prepared);
+  else if (input.style === 'mocktail') content = mocktailTest(input, prepared) ?? mockClientTest(input, prepared, mocktailFallbackNote(input));
+  else content = mockClientTest(input, prepared);
+  return [...prepared.files, { path: `test/${baseName(input.name)}_test.dart`, content }];
+}
+
+function noCasesTest(lines: string[], p: Prepared): void {
+  if (!p.cases.length) lines.push("  test('recorded exchanges', () {}, skip: 'none of the exchanges had a response');");
+}
+
+function caseHead(c: Case): string[] {
+  const out = [`  test(${dartString(c.label)}, () async {`, ...c.notes.map((l) => '    ' + l), `    const url = ${dartString(c.url)};`];
+  if (c.fixture) out.push(`    final body = fixture(${dartString(c.fixture)});`);
+  return out;
+}
+
+// ------------------------------------------------------------------ http_mock_adapter
+
+const DIO_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']);
+
+function dioAdapterTest(input: FixtureGenInput, p: Prepared): string {
+  const lines = [
+    ...header(input),
+    '',
+    ...imports(['dart:convert', 'dart:io', 'package:dio/dio.dart', testPkg(input), 'package:http_mock_adapter/http_mock_adapter.dart']),
+    '',
+    ...FIXTURE_LOADER,
+    '',
+    'void main() {',
+    '  late Dio dio;',
+    '  late DioAdapter adapter;',
+    '',
+    '  setUp(() {',
+    '    // Every status is a response here, so error bodies can be checked too.',
+    '    dio = Dio(BaseOptions(validateStatus: (_) => true));',
+    '    adapter = DioAdapter(dio: dio);',
+    '  });',
+  ];
+  for (const s of p.skipped) lines.push('', '  ' + s);
+  noCasesTest(lines, p);
+  for (const c of p.cases) {
+    lines.push('');
+    if (!DIO_METHODS.has(c.method)) {
+      lines.push(commentText(`  // Not included: http_mock_adapter can't mock ${c.method} (${c.label}).`));
+      continue;
+    }
+    const on = 'on' + c.method.charAt(0) + c.method.slice(1).toLowerCase();
+    const data = c.kind === 'empty' ? 'null' : 'body';
+    const replyHeaders = c.kind === 'string' ? `, headers: {Headers.contentTypeHeader: [${dartString(textType(c))}]}` : '';
+    lines.push(...caseHead(c), `    adapter.${on}(`, '      url,', `      (server) => server.reply(${c.status}, ${data}${replyHeaders}),`);
+    if (c.requestBody !== undefined) lines.push('      data: Matchers.any,');
+    lines.push('    );', '');
+    const call = `dio.${c.method.toLowerCase()}<dynamic>(`;
+    if (c.requestBody !== undefined) lines.push(`    final response = await ${call}`, '      url,', `      data: ${dartBodyLiteral(c.requestBody)},`, '    );');
+    else lines.push(`    final response = await ${call}url);`);
+    lines.push('', `    expect(response.statusCode, ${c.status});`);
+    if (c.kind !== 'empty' && c.method !== 'HEAD') lines.push('    expect(response.data, body);');
+    lines.push('  });');
+  }
+  lines.push('}', '');
+  return lines.join('\n');
+}
+
+// ------------------------------------------------------------------ package:http MockClient
+
+const HTTP_SHORTHAND = new Set(['GET', 'HEAD', 'DELETE', 'POST', 'PUT', 'PATCH']);
+
+function mockClientTest(input: FixtureGenInput, p: Prepared, note: string[] = []): string {
+  const lines = [
+    ...header(input, note),
+    '',
+    ...imports(['dart:convert', 'dart:io', testPkg(input), 'package:http/http.dart', 'package:http/testing.dart']),
+    '',
+    ...FIXTURE_LOADER,
+    '',
+    'void main() {',
+  ];
+  let first = true;
+  const gap = () => {
+    if (!first) lines.push('');
+    first = false;
+  };
+  for (const s of p.skipped) {
+    gap();
+    lines.push('  ' + s);
+  }
+  noCasesTest(lines, p);
+  for (const c of p.cases) {
+    gap();
+    const bytes = c.kind === 'json' ? 'utf8.encode(jsonEncode(body))' : c.kind === 'string' ? 'utf8.encode(body as String)' : '<int>[]';
+    const type = c.kind === 'json' ? 'application/json; charset=utf-8' : c.kind === 'string' ? withCharset(textType(c)) : undefined;
+    lines.push(
+      ...caseHead(c),
+      '    // Inject `client` (an http.Client) into the code under test instead of calling it here.',
+      '    final client = MockClient((request) async {',
+      `      expect(request.method, ${dartString(c.method)});`,
+      '      expect(request.url, Uri.parse(url));',
+      '      return Response.bytes(',
+      `        ${bytes},`,
+      `        ${c.status},`,
+    );
+    if (type) lines.push(`        headers: {'content-type': ${dartString(type)}},`);
+    lines.push('      );', '    });', '');
+    const hasBody = c.requestBody !== undefined;
+    const bodyArg = hasBody ? dartBodyLiteral(c.requestBody!) : undefined;
+    if (HTTP_SHORTHAND.has(c.method) && !(hasBody && (c.method === 'GET' || c.method === 'HEAD'))) {
+      const m = c.method.toLowerCase();
+      if (hasBody) lines.push(`    final response = await client.${m}(`, '      Uri.parse(url),', `      body: ${bodyArg},`, '    );');
+      else lines.push(`    final response = await client.${m}(Uri.parse(url));`);
+    } else {
+      lines.push(`    final request = Request(${dartString(c.method)}, Uri.parse(url));`);
+      if (hasBody) lines.push(`    request.body = ${bodyArg};`);
+      lines.push('    final response = await Response.fromStream(await client.send(request));');
+    }
+    lines.push('', `    expect(response.statusCode, ${c.status});`);
+    if (c.method !== 'HEAD') {
+      if (c.kind === 'json') lines.push('    expect(jsonDecode(response.body), body);');
+      else if (c.kind === 'string') lines.push('    expect(response.body, body);');
+    }
+    lines.push('  });');
+  }
+  lines.push('}', '');
+  return lines.join('\n');
+}
+
+function withCharset(type: string): string {
+  return /charset=/i.test(type) ? type : `${type}; charset=utf-8`;
+}
+
+// ------------------------------------------------------------------ mocktail (Retrofit interface)
+
+function mocktailFallbackNote(input: FixtureGenInput): string[] {
+  const api = input.api;
+  const why = !api
+    ? 'no Retrofit interface was found for these requests'
+    : api.endpoints.some((e) => e.params)
+      ? `no ${api.className} method matches these requests`
+      : `the parameters of ${api.className}'s methods are unknown`;
+  return [commentText(`// mocktail needs the Retrofit interface to mock, but ${why}:`), "// this test uses package:http's MockClient instead."];
+}
+
+interface Match {
+  endpoint: ApiEndpoint;
+  pathValues: Map<string, string>;
+  score: number;
+}
+
+/** Finds the endpoint for a request: same method, path template matching (longest literal part wins). */
+export function matchEndpoint(endpoints: readonly ApiEndpoint[], method: string, url: string): Match | undefined {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return undefined;
+  }
+  let best: Match | undefined;
+  for (const ep of endpoints) {
+    if (ep.method.toUpperCase() !== method.toUpperCase()) continue;
+    let tpl = ep.pathTemplate.replace(/[?#].*$/s, '');
+    const absolute = /^[a-z][a-z0-9+.-]*:\/\//i.test(tpl);
+    let target = decodeSafe(u.pathname);
+    if (absolute) target = u.origin + target;
+    else if (!tpl.startsWith('/')) tpl = '/' + tpl;
+    const names: string[] = [];
+    const literal = tpl.replace(/\{[^}]*\}/g, '').length;
+    const re = tpl
+      .split(/(\{[^}]*\})/)
+      .map((part) => {
+        const m = /^\{([^}]*)\}$/.exec(part);
+        if (m) {
+          names.push(m[1]);
+          return '([^/]+)';
+        }
+        return part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      })
+      .join('');
+    const m = new RegExp(`${absolute ? '^' : '^(?:/.*)?'}${re.replace(/\/$/, '')}/?$`, absolute ? 'i' : '').exec(target);
+    if (!m) continue;
+    const score = literal + (absolute ? 1000 : 0);
+    if (!best || score > best.score) best = { endpoint: ep, pathValues: new Map(names.map((n, i) => [n, m[i + 1]])), score };
+  }
+  return best;
+}
+
+function decodeSafe(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+const PRIMITIVE = new Set(['int', 'double', 'num', 'String', 'bool', 'dynamic', 'Object', 'void', 'DateTime', 'List', 'Map', 'Set', 'Iterable', 'Function']);
+const NO_FALLBACK = new Set(['int', 'double', 'num', 'String', 'bool', 'dynamic', 'Object', 'List', 'Map', 'Set', 'DateTime', 'Function']);
+
+function stripNullable(t: string): string {
+  return t.trim().replace(/\?$/, '');
+}
+function outerName(t: string): string {
+  return /^[A-Za-z_$][\w$]*/.exec(stripNullable(t))?.[0] ?? '';
+}
+function typeArg(t: string): string | undefined {
+  const s = stripNullable(t);
+  const i = s.indexOf('<');
+  return i >= 0 && s.endsWith('>') ? s.slice(i + 1, -1).trim() : undefined;
+}
+const isModel = (t: string) => {
+  const n = outerName(t);
+  return !!n && /^[A-Z]/.test(n) && !PRIMITIVE.has(n) && !typeArg(t);
+};
+
+/** A Dart value of `type` built from a recorded string (path / query value). */
+function literalFor(type: string, raw: string | undefined): string {
+  const nullable = type.trim().endsWith('?');
+  const base = outerName(type);
+  if (raw === undefined) return nullable ? 'null' : defaultFor(type);
+  if (base === 'int' && /^-?\d+$/.test(raw)) return raw;
+  if ((base === 'double' || base === 'num') && raw !== '' && !Number.isNaN(Number(raw))) return base === 'double' && /^-?\d+$/.test(raw) ? `${raw}.0` : raw;
+  if (base === 'bool' && /^(true|false)$/.test(raw)) return raw;
+  if (base === 'String' || base === 'dynamic' || base === 'Object') return dartString(raw);
+  return nullable ? 'null' : defaultFor(type);
+}
+
+function defaultFor(type: string): string {
+  const base = outerName(type);
+  switch (base) {
+    case 'int':
+    case 'num':
+      return '0';
+    case 'double':
+      return '0.0';
+    case 'String':
+      return "''";
+    case 'bool':
+      return 'false';
+    case 'List':
+    case 'Iterable':
+      return 'const []';
+    case 'Map':
+      return 'const {}';
+    case 'Set':
+      return 'const {}';
+    case 'DateTime':
+      return 'DateTime(2000)';
+    case 'dynamic':
+      return 'null';
+    case 'Object':
+      return 'Object()';
+    default:
+      return `_Fake${base}()`;
+  }
+}
+
+/** The body argument from the recorded request body. */
+function bodyArgument(type: string, text: string | undefined, fakes: Set<string>): string {
+  const nullable = type.trim().endsWith('?');
+  if (text === undefined) return nullable ? 'null' : fakeOrDefault(type, fakes);
+  const json = `jsonDecode(${dartBodyLiteral(text)})`;
+  let parsed: unknown;
+  try {
+    parsed = parseJsonSample(text);
+  } catch {
+    return outerName(type) === 'String' || outerName(type) === 'dynamic' ? dartBodyLiteral(text) : fakeOrDefault(type, fakes);
+  }
+  const base = outerName(type);
+  if (isModel(type) && parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return `${base}.fromJson(${json} as Map<String, dynamic>)`;
+  if (base === 'Map' && /^String\s*,\s*dynamic$/.test(typeArg(type) ?? '')) return `${json} as Map<String, dynamic>`;
+  if (base === 'dynamic' || base === 'Object') return json;
+  if (base === 'String') return dartBodyLiteral(text);
+  return nullable ? 'null' : fakeOrDefault(type, fakes);
+}
+
+function fakeOrDefault(type: string, fakes: Set<string>): string {
+  const d = defaultFor(type);
+  if (d.startsWith('_Fake')) fakes.add(outerName(type));
+  return d;
+}
+
+/** `thenAnswer` closure body for a 2xx response, by declared return type (Future<…> unwrapped). */
+function answerFor(ret: string, c: Case, imports: Set<string>): string {
+  let t = ret.trim();
+  const fut = /^Future<(.*)>$/s.exec(t);
+  if (fut) t = fut[1].trim();
+  if (outerName(t) === 'HttpResponse') {
+    imports.add('package:retrofit/retrofit.dart');
+    imports.add('package:dio/dio.dart');
+    const inner = typeArg(t) ?? 'dynamic';
+    return `HttpResponse(${valueFor(inner, c) || 'null'}, Response(requestOptions: RequestOptions(path: url), statusCode: ${c.status}, data: body))`;
+  }
+  return valueFor(t, c);
+}
+
+function valueFor(t: string, c: Case): string {
+  if (t === 'void') return '';
+  if (c.kind !== 'json') return 'body'; // dynamic: compiles against any return type
+  if (isModel(t)) return `${outerName(t)}.fromJson(body as Map<String, dynamic>)`;
+  if (outerName(t) === 'List') {
+    const of = typeArg(t);
+    if (of && isModel(of)) return `(body as List<dynamic>).map((e) => ${outerName(of)}.fromJson(e as Map<String, dynamic>)).toList()`;
+    if (of && of !== 'dynamic') return `(body as List<dynamic>).cast<${of}>()`;
+  }
+  return 'body';
+}
+
+function mocktailTest(input: FixtureGenInput, p: Prepared): string | undefined {
+  const api = input.api;
+  if (!api || !api.endpoints.length) return undefined;
+  // Only methods whose parameters are known can be called (and stubbed) in code that compiles.
+  const usable = api.endpoints.filter((e) => e.params);
+  const matched = p.cases.map((c) => ({ c, m: matchEndpoint(usable, c.method, c.url) }));
+  if (!matched.some((x) => x.m)) return undefined;
+
+  const extraImports = new Set<string>();
+  const fakes = new Set<string>();
+  const notes: string[] = [];
+  if (api.imports?.length) api.imports.forEach((i) => extraImports.add(i));
+  else if (api.endpoints.some((e) => e.importUri)) {
+    for (const e of api.endpoints) if (e.importUri) extraImports.add(e.importUri);
+    notes.push('// Also import the models its methods return.');
+  } else {
+    const file = api.endpoints[0].file;
+    const lib = /\/lib\/(.+\.dart)$/.exec(file.replace(/\\/g, '/'));
+    if (input.packageName && lib) extraImports.add(`package:${input.packageName}/${lib[1]}`);
+    else notes.push(commentText(`// Import the file that declares ${api.className}.`));
+    notes.push('// Also import the models its methods return.');
+  }
+  const mock = `Mock${api.className}`;
+  const body: string[] = [];
+  for (const s of p.skipped) body.push('', '  ' + s);
+  for (const { c, m } of matched) {
+    body.push('');
+    if (!m) {
+      body.push(commentText(`  // Not included: no ${api.className} method with a known signature matches ${c.label}.`));
+      continue;
+    }
+    const ep = m.endpoint;
+    const params = ep.params!;
+    const q = new URL(c.url).searchParams;
+    const matchers: string[] = [];
+    const args: string[] = [];
+    for (const prm of params) {
+      const key = prm.key ?? prm.name;
+      const nullable = prm.type.trim().endsWith('?');
+      let value: string;
+      if (prm.kind === 'path') value = literalFor(prm.type, m.pathValues.has(key) ? decodeSafe(m.pathValues.get(key)!) : undefined);
+      else if (prm.kind === 'query') value = literalFor(prm.type, q.get(key) ?? undefined);
+      else if (prm.kind === 'body') value = bodyArgument(prm.type, c.requestBody, fakes);
+      else value = nullable ? 'null' : defaultFor(prm.type);
+      // any() needs a fallback value for non-nullable types mocktail doesn't know.
+      if (!nullable && !NO_FALLBACK.has(outerName(prm.type))) fakes.add(outerName(prm.type));
+      matchers.push(prm.named ? `${prm.name}: any(named: ${dartString(prm.name)})` : 'any()');
+      args.push(prm.named ? `${prm.name}: ${value}` : value);
+    }
+    const ok = c.status >= 200 && c.status < 300;
+    const callOf = (list: string[]) => `api.${ep.dartMethod}(${list.join(', ')})`;
+    const stmts: string[] = [];
+    if (ok) {
+      // Without the declared return type the fixture goes in as `dynamic` (compiles against any type).
+      const answer = ep.returnType ? answerFor(ep.returnType, c, extraImports) : 'body';
+      const typed = !!ep.returnType && answer !== '';
+      if (answer === '') stmts.push(`    when(() => ${callOf(matchers)}).thenAnswer((_) async {});`);
+      else stmts.push(`    final value = ${answer};`, `    when(() => ${callOf(matchers)}).thenAnswer((_) async => value);`);
+      stmts.push('', '    // Use `api` in the code under test instead of calling it here.', `    ${typed ? 'final result = ' : ''}await ${callOf(args)};`, '');
+      if (typed) stmts.push('    expect(result, value);');
+      stmts.push(`    verify(() => ${callOf(matchers)}).called(1);`);
+    } else {
+      extraImports.add('package:dio/dio.dart');
+      stmts.push(
+        '    // Retrofit throws a DioException for a non-2xx status.',
+        `    when(() => ${callOf(matchers)}).thenAnswer(`,
+        '      (_) async => throw DioException(',
+        '        requestOptions: RequestOptions(path: url),',
+        '        response: Response(',
+        '          requestOptions: RequestOptions(path: url),',
+        `          statusCode: ${c.status},`,
+        ...(c.fixture ? ['          data: body,'] : []),
+        '        ),',
+        '        type: DioExceptionType.badResponse,',
+        '      ),',
+        '    );',
+        '',
+        '    await expectLater(',
+        `      ${callOf(args)},`,
+        '      throwsA(',
+        `        isA<DioException>().having((e) => e.response?.statusCode, 'status', ${c.status}),`,
+        '      ),',
+        '    );',
+      );
+    }
+    const uses = (name: string) => stmts.some((l) => new RegExp(`\\b${name}\\b`).test(l.replace(/'(?:[^'\\]|\\.)*'/g, '')));
+    body.push(`  test(${dartString(`${ep.dartMethod}: ${c.label}`)}, () async {`, ...c.notes.map((l) => '    ' + l));
+    if (uses('url')) body.push(`    const url = ${dartString(c.url)};`);
+    if (uses('body')) body.push(c.fixture ? `    final body = fixture(${dartString(c.fixture)});` : '    const dynamic body = null; // the response had no body');
+    body.push(...stmts, '  });');
+  }
+
+  const fakeList = [...fakes].filter((f) => f && !NO_FALLBACK.has(f)).sort();
+  const lines = [
+    ...header(input, notes),
+    '',
+    ...imports(['dart:convert', 'dart:io', testPkg(input), 'package:mocktail/mocktail.dart', ...extraImports]),
+    '',
+    ...FIXTURE_LOADER,
+    '',
+    `class ${mock} extends Mock implements ${api.className} {}`,
+    ...fakeList.flatMap((f) => ['', `class _Fake${f} extends Fake implements ${f} {}`]),
+    '',
+    'void main() {',
+    `  late ${mock} api;`,
+  ];
+  if (fakeList.length) lines.push('', '  setUpAll(() {', ...fakeList.map((f) => `    registerFallbackValue(_Fake${f}());`), '  });');
+  lines.push('', '  setUp(() {', `    api = ${mock}();`, '  });', ...body, '}', '');
+  return lines.join('\n');
+}

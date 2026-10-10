@@ -7,17 +7,50 @@ import * as path from 'path';
 import { fileURLToPath } from 'url';
 import type { Body, Exchange, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest, StackFrame } from '@flutter-intercept/proxy';
 import { describeProfile, NETWORK_PRESETS, presetProfile, type NetworkPresetId, type NetworkProfile } from '@flutter-intercept/proxy/network';
-import { matches } from '@flutter-intercept/proxy/rules';
+import { compileMatcher } from '@flutter-intercept/proxy/rules';
 import { toSnippet } from '../codegen/snippets';
-import { sanitizeSendHeaders, validateEdit, validateRule } from '../ui/controller';
+import type { CodegenService } from '../codegen/types';
+import type { ContractResult, ContractService } from '../contract/types';
+import { fixtureApi, sanitizeSendHeaders, validateEdit, validateRule } from '../ui/controller';
 import { buildHar, writeHar } from './har';
-import { REDACTED, redactBodyText, redactHeaders, redactUrl } from './redact';
+import { pathError, select } from './paths';
+import { isSensitiveField, REDACTED, redactBodyText, redactHeaders, redactUrl } from './redact';
+import { parsePath, type PathSegment } from '@flutter-intercept/proxy/jsonpath';
+import {
+  contractForAgent,
+  decodeJson,
+  decodeSample,
+  defaultFixtureName,
+  defaultModelName,
+  FINAL_STATES,
+  looksJson,
+  MAX_FIXTURES,
+  modelSamples,
+  redactExchange,
+  redactJsonValue,
+  routeOf,
+  testPackageFor,
+} from './samples';
 import { parseToolInput, ToolInput, TRIGGER_WINDOW_MS } from './schema';
 import { bodyShape } from './shape';
 import { AgentAccess, AgentTools, AgentToolError, AppLauncher, isWriteTool, ToolName, ToolResult } from './types';
 
 export const AGENT_RULE_PREFIX = '[agent] ';
-export const FINAL_STATES = new Set<Exchange['state']>(['completed', 'mocked', 'blocked', 'aborted', 'error']);
+export { FINAL_STATES };
+/** assert_traffic: at most this many failure texts in all, and JSON failure texts per exchange. */
+export const MAX_ASSERT_FAILURES = 50;
+export const MAX_JSON_FAILURES_PER_EXCHANGE = 10;
+
+/** True when `path` selects something BELOW a sensitive key (a redacted field), e.g. `$.session.id`. */
+function insideRedacted(path: string): boolean {
+  let segs: PathSegment[];
+  try {
+    segs = parsePath(path);
+  } catch {
+    return false; // reported as an invalid path by select()
+  }
+  return segs.slice(0, -1).some((s) => 'key' in s && isSensitiveField(s.key));
+}
 
 /** CONTRACTS §9.4 (src/source/resolve.ts): a stack frame resolved to a file. `path` may be absolute. */
 export type ResolvedFrame = StackFrame & { path?: string; inProject: boolean };
@@ -61,6 +94,15 @@ export interface AgentApiDeps {
   version?: string;
   newRuleId?(): string;
   now?(): number;
+  // ---- CONTRACTS §10.6 (v0.4.0). Optional: without them the tools answer with a clear "not available" error.
+  /** The contract checker (src/contract/service.ts). */
+  contract?: ContractService;
+  /** The controller's cached result for an exchange (`controller.contractResult(id)`), reused when no model is forced. */
+  contractResult?(id: string): ContractResult | undefined;
+  /** Code generation (src/codegen/service.ts). */
+  codegen?: CodegenService;
+  /** The app's pubspec `name` (fixture imports). */
+  appPackageName?(): string | undefined;
 }
 
 type StatusFilter = number | '1xx' | '2xx' | '3xx' | '4xx' | '5xx' | 'error' | undefined;
@@ -72,11 +114,39 @@ function statusMatches(e: Exchange, s: StatusFilter): boolean {
   return e.status !== undefined && Math.floor(e.status / 100) === Number(s[0]);
 }
 
-function exchangeMatches(e: Exchange, f: { url?: string; method?: string; status?: StatusFilter; sinceMs?: number }): boolean {
-  if (f.sinceMs !== undefined && e.startedAt < f.sinceMs) return false;
-  if (f.url !== undefined && !matches({ url: f.url, method: f.method }, e.method, e.url)) return false;
-  if (f.url === undefined && f.method !== undefined && e.method.toUpperCase() !== f.method.toUpperCase()) return false;
-  return statusMatches(e, f.status);
+/**
+ * REVIEW-4 #1: a rule pattern that fixes the value of a sensitive query parameter (`*access_token=a*`) would let
+ * an agent recover the redacted value through `matchedRuleId`. Returns the parameter name, or undefined.
+ */
+export function sensitiveQueryProbe(pattern: string): string | undefined {
+  for (const m of pattern.matchAll(/(?:^|[?&*])([^?&=*#/]+)=([^&#]*)/g)) {
+    let key = m[1];
+    try {
+      key = decodeURIComponent(key.replace(/\+/g, ' '));
+    } catch {
+      // keep raw
+    }
+    if (isSensitiveField(key) && m[2] !== '' && !m[2].startsWith('*')) return key;
+  }
+  return undefined;
+}
+
+type ExchangeFilter = { url?: string; method?: string; status?: StatusFilter; sinceMs?: number };
+
+/**
+ * Compiles an agent filter once per tool call (REVIEW-4 #11). The URL glob is matched against `view(e.url)`,
+ * the URL as the agent sees it (redacted when redaction is on), so a filter can't be used as an oracle for
+ * redacted query values (REVIEW-4 #1).
+ */
+function compileFilter(f: ExchangeFilter, view: (url: string) => string): (e: Exchange) => boolean {
+  const url = f.url !== undefined ? compileMatcher({ url: f.url, method: f.method }) : undefined;
+  const method = f.method?.toUpperCase();
+  return (e) => {
+    if (f.sinceMs !== undefined && e.startedAt < f.sinceMs) return false;
+    if (url && !url(e.method, view(e.url))) return false;
+    if (!url && method !== undefined && e.method.toUpperCase() !== method) return false;
+    return statusMatches(e, f.status);
+  };
 }
 
 function bodyBytes(b: Body | undefined): number | undefined {
@@ -180,6 +250,16 @@ export class AgentApi implements AgentTools {
         return this.simulateNetwork(input as ToolInput<'simulate_network'>);
       case 'resend_request':
         return this.resendRequest(input as ToolInput<'resend_request'>);
+      case 'check_contract':
+        return this.checkContract(input as ToolInput<'check_contract'>);
+      case 'generate_model':
+        return this.generateModel(input as ToolInput<'generate_model'>);
+      case 'generate_fixture_test':
+        return this.generateFixtureTest(input as ToolInput<'generate_fixture_test'>);
+      case 'assert_traffic':
+        return this.assertTraffic(input as ToolInput<'assert_traffic'>, signal);
+      case 'add_mutation':
+        return this.addMutation(input as ToolInput<'add_mutation'>);
       default:
         throw new AgentToolError(`unknown tool ${String(tool)}`, 'invalid');
     }
@@ -214,6 +294,12 @@ export class AgentApi implements AgentTools {
 
   private url(u: string): string {
     return this.redact ? redactUrl(u) : u;
+  }
+
+  /** An exchange filter for this call (compiled once; matches the agent's view of the URL). */
+  private filter(f: ExchangeFilter): (e: Exchange) => boolean {
+    const view = this.redact ? redactUrl : (u: string) => u;
+    return compileFilter(f, view);
   }
 
   private bodyView(b: Body | undefined, headers: Exchange['requestHeaders'] | undefined, maxChars: number): Record<string, unknown> | undefined {
@@ -278,9 +364,10 @@ export class AgentApi implements AgentTools {
   }
 
   private listRequests(i: ToolInput<'list_requests'>): ToolResult {
+    const keep = this.filter(i as ExchangeFilter);
     const matched = this.deps.host
       .getExchanges()
-      .filter((e) => exchangeMatches(e, i) && (i.state === undefined || e.state === i.state))
+      .filter((e) => keep(e) && (i.state === undefined || e.state === i.state))
       .sort((a, b) => b.startedAt - a.startedAt);
     return { items: matched.slice(0, i.limit).map((e) => this.summary(e)), total: matched.length };
   }
@@ -331,7 +418,8 @@ export class AgentApi implements AgentTools {
   private waitForRequest(i: ToolInput<'wait_for_request'>, signal?: AbortSignal): Promise<ToolResult> {
     const since = i.sinceMs === undefined ? this.defaultSince() : i.sinceMs === 'now' ? this.now() : i.sinceMs;
     const f = { url: i.url, method: i.method, status: i.status as StatusFilter, sinceMs: since };
-    const hit = (e: Exchange) => FINAL_STATES.has(e.state) && exchangeMatches(e, f);
+    const keep = this.filter(f);
+    const hit = (e: Exchange) => FINAL_STATES.has(e.state) && keep(e);
     const view = (e: Exchange) => ({ timedOut: false, sinceMs: since, ...this.detail(e, i.includeBodies, 20_000) });
     if (signal?.aborted) return Promise.reject(new AgentToolError('wait_for_request was cancelled', 'state'));
 
@@ -365,7 +453,7 @@ export class AgentApi implements AgentTools {
   private async exportHar(i: ToolInput<'export_har'>): Promise<ToolResult> {
     const root = this.deps.projectRoot();
     if (!root) throw new AgentToolError('no workspace folder is open to export into', 'state');
-    const list = this.deps.host.getExchanges().filter((e) => exchangeMatches(e, { url: i.url, method: i.method, sinceMs: i.sinceMs }));
+    const list = this.deps.host.getExchanges().filter(this.filter({ url: i.url, method: i.method, sinceMs: i.sinceMs }));
     const har = buildHar(list, { redact: this.redact, creatorVersion: this.deps.version });
     const file = await writeHar(root, har, new Date(this.now()));
     return { path: file, entries: list.length, redacted: this.redact };
@@ -384,6 +472,13 @@ export class AgentApi implements AgentTools {
 
   /** Validates with the host's rule validation and inserts the rule FIRST (it wins). */
   private insertRule(rule: Rule): ToolResult {
+    const probed = sensitiveQueryProbe(rule.match.url);
+    if (probed) {
+      throw new AgentToolError(
+        `the url pattern pins the value of the query parameter "${probed}", which agents only see redacted; use * for its value (e.g. "${probed}=*")`,
+        'invalid',
+      );
+    }
     let valid: Rule;
     try {
       valid = validateRule(rule);
@@ -700,9 +795,381 @@ export class AgentApi implements AgentTools {
     }
     return { id, sinceMs };
   }
+
+  // ------------------------------------------------------------------ v0.4.0 (CONTRACTS §10.6)
+
+  private codegenOrThrow(): CodegenService {
+    if (!this.deps.codegen) throw new AgentToolError('code generation is not available in this build of Flutter Intercept', 'state');
+    return this.deps.codegen;
+  }
+
+  private template(): (p: string) => string {
+    const cg = this.codegenOrThrow();
+    return (p) => cg.routeTemplate(p);
+  }
+
+  private async checkContract(i: ToolInput<'check_contract'>): Promise<ToolResult> {
+    const svc = this.deps.contract;
+    if (!svc) throw new AgentToolError('contract checking is not available in this build of Flutter Intercept', 'state');
+    let targets: Exchange[];
+    if (i.id !== undefined) {
+      if (i.url !== undefined || i.method !== undefined || i.sinceMs !== undefined) throw new AgentToolError('pass either id, or url/method/sinceMs', 'invalid');
+      targets = [this.find(i.id)];
+    } else {
+      const keep = this.filter({ url: i.url, method: i.method, sinceMs: i.sinceMs });
+      targets = this.deps.host
+        .getExchanges()
+        .filter((e) => FINAL_STATES.has(e.state) && looksJson(e) && keep(e))
+        .sort((a, b) => b.startedAt - a.startedAt)
+        .slice(0, i.limit);
+    }
+    const root = this.deps.projectRoot();
+    const results: Record<string, unknown>[] = [];
+    for (const e of targets) {
+      let r: ContractResult;
+      if (!FINAL_STATES.has(e.state)) {
+        r = { exchangeId: e.id, checked: false, via: 'none', violations: [], reason: `the response has not arrived yet (state ${e.state})` };
+      } else {
+        const cached = i.model === undefined ? this.deps.contractResult?.(e.id) : undefined;
+        try {
+          r = cached ?? (await svc.check(e, i.model !== undefined ? { model: i.model } : undefined));
+        } catch (err) {
+          r = { exchangeId: e.id, checked: false, via: 'none', violations: [], reason: `the check failed: ${(err as Error)?.message ?? String(err)}` };
+        }
+      }
+      results.push(contractForAgent(r, { root, exchange: e, redact: this.redact }));
+    }
+    const errors = results.reduce((n, r) => n + (r.errors as number), 0);
+    return {
+      results,
+      checked: results.filter((r) => r.checked).length,
+      errors,
+      ...(targets.length ? {} : { note: 'no finished JSON response matched; make the app call the endpoint first (or check list_requests)' }),
+    };
+  }
+
+  private async generateModel(i: ToolInput<'generate_model'>): Promise<ToolResult> {
+    if ((i.id === undefined) === (i.url === undefined)) throw new AgentToolError('pass id or url (exactly one)', 'invalid');
+    const cg = this.codegenOrThrow();
+    const template = this.template();
+    const all = this.deps.host.getExchanges();
+    let target: Exchange;
+    if (i.id !== undefined) target = this.find(i.id);
+    else {
+      const keep = this.filter({ url: i.url });
+      const hit = all
+        .filter((e) => FINAL_STATES.has(e.state) && decodeJson(e.responseBody).ok && keep(e))
+        .sort((a, b) => b.startedAt - a.startedAt)[0];
+      if (!hit) throw new AgentToolError(`no finished JSON response matches ${i.url}; make the app call it first`, 'not_found');
+      target = hit;
+    }
+    // decodeSample keeps `1.0` a double (JsonDouble) so the models get `double`, not `int`.
+    const json = decodeSample(target.responseBody);
+    if (!json.ok) throw new AgentToolError(`exchange "${target.id}" has no usable JSON response: ${json.reason}`, 'invalid');
+    const route = routeOf(target, template);
+    const samples = modelSamples(all, target, template).flatMap((s) => {
+      const d = decodeSample(s.responseBody);
+      return d.ok ? [this.redact ? redactJsonValue(d.value) : d.value] : [];
+    });
+    const root = this.deps.projectRoot();
+    const style = i.style ?? (root ? cg.detectModelStyle(root) : 'plain');
+    const files = cg.generateModels({
+      samples: samples.length ? samples : [this.redact ? redactJsonValue(json.value) : json.value],
+      rootName: i.name ?? defaultModelName(route.template),
+      style,
+      source: `${target.method.toUpperCase()} ${route.origin}${route.template}`,
+    });
+    return { files, samples: Math.max(1, samples.length), route: `${target.method.toUpperCase()} ${route.template}`, style };
+  }
+
+  private async generateFixtureTest(i: ToolInput<'generate_fixture_test'>): Promise<ToolResult> {
+    if ((i.ids === undefined) === (i.url === undefined)) throw new AgentToolError('pass ids or url (exactly one)', 'invalid');
+    const cg = this.codegenOrThrow();
+    let exchanges: Exchange[];
+    if (i.ids) {
+      exchanges = [...new Set(i.ids)].map((id) => this.find(id));
+      const unfinished = exchanges.find((e) => !FINAL_STATES.has(e.state) || e.status === undefined);
+      if (unfinished) throw new AgentToolError(`exchange "${unfinished.id}" has no finished response (state ${unfinished.state})`, 'invalid');
+    } else {
+      const keep = this.filter({ url: i.url });
+      exchanges = this.deps.host
+        .getExchanges()
+        .filter((e) => FINAL_STATES.has(e.state) && e.status !== undefined && keep(e))
+        .sort((a, b) => b.startedAt - a.startedAt)
+        .slice(0, MAX_FIXTURES);
+      if (!exchanges.length) throw new AgentToolError(`no finished request matches ${i.url}; make the app call it first`, 'not_found');
+    }
+    const route = routeOf(exchanges[0], this.template());
+    const root = this.deps.projectRoot();
+    const style = i.style ?? (root ? cg.detectFixtureStyle(root) : 'mock_client');
+    const pkg = this.deps.appPackageName?.();
+    const api = style === 'mocktail' ? await fixtureApi(this.deps.contract, exchanges, root, pkg) : undefined;
+    const testPackage = testPackageFor(root);
+    // Fixtures are meant to be committed: always the redacted view, whatever the setting (CONTRACTS §10.6).
+    const files = cg.generateFixtureTest({
+      exchanges: exchanges.map(redactExchange),
+      style,
+      name: i.name ?? defaultFixtureName(exchanges[0].method, route.template),
+      ...(pkg ? { packageName: pkg } : {}),
+      ...(api ? { api } : {}),
+      ...(testPackage ? { testPackage } : {}),
+    });
+    return { files, exchanges: exchanges.length, style, ...(api ? { mocks: api.className } : {}), redacted: true };
+  }
+
+  /** assert_traffic's default `sinceMs`: the latest launch/restart if within TRIGGER_WINDOW_MS, else all recorded traffic. */
+  private assertSince(): number {
+    return this.lastTriggerAt !== undefined && this.now() - this.lastTriggerAt <= TRIGGER_WINDOW_MS ? this.lastTriggerAt : 0;
+  }
+
+  /**
+   * Waits (event-driven, at most withinMs) until the count/presence/order expectations can hold, then evaluates
+   * every expectation once. With an upper bound (count.max / exact) the whole window is observed, unless it is
+   * already exceeded. Never hangs: a timer always settles it; cancellation rejects.
+   */
+  private assertTraffic(i: ToolInput<'assert_traffic'>, signal?: AbortSignal): Promise<ToolResult> {
+    const x = i.expect;
+    const c = x.count;
+    if (c) {
+      if (c.exact !== undefined && (c.min !== undefined || c.max !== undefined)) throw new AgentToolError('expect.count: use exact alone, or min and/or max', 'invalid');
+      if (c.min !== undefined && c.max !== undefined && c.min > c.max) throw new AgentToolError('expect.count: min is greater than max', 'invalid');
+    }
+    (x.json ?? []).forEach((a, n) => {
+      const bad = pathError(a.path);
+      if (bad) throw new AgentToolError(`expect.json[${n}]: ${bad}`, 'invalid');
+      if (a.exists === false && (a.equals !== undefined || a.type !== undefined)) throw new AgentToolError(`expect.json[${n}]: exists:false cannot be combined with equals or type`, 'invalid');
+    });
+    const since = i.sinceMs ?? this.assertSince();
+    // Compiled once per call (REVIEW-4 #11), matched against the agent's view of the URL (#1).
+    const keep = this.filter({ url: i.url, method: i.method, sinceMs: since });
+    const order = x.order?.map((glob) => ({ glob, test: compileMatcher({ url: glob }) }));
+    const upper = c?.exact ?? c?.max;
+    const need = c ? (c.exact ?? c.min ?? 0) : 1;
+    const start = this.now();
+    const count = () => this.deps.host.getExchanges().filter((e) => FINAL_STATES.has(e.state) && keep(e)).length;
+    const ready = (): boolean => {
+      const n = count();
+      if (upper !== undefined) return n > upper; // exceeded: no point waiting
+      return n >= need && (!order || this.orderFailure(order, since) === undefined);
+    };
+    const evaluate = () => this.evaluateAssert(i, since, Math.max(0, this.now() - start), keep, order);
+    if (signal?.aborted) return Promise.reject(new AgentToolError('assert_traffic was cancelled', 'state'));
+    if (i.withinMs === 0) return Promise.resolve().then(evaluate);
+
+    return new Promise<ToolResult>((resolve, reject) => {
+      let done = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (fn: () => void) => {
+        if (done) return;
+        done = true;
+        this.deps.host.off('exchange', onExchange);
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        fn();
+      };
+      const settle = () =>
+        finish(() => {
+          try {
+            resolve(evaluate());
+          } catch (e) {
+            reject(e);
+          }
+        });
+      const onExchange = (e: Exchange) => {
+        if (FINAL_STATES.has(e.state) && ready()) settle();
+      };
+      const onAbort = () => finish(() => reject(new AgentToolError('assert_traffic was cancelled', 'state')));
+      this.deps.host.on('exchange', onExchange);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      timer = setTimeout(settle, i.withinMs);
+      if (ready()) settle();
+    });
+  }
+
+  /** Why `order` does not hold among the finished exchanges since `since`, or undefined when it does. */
+  private orderFailure(order: { glob: string; test: (method: string, url: string) => boolean }[], since: number): string | undefined {
+    const done = this.deps.host
+      .getExchanges()
+      .filter((e) => FINAL_STATES.has(e.state) && e.startedAt >= since)
+      .sort((a, b) => a.startedAt - b.startedAt);
+    let after = -Infinity;
+    let prev: string | undefined;
+    const view = this.redact ? redactUrl : (u: string) => u;
+    for (const { glob, test } of order) {
+      const hit = done.find((e) => e.startedAt > after && test(e.method, view(e.url)));
+      if (!hit) return `order: no request matching ${JSON.stringify(glob)} ${prev !== undefined ? `started after the one matching ${JSON.stringify(prev)}` : 'was recorded'}`;
+      after = hit.startedAt;
+      prev = glob;
+    }
+    return undefined;
+  }
+
+  private evaluateAssert(
+    i: ToolInput<'assert_traffic'>,
+    since: number,
+    waitedMs: number,
+    keep: (e: Exchange) => boolean,
+    order: { glob: string; test: (method: string, url: string) => boolean }[] | undefined,
+  ): ToolResult {
+    const x = i.expect;
+    const all = this.deps.host.getExchanges();
+    const m = all.filter((e) => FINAL_STATES.has(e.state) && keep(e)).sort((a, b) => a.startedAt - b.startedAt);
+    const inFlight = all.filter((e) => !FINAL_STATES.has(e.state) && keep(e)).length;
+    const failures: string[] = [];
+    const label = (e: Exchange) => `${e.id} (${e.method} ${this.url(e.url)})`;
+    const what = `${i.method ? `${i.method.toUpperCase()} ` : ''}${i.url}`;
+    const flight = inFlight ? ` (${inFlight} more still in flight)` : '';
+    const sinceText = since > 0 ? ` since ${new Date(since).toISOString()}` : '';
+
+    const c = x.count;
+    const n = m.length;
+    if (c) {
+      if (c.exact !== undefined && n !== c.exact) failures.push(`count: expected exactly ${c.exact} request(s) matching ${what}${sinceText}, got ${n}${flight}`);
+      if (c.min !== undefined && n < c.min) failures.push(`count: expected at least ${c.min} request(s) matching ${what}${sinceText}, got ${n}${flight}`);
+      if (c.max !== undefined && n > c.max) failures.push(`count: expected at most ${c.max} request(s) matching ${what}${sinceText}, got ${n}`);
+    } else if (!n) failures.push(`no finished request matched ${what}${sinceText}${flight}`);
+
+    if (order) {
+      const why = this.orderFailure(order, since);
+      if (why) failures.push(why);
+    }
+    for (const e of m) {
+      if (x.status !== undefined && !statusMatches(e, x.status as StatusFilter)) {
+        failures.push(`${label(e)}: ${e.status !== undefined ? `status ${e.status}` : `no status (state ${e.state})`}, expected ${x.status}`);
+      }
+      if (x.maxDurationMs !== undefined && !(e.durationMs !== undefined && e.durationMs <= x.maxDurationMs)) {
+        failures.push(`${label(e)}: ${e.durationMs !== undefined ? `took ${e.durationMs} ms` : 'duration unknown'}, expected at most ${x.maxDurationMs} ms`);
+      }
+      if (x.json?.length) this.jsonFailures(e, x.json, label(e), failures);
+      if (failures.length > MAX_ASSERT_FAILURES) break;
+    }
+    const extra = failures.length - MAX_ASSERT_FAILURES;
+    const shown = extra > 0 ? [...failures.slice(0, MAX_ASSERT_FAILURES), `… and more failures (stopped after ${MAX_ASSERT_FAILURES})`] : failures;
+    return {
+      pass: failures.length === 0,
+      matched: n,
+      ids: m.slice(-20).map((e) => e.id),
+      ...(inFlight ? { inFlight } : {}),
+      sinceMs: since,
+      ...(i.withinMs ? { waitedMs } : {}),
+      failures: shown,
+    };
+  }
+
+  /**
+   * json assertions on one exchange (REVIEW-4 #7/#8). With redaction on, EVERY assertion is evaluated on the
+   * redacted view (what get_request shows: a sensitive field is just the string "[redacted]"), and a path that
+   * goes below a sensitive key fails with "is inside a redacted field" without being evaluated. So neither the
+   * pass/fail nor the texts reveal values, keys or counts under a redacted field. Failure texts carry paths,
+   * types and sizes, never values. At most MAX_JSON_FAILURES_PER_EXCHANGE texts per exchange.
+   */
+  private jsonFailures(e: Exchange, asserts: NonNullable<ToolInput<'assert_traffic'>['expect']['json']>, label: string, out: string[]): void {
+    const d = decodeJson(e.responseBody);
+    if (!d.ok) {
+      out.push(`${label}: cannot check JSON paths: ${e.responseBody ? `the response ${d.reason.replace(/^the body/, 'body')}` : 'no response body'}`);
+      return;
+    }
+    const root = this.redact ? redactJsonValue(d.value) : d.value;
+    let left = MAX_JSON_FAILURES_PER_EXCHANGE;
+    const push = (text: string): boolean => {
+      if (left <= 0) return false;
+      left--;
+      out.push(left === 0 ? `${text} (further JSON failures of ${e.id} omitted)` : text);
+      return left > 0;
+    };
+    const sel = (p: string) => {
+      try {
+        return select(root, p);
+      } catch (err) {
+        throw new AgentToolError(`invalid JSON path ${JSON.stringify(p)}: ${(err as Error)?.message ?? String(err)}`, 'invalid');
+      }
+    };
+    for (const a of asserts) {
+      if (left <= 0) return;
+      if (this.redact && insideRedacted(a.path)) {
+        push(`${label}: ${a.path} is inside a redacted field (secrets cannot be asserted; check the field itself with exists)`);
+        continue;
+      }
+      const got = sel(a.path);
+      const exists = a.exists ?? (a.equals === undefined && a.type === undefined ? true : undefined);
+      if (exists === false) {
+        if (got.length) push(`${label}: ${a.path} is present (${got.length} value${got.length === 1 ? '' : 's'}), expected it to be absent`);
+        continue;
+      }
+      if (!got.length) {
+        push(`${label}: ${a.path} not found${a.type ? ` (expected ${a.type})` : a.equals !== undefined ? ' (expected a value)' : ''}`);
+        continue;
+      }
+      if (a.type) {
+        for (const s of got) if (!typeMatches(s.value, a.type) && !push(`${label}: ${s.path} is ${jsonType(s.value)}, expected ${a.type}`)) return;
+      }
+      if (a.equals !== undefined) {
+        for (const s of got) if (!jsonEqual(s.value, a.equals) && !push(`${label}: ${s.path} does not equal the expected value (it is ${describeValue(s.value)})`)) return;
+      }
+    }
+  }
+
+  private addMutation(i: ToolInput<'add_mutation'>): ToolResult {
+    const ops = i.ops.map((o) => ({ path: o.path, op: o.op, ...(o.value !== undefined ? { value: o.value } : {}), ...(o.valueJson !== undefined ? { valueJson: o.valueJson } : {}) }));
+    const summary = ops.map((o) => `${o.op} ${o.path}`).join(', ');
+    const fallback = `mutate ${i.method ?? '*'} ${i.url}: ${summary}`;
+    return this.insertRule({
+      id: this.newId(),
+      enabled: true,
+      name: this.label(i.name, fallback.length > 300 ? `${fallback.slice(0, 299)}…` : fallback),
+      match: { url: i.url, ...(i.method ? { method: i.method.toUpperCase() } : {}) },
+      action: { kind: 'mutate', ops },
+      ...this.spending(i),
+    });
+  }
 }
 
 const isRedacted = (v: string) => v === REDACTED || v === encodeURIComponent(REDACTED);
+
+/** JSON type name as assert_traffic uses it ("integer" is also a "number"). */
+function jsonType(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'array';
+  if (typeof v === 'number') return Number.isInteger(v) ? 'integer' : 'number';
+  return typeof v; // string, boolean, object
+}
+
+function typeMatches(v: unknown, want: string): boolean {
+  const t = jsonType(v);
+  return t === want || (want === 'number' && t === 'integer');
+}
+
+/** A value described without revealing it (assert_traffic failure texts). */
+function describeValue(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return `an array of ${v.length} item${v.length === 1 ? '' : 's'}`;
+  switch (typeof v) {
+    case 'string':
+      return `a string of ${v.length} character${v.length === 1 ? '' : 's'}`;
+    case 'number':
+      return Number.isInteger(v) ? 'an integer' : 'a number';
+    case 'boolean':
+      return 'a boolean';
+    case 'object':
+      return `an object with ${Object.keys(v as object).length} key${Object.keys(v as object).length === 1 ? '' : 's'}`;
+    default:
+      return typeof v;
+  }
+}
+
+/** Structural JSON equality (object key order ignored). */
+export function jsonEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    const bb = b as unknown[];
+    return a.length === bb.length && a.every((x, i) => jsonEqual(x, bb[i]));
+  }
+  const ka = Object.keys(a as object);
+  const kb = Object.keys(b as object);
+  return ka.length === kb.length && ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && jsonEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+}
 
 /** Header values the agent only saw as "[redacted]" get their original value back (dropped if there was none). */
 export function restoreRedactedHeaders(edit: Record<string, string | string[]>, original: Record<string, string | string[]>): Record<string, string | string[]> {

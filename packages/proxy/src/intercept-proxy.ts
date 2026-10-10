@@ -19,6 +19,7 @@ import {
   decodeForDisplay,
   deleteHeader,
   frameBody,
+  frameBodyAsync,
   getHeader,
   normalizedEncoding,
   type HeaderBag,
@@ -41,6 +42,7 @@ import {
   SSRF_MARKER,
 } from './lan';
 import { describeProfile, NO_PROFILE, type NetworkProfile } from './network';
+import { mutateBody } from './mutate';
 import { isTraceHost, isTraceUrl, parseTraceBody, TraceJoin, TRACE_BODY_MAX, TRACE_HEADER, TRACE_ID_RE, TRACE_PATH } from './trace';
 import type { Shaping } from './shaper';
 import type {
@@ -48,6 +50,7 @@ import type {
   Exchange,
   FaultKind,
   InterceptProxyOptions,
+  MutateOp,
   RequestEdit,
   ResponseEdit,
   Rule,
@@ -70,7 +73,7 @@ type Decision =
  *   applied by the route matcher (before forwarding, nothing read); kbps / truncate by the taps.
  * - h1: beforeRequest only (mock, block, request breakpoint, and the reset / dns / timeout faults).
  *   The response, if forwarded, streams.
- * - h2: beforeRequest + beforeResponse (response / both breakpoints); response buffered ≤ 32 MB.
+ * - h2: beforeRequest + beforeResponse (response / both breakpoints, mutate rules); response buffered ≤ 32 MB.
  * - trace: the trace sink (CONTRACTS §9.2), answered 204 locally, never recorded.
  */
 type Route = 'plain' | 'h1' | 'h2' | 'denied' | 'trace';
@@ -89,7 +92,7 @@ interface SendMeta {
 interface Flow {
   route: Route;
   rule?: Rule;
-  /** Why a matching breakpoint was not applied (shown in Exchange.error on a non-error state). */
+  /** Why a matching breakpoint / mutate rule was not applied (shown in Exchange.error on a non-error state). */
   note?: string;
   /** `x-fi-id` of the request (CONTRACTS §9.1), stripped from the headers. */
   traceId?: string;
@@ -197,8 +200,8 @@ const bodySize = (e: Exchange) => (e.requestBody?.text.length ?? 0) + (e.respons
  * Memory: pass-through traffic streams; only the first 5 MB of each body is kept for display
  * (src/taps.ts), and mockttp's own in-flight buffers are capped with `maxBodySize` (5 MB).
  * A request breakpoint holds at most 5 MB of request body (bigger or unknown-length bodies skip
- * the breakpoint, with a note); a response breakpoint holds at most 32 MB (bigger responses fail
- * with a 502 that says why).
+ * the breakpoint, with a note); a response breakpoint or mutate rule holds at most 32 MB (bigger
+ * responses fail with a 502 that says why).
  */
 export class InterceptProxy extends EventEmitter {
   private readonly host: string;
@@ -961,29 +964,31 @@ export class InterceptProxy extends EventEmitter {
     } else if (action.kind === 'throttle') {
       flow = { route: 'plain', rule, throttle: { latencyMs: action.latencyMs, kbps: action.kbps }, simulated: throttleLabel(action) };
       dropRate = action.dropRate;
-    } else if (action.kind !== 'breakpoint') {
+    } else if (action.kind !== 'breakpoint' && action.kind !== 'mutate') {
       flow = { route: 'h1', rule };
     } else {
-      // A breakpoint must buffer the request body before forwarding it. Only do that when the
-      // size is known and small; mockttp would otherwise drop data past maxBodySize.
+      // Breakpoints and mutate rules run on hooked routes, where mockttp buffers the request body
+      // before forwarding it. Only do that when the size is known and small; mockttp would otherwise
+      // drop data past maxBodySize. (The mutate rule's response side never needs this; its request does.)
+      const what = action.kind === 'mutate' ? 'Mutate rule' : 'Breakpoint';
       const te = getHeader(req.headers, 'transfer-encoding');
       const cl = Number(getHeader(req.headers, 'content-length') ?? 0);
       if (te) {
-        flow = { route: 'plain', rule, note: 'Breakpoint skipped: the request body is streamed (unknown length), so it was passed through unedited.' };
+        flow = { route: 'plain', rule, note: `${what} skipped: the request body is streamed (unknown length), so it was passed through unedited.` };
       } else if (cl > REQUEST_PAUSE_LIMIT_BYTES) {
         flow = {
           route: 'plain',
           rule,
-          note: `Breakpoint skipped: the request body (${(cl / MB).toFixed(1)} MB) is over the ${REQUEST_PAUSE_LIMIT_BYTES / MB} MB pause limit, so it was passed through unedited.`,
+          note: `${what} skipped: the request body (${(cl / MB).toFixed(1)} MB) is over the ${REQUEST_PAUSE_LIMIT_BYTES / MB} MB pause limit, so it was passed through unedited.`,
         };
       } else {
-        flow = { route: action.phase === 'request' ? 'h1' : 'h2', rule };
+        flow = { route: action.kind === 'breakpoint' && action.phase === 'request' ? 'h1' : 'h2', rule };
       }
     }
 
-    // The network profile: everything that would reach the network (no rule, breakpoints, throttle
-    // rules — whose own settings win over a throttle profile). Mock / block / fault rules answer as set.
-    const reachesNetwork = !action || action.kind === 'breakpoint' || action.kind === 'throttle';
+    // The network profile: everything that would reach the network (no rule, breakpoints, mutate and
+    // throttle rules — whose own settings win over a throttle profile). Mock / block / fault rules answer as set.
+    const reachesNetwork = !action || action.kind === 'breakpoint' || action.kind === 'mutate' || action.kind === 'throttle';
     const p = this.profile;
     if (reachesNetwork && p.kind === 'offline') {
       flow = { route: 'h1', rule, fault: 'dns', simulated: describeProfile(p) };
@@ -1253,9 +1258,33 @@ export class InterceptProxy extends EventEmitter {
       }
       if (d.kind === 'gone') return 'close';
       result = await this.applyResponseEdit(res, ex, d.edit as ResponseEdit | undefined);
+    } else if (action?.kind === 'mutate') {
+      result = await this.applyMutation(res, ex, action.ops);
+      if (!this.live.has(ex.id) || ex.state !== 'pending') return 'close'; // the app left meanwhile
     }
     this.finish(ex, 'completed');
     return result;
+  }
+
+  /**
+   * The mutate rule (CONTRACTS §10.2): JSON ops on the complete upstream body, re-encoded and re-framed
+   * like a body edit. Anything that can't be mutated is forwarded unchanged with a note in `error`.
+   */
+  private async applyMutation(res: PassThroughResponse, ex: Exchange, ops: MutateOp[]): Promise<CallbackResponseMessageResult | undefined> {
+    const outcome = await mutateBody(res.body.buffer, getHeader(res.headers, 'content-encoding'), ops);
+    if (outcome.kind === 'skipped') {
+      ex.error = outcome.note;
+      return undefined;
+    }
+    const headers: HeaderBag = { ...res.headers };
+    // Integrity headers would no longer describe the body.
+    for (const h of ['content-md5', 'digest', 'content-digest', 'repr-digest']) deleteHeader(headers, h);
+    const rawBody = await frameBodyAsync(outcome.decoded, headers); // off the event loop (REVIEW-4 #4)
+    ex.responseHeaders = cleanHeaders(headers);
+    ex.responseBody = await decodeForDisplay(outcome.decoded, undefined, true);
+    ex.simulated = ex.simulated ? `${ex.simulated} · ${outcome.label}` : outcome.label;
+    if (outcome.unmatched.length) ex.error = `Mutate rule: nothing matched ${outcome.unmatched.join(', ')} (the other changes were applied).`;
+    return { headers, rawBody };
   }
 
   private async applyRequestEdit(

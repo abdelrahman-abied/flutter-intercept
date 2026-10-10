@@ -10,13 +10,19 @@
  * 4. `Authorization: Bearer <token>`, compared in constant time → else 401;
  * 5. body ≤ 1 MiB (the SDK transport answers 413), ≤ 64 connections, ≤ 16 MCP sessions (oldest idle
  *    evicted), idle sessions closed after 1 h. The token is never logged.
+ *
+ * CONTRACTS §10.6: besides the tools, read-only resources (the same redacted views as the tools, read through
+ * `AgentTools.call`, so access level and redaction apply) and short tool-oriented prompts. No change
+ * notifications: the traffic changes constantly and `resources/subscribe` is being replaced (MCP 2026-07-28);
+ * clients re-read. No Sampling, Roots or Logging.
  */
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'crypto';
 import * as http from 'http';
 import type { AddressInfo } from 'net';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { ErrorCode, McpError, type CallToolResult, type GetPromptResult, type ReadResourceResult } from '@modelcontextprotocol/sdk/types.js';
+import { z } from 'zod';
 import { AgentToolError, READ_TOOLS, WRITE_TOOLS, type AgentTools, type ToolName } from '../types';
 
 export const MCP_PATH = '/mcp';
@@ -157,7 +163,188 @@ function buildServer(o: McpServerOptions, life: Lifecycle): McpServer {
       },
     );
   }
+  registerResources(server, o.tools);
+  registerPrompts(server);
   return server;
+}
+
+// ------------------------------------------------------------------ resources (CONTRACTS §10.6)
+
+export const RESOURCE_URIS = {
+  exchange: 'intercept://exchange/{id}',
+  paused: 'intercept://paused',
+  rules: 'intercept://rules',
+  contract: 'intercept://contract/{id}',
+} as const;
+
+const JSON_MIME = 'application/json';
+
+/** Runs a read tool for a resource; tool errors become MCP errors (never a crash, never a token). */
+async function readVia(tools: AgentTools, uri: URL, tool: ToolName, input: Record<string, unknown>): Promise<ReadResourceResult> {
+  try {
+    const result = await tools.call(tool, input);
+    return { contents: [{ uri: uri.href, mimeType: JSON_MIME, text: JSON.stringify(result, null, 2) }] };
+  } catch (e) {
+    const code = e instanceof AgentToolError && (e.code === 'not_found' || e.code === 'invalid') ? ErrorCode.InvalidParams : ErrorCode.InternalError;
+    throw new McpError(code, errorText(e));
+  }
+}
+
+function idVar(v: string | string[] | undefined): string {
+  const raw = Array.isArray(v) ? v[0] : v;
+  let id = '';
+  try {
+    id = decodeURIComponent(raw ?? '');
+  } catch {
+    id = '';
+  }
+  if (!id || id.length > 200) throw new McpError(ErrorCode.InvalidParams, 'the resource URI needs an exchange id');
+  return id;
+}
+
+function registerResources(server: McpServer, tools: AgentTools): void {
+  server.registerResource(
+    'exchange',
+    new ResourceTemplate(RESOURCE_URIS.exchange, {
+      // The newest recorded exchanges (same redacted summary as list_requests).
+      list: async () => {
+        try {
+          const r = (await tools.call('list_requests', { limit: 50 })) as { items?: { id: string; method?: string; url?: string; status?: number; state?: string }[] };
+          return {
+            resources: (r.items ?? []).map((i) => ({
+              uri: `intercept://exchange/${encodeURIComponent(i.id)}`,
+              name: `${i.method ?? ''} ${i.url ?? i.id}`.trim().slice(0, 300),
+              description: `${i.status ?? i.state ?? ''}`,
+              mimeType: JSON_MIME,
+            })),
+          };
+        } catch {
+          return { resources: [] };
+        }
+      },
+    }),
+    {
+      title: 'Recorded HTTP exchange',
+      description: 'One recorded HTTP request/response of the running app, as get_request returns it (headers, bodies, timings; secrets redacted).',
+      mimeType: JSON_MIME,
+    },
+    (uri, vars) => readVia(tools, uri, 'get_request', { id: idVar(vars.id) }),
+  );
+  server.registerResource(
+    'paused',
+    RESOURCE_URIS.paused,
+    { title: 'Paused requests', description: 'Requests currently paused at a breakpoint (as list_paused returns them).', mimeType: JSON_MIME },
+    (uri) => readVia(tools, uri, 'list_paused', {}),
+  );
+  server.registerResource(
+    'rules',
+    RESOURCE_URIS.rules,
+    { title: 'Intercept rules', description: 'Active mock / block / breakpoint / throttle / fault / mutate rules in priority order (as list_rules returns them).', mimeType: JSON_MIME },
+    (uri) => readVia(tools, uri, 'list_rules', {}),
+  );
+  server.registerResource(
+    'contract',
+    new ResourceTemplate(RESOURCE_URIS.contract, { list: undefined }),
+    {
+      title: 'Contract check of an exchange',
+      description: "The check of one recorded JSON response against the app's Dart models (as check_contract {id} returns it).",
+      mimeType: JSON_MIME,
+    },
+    (uri, vars) => readVia(tools, uri, 'check_contract', { id: idVar(vars.id) }),
+  );
+}
+
+// ------------------------------------------------------------------ prompts (CONTRACTS §10.6)
+
+const promptText = (text: string): GetPromptResult => ({ messages: [{ role: 'user', content: { type: 'text', text } }] });
+const oneLine = (v: string | undefined, max: number) => (v ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, max);
+
+export const PROMPT_NAMES = ['debug-failing-request', 'test-error-states', 'verify-change', 'build-api-layer-from-traffic'] as const;
+
+function registerPrompts(server: McpServer): void {
+  server.registerPrompt(
+    'debug-failing-request',
+    {
+      title: 'Debug a failing request',
+      description: 'Find why an HTTP request of the running Flutter app fails, fix it and verify the fix.',
+      argsSchema: { id: z.string().max(200).optional().describe('Recorded exchange id (default: the newest failure).') },
+    },
+    ({ id }) => {
+      const ex = oneLine(id, 200);
+      return promptText(
+        [
+          'Debug a failing HTTP request of the running Flutter app with the flutter-intercept tools.',
+          ex
+            ? `1. Start from exchange "${ex}": get_request {"id": "${ex}"}.`
+            : '1. Find it: list_requests with status "error", then "5xx", then "4xx" (newest first) and take the most recent failure.',
+          '2. Read the request and response (get_request) and the Dart call site that sent it (get_request_source).',
+          '3. If the response is JSON, run check_contract on it: a field that makes the generated fromJson throw is a common cause.',
+          '4. Explain the cause (request built wrong, server error, or parsing) and fix the code.',
+          '5. Verify: hot_restart (or trigger the flow again), then assert_traffic for that request (status "2xx", json fields).',
+          'Secrets appear as "[redacted]"; that is intentional.',
+        ].join('\n'),
+      );
+    },
+  );
+  server.registerPrompt(
+    'test-error-states',
+    {
+      title: 'Test error states of an endpoint',
+      description: 'Exercise how the app handles failures of one endpoint (errors, timeouts, bad fields) without touching the backend.',
+      argsSchema: { url: z.string().min(1).max(2000).describe('URL glob of the endpoint, e.g. "*/api/users*".') },
+    },
+    ({ url }) => {
+      const u = oneLine(url, 2000);
+      return promptText(
+        [
+          `Test how the app handles error states of ${u} without changing the backend. For each case: add the rule with times: 1, hot_restart or trigger the call, observe the app (wait_for_request, get_request, its logs/UI), then go on.`,
+          '- add_mock with status 500, 401 and 404 (realistic error bodies), and with an empty list / object.',
+          `- simulate_network with url "${u}" and fault "timeout", then "reset"; and profile "slow-3g" for the same url.`,
+          '- add_mutation: null and delete the fields the models need (get_body_shape and check_contract show which).',
+          'Report what the app did in each case and what should change. At the end remove leftover rules (list_rules, remove_rule).',
+        ].join('\n'),
+      );
+    },
+  );
+  server.registerPrompt(
+    'verify-change',
+    {
+      title: 'Verify a change with real traffic',
+      description: "Check that a code change produces the expected HTTP traffic and parses with the app's models.",
+      argsSchema: { description: z.string().min(1).max(2000).describe('What changed and what the app should now send or receive.') },
+    },
+    ({ description }) =>
+      promptText(
+        [
+          `Verify this change with the app's real traffic: ${oneLine(description, 2000)}`,
+          '1. hot_restart the app (launch_app if get_status shows no session) and drive the affected flow, or ask the user to.',
+          '2. assert_traffic for the requests the change should produce: url, method, status, count, order, json fields (withinMs to wait for them).',
+          '3. check_contract on the responses involved.',
+          '4. On failure use get_request / get_request_source, fix, and repeat. Report pass or fail with the evidence.',
+        ].join('\n'),
+      ),
+  );
+  server.registerPrompt(
+    'build-api-layer-from-traffic',
+    {
+      title: 'Build the API layer from traffic',
+      description: "Generate models, client methods and fixture tests for an API from the app's recorded traffic.",
+      argsSchema: { urlPrefix: z.string().min(1).max(2000).describe('Base URL of the API, e.g. "https://api.example.com/v1/".') },
+    },
+    ({ urlPrefix }) => {
+      const p = oneLine(urlPrefix, 2000).replace(/\*+$/, '');
+      return promptText(
+        [
+          `Build or update the app's API layer for ${p} from recorded traffic.`,
+          `1. list_requests with url "${p}*" (limit 200) and group the requests by method + route (ids become {id}).`,
+          '2. For each route: get_body_shape, then generate_model {"id": …}. Write the files, merge them with existing models, and run build_runner for freezed / json_serializable.',
+          "3. Add the endpoints to the API client in the project's style (Retrofit, Chopper or Dio).",
+          '4. generate_fixture_test for the main routes and adapt the tests to call the new client.',
+          '5. hot_restart and run check_contract on the new responses until it reports no errors.',
+        ].join('\n'),
+      );
+    },
+  );
 }
 
 interface Session {
