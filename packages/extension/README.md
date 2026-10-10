@@ -268,6 +268,343 @@ Running the command again updates it in place, and the rest of the file is left 
 - "Mock the feed endpoint with a 10-second delay and check the loading state."
 - "Pause the next checkout request, change the quantity to 3, and resume it."
 
+## Tutorials
+
+Short, hands-on walkthroughs, one per feature. Each one says what you'll do, the exact steps, what you should
+see, and a tip. The examples use public test APIs such as `jsonplaceholder.typicode.com`; swap in your own
+endpoints.
+
+**Getting started**
+
+1. [Run your app with interception](#run-your-app-with-interception)
+2. [Read the traffic list and request details](#read-the-traffic-list-and-request-details)
+3. [Find requests with filters and search](#find-requests-with-filters-and-search)
+
+**Change what your app sends and receives**
+
+4. [Pause and edit a request or response](#pause-and-edit-a-request-or-response)
+5. [Mock a response](#mock-a-response)
+6. [Block a request](#block-a-request)
+7. [Organize your rules](#organize-your-rules)
+8. [Make a rule remove itself](#make-a-rule-remove-itself)
+
+**Debug a request**
+
+9. [Jump from a request to the code that sent it](#jump-from-a-request-to-the-code-that-sent-it)
+10. [Copy a request as cURL, Dart or Dio](#copy-a-request-as-curl-dart-or-dio)
+11. [Resend a request, or edit it and resend](#resend-a-request-or-edit-it-and-resend)
+
+**Bad networks**
+
+12. [Simulate a slow, flaky or offline network](#simulate-a-slow-flaky-or-offline-network)
+13. [Slow down or break a single endpoint](#slow-down-or-break-a-single-endpoint)
+
+**Devices**
+
+14. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
+15. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
+16. [Run on a physical iPhone](#run-on-a-physical-iphone)
+17. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
+
+**AI agents**
+
+18. [Connect an AI agent](#connect-an-ai-agent)
+19. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
+20. [Control what agents can see and do](#control-what-agents-can-see-and-do)
+
+### Run your app with interception
+
+You'll install the extension and see your app's requests in VS Code.
+
+1. Install **Flutter Intercept** from the Marketplace. VS Code also installs the Dart extension it needs.
+2. Open your Flutter project, pick a device in the status bar, and press **F5**, as you always do.
+3. The **Traffic** panel opens at the bottom of VS Code on the first intercepted session.
+
+**You should see:** each request your app makes appear as a row, and `Intercept: on` in the status bar.
+
+**Tip:** click `Intercept: on` (status bar or panel toolbar) to turn interception off; it applies from the next
+launch. If F5 isn't picked up, run **Flutter Intercept: Debug with Intercept** from the Command Palette.
+
+### Read the traffic list and request details
+
+You'll inspect what your app sent and what the server answered.
+
+1. Each row shows **Method**, **Status**, **Host**, **Path**, **Time**, **Size** and **State** (paused,
+   mocked, blocked, error).
+2. Click a row, or move with the arrow keys, **Home**, **End**, **Page Up** and **Page Down**. Press **Enter** to
+   move focus into the details and **Esc** to close them.
+3. Switch between the **Request** and **Response** tabs. Each shows **Headers** and **Body**.
+4. Drag the splitter between the list and the details to resize them.
+
+**You should see:** JSON as a collapsible tree, compressed bodies already decoded, and a preview for images.
+
+**Tip:** right-click a row (or press **Shift+F10**) for the same actions as the detail pane. **Clear traffic** in
+the toolbar empties the list; requests still in flight stay.
+
+### Find requests with filters and search
+
+You'll narrow a busy list down to the requests you care about.
+
+1. Type in the **Filter** box: plain words match the URL, for example `todos`.
+2. Add filters, separated by spaces:
+   - `m:POST` (method), `s:404`, `s:4xx` or `s:error` (status);
+   - `t:json` (also `html`, `image`, `text`, `xml`, `binary`, `other`);
+   - `body:token` or `body:"a phrase"`, `h:authorization` or `h:name=value`;
+   - `state:paused` (also `mocked`, `blocked`, `error`, `simulated`, `resent`), `src:login_page.dart`.
+3. Put `-` in front of any word or filter to exclude it, for example `-s:2xx`.
+4. Or use the toolbar: **All methods**, the **2xx** to **5xx** and **err** toggles, and **paused only**.
+
+**You should see:** the status line shows how many exchanges are listed and how many are shown.
+
+**Tip:** hover the filter box for the syntax; an invalid filter is marked and explained there. **Clear filters**
+(next to the toggles) resets everything.
+
+### Pause and edit a request or response
+
+You'll stop a request before it reaches the server (or a response before the app gets it) and change it.
+
+1. Select a request, for example `GET https://jsonplaceholder.typicode.com/users/1`, and click
+   **Break on this**. This pauses its *responses*.
+2. Trigger the request again in your app.
+3. The row shows as paused, the toolbar shows **1 paused**, and the details open on a banner with a countdown.
+4. Edit the status, headers or body (for a paused request: method, URL, headers and body). JSON is checked as
+   you type; **Format** tidies it and **Go to error** finds a mistake.
+5. Click **Resume with edits**, **Resume unchanged** or **Abort**.
+
+**You should see:** your app receive the edited response. **Abort** gives it a network error.
+
+**Tip:** to pause requests instead, open the rule in **Rules** and pick **Pause request** or **Both**. An
+untouched breakpoint resumes by itself after 5 minutes, but your app's own timeout may fire first; the exchange
+is then marked as given up.
+
+### Mock a response
+
+You'll make your app receive a response you wrote, without calling the server.
+
+1. Select a request, for example `GET .../todos/1`, and click **Mock this**.
+2. The **Rules** tab opens with the new mock in the editor, pre-filled with the real response.
+3. Change **Status**, **Delay (ms)**, **Headers** or **Body**, for example `"completed": true`, then **Save**.
+4. Trigger the request again in your app.
+
+**You should see:** the row marked as mocked, with a link to the rule that answered it. The server isn't
+contacted.
+
+**Tip:** to start from scratch, open **Rules** → **Add rule** → **Mock response**. A `500` with an empty body
+and a 3000 ms delay is a quick way to test error and loading states.
+
+### Block a request
+
+You'll make a request fail, to check how your app handles errors.
+
+1. Select a request and click **Block this**. The rule answers with status `403` and goes to the top of
+   **Rules**.
+2. To simulate a network error instead, edit the rule and pick **Connection reset (app sees a network error)**,
+   or keep **Respond with status** with another code.
+3. Trigger the request again.
+
+**You should see:** the row marked as blocked, and your app's error handling run.
+
+**Tip:** untick the rule's checkbox to let requests through again without deleting it.
+
+### Organize your rules
+
+You'll control which rule applies when several match.
+
+1. Open the **Rules** tab. Rules run top to bottom, and the **first enabled rule that matches wins**.
+2. Click **Add rule**. Fill in **Method** (empty = any) and **URL**: a glob such as
+   `https://jsonplaceholder.typicode.com/users/*`, or a `/regex/` such as `/\/users\/\d+$/`.
+3. The editor shows how many listed exchanges the rule matches. Pick an **Action** and click **Add rule**.
+4. Reorder by dragging, with **Move up** / **Move down**, or with **Alt+↑** / **Alt+↓**.
+5. Use the checkbox to enable or disable a rule, **Edit** to change it, and **Delete** to remove it.
+
+**You should see:** each rule's match count, and a warning when an earlier rule takes some of its matches.
+
+**Tip:** a delete can be undone with **Undo** in the notice that appears. Rules are saved per workspace.
+
+### Make a rule remove itself
+
+You'll add a temporary mock that can't linger after a test.
+
+1. Open a rule in the editor (or **Add rule**) and find **Lifetime**.
+2. Set **Only first N requests**, for example `1` to fail just the next call and test a retry.
+3. Or set **Expires in** with **seconds**, **minutes** or **hours**.
+4. **Save**.
+
+**You should see:** a badge on the rule with what's left. The rule is removed once it is spent or expired.
+
+**Tip:** rules added by AI agents can do the same (`times`, `ttlMs`), so their mocks clean themselves up too.
+
+### Jump from a request to the code that sent it
+
+You'll find the line of your code behind a request.
+
+1. Select a request. Under the title, **Called from** shows the function and file, for example
+   `CatalogApi.fetchAlbum  lib/api/catalog_api.dart:37`.
+2. Click **Open source** to open that line in the editor.
+3. Click **All frames** to see the whole stack; click any frame to open it. SDK and library frames are dimmed.
+
+**You should see:** works for `package:http`, `HttpClient` and Dio, including interceptors.
+
+**Tip:** filter by file with `src:catalog_api.dart`. In profile builds Dio requests have no call site. Turn
+recording off with `flutterIntercept.captureSource`.
+
+### Copy a request as cURL, Dart or Dio
+
+You'll reproduce a request outside the app.
+
+1. Select a request and open **Copy as…** in the detail pane (or right-click the row).
+2. Pick **Copy as cURL**, **Copy as Dart (http)** or **Copy as Dio**.
+
+**You should see:** a short "Copied as …" notice; paste the snippet into a terminal, a test or a bug report.
+
+**Tip:** the snippet contains real headers, including auth tokens. Check it before sharing.
+
+### Resend a request, or edit it and resend
+
+You'll replay a request without touching the app.
+
+1. Select a finished request, for example `POST https://jsonplaceholder.typicode.com/todos`.
+2. Click **Resend** to send it again unchanged.
+3. Or click **Edit and resend**, change the method, URL, headers or body, and click **Send**
+   (**Ctrl/Cmd+Enter**).
+
+**You should see:** a new row marked **resent**, selected once recorded, with a link back to the original.
+
+**Tip:** resent requests go through the proxy like app traffic, so your rules and the network profile apply.
+**Resend** is disabled for binary or truncated bodies; use **Edit and resend**.
+
+### Simulate a slow, flaky or offline network
+
+You'll check how your app behaves on a bad connection.
+
+1. In the panel toolbar, open **Network**.
+2. Pick **Offline**, **Slow 3G**, **Fast 3G** or **Flaky (20% fail)**.
+3. Or pick **Custom…**, fill in **Latency (ms)**, **Bandwidth (kbps)** and **Fail (%)**, and click **Apply**.
+
+**You should see:** the picker highlighted, `Network: …` in the status line, and affected rows marked **sim**.
+
+**Tip:** only the app you're debugging is affected, not your Mac. Mocks and blocks still answer as set. Pick
+**No throttling** to switch it off; it's easy to forget.
+
+### Slow down or break a single endpoint
+
+You'll make one endpoint slow or failing while the rest of the app stays normal.
+
+1. In **Rules**, click **Add rule** and set the URL, for example `https://jsonplaceholder.typicode.com/posts*`.
+2. For a slow endpoint, pick **Throttle** and set **Latency (ms)**, **Bandwidth (kbps)** or **Fail (%)**.
+3. For a failure, pick **Fault** and one of: **Connection reset**, **Timeout (never answered)**,
+   **Truncated response** or **DNS failure (host lookup)**.
+4. Click **Add rule** and trigger the request.
+
+**You should see:** the row marked **simulated**, with what was applied in the detail pane.
+
+**Tip:** **Timeout** holds the request until your app gives up, so it tests your client timeout. Throttling
+doesn't slow uploads or WebSockets.
+
+### Run on an Android emulator or phone
+
+You'll intercept an Android build.
+
+1. **Emulator:** pick it and press **F5**. The app reaches the proxy at `10.0.2.2`; nothing to set up.
+2. **Phone:** connect it over USB with USB debugging on, pick it and press **F5**. Flutter Intercept runs
+   `adb reverse` for the proxy port and removes it when the last session ends.
+
+**You should see:** traffic in the panel, the same as on any other target.
+
+**Tip:** for phones, `adb` must be found through `ANDROID_HOME` / `ANDROID_SDK_ROOT`, the default SDK location,
+or `PATH`. Hot reload, hot restart, flavors and `--profile` keep working; release launches are never
+intercepted.
+
+### Run on the iOS simulator or macOS
+
+You'll intercept an Apple build that runs on your Mac.
+
+1. **iOS simulator:** pick it and press **F5**. The app uses `localhost`; nothing to set up.
+2. **macOS desktop:** pick **macOS** and press **F5**.
+
+**You should see:** traffic in the panel, including HTTPS, with no certificate installed anywhere.
+
+**Tip:** a macOS app needs the `com.apple.security.network.client` entitlement (in
+`macos/Runner/DebugProfile.entitlements`). Any macOS app that already makes network calls has it.
+
+### Run on a physical iPhone
+
+You'll intercept an app running on your own iPhone over Wi-Fi.
+
+1. Do the [one-time setup](#iphone): signing team in Xcode, trust the developer certificate on the phone.
+2. Put the iPhone on the **same Wi-Fi** as your Mac, unlock it, pick it and press **F5**.
+3. When the app starts, allow it to **find and connect to devices on your local network**.
+4. On the Mac, allow **Visual Studio Code** to accept incoming connections the first time you're asked.
+
+**You should see:** `Intercept: on · LAN` in the status bar and `LAN open for iPhone · <ip>:<port>` in the
+panel's status line. The listener is protected by a per-session token and locks to your phone.
+
+**Tip:** use a trusted Wi-Fi. After a network change the listener closes; relaunch the session. On Apple Silicon,
+a USB iPhone needs Rosetta, or pair the phone over Wi-Fi.
+
+### Call a server on your Mac from the app
+
+You'll reach a backend running on your Mac, for example `http://localhost:8787`.
+
+1. Start your local server.
+2. In the app, use `http://10.0.2.2:8787/...` on the Android emulator, or `http://localhost:8787/...` on the
+   iOS simulator, macOS or an Android phone.
+3. Press **F5** and trigger the request.
+
+**You should see:** the request in the list, answered by the server on your Mac.
+
+**Tip:** `10.0.2.2` / `10.0.3.2` are sent to your Mac's `localhost` by `flutterIntercept.rewriteLocalhost` (on
+by default). This never applies to a physical iPhone: requests aimed at your Mac are refused there.
+
+### Connect an AI agent
+
+You'll let an AI coding agent see and drive your app's traffic.
+
+1. **GitHub Copilot (agent mode in VS Code):** nothing to set up. Open Chat in agent mode; the
+   Flutter Intercept tools are listed in its tools picker. You can name one in a prompt, for example
+   `#interceptListRequests`.
+2. **Claude Code, Cursor, Gemini CLI or another MCP client:** run **Flutter Intercept: Connect AI Agent** and pick
+   the client. The setup is copied to the clipboard; paste it into the client.
+3. For Claude Code you can click **Add to Claude Code now** instead of pasting.
+
+**You should see:** the panel's status line show the agent as connected, and its last tool call.
+
+**Tip:** the copied setup contains your access token. Treat it like a password: don't commit or share it.
+Inside Cursor, the server is also registered automatically.
+
+### Teach your agent the workflow and give it tasks
+
+You'll tell the agent how to use Flutter Intercept, then ask it to test something.
+
+1. Run **Flutter Intercept: Add AI Agent Instructions** and pick `AGENTS.md`, `CLAUDE.md` and/or
+   `.github/copilot-instructions.md`.
+2. Ask the agent, for example:
+   - "Run the app and check that the `POST /todos` request sends a JSON body with a title."
+   - "Make `GET /users/1` return 500 once, check the error UI, then remove the mock."
+   - "Where in the code is the album request sent?"
+   - "Put the app on Slow 3G and check the loading state."
+3. Approve the agent's changes when its client asks.
+
+**You should see:** rules the agent adds named `[agent] …` with an **agent** badge, and its requests in the list.
+
+**Tip:** running the command again updates the section in place. Ask agents to use `times` or `ttlMs` so their
+rules clean themselves up.
+
+### Control what agents can see and do
+
+You'll choose how much access agents get.
+
+1. Open Settings and search for `flutterIntercept.agent`.
+2. Set `flutterIntercept.agent.access` to `readWrite` (default), `readOnly` (look, don't change) or `off`.
+3. Keep `flutterIntercept.agent.redactSecrets` on to show agents `[redacted]` instead of auth headers, cookies,
+   tokens, passwords and keys.
+
+**You should see:** with `readOnly`, change requests refused; with redaction on, secrets hidden in everything
+agents read, including HAR exports and code snippets.
+
+**Tip:** redaction only affects what agents read; your app always gets the real values. Agents never see the CA
+key, the iPhone LAN token or the MCP token.
+
 ## Settings and commands
 
 | Setting | Default | Description |

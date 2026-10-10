@@ -83,6 +83,9 @@ Code installs for you.
    - **Break on this** to pause matching requests so you can edit them.
 5. Click `Intercept: on` in the status bar to turn interception off for your next sessions.
 
+For a step-by-step walkthrough of every feature, see the
+[tutorials](packages/extension/README.md#tutorials).
+
 ## Works with AI agents
 
 AI coding agents can drive Flutter Intercept too: GitHub Copilot (agent mode), Claude Code, Cursor, or any MCP
