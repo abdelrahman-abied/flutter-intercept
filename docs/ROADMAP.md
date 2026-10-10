@@ -93,8 +93,28 @@ headless/CI mode for `integration_test` (`packages/cli`), Postman / OpenAPI expo
 the panel in its own window, and background-isolate **interception** (0.5.0 shipped the warning only).
 **Ops (not code):** publish on Open VSX (Cursor users can't install today) — packaging ready, the owner publishes.
 
-### Next / considered
-Publish the CLI on npm (owner decision), a GitHub Action wrapping it, physical iPhones in CI mode.
+### Next / considered (recorded 2026-10-10, after 0.7.0)
+Proposed **0.8.0**: the GitHub Action, mockable native clients, WebSocket/SSE in recordings, and the small items
+below. Same way of working: contract first, parallel owners, independent security review, README tutorials.
+
+| Item | Why / today | Effort | Notes |
+|---|---|---|---|
+| **CLI on npm** | `npx flutter-intercept test` instead of `node packages/cli/dist/cli.js` | S | Owner decision (publishing). Package name, `bin`, README. |
+| **GitHub Action** | CI users want one step, not a script | S | Wraps the CLI: caches the runner, uploads HAR / JUnit / recording as artifacts, fails on assertions. macOS + Android emulator examples. |
+| **Physical iPhones in CI mode** | the CLI refuses them (LAN mode is editor-only) | M | Reuse the LAN listener + token + device lock outside VS Code; security review. |
+| **Native clients: mock / block** | `cupertino_http` / `cronet_http` are listed read-only | L (spike) | Set the OS / emulator proxy for the app (Android `settings put global http_proxy`, iOS simulator proxy via the Mac) and trust the CA natively, or a package-level hook; debug only. |
+| **WebSocket / SSE in recordings** | recordings keep finished HTTP only | M | Store frames, replay as a scripted server (timed frames), diff frame counts. |
+| **Background isolates in profile mode / `Isolate.spawnUri`** | warning only today | M (spike) | No pause-at-start in profile; spawnUri runs another program without our entry. |
+| **mTLS (client certificates)** | the proxy can't present the app's client certificate | M | User-supplied cert/key per host (user settings / secret storage), presented upstream. |
+| **Dio `validateCertificate` pinning** | those requests fail while intercepting | S–M | Document a debug-only switch, or pin the proxy's leaf per host for the session. |
+| **Flutter Web: DIRECT fallback, `web-server` device** | no fallback; web-server can't be intercepted | M (spike) | A service-worker or PAC-based route; or instructions for a manually started browser. |
+| **Throttle uploads and WebSocket messages** | throttling only slows downloads | S–M | Throttling transform on the request stream and on frames. |
+| **Screenshots on physical iPhones and the web** | need the debug connection there | S | `idevicescreenshot` when available; Chrome DevTools protocol for web sessions. |
+| **Apps with their own `HttpOverrides` zone / `connectionFactory`** | the inner zone wins / the proxy is bypassed | M (spike) | Detect and warn with the exact call site; possibly wrap `runZoned` overrides. |
+| **OpenAPI `securitySchemes`** | exports list auth headers but no schemes | S | Infer bearer / API key / basic from redacted header names. |
+| **Multipart redaction** | multipart bodies are only partly redacted (pre-existing) | S | Parse parts; redact secret-named fields and file contents for agents. |
+| **VS Code `http.proxy` as the default upstream** | since REVIEW-7 #14 the app's traffic ignores it | S | Owner decision: use it when `flutterIntercept.upstreamProxy` is empty (user settings only). |
+| **Idle pooled connections** | keep-alive to real hosts is new inside VS Code (REVIEW-7 #14) | S | Watch item: idle timeout / retry on a stale socket if flaky failures appear. |
 
 ## 5. Spikes and decisions before building
 - Dio's async stack depth for request → source (0.3).

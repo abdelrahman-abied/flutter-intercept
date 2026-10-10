@@ -150,3 +150,11 @@ contract change requests in `docs/spikes/<topic>.md`).
 | H host + agent | `src/agent/**` (new tools, Windsurf, HAR timings, script views), `src/ui/controller.ts`, `src/proxyHost.ts`, their tests, `test/integration/suite/agent.ts` |
 | W webview | `packages/webview/**` except `protocol.ts` |
 | lead | contract, types, `extension.ts`, extension `package.json`, `src/ui/view.ts` + new `src/ui/panel.ts` (own window), Open VSX, docs, E2E, review |
+
+### v0.7.0 status (2026-10-10)
+Built and verified: unit tests (proxy 389, webview 385, extension 1534, cli 79) and the integration suites on the
+packaged VSIX — default 42/42, agent 17/17 (macOS + Android emulator), devices 23/23 (Android emulator, iOS
+simulator, macOS), web 6/6. Independent review: docs/REVIEW-7.md, all 14 findings fixed. Merged into `main` locally
+(0.3.0 → 0.7.0 in one fast-forward) for the Marketplace release; push, Open VSX and Marketplace publishing are the
+owner's steps. Next: docs/ROADMAP.md §4 "Next / considered" (proposed 0.8.0).
+
