@@ -97,7 +97,7 @@ client. They can:
 - pause and edit live traffic;
 - clean up the rules they added.
 
-Copilot picks up the tools automatically. Other clients connect with **Flutter Intercept: Connect AI agent**.
+Copilot picks up the tools automatically. Other clients connect with **Flutter Intercept: Connect AI Agent**.
 
 You stay in control:
 - changes need your confirmation;

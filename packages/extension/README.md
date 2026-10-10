@@ -124,7 +124,7 @@ The panel follows your VS Code theme: light, dark and high contrast.
 | **macOS desktop** | Uses `localhost`. The app needs the `com.apple.security.network.client` entitlement, which any macOS app that already does networking has. |
 | **Plain Dart programs** (`bin/main.dart`) | Intercepted the same way. |
 | **iPhone** (physical) | Supported, after some one-time setup; see [iPhone](#iphone) below. Verified over Wi-Fi. On Apple Silicon Macs, a USB connection also needs Rosetta. |
-| **Flutter web** | Not supported (no `dart:io`). The session is left untouched. |
+| **Flutter web** | Chrome launched from VS Code: Chrome gets Flutter Intercept as its proxy (see [Flutter Web](#flutter-web)). The `web-server` device isn't intercepted. |
 
 Hot reload, hot restart, flavors (`lib/main_dev.dart` etc.) and `--profile` keep working through the generated
 entry. **Release launches** (`flutterMode: "release"` or `--release`) are never intercepted. They run your
@@ -230,7 +230,7 @@ In VS Code the tools are named `flutter_intercept_<tool>`; over MCP they use the
 - **GitHub Copilot (agent mode in VS Code):** nothing to set up. The tools are available as soon as the extension
   is installed.
 - **Claude Code, Cursor and other MCP clients:**
-  1. Run **Flutter Intercept: Connect AI agent** and pick your client.
+  1. Run **Flutter Intercept: Connect AI Agent** and pick your client.
   2. The command copies the setup to the clipboard: the `claude mcp add …` command for Claude Code, an
      `mcp.json` snippet for Cursor, or the URL and header for other clients.
   3. Paste it into your client. The command never writes config files itself.
@@ -860,7 +860,7 @@ allows only local pages and no credentials, unless it names an origin or asks fo
 | **Flutter Intercept: Toggle Interception** | Same as clicking `Intercept: on/off` in the status bar. |
 | **Flutter Intercept: Clear Traffic** | Clears the list. Requests still in flight stay. |
 | **Flutter Intercept: Debug with Intercept** | Starts an intercepted debug session directly. A fallback if F5 isn't picked up. |
-| **Flutter Intercept: Connect AI agent** | Copies the setup for Claude Code, Cursor or another MCP client to the clipboard. |
+| **Flutter Intercept: Connect AI Agent** | Copies the setup for Claude Code, Cursor or another MCP client to the clipboard. |
 | **Flutter Intercept: Add AI Agent Instructions** | Adds or updates the Flutter Intercept section in `AGENTS.md`, `CLAUDE.md` or `.github/copilot-instructions.md`. |
 
 ## Limitations
@@ -881,7 +881,7 @@ What isn't intercepted, or behaves differently while intercepting:
   requests fail with `bad certificate` while intercepting. Turn interception off to test pinning.
 - **mTLS (client certificates)**: the proxy can't present your app's client certificate to the server.
 - **A custom `connectionFactory`** that ignores the proxy host and port bypasses the proxy.
-- **Throttling and faults** don't slow down uploads and don't apply to WebSockets.
+- **Throttling** doesn't slow down uploads or WebSocket messages. On WebSockets only block and fault rules apply (to the connection); mocks, breakpoints and mutations pass sockets through.
 - **Long breakpoints and client timeouts**: if your app's own timeout fires while a request is paused (for
   example Dio's `receiveTimeout`), the app gives up. The exchange is then marked "gave up" and can't be resumed.
   Raise the timeout in debug builds if you need long pauses.
