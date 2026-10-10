@@ -62,6 +62,22 @@ and the traffic shows up.
   tab. Block and fault rules work on sockets.
 - GraphQL requests show their operation name; filter with `op:getUser` and match rules to one operation.
 
+**Team rules and scenarios**
+- **Share** moves a rule into `.vscode/flutter-intercept.json`, committed with your project, so the whole team
+  gets it. Shared rules run before personal ones. Rules from the repo that could redirect or alter your traffic
+  wait until you approve them.
+- Mock bodies can live in a file (**From a file in the workspace**) that you edit like any other.
+- **Sequence** rules answer successive requests differently, for example "500 twice, then the real server".
+- **Expire token…** gives the next request(s) a 401. The **Auth** tab shows each 401 → refresh → retry timeline
+  and warns about refresh stampedes.
+
+**Record, replay and reroute**
+- **Recordings**: save the traffic, replay it as mocks (requests not in the recording go to the real server or
+  fail like offline), and diff two recordings.
+- **Map remote** sends matching requests to another server (staging, a local backend) while the app keeps its
+  URLs. **Rewrite** changes headers, status or body text of real requests and responses.
+- `flutterIntercept.upstreamProxy` chains Flutter Intercept to Charles, Burp or a corporate proxy.
+
 **Copy and resend**
 - **Copy as cURL**, **Copy as Dart (http)** or **Copy as Dio** from the detail pane or a row's right-click menu.
 - **Resend** a request unchanged, or **Edit and resend** it. The new request is listed with a link to the original.
@@ -101,7 +117,8 @@ and the traffic shows up.
   refused and the rule shows as invalid; AI agents can only use globs.
 - Rules run top to bottom and the first enabled match wins. The list shows which rules are shadowed by an
   earlier one.
-- Reorder, enable/disable, delete with undo. Rules are saved per workspace.
+- Reorder, enable/disable, delete with undo. Personal rules are saved per workspace; shared rules live in
+  `.vscode/flutter-intercept.json`.
 - A rule can apply to **only the first N requests** or **expire** after a time; it removes itself afterwards.
 
 ![Rules tab: ordered rules with enable toggles and match counts](media/screenshots/rules-dark.png)
@@ -110,7 +127,8 @@ and the traffic shows up.
 - `Intercept: on/off` toggles interception for new sessions. It shows `· LAN` while an iPhone session runs.
 - A pause counter appears while exchanges are waiting at a breakpoint.
 
-The panel follows your VS Code theme: light, dark and high contrast.
+The panel has four tabs: **Traffic**, **Rules**, **Recordings** and **Auth**. It follows your VS Code theme: light,
+dark and high contrast.
 
 ![Traffic panel in a light theme](media/screenshots/traffic-light.png)
 
@@ -215,6 +233,11 @@ Cursor, and any client that speaks MCP (Model Context Protocol).
 | Change fields in real JSON responses (null, remove, set) | `add_mutation` |
 | Read WebSocket messages and SSE events | `get_frames` |
 | Add CORS headers to a real API while developing (Flutter Web) | `add_cors_rule` |
+| Save, list, replay or compare traffic recordings | `save_recording`, `list_recordings`, `replay_recording`, `diff_recordings` |
+| Answer successive requests differently (fail twice, then succeed) | `add_sequence` |
+| Make the next requests get 401, and read the token refresh flows | `expire_token`, `get_auth_flows` |
+| Send matching requests to a local server (agents: local targets only) | `add_map_remote` |
+| Change headers, status or body text of real requests and responses | `add_rewrite` |
 
 Over MCP there are also resources (`intercept://exchange/{id}`, `intercept://paused`, `intercept://rules`,
 `intercept://contract/{id}`) and prompts (`debug-failing-request`, `test-error-states`, `verify-change`,
@@ -335,20 +358,37 @@ endpoints.
 21. [Work with GraphQL operations](#work-with-graphql-operations)
 22. [See requests from native clients and background isolates](#see-requests-from-native-clients-and-background-isolates)
 
+**Team rules and scenarios**
+
+23. [Share rules with your team](#share-rules-with-your-team)
+24. [Approve rules that came from the repo](#approve-rules-that-came-from-the-repo)
+25. [Keep a mock body in a file](#keep-a-mock-body-in-a-file)
+26. [Answer successive requests differently](#answer-successive-requests-differently)
+27. [Test token refresh with Expire token](#test-token-refresh-with-expire-token)
+
+**Record, replay and reroute**
+
+28. [Record traffic and replay it](#record-traffic-and-replay-it)
+29. [Compare two recordings](#compare-two-recordings)
+30. [Send requests to another server](#send-requests-to-another-server)
+31. [Change headers, status or body text](#change-headers-status-or-body-text)
+32. [Chain to Charles, Burp or a corporate proxy](#chain-to-charles-burp-or-a-corporate-proxy)
+
 **Devices**
 
-23. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
-24. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
-25. [Run on a physical iPhone](#run-on-a-physical-iphone)
-26. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
+33. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
+34. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
+35. [Run on a physical iPhone](#run-on-a-physical-iphone)
+36. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
 
 **AI agents**
 
-27. [Connect an AI agent](#connect-an-ai-agent)
-28. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
-29. [Control what agents can see and do](#control-what-agents-can-see-and-do)
-30. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
-31. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
+37. [Connect an AI agent](#connect-an-ai-agent)
+38. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
+39. [Control what agents can see and do](#control-what-agents-can-see-and-do)
+40. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
+41. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
+42. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
 
 ### Run your app with interception
 
@@ -460,7 +500,8 @@ You'll control which rule applies when several match.
 
 **You should see:** each rule's match count, and a warning when an earlier rule takes some of its matches.
 
-**Tip:** a delete can be undone with **Undo** in the notice that appears. Rules are saved per workspace.
+**Tip:** a delete can be undone with **Undo** in the notice that appears. Personal rules are saved per workspace;
+to give a rule to your team, [share it](#share-rules-with-your-team).
 
 ### Make a rule remove itself
 
@@ -693,6 +734,158 @@ You'll find the requests Flutter Intercept can't intercept, instead of missing t
 **Tip:** filter with `captured:native`. Requests from a background isolate go direct, so rules don't apply to
 them. Turn native listing off with `flutterIntercept.nativeClients`.
 
+### Share rules with your team
+
+You'll commit a rule with the project so everyone who pulls it gets the same mock.
+
+1. In **Rules**, click **Share** on a personal rule.
+2. Read the confirmation: the rule moves into `.vscode/flutter-intercept.json`, which is committed with your code.
+   Click **Share**.
+3. Commit `.vscode/flutter-intercept.json` (and any mock body files it uses).
+
+**You should see:** the rule marked **shared**, above your personal rules. "N shared rules from
+`.vscode/flutter-intercept.json` run first" heads the list.
+
+**Tip:** shared rules are read-only in the panel: **View** instead of **Edit**, and their enable box and delete are
+disabled. Change them in the file, or click **Unshare** to make one personal again. A rule holding something that looks like a real
+token, password or key isn't shared; replace it with a placeholder such as `test-token`.
+
+### Approve rules that came from the repo
+
+You'll decide which shared rules may change where your app's requests go.
+
+1. Pull a project whose `.vscode/flutter-intercept.json` has rules that could redirect or alter your traffic.
+2. A banner at the top of the panel says how many shared rules are held back, and lists each one with the reason.
+3. Click **Review file** to read `.vscode/flutter-intercept.json`.
+4. Click **Approve…**. VS Code lists the held rules again; click **Approve** only if you trust who wrote them.
+
+**You should see:** the banner go away and the approved rules run.
+
+**Tip:** rules are held back when they send requests to another server (Map Remote to a non-local host), change
+request headers or bodies, answer with a redirect, HTML or JavaScript, set cookies or CORS headers, or change the
+page's Content-Security-Policy. Approval is per rule and per machine: if someone changes the rule later, it's held
+again. Rules you share yourself count as approved.
+
+### Keep a mock body in a file
+
+You'll edit a large mock body in a normal editor tab and share it through git.
+
+1. Open a mock rule (or **Add rule** → **Mock response**). Under **Body**, pick **From a file in the workspace**.
+2. Keep the suggested path under `.vscode/flutter-intercept/mocks/`, or type another workspace-relative path.
+3. Click **Create file…** to write the current body there, then **Create file**. Or **Open file** if it exists.
+4. **Save** the rule and edit the file like any other.
+
+**You should see:** the mock answer with the file's content. Changes apply as soon as you save the file.
+
+**Tip:** a body copied from real traffic can hold live tokens. The editor warns when the body looks like it contains
+one, and a file with something that looks like a real credential isn't written. A missing file skips the rule
+and shows a problem.
+
+### Answer successive requests differently
+
+You'll make the first calls fail and later ones succeed, to test retries and recovery.
+
+1. **Add rule**, set the URL (for example `https://jsonplaceholder.typicode.com/todos/*`) and pick **Sequence**.
+2. Under **Steps**, set step 1 to **Mock response** with status `500` and `×` `2` requests.
+3. **+ Add step**, then pick **Real server** (or **Block**, **Fault**, **Throttle** and more).
+4. Under **After the last step**, pick **Keep answering with the last step**, **Go to the real server** or
+   **Start again from step 1**.
+5. Check the **Requests get:** preview, then **Add rule**.
+
+**You should see:** the first two requests get 500 and the third reaches the server.
+
+**Tip:** the count restarts whenever you change the rule. A sequence can't contain breakpoints.
+
+### Test token refresh with Expire token
+
+You'll fake an expired access token and watch how your app refreshes it.
+
+1. Select an authenticated request in **Traffic** and click **Expire token…**.
+2. Check **Requests to** (a glob; widen it, for example `https://api.example.com/*`, to expire every call) and
+   **How many**, then click **Expire token**.
+3. Use the app so it calls the API again.
+4. Open the **Auth** tab.
+
+**You should see:** a timeline per expiry: **Unauthorized**, **Refresh**, **Retry**, with timings. Click a step to
+jump to it in **Traffic**.
+
+**Tip:** a **stampede** warning means several refresh calls went out for one expiry, usually one per failed request.
+Share a single in-flight refresh (one `Future`, or Dio's `QueuedInterceptor`). The **Auth** tab counts flows that
+need attention.
+
+### Record traffic and replay it
+
+You'll save a session and later run the app against it, even offline.
+
+1. Run the app through the flow you want, then open **Recordings** and click **Save current traffic**.
+2. Name it. Tick **Redact secrets (Authorization, cookies, tokens)** if you'll share it; a replay then answers
+   with `[redacted]`. Click **Save N exchanges**.
+3. Later, click **Replay…** on the recording. Under **Requests not in the recording**, pick
+   **Go to the real server** or **Fail like offline** (demo mode), then **Start replay**.
+4. Click **Stop replay** in the bar at the top (or **Stop** on the recording) when you're done.
+
+**You should see:** a "Replaying …" bar while it's on, and replayed rows marked as simulated.
+
+**Tip:** recordings live in `.dart_tool/flutter_intercept/recordings/`, which git ignores by default. An
+unredacted recording is refused where git would track it. Only finished HTTP exchanges are saved, not WebSocket,
+SSE or native-client traffic. Your rules still apply before the recording.
+
+### Compare two recordings
+
+You'll see what a backend or app change did to the traffic.
+
+1. Save a recording before the change and another after it.
+2. In **Recordings**, tick both and click **Diff selected**.
+
+**You should see:** a diff editor showing routes added or removed, status changes, JSON shape changes, call counts
+and responses that got much slower.
+
+**Tip:** **Clear selection** unticks both. To delete a recording, click its delete icon and confirm with
+**Delete**; the file is removed from disk.
+
+### Send requests to another server
+
+You'll point the app at staging or a local backend without changing its URLs.
+
+1. **Add rule**, set the URL (for example `https://api.example.com/*`) and pick **Map remote**.
+2. In **Forward to**, enter an origin (`http://localhost:8080`) or a URL prefix
+   (`https://staging.example.com/api`). The rest of the path and the query are kept.
+3. Tick **Keep the original Host header** only if the target needs it, then **Add rule**.
+
+**You should see:** the requests answered by the target, with a "Mapped to …" note, while the app still shows the
+original URL. The target's certificate is checked as usual.
+
+**Tip:** requests keep their headers, tokens included, so map only to servers you trust; the editor warns for
+non-local targets. AI agents can only map to local servers (`localhost`, `127.0.0.1`, `::1`).
+
+### Change headers, status or body text
+
+You'll tweak real requests or responses without mocking them.
+
+1. **Add rule**, set the URL and pick **Rewrite**.
+2. Under **Request**: **Set headers**, **Remove headers** (comma separated) or **Replace in body**.
+3. Under **Response**: a new **Status**, headers to set or remove, and body replacements.
+4. **+ Add replacement** for more; tick **all** to replace every occurrence. Then **Add rule**.
+
+**You should see:** the real server's answer with your changes, for example a feature-flag header added.
+
+**Tip:** body replacements are plain text, not regexes (up to 20); binary bodies are left alone.
+
+### Chain to Charles, Burp or a corporate proxy
+
+You'll send Flutter Intercept's outgoing traffic through another proxy.
+
+1. Open your **user** settings (not workspace settings) and set `flutterIntercept.upstreamProxy`, for example
+   `http://127.0.0.1:8888`.
+2. If that proxy decrypts HTTPS itself (Charles, Burp), also turn on
+   `flutterIntercept.upstreamProxyIgnoreCertErrors`.
+
+**You should see:** "via upstream proxy 127.0.0.1:8888" in the panel. With certificate checks off, it adds
+"certificate checks OFF".
+
+**Tip:** only the user setting counts, so a cloned repo can't reroute your traffic. Requests to `localhost` and the
+emulator aliases go direct. Turn certificate checks off only for a proxy you run yourself.
+
 ### Run on an Android emulator or phone
 
 You'll intercept an Android build.
@@ -786,7 +979,8 @@ rules clean themselves up.
 
 You'll choose how much access agents get.
 
-1. Open Settings and search for `flutterIntercept.agent`.
+1. Open your **user** settings (workspace settings are ignored for these) and search for
+   `flutterIntercept.agent`.
 2. Set `flutterIntercept.agent.access` to `readWrite` (default), `readOnly` (look, don't change) or `off`.
 3. Keep `flutterIntercept.agent.redactSecrets` on to show agents `[redacted]` instead of auth headers, cookies,
    tokens, passwords and keys.
@@ -839,6 +1033,27 @@ You'll have an agent work with the 0.5.0 traffic types.
 **Tip:** agents don't see Chrome's own background requests unless they ask for them. A CORS rule an agent adds
 allows only local pages and no credentials, unless it names an origin or asks for credentials.
 
+### Let agents record, replay and run scenarios
+
+You'll have an agent set up test scenarios and compare traffic for you.
+
+1. [Connect your agent](#connect-an-ai-agent), then run **Flutter Intercept: Add AI Agent Instructions** again
+   to pick up the new tools.
+2. Ask, for example:
+   - "Save a recording, then after my change save another and tell me what changed." (`save_recording`,
+     `diff_recordings`)
+   - "Replay the 'checkout' recording with everything else failing like offline." (`replay_recording`)
+   - "Fail `GET /todos/*` twice with 500, then let it through, and check the retry." (`add_sequence`)
+   - "Expire the token once and check the app refreshes it only once." (`expire_token`, `get_auth_flows`)
+   - "Send `/api/*` to my local server on port 8080." (`add_map_remote`)
+   - "Add `x-feature-beta: on` to requests to `/api/*`." (`add_rewrite`)
+3. Approve the changes when the client asks.
+
+**You should see:** the agent's rules named `[agent] …` in **Rules**, and a "Replaying …" bar while it replays.
+
+**Tip:** agents save recordings redacted unless they ask otherwise, may only map to local servers, and can't set
+request headers that carry credentials. Ask them to stop replaying and remove their rules when done.
+
 ## Settings and commands
 
 | Setting | Default | Description |
@@ -853,6 +1068,12 @@ allows only local pages and no credentials, unless it names an origin or asks fo
 | `flutterIntercept.contractCheck` | `true` | Check JSON responses against your json_serializable / freezed models and show fields that would make `fromJson` throw. |
 | `flutterIntercept.rewriteLocalhost` | `true` | Requests to `10.0.2.2` / `10.0.3.2` (the emulator's names for your Mac) go to your Mac's `localhost`. Never applies to iPhones. |
 | `flutterIntercept.agent.mcpPort` | `47823` | Port of the local MCP server for agents. If it's busy, the next free port is used. |
+| `flutterIntercept.upstreamProxy` | empty | Send intercepted traffic on through another HTTP proxy, such as Charles or Burp at `http://127.0.0.1:8888`, or a corporate proxy. Empty = connect to servers directly. Requests to `localhost` and the emulator aliases always go direct. |
+| `flutterIntercept.upstreamProxyIgnoreCertErrors` | `false` | Accept any certificate from servers reached through the upstream proxy. Only for a proxy that decrypts HTTPS itself (Charles, Burp). The panel shows "certificate checks OFF" while it's on. |
+
+`flutterIntercept.upstreamProxy`, `flutterIntercept.upstreamProxyIgnoreCertErrors` and the `flutterIntercept.agent.*`
+settings are read from your **user** settings only. A workspace's `.vscode/settings.json` can't set them, so a
+cloned project can't reroute your traffic or widen agent access.
 
 | Command | What it does |
 |---|---|
@@ -885,6 +1106,10 @@ What isn't intercepted, or behaves differently while intercepting:
 - **Long breakpoints and client timeouts**: if your app's own timeout fires while a request is paused (for
   example Dio's `receiveTimeout`), the app gives up. The exchange is then marked "gave up" and can't be resumed.
   Raise the timeout in debug builds if you need long pauses.
+- **Recordings** hold finished HTTP exchanges only: WebSocket, SSE and native-client traffic isn't saved or
+  replayed.
+- **Rewrite** body replacements are plain text (no regexes, up to 20 per body); binary bodies are left untouched.
+- **Shared rules** that could redirect or alter your traffic don't run on a machine until they're approved there.
 - **What the panel keeps**: bodies are shown up to 5 MB, after which they're marked truncated. Recorded traffic
   is cleared when the window reloads; rules are kept.
 
@@ -904,6 +1129,14 @@ What isn't intercepted, or behaves differently while intercepting:
     (an `Origin` header or a foreign `Host`) are refused.
   - Changes need your confirmation, and `flutterIntercept.agent.access` can make access read-only or turn it off.
   - Secrets are redacted in everything agents read. See [Use with AI agents](#use-with-ai-agents).
+- **Rules from a repository can't silently reroute your app.** Shared rules in `.vscode/flutter-intercept.json`
+  that send requests to another server, change request headers or bodies, redirect, serve HTML or JavaScript, or
+  set cookies or CORS headers are held until you approve them; a changed rule is held again. Sharing refuses
+  rules and mock body files that look like they hold real credentials.
+- **Routing settings are yours.** The upstream proxy and agent settings are read from user settings only, and AI
+  agents can only map requests to local servers.
+- **Recordings stay on your machine.** They're saved in `.dart_tool/flutter_intercept/recordings/`; an
+  unredacted recording is refused where git would track it.
 - **Only sessions you launch from VS Code** while interception is on.
   - It doesn't attach to running apps.
   - It leaves test runs and web sessions alone.
