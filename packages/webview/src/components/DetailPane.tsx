@@ -2,12 +2,15 @@ import type { Ref } from 'preact';
 import { useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Exchange } from '../protocol';
-import { canResend, clientGaveUp, describeAction, findExchange, initiatorLabel, isAgentRule, ruleDisplayName } from '../state';
+import { clientGaveUp, describeAction, findExchange, initiatorLabel, isAgentRule, ruleDisplayName } from '../state';
 import { formatDuration, formatTime, fullFrameLocation, isFrameworkFrame, isPaused, shortFrameLocation } from '../util';
 import { normalizePath } from '../jsonpath';
 import { useExchangeActions, type ExchangeActions } from './actions';
 import { ContractSection } from './ContractSection';
-import { AgentBadge, Button, MenuButton, PauseTimer, StateBadge, StatusText } from './bits';
+import { AgentBadge, Button, CoverageBadges, MenuButton, PauseTimer, StateBadge, StatusText } from './bits';
+import { CORS_DEV_NOTE, isNative, NATIVE_READ_ONLY, requestOrigin, routeGlob, sentCookies } from '../coverage';
+import { frameTotal, hasFrames } from '../frames';
+import { FramesView } from './FramesView';
 import { PauseEditor } from './Editors';
 import { Icon } from './Icon';
 import { BodyView, HeadersTable, type TreeFieldActions } from './Viewers';
@@ -19,7 +22,9 @@ const PAUSE_TEXT = {
 
 export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLElement> }) {
   const { state, dispatch } = useApp();
-  const tab = state.detailTab;
+  const framed = hasFrames(ex);
+  const tab = state.detailTab === 'messages' && !framed ? 'response' : state.detailTab;
+  const tabs = framed ? (['request', 'response', 'messages'] as const) : (['request', 'response'] as const);
   const gaveUp = clientGaveUp(state, ex);
   const rule = ex.matchedRuleId ? state.rules.find((r) => r.id === ex.matchedRuleId) : undefined;
   const ruleIndex = rule ? state.rules.indexOf(rule) : -1;
@@ -41,15 +46,19 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
           <StatusText ex={ex} />
           <span class="url" title={ex.url}>{ex.url}</span>
           <StateBadge ex={ex} gaveUp={gaveUp} />
+          <CoverageBadges ex={ex} />
           <span class="spacer" />
           <Button kind="icon" title="Close details (Esc)" onClick={() => dispatch({ type: 'select', id: undefined })}>
             <Icon name="close" />
           </Button>
         </div>
         <div class="detail-actions">
-          <Button onClick={() => create('mock')} title="Create a mock rule from this exchange (the response becomes the mock)">Mock this</Button>
-          <Button onClick={() => create('block')} title="Create a rule that blocks requests like this one">Block this</Button>
-          <Button onClick={() => create('breakpoint')} title="Create a breakpoint rule that pauses requests like this one">Break on this</Button>
+          <Button onClick={() => create('mock')} disabled={!!actions.off.mock}
+            title={actions.off.mock ?? 'Create a mock rule from this exchange (the response becomes the mock)'}>Mock this</Button>
+          <Button onClick={() => create('block')} disabled={!!actions.off.block}
+            title={actions.off.block ?? 'Create a rule that blocks requests like this one'}>Block this</Button>
+          <Button onClick={() => create('breakpoint')} disabled={!!actions.off.breakpoint}
+            title={actions.off.breakpoint ?? 'Create a breakpoint rule that pauses requests like this one'}>Break on this</Button>
           <span class="sep" aria-hidden="true" />
           <MenuButton label="Copy request as" title="Copy this request as code (cURL, Dart http, Dio)" items={actions.copyItems}>
             <Icon name="copy" /> Copy as… <Icon name="chevronDown" />
@@ -58,8 +67,8 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             title={actions.resendDisabled ?? 'Send this request again through the proxy, unchanged'}>
             Resend
           </Button>
-          <Button onClick={actions.editAndResend} disabled={!canResend(ex)}
-            title={canResend(ex) ? 'Edit method, URL, headers or body, then send it through the proxy' : 'Wait until the exchange has finished'}>
+          <Button onClick={actions.editAndResend} disabled={!!actions.off.edit}
+            title={actions.off.edit ?? 'Edit method, URL, headers or body, then send it through the proxy'}>
             <Icon name="edit" /> Edit and resend
           </Button>
           <MenuButton label="Generate" title="Generate a Dart model or a test fixture from this exchange" items={actions.generateItems}>
@@ -100,6 +109,14 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
           </span>
         </div>
         {ex.source && <SourceSection ex={ex} onOpen={actions.openSource} />}
+        {isNative(ex) && (
+          <div class="msg info native-note" role="note">
+            <span class="badge mini native-badge">native</span> {NATIVE_READ_ONLY}
+          </div>
+        )}
+        {ex.cors && (ex.cors.problem || ex.cors.preflight || ex.cors.patched) && (
+          <CorsSection ex={ex} onAddRule={isNative(ex) ? undefined : actions.addCorsRule} />
+        )}
         {isPaused(ex) && (
           <div class="pause-banner" role="status">
             <Icon name="pause" />
@@ -122,10 +139,11 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
       </header>
 
       <div class="tabs" role="tablist" aria-label="Message">
-        {(['request', 'response'] as const).map((t) => (
+        {tabs.map((t) => (
           <button key={t} type="button" role="tab" class="tab" aria-selected={tab === t}
             onClick={() => dispatch({ type: 'setDetailTab', tab: t })}>
-            {t === 'request' ? 'Request' : 'Response'}
+            {t === 'request' ? 'Request' : t === 'response' ? 'Response' : `${ex.kind === 'sse' ? 'Events' : 'Messages'} (${frameTotal(ex)})`}
+            {t === 'messages' && ex.state === 'pending' && <span class="tab-dot live" title="Open — live" />}
             {((t === 'request' && ex.state === 'paused-request') || (t === 'response' && ex.state === 'paused-response')) && (
               <span class="tab-dot" title="Paused here" />
             )}
@@ -134,7 +152,9 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
       </div>
 
       <div class="tab-body" role="tabpanel">
-        {tab === 'request' ? <RequestTab ex={ex} /> : <ResponseTab ex={ex} actions={actions} />}
+        {tab === 'request' ? <RequestTab ex={ex} />
+          : tab === 'messages' ? <FramesView key={ex.id} ex={ex} />
+          : <ResponseTab ex={ex} actions={actions} />}
       </div>
     </section>
   );
@@ -163,8 +183,9 @@ function ResponseTab({ ex, actions }: { ex: Exchange; actions: ExchangeActions }
       const k = normalizePath(v.path);
       if (!marks.has(k) || v.severity === 'error') marks.set(k, { severity: v.severity, message: v.message });
     }
-    return { mutate: actions.mutateField, marks, disabled: ex.state === 'mocked' ? MOCKED_NOTE : undefined };
-  }, [result, ex.id, ex.state]);
+    const disabled = isNative(ex) ? NATIVE_READ_ONLY : ex.state === 'mocked' ? MOCKED_NOTE : undefined;
+    return { mutate: actions.mutateField, marks, disabled };
+  }, [result, ex.id, ex.state, ex.captured]);
   if (ex.state === 'paused-response') return <PauseEditor key={ex.id + ex.state} ex={ex} />;
   if (ex.status === undefined) {
     const why: Record<string, string> = {
@@ -184,6 +205,56 @@ function ResponseTab({ ex, actions }: { ex: Exchange; actions: ExchangeActions }
       <h4 class="section-title">Body</h4>
       <BodyView body={ex.responseBody} headers={ex.responseHeaders} fields={fields} />
     </>
+  );
+}
+
+/**
+ * CONTRACTS §11.3: why a browser would block this (Flutter Web), with the dev-only CORS rule. The rule is added
+ * after a confirmation that names the origin and the route; credentials are off unless ticked (REVIEW-5 #3).
+ */
+export function CorsSection({ ex, onAddRule }: { ex: Exchange; onAddRule?: (credentials: boolean) => void }) {
+  const c = ex.cors!;
+  const origin = requestOrigin(ex);
+  const [confirming, setConfirming] = useState(false);
+  const [credentials, setCredentials] = useState(false);
+  return (
+    <div class={`msg ${c.problem ? 'error' : 'info'} cors`} aria-label="CORS">
+      <div class="cors-line">
+        <strong>CORS</strong>
+        {c.preflight && <span class="badge mini cors-pre" title="The browser sends an OPTIONS preflight before the real request">preflight</span>}
+        {c.problem ? <span class="cors-problem">{c.problem}</span> : <span>Looks fine for {origin ?? 'this origin'}.</span>}
+      </div>
+      {c.preflight && <div class="hint">This is the browser's preflight (OPTIONS) for {origin ?? 'a cross-origin request'}.</div>}
+      {c.patched && <div class="hint">Patched by Flutter Intercept: the proxy answered or added the CORS headers itself (a mock / CORS rule).</div>}
+      {c.problem && onAddRule && !confirming && (
+        <div class="cors-actions">
+          <Button onClick={() => setConfirming(true)} disabled={!origin}
+            title={origin ? `Insert a rule first that lets ${origin} read this route's responses. ${CORS_DEV_NOTE}` : 'The request has no Origin header to allow'}>
+            Add CORS rule (dev only)
+          </Button>
+          <span class="hint">{CORS_DEV_NOTE}</span>
+        </div>
+      )}
+      {c.problem && onAddRule && confirming && origin && (
+        <div class="cors-confirm" role="group" aria-label="Add CORS rule">
+          <div>
+            Allow <code>{origin}</code> to read responses from <code>{routeGlob(ex.url)}</code> (any method, preflights
+            answered by the proxy). Only this origin — no other website.
+          </div>
+          <label class="check">
+            <input type="checkbox" checked={credentials} onChange={() => setCredentials(!credentials)} />
+            Allow credentials (cookies){sentCookies(ex) ? ' — this request sent cookies' : ''}
+          </label>
+          <div class="hint">{CORS_DEV_NOTE}</div>
+          <div class="cors-actions">
+            <Button kind="primary" onClick={() => { setConfirming(false); onAddRule(credentials); }}>
+              Add rule{credentials ? ' with credentials' : ''}
+            </Button>
+            <Button onClick={() => { setConfirming(false); setCredentials(false); }}>Cancel</Button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 

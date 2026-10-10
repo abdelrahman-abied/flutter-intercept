@@ -1,0 +1,422 @@
+{
+ "type": "HttpProfile",
+ "timestamp": 1791616248306627,
+ "requests": [
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-3045183002414206065",
+   "isolateId": "isolates/6099766762398339",
+   "method": "GET",
+   "uri": "https://echo.websocket.org:0",
+   "events": [
+    {
+     "timestamp": 1791616248198549,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791616248198553,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791616248198555,
+     "event": "Request sent"
+    }
+   ],
+   "startTime": 1791616248187617,
+   "endTime": 1791616248198568,
+   "request": {
+    "proxyDetails": {
+     "host": "localhost",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "cache-control": [
+      "no-cache"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "x-fi-id": [
+      "c9d2feb99145820e-e"
+     ],
+     "host": [
+      "echo.websocket.org"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "GET",
+    "persistentConnection": true,
+    "uri": "https://echo.websocket.org:0",
+    "filterKey": "HTTP/client"
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-3045183002414206064",
+   "isolateId": "isolates/6099766762398339",
+   "method": "GET",
+   "uri": "https://echo.websocket.org/.sse",
+   "events": [
+    {
+     "timestamp": 1791616248198211,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791616248198217,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791616248198219,
+     "event": "Request sent"
+    }
+   ],
+   "startTime": 1791616248187676,
+   "endTime": 1791616248198255,
+   "request": {
+    "proxyDetails": {
+     "host": "localhost",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "accept": [
+      "text/event-stream"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "x-fi-id": [
+      "c9d2feb99145820e-f"
+     ],
+     "host": [
+      "echo.websocket.org"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "GET",
+    "persistentConnection": true,
+    "uri": "https://echo.websocket.org/.sse",
+    "filterKey": "HTTP/client"
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-3045183002414206063",
+   "isolateId": "isolates/6099766762398339",
+   "method": "POST",
+   "uri": "https://countries.trevorblades.com/graphql",
+   "events": [
+    {
+     "timestamp": 1791616248198863,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791616248198867,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791616248198870,
+     "event": "Request sent"
+    }
+   ],
+   "startTime": 1791616248187706,
+   "endTime": 1791616248198890,
+   "request": {
+    "proxyDetails": {
+     "host": "localhost",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "content-type": [
+      "application/json"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "152"
+     ],
+     "x-fi-id": [
+      "c9d2feb99145820e-g"
+     ],
+     "host": [
+      "countries.trevorblades.com"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 152,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "POST",
+    "persistentConnection": true,
+    "uri": "https://countries.trevorblades.com/graphql",
+    "filterKey": "HTTP/client"
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-3045183002414206057",
+   "isolateId": "isolates/6099766762398339",
+   "method": "CONNECT",
+   "uri": "//echo.websocket.org:443",
+   "events": [
+    {
+     "timestamp": 1791616248194832,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791616248195435,
+     "event": "Waiting (TTFB)"
+    }
+   ],
+   "startTime": 1791616248194825,
+   "endTime": 1791616248194858,
+   "request": {
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "host": [
+      "echo.websocket.org:443"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "CONNECT",
+    "persistentConnection": true,
+    "uri": "//echo.websocket.org:443",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791616248195440,
+    "headers": {},
+    "compressionState": "HttpClientResponseCompressionState.notCompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": -1,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "Connection established",
+    "redirects": [],
+    "statusCode": 200
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-3045183002414206051",
+   "isolateId": "isolates/6099766762398339",
+   "method": "POST",
+   "uri": "https://trace.flutter-intercept.invalid/v1/traces",
+   "events": [
+    {
+     "timestamp": 1791616248293433,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791616248293439,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791616248293443,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791616248294713,
+     "event": "Waiting (TTFB)"
+    },
+    {
+     "timestamp": 1791616248294769,
+     "event": "Content Download"
+    }
+   ],
+   "startTime": 1791616248289778,
+   "endTime": 1791616248293504,
+   "request": {
+    "proxyDetails": {
+     "host": "localhost",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "1328"
+     ],
+     "host": [
+      "trace.flutter-intercept.invalid"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 1328,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "POST",
+    "persistentConnection": true,
+    "uri": "https://trace.flutter-intercept.invalid/v1/traces",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791616248294725,
+    "headers": {
+     "content-type": [
+      "text/plain; charset=utf-8"
+     ],
+     "content-length": [
+      "0"
+     ]
+    },
+    "compressionState": "HttpClientResponseCompressionState.notCompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "No Content",
+    "redirects": [],
+    "statusCode": 204,
+    "endTime": 1791616248294766
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "from_package/1",
+   "isolateId": "isolates/6099766762398339",
+   "method": "GET",
+   "uri": "https://jsonplaceholder.typicode.com/posts/1",
+   "events": [],
+   "startTime": 1791616248188305,
+   "request": {
+    "connectionInfo": {
+     "package": "package:cupertino_http",
+     "client": "CupertinoClient",
+     "configuration": "[URLSessionConfiguration allowsCellularAccess=true allowsConstrainedNetworkAccess=true allowsExpensiveNetworkAccess=true discretionary=false httpAdditionalHeaders=null httpCookieAcceptPolicy=NSHTTPCookieAcceptPolicy.NSHTTPCookieAcceptPolicyOnlyFromMainDocumentDomain httpShouldSetCookies=true httpMaximumConnectionsPerHost=6 httpShouldUsePipelining=false requestCachePolicy=NSURLRequestCachePolicy.NSURLRequestUseProtocolCachePolicy sessionSendsLaunchEvents=false shouldUseExtendedBackgroundIdleMode=timeoutIntervalForRequest=0:01:00.000000 waitsForConnectivity=false]"
+    },
+    "contentLength": 0,
+    "followRedirects": true,
+    "headers": {
+     "Content-Length": [
+      "0"
+     ],
+     "x-demo-client": [
+      "cupertino_http"
+     ]
+    },
+    "maxRedirects": 5
+   },
+   "response": {
+    "redirects": [],
+    "connectionInfo": {
+     "package": "package:cupertino_http",
+     "client": "CupertinoClient",
+     "configuration": "[URLSessionConfiguration allowsCellularAccess=true allowsConstrainedNetworkAccess=true allowsExpensiveNetworkAccess=true discretionary=false httpAdditionalHeaders=null httpCookieAcceptPolicy=NSHTTPCookieAcceptPolicy.NSHTTPCookieAcceptPolicyOnlyFromMainDocumentDomain httpShouldSetCookies=true httpMaximumConnectionsPerHost=6 httpShouldUsePipelining=false requestCachePolicy=NSURLRequestCachePolicy.NSURLRequestUseProtocolCachePolicy sessionSendsLaunchEvents=false shouldUseExtendedBackgroundIdleMode=timeoutIntervalForRequest=0:01:00.000000 waitsForConnectivity=false]"
+    }
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "from_package/2",
+   "isolateId": "isolates/6099766762398339",
+   "method": "POST",
+   "uri": "https://jsonplaceholder.typicode.com/posts",
+   "events": [],
+   "startTime": 1791616248188525,
+   "request": {
+    "connectionInfo": {
+     "package": "package:cupertino_http",
+     "client": "CupertinoClient",
+     "configuration": "[URLSessionConfiguration allowsCellularAccess=true allowsConstrainedNetworkAccess=true allowsExpensiveNetworkAccess=true discretionary=false httpAdditionalHeaders=null httpCookieAcceptPolicy=NSHTTPCookieAcceptPolicy.NSHTTPCookieAcceptPolicyOnlyFromMainDocumentDomain httpShouldSetCookies=true httpMaximumConnectionsPerHost=6 httpShouldUsePipelining=false requestCachePolicy=NSURLRequestCachePolicy.NSURLRequestUseProtocolCachePolicy sessionSendsLaunchEvents=false shouldUseExtendedBackgroundIdleMode=timeoutIntervalForRequest=0:01:00.000000 waitsForConnectivity=false]"
+    },
+    "contentLength": 58,
+    "followRedirects": true,
+    "headers": {
+     "Content-Length": [
+      "58"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ],
+     "x-demo-client": [
+      "cupertino_http"
+     ]
+    },
+    "maxRedirects": 5
+   },
+   "response": {
+    "redirects": [],
+    "connectionInfo": {
+     "package": "package:cupertino_http",
+     "client": "CupertinoClient",
+     "configuration": "[URLSessionConfiguration allowsCellularAccess=true allowsConstrainedNetworkAccess=true allowsExpensiveNetworkAccess=true discretionary=false httpAdditionalHeaders=null httpCookieAcceptPolicy=NSHTTPCookieAcceptPolicy.NSHTTPCookieAcceptPolicyOnlyFromMainDocumentDomain httpShouldSetCookies=true httpMaximumConnectionsPerHost=6 httpShouldUsePipelining=false requestCachePolicy=NSURLRequestCachePolicy.NSURLRequestUseProtocolCachePolicy sessionSendsLaunchEvents=false shouldUseExtendedBackgroundIdleMode=timeoutIntervalForRequest=0:01:00.000000 waitsForConnectivity=false]"
+    }
+   }
+  }
+ ]
+}

@@ -15,16 +15,22 @@
  * CONTRACTS §10.5: `rules` after `mutateField`; `contract` results (batched with `exchange` updates) for every
  * finished JSON exchange while checking is on, and for the current snapshot on `ready`; `pickModel`,
  * `openViolation`, `generateModel`, `generateFixture` go through injected deps (`error` on failure).
+ *
+ * CONTRACTS §11: `status` (with `warnings`) after every host 'warnings' event; rules can't be made from read-only
+ * `captured: 'vm-profile'` exchanges (nor resent); WebSocket exchanges only get block rules (ws(s):// patterns
+ * only block / fault). WebSocket/SSE
+ * exchanges are sent to the panel with at most UI_MAX_FRAMES newest frames (and UI_MAX_FRAME_CHARS of payload);
+ * the rest is folded into `framesDropped` (the agent API reads the host's full list).
  */
 import type { Exchange, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
-import { ruleFromExchange } from '@flutter-intercept/proxy/rules';
+import { ruleFromExchange, ruleProblem } from '@flutter-intercept/proxy/rules';
 import { pathError } from '../agent/paths';
 import { decodeJson, decodeSample, defaultFixtureName, FINAL_STATES, defaultModelName, fixtureApiFor, fixtureSamples, isCheckable, modelSamples, redactExchange, routeOf, testPackageFor } from '../agent/samples';
 import { SNIPPET_FORMATS, toSnippet } from '../codegen/snippets';
 import type { CodegenService, FixtureApi, GeneratedFile } from '../codegen/types';
 import type { ContractResult, ContractService } from '../contract/types';
-import type { AgentStatus, ContractSummary, HostMsg, SendDraft, SnippetFormat, Status, ViewMsg } from './protocol';
+import type { AgentStatus, ContractSummary, HostMsg, SendDraft, SessionWarning, SnippetFormat, Status, ViewMsg } from './protocol';
 
 export type Sink = (msg: HostMsg) => void;
 
@@ -50,6 +56,10 @@ export interface ControllerHost {
   send?(req: SendRequest): Promise<{ id: string }>;
   setNetworkProfile?(p: NetworkProfile): void;
   readonly networkProfile?: NetworkProfile;
+  /** CONTRACTS §11.4: the current session warnings (InterceptProxyHost.warnings). Optional on older hosts. */
+  readonly warnings?: SessionWarning[];
+  /** Fires after every change of `warnings`. */
+  on(event: 'warnings', l: (warnings: SessionWarning[]) => void): unknown;
 }
 
 export interface ControllerDeps {
@@ -94,6 +104,8 @@ export interface ControllerDeps {
   /** Delay before queued checks start (default 150 ms) and how many run at once (default 2). */
   contractDebounceMs?: number;
   contractConcurrency?: number;
+  /** REVIEW-5 #4: min ms between panel updates of one open WebSocket / SSE exchange (default UI_STREAM_UPDATE_MS). */
+  streamUpdateMs?: number;
 }
 
 /** CONTRACTS §10.5: the panel's view of a contract result (no file paths). */
@@ -135,6 +147,51 @@ export async function fixtureApi(
 const RULE_KINDS = new Set<RuleAction['kind']>(['mock', 'block', 'breakpoint']);
 const FAULTS = new Set(['reset', 'timeout', 'truncate', 'dns']);
 const PRESET_IDS = new Set(['slow-3g', 'fast-3g', 'flaky']);
+
+/** CONTRACTS §11: what the panel gets of a WebSocket / SSE exchange's frames (the newest; the rest is counted). */
+export const UI_MAX_FRAMES = 200;
+export const UI_MAX_FRAME_CHARS = 2_000_000;
+/** REVIEW-5 #4: an open WebSocket / SSE exchange updates the panel at most every this many ms (≤ 2×/s). */
+export const UI_STREAM_UPDATE_MS = 500;
+
+type Frame = NonNullable<Exchange['frames']>[number];
+
+/** A frame's weight, as the proxy counts it (packages/proxy/src/frames.ts `frameCost`, not exported). */
+export function uiFrameCost(f: Frame): number {
+  return (f.text?.length ?? 0) + (f.base64?.length ?? 0) + (f.event?.length ?? 0) + (f.id?.length ?? 0) + 32;
+}
+
+/** A WebSocket / SSE exchange that is still open (its frames keep changing). */
+function isLiveStream(e: Exchange): boolean {
+  return !!e.kind && e.state === 'pending';
+}
+
+/**
+ * The exchange as sent to the webview: at most UI_MAX_FRAMES newest frames and UI_MAX_FRAME_CHARS of frame
+ * payload (text, base64, SSE event name and id: `uiFrameCost`), the older ones added to `framesDropped`. Other exchanges are returned as is.
+ */
+export function uiExchange(e: Exchange): Exchange {
+  const frames = e.frames;
+  if (!frames || !frames.length) return e;
+  let keep = 0;
+  let chars = 0;
+  for (let i = frames.length - 1; i >= 0 && keep < UI_MAX_FRAMES; i--) {
+    const n = uiFrameCost(frames[i]);
+    if (keep > 0 && chars + n > UI_MAX_FRAME_CHARS) break;
+    chars += n;
+    keep++;
+  }
+  if (keep === frames.length) return e;
+  return { ...e, frames: frames.slice(frames.length - keep), framesDropped: (e.framesDropped ?? 0) + (frames.length - keep) };
+}
+
+/** CONTRACTS §11.4: why a rule / resend can't be based on this exchange, or undefined. */
+export function readOnlyReason(e: Exchange): string | undefined {
+  if (e.captured === 'vm-profile') {
+    return "this request was made by a native HTTP client (read from the app's HTTP profile); it never went through the proxy, so rules can't change it and it can't be resent from here";
+  }
+  return undefined;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Host-side validation of everything the webview sends (review #7). The webview is ours, but
@@ -284,10 +341,13 @@ export function validateRule(raw: unknown, where = 'rule'): Rule {
   }
   const m = raw.match;
   if (!isObj(m)) fail(where, 'match is required (a rule without match would match everything)');
-  onlyKeys(m, ['url', 'method'], `${where}.match`);
+  onlyKeys(m, ['url', 'method', 'graphqlOperation'], `${where}.match`);
   if (typeof m.url !== 'string' || !m.url.trim() || m.url.length > 8192) fail(`${where}.match`, 'url must be a non-empty string (use "*" to match everything)');
   if (m.method !== undefined && (typeof m.method !== 'string' || (m.method !== '' && m.method !== '*' && !TOKEN.test(m.method)))) {
     fail(`${where}.match`, 'method must be an HTTP method name');
+  }
+  if (m.graphqlOperation !== undefined && (typeof m.graphqlOperation !== 'string' || m.graphqlOperation.length > 200 || !GRAPHQL_NAME.test(m.graphqlOperation))) {
+    fail(`${where}.match`, 'graphqlOperation must be a GraphQL operation name (letters, digits, _; not starting with a digit; at most 200)');
   }
   const a = raw.action;
   if (!isObj(a)) fail(where, 'action is required');
@@ -323,14 +383,39 @@ export function validateRule(raw: unknown, where = 'rule'): Rule {
       onlyKeys(a, ['kind', 'ops'], aw);
       checkMutateOps(a.ops, aw);
       break;
+    case 'cors':
+      onlyKeys(a, ['kind', 'allowOrigin', 'allowCredentials'], aw);
+      if (typeof a.allowOrigin === 'string' && a.allowOrigin.trim().toLowerCase() === 'null') {
+        fail(aw, 'allowOrigin "null" is refused: sandboxed frames and file pages send it, so it would let any of them read the responses');
+      }
+      if (a.allowOrigin !== undefined && !isAllowOrigin(a.allowOrigin)) {
+        fail(aw, 'allowOrigin must be "*" or one origin such as "http://localhost:5000" (at most 500 characters, no spaces or commas)');
+      }
+      if (a.allowCredentials !== undefined && typeof a.allowCredentials !== 'boolean') fail(aw, 'allowCredentials must be a boolean');
+      if (a.allowOrigin === '*' && a.allowCredentials === true) {
+        fail(aw, 'allowOrigin "*" cannot be combined with allowCredentials: browsers reject credentials with a wildcard origin (omit allowOrigin to echo the request\'s Origin)');
+      }
+      break;
     default:
       fail(aw, `unknown kind ${JSON.stringify(a.kind)}`);
   }
+  // CONTRACTS §11.1 / REVIEW-5 #16: refuse rules the proxy can never apply (e.g. a mock or a truncate fault on a
+  // ws:// URL, a GraphQL operation on a WebSocket upgrade).
+  const problem = ruleProblem(raw as unknown as Rule);
+  if (problem) fail(where, problem);
   if ('used' in raw) {
     const { used: _used, ...rest } = raw;
     return rest as unknown as Rule;
   }
   return raw as unknown as Rule;
+}
+
+/** GraphQL Name (spec §2.1.9). */
+const GRAPHQL_NAME = /^[_A-Za-z][_0-9A-Za-z]*$/;
+
+/** `*`, or one serialized origin / token-ish value: printable, no whitespace or commas (a header value), ≤ 500. */
+function isAllowOrigin(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0 && v.length <= 500 && /^[\x21-\x7e]+$/.test(v) && !v.includes(',');
 }
 
 export function validateRules(raw: unknown): Rule[] {
@@ -433,10 +518,13 @@ export function snippetFor(ex: Exchange, format: SnippetFormat): string {
 export class InterceptController {
   private readonly sinks = new Set<Sink>();
   private readonly pending = new Map<string, Exchange>();
+  /** When each open stream was last sent to the panel (REVIEW-5 #4). */
+  private readonly streamSentAt = new Map<string, number>();
   /** Latest `rule-hit` count per rule id (display only: never persisted, never sent to the proxy). */
   private readonly used = new Map<string, number>();
   private rulesDirty = false;
   private timer: ReturnType<typeof setTimeout> | undefined;
+  private timerDue = 0;
   private readonly paused = new Set<string>();
   private sessions = 0;
   private pausedListeners: ((count: number) => void)[] = [];
@@ -459,6 +547,7 @@ export class InterceptController {
     // Start/stop/restart: the exchange list belongs to the proxy instance, so resend everything.
     deps.host.on('state', () => {
       this.pending.clear();
+      this.streamSentAt.clear();
       this.rulesDirty = false;
       this.used.clear(); // hit counts belong to the proxy instance
       this.dropContracts(undefined);
@@ -467,6 +556,7 @@ export class InterceptController {
     });
     deps.host.on('rule-spent', (ruleId) => this.onRuleSpent(ruleId));
     deps.host.on('rule-hit', (ruleId, used) => this.onRuleHit(ruleId, used));
+    deps.host.on('warnings', () => this.broadcastStatus());
     this.modelsSub = deps.contract?.onDidChangeModels(() => this.recheckContracts());
   }
 
@@ -494,6 +584,7 @@ export class InterceptController {
         : {}),
       ...(this.deps.getAgentStatus?.() ? { agent: this.deps.getAgentStatus() } : {}),
       ...(this.networkProfile() ? { networkProfile: this.networkProfile() } : {}),
+      ...(this.deps.host.warnings?.length ? { warnings: this.deps.host.warnings } : {}),
     };
   }
 
@@ -522,7 +613,7 @@ export class InterceptController {
   }
 
   snapshot(): HostMsg {
-    return { type: 'snapshot', exchanges: this.deps.host.getExchanges(), rules: this.rulesView(), status: this.status() };
+    return { type: 'snapshot', exchanges: this.deps.host.getExchanges().map(uiExchange), rules: this.rulesView(), status: this.status() };
   }
 
   async handle(raw: unknown, reply: Sink): Promise<void> {
@@ -569,6 +660,11 @@ export class InterceptController {
           const id = checkId(msg.id, 'createRuleFromExchange');
           const ex = this.deps.host.getExchanges().find((e) => e.id === id);
           if (!ex) throw new Error('That exchange is no longer available.');
+          const ro = readOnlyReason(ex);
+          if (ro) throw new Error(`Can't create a rule from this request: ${ro}.`);
+          if (ex.kind === 'websocket' && msg.action !== 'block') {
+            throw new Error(`Can't create ${msg.action === 'mock' ? 'a mock' : 'a breakpoint'} rule from a WebSocket: WebSocket connections can only be blocked (or failed with a fault rule).`);
+          }
           let rule: Rule;
           try {
             rule = validateRule(ruleFromExchange(ex, msg.action, this.newRuleId()));
@@ -580,7 +676,12 @@ export class InterceptController {
         }
         case 'send': {
           const request = validateSendDraft(msg.request);
-          if (msg.resentFrom !== undefined) checkId(msg.resentFrom, 'send');
+          if (msg.resentFrom !== undefined) {
+            const fromId = checkId(msg.resentFrom, 'send');
+            const from = this.deps.host.getExchanges().find((e) => e.id === fromId);
+            const ro = from && readOnlyReason(from);
+            if (ro) throw new Error(`Can't resend this request: ${ro}.`);
+          }
           if (!this.deps.host.send) throw new Error('This proxy build cannot send requests.');
           const { id } = await this.deps.host.send({ ...request, initiator: 'editor', ...(msg.resentFrom ? { resentFrom: msg.resentFrom } : {}) });
           this.send(reply, { type: 'sent', id });
@@ -651,6 +752,7 @@ export class InterceptController {
   clear(): void {
     this.deps.host.clear();
     this.pending.clear();
+    this.streamSentAt.clear();
     const left = new Set(this.deps.host.getExchanges().map((e) => e.id));
     this.dropContracts([...this.contractResults.keys(), ...this.contractQueue.keys(), ...this.pendingContract.keys()].filter((id) => !left.has(id)));
     this.recomputePaused(this.deps.host.getExchanges());
@@ -772,7 +874,7 @@ export class InterceptController {
       } catch (err) {
         this.deps.log?.(`onContractResult failed: ${String(err)}`);
       }
-      if (!this.timer) this.timer = setTimeout(() => this.flush(), this.deps.throttleMs ?? 50);
+      this.scheduleFlush(this.deps.throttleMs ?? 50);
       return result;
     } finally {
       // Yield to the event loop between checks (REVIEW-4 #5): a re-check of many exchanges never runs as one microtask chain.
@@ -797,6 +899,9 @@ export class InterceptController {
   }
 
   private mutateField(ex: Exchange, msg: { path?: unknown; op?: unknown; value?: unknown; valueJson?: unknown }): void {
+    const ro = readOnlyReason(ex);
+    if (ro) throw new Error(`Can't change the next responses of this request: ${ro}.`);
+    if (ex.kind === 'websocket' || ex.kind === 'sse') throw new Error(`Can't change fields of a ${ex.kind === 'sse' ? 'server-sent event stream' : 'WebSocket'}: mutation rules apply to JSON responses.`);
     if (typeof msg.op !== 'string' || !['null', 'delete', 'set'].includes(msg.op)) fail('mutateField', 'op must be "null", "delete" or "set"');
     const bad = pathError(msg.path);
     if (bad) fail('mutateField', bad);
@@ -880,7 +985,7 @@ export class InterceptController {
     if (!this.deps.host.getRules().some((r) => r.id === ruleId) || this.used.get(ruleId) === used) return;
     this.used.set(ruleId, used);
     this.rulesDirty = true;
-    if (!this.timer) this.timer = setTimeout(() => this.flush(), this.deps.throttleMs ?? 50);
+    this.scheduleFlush(this.deps.throttleMs ?? 50);
   }
 
   /** CONTRACTS §9.4: a spent rule (times used up / expired) is removed, persisted and broadcast. */
@@ -907,17 +1012,30 @@ export class InterceptController {
     else this.paused.delete(e.id);
     if (this.paused.size !== before) this.firePaused();
     this.pending.set(e.id, e);
-    if (!this.timer) this.timer = setTimeout(() => this.flush(), this.deps.throttleMs ?? 50);
+    this.scheduleFlush(this.deps.throttleMs ?? 50);
     this.maybeCheck(e);
   }
 
   private onRemoved(ids: string[]): void {
+    for (const id of ids) {
+      this.pending.delete(id);
+      this.streamSentAt.delete(id);
+    }
     this.flush();
     this.dropContracts(ids);
     let changed = false;
     for (const id of ids) changed = this.paused.delete(id) || changed;
     if (changed) this.firePaused();
     this.broadcast({ type: 'removed', ids });
+  }
+
+  /** Flush within `ms`: keeps an earlier timer, replaces a later one (a held stream must not delay other updates). */
+  private scheduleFlush(ms: number): void {
+    const due = Date.now() + ms;
+    if (this.timer && this.timerDue <= due) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timerDue = due;
+    this.timer = setTimeout(() => this.flush(), ms);
   }
 
   private flush(): void {
@@ -930,7 +1048,23 @@ export class InterceptController {
     if (this.pending.size) {
       const batch = [...this.pending.values()];
       this.pending.clear();
-      for (const exchange of batch) this.broadcast({ type: 'exchange', exchange });
+      const now = Date.now();
+      const every = this.deps.streamUpdateMs ?? UI_STREAM_UPDATE_MS;
+      let wait = Infinity;
+      for (const exchange of batch) {
+        if (isLiveStream(exchange)) {
+          // Open streams: at most one update per `every` ms; the latest state waits for its turn.
+          const last = this.streamSentAt.get(exchange.id);
+          if (last !== undefined && now - last < every) {
+            this.pending.set(exchange.id, exchange);
+            wait = Math.min(wait, last + every - now);
+            continue;
+          }
+          this.streamSentAt.set(exchange.id, now);
+        } else this.streamSentAt.delete(exchange.id); // finished: sent at once
+        this.broadcast({ type: 'exchange', exchange: uiExchange(exchange) });
+      }
+      if (wait !== Infinity) this.scheduleFlush(Math.max(1, wait));
     }
     // After the exchanges, so the panel already knows every id a result refers to.
     if (this.pendingContract.size) {

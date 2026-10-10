@@ -43,8 +43,52 @@ export interface Exchange {
   resentFrom?: string;
   /** Set when the client came through the LAN listener (physical iPhone, CONTRACTS §7). */
   viaLan?: true;
+  // CONTRACTS §11 (v0.5.0)
+  /** absent = plain HTTP. websocket = an upgraded connection; sse = a text/event-stream response. */
+  kind?: 'websocket' | 'sse';
+  /** WebSocket messages / SSE events, oldest first; the newest `maxFramesPerExchange` are kept. */
+  frames?: Frame[];
+  /** Frames dropped (oldest) beyond the cap. */
+  framesDropped?: number;
+  /** Detected GraphQL operation (POST JSON `{query, operationName}`, GET `?query=`, persisted-query extensions). */
+  graphql?: GraphqlInfo;
+  /** CORS diagnosis for browser requests (they carry `Origin`): Flutter Web. */
+  cors?: CorsInfo;
+  /** How it was captured. absent = through the proxy. `vm-profile` = read-only, from the app's HTTP profile
+   * (native clients such as cupertino_http / cronet_http that bypass the proxy); rules never apply to it. */
+  captured?: 'vm-profile';
+  /** Flutter Web: the browser's own traffic (updates, GCM, optimization guide), not the app's — hidden by default. */
+  browserInternal?: true;
   /** Human label when a throttle / fault / network profile affected it (e.g. "Slow 3G: +400 ms, 400 kbps"). */
   simulated?: string;
+}
+
+export interface Frame {
+  dir: 'send' | 'receive';         // send = app → server
+  at: number;                      // epoch ms
+  kind: 'text' | 'binary' | 'ping' | 'pong' | 'close' | 'event'; // event = one SSE event
+  text?: string;                   // text / event data, ≤ 64 KB (then `truncated`)
+  base64?: string;                 // binary, ≤ 64 KB
+  size: number;                    // full payload bytes
+  truncated?: true;
+  event?: string;                  // SSE `event:` name
+  id?: string;                     // SSE `id:`
+  closeCode?: number;              // close frames
+}
+
+export interface GraphqlInfo {
+  operationName?: string;
+  operationType?: 'query' | 'mutation' | 'subscription';
+  persisted?: true;                // persisted-query hash, no query text
+  batch?: number;                  // batched array: number of operations (the fields describe the first)
+}
+
+export interface CorsInfo {
+  preflight?: true;                // this exchange IS an OPTIONS preflight
+  /** Why a browser would block it (absent = looks fine), e.g. "no Access-Control-Allow-Origin for http://localhost:5000". */
+  problem?: string;
+  /** Set when the proxy answered or patched CORS itself (a mock's preflight, a `cors` rule). */
+  patched?: true;
 }
 
 /** One parsed Dart stack frame. `line`/`column` are 1-based as Dart prints them. */
@@ -67,6 +111,8 @@ export interface Matcher {
   method?: string;
   /** Glob on the full URL ("*" = any chars, case-sensitive), or /regex/flags. */
   url: string;
+  /** CONTRACTS §11: also require this GraphQL operation name (exact, case-sensitive). */
+  graphqlOperation?: string;
 }
 
 export type RuleAction =
@@ -77,7 +123,10 @@ export type RuleAction =
   | { kind: 'throttle'; latencyMs?: number; kbps?: number; dropRate?: number }
   | { kind: 'fault'; fault: FaultKind }
   // CONTRACTS §10.2: the real response, with JSON fields changed (reproduce "Null is not a subtype…").
-  | { kind: 'mutate'; ops: MutateOp[] };
+  | { kind: 'mutate'; ops: MutateOp[] }
+  // CONTRACTS §11: pass through, but answer CORS preflights locally and add CORS headers to the response
+  // (development only — the real server's CORS policy is NOT fixed by this).
+  | { kind: 'cors'; allowOrigin?: string; allowCredentials?: boolean };
 
 /**
  * One change to a JSON response body. `path` is the JSON path subset of `@flutter-intercept/proxy/jsonpath`
@@ -160,4 +209,6 @@ export interface InterceptProxyOptions {
    * host) to 127.0.0.1. Default true. LAN clients keep the §7 SSRF guard.
    */
   rewriteLocalhost?: boolean;
+  /** CONTRACTS §11: keep at most this many frames per WebSocket / SSE exchange (newest kept). Default 500. */
+  maxFramesPerExchange?: number;
 }

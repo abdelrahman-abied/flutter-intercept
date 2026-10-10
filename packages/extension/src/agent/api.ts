@@ -5,16 +5,18 @@
  */
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import type { Body, Exchange, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest, StackFrame } from '@flutter-intercept/proxy';
+import type { Body, Exchange, Matcher, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest, StackFrame } from '@flutter-intercept/proxy';
 import { describeProfile, NETWORK_PRESETS, presetProfile, type NetworkPresetId, type NetworkProfile } from '@flutter-intercept/proxy/network';
 import { compileMatcher } from '@flutter-intercept/proxy/rules';
 import { toSnippet } from '../codegen/snippets';
 import type { CodegenService } from '../codegen/types';
 import type { ContractResult, ContractService } from '../contract/types';
-import { fixtureApi, sanitizeSendHeaders, validateEdit, validateRule } from '../ui/controller';
+import { fixtureApi, readOnlyReason, sanitizeSendHeaders, validateEdit, validateRule } from '../ui/controller';
+import type { SessionWarning } from '../ui/protocol';
 import { buildHar, writeHar } from './har';
 import { pathError, select } from './paths';
-import { isSensitiveField, REDACTED, redactBodyText, redactHeaders, redactUrl } from './redact';
+import { corsPolicyShort, urlGlobHasHost } from './corsPolicy';
+import { isSensitiveField, REDACTED, redactBodyText, redactFrameText, redactHeaders, redactQueryString, redactSecretValues, redactText, redactUrl } from './redact';
 import { parsePath, type PathSegment } from '@flutter-intercept/proxy/jsonpath';
 import {
   contractForAgent,
@@ -40,6 +42,10 @@ export { FINAL_STATES };
 /** assert_traffic: at most this many failure texts in all, and JSON failure texts per exchange. */
 export const MAX_ASSERT_FAILURES = 50;
 export const MAX_JSON_FAILURES_PER_EXCHANGE = 10;
+/** get_frames: total characters of frame text in one result (further frames → `more`, page with `next`). */
+export const MAX_FRAME_RESULT_CHARS = 200_000;
+
+type Frame = NonNullable<Exchange['frames']>[number];
 
 /** True when `path` selects something BELOW a sensitive key (a redacted field), e.g. `$.session.id`. */
 function insideRedacted(path: string): boolean {
@@ -73,6 +79,8 @@ export interface AgentApiDeps {
     send?(req: SendRequest): Promise<{ id: string }>;
     setNetworkProfile?(p: NetworkProfile): void;
     readonly networkProfile?: NetworkProfile;
+    /** CONTRACTS §11.4 (InterceptProxyHost.warnings): traffic that is not intercepted. Optional on older builds. */
+    readonly warnings?: SessionWarning[];
   };
   /**
    * CONTRACTS §9.4: resolves `package:` / `file:` frames to files (src/source/resolve.ts `resolveFrames` bound
@@ -131,7 +139,16 @@ export function sensitiveQueryProbe(pattern: string): string | undefined {
   return undefined;
 }
 
-type ExchangeFilter = { url?: string; method?: string; status?: StatusFilter; sinceMs?: number };
+type ExchangeFilter = {
+  url?: string;
+  method?: string;
+  status?: StatusFilter;
+  sinceMs?: number;
+  kind?: 'http' | 'websocket' | 'sse';
+  graphqlOperation?: string;
+  /** CONTRACTS §11.3: the web browser's own traffic is excluded unless true. */
+  includeBrowserInternal?: boolean;
+};
 
 /**
  * Compiles an agent filter once per tool call (REVIEW-4 #11). The URL glob is matched against `view(e.url)`,
@@ -142,9 +159,12 @@ function compileFilter(f: ExchangeFilter, view: (url: string) => string): (e: Ex
   const url = f.url !== undefined ? compileMatcher({ url: f.url, method: f.method }) : undefined;
   const method = f.method?.toUpperCase();
   return (e) => {
+    if (e.browserInternal && !f.includeBrowserInternal) return false;
     if (f.sinceMs !== undefined && e.startedAt < f.sinceMs) return false;
     if (url && !url(e.method, view(e.url))) return false;
     if (!url && method !== undefined && e.method.toUpperCase() !== method) return false;
+    if (f.kind !== undefined && (e.kind ?? 'http') !== f.kind) return false;
+    if (f.graphqlOperation !== undefined && e.graphql?.operationName !== f.graphqlOperation) return false;
     return statusMatches(e, f.status);
   };
 }
@@ -260,6 +280,10 @@ export class AgentApi implements AgentTools {
         return this.assertTraffic(input as ToolInput<'assert_traffic'>, signal);
       case 'add_mutation':
         return this.addMutation(input as ToolInput<'add_mutation'>);
+      case 'get_frames':
+        return this.getFrames(input as ToolInput<'get_frames'>);
+      case 'add_cors_rule':
+        return this.addCorsRule(input as ToolInput<'add_cors_rule'>);
       default:
         throw new AgentToolError(`unknown tool ${String(tool)}`, 'invalid');
     }
@@ -296,6 +320,11 @@ export class AgentApi implements AgentTools {
     return this.redact ? redactUrl(u) : u;
   }
 
+  /** Free text that may embed URLs or tokens (`error`, `cors.problem`): REVIEW-5 #5. */
+  private text(t: string): string {
+    return this.redact ? redactText(t) : t;
+  }
+
   /** An exchange filter for this call (compiled once; matches the agent's view of the URL). */
   private filter(f: ExchangeFilter): (e: Exchange) => boolean {
     const view = this.redact ? redactUrl : (u: string) => u;
@@ -326,6 +355,12 @@ export class AgentApi implements AgentTools {
       ...(e.matchedRuleId ? { matchedRuleId: e.matchedRuleId } : {}),
       ...(e.initiator ? { initiator: e.initiator } : {}),
       ...(e.simulated ? { simulated: e.simulated } : {}),
+      // CONTRACTS §11.5
+      ...(e.kind ? { kind: e.kind } : {}),
+      ...(e.graphql?.operationName ? { graphqlOperation: e.graphql.operationName } : {}),
+      ...(e.cors?.problem ? { corsProblem: true } : {}),
+      ...(e.captured ? { captured: e.captured } : {}),
+      ...(e.browserInternal ? { browserInternal: true } : {}),
     };
   }
 
@@ -340,9 +375,15 @@ export class AgentApi implements AgentTools {
       ...(includeBodies && e.responseBody ? { responseBody: this.bodyView(e.responseBody, e.responseHeaders, maxBodyChars) } : {}),
       ...(e.pausedAt ? { pausedAt: e.pausedAt } : {}),
       ...(e.pauseDeadline ? { pauseDeadline: e.pauseDeadline } : {}),
-      ...(e.error ? { error: e.error } : {}),
+      ...(e.error ? { error: this.text(e.error) } : {}),
       ...(e.resentFrom ? { resentFrom: e.resentFrom } : {}),
       ...(e.source?.frames?.length ? { hasSource: true } : {}),
+      // CONTRACTS §11.5: frames are read with get_frames.
+      ...(e.kind ? { frameCount: e.frames?.length ?? 0 } : {}),
+      ...(e.framesDropped ? { framesDropped: e.framesDropped } : {}),
+      ...(e.graphql ? { graphql: { ...e.graphql } } : {}),
+      ...(e.cors ? { cors: { ...e.cors, ...(e.cors.problem ? { problem: this.text(e.cors.problem) } : {}) } } : {}),
+      ...(e.captured ? { captured: e.captured, readOnly: readOnlyReason(e) } : {}),
     };
   }
 
@@ -360,6 +401,9 @@ export class AgentApi implements AgentTools {
       exchangeCount: all.length,
       agentAccess: s.access,
       networkProfile: this.profileView(this.deps.host.networkProfile ?? { kind: 'none' }),
+      // REVIEW-5 #6: what list / wait / assert hide by default.
+      browserInternalHidden: all.filter((e) => e.browserInternal).length,
+      warnings: (this.deps.host.warnings ?? []).map((w) => ({ kind: w.kind, text: w.text, ...(w.sessionId ? { sessionId: w.sessionId } : {}) })),
     };
   }
 
@@ -417,7 +461,7 @@ export class AgentApi implements AgentTools {
    */
   private waitForRequest(i: ToolInput<'wait_for_request'>, signal?: AbortSignal): Promise<ToolResult> {
     const since = i.sinceMs === undefined ? this.defaultSince() : i.sinceMs === 'now' ? this.now() : i.sinceMs;
-    const f = { url: i.url, method: i.method, status: i.status as StatusFilter, sinceMs: since };
+    const f = { url: i.url, method: i.method, status: i.status as StatusFilter, sinceMs: since, includeBrowserInternal: i.includeBrowserInternal };
     const keep = this.filter(f);
     const hit = (e: Exchange) => FINAL_STATES.has(e.state) && keep(e);
     const view = (e: Exchange) => ({ timedOut: false, sinceMs: since, ...this.detail(e, i.includeBodies, 20_000) });
@@ -453,7 +497,7 @@ export class AgentApi implements AgentTools {
   private async exportHar(i: ToolInput<'export_har'>): Promise<ToolResult> {
     const root = this.deps.projectRoot();
     if (!root) throw new AgentToolError('no workspace folder is open to export into', 'state');
-    const list = this.deps.host.getExchanges().filter(this.filter({ url: i.url, method: i.method, sinceMs: i.sinceMs }));
+    const list = this.deps.host.getExchanges().filter(this.filter({ url: i.url, method: i.method, sinceMs: i.sinceMs, includeBrowserInternal: i.includeBrowserInternal }));
     const har = buildHar(list, { redact: this.redact, creatorVersion: this.deps.version });
     const file = await writeHar(root, har, new Date(this.now()));
     return { path: file, entries: list.length, redacted: this.redact };
@@ -468,6 +512,11 @@ export class AgentApi implements AgentTools {
   private label(name: string | undefined, fallback: string): string {
     const n = (name ?? '').trim() || fallback;
     return n.startsWith(AGENT_RULE_PREFIX) ? n : `${AGENT_RULE_PREFIX}${n}`;
+  }
+
+  /** A rule matcher from an agent's url / method / graphqlOperation. */
+  private match(i: { url: string; method?: string; graphqlOperation?: string }): Matcher {
+    return { url: i.url, ...(i.method ? { method: i.method.toUpperCase() } : {}), ...(i.graphqlOperation ? { graphqlOperation: i.graphqlOperation } : {}) };
   }
 
   /** Validates with the host's rule validation and inserts the rule FIRST (it wins). */
@@ -496,8 +545,8 @@ export class AgentApi implements AgentTools {
     return this.insertRule({
       id: this.newId(),
       enabled: true,
-      name: this.label(i.name, `mock ${i.method ?? '*'} ${i.url} → ${i.status}`),
-      match: { url: i.url, ...(i.method ? { method: i.method.toUpperCase() } : {}) },
+      name: this.label(i.name, `mock ${i.method ?? '*'} ${i.url}${opLabel(i)} → ${i.status}`),
+      match: this.match(i),
       action: {
         kind: 'mock',
         status: i.status,
@@ -513,8 +562,8 @@ export class AgentApi implements AgentTools {
     return this.insertRule({
       id: this.newId(),
       enabled: true,
-      name: this.label(i.name, `block ${i.method ?? '*'} ${i.url}`),
-      match: { url: i.url, ...(i.method ? { method: i.method.toUpperCase() } : {}) },
+      name: this.label(i.name, `block ${i.method ?? '*'} ${i.url}${opLabel(i)}`),
+      match: this.match(i),
       action: i.mode === 'reset' ? { kind: 'block', mode: 'reset' } : { kind: 'block', mode: 'status', status: i.status },
       ...this.spending(i),
     });
@@ -524,8 +573,8 @@ export class AgentApi implements AgentTools {
     return this.insertRule({
       id: this.newId(),
       enabled: true,
-      name: this.label(i.name, `break ${i.phase} ${i.method ?? '*'} ${i.url}`),
-      match: { url: i.url, ...(i.method ? { method: i.method.toUpperCase() } : {}) },
+      name: this.label(i.name, `break ${i.phase} ${i.method ?? '*'} ${i.url}${opLabel(i)}`),
+      match: this.match(i),
       action: { kind: 'breakpoint', phase: i.phase },
       ...this.spending(i),
     });
@@ -679,8 +728,8 @@ export class AgentApi implements AgentTools {
 
     if (i.url === undefined) {
       if (i.fault) throw bad('fault needs a url; to make every request fail use profile "offline"');
-      if (i.method !== undefined || i.times !== undefined || i.ttlMs !== undefined || i.name !== undefined) {
-        throw bad('method, times, ttlMs and name only apply together with a url (a rule for matching requests)');
+      if (i.method !== undefined || i.graphqlOperation !== undefined || i.times !== undefined || i.ttlMs !== undefined || i.name !== undefined) {
+        throw bad('method, graphqlOperation, times, ttlMs and name only apply together with a url (a rule for matching requests)');
       }
       const p: NetworkProfile =
         i.profile === 'none' || i.profile === 'offline'
@@ -715,8 +764,8 @@ export class AgentApi implements AgentTools {
     return this.insertRule({
       id: this.newId(),
       enabled: true,
-      name: this.label(i.name, `${what} ${i.method ?? '*'} ${i.url}`),
-      match: { url: i.url, ...(i.method ? { method: i.method.toUpperCase() } : {}) },
+      name: this.label(i.name, `${what} ${i.method ?? '*'} ${i.url}${opLabel(i)}`),
+      match: this.match({ ...i, url: i.url }),
       action,
       ...this.spending(i),
     });
@@ -730,6 +779,10 @@ export class AgentApi implements AgentTools {
    * Returns why not, or undefined when allowed.
    */
   private resendRefusal(e: Exchange): string | undefined {
+    const ro = readOnlyReason(e);
+    if (ro) return `exchange "${e.id}": ${ro}`;
+    if (e.kind === 'websocket') return `exchange "${e.id}" is a WebSocket connection; only plain HTTP requests can be resent`;
+    if (e.kind === 'sse') return `exchange "${e.id}" is a server-sent event stream; resending it would hold a stream open, so only plain HTTP requests can be resent`;
     if (e.initiator) return `exchange "${e.id}" was itself sent by ${e.initiator === 'agent' ? 'an agent' : 'the editor'}; resend the app's original request instead`;
     if (/^(lan|tls)-/.test(e.id)) return `exchange "${e.id}" is a connection-level record (refused LAN or TLS connection), not a request that reached a server`;
     if (e.viaLan) return `exchange "${e.id}" came from a physical device over the LAN; resending it from this computer would bypass the LAN safeguards`;
@@ -941,8 +994,9 @@ export class AgentApi implements AgentTools {
     });
     const since = i.sinceMs ?? this.assertSince();
     // Compiled once per call (REVIEW-4 #11), matched against the agent's view of the URL (#1).
-    const keep = this.filter({ url: i.url, method: i.method, sinceMs: since });
+    const keep = this.filter({ url: i.url, method: i.method, sinceMs: since, includeBrowserInternal: i.includeBrowserInternal });
     const order = x.order?.map((glob) => ({ glob, test: compileMatcher({ url: glob }) }));
+    const internal = i.includeBrowserInternal === true;
     const upper = c?.exact ?? c?.max;
     const need = c ? (c.exact ?? c.min ?? 0) : 1;
     const start = this.now();
@@ -950,7 +1004,7 @@ export class AgentApi implements AgentTools {
     const ready = (): boolean => {
       const n = count();
       if (upper !== undefined) return n > upper; // exceeded: no point waiting
-      return n >= need && (!order || this.orderFailure(order, since) === undefined);
+      return n >= need && (!order || this.orderFailure(order, since, internal) === undefined);
     };
     const evaluate = () => this.evaluateAssert(i, since, Math.max(0, this.now() - start), keep, order);
     if (signal?.aborted) return Promise.reject(new AgentToolError('assert_traffic was cancelled', 'state'));
@@ -987,10 +1041,10 @@ export class AgentApi implements AgentTools {
   }
 
   /** Why `order` does not hold among the finished exchanges since `since`, or undefined when it does. */
-  private orderFailure(order: { glob: string; test: (method: string, url: string) => boolean }[], since: number): string | undefined {
+  private orderFailure(order: { glob: string; test: (method: string, url: string) => boolean }[], since: number, includeBrowserInternal = false): string | undefined {
     const done = this.deps.host
       .getExchanges()
-      .filter((e) => FINAL_STATES.has(e.state) && e.startedAt >= since)
+      .filter((e) => FINAL_STATES.has(e.state) && e.startedAt >= since && (includeBrowserInternal || !e.browserInternal))
       .sort((a, b) => a.startedAt - b.startedAt);
     let after = -Infinity;
     let prev: string | undefined;
@@ -1030,7 +1084,7 @@ export class AgentApi implements AgentTools {
     } else if (!n) failures.push(`no finished request matched ${what}${sinceText}${flight}`);
 
     if (order) {
-      const why = this.orderFailure(order, since);
+      const why = this.orderFailure(order, since, i.includeBrowserInternal === true);
       if (why) failures.push(why);
     }
     for (const e of m) {
@@ -1112,16 +1166,109 @@ export class AgentApi implements AgentTools {
   private addMutation(i: ToolInput<'add_mutation'>): ToolResult {
     const ops = i.ops.map((o) => ({ path: o.path, op: o.op, ...(o.value !== undefined ? { value: o.value } : {}), ...(o.valueJson !== undefined ? { valueJson: o.valueJson } : {}) }));
     const summary = ops.map((o) => `${o.op} ${o.path}`).join(', ');
-    const fallback = `mutate ${i.method ?? '*'} ${i.url}: ${summary}`;
+    const fallback = `mutate ${i.method ?? '*'} ${i.url}${opLabel(i)}: ${summary}`;
     return this.insertRule({
       id: this.newId(),
       enabled: true,
       name: this.label(i.name, fallback.length > 300 ? `${fallback.slice(0, 299)}…` : fallback),
-      match: { url: i.url, ...(i.method ? { method: i.method.toUpperCase() } : {}) },
+      match: this.match(i),
       action: { kind: 'mutate', ops },
       ...this.spending(i),
     });
   }
+
+  // ------------------------------------------------------------------ v0.5.0 (CONTRACTS §11.5)
+
+  /** One frame as agents see it: redacted text (cut at maxChars), binary summarised, absolute `index`. */
+  private wsFrameView(f: Frame, index: number, maxChars: number): Record<string, unknown> {
+    let text: string | undefined;
+    let binary = false;
+    if (f.base64 !== undefined && f.text === undefined) {
+      text = `[binary ${f.size} bytes]`;
+      binary = true;
+    } else if (f.text !== undefined) {
+      text = this.redact ? redactFrameText(f.text) : f.text;
+    }
+    const cut = text !== undefined && !binary && text.length > maxChars;
+    return {
+      index,
+      dir: f.dir,
+      at: f.at,
+      kind: f.kind,
+      size: f.size,
+      ...(text !== undefined ? { text: cut ? text.slice(0, maxChars) : text } : {}),
+      ...(binary ? { binary: true } : {}),
+      ...(cut || f.truncated ? { truncated: true } : {}),
+      ...(cut ? { textChars: text!.length } : {}),
+      ...(f.event !== undefined ? { event: f.event } : {}),
+      ...(f.id !== undefined ? { id: this.redact ? redactSecretValues(f.id, true) : f.id } : {}),
+      ...(f.closeCode !== undefined ? { closeCode: f.closeCode } : {}),
+    };
+  }
+
+  /**
+   * get_frames: frames of a WebSocket / SSE exchange, oldest first. Indexes are absolute (`framesDropped` +
+   * position), so `since` = the previous `next` keeps paging correct while old frames are dropped.
+   */
+  private getFrames(i: ToolInput<'get_frames'>): ToolResult {
+    const e = this.find(i.id);
+    if (!e.kind) {
+      throw new AgentToolError(`exchange "${e.id}" is a plain HTTP request, not a WebSocket or SSE stream; read it with get_request`, 'invalid');
+    }
+    const frames = e.frames ?? [];
+    const dropped = e.framesDropped ?? 0;
+    const total = dropped + frames.length;
+    const from = Math.max(i.since ?? dropped, dropped);
+    const out: Record<string, unknown>[] = [];
+    let chars = 0;
+    let next = from;
+    for (let n = from - dropped; n < frames.length && out.length < i.limit; n++) {
+      const view = this.wsFrameView(frames[n], dropped + n, i.maxChars);
+      const len = typeof view.text === 'string' ? view.text.length : 0;
+      if (out.length && chars + len > MAX_FRAME_RESULT_CHARS) break;
+      chars += len;
+      out.push(view);
+      next = dropped + n + 1;
+    }
+    return {
+      id: e.id,
+      kind: e.kind,
+      state: e.state,
+      frames: out,
+      next,
+      total,
+      ...(dropped ? { dropped } : {}),
+      ...(i.since !== undefined && i.since < dropped ? { skipped: dropped - i.since, note: `frames ${i.since}-${dropped - 1} were dropped (only the newest are kept)` } : {}),
+      more: next < total,
+      ...(e.state === 'pending' ? { open: true } : {}),
+    };
+  }
+
+  private addCorsRule(i: ToolInput<'add_cors_rule'>): ToolResult {
+    if (i.allowOrigin === '*' && i.allowCredentials) {
+      throw new AgentToolError('allowOrigin "*" cannot be combined with allowCredentials (browsers reject it); name the origin instead (e.g. "http://localhost:5000")', 'invalid');
+    }
+    // REVIEW-5 #3: never a match-all CORS rule.
+    if (!urlGlobHasHost(i.url)) {
+      throw new AgentToolError(`add_cors_rule needs a url with a host, e.g. "https://api.example.com/*" (got ${JSON.stringify(i.url.slice(0, 100))}): a CORS rule for every site would let any page in the debug browser read them`, 'invalid');
+    }
+    // The policy is always part of the name, also with a custom one (REVIEW-5 #3).
+    const policy = `[CORS dev only: ${corsPolicyShort(i.allowOrigin, i.allowCredentials)}]`;
+    const base = (i.name ?? '').trim() || `${i.method ?? '*'} ${i.url}`;
+    return this.insertRule({
+      id: this.newId(),
+      enabled: true,
+      name: this.label(undefined, `${base} ${policy}`),
+      match: this.match(i),
+      action: { kind: 'cors', ...(i.allowOrigin !== undefined ? { allowOrigin: i.allowOrigin } : {}), ...(i.allowCredentials !== undefined ? { allowCredentials: i.allowCredentials } : {}) },
+      ...this.spending(i),
+    });
+  }
+}
+
+/** " (GraphQL GetUser)" for rule names. */
+function opLabel(i: { graphqlOperation?: string }): string {
+  return i.graphqlOperation ? ` (GraphQL ${i.graphqlOperation})` : '';
 }
 
 const isRedacted = (v: string) => v === REDACTED || v === encodeURIComponent(REDACTED);
@@ -1199,8 +1346,17 @@ export function restoreRedactedQuery(url: string, original: string): string {
   const used = new Set<number>();
   const parts = query.split('&').map((part) => {
     const eq = part.indexOf('=');
-    if (eq === -1 || !isRedacted(part.slice(eq + 1))) return part;
+    if (eq === -1) return part;
     const key = part.slice(0, eq);
+    if (!isRedacted(part.slice(eq + 1))) {
+      // A value redacted only inside (GraphQL ?variables= JSON, ?query= document): the agent passed back exactly
+      // what it saw → the original value.
+      if (!part.includes(encodeURIComponent(REDACTED)) && !part.includes(REDACTED)) return part;
+      const idx = origParts.findIndex((p, n) => !used.has(n) && p.startsWith(`${key}=`) && redactQueryString(p) === part);
+      if (idx === -1) return part;
+      used.add(idx);
+      return origParts[idx];
+    }
     const idx = origParts.findIndex((p, n) => !used.has(n) && p.startsWith(`${key}=`));
     if (idx === -1) return part;
     used.add(idx);

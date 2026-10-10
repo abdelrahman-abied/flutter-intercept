@@ -1,0 +1,325 @@
+{
+ "type": "HttpProfile",
+ "timestamp": 1791616249311514,
+ "requests": [
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-3045183002414206065",
+   "isolateId": "isolates/6099766762398339",
+   "method": "GET",
+   "uri": "https://echo.websocket.org:0",
+   "events": [
+    {
+     "timestamp": 1791616248198549,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791616248198553,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791616248198555,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791616248486045,
+     "event": "Waiting (TTFB)"
+    }
+   ],
+   "startTime": 1791616248187617,
+   "endTime": 1791616248198568,
+   "request": {
+    "proxyDetails": {
+     "host": "localhost",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "cache-control": [
+      "no-cache"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "x-fi-id": [
+      "c9d2feb99145820e-e"
+     ],
+     "host": [
+      "echo.websocket.org"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "GET",
+    "persistentConnection": true,
+    "uri": "https://echo.websocket.org:0",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791616248486057,
+    "headers": {
+     "date": [
+      "Sat, 10 Oct 2026 07:10:48 GMT"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "content-type": [
+      "text/plain; charset=utf-8"
+     ]
+    },
+    "compressionState": "HttpClientResponseCompressionState.notCompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "Switching Protocols",
+    "redirects": [],
+    "statusCode": 101,
+    "endTime": 1791616248486100,
+    "error": "Socket has been detached"
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-3045183002414206063",
+   "isolateId": "isolates/6099766762398339",
+   "method": "POST",
+   "uri": "https://countries.trevorblades.com/graphql",
+   "events": [
+    {
+     "timestamp": 1791616248198863,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791616248198867,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791616248198870,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791616248308911,
+     "event": "Waiting (TTFB)"
+    },
+    {
+     "timestamp": 1791616248309012,
+     "event": "Content Download"
+    }
+   ],
+   "startTime": 1791616248187706,
+   "endTime": 1791616248198890,
+   "request": {
+    "proxyDetails": {
+     "host": "localhost",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "content-type": [
+      "application/json"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "152"
+     ],
+     "x-fi-id": [
+      "c9d2feb99145820e-g"
+     ],
+     "host": [
+      "countries.trevorblades.com"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 152,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "POST",
+    "persistentConnection": true,
+    "uri": "https://countries.trevorblades.com/graphql",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791616248308923,
+    "headers": {
+     "date": [
+      "Sat, 10 Oct 2026 06:46:57 GMT"
+     ],
+     "content-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "87"
+     ],
+     "cache-control": [
+      "public, s-maxage=2628000, stale-while-revalidate=2628000"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ]
+    },
+    "compressionState": "HttpClientResponseCompressionState.decompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 87,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "OK",
+    "redirects": [],
+    "statusCode": 200,
+    "endTime": 1791616248309011
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "from_package/1",
+   "isolateId": "isolates/6099766762398339",
+   "method": "GET",
+   "uri": "https://jsonplaceholder.typicode.com/posts/1",
+   "events": [],
+   "startTime": 1791616248188305,
+   "endTime": 1791616248387850,
+   "request": {
+    "connectionInfo": {
+     "package": "package:cupertino_http",
+     "client": "CupertinoClient",
+     "configuration": "[URLSessionConfiguration allowsCellularAccess=true allowsConstrainedNetworkAccess=true allowsExpensiveNetworkAccess=true discretionary=false httpAdditionalHeaders=null httpCookieAcceptPolicy=NSHTTPCookieAcceptPolicy.NSHTTPCookieAcceptPolicyOnlyFromMainDocumentDomain httpShouldSetCookies=true httpMaximumConnectionsPerHost=6 httpShouldUsePipelining=false requestCachePolicy=NSURLRequestCachePolicy.NSURLRequestUseProtocolCachePolicy sessionSendsLaunchEvents=false shouldUseExtendedBackgroundIdleMode=timeoutIntervalForRequest=0:01:00.000000 waitsForConnectivity=false]"
+    },
+    "contentLength": 0,
+    "followRedirects": true,
+    "headers": {
+     "Content-Length": [
+      "0"
+     ],
+     "x-demo-client": [
+      "cupertino_http"
+     ]
+    },
+    "maxRedirects": 5
+   },
+   "response": {
+    "redirects": [],
+    "connectionInfo": {
+     "package": "package:cupertino_http",
+     "client": "CupertinoClient",
+     "configuration": "[URLSessionConfiguration allowsCellularAccess=true allowsConstrainedNetworkAccess=true allowsExpensiveNetworkAccess=true discretionary=false httpAdditionalHeaders=null httpCookieAcceptPolicy=NSHTTPCookieAcceptPolicy.NSHTTPCookieAcceptPolicyOnlyFromMainDocumentDomain httpShouldSetCookies=true httpMaximumConnectionsPerHost=6 httpShouldUsePipelining=false requestCachePolicy=NSURLRequestCachePolicy.NSURLRequestUseProtocolCachePolicy sessionSendsLaunchEvents=false shouldUseExtendedBackgroundIdleMode=timeoutIntervalForRequest=0:01:00.000000 waitsForConnectivity=false]"
+    },
+    "contentLength": 292,
+    "headers": {
+     "content-encoding": [
+      "br"
+     ],
+     "cache-control": [
+      "max-age=43200"
+     ],
+     "date": [
+      "Sat",
+      "10 Oct 2026 07:10:48 GMT"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ]
+    },
+    "isRedirect": false,
+    "reasonPhrase": "OK",
+    "startTime": 1791616248387841,
+    "statusCode": 200,
+    "endTime": 1791616248387884
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "from_package/2",
+   "isolateId": "isolates/6099766762398339",
+   "method": "POST",
+   "uri": "https://jsonplaceholder.typicode.com/posts",
+   "events": [],
+   "startTime": 1791616248188525,
+   "endTime": 1791616248892159,
+   "request": {
+    "connectionInfo": {
+     "package": "package:cupertino_http",
+     "client": "CupertinoClient",
+     "configuration": "[URLSessionConfiguration allowsCellularAccess=true allowsConstrainedNetworkAccess=true allowsExpensiveNetworkAccess=true discretionary=false httpAdditionalHeaders=null httpCookieAcceptPolicy=NSHTTPCookieAcceptPolicy.NSHTTPCookieAcceptPolicyOnlyFromMainDocumentDomain httpShouldSetCookies=true httpMaximumConnectionsPerHost=6 httpShouldUsePipelining=false requestCachePolicy=NSURLRequestCachePolicy.NSURLRequestUseProtocolCachePolicy sessionSendsLaunchEvents=false shouldUseExtendedBackgroundIdleMode=timeoutIntervalForRequest=0:01:00.000000 waitsForConnectivity=false]"
+    },
+    "contentLength": 58,
+    "followRedirects": true,
+    "headers": {
+     "Content-Length": [
+      "58"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ],
+     "x-demo-client": [
+      "cupertino_http"
+     ]
+    },
+    "maxRedirects": 5
+   },
+   "response": {
+    "redirects": [],
+    "connectionInfo": {
+     "package": "package:cupertino_http",
+     "client": "CupertinoClient",
+     "configuration": "[URLSessionConfiguration allowsCellularAccess=true allowsConstrainedNetworkAccess=true allowsExpensiveNetworkAccess=true discretionary=false httpAdditionalHeaders=null httpCookieAcceptPolicy=NSHTTPCookieAcceptPolicy.NSHTTPCookieAcceptPolicyOnlyFromMainDocumentDomain httpShouldSetCookies=true httpMaximumConnectionsPerHost=6 httpShouldUsePipelining=false requestCachePolicy=NSURLRequestCachePolicy.NSURLRequestUseProtocolCachePolicy sessionSendsLaunchEvents=false shouldUseExtendedBackgroundIdleMode=timeoutIntervalForRequest=0:01:00.000000 waitsForConnectivity=false]"
+    },
+    "contentLength": 84,
+    "headers": {
+     "location": [
+      "https://jsonplaceholder.typicode.com/posts/101"
+     ],
+     "cache-control": [
+      "no-cache"
+     ],
+     "content-length": [
+      "84"
+     ],
+     "date": [
+      "Sat",
+      "10 Oct 2026 07:10:48 GMT"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ]
+    },
+    "isRedirect": false,
+    "reasonPhrase": "Created",
+    "startTime": 1791616248892152,
+    "statusCode": 201,
+    "endTime": 1791616248892200
+   }
+  }
+ ]
+}

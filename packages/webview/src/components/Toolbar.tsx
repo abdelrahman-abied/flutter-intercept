@@ -3,7 +3,7 @@ import { useApp } from '../context';
 import { FILTER_HINT, parseFilter } from '../filter';
 import type { NetworkProfile } from '../protocol';
 import {
-  checkThrottle, customProfile, hasActiveFilters, isProfileActive, pausedCount, PROFILE_CHOICES, profileChoice,
+  checkThrottle, customProfile, hasActiveFilters, hiddenBrowserCount, isProfileActive, pausedCount, PROFILE_CHOICES, profileChoice,
   profileForChoice, profileLabel, throttleFieldsOf, type ProfileChoice, type ThrottleFields,
 } from '../state';
 import { STATUS_CLASSES } from '../util';
@@ -17,6 +17,8 @@ export function Toolbar() {
   const { filters, status, view } = state;
   const paused = pausedCount(state.exchanges);
   const filterErrors = parseFilter(filters.text).errors;
+  const browserHidden = hiddenBrowserCount(state.exchanges, filters);
+  const anyBrowser = filters.showBrowser || browserHidden > 0 || state.exchanges.some((e) => e.browserInternal);
 
   return (
     <div class="toolbar" role="toolbar" aria-label="Flutter Intercept">
@@ -84,6 +86,14 @@ export function Toolbar() {
               onClick={() => dispatch({ type: 'setFilters', patch: { pausedOnly: !filters.pausedOnly } })}>
               paused only
             </button>
+            {anyBrowser && (
+              <button type="button" class="toggle browser-toggle" aria-pressed={filters.showBrowser}
+                title={'Flutter Web: the browser\'s own requests (updates, sync, safe browsing…) are not the app\'s and are hidden by default. ' +
+                  (filters.showBrowser ? 'Click to hide them.' : `${browserHidden} hidden — click to show them.`)}
+                onClick={() => dispatch({ type: 'setFilters', patch: { showBrowser: !filters.showBrowser } })}>
+                Show browser traffic{browserHidden > 0 && <span class="count">{browserHidden}</span>}
+              </button>
+            )}
           </div>
           {hasActiveFilters(filters) && (
             <Button kind="icon" title="Clear filters" onClick={() => dispatch({ type: 'clearFilters' })}>

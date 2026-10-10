@@ -28,6 +28,17 @@ export interface Capture {
   captured: number;
   total: number;
   ended: boolean;
+  /** Count bytes only, keep none (SSE: the events are recorded as frames instead). */
+  skip?: boolean;
+}
+
+/** What the response-head hook may change before the head is written. */
+export interface HeadPatch {
+  /** Headers removed (case-insensitive) and then set. */
+  remove?: string[];
+  set?: Record<string, string>;
+  /** Send the head now instead of with the first body chunk (event streams: the app sees it at once). */
+  flush?: boolean;
 }
 
 export interface Tap {
@@ -40,6 +51,13 @@ export interface Tap {
   onResponseDone?: (finished: boolean) => void;
   /** Set by the flow before the first response byte: pace and/or cut the body to the app. */
   shaping?: Shaping;
+  /**
+   * Called once, when the response head is about to be written, with the status and the headers
+   * (lower-cased names). May patch the headers (CORS) or ask for an early flush (SSE).
+   */
+  onResponseHead?: (status: number, headers: Record<string, string | string[]>) => HeadPatch | void;
+  /** Each response chunk as it goes to the app (after shaping). */
+  onResponseData?: (buf: Buffer) => void;
 }
 
 const taps = new Map<string, Tap>();
@@ -59,16 +77,65 @@ function toBuffer(chunk: unknown, encoding?: unknown): Buffer | undefined {
         : undefined;
 }
 
-function add(c: Capture, chunk: unknown, encoding?: unknown): void {
+function add(c: Capture, chunk: unknown, encoding?: unknown): Buffer | undefined {
   const buf = toBuffer(chunk, encoding);
-  if (!buf) return;
+  if (!buf) return undefined;
   c.total += buf.length;
-  if (c.captured < BODY_CAP_BYTES) {
+  if (!c.skip && c.captured < BODY_CAP_BYTES) {
     const take = buf.subarray(0, BODY_CAP_BYTES - c.captured);
     // Copy: the chunk may be a slice of a pooled buffer that gets reused.
     c.chunks.push(Buffer.from(take));
     c.captured += take.length;
   }
+  return buf;
+}
+
+type FlatHeaders = string[];
+
+/** Header view (lower-cased names) of writeHead's argument plus headers already set with setHeader. */
+function headView(res: http.ServerResponse, arg: unknown): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  const put = (k: string, v: unknown) => {
+    if (v === undefined || v === null) return;
+    const name = k.toLowerCase();
+    const vals = Array.isArray(v) ? v.map(String) : [String(v)];
+    const prev = out[name];
+    const all = prev === undefined ? vals : [...(Array.isArray(prev) ? prev : [prev]), ...vals];
+    out[name] = all.length === 1 ? all[0] : all;
+  };
+  for (const [k, v] of Object.entries(res.getHeaders())) put(k, v);
+  if (Array.isArray(arg)) {
+    if (arg.length && Array.isArray(arg[0])) for (const [k, v] of arg as Array<[string, string]>) put(k, v);
+    else for (let i = 0; i + 1 < arg.length; i += 2) put(String(arg[i]), arg[i + 1]);
+  } else if (arg && typeof arg === 'object') {
+    for (const [k, v] of Object.entries(arg as Record<string, unknown>)) put(k, v);
+  }
+  return out;
+}
+
+/** Apply a HeadPatch to writeHead's headers argument (and to headers set with setHeader). */
+function patchHeadArg(res: http.ServerResponse, arg: unknown, patch: HeadPatch): unknown {
+  const drop = new Set([...(patch.remove ?? []), ...Object.keys(patch.set ?? {})].map((n) => n.toLowerCase()));
+  for (const name of res.getHeaderNames()) if (drop.has(name.toLowerCase())) res.removeHeader(name);
+  const set = Object.entries(patch.set ?? {});
+  if (Array.isArray(arg)) {
+    if (arg.length && Array.isArray(arg[0])) {
+      const pairs = (arg as Array<[string, string]>).filter(([k]) => !drop.has(String(k).toLowerCase()));
+      return [...pairs, ...set];
+    }
+    const flat: FlatHeaders = [];
+    for (let i = 0; i + 1 < arg.length; i += 2) if (!drop.has(String(arg[i]).toLowerCase())) flat.push(arg[i], arg[i + 1]);
+    for (const [k, v] of set) flat.push(k, v);
+    return flat;
+  }
+  if (arg && typeof arg === 'object') {
+    const obj: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(arg as Record<string, unknown>)) if (!drop.has(k.toLowerCase())) obj[k] = v;
+    for (const [k, v] of set) obj[k] = v;
+    return obj;
+  }
+  for (const [k, v] of set) res.setHeader(k, v);
+  return arg;
 }
 
 export function captured(c: Capture): Buffer {
@@ -122,6 +189,48 @@ function attach(id: string, req: http.IncomingMessage, raw: http.ServerResponse,
     return reqEmit.call(this, event, ...a);
   } as typeof req.emit;
 
+  const addRes = (chunk: unknown, enc?: unknown) => {
+    const buf = add(tap.res, chunk, enc);
+    if (buf?.length && tap.onResponseData) {
+      try {
+        tap.onResponseData(buf);
+      } catch {
+        /* recording must never break the response */
+      }
+    }
+  };
+  const writeHead = tracked.writeHead;
+  let headSeen = false;
+  tracked.writeHead = function (this: http.ServerResponse, ...a: unknown[]) {
+    let flush = false;
+    if (!headSeen && tap.onResponseHead) {
+      headSeen = true;
+      try {
+        // writeHead(status, [statusMessage], [headers])
+        const hi = typeof a[1] === 'string' ? 2 : 1;
+        const patch = tap.onResponseHead(Number(a[0]), headView(this, a[hi]));
+        if (patch) {
+          if (patch.remove?.length || (patch.set && Object.keys(patch.set).length)) {
+            const patched = patchHeadArg(this, a[hi], patch);
+            if (a.length > hi || patched !== undefined) a[hi] = patched;
+          }
+          flush = !!patch.flush;
+        }
+      } catch {
+        /* never break the response */
+      }
+    }
+    const r = (writeHead as (...x: unknown[]) => unknown).apply(this, a);
+    if (flush) {
+      try {
+        this.flushHeaders();
+      } catch {
+        /* ignore */
+      }
+    }
+    return r;
+  } as typeof tracked.writeHead;
+
   const write = tracked.write;
   const end = tracked.end;
   let shaper: ResponseShaper | undefined;
@@ -132,7 +241,7 @@ function attach(id: string, req: http.IncomingMessage, raw: http.ServerResponse,
       tap.shaping,
       write as unknown as (chunk: Buffer) => boolean,
       end as unknown as (cb?: () => void) => unknown,
-      (buf) => add(tap.res, buf),
+      (buf) => addRes(buf),
     );
     return shaper;
   };
@@ -143,7 +252,7 @@ function attach(id: string, req: http.IncomingMessage, raw: http.ServerResponse,
       const callback = typeof enc === 'function' ? enc : cb;
       return sh.write(buf ?? Buffer.alloc(0), callback as ((e?: Error | null) => void) | undefined);
     }
-    add(tap.res, chunk, enc);
+    addRes(chunk, enc);
     return (write as (...x: unknown[]) => boolean).call(this, chunk, enc, cb);
   } as typeof tracked.write;
   tracked.end = function (this: unknown, chunk?: unknown, enc?: unknown, cb?: unknown) {
@@ -153,7 +262,7 @@ function attach(id: string, req: http.IncomingMessage, raw: http.ServerResponse,
       sh.end(typeof chunk === 'function' ? undefined : toBuffer(chunk, enc), callback);
       return this;
     }
-    add(tap.res, chunk, enc);
+    if (typeof chunk !== 'function') addRes(chunk, enc);
     return (end as (...x: unknown[]) => unknown).call(this, chunk, enc, cb);
   } as typeof tracked.end;
 

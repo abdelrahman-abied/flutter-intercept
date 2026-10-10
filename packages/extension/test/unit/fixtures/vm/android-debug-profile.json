@@ -1,0 +1,1142 @@
+{
+ "type": "HttpProfile",
+ "timestamp": 1791614851926707,
+ "requests": [
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-299097062",
+   "isolateId": "isolates/1894847211511335",
+   "method": "GET",
+   "uri": "https://jsonplaceholder.typicode.com/users/1",
+   "events": [
+    {
+     "timestamp": 1791614850661595,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791614850661660,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791614850661677,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791614850951543,
+     "event": "Waiting (TTFB)"
+    },
+    {
+     "timestamp": 1791614850952188,
+     "event": "Content Download"
+    }
+   ],
+   "startTime": 1791614850622978,
+   "endTime": 1791614850662712,
+   "request": {
+    "proxyDetails": {
+     "host": "10.0.2.2",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "x-fi-id": [
+      "4bb49e9d16969b00-6"
+     ],
+     "host": [
+      "jsonplaceholder.typicode.com"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "GET",
+    "persistentConnection": true,
+    "uri": "https://jsonplaceholder.typicode.com/users/1",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791614850951588,
+    "headers": {
+     "date": [
+      "Sat, 10 Oct 2026 06:47:31 GMT"
+     ],
+     "content-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "329"
+     ],
+     "cache-control": [
+      "max-age=43200"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ]
+    },
+    "compressionState": "HttpClientResponseCompressionState.decompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 329,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "OK",
+    "redirects": [],
+    "statusCode": 200,
+    "endTime": 1791614850952181
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-299097061",
+   "isolateId": "isolates/1894847211511335",
+   "method": "POST",
+   "uri": "https://jsonplaceholder.typicode.com/posts",
+   "events": [
+    {
+     "timestamp": 1791614850663036,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791614850663161,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791614850663176,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791614851034659,
+     "event": "Waiting (TTFB)"
+    },
+    {
+     "timestamp": 1791614851035991,
+     "event": "Content Download"
+    }
+   ],
+   "startTime": 1791614850626837,
+   "endTime": 1791614850665533,
+   "request": {
+    "proxyDetails": {
+     "host": "10.0.2.2",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "content-type": [
+      "application/json"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "47"
+     ],
+     "x-fi-id": [
+      "4bb49e9d16969b00-7"
+     ],
+     "host": [
+      "jsonplaceholder.typicode.com"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 47,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "POST",
+    "persistentConnection": true,
+    "uri": "https://jsonplaceholder.typicode.com/posts",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791614851034718,
+    "headers": {
+     "date": [
+      "Sat, 10 Oct 2026 06:47:31 GMT"
+     ],
+     "location": [
+      "https://jsonplaceholder.typicode.com/posts/101"
+     ],
+     "content-length": [
+      "73"
+     ],
+     "cache-control": [
+      "no-cache"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ]
+    },
+    "compressionState": "HttpClientResponseCompressionState.notCompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 73,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "Created",
+    "redirects": [],
+    "statusCode": 201,
+    "endTime": 1791614851035980
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-299097060",
+   "isolateId": "isolates/1894847211511335",
+   "method": "GET",
+   "uri": "https://jsonplaceholder.typicode.com/users/2",
+   "events": [
+    {
+     "timestamp": 1791614850668626,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791614850668685,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791614850668704,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791614850929385,
+     "event": "Waiting (TTFB)"
+    },
+    {
+     "timestamp": 1791614850936688,
+     "event": "Content Download"
+    }
+   ],
+   "startTime": 1791614850627569,
+   "endTime": 1791614850668867,
+   "request": {
+    "proxyDetails": {
+     "host": "10.0.2.2",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "x-fi-id": [
+      "4bb49e9d16969b00-8"
+     ],
+     "host": [
+      "jsonplaceholder.typicode.com"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "GET",
+    "persistentConnection": true,
+    "uri": "https://jsonplaceholder.typicode.com/users/2",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791614850929420,
+    "headers": {
+     "date": [
+      "Sat, 10 Oct 2026 06:47:31 GMT"
+     ],
+     "content-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "325"
+     ],
+     "cache-control": [
+      "max-age=43200"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ]
+    },
+    "compressionState": "HttpClientResponseCompressionState.decompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 325,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "OK",
+    "redirects": [],
+    "statusCode": 200,
+    "endTime": 1791614850936675
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-299097059",
+   "isolateId": "isolates/1894847211511335",
+   "method": "GET",
+   "uri": "https://jsonplaceholder.typicode.com/users/3",
+   "events": [
+    {
+     "timestamp": 1791614850669354,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791614850669420,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791614850669446,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791614851001832,
+     "event": "Waiting (TTFB)"
+    },
+    {
+     "timestamp": 1791614851003052,
+     "event": "Content Download"
+    }
+   ],
+   "startTime": 1791614850629476,
+   "endTime": 1791614850669593,
+   "request": {
+    "proxyDetails": {
+     "host": "10.0.2.2",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "x-fi-id": [
+      "4bb49e9d16969b00-9"
+     ],
+     "host": [
+      "jsonplaceholder.typicode.com"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "GET",
+    "persistentConnection": true,
+    "uri": "https://jsonplaceholder.typicode.com/users/3",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791614851001888,
+    "headers": {
+     "date": [
+      "Sat, 10 Oct 2026 06:47:31 GMT"
+     ],
+     "content-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "328"
+     ],
+     "cache-control": [
+      "max-age=43200"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ]
+    },
+    "compressionState": "HttpClientResponseCompressionState.decompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 328,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "OK",
+    "redirects": [],
+    "statusCode": 200,
+    "endTime": 1791614851003042
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-299097049",
+   "isolateId": "isolates/1894847211511335",
+   "method": "GET",
+   "uri": "https://jsonplaceholder.typicode.com/albums/1",
+   "events": [
+    {
+     "timestamp": 1791614850676259,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791614850676315,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791614850676329,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791614850943972,
+     "event": "Waiting (TTFB)"
+    },
+    {
+     "timestamp": 1791614850945010,
+     "event": "Content Download"
+    }
+   ],
+   "startTime": 1791614850652825,
+   "endTime": 1791614850676502,
+   "request": {
+    "proxyDetails": {
+     "host": "10.0.2.2",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "x-demo-client": [
+      "demo_app"
+     ],
+     "x-fi-id": [
+      "4bb49e9d16969b00-a"
+     ],
+     "host": [
+      "jsonplaceholder.typicode.com"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "GET",
+    "persistentConnection": true,
+    "uri": "https://jsonplaceholder.typicode.com/albums/1",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791614850944015,
+    "headers": {
+     "date": [
+      "Sat, 10 Oct 2026 06:47:31 GMT"
+     ],
+     "content-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "72"
+     ],
+     "cache-control": [
+      "max-age=43200"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ]
+    },
+    "compressionState": "HttpClientResponseCompressionState.decompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 72,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "OK",
+    "redirects": [],
+    "statusCode": 200,
+    "endTime": 1791614850945001
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-299097027",
+   "isolateId": "isolates/1894847211511335",
+   "method": "POST",
+   "uri": "https://trace.flutter-intercept.invalid/v1/traces",
+   "events": [
+    {
+     "timestamp": 1791614850917711,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791614850917751,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791614850917771,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791614850925756,
+     "event": "Waiting (TTFB)"
+    },
+    {
+     "timestamp": 1791614850925851,
+     "event": "Content Download"
+    }
+   ],
+   "startTime": 1791614850725237,
+   "endTime": 1791614850918444,
+   "request": {
+    "proxyDetails": {
+     "host": "10.0.2.2",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "6344"
+     ],
+     "host": [
+      "trace.flutter-intercept.invalid"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 6344,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "POST",
+    "persistentConnection": true,
+    "uri": "https://trace.flutter-intercept.invalid/v1/traces",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791614850925789,
+    "headers": {
+     "content-type": [
+      "text/plain; charset=utf-8"
+     ],
+     "content-length": [
+      "0"
+     ]
+    },
+    "compressionState": "HttpClientResponseCompressionState.notCompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "No Content",
+    "redirects": [],
+    "statusCode": 204,
+    "endTime": 1791614850925846
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-299097026",
+   "isolateId": "isolates/1894847211511335",
+   "method": "CONNECT",
+   "uri": "//trace.flutter-intercept.invalid:443",
+   "events": [
+    {
+     "timestamp": 1791614850729886,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791614850899851,
+     "event": "Waiting (TTFB)"
+    }
+   ],
+   "startTime": 1791614850729852,
+   "endTime": 1791614850730093,
+   "request": {
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "host": [
+      "trace.flutter-intercept.invalid:443"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "CONNECT",
+    "persistentConnection": true,
+    "uri": "//trace.flutter-intercept.invalid:443",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791614850899891,
+    "headers": {},
+    "compressionState": "HttpClientResponseCompressionState.notCompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": -1,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "Connection established",
+    "redirects": [],
+    "statusCode": 200
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-299096999",
+   "isolateId": "isolates/1894847211511335",
+   "method": "GET",
+   "uri": "https://echo.websocket.org:0",
+   "events": [
+    {
+     "timestamp": 1791614851452770,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791614851452845,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791614851452856,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791614851733111,
+     "event": "Waiting (TTFB)"
+    }
+   ],
+   "startTime": 1791614851369101,
+   "endTime": 1791614851453720,
+   "request": {
+    "proxyDetails": {
+     "host": "10.0.2.2",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "cache-control": [
+      "no-cache"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "x-fi-id": [
+      "4bb49e9d16969b00-b"
+     ],
+     "host": [
+      "echo.websocket.org"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "GET",
+    "persistentConnection": true,
+    "uri": "https://echo.websocket.org:0",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791614851733153,
+    "headers": {
+     "date": [
+      "Sat, 10 Oct 2026 06:47:31 GMT"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "content-type": [
+      "text/plain; charset=utf-8"
+     ]
+    },
+    "compressionState": "HttpClientResponseCompressionState.notCompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "Switching Protocols",
+    "redirects": [],
+    "statusCode": 101,
+    "endTime": 1791614851733704,
+    "error": "Socket has been detached"
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-299096998",
+   "isolateId": "isolates/1894847211511335",
+   "method": "GET",
+   "uri": "https://echo.websocket.org/.sse",
+   "events": [
+    {
+     "timestamp": 1791614851455284,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791614851455326,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791614851455338,
+     "event": "Request sent"
+    }
+   ],
+   "startTime": 1791614851370174,
+   "endTime": 1791614851455649,
+   "request": {
+    "proxyDetails": {
+     "host": "10.0.2.2",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "accept": [
+      "text/event-stream"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "0"
+     ],
+     "x-fi-id": [
+      "4bb49e9d16969b00-c"
+     ],
+     "host": [
+      "echo.websocket.org"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "GET",
+    "persistentConnection": true,
+    "uri": "https://echo.websocket.org/.sse",
+    "filterKey": "HTTP/client"
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-299096997",
+   "isolateId": "isolates/1894847211511335",
+   "method": "POST",
+   "uri": "https://countries.trevorblades.com/graphql",
+   "events": [
+    {
+     "timestamp": 1791614851456176,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791614851456240,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791614851456252,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791614851740780,
+     "event": "Waiting (TTFB)"
+    },
+    {
+     "timestamp": 1791614851741401,
+     "event": "Content Download"
+    }
+   ],
+   "startTime": 1791614851370638,
+   "endTime": 1791614851456438,
+   "request": {
+    "proxyDetails": {
+     "host": "10.0.2.2",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "content-type": [
+      "application/json"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "152"
+     ],
+     "x-fi-id": [
+      "4bb49e9d16969b00-d"
+     ],
+     "host": [
+      "countries.trevorblades.com"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 152,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "POST",
+    "persistentConnection": true,
+    "uri": "https://countries.trevorblades.com/graphql",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791614851740814,
+    "headers": {
+     "date": [
+      "Sat, 10 Oct 2026 06:46:57 GMT"
+     ],
+     "content-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "87"
+     ],
+     "cache-control": [
+      "public, s-maxage=2628000, stale-while-revalidate=2628000"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ]
+    },
+    "compressionState": "HttpClientResponseCompressionState.decompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 87,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "OK",
+    "redirects": [],
+    "statusCode": 200,
+    "endTime": 1791614851741392
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "-299096990",
+   "isolateId": "isolates/1894847211511335",
+   "method": "POST",
+   "uri": "https://trace.flutter-intercept.invalid/v1/traces",
+   "events": [
+    {
+     "timestamp": 1791614851481372,
+     "event": "Proxy tunnel established"
+    },
+    {
+     "timestamp": 1791614851481399,
+     "event": "Connection established"
+    },
+    {
+     "timestamp": 1791614851481410,
+     "event": "Request sent"
+    },
+    {
+     "timestamp": 1791614851484491,
+     "event": "Waiting (TTFB)"
+    },
+    {
+     "timestamp": 1791614851484574,
+     "event": "Content Download"
+    }
+   ],
+   "startTime": 1791614851470789,
+   "endTime": 1791614851482004,
+   "request": {
+    "proxyDetails": {
+     "host": "10.0.2.2",
+     "port": 8931
+    },
+    "headers": {
+     "user-agent": [
+      "Dart/3.13 (dart:io)"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ],
+     "accept-encoding": [
+      "gzip"
+     ],
+     "content-length": [
+      "2017"
+     ],
+     "host": [
+      "trace.flutter-intercept.invalid"
+     ]
+    },
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 2017,
+    "cookies": [],
+    "followRedirects": true,
+    "maxRedirects": 5,
+    "method": "POST",
+    "persistentConnection": true,
+    "uri": "https://trace.flutter-intercept.invalid/v1/traces",
+    "filterKey": "HTTP/client"
+   },
+   "response": {
+    "startTime": 1791614851484512,
+    "headers": {
+     "content-type": [
+      "text/plain; charset=utf-8"
+     ],
+     "content-length": [
+      "0"
+     ]
+    },
+    "compressionState": "HttpClientResponseCompressionState.notCompressed",
+    "connectionInfo": {
+     "localPort": 50000,
+     "remoteAddress": "127.0.0.1",
+     "remotePort": 8931
+    },
+    "contentLength": 0,
+    "cookies": [],
+    "isRedirect": false,
+    "persistentConnection": true,
+    "reasonPhrase": "No Content",
+    "redirects": [],
+    "statusCode": 204,
+    "endTime": 1791614851484569
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "from_package/1",
+   "isolateId": "isolates/1894847211511335",
+   "method": "GET",
+   "uri": "https://jsonplaceholder.typicode.com/posts/1",
+   "events": [],
+   "startTime": 1791614851419113,
+   "endTime": 1791614851724330,
+   "request": {
+    "connectionInfo": {
+     "package": "package:cronet_http",
+     "client": "CronetHttp"
+    },
+    "contentLength": 0,
+    "followRedirects": true,
+    "headers": {
+     "Content-Length": [
+      "0"
+     ],
+     "x-demo-client": [
+      "cronet_http"
+     ]
+    },
+    "maxRedirects": 5
+   },
+   "response": {
+    "redirects": [],
+    "connectionInfo": {
+     "package": "package:cronet_http",
+     "client": "CronetHttp"
+    },
+    "headers": {
+     "cache-control": [
+      "max-age=43200"
+     ],
+     "content-encoding": [
+      "gzip"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ],
+     "date": [
+      "Sat",
+      "10 Oct 2026 06:47:31 GMT"
+     ]
+    },
+    "isRedirect": false,
+    "reasonPhrase": "",
+    "startTime": 1791614851721926,
+    "statusCode": 200,
+    "endTime": 1791614851729072
+   }
+  },
+  {
+   "type": "@HttpProfileRequest",
+   "id": "from_package/2",
+   "isolateId": "isolates/1894847211511335",
+   "method": "POST",
+   "uri": "https://jsonplaceholder.typicode.com/posts",
+   "events": [],
+   "startTime": 1791614851421326,
+   "endTime": 1791614851796258,
+   "request": {
+    "connectionInfo": {
+     "package": "package:cronet_http",
+     "client": "CronetHttp"
+    },
+    "contentLength": 55,
+    "followRedirects": true,
+    "headers": {
+     "Content-Length": [
+      "55"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ],
+     "x-demo-client": [
+      "cronet_http"
+     ]
+    },
+    "maxRedirects": 5
+   },
+   "response": {
+    "redirects": [],
+    "connectionInfo": {
+     "package": "package:cronet_http",
+     "client": "CronetHttp"
+    },
+    "contentLength": 81,
+    "headers": {
+     "cache-control": [
+      "no-cache"
+     ],
+     "content-length": [
+      "81"
+     ],
+     "content-type": [
+      "application/json; charset=utf-8"
+     ],
+     "date": [
+      "Sat",
+      "10 Oct 2026 06:47:32 GMT"
+     ],
+     "location": [
+      "https://jsonplaceholder.typicode.com/posts/101"
+     ]
+    },
+    "isRedirect": false,
+    "reasonPhrase": "",
+    "startTime": 1791614851796069,
+    "statusCode": 201,
+    "endTime": 1791614851798091
+   }
+  }
+ ]
+}

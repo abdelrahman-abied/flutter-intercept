@@ -3,7 +3,7 @@ import { ReverseTracker, withSoftTimeout } from '../adb';
 import { writeEntry } from '../entry/generator';
 import type { LanOpening, ProxyHost } from '../proxyHost';
 import { LanDeps, prepareLan } from './lanPrepare';
-import { DebugConfig, rewriteDebugConfig, RewriteResult } from './rewrite';
+import { DebugConfig, isWebDevice, MARKER_KEY, ORIGINAL_PROGRAM_KEY, rewriteDebugConfig, RewriteResult } from './rewrite';
 
 export interface InterceptEvent {
   time: number;
@@ -28,11 +28,21 @@ export interface PrepareDeps {
   reverses: ReverseTracker;
   /** LAN mode (CONTRACTS §7). All optional: without them physical iOS is not special-cased. */
   lan?: LanDeps;
+  /**
+   * A Flutter Web launch on the `web-server` device was not intercepted (CONTRACTS §11.3): `message` says why.
+   * Called on every such launch; the host shows it once.
+   */
+  webServerSkipped?: (message: string) => void;
+  /**
+   * A Flutter Web launch on the user's own browser profile (`--user-data-dir`) was not intercepted (REVIEW-5 #10).
+   * Called on every such launch; the host shows it once. Falls back to `webServerSkipped` when absent.
+   */
+  webUserProfileSkipped?: (message: string) => void;
 }
 
-export function readSettings(folder?: vscode.WorkspaceFolder): { enabled: boolean; port: number } {
+export function readSettings(folder?: vscode.WorkspaceFolder): { enabled: boolean; port: number; webEnabled: boolean } {
   const c = vscode.workspace.getConfiguration('flutterIntercept', folder?.uri);
-  return { enabled: c.get<boolean>('enabled', true), port: c.get<number>('port', 8899) };
+  return { enabled: c.get<boolean>('enabled', true), port: c.get<number>('port', 8899), webEnabled: c.get<boolean>('web.enabled', true) };
 }
 
 /**
@@ -60,7 +70,7 @@ function dartSettingsToolArgs(folder: vscode.WorkspaceFolder | undefined): strin
 function rewriteFor(
   folder: vscode.WorkspaceFolder | undefined,
   config: DebugConfig,
-  enabled: boolean,
+  settings: { enabled: boolean; webEnabled: boolean },
   port: number,
   selected: string | undefined,
   caCertPem: string,
@@ -68,7 +78,8 @@ function rewriteFor(
 ): RewriteResult {
   const active = vscode.window.activeTextEditor?.document.uri;
   return rewriteDebugConfig(config, {
-    enabled,
+    enabled: settings.enabled,
+    webEnabled: settings.webEnabled,
     caCertPem,
     proxyPort: port,
     selectedDeviceId: selected,
@@ -94,21 +105,22 @@ export async function prepareLaunch(
 ): Promise<vscode.DebugConfiguration> {
   const dartCodeRanFirst = typeof config.debuggerType === 'number' && config.toolEnv !== undefined;
   try {
-    const { enabled, port: configuredPort } = readSettings(folder);
+    const settings = readSettings(folder);
     // First pass decides whether this launch is intercepted (no CA yet: nothing is written from it).
-    let result = rewriteFor(folder, config, enabled, configuredPort, undefined, '');
-    if (result.kind === 'rewrite') {
+    let result = rewriteFor(folder, config, settings, settings.port, undefined, '');
+    if (result.kind === 'rewrite' || (result.kind === 'skip' && result.needsCa)) {
       const port = await deps.proxyHost.start();
       const caCertPem = await deps.getCaCertPem();
       // Before Dart-Code (no deviceId yet) the host depends on the device Dart-Code will pick.
-      const selected = result.debuggerType === 'Flutter' && typeof config.deviceId !== 'string' ? await selectedDeviceId() : undefined;
+      const flutter = result.kind === 'rewrite' && result.debuggerType === 'Flutter';
+      const selected = flutter && typeof config.deviceId !== 'string' ? await selectedDeviceId() : undefined;
       // Physical iOS (CONTRACTS §7): LAN listener + token, or no interception when there is no LAN.
       let lanInfo: Awaited<ReturnType<typeof prepareLan>> = { physicalIos: false };
-      if (result.debuggerType === 'Flutter') {
+      if (flutter && !isWebDevice(selected)) {
         const sdkHint = typeof config.flutterSdkPath === 'string' ? config.flutterSdkPath : vscode.workspace.getConfiguration('dart', folder?.uri).get<string>('flutterSdkPath');
         lanInfo = await prepareLan(deps.lan, typeof config.deviceId === 'string' ? config.deviceId : selected, deps.log, sdkHint || undefined);
       }
-      result = rewriteFor(folder, config, enabled, port, selected, caCertPem, lanInfo);
+      result = rewriteFor(folder, config, settings, port, selected, caCertPem, lanInfo);
       if ((result.kind === 'skip' && result.noLan) || (result.kind === 'restore' && lanInfo.physicalIos && !lanInfo.lan)) {
         const message = `Flutter Intercept: ${lanInfo.problem ?? result.reason}, so this iPhone session runs without interception.`;
         deps.log(message);
@@ -125,6 +137,17 @@ export async function prepareLaunch(
     if (result.kind === 'skip') {
       deps.events.push({ time: Date.now(), hook, result: 'skip', reason: result.reason, program: config.program, dartCodeRanFirst });
       deps.log(`[${hook}] not intercepting: ${result.reason}`);
+      if (result.webServer) deps.webServerSkipped?.(`Flutter Intercept: ${result.reason}.`);
+      if (result.webUserProfile) (deps.webUserProfileSkipped ?? deps.webServerSkipped)?.(`Flutter Intercept: ${result.reason}.`);
+      return config;
+    }
+    if (result.kind === 'web') {
+      // CONTRACTS §11.3: the program is not rewritten; Chrome/Edge get our proxy + CA pin as browser flags.
+      deps.log(`[${hook}] mode=${result.mode} Flutter Web device=${result.deviceId} program ${result.config[ORIGINAL_PROGRAM_KEY]} (unchanged), browser proxy ${result.proxyHost}:${result.config[MARKER_KEY]}`);
+      deps.events.push({ time: Date.now(), hook, result: 'rewrite', mode: 'web', program: result.config.program, originalProgram: result.config[ORIGINAL_PROGRAM_KEY], dartCodeRanFirst });
+      // Replace, not merge: the result may have dropped keys (an earlier entry rewrite, LAN marker).
+      for (const k of Object.keys(config)) if (!(k in result.config)) delete config[k];
+      Object.assign(config, result.config);
       return config;
     }
     if (result.kind !== 'rewrite') return config;

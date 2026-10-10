@@ -4,8 +4,8 @@ import type { Host } from '../host';
 import type { HostMsg, Status } from '../protocol';
 import { agentLine } from '../util';
 import {
-  filterExchanges, findExchange, hasActiveFilters, initialState, isProfileActive, pausedCount, profileLabel, reducer,
-  toPersisted, type Persisted, type State,
+  filterExchanges, findExchange, hasActiveFilters, hiddenBrowserCount, initialState, isProfileActive, pausedCount, profileLabel, reducer,
+  toPersisted, visibleWarnings, type Persisted, type State,
 } from '../state';
 import { Button, useNow } from './bits';
 import { DetailPane } from './DetailPane';
@@ -51,14 +51,14 @@ export function App({ host }: { host: Host }) {
     return () => { off(); if (timer !== undefined) clearTimeout(timer); };
   }, [host]);
 
-  const { filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId, composer } = state;
+  const { filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId, composer, dismissedWarnings } = state;
   // Debounced: drafts can hold multi-MB bodies and change on every keystroke.
   useEffect(() => {
     const t = setTimeout(() => {
       try { host.setState(toPersisted(state)); } catch { /* state too large etc. — non-critical */ }
     }, PERSIST_MS);
     return () => clearTimeout(t);
-  }, [filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId, composer]);
+  }, [filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId, composer, dismissedWarnings]);
 
   const ctx = useMemo(() => ({ state, dispatch, post: host.post }), [state, host]);
 
@@ -68,6 +68,7 @@ export function App({ host }: { host: Host }) {
         <Toolbar />
         <HostErrorBar />
         <NoticeBar />
+        <WarningsBar />
         <main class="content">
           {state.view === 'traffic' ? <TrafficView /> : <RulesView />}
         </main>
@@ -115,10 +116,7 @@ function TrafficView() {
         {list.length ? (
           <TrafficList list={list} onOpen={() => detailRef.current?.focus()} />
         ) : (
-          <div class="empty small">
-            <p>No exchanges match the filters.</p>
-            <Button onClick={() => dispatch({ type: 'clearFilters' })}>Clear filters</Button>
-          </div>
+          <EmptyList />
         )}
       </div>
       {(selected || composing) && (
@@ -133,6 +131,22 @@ function TrafficView() {
           {composing ? <Composer /> : <DetailPane ex={selected!} paneRef={detailRef} />}
         </>
       )}
+    </div>
+  );
+}
+
+function EmptyList() {
+  const { state, dispatch } = useApp();
+  const hidden = hiddenBrowserCount(state.exchanges, state.filters);
+  const filtered = hasActiveFilters(state.filters);
+  return (
+    <div class="empty small">
+      <p>
+        {filtered ? 'No exchanges match the filters.' : 'Only browser traffic so far.'}
+        {hidden > 0 && ` ${hidden} browser-internal exchange${hidden === 1 ? ' is' : 's are'} hidden.`}
+      </p>
+      {filtered && <Button onClick={() => dispatch({ type: 'clearFilters' })}>Clear filters</Button>}
+      {hidden > 0 && <Button onClick={() => dispatch({ type: 'setFilters', patch: { showBrowser: true } })}>Show browser traffic</Button>}
     </div>
   );
 }
@@ -175,7 +189,7 @@ function StatusLine() {
       <span>Intercept {status.interceptEnabled ? 'on' : 'off'}</span>
       <span>
         {exchanges.length} exchange{exchanges.length === 1 ? '' : 's'}
-        {hasActiveFilters(filters) ? ` (${shown} shown)` : ''}
+        {hasActiveFilters(filters) || shown !== exchanges.length ? ` (${shown} shown)` : ''}
       </span>
       {paused > 0 && <span class="warn-text">{paused} paused</span>}
       {isProfileActive(status.networkProfile) && (
@@ -220,6 +234,31 @@ function NoticeBar() {
       )}
       <span class="spacer" />
       <Button kind="icon" title="Dismiss" onClick={() => dispatch({ type: 'notice' })}><Icon name="close" /></Button>
+    </div>
+  );
+}
+
+const WARNING_TITLE: Record<string, string> = {
+  'background-isolate': 'HttpOverrides is set per isolate: requests made from a background isolate (compute(), Isolate.run, a worker) bypass the proxy.',
+  'native-client': 'Native HTTP clients (cupertino_http, cronet_http, ok_http) don\'t use dart:io, so they bypass the proxy. Their requests are shown from the app\'s HTTP profile, read-only.',
+  'web': 'Flutter Web: the browser talks to the proxy directly.',
+};
+
+/** CONTRACTS §11: session warnings (background isolates, native clients, web), dismissable per id. */
+function WarningsBar() {
+  const { state, dispatch } = useApp();
+  const list = visibleWarnings(state);
+  if (!list.length) return null;
+  return (
+    <div class="warnings" role="status" aria-label="Session warnings">
+      {list.map((w) => (
+        <div key={w.id} class={`warning-banner wk-${w.kind}`} title={WARNING_TITLE[w.kind]}>
+          <span class="warning-icon" aria-hidden="true">⚠</span>
+          <span class="warning-text">{w.text}</span>
+          <span class="spacer" />
+          <Button kind="icon" title="Dismiss this warning" onClick={() => dispatch({ type: 'dismissWarning', id: w.id })}><Icon name="close" /></Button>
+        </div>
+      ))}
     </div>
   );
 }

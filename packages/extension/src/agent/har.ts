@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Body, Exchange } from '@flutter-intercept/proxy';
-import { Headers, redactBodyText, redactHeaders, redactUrl } from './redact';
+import { Headers, redactBodyText, redactFrameText, redactHeaders, redactSecretValues, redactText, redactUrl } from './redact';
 
 export interface HarOptions {
   redact: boolean;
@@ -44,19 +44,57 @@ function bodyText(b: Body, headers: Headers | undefined, redact: boolean): strin
   return b.encoding === 'utf8' && redact ? redactBodyText(b.text, headers) : b.text;
 }
 
+/** REVIEW-5 #7: an ISO time for HAR even when `ms` is not a valid date (imported entries); epoch 0 then. */
+function isoTime(ms: number): string {
+  const d = new Date(Number.isFinite(ms) ? ms : 0);
+  return Number.isNaN(d.getTime()) ? new Date(0).toISOString() : d.toISOString();
+}
+
+const finiteOr = (v: number | undefined, fallback: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
+
+const OPCODES: Record<string, number> = { text: 1, binary: 2, close: 8, ping: 9, pong: 10 };
+
+/**
+ * CONTRACTS §11: WebSocket frames as Chrome's `_webSocketMessages`, SSE events as `_eventSourceMessages`
+ * (time in seconds, redacted like get_frames).
+ */
+function frameFields(e: Exchange, redact: boolean): Record<string, unknown> {
+  if (!e.kind || !e.frames?.length) return {};
+  const text = (t: string | undefined) => (t === undefined ? '' : redact ? redactFrameText(t) : t);
+  if (e.kind === 'websocket') {
+    return {
+      _webSocketMessages: e.frames.map((f) => ({
+        type: f.dir,
+        time: finiteOr(f.at, 0) / 1000,
+        opcode: OPCODES[f.kind] ?? 1,
+        // Redacted: binary summarised like get_frames (REVIEW-5 #17).
+        data: f.base64 !== undefined && f.text === undefined ? (redact ? `[binary ${f.size} bytes]` : f.base64) : text(f.text),
+      })),
+    };
+  }
+  return {
+    _eventSourceMessages: e.frames.map((f) => ({
+      time: finiteOr(f.at, 0) / 1000,
+      eventName: f.event ?? 'message',
+      eventId: f.id === undefined ? '' : redact ? redactSecretValues(f.id, true) : f.id,
+      data: text(f.text),
+    })),
+  };
+}
+
 export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string, unknown> {
   const r = opts.redact;
   const entries = [...exchanges]
-    .sort((a, b) => a.startedAt - b.startedAt)
+    .sort((a, b) => finiteOr(a.startedAt, 0) - finiteOr(b.startedAt, 0))
     .map((e) => {
       const url = r ? redactUrl(e.url) : e.url;
       const reqHeaders = r ? redactHeaders(e.requestHeaders) : e.requestHeaders;
       const resHeaders = r ? redactHeaders(e.responseHeaders) : e.responseHeaders;
       const reqMime = headerValue(e.requestHeaders, 'content-type') ?? 'application/octet-stream';
       const resMime = headerValue(e.responseHeaders, 'content-type') ?? '';
-      const time = e.durationMs ?? 0;
+      const time = Math.max(0, finiteOr(e.durationMs, 0));
       const entry: Record<string, unknown> = {
-        startedDateTime: new Date(e.startedAt).toISOString(),
+        startedDateTime: isoTime(e.startedAt),
         time,
         request: {
           method: e.method,
@@ -99,7 +137,11 @@ export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string
         timings: { send: 0, wait: time, receive: 0 },
         _state: e.state,
         ...(e.matchedRuleId ? { _matchedRuleId: e.matchedRuleId } : {}),
-        ...(e.error ? { _error: e.error } : {}),
+        ...(e.error ? { _error: r ? redactText(e.error) : e.error } : {}),
+        ...(e.framesDropped ? { _framesDropped: e.framesDropped } : {}),
+        ...(e.graphql ? { _graphql: { ...e.graphql } } : {}),
+        ...(e.captured ? { _captured: e.captured } : {}),
+        ...frameFields(e, r),
       };
       return entry;
     });

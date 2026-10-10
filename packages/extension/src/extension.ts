@@ -15,7 +15,7 @@ import { languageModelToolsContribution, toolDescriptions, toolSchemas } from '.
 import type { AgentAccess } from './agent/types';
 import { CaStore } from './ca';
 import { InterceptDebugConfigurationProvider, InterceptEvent, prepareLaunch, PrepareDeps, readSettings } from './debug/provider';
-import { DebugConfig, debuggerTypeName, HOST_KEY, LAN_KEY, MARKER_KEY, ORIGINAL_PROGRAM_KEY, proxyHostFor } from './debug/rewrite';
+import { DebugConfig, debuggerTypeName, HOST_KEY, LAN_KEY, MARKER_KEY, ORIGINAL_PROGRAM_KEY, proxyHostFor, WEB_KEY } from './debug/rewrite';
 import { IosDeviceClassifier } from './iosDevices';
 import { IosUsbToolingChecker, needsRosettaWarning, resolveFlutterSdk, ROSETTA_INSTALL_COMMAND, rosettaWarningText } from './iosUsbTooling';
 import { lanAddressForIphone } from './lanAddress';
@@ -26,6 +26,7 @@ import { createCodegenService } from './codegen/service';
 import type { GeneratedFile } from './codegen/types';
 import { createContractService, DONT_CHECK } from './contract/service';
 import { openFrame } from './source/open';
+import { createVmWatcher } from './vm';
 import { checkSourcePath, packageRootsFor, resolveFrames } from './source/resolve';
 import { InterceptController, validateRules } from './ui/controller';
 import { TrafficViewProvider, VIEW_ID } from './ui/view';
@@ -73,6 +74,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   const events: InterceptEvent[] = [];
   const reverses = new ReverseTracker({ log });
   const intercepted = new Set<string>(); // ids of live debug sessions running our entry
+  const webSessions = new Set<string>(); // the Flutter Web ones among them (CONTRACTS §11.3)
   // Per-install CA (key file 0600 in global storage), created on the first intercepted launch.
   const ca = new CaStore(context.globalStorageUri.fsPath, { log });
   const proxyHost: InterceptProxyHost = new InterceptProxyHost({
@@ -141,9 +143,23 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   }
   proxyHost.setRules(saved);
   deactivateHooks = [() => proxyHost.stop()];
+  let webServerNoticeShown = false;
+  let webProfileNoticeShown = false;
   const deps: PrepareDeps = {
     proxyHost,
     log,
+    webServerSkipped: (message) => {
+      log(message);
+      if (webServerNoticeShown) return;
+      webServerNoticeShown = true;
+      void vscode.window.showInformationMessage(message);
+    },
+    webUserProfileSkipped: (message) => {
+      log(message);
+      if (webProfileNoticeShown) return;
+      webProfileNoticeShown = true;
+      void vscode.window.showInformationMessage(message);
+    },
     events,
     reverses,
     getCaCertPem: async () => (await ca.get()).cert,
@@ -179,6 +195,14 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   const contract = createContractService({ workspaceState: context.workspaceState, log });
   context.subscriptions.push(contract);
   const codegen = createCodegenService();
+  // CONTRACTS §11.4: background-isolate warnings and read-only native-client traffic from the app's HTTP profile.
+  const vm = createVmWatcher({
+    ...proxyHost.vmHostDeps(log),
+    nativeClients: () => (vscode.workspace.getConfiguration('flutterIntercept').get<string>('nativeClients', 'profile') === 'off' ? 'off' : 'profile'),
+    // dart:io entries whose proxyDetails name this proxy already are in the list.
+    isOurProxy: (_host, port) => port === proxyHost.port || port === proxyHost.lan?.port,
+  });
+  context.subscriptions.push(vm);
   const contractCheckEnabled = () => vscode.workspace.getConfiguration('flutterIntercept').get<boolean>('contractCheck', true);
 
   const controller = new InterceptController({
@@ -383,6 +407,15 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
         revealed = true;
         void Promise.resolve(view.reveal(true)).catch((e) => log(`reveal failed: ${String(e)}`));
       }
+      // Flutter Web (CONTRACTS §11.3): Chrome is pointed at the proxy by flags; no adb reverse, LAN or DIRECT fallback.
+      if (conf[WEB_KEY] === true) {
+        log(`web session started: ${session.name} deviceId=${String(conf.deviceId ?? '-')}`);
+        webSessions.add(session.id);
+        proxyHost.setWebSessionActive(true); // tags the browser's own traffic (CONTRACTS §11.3)
+        return;
+      }
+      // CONTRACTS §11.4 (dart:io sessions only): isolate warnings + native-client traffic from the HTTP profile.
+      void vm.attach({ sessionId: session.id }).catch((e: unknown) => log(`vm attach failed: ${String(e)}`));
       if (debuggerTypeName(conf.debuggerType) !== 'Flutter') return; // host VM program: nothing to reverse
       const port = typeof conf[MARKER_KEY] === 'number' ? conf[MARKER_KEY] : readSettings(session.workspaceFolder).port;
       const deviceId = typeof conf.deviceId === 'string' ? conf.deviceId : undefined;
@@ -416,6 +449,9 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     }),
     vscode.debug.onDidTerminateDebugSession((session) => {
       lanLife.ended(session.id); // also on crash / app killed: closes the LAN listener after the last iPhone session
+      if (webSessions.delete(session.id) && webSessions.size === 0) proxyHost.setWebSessionActive(false);
+      vm.detach(session.id);
+      proxyHost.setWarnings(session.id, []);
       if (!intercepted.delete(session.id)) return;
       controller.setSessions(intercepted.size);
       if (intercepted.size === 0 && reverses.size > 0) {

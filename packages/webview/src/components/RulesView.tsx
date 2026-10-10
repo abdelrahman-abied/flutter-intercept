@@ -2,8 +2,9 @@ import { useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Rule } from '../protocol';
 import type { FaultKind } from '@flutter-intercept/proxy/types';
+import { CORS_DEV_NOTE } from '../coverage';
 import {
-  countMatches, deleteRule, describeAction, FAULT_LABEL, formToRule, isAgentRule, moveRule, NEW_RULE, ruleBudget, ruleDisplayName,
+  compileExchangeMatcher, countMatches, deleteRule, describeAction, FAULT_LABEL, formToRule, isAgentRule, moveRule, NEW_RULE, ruleBudget, ruleDisplayName,
   ruleHits, ruleLabel, ruleStats, ruleToForm, toggleRule, upsertRule, validateRuleForm, type MutateRow, type RuleForm, type ThrottleFields,
 } from '../state';
 import { formatTime } from '../util';
@@ -83,6 +84,11 @@ export function RulesView() {
                     </div>
                     <div class="rule-sub">
                       <code>{r.match.method?.toUpperCase() ?? 'ANY'} {r.match.url}</code>
+                      {r.match.graphqlOperation && (
+                        <span class="badge mini gql-badge" title={`Only the GraphQL operation “${r.match.graphqlOperation}” (exact name)`}>
+                          op {r.match.graphqlOperation}
+                        </span>
+                      )}
                       <span> → {describeAction(r.action)}</span>
                       <span class={`rule-stat${shadowed ? ' warn' : ''}`}
                         title={shadowed ? 'An earlier enabled rule matches some of these first' : 'Matches among the exchanges currently listed'}>
@@ -139,8 +145,19 @@ export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r
   const jsonBad = form.kind === 'mock' && v.json && !v.json.ok ? v.json : undefined;
   const preview = useMemo(() => {
     if (v.errors.url) return undefined;
-    return countMatches({ url: form.url.trim(), method: form.method.trim() || undefined }, state.exchanges);
+    return countMatches({
+      url: form.url.trim(), method: form.method.trim() || undefined, graphqlOperation: form.graphqlOperation.trim() || undefined,
+    }, state.exchanges);
+  }, [form.url, form.method, form.graphqlOperation, state.exchanges, v.errors.url]);
+  // GraphQL operations seen on the matched route: offered as suggestions, and the reason the field is shown.
+  const knownOps = useMemo(() => {
+    if (v.errors.url || !form.url.trim()) return [];
+    const test = compileExchangeMatcher({ url: form.url.trim(), method: form.method.trim() || undefined });
+    const ops = new Set<string>();
+    for (const e of state.exchanges) if (e.graphql?.operationName && test(e)) ops.add(e.graphql.operationName);
+    return [...ops].sort();
   }, [form.url, form.method, state.exchanges, v.errors.url]);
+  const showGql = !!form.graphqlOperation || knownOps.length > 0 || /graphql/i.test(form.url);
 
   const save = (force = false) => {
     if (hasErrors) return;
@@ -197,6 +214,19 @@ export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r
         {v.errors.url && form.url.trim()
           ? <div class="msg error">{v.errors.url}</div>
           : <div class="hint">{v.errors.url ? `${v.errors.url} ${v.urlHint}` : v.urlHint}</div>}
+        {showGql && (
+          <>
+            <label class="field">
+              <span>GraphQL operation <span class="muted">(optional)</span></span>
+              <input class="mono" list="fi-rule-ops" value={form.graphqlOperation} placeholder="any operation, e.g. getUser" spellcheck={false}
+                aria-invalid={!!v.errors.graphqlOperation} onInput={(e) => set({ graphqlOperation: (e.target as HTMLInputElement).value })} />
+              <datalist id="fi-rule-ops">{knownOps.map((o) => <option key={o} value={o} />)}</datalist>
+            </label>
+            {v.errors.graphqlOperation
+              ? <div class="msg error">{v.errors.graphqlOperation}</div>
+              : <div class="hint">Exact, case-sensitive operation name. The proxy reads the request body (up to 5 MB) to check it before routing.</div>}
+          </>
+        )}
         {preview !== undefined && (
           <div class="hint">Matches {preview} of the {state.exchanges.length} exchanges currently listed.</div>
         )}
@@ -211,6 +241,7 @@ export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r
           {radio('kind', 'throttle', 'Throttle')}
           {radio('kind', 'fault', 'Fault')}
           {radio('kind', 'mutate', 'Mutate JSON')}
+          {radio('kind', 'cors', 'CORS (dev only)')}
         </div>
 
         {form.kind === 'mock' && (
@@ -271,6 +302,24 @@ export function RuleEditor({ rule, onSave, onCancel }: { rule?: Rule; onSave: (r
               {throttleField('dropPct', 'Fail (%)', '0')}
             </div>
             {(['latencyMs', 'kbps', 'dropPct', 'throttle'] as const).map((k) => v.errors[k] && <div key={k} class="msg error">{v.errors[k]}</div>)}
+          </>
+        )}
+
+        {form.kind === 'cors' && (
+          <>
+            <div class="field-row">
+              <label class="field grow">
+                <span>Allow origin</span>
+                <input class="mono" value={form.corsOrigin} placeholder="e.g. http://localhost:5000 (empty = localhost origins only)" spellcheck={false}
+                  aria-invalid={!!v.errors.cors} onInput={(e) => set({ corsOrigin: (e.target as HTMLInputElement).value })} />
+              </label>
+            </div>
+            <label class="check">
+              <input type="checkbox" checked={form.corsCredentials} onChange={() => set({ corsCredentials: !form.corsCredentials })} />
+              Allow credentials (cookies) — off by default; only with a named origin
+            </label>
+            {v.errors.cors && <div class="msg error">{v.errors.cors}</div>}
+            <div class="msg warn cors-dev-note">{CORS_DEV_NOTE}</div>
           </>
         )}
 

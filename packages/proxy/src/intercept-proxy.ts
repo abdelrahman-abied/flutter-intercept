@@ -9,7 +9,9 @@ import type * as mockttp from 'mockttp';
 import { MockttpServer } from 'mockttp/dist/server/mockttp-server';
 import { generateCACertificate } from 'mockttp/dist/util/certificates';
 import { CallbackStep, PassThroughStep } from 'mockttp/dist/rules/requests/request-step-definitions';
+import { PassThroughWebSocketStep, RejectWebSocketStep } from 'mockttp/dist/rules/websockets/websocket-step-definitions';
 import { Always } from 'mockttp/dist/rules/completion-checkers';
+import { resetOrDestroy } from 'mockttp/dist/util/socket-util';
 import type { RequestMatcher } from 'mockttp/dist/rules/matchers';
 import type { CompletedBody, CompletedRequest, OngoingRequest, TlsHandshakeFailure } from 'mockttp';
 
@@ -24,11 +26,35 @@ import {
   normalizedEncoding,
   type HeaderBag,
 } from './body';
-import { compileRules, isInvalidMatcher, type CompiledRule } from './rules';
+import { compileRules, isInvalidMatcher, WEBSOCKET_ACTIONS, type CompiledRule } from './rules';
+import { detectGraphql, graphqlOperationNames } from './graphql';
+import {
+  allowedOrigin,
+  CORS_RESPONSE_HEADERS,
+  corsResponseHeaders,
+  diagnoseCors,
+  hasAllowOrigin,
+  isCorsRequest,
+  preflightMethod,
+  preflightResponseHeaders,
+  type CorsOptions,
+} from './cors';
+import {
+  closeFrame,
+  DEFAULT_MAX_FRAMES,
+  frameCost,
+  LIVE_FRAME_FLOOR,
+  MAX_FRAME_BYTES_PER_EXCHANGE,
+  payloadFrame,
+  sseFrame,
+} from './frames';
+import { SseParser, SseRecorder } from './sse';
+import { isBrowserInternal } from './browser';
+import { installWsLimit, markProxySocket, WS_MAX_MESSAGE_BYTES } from './ws-limit';
 import { boundAddressMatches, rebindIfNeeded, runWithListenHost } from './listen-host';
 import { createUpstreamPool, type UpstreamPool } from './upstream-pool';
 import { refreshRoutes } from './routes';
-import { captured, getTap, installTaps, isComplete, RESPONSE_PAUSE_LIMIT_BYTES, type Tap } from './taps';
+import { captured, getTap, installTaps, isComplete, RESPONSE_PAUSE_LIMIT_BYTES, type HeadPatch, type Tap } from './taps';
 import {
   checkLanRequest,
   LanGate,
@@ -49,6 +75,7 @@ import type {
   Body,
   Exchange,
   FaultKind,
+  Frame,
   InterceptProxyOptions,
   MutateOp,
   RequestEdit,
@@ -75,8 +102,10 @@ type Decision =
  *   The response, if forwarded, streams.
  * - h2: beforeRequest + beforeResponse (response / both breakpoints, mutate rules); response buffered ≤ 32 MB.
  * - trace: the trace sink (CONTRACTS §9.2), answered 204 locally, never recorded.
+ * - ws-pass / ws-local: WebSocket upgrades (CONTRACTS §11.1), passed through and recorded frame by frame, or
+ *   answered locally (block / fault rules, the offline profile).
  */
-type Route = 'plain' | 'h1' | 'h2' | 'denied' | 'trace';
+type Route = 'plain' | 'h1' | 'h2' | 'denied' | 'trace' | 'ws-pass' | 'ws-local';
 
 /** A fault applied to a request: a fault rule, the `offline` profile ('dns'), or a throttle drop ('drop' = reset). */
 type FlowFault = FaultKind | 'drop';
@@ -109,6 +138,49 @@ interface Flow {
   truncated?: boolean;
   /** The client came through the LAN listener (Exchange.viaLan). */
   viaLan?: boolean;
+  /**
+   * A rule with `graphqlOperation` needs the request body (CONTRACTS §11.2): routed like a request breakpoint
+   * (h1, or h2 when a candidate rule needs the response hook) and the rule is chosen in beforeRequest.
+   */
+  deferred?: boolean;
+  /** A CORS preflight answered locally because a mock / block / cors rule matches the request it asks about. */
+  preflight?: boolean;
+  /** A cors rule: add CORS headers to the real response (CONTRACTS §11.3). */
+  corsPatch?: CorsOptions;
+}
+
+/** Recording state of a WebSocket / event stream. */
+interface StreamState {
+  sse?: SseRecorder;
+  /** The 'ws-upgrade' hook attached to the connection (frames are recorded). */
+  wsDirect?: boolean;
+  /** The server's side closed first: its close code / reason. */
+  serverClose?: { code: number; reason: Buffer };
+  /** A message over WS_MAX_MESSAGE_BYTES (REVIEW-5 #1): from the server (receive) or the app (send). */
+  tooBig?: Frame['dir'];
+}
+
+interface MatchOptions {
+  /** Count the hit (rules with `times`). */
+  count: boolean;
+  /** Request headers (for the GraphQL body limits). */
+  headers?: HeaderBag;
+  /** The decoded request body, when known: GraphQL-scoped rules are decided with it. */
+  body?: () => string | undefined;
+  /** Treat GraphQL-scoped rules as matching on method + URL alone (preflights). */
+  ignoreGraphql?: boolean;
+  /** A WebSocket upgrade: only block / fault rules apply, GraphQL-scoped rules never do. */
+  ws?: boolean;
+}
+
+interface MatchResult {
+  rule?: Rule;
+  /** A GraphQL-scoped rule needs the body to decide. */
+  deferred?: boolean;
+  /** …and some candidate from there on needs the response hook (response breakpoint / mutate). */
+  needsResponseHook?: boolean;
+  /** Why a matching rule was skipped (shown in Exchange.error on a non-error state). */
+  note?: string;
 }
 
 interface ReqMeta {
@@ -119,6 +191,7 @@ interface ReqMeta {
 interface Live {
   ex: Exchange;
   flow: Flow;
+  stream?: StreamState;
 }
 
 interface Paused {
@@ -191,6 +264,36 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 const bodySize = (e: Exchange) => (e.requestBody?.text.length ?? 0) + (e.responseBody?.text.length ?? 0);
 
+/** 'exchange' events for frames: at most one per exchange per this many ms (CONTRACTS §11.1). */
+const FRAME_EMIT_INTERVAL_MS = 100;
+
+const isEventStream = (contentType: string | undefined) =>
+  (contentType ?? '').split(';')[0].trim().toLowerCase() === 'text/event-stream';
+
+/** WebSocket upgrades are recorded (and matched) as ws:// / wss:// URLs. */
+const toWsUrl = (url: string) => url.replace(/^http(s?):\/\//i, (_m, s: string) => `ws${s.toLowerCase()}://`);
+
+const capitalize = (s: string) => `${s[0]?.toUpperCase() ?? ''}${s.slice(1)}`;
+
+function toBuffer(data: unknown): Buffer {
+  if (Buffer.isBuffer(data)) return data;
+  if (Array.isArray(data)) return Buffer.concat(data.map(toBuffer));
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  return Buffer.from(String(data ?? ''), 'utf8');
+}
+
+/** Minimal shape of the `ws` WebSocket objects mockttp hands over in its 'ws-upgrade' socket event. */
+interface WsLike {
+  on(event: 'message', l: (data: unknown, isBinary: boolean) => void): unknown;
+  on(event: 'ping' | 'pong', l: (data: Buffer) => void): unknown;
+  on(event: 'error', l: (e: Error & { code?: string }) => void): unknown;
+  once(event: 'close', l: (code: number, reason: Buffer) => void): unknown;
+  close(code?: number, reason?: string): void;
+  upstreamWebSocket?: WsLike;
+}
+
+const isTooBig = (e: { code?: string } | undefined) => e?.code === 'WS_ERR_UNSUPPORTED_MESSAGE_LENGTH';
 /**
  * HTTP(S) MITM proxy that records every exchange and applies rules (CONTRACTS §3).
  *
@@ -245,6 +348,15 @@ export class InterceptProxy extends EventEmitter {
   private profile: NetworkProfile = NO_PROFILE;
   /** Faulted requests held unanswered ('timeout'): settle = the app left (true) or the hold ran out (false). */
   private readonly holds = new Map<string, (appLeft: boolean) => void>();
+  private readonly maxFrames: number;
+  /** Stored frame payload bytes per exchange (part of the body byte budget). */
+  private readonly frameBytes = new Map<string, number>();
+  /** Coalesced 'exchange' emits for frames: last emit time and the pending timer, per exchange. */
+  private readonly emitState = new Map<string, { last: number; timer?: NodeJS.Timeout }>();
+  /** Ids of read-only records added with record() (CONTRACTS §11.4). */
+  private readonly records = new Set<string>();
+  /** A Flutter Web session is running: tag the browser's own requests (CONTRACTS §11.3). */
+  private webSession = false;
 
   constructor(private readonly opts: InterceptProxyOptions) {
     super();
@@ -252,6 +364,8 @@ export class InterceptProxy extends EventEmitter {
     this.maxExchanges = Math.max(1, Math.floor(opts.maxExchanges ?? DEFAULT_MAX_EXCHANGES));
     this.maxStoredBodyBytes = opts.maxStoredBodyBytes ?? DEFAULT_MAX_STORED_BODY_BYTES;
     this.breakpointTimeoutMs = opts.breakpointTimeoutMs ?? DEFAULT_BREAKPOINT_TIMEOUT_MS;
+    const mf = opts.maxFramesPerExchange ?? DEFAULT_MAX_FRAMES;
+    this.maxFrames = Number.isFinite(mf) ? Math.max(0, Math.floor(mf)) : DEFAULT_MAX_FRAMES;
   }
 
   /** Actual port after start() (0 before). */
@@ -262,7 +376,7 @@ export class InterceptProxy extends EventEmitter {
   async start(): Promise<void> {
     if (this.server) throw new Error('InterceptProxy already started');
     const hooks = installTaps();
-    if (!hooks.taps || !hooks.responseLimit) {
+    if (!hooks.taps || !hooks.responseLimit || !installWsLimit()) {
       // Without them recording / response breakpoints would be unbounded: refuse to run.
       throw new Error('Flutter Intercept: incompatible mockttp version (body capture hooks unavailable)');
     }
@@ -382,11 +496,32 @@ export class InterceptProxy extends EventEmitter {
         steps: [new PassThroughStep(connection)],
       },
     );
-    await server.forAnyWebSocket().always().thenPassThrough(connection); // kept working, not recorded
+    // WebSocket upgrades (CONTRACTS §11.1): recorded; block / fault rules and the offline profile answer
+    // locally, everything else passes through (frames recorded from the connection, see watchWebSocket).
+    const wsRoute = (r: Route): RequestMatcher =>
+      ({
+        type: 'flutter-intercept-ws-route',
+        matches: (req: OngoingRequest) => this.decideWs(req).route === r,
+        explain: () => `websocket routed to "${r}" by Flutter Intercept`,
+        dispose: () => undefined,
+        serialize: () => {
+          throw new Error('not serializable');
+        },
+      }) as unknown as RequestMatcher;
+    // A ws step whose handler is ours: mockttp builds the step from the definition's own properties
+    // (Object.assign onto the impl prototype), so an own `handle` replaces the reject implementation.
+    const localWsStep = Object.assign(new RejectWebSocketStep(500), {
+      handle: (req: OngoingRequest, socket: net.Socket) => this.onWsLocal(req, socket),
+    });
+    await (server as unknown as { addWebSocketRules: (...r: unknown[]) => Promise<unknown> }).addWebSocketRules(
+      { matchers: [wsRoute('ws-local')], completionChecker: new Always(), steps: [localWsStep] },
+      { matchers: [wsRoute('ws-pass')], completionChecker: new Always(), steps: [new PassThroughWebSocketStep(connection)] },
+    );
     // A 'response' listener makes mockttp consume (and, past maxBodySize, discard) its internal
     // copy of each response; without a consumer that copy would grow without bound. We record
-    // from the taps instead, so the listener itself does nothing.
-    await server.on('response', () => undefined);
+    // from the taps instead; the listener only handles refused WebSocket upgrades.
+    await server.on('response', (res) => this.onWsRefused(res));
+    await server.on('websocket-accepted', (res) => this.onWsAccepted(res));
     await server.on('abort', (req) => this.onAbort(req.id, req.error?.message));
     await server.on('tls-client-error', (f) => this.onTlsError(f));
 
@@ -469,6 +604,8 @@ export class InterceptProxy extends EventEmitter {
     this.flows.clear();
     this.clearExpiryTimers();
     this.traceJoin.clear();
+    for (const st of this.emitState.values()) clearTimeout(st.timer);
+    this.emitState.clear();
     this._port = 0;
   }
 
@@ -589,6 +726,15 @@ export class InterceptProxy extends EventEmitter {
     this.armExpiryTimers();
   }
 
+  /**
+   * CONTRACTS §11.3: while a web session runs, requests the browser makes for itself (`Sec-Fetch-Site: none`,
+   * or neither Origin nor Referer to a Google browser-service host — src/browser.ts) are recorded with
+   * `browserInternal: true`. Never a request with `Origin`. Applies to requests that arrive from now on.
+   */
+  setWebSessionActive(active: boolean): void {
+    this.webSession = !!active;
+  }
+
   /** App package names (pubspec `name`s) whose frames are the preferred `Exchange.source.appFrame`. */
   setAppPackages(names: string[]): void {
     this.appPackages = [...new Set((names ?? []).filter((n) => typeof n === 'string' && /^[A-Za-z0-9_]+$/.test(n)))];
@@ -694,7 +840,60 @@ export class InterceptProxy extends EventEmitter {
 
   /** Oldest first. In-flight exchanges are always included. */
   getExchanges(): Exchange[] {
-    return [...this.store.values()].map((e) => ({ ...e }));
+    return [...this.store.values()].map(snapshot);
+  }
+
+  /**
+   * Store a read-only exchange that did not go through the proxy (CONTRACTS §11.4): e.g. a native client's
+   * request read from the app's HTTP profile. `captured` defaults to 'vm-profile'. It is stored and evicted
+   * like any other exchange and emits 'exchange', but is never routed, never matched against rules, never
+   * CORS-diagnosed. Bodies are capped like recorded ones (5 MB of text), frames at maxFramesPerExchange.
+   * Returns its id. Throws on a missing method / URL.
+   */
+  record(input: Omit<Exchange, 'id'>): string {
+    if (!input || typeof input !== 'object') throw new Error('Invalid exchange');
+    if (typeof input.method !== 'string' || !input.method || typeof input.url !== 'string' || !input.url) {
+      throw new Error('Invalid exchange: method and url are required');
+    }
+    const id = `rec-${randomUUID()}`;
+    const ex = {
+      startedAt: Date.now(),
+      requestHeaders: {},
+      state: 'completed',
+      ...sanitizeRecord(input as Partial<Exchange>, this.maxFrames),
+      id,
+    } as Exchange;
+    ex.captured ??= 'vm-profile';
+    this.records.add(id);
+    this.store.set(id, ex);
+    if (ex.frames) this.frameBytes.set(id, ex.frames.reduce((n, f) => n + frameCost(f), 0));
+    this.emitChange(ex);
+    return id;
+  }
+
+  /**
+   * Change a record() exchange (a pending native request that completed, more frames…): fields in `patch`
+   * replace the stored ones, `undefined` removes one; `id` can't change. Emits 'exchange'. Returns false (and
+   * does nothing) for an id that is not a record or was evicted / cleared.
+   */
+  update(id: string, patch: Partial<Omit<Exchange, 'id'>>): boolean {
+    const ex = this.records.has(id) ? this.store.get(id) : undefined;
+    if (!ex) {
+      this.records.delete(id);
+      return false;
+    }
+    if (!patch || typeof patch !== 'object') return false;
+    const clean = sanitizeRecord(patch as Partial<Exchange>, this.maxFrames);
+    for (const k of Object.keys(patch)) {
+      if (k === 'id') continue;
+      const v = (clean as Record<string, unknown>)[k];
+      if (v === undefined) delete (ex as unknown as Record<string, unknown>)[k];
+      else (ex as unknown as Record<string, unknown>)[k] = v;
+    }
+    ex.captured ??= 'vm-profile';
+    if ('frames' in patch) this.frameBytes.set(id, (ex.frames ?? []).reduce((n, f) => n + frameCost(f), 0));
+    this.emitChange(ex);
+    return true;
   }
 
   /**
@@ -737,23 +936,106 @@ export class InterceptProxy extends EventEmitter {
   // ---------------------------------------------------------------- store
 
   private emitChange(ex: Exchange): void {
+    if (!ex.captured) {
+      // CONTRACTS §11.3: browser requests (Origin) get a CORS diagnosis; `patched` is kept.
+      const cors = diagnoseCors(ex);
+      if (cors) ex.cors = cors;
+      else delete ex.cors;
+    }
     if (this.store.get(ex.id) === ex) {
-      const size = bodySize(ex);
+      const size = bodySize(ex) + (this.frameBytes.get(ex.id) ?? 0);
       this.storedBytes += size - (this.sizes.get(ex.id) ?? 0);
       this.sizes.set(ex.id, size);
     }
-    this.emit('exchange', { ...ex });
+    const st = this.emitState.get(ex.id);
+    if (st) {
+      clearTimeout(st.timer);
+      st.timer = undefined;
+      st.last = Date.now();
+    }
+    this.emit('exchange', snapshot(ex));
     this.evict();
+  }
+
+  /** Coalesced emit for frame updates: at most one 'exchange' per exchange per FRAME_EMIT_INTERVAL_MS. */
+  private touch(ex: Exchange): void {
+    let st = this.emitState.get(ex.id);
+    if (!st) {
+      st = { last: 0 };
+      this.emitState.set(ex.id, st);
+    }
+    if (st.timer) return;
+    const wait = st.last + FRAME_EMIT_INTERVAL_MS - Date.now();
+    if (wait <= 0) return this.emitChange(ex);
+    const state = st;
+    state.timer = setTimeout(() => {
+      state.timer = undefined;
+      if (this.store.get(ex.id) === ex || this.live.get(ex.id)?.ex === ex) this.emitChange(ex);
+    }, wait);
+    state.timer.unref?.();
+  }
+
+  /** Append a frame (WebSocket message / SSE event), keeping the newest maxFrames. */
+  private addFrame(ex: Exchange, f: Frame): void {
+    if (this.live.get(ex.id)?.ex !== ex) return; // finished: late frames are ignored
+    const frames = (ex.frames ??= []);
+    frames.push(f);
+    let bytes = (this.frameBytes.get(ex.id) ?? 0) + frameCost(f);
+    // Newest maxFrames, and at most MAX_FRAME_BYTES_PER_EXCHANGE of them (REVIEW-5 #4); always the newest one.
+    while (frames.length > this.maxFrames || (bytes > MAX_FRAME_BYTES_PER_EXCHANGE && frames.length > 1)) {
+      bytes -= frameCost(frames.shift()!);
+      ex.framesDropped = (ex.framesDropped ?? 0) + 1;
+    }
+    this.frameBytes.set(ex.id, bytes);
+    this.touch(ex);
+  }
+
+  /**
+   * Over the store's byte budget: drop the oldest frames of open streams first (down to LIVE_FRAME_FLOOR each),
+   * so heavy live WebSockets / SSE streams can't push every finished exchange out (REVIEW-5 #4).
+   */
+  private trimLiveFrames(): void {
+    for (const { ex } of this.live.values()) {
+      if (this.storedBytes <= this.maxStoredBodyBytes) return;
+      const frames = ex.frames;
+      if (!frames || frames.length <= LIVE_FRAME_FLOOR) continue;
+      let freed = 0;
+      let dropped = 0;
+      while (frames.length > LIVE_FRAME_FLOOR && this.storedBytes - freed > this.maxStoredBodyBytes) {
+        freed += frameCost(frames.shift()!);
+        dropped++;
+      }
+      if (!dropped) continue;
+      ex.framesDropped = (ex.framesDropped ?? 0) + dropped;
+      this.frameBytes.set(ex.id, (this.frameBytes.get(ex.id) ?? 0) - freed);
+      if (this.sizes.has(ex.id)) {
+        this.sizes.set(ex.id, this.sizes.get(ex.id)! - freed);
+        this.storedBytes -= freed;
+      }
+      // Not synchronously: evict() runs inside emitChange.
+      queueMicrotask(() => {
+        if (this.live.get(ex.id)?.ex === ex) this.touch(ex);
+      });
+    }
   }
 
   private drop(id: string): void {
     this.storedBytes -= this.sizes.get(id) ?? 0;
     this.sizes.delete(id);
     this.store.delete(id);
+    this.frameBytes.delete(id);
+    this.records.delete(id);
+    const st = this.emitState.get(id);
+    if (st) {
+      clearTimeout(st.timer);
+      this.emitState.delete(id);
+    }
   }
 
   /** Evict oldest finished exchanges beyond maxExchanges / maxStoredBodyBytes; never in-flight ones. */
   private evict(): void {
+    if (this.store.size <= this.maxExchanges && this.storedBytes <= this.maxStoredBodyBytes) return;
+    if (this.storedBytes > this.maxStoredBodyBytes) this.trimLiveFrames();
     if (this.store.size <= this.maxExchanges && this.storedBytes <= this.maxStoredBodyBytes) return;
     const removed: string[] = [];
     for (const id of [...this.store.keys()]) {
@@ -791,7 +1073,19 @@ export class InterceptProxy extends EventEmitter {
       ...(flow.send ? { initiator: flow.send.initiator } : {}),
       ...(flow.send?.resentFrom !== undefined ? { resentFrom: flow.send.resentFrom } : {}),
       ...(flow.viaLan ? { viaLan: true as const } : {}),
+      ...graphqlOf(req.method, req.url, req.headers),
+      ...(this.webSession && !flow.send && !flow.viaLan && !flow.traceId && isBrowserInternal(req.url, req.headers)
+        ? { browserInternal: true as const }
+        : {}),
     };
+  }
+
+  /** Set the request body (and, once it is known, `graphql`: CONTRACTS §11.2). */
+  private setRequestBody(ex: Exchange, body: Body | undefined): void {
+    ex.requestBody = body;
+    const g = graphqlOf(ex.method, ex.url, ex.requestHeaders, body);
+    if (g.graphql) ex.graphql = g.graphql;
+    else delete ex.graphql;
   }
 
   // ---------------------------------------------------------------- request → source
@@ -863,21 +1157,64 @@ export class InterceptProxy extends EventEmitter {
     process.nextTick(() => this.emit('rule-spent', id, reason));
   }
 
-  /** First enabled, unspent, matching rule. `count`: this request uses it (decided once per request). */
-  private matchRule(method: string, url: string, count: boolean): Rule | undefined {
+  /**
+   * First enabled, unspent, matching rule. `count`: this request uses it (decided once per request).
+   * GraphQL-scoped rules (CONTRACTS §11.2) are decided from the URL for GET / body-less requests and from
+   * `o.body` when given; otherwise the decision is deferred to beforeRequest (`deferred`), unless the body is
+   * streamed or over the pause limit (then the rule is skipped with a note).
+   */
+  private matchRule(method: string, url: string, o: MatchOptions): MatchResult {
     const now = Date.now();
-    for (const { rule, test } of this.compiled) {
-      if (!rule.enabled || this.spentReason(rule, now) || !test(method, url)) continue;
-      if (count && rule.times !== undefined) {
+    let note: string | undefined;
+    let names: string[] | undefined;
+    for (let i = 0; i < this.compiled.length; i++) {
+      const { rule, base, graphqlOperation: op } = this.compiled[i];
+      if (!rule.enabled || this.spentReason(rule, now) || !base(method, url)) continue;
+      if (op !== undefined && !o.ignoreGraphql) {
+        if (o.ws) continue; // the operation of a subscription is inside the frames
+        if (o.body) {
+          names ??= graphqlOperationNames(method, url, o.body());
+        } else if (!o.headers || !hasRequestBody(o.headers)) {
+          names ??= graphqlOperationNames(method, url);
+        } else {
+          const why = bodyLimitReason(o.headers);
+          if (why) {
+            note ??= `GraphQL rule skipped: ${why}, so the operation name could not be read and the request was not matched against it.`;
+            continue;
+          }
+          return { deferred: true, needsResponseHook: this.responseHookFrom(i, method, url, now), note };
+        }
+        if (!names.includes(op)) continue;
+      }
+      if (o.ws) {
+        const a = rule.action;
+        if (!WEBSOCKET_ACTIONS.has(a.kind) || (a.kind === 'fault' && a.fault === 'truncate')) {
+          const what = a.kind === 'fault' ? 'The truncate fault' : `${capitalize(a.kind)} rule`;
+          note ??= `${what}${rule.name ? ` "${rule.name}"` : ''} does not apply to WebSocket connections; passed through.`;
+          continue;
+        }
+      }
+      if (o.count && rule.times !== undefined) {
         const n = (this.hits.get(rule.id) ?? 0) + 1;
         this.hits.set(rule.id, n);
         const id = rule.id;
         process.nextTick(() => this.emit('rule-hit', id, n)); // host shows "N of M left" (Rule.used)
         if (n >= rule.times) this.markSpent(rule.id, 'times');
       }
-      return rule;
+      return { rule, note };
     }
-    return undefined;
+    return { note };
+  }
+
+  /** Could a rule from index `from` on (method + URL match) need the response hook? */
+  private responseHookFrom(from: number, method: string, url: string, now: number): boolean {
+    for (let i = from; i < this.compiled.length; i++) {
+      const { rule, base } = this.compiled[i];
+      if (!rule.enabled || this.spentReason(rule, now) || !base(method, url)) continue;
+      const a = rule.action;
+      if (a.kind === 'mutate' || (a.kind === 'breakpoint' && a.phase !== 'request')) return true;
+    }
+    return false;
   }
 
   private clearExpiryTimers(): void {
@@ -911,6 +1248,7 @@ export class InterceptProxy extends EventEmitter {
     this.live.delete(ex.id);
     this.flows.delete(ex.id);
     this.emitChange(ex);
+    this.emitState.delete(ex.id); // emitChange cleared its timer
   }
 
   private fail(ex: Exchange, error: string): void {
@@ -952,55 +1290,26 @@ export class InterceptProxy extends EventEmitter {
     if (isTraceUrl(req.url)) return TRACE_FLOW; // answered locally, never recorded, never throttled
     const meta = this.reqMeta.get(req);
     const send = meta?.sendNonce ? this.sends.get(meta.sendNonce) : undefined;
-    const rule = this.matchRule(req.method, req.url, true);
-    const action = rule?.action;
-    let flow: Flow;
-    let dropRate: number | undefined;
-    if (!rule || !action) {
-      flow = { route: 'plain' };
-    } else if (action.kind === 'fault') {
-      // truncate forwards and cuts the response (streaming route); the others never reach the server.
-      flow = { route: action.fault === 'truncate' ? 'plain' : 'h1', rule, fault: action.fault, simulated: FAULT_LABELS[action.fault] };
-    } else if (action.kind === 'throttle') {
-      flow = { route: 'plain', rule, throttle: { latencyMs: action.latencyMs, kbps: action.kbps }, simulated: throttleLabel(action) };
-      dropRate = action.dropRate;
-    } else if (action.kind !== 'breakpoint' && action.kind !== 'mutate') {
-      flow = { route: 'h1', rule };
-    } else {
-      // Breakpoints and mutate rules run on hooked routes, where mockttp buffers the request body
-      // before forwarding it. Only do that when the size is known and small; mockttp would otherwise
-      // drop data past maxBodySize. (The mutate rule's response side never needs this; its request does.)
-      const what = action.kind === 'mutate' ? 'Mutate rule' : 'Breakpoint';
-      const te = getHeader(req.headers, 'transfer-encoding');
-      const cl = Number(getHeader(req.headers, 'content-length') ?? 0);
-      if (te) {
-        flow = { route: 'plain', rule, note: `${what} skipped: the request body is streamed (unknown length), so it was passed through unedited.` };
-      } else if (cl > REQUEST_PAUSE_LIMIT_BYTES) {
-        flow = {
-          route: 'plain',
-          rule,
-          note: `${what} skipped: the request body (${(cl / MB).toFixed(1)} MB) is over the ${REQUEST_PAUSE_LIMIT_BYTES / MB} MB pause limit, so it was passed through unedited.`,
-        };
-      } else {
-        flow = { route: action.kind === 'breakpoint' && action.phase === 'request' ? 'h1' : 'h2', rule };
+    const headers = req.headers as HeaderBag;
+    let flow: Flow | undefined;
+    // CONTRACTS §11.3: a CORS preflight for a request a mock / block / cors rule would handle is answered
+    // here (the rule isn't spent by it). Otherwise the OPTIONS request is matched like any other.
+    const asked = preflightMethod(req.method, headers);
+    if (asked) {
+      const pre = this.matchRule(asked, req.url, { count: false, ignoreGraphql: true }).rule;
+      const a = pre?.action;
+      if (pre && a && (a.kind === 'mock' || a.kind === 'block' || a.kind === 'cors')) {
+        const o = a.kind === 'cors' ? corsOptions(a) : {};
+        // Only for an origin the proxy may allow (loopback, or the cors rule's allowOrigin): otherwise the
+        // server answers its own preflight (REVIEW-5 #3).
+        if (allowedOrigin(headers, o)) flow = { route: 'h1', rule: pre, preflight: true, ...(a.kind === 'cors' ? { corsPatch: o } : {}) };
       }
     }
-
-    // The network profile: everything that would reach the network (no rule, breakpoints, mutate and
-    // throttle rules — whose own settings win over a throttle profile). Mock / block / fault rules answer as set.
-    const reachesNetwork = !action || action.kind === 'breakpoint' || action.kind === 'mutate' || action.kind === 'throttle';
-    const p = this.profile;
-    if (reachesNetwork && p.kind === 'offline') {
-      flow = { route: 'h1', rule, fault: 'dns', simulated: describeProfile(p) };
-      dropRate = undefined;
-    } else if (reachesNetwork && p.kind === 'throttle' && action?.kind !== 'throttle') {
-      flow.throttle = { latencyMs: p.latencyMs, kbps: p.kbps };
-      flow.simulated = describeProfile(p);
-      dropRate = p.dropRate;
-    }
-    if (dropRate && dropRate > 0 && Math.random() < dropRate) {
-      // Reset instead (after the latency, like a flaky link), never forwarded.
-      flow = { route: 'h1', rule, fault: 'drop', throttle: { latencyMs: flow.throttle?.latencyMs }, simulated: `${flow.simulated ?? 'Throttle'}: dropped` };
+    if (!flow) {
+      const m = this.matchRule(req.method, req.url, { count: true, headers });
+      flow = m.deferred
+        ? { route: m.needsResponseHook ? 'h2' : 'h1', deferred: true, ...(m.note ? { note: m.note } : {}) }
+        : this.flowFor(headers, m.rule, m.note);
     }
     if (meta?.traceId) flow.traceId = meta.traceId;
     if (send) flow.send = send;
@@ -1017,11 +1326,78 @@ export class InterceptProxy extends EventEmitter {
     return flow;
   }
 
+  /** The flow for a chosen rule (or none): its route, plus the network profile and drop rate. */
+  private flowFor(headers: HeaderBag, rule: Rule | undefined, note?: string): Flow {
+    const action = rule?.action;
+    let flow: Flow;
+    let dropRate: number | undefined;
+    if (!rule || !action) {
+      flow = { route: 'plain' };
+    } else if (action.kind === 'fault') {
+      // truncate forwards and cuts the response (streaming route); the others never reach the server.
+      flow = { route: action.fault === 'truncate' ? 'plain' : 'h1', rule, fault: action.fault, simulated: FAULT_LABELS[action.fault] };
+    } else if (action.kind === 'throttle') {
+      flow = { route: 'plain', rule, throttle: { latencyMs: action.latencyMs, kbps: action.kbps }, simulated: throttleLabel(action) };
+      dropRate = action.dropRate;
+    } else if (action.kind === 'cors') {
+      // Streams like a pass-through; the taps patch the response head (CONTRACTS §11.3).
+      flow = { route: 'plain', rule, corsPatch: corsOptions(action) };
+    } else if (action.kind !== 'breakpoint' && action.kind !== 'mutate') {
+      flow = { route: 'h1', rule };
+    } else {
+      // Breakpoints and mutate rules run on hooked routes, where mockttp buffers the request body
+      // before forwarding it. Only do that when the size is known and small; mockttp would otherwise
+      // drop data past maxBodySize. (The mutate rule's response side never needs this; its request does.)
+      const what = action.kind === 'mutate' ? 'Mutate rule' : 'Breakpoint';
+      const why = bodyLimitReason(headers);
+      flow = why
+        ? { route: 'plain', rule, note: `${what} skipped: ${why}, so it was passed through unedited.` }
+        : { route: action.kind === 'breakpoint' && action.phase === 'request' ? 'h1' : 'h2', rule };
+    }
+    if (note && !flow.note) flow.note = note;
+
+    // The network profile: everything that would reach the network (no rule, breakpoints, mutate, cors and
+    // throttle rules — whose own settings win over a throttle profile). Mock / block / fault rules answer as set.
+    const reachesNetwork =
+      !action || action.kind === 'breakpoint' || action.kind === 'mutate' || action.kind === 'throttle' || action.kind === 'cors';
+    const p = this.profile;
+    if (reachesNetwork && p.kind === 'offline') {
+      flow = { route: 'h1', rule, fault: 'dns', simulated: describeProfile(p) };
+      dropRate = undefined;
+    } else if (reachesNetwork && p.kind === 'throttle' && action?.kind !== 'throttle') {
+      flow.throttle = { latencyMs: p.latencyMs, kbps: p.kbps };
+      flow.simulated = describeProfile(p);
+      dropRate = p.dropRate;
+    }
+    if (dropRate && dropRate > 0 && Math.random() < dropRate) {
+      // Reset instead (after the latency, like a flaky link), never forwarded.
+      flow = { route: 'h1', rule, fault: 'drop', throttle: { latencyMs: flow.throttle?.latencyMs }, simulated: `${flow.simulated ?? 'Throttle'}: dropped` };
+    }
+    return flow;
+  }
+
   /** Record from the passive taps: request body, response completion (except finished h1/h2 hooks). */
   private wireTap(req: OngoingRequest, flow: Flow): void {
     const tap = getTap(req.id);
     if (flow.route === 'plain') this.track(this.newExchange(req, flow), flow);
     if (!tap) return;
+    this.applyShaping(tap, flow);
+    tap.onRequestEnd = () => {
+      const live = this.live.get(req.id);
+      if (live && live.ex.state === 'pending' && live.flow.route === 'plain') {
+        void this.requestBodyFromTap(tap, live.ex).then((b) => {
+          if (!this.live.has(req.id)) return;
+          this.setRequestBody(live.ex, b);
+          this.emitChange(live.ex);
+        });
+      }
+    };
+    tap.onResponseHead = (status, headers) => this.onResponseHead(tap, status, headers);
+    tap.onResponseDone = (finished) => void this.onResponseDone(tap, finished);
+  }
+
+  /** kbps pacing / the truncate fault, applied by the taps to the response on its way to the app. */
+  private applyShaping(tap: Tap, flow: Flow): void {
     const kbps = flow.throttle?.kbps;
     if ((kbps && kbps > 0) || flow.fault === 'truncate') {
       const shaping: Shaping = {};
@@ -1032,17 +1408,58 @@ export class InterceptProxy extends EventEmitter {
       }
       tap.shaping = shaping;
     }
-    tap.onRequestEnd = () => {
-      const live = this.live.get(req.id);
-      if (live && live.ex.state === 'pending' && live.flow.route === 'plain') {
-        void this.requestBodyFromTap(tap, live.ex).then((b) => {
-          if (!this.live.has(req.id)) return;
-          live.ex.requestBody = b;
-          this.emitChange(live.ex);
-        });
+  }
+
+  /**
+   * The response head is about to go to the app (streaming routes; hooked routes are finished by then).
+   * A cors rule patches it (CONTRACTS §11.3); an event stream starts SSE recording and is flushed at once.
+   */
+  private onResponseHead(tap: Tap, status: number, headers: Record<string, string | string[]>): HeadPatch | void {
+    const live = this.live.get(tap.id);
+    if (!live || live.ex.state !== 'pending') return;
+    const { ex, flow } = live;
+    let patch: HeadPatch | undefined;
+    let shown = headers;
+    if (flow.corsPatch && isCorsRequest(ex.method, ex.url, ex.requestHeaders)) {
+      const vary = getHeader(headers, 'vary');
+      const set = corsResponseHeaders(ex.requestHeaders, Object.keys(headers), vary, flow.corsPatch);
+      if (set) {
+        patch = { remove: CORS_RESPONSE_HEADERS, set };
+        shown = { ...headers };
+        for (const h of CORS_RESPONSE_HEADERS) delete shown[h];
+        Object.assign(shown, set);
+        ex.cors = { ...ex.cors, patched: true };
       }
-    };
-    tap.onResponseDone = (finished) => void this.onResponseDone(tap, finished);
+    }
+    if (isEventStream(getHeader(headers, 'content-type')) && status >= 200 && status < 300) {
+      this.startSse(live, tap, status, shown);
+      patch = { ...patch, flush: true };
+    }
+    return patch;
+  }
+
+  /** CONTRACTS §11.1: events are parsed from the bytes going to the app; no body copy is kept. */
+  private startSse(live: Live, tap: Tap, status: number, headers: Record<string, string | string[]>): void {
+    const { ex } = live;
+    ex.kind = 'sse';
+    ex.frames ??= [];
+    ex.status = status;
+    ex.responseHeaders = cleanHeaders(headers);
+    tap.res.skip = true;
+    tap.res.chunks = [];
+    tap.res.captured = 0;
+    const rec = new SseRecorder(
+      getHeader(headers, 'content-encoding'),
+      (e) => this.addFrame(ex, sseFrame(e)),
+      (message) => {
+        if (this.live.get(ex.id)?.ex !== ex) return;
+        ex.error = message;
+        this.touch(ex);
+      },
+    );
+    live.stream = { ...live.stream, sse: rec };
+    tap.onResponseData = (buf) => rec.push(buf);
+    this.emitChange(ex);
   }
 
   /** The truncate fault cut the response: record what the app got, as 'blocked'. */
@@ -1060,10 +1477,11 @@ export class InterceptProxy extends EventEmitter {
     const resRaw = captured(tap.res);
     void Promise.all([
       ex.requestBody ? Promise.resolve(ex.requestBody) : decodeForDisplay(reqRaw, getHeader(ex.requestHeaders, 'content-encoding'), reqComplete),
-      decodeForDisplay(resRaw, getHeader(headers, 'content-encoding'), false),
+      live.stream?.sse ? Promise.resolve(undefined) : decodeForDisplay(resRaw, getHeader(headers, 'content-encoding'), false),
+      live.stream?.sse?.end(),
     ]).then(([reqBody, resBody]) => {
       if (!this.live.has(ex.id)) return;
-      ex.requestBody = reqBody;
+      this.setRequestBody(ex, reqBody);
       ex.responseBody = resBody;
       this.finish(ex, 'blocked');
     });
@@ -1089,21 +1507,28 @@ export class InterceptProxy extends EventEmitter {
     const res = tap.response;
     const headers = res.getHeaders() as HeaderBag;
     ex.status = res.statusCode;
-    ex.responseHeaders = cleanHeaders(headers);
+    if (!live.stream?.sse) ex.responseHeaders = cleanHeaders(headers); // SSE: recorded (maybe CORS-patched) at the head
+    const sse = live.stream?.sse;
     const [reqBody, resBody] = await Promise.all([
       ex.requestBody ? Promise.resolve(ex.requestBody) : this.requestBodyFromTap(tap, ex),
-      decodeForDisplay(captured(tap.res), getHeader(headers, 'content-encoding'), isComplete(tap.res)),
+      sse ? Promise.resolve(undefined) : decodeForDisplay(captured(tap.res), getHeader(headers, 'content-encoding'), isComplete(tap.res)),
+      sse?.end(),
     ]);
     if (!this.live.has(ex.id)) return; // finished meanwhile (e.g. proxy stopped)
-    ex.requestBody = reqBody;
+    this.setRequestBody(ex, reqBody);
     ex.responseBody = resBody;
     const upstreamError = res.tags?.find((t) => t.startsWith('passthrough-error:'));
     const ssrf = res.statusCode === 403 && resBody?.encoding === 'utf8' && resBody.text.includes(SSRF_MARKER);
     if (ssrf) {
       this.fail(ex, resBody!.text.replace(/^Error: /, ''));
-    } else if (upstreamError || flow.route === 'h2') {
+    } else if (upstreamError || (flow.route === 'h2' && flow.fault !== 'truncate')) {
       // h2 still pending here = beforeResponse never ran: upstream failure or response too large.
-      this.fail(ex, (resBody?.encoding === 'utf8' && resBody.text) || upstreamError || `Failed with status ${res.statusCode}`);
+      const cause = upstreamError?.slice('passthrough-error:'.length);
+      this.fail(
+        ex,
+        (resBody?.encoding === 'utf8' && resBody.text) ||
+          (cause ? `The connection to the server failed${live.stream?.sse ? ' mid-stream' : ''} (${cause}).` : `Failed with status ${res.statusCode}`),
+      );
     } else {
       this.finish(ex, 'completed');
     }
@@ -1111,12 +1536,32 @@ export class InterceptProxy extends EventEmitter {
 
   private onAbort(id: string, message: string | undefined): void {
     const live = this.live.get(id);
-    this.flows.delete(id);
-    if (!live) return; // finished (incl. our own block/abort resets) or unknown
+    if (!live) {
+      this.flows.delete(id);
+      return; // finished (incl. our own block/abort resets) or unknown
+    }
     const { ex, flow } = live;
     if (flow.truncated) return; // the truncate fault closed it; recorded by onTruncated
     const hold = this.holds.get(id);
     if (hold) return hold(true); // the timeout fault: the app gave up
+    this.flows.delete(id);
+    if (ex.kind === 'websocket') {
+      // Before the upgrade (after it, the connection's own close events finish the exchange).
+      return this.fail(ex, message || 'No WebSocket connection: the upgrade got no answer (server unreachable, a TLS error, or the app gave up).');
+    }
+    const sse = live.stream?.sse;
+    if (sse) {
+      // An event stream usually ends when the app stops listening: that is not an error.
+      void sse.end().then(() => {
+        if (this.live.get(id)?.ex !== ex) return;
+        if (message) this.fail(ex, message);
+        else {
+          ex.error ??= 'The app closed the event stream.';
+          this.finish(ex, 'completed');
+        }
+      });
+      return;
+    }
     const paused = this.paused.get(id);
     this.fail(
       ex,
@@ -1130,17 +1575,36 @@ export class InterceptProxy extends EventEmitter {
   // ---------------------------------------------------------------- hooked paths (h1 / h2)
 
   private async onRequest(req: CompletedRequest): Promise<CallbackRequestResult | void> {
-    const flow: Flow = this.flows.get(req.id) ?? { route: 'h1', rule: this.matchRule(req.method, req.url, false) };
-    const rule = flow.rule;
+    const flow: Flow = this.flows.get(req.id) ?? { route: 'h1', rule: this.matchRule(req.method, req.url, { count: false }).rule };
     const tap = getTap(req.id);
-    const ex = this.newExchange(req, flow);
-    // For breakpoints the body is complete (≤ 5 MB); for mock/block it may be a capped prefix.
-    ex.requestBody = tap
-      ? await this.requestBodyFromTap(tap, ex)
+    // For breakpoints / deferred GraphQL rules the body is complete (≤ 5 MB); for mock/block it may be a capped prefix.
+    const body = tap
+      ? await decodeForDisplay(captured(tap.req), getHeader(req.headers, 'content-encoding'), isComplete(tap.req))
       : await decodeForDisplay(req.body.buffer, getHeader(req.headers, 'content-encoding'), true);
+    if (flow.deferred) {
+      // CONTRACTS §11.2: choose the rule now that the operation name can be read.
+      const text = body && body.encoding === 'utf8' && !body.truncated ? body.text : undefined;
+      const m = this.matchRule(req.method, req.url, { count: true, body: () => text });
+      const r = this.flowFor(req.headers as HeaderBag, m.rule, m.note ?? flow.note);
+      flow.deferred = false;
+      Object.assign(flow, {
+        rule: r.rule,
+        note: r.note,
+        fault: r.fault,
+        throttle: r.throttle,
+        simulated: r.simulated,
+        corsPatch: r.corsPatch,
+      });
+      if (tap) this.applyShaping(tap, flow);
+    }
+    const rule = flow.rule;
+    const ex = this.newExchange(req, flow);
+    this.setRequestBody(ex, body);
     const action = rule?.action;
 
-    if (flow.fault) return this.applyFault(ex, flow);
+    if (flow.preflight) return this.answerPreflight(req, ex, flow);
+
+    if (flow.fault && flow.fault !== 'truncate') return this.applyFault(ex, flow);
 
     if (action?.kind === 'mock') {
       this.track(ex, flow);
@@ -1149,11 +1613,13 @@ export class InterceptProxy extends EventEmitter {
         if (ex.state !== 'pending') return { response: 'close' }; // client left during the delay
       }
       const headers: HeaderBag = { ...(action.headers ?? {}) };
+      this.addCorsToLocalResponse(ex, headers);
       const decoded = Buffer.from(action.body ?? '', 'utf8');
       const rawBody = frameBody(decoded, headers);
       ex.status = action.status;
       ex.responseHeaders = cleanHeaders(headers);
       ex.responseBody = await decodeForDisplay(decoded, undefined, true);
+      if (isEventStream(getHeader(headers, 'content-type'))) this.setSseFrames(ex, decoded);
       this.finish(ex, 'mocked');
       return {
         response: { statusCode: action.status, statusMessage: STATUS_CODES[action.status], headers, rawBody },
@@ -1168,6 +1634,7 @@ export class InterceptProxy extends EventEmitter {
       }
       const status = action.status ?? 403;
       const headers: HeaderBag = { 'content-type': 'text/plain; charset=utf-8' };
+      this.addCorsToLocalResponse(ex, headers);
       const decoded = Buffer.from(BLOCK_BODY, 'utf8');
       const rawBody = frameBody(decoded, headers);
       ex.status = status;
@@ -1196,6 +1663,51 @@ export class InterceptProxy extends EventEmitter {
     this.track(ex, flow);
     if (!(await this.latency(ex, flow))) return { response: 'close' };
     return undefined;
+  }
+
+  /** A CORS preflight answered locally for a mock / block / cors rule (CONTRACTS §11.3). */
+  private answerPreflight(req: CompletedRequest, ex: Exchange, flow: Flow): CallbackRequestResult {
+    this.track(ex, flow);
+    const headers: HeaderBag = preflightResponseHeaders(req.headers as HeaderBag, flow.corsPatch ?? {}) ?? { 'content-length': '0' };
+    ex.status = 204;
+    ex.responseHeaders = cleanHeaders(headers);
+    ex.cors = { preflight: true, patched: true };
+    this.finish(ex, 'mocked');
+    return { response: { statusCode: 204, statusMessage: STATUS_CODES[204], headers, rawBody: Buffer.alloc(0) } };
+  }
+
+  /** Mock / block answers to browser requests get Access-Control-Allow-Origin when they lack it. */
+  private addCorsToLocalResponse(ex: Exchange, headers: HeaderBag): void {
+    if (hasAllowOrigin(headers) || !isCorsRequest(ex.method, ex.url, ex.requestHeaders)) return;
+    const vary = getHeader(headers, 'vary');
+    const set = corsResponseHeaders(ex.requestHeaders, Object.keys(headers), vary); // loopback origins only
+    if (!set) return;
+    deleteHeader(headers, 'vary');
+    Object.assign(headers, set);
+    ex.cors = { ...ex.cors, patched: true };
+  }
+
+  /** A complete event-stream body (mock, buffered response) → frames. */
+  private setSseFrames(ex: Exchange, decoded: Buffer): void {
+    ex.kind = 'sse';
+    const frames: Frame[] = [];
+    let dropped = 0;
+    const at = Date.now();
+    let bytes = 0;
+    const parser = new SseParser((e) => {
+      const f = sseFrame(e, at);
+      frames.push(f);
+      bytes += frameCost(f);
+      while (frames.length > this.maxFrames || (bytes > MAX_FRAME_BYTES_PER_EXCHANGE && frames.length > 1)) {
+        bytes -= frameCost(frames.shift()!);
+        dropped++;
+      }
+    });
+    parser.pushBytes(decoded);
+    parser.end();
+    ex.frames = frames;
+    if (dropped) ex.framesDropped = dropped;
+    this.frameBytes.set(ex.id, bytes);
   }
 
   /** Throttle latency before forwarding on a hooked route. false = the exchange ended meanwhile. */
@@ -1261,7 +1773,23 @@ export class InterceptProxy extends EventEmitter {
     } else if (action?.kind === 'mutate') {
       result = await this.applyMutation(res, ex, action.ops);
       if (!this.live.has(ex.id) || ex.state !== 'pending') return 'close'; // the app left meanwhile
+    } else if (flow.corsPatch && isCorsRequest(ex.method, ex.url, ex.requestHeaders)) {
+      // A GraphQL-scoped cors rule resolved on the buffered route: patch the head here.
+      const set = corsResponseHeaders(ex.requestHeaders, Object.keys(res.headers), getHeader(res.headers, 'vary'), flow.corsPatch);
+      if (set) {
+        const headers: HeaderBag = { ...res.headers };
+        for (const h of CORS_RESPONSE_HEADERS) deleteHeader(headers, h);
+        Object.assign(headers, set);
+        result = { headers };
+        ex.responseHeaders = cleanHeaders(headers);
+        ex.cors = { ...ex.cors, patched: true };
+      }
     }
+    if (isEventStream(getHeader(ex.responseHeaders ?? {}, 'content-type')) && ex.responseBody && !ex.responseBody.truncated) {
+      // Buffered (h2) event stream: frames from the whole body.
+      this.setSseFrames(ex, (await decodeFull(res.body)) ?? Buffer.alloc(0));
+    }
+    if (flow.fault === 'truncate') return result; // onTruncated finishes it once the cut happens
     this.finish(ex, 'completed');
     return result;
   }
@@ -1330,7 +1858,7 @@ export class InterceptProxy extends EventEmitter {
       if (!getHeader(recorded, 'host')) recorded.host = new URL(ex.url).host;
       ex.requestHeaders = cleanHeaders(recorded);
     }
-    if (decodedBody) ex.requestBody = await decodeForDisplay(decodedBody, undefined, true);
+    if (decodedBody) this.setRequestBody(ex, await decodeForDisplay(decodedBody, undefined, true));
     return result;
   }
 
@@ -1372,6 +1900,188 @@ export class InterceptProxy extends EventEmitter {
     return result;
   }
 
+  // ---------------------------------------------------------------- WebSockets (CONTRACTS §11.1)
+
+  /** Called by the WebSocket route matchers; decided (and recorded) once per upgrade. */
+  private decideWs(req: OngoingRequest): Flow {
+    const known = this.flows.get(req.id);
+    if (known) return known;
+    const url = toWsUrl(req.url);
+    const meta = this.reqMeta.get(req);
+    const m = this.matchRule(req.method, url, { count: true, ws: true });
+    const action = m.rule?.action;
+    let flow: Flow = { route: 'ws-pass' };
+    if (action?.kind === 'block') flow = { route: 'ws-local', rule: m.rule };
+    else if (action?.kind === 'fault') flow = { route: 'ws-local', rule: m.rule, fault: action.fault, simulated: FAULT_LABELS[action.fault] };
+    else if (this.profile.kind === 'offline') flow = { route: 'ws-local', fault: 'dns', simulated: describeProfile(this.profile) };
+    if (m.note) flow.note = m.note;
+    if (meta?.traceId) flow.traceId = meta.traceId;
+    if (lanGateOf((req as unknown as { socket?: unknown }).socket)) flow.viaLan = true;
+    this.flows.set(req.id, flow);
+    const ex = this.newExchange({ id: req.id, method: req.method, url, headers: req.headers as HeaderBag, timingEvents: req.timingEvents }, flow);
+    delete ex.graphql;
+    ex.kind = 'websocket';
+    ex.frames = [];
+    this.track(ex, flow);
+    if (flow.route === 'ws-pass') {
+      markProxySocket((req as unknown as { socket?: object }).socket); // app side gets the message size limit
+      this.watchWebSocket(req, ex);
+    }
+    return flow;
+  }
+
+  /**
+   * Frames straight from the two `ws` connections mockttp pipes together (its 'ws-upgrade' socket event,
+   * which hands over the app-side WebSocket with `upstreamWebSocket` attached). Unlike mockttp's
+   * websocket-message events this sees pings / pongs and which side closed first (and how), and records in
+   * order without a setImmediate per message.
+   */
+  private watchWebSocket(req: OngoingRequest, ex: Exchange): void {
+    const socket = (req as unknown as { socket?: net.Socket }).socket;
+    socket?.once('ws-upgrade', (ws: WsLike) => {
+      const live = this.live.get(ex.id);
+      if (!live || live.ex !== ex) return;
+      const st: StreamState = (live.stream = { ...live.stream, wsDirect: true });
+      const up = ws.upstreamWebSocket;
+      ws.on('message', (data, isBinary) => this.addFrame(ex, payloadFrame('send', isBinary ? 'binary' : 'text', toBuffer(data))));
+      ws.on('ping', (d) => this.addFrame(ex, payloadFrame('send', 'ping', toBuffer(d))));
+      ws.on('pong', (d) => this.addFrame(ex, payloadFrame('send', 'pong', toBuffer(d))));
+      // Over the size limit (ws-limit.ts): ws closes that side with 1009; close the other side with 1009 too
+      // (mockttp's pipe would otherwise just drop it). Our listeners run before the pipe's.
+      ws.on('error', (e) => {
+        if (!isTooBig(e)) return;
+        st.tooBig ??= 'send';
+        try {
+          up?.close(1009, 'Message too big');
+        } catch {
+          /* already closing */
+        }
+      });
+      if (up) {
+        up.on('error', (e) => {
+          if (!isTooBig(e)) return;
+          st.tooBig ??= 'receive';
+          try {
+            ws.close(1009, 'Message too big');
+          } catch {
+            /* already closing */
+          }
+        });
+        up.on('message', (data, isBinary) => this.addFrame(ex, payloadFrame('receive', isBinary ? 'binary' : 'text', toBuffer(data))));
+        up.on('ping', (d) => this.addFrame(ex, payloadFrame('receive', 'ping', toBuffer(d))));
+        up.on('pong', (d) => this.addFrame(ex, payloadFrame('receive', 'pong', toBuffer(d))));
+        up.once('close', (code, reason) => {
+          st.serverClose ??= { code, reason: toBuffer(reason) };
+        });
+      }
+      ws.once('close', (code, reason) => this.onWsClosed(ex, code, toBuffer(reason)));
+    });
+  }
+
+  /** The app's side of the WebSocket closed: the exchange ends (the side that closed first decides how). */
+  private onWsClosed(ex: Exchange, appCode: number, appReason: Buffer): void {
+    const live = this.live.get(ex.id);
+    if (!live || live.ex !== ex) return;
+    const tooBig = live.stream?.tooBig;
+    if (tooBig) {
+      return this.fail(
+        ex,
+        `A message from the ${tooBig === 'receive' ? 'server' : 'app'} was over the ${WS_MAX_MESSAGE_BYTES / 1024 / 1024} MB limit; ` +
+          'the connection was closed (1009, message too big).',
+      );
+    }
+    const server = live.stream?.serverClose;
+    const [dir, code, reason] = server ? (['receive', server.code, server.reason] as const) : (['send', appCode, appReason] as const);
+    if (code === 1006) {
+      return this.fail(
+        ex,
+        dir === 'receive'
+          ? "The server's connection ended without a close frame (abnormal closure, 1006)."
+          : "The app's connection ended without a close frame (abnormal closure, 1006).",
+      );
+    }
+    this.addFrame(ex, closeFrame(dir, code === 1005 ? undefined : code, reason));
+    this.finish(ex, 'completed');
+  }
+
+  /** mockttp's 'websocket-accepted': the 101 and its headers. */
+  private onWsAccepted(res: { id?: string; statusCode?: number; headers?: Record<string, unknown> }): void {
+    const live = res.id ? this.live.get(res.id) : undefined;
+    if (!live || live.ex.kind !== 'websocket') return;
+    const { ex } = live;
+    ex.status = res.statusCode ?? 101;
+    ex.responseHeaders = cleanHeaders((res.headers ?? {}) as HeaderBag);
+    if (!live.stream?.wsDirect) ex.error = 'Frames are not recorded (incompatible mockttp version).';
+    this.emitChange(ex);
+  }
+
+  /** A response other than 101 to a passed-through upgrade (the server refused it, or mockttp failed). */
+  private onWsRefused(res: { id?: string; statusCode?: number; statusMessage?: string; headers?: Record<string, unknown> }): void {
+    const live = res.id ? this.live.get(res.id) : undefined;
+    if (!live || live.ex.kind !== 'websocket' || live.flow.route !== 'ws-pass') return;
+    const { ex } = live;
+    ex.status = res.statusCode;
+    ex.responseHeaders = cleanHeaders((res.headers ?? {}) as HeaderBag);
+    this.fail(ex, `The WebSocket upgrade was refused: ${res.statusCode ?? '?'} ${res.statusMessage ?? ''}`.trim());
+  }
+
+  /** Block / fault rules and the offline profile on an upgrade: answered here, never forwarded. */
+  private async onWsLocal(req: OngoingRequest, socket: net.Socket): Promise<void> {
+    const live = this.live.get(req.id);
+    if (!live) {
+      socket.destroy();
+      return;
+    }
+    const { ex, flow } = live;
+    const action = flow.rule?.action;
+    const reset = () => resetOrDestroy(req as unknown as Parameters<typeof resetOrDestroy>[0]);
+    if (flow.fault === 'timeout') {
+      const appLeft = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => settle(false), this.breakpointTimeoutMs);
+        timer.unref?.();
+        const settle = (left: boolean) => {
+          clearTimeout(timer);
+          this.holds.delete(ex.id);
+          resolve(left);
+        };
+        this.holds.set(ex.id, settle);
+      });
+      if (!this.live.has(ex.id)) {
+        socket.destroy(); // proxy stopped
+        return;
+      }
+      const s = ((Date.now() - ex.startedAt) / 1000).toFixed(1);
+      ex.simulated = appLeft ? `${FAULT_LABELS.timeout} (the app gave up after ${s} s)` : `${FAULT_LABELS.timeout} (reset after ${s} s)`;
+      this.finish(ex, 'blocked');
+      if (!appLeft) reset();
+      return;
+    }
+    if (flow.fault) {
+      this.finish(ex, 'blocked');
+      if (flow.fault === 'dns') {
+        socket.end();
+        socket.destroy();
+      } else reset();
+      return;
+    }
+    if (action?.kind === 'block' && action.mode === 'reset') {
+      this.finish(ex, 'blocked');
+      return reset();
+    }
+    const status = action?.kind === 'block' ? (action.status ?? 403) : 403;
+    const body = Buffer.from(BLOCK_BODY, 'utf8');
+    const headers = { 'content-type': 'text/plain; charset=utf-8', 'content-length': String(body.length), connection: 'close' };
+    ex.status = status;
+    ex.responseHeaders = { ...headers };
+    ex.responseBody = { text: BLOCK_BODY, encoding: 'utf8' };
+    this.finish(ex, 'blocked');
+    const head = `HTTP/1.1 ${status} ${STATUS_CODES[status] ?? 'Blocked'}\r\n${Object.entries(headers)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join('\r\n')}\r\n\r\n`;
+    socket.on('error', () => undefined);
+    socket.end(Buffer.concat([Buffer.from(head, 'latin1'), body]));
+  }
+
   private onTlsError(f: TlsHandshakeFailure): void {
     const host = f.tlsMetadata?.sniHostname ?? f.destination?.hostname ?? 'unknown-host';
     const port = f.destination?.port;
@@ -1392,6 +2102,82 @@ export class InterceptProxy extends EventEmitter {
 }
 
 export { RESPONSE_PAUSE_LIMIT_BYTES };
+
+/** A copy for listeners / getExchanges (frames is the only array the proxy keeps appending to). */
+function snapshot(ex: Exchange): Exchange {
+  const copy = { ...ex };
+  if (ex.frames) copy.frames = ex.frames.slice();
+  return copy;
+}
+
+/** `{graphql}` for a request whose body (if any) is known; strict detection (CONTRACTS §11.2). */
+function graphqlOf(method: string, url: string, headers: HeaderBag, body?: Body): { graphql?: Exchange['graphql'] } {
+  const m = method.toUpperCase();
+  let text: string | undefined;
+  if (m !== 'GET' && m !== 'HEAD') {
+    if (!body || body.encoding !== 'utf8' || body.truncated) return {};
+    text = body.text;
+  }
+  const d = detectGraphql({ method, url, contentType: getHeader(headers, 'content-type') ?? '', body: text });
+  return d ? { graphql: d.info } : {};
+}
+
+function hasRequestBody(headers: HeaderBag): boolean {
+  return !!getHeader(headers, 'transfer-encoding') || Number(getHeader(headers, 'content-length') ?? 0) > 0;
+}
+
+/** Why a request body can't be held for a hooked route (streamed, or over the pause limit). */
+function bodyLimitReason(headers: HeaderBag): string | undefined {
+  if (getHeader(headers, 'transfer-encoding')) return 'the request body is streamed (unknown length)';
+  const cl = Number(getHeader(headers, 'content-length') ?? 0);
+  if (cl > REQUEST_PAUSE_LIMIT_BYTES) {
+    return `the request body (${(cl / MB).toFixed(1)} MB) is over the ${REQUEST_PAUSE_LIMIT_BYTES / MB} MB pause limit`;
+  }
+  return undefined;
+}
+
+function corsOptions(a: { allowOrigin?: string; allowCredentials?: boolean }): CorsOptions {
+  const o: CorsOptions = {};
+  if (typeof a.allowOrigin === 'string' && a.allowOrigin.trim()) o.allowOrigin = a.allowOrigin.trim();
+  if (typeof a.allowCredentials === 'boolean') o.allowCredentials = a.allowCredentials;
+  return o;
+}
+
+function capBody(b: unknown): Body | undefined {
+  if (!b || typeof b !== 'object') return undefined;
+  const { text, encoding, truncated } = b as Body;
+  if (typeof text !== 'string') return undefined;
+  const enc = encoding === 'base64' ? 'base64' : 'utf8';
+  const cap = enc === 'base64' ? Math.ceil((BODY_CAP_BYTES * 4) / 3) : BODY_CAP_BYTES;
+  if (text.length > cap) return { text: text.slice(0, cap), encoding: enc, truncated: true };
+  return truncated ? { text, encoding: enc, truncated: true } : { text, encoding: enc };
+}
+
+/** Copy of a record() / update() input: headers copied, bodies capped, frames capped (newest kept). */
+function sanitizeRecord(input: Partial<Exchange>, maxFrames: number): Partial<Exchange> {
+  const out: Record<string, unknown> = { ...input };
+  delete out.id;
+  if ('requestHeaders' in input) out.requestHeaders = cleanHeaders((input.requestHeaders ?? {}) as HeaderBag);
+  if ('responseHeaders' in input) out.responseHeaders = input.responseHeaders ? cleanHeaders(input.responseHeaders as HeaderBag) : undefined;
+  if ('requestBody' in input) out.requestBody = capBody(input.requestBody);
+  if ('responseBody' in input) out.responseBody = capBody(input.responseBody);
+  if ('frames' in input) {
+    const frames = Array.isArray(input.frames) ? input.frames.map((f) => ({ ...f })) : undefined;
+    if (frames) {
+      let bytes = frames.reduce((n, f) => n + frameCost(f), 0);
+      let drop = 0;
+      while (frames.length - drop > maxFrames || (bytes > MAX_FRAME_BYTES_PER_EXCHANGE && frames.length - drop > 1)) {
+        bytes -= frameCost(frames[drop++]);
+      }
+      if (drop) {
+        out.framesDropped = (input.framesDropped ?? 0) + drop;
+        frames.splice(0, drop);
+      }
+    }
+    out.frames = frames;
+  }
+  return out as Partial<Exchange>;
+}
 
 function copyHeaders(h: Record<string, string | string[]>): HeaderBag {
   const out: HeaderBag = {};

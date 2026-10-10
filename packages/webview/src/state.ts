@@ -6,10 +6,12 @@ import type {
   ContractSummary, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit, Rule, RuleAction, SendDraft, SnippetFormat, Status,
 } from './protocol';
 import type { FaultKind, MutateOp } from '@flutter-intercept/proxy/types';
-import { compileMatcher, matches } from '@flutter-intercept/proxy/rules';
+import { compileMatcher } from '@flutter-intercept/proxy/rules';
 import { describeProfile, NETWORK_PRESETS, presetProfile, type NetworkPresetId } from '@flutter-intercept/proxy/network';
 import { matchesFilter, parseFilter } from './filter';
 import { checkPath } from './jsonpath';
+import { corsActionError } from './coverage';
+import { hasFrames } from './frames';
 import {
   describeMatcherUrl, formatRemaining, headerValue, isAbsoluteUrl, isJsonContentType, isPaused, newId, statusClassOf,
   validateJson, type Headers, type JsonCheck, type StatusClass,
@@ -19,13 +21,16 @@ import {
 export const MAX_HOST_ERRORS = 5;
 
 export type View = 'traffic' | 'rules';
-export type DetailTab = 'request' | 'response';
+/** `messages` = WebSocket messages / SSE events (CONTRACTS §11.5), only for exchanges with a `kind`. */
+export type DetailTab = 'request' | 'response' | 'messages';
 
 export interface Filters {
   text: string;                 // whitespace-separated terms matched against the URL, "-term" excludes
   method: string;               // '' = any
   statusClasses: StatusClass[]; // empty = any
   pausedOnly: boolean;
+  /** CONTRACTS §11.3: show the browser's own traffic (Exchange.browserInternal); hidden by default. */
+  showBrowser: boolean;
 }
 
 export interface HeaderRow { name: string; value: string }
@@ -72,11 +77,13 @@ export interface State {
   composer?: Composer;
   /** Host said `sent` before the new exchange arrived: select it when it does. */
   pendingSelectId?: string;
+  /** SessionWarning ids the user dismissed (CONTRACTS §11); pruned to the warnings the host still reports. */
+  dismissedWarnings: string[];
 }
 
 export const NEW_RULE = '__new__';
 
-export const EMPTY_FILTERS: Filters = { text: '', method: '', statusClasses: [], pausedOnly: false };
+export const EMPTY_FILTERS: Filters = { text: '', method: '', statusClasses: [], pausedOnly: false, showBrowser: false };
 
 export function initialState(): State {
   return {
@@ -93,15 +100,17 @@ export function initialState(): State {
     hostErrors: [],
     splitPct: 55,
     contracts: {},
+    dismissedWarnings: [],
   };
 }
 
 /** The part of State worth keeping across webview reloads (vscode.setState). */
-export type Persisted = Pick<State, 'filters' | 'view' | 'detailTab' | 'selectedId' | 'splitPct' | 'drafts' | 'editingRuleId' | 'composer'>;
+export type Persisted = Pick<State,
+  'filters' | 'view' | 'detailTab' | 'selectedId' | 'splitPct' | 'drafts' | 'editingRuleId' | 'composer' | 'dismissedWarnings'>;
 export function toPersisted(s: State): Persisted {
   return {
     filters: s.filters, view: s.view, detailTab: s.detailTab, selectedId: s.selectedId, splitPct: s.splitPct,
-    drafts: s.drafts, editingRuleId: s.editingRuleId, composer: s.composer,
+    drafts: s.drafts, editingRuleId: s.editingRuleId, composer: s.composer, dismissedWarnings: s.dismissedWarnings,
   };
 }
 
@@ -129,7 +138,8 @@ export type Action =
   | { type: 'openComposer'; id?: string }
   | { type: 'patchComposer'; patch: Partial<RequestDraft> }
   | { type: 'closeComposer'; discard?: boolean }
-  | { type: 'composerSending' };
+  | { type: 'composerSending' }
+  | { type: 'dismissWarning'; id: string };
 
 let noticeSeq = 0;
 let errorSeq = 0;
@@ -154,12 +164,13 @@ export function reducer(state: State, action: Action): State {
         drafts: p.drafts ?? state.drafts,
         editingRuleId: p.editingRuleId ?? state.editingRuleId,
         composer: p.composer ? { ...p.composer, sending: false } : state.composer,
+        dismissedWarnings: Array.isArray(p.dismissedWarnings) ? p.dismissedWarnings.filter((x) => typeof x === 'string') : state.dismissedWarnings,
       };
     }
 
     case 'select': {
       const ex = action.id ? findExchange(state, action.id) : undefined;
-      return { ...state, selectedId: ex?.id, detailTab: tabFor(ex, state.detailTab), composer: hideComposer(state.composer) };
+      return { ...state, selectedId: ex?.id, detailTab: tabForSelect(ex, state.detailTab), composer: hideComposer(state.composer) };
     }
 
     case 'move': {
@@ -174,7 +185,7 @@ export function reducer(state: State, action: Action): State {
         case 'prev': idx = cur < 0 ? list.length - 1 : Math.max(cur - 1, 0); break;
       }
       const ex = list[idx];
-      return { ...state, selectedId: ex.id, detailTab: tabFor(ex, state.detailTab), composer: hideComposer(state.composer) };
+      return { ...state, selectedId: ex.id, detailTab: tabForSelect(ex, state.detailTab), composer: hideComposer(state.composer) };
     }
 
     case 'setFilters':
@@ -187,7 +198,8 @@ export function reducer(state: State, action: Action): State {
     }
 
     case 'clearFilters':
-      return { ...state, filters: EMPTY_FILTERS };
+      // "Show browser traffic" is a view preference, not a filter: it survives clearing.
+      return { ...state, filters: { ...EMPTY_FILTERS, showBrowser: state.filters.showBrowser } };
 
     case 'showPaused': {
       // Jump to the next paused exchange after the current selection (wrapping).
@@ -201,7 +213,7 @@ export function reducer(state: State, action: Action): State {
         view: 'traffic',
         selectedId: ex.id,
         detailTab: tabFor(ex, state.detailTab),
-        filters: visible ? state.filters : { ...EMPTY_FILTERS, pausedOnly: true },
+        filters: visible ? state.filters : { ...EMPTY_FILTERS, pausedOnly: true, showBrowser: state.filters.showBrowser || !!ex.browserInternal },
       };
     }
 
@@ -274,7 +286,26 @@ export function reducer(state: State, action: Action): State {
 
     case 'composerSending':
       return state.composer ? { ...state, composer: { ...state.composer, sending: true } } : state;
+
+    case 'dismissWarning':
+      if (state.dismissedWarnings.includes(action.id)) return state;
+      return { ...state, dismissedWarnings: [...state.dismissedWarnings, action.id] };
   }
+}
+
+/** Dismissed ids the host no longer reports are forgotten (the list can't grow without bound). */
+function pruneDismissed(dismissed: string[], status: Status): string[] {
+  if (!dismissed.length) return dismissed;
+  const live = new Set((status.warnings ?? []).map((w) => w.id));
+  const kept = dismissed.filter((id) => live.has(id));
+  return kept.length === dismissed.length ? dismissed : kept;
+}
+
+/** Warnings to show as banners: reported by the host and not dismissed. */
+export function visibleWarnings(state: Pick<State, 'status' | 'dismissedWarnings'>): NonNullable<Status['warnings']> {
+  const w = state.status.warnings ?? [];
+  if (!w.length || !state.dismissedWarnings.length) return w;
+  return w.filter((x) => !state.dismissedWarnings.includes(x.id));
 }
 
 function hideComposer(c: Composer | undefined): Composer | undefined {
@@ -300,6 +331,7 @@ function applyHostMsg(state: State, msg: HostMsg): State {
         exchanges,
         rules: msg.rules,
         status: msg.status,
+        dismissedWarnings: pruneDismissed(state.dismissedWarnings, msg.status),
         drafts: pruneDrafts(state.drafts, byId),
         resolving: {},
         gaveUp: pick(state.gaveUp, byId),
@@ -315,6 +347,7 @@ function applyHostMsg(state: State, msg: HostMsg): State {
       }
       if (next.selectedId) {
         next.detailTab = tabFor(byId.get(next.selectedId), state.detailTab);
+        if (next.detailTab === 'messages' && !hasFrames(byId.get(next.selectedId)!)) next.detailTab = 'response';
       } else {
         // Something is waiting at a breakpoint: show it rather than an unselected list.
         const paused = exchanges.find(isPaused);
@@ -403,7 +436,7 @@ function applyHostMsg(state: State, msg: HostMsg): State {
     }
 
     case 'status':
-      return { ...state, status: msg.status };
+      return { ...state, status: msg.status, dismissedWarnings: pruneDismissed(state.dismissedWarnings, msg.status) };
 
     case 'contract': {
       if (!msg.results.length) return state;
@@ -477,6 +510,17 @@ function tabFor(ex: Exchange | undefined, current: DetailTab): DetailTab {
   return current;
 }
 
+/**
+ * Tab when the user selects an exchange: a paused phase wins; a WebSocket / SSE exchange opens on its messages;
+ * leaving one for a plain exchange goes back to the response.
+ */
+function tabForSelect(ex: Exchange | undefined, current: DetailTab): DetailTab {
+  const t = tabFor(ex, current);
+  if (!ex || t !== current || (ex.state === 'paused-request' || ex.state === 'paused-response')) return t;
+  if (hasFrames(ex)) return 'messages';
+  return current === 'messages' ? 'response' : current;
+}
+
 function omit<T>(rec: Record<string, T>, key: string): Record<string, T> {
   if (!(key in rec)) return rec;
   const { [key]: _, ...rest } = rec;
@@ -505,10 +549,13 @@ export function hasActiveFilters(f: Filters): boolean {
  * src:, -negation); it is AND-ed with the method / status-class / paused-only controls.
  */
 export function filterExchanges(exchanges: Exchange[], f: Filters, contracts?: Record<string, ContractSummary>): Exchange[] {
-  if (!hasActiveFilters(f)) return exchanges;
   const parsed = parseFilter(f.text);
+  // Browser-internal traffic is hidden unless the toggle is on or the filter asks for it (`browser:`).
+  const hideBrowser = !f.showBrowser && !parsed.keys.has('browser');
+  if (!hasActiveFilters(f) && !(hideBrowser && exchanges.some(isBrowserInternal))) return exchanges;
   const method = f.method.toUpperCase();
   return exchanges.filter((e) => {
+    if (hideBrowser && e.browserInternal) return false;
     if (f.pausedOnly && !isPaused(e)) return false;
     if (method && e.method.toUpperCase() !== method) return false;
     if (f.statusClasses.length) {
@@ -517,6 +564,16 @@ export function filterExchanges(exchanges: Exchange[], f: Filters, contracts?: R
     }
     return parsed.empty || matchesFilter(e, parsed, { contracts });
   });
+}
+
+const isBrowserInternal = (e: Exchange) => !!e.browserInternal;
+
+/** How many browser-internal exchanges the list hides right now (0 when the toggle or a `browser:` token shows them). */
+export function hiddenBrowserCount(exchanges: Exchange[], f: Filters): number {
+  if (f.showBrowser || parseFilter(f.text).keys.has('browser')) return 0;
+  let n = 0;
+  for (const e of exchanges) if (e.browserInternal) n++;
+  return n;
 }
 
 // ---------------------------------------------------------------- paused-exchange drafts
@@ -833,9 +890,22 @@ export function upsertRule(rules: Rule[], rule: Rule): Rule[] {
   return out;
 }
 
+/**
+ * A matcher as the preview applies it to recorded exchanges. method + url are the proxy's own matcher;
+ * `graphqlOperation` (CONTRACTS §11.2) is compared with the operation the proxy detected (`Exchange.graphql`),
+ * which is what its body-based check finds too. Native exchanges (captured: 'vm-profile') never match: rules
+ * never apply to them.
+ */
+export type ExchangeTest = (ex: Pick<Exchange, 'method' | 'url' | 'graphql' | 'captured'>) => boolean;
+export function compileExchangeMatcher(m: Rule['match']): ExchangeTest {
+  const op = m.graphqlOperation?.trim();
+  const test = compileMatcher({ method: m.method, url: m.url });
+  return (ex) => !ex.captured && test(ex.method, ex.url) && (!op || ex.graphql?.operationName === op);
+}
+
 /** Index of the rule that would handle `ex` (first enabled match wins), or -1. */
-export function winningRuleIndex(rules: Rule[], ex: Pick<Exchange, 'method' | 'url'>): number {
-  return rules.findIndex((r) => r.enabled && matches(r.match, ex.method, ex.url));
+export function winningRuleIndex(rules: Rule[], ex: Pick<Exchange, 'method' | 'url' | 'graphql' | 'captured'>): number {
+  return rules.findIndex((r) => r.enabled && compileExchangeMatcher(r.match)(ex));
 }
 
 export interface RuleStat { matches: number; wins: number }
@@ -847,13 +917,13 @@ export interface RuleStat { matches: number; wins: number }
  */
 export function ruleStats(rules: Rule[], exchanges: Exchange[]): RuleStat[] {
   // compileMatcher is the proxy's own matcher (same module as `matches`), compiled once per rule.
-  const compiled = rules.map((r) => ({ test: compileMatcher(r.match), enabled: r.enabled }));
+  const compiled = rules.map((r) => ({ test: compileExchangeMatcher(r.match), enabled: r.enabled }));
   const stats = rules.map(() => ({ matches: 0, wins: 0 }));
   for (const ex of exchanges) {
     let won = false;
     for (let i = 0; i < compiled.length; i++) {
       const c = compiled[i];
-      if (!c.test(ex.method, ex.url)) continue;
+      if (!c.test(ex)) continue;
       stats[i].matches++;
       if (c.enabled && !won) { stats[i].wins++; won = true; }
     }
@@ -863,9 +933,9 @@ export function ruleStats(rules: Rule[], exchanges: Exchange[]): RuleStat[] {
 
 /** How many exchanges a matcher matches (rule editor preview). */
 export function countMatches(m: Rule['match'], exchanges: Exchange[]): number {
-  const test = compileMatcher(m);
+  const test = compileExchangeMatcher(m);
   let n = 0;
-  for (const e of exchanges) if (test(e.method, e.url)) n++;
+  for (const e of exchanges) if (test(e)) n++;
   return n;
 }
 
@@ -884,7 +954,14 @@ export function describeAction(a: RuleAction): string {
     case 'throttle': return `Throttle (${describeProfile({ kind: 'throttle', latencyMs: a.latencyMs, kbps: a.kbps, dropRate: a.dropRate })})`;
     case 'fault': return `Fault: ${FAULT_LABEL[a.fault]}`;
     case 'mutate': return `Mutate: ${describeMutateOps(a.ops)}`;
+    case 'cors': return describeCors(a);
   }
+}
+
+/** "CORS (dev only): allow the request's origin", "+ credentials". */
+export function describeCors(a: { allowOrigin?: string; allowCredentials?: boolean }): string {
+  const origin = a.allowOrigin?.trim() ? a.allowOrigin.trim() : 'localhost origins';
+  return `CORS (dev only): allow ${origin}${a.allowCredentials ? ' + credentials' : ''}`;
 }
 
 const MAX_VALUE_TEXT = 40;
@@ -937,7 +1014,12 @@ export function ruleBudget(rule: Pick<Rule, 'times' | 'expiresAt'>, hits: number
 }
 
 export function ruleLabel(r: Rule): string {
-  return r.name?.trim() || `${r.match.method ? r.match.method.toUpperCase() + ' ' : ''}${r.match.url}`;
+  return r.name?.trim() || matcherLabel(r.match);
+}
+
+/** "POST https://api.example.com/graphql · op getUser". */
+export function matcherLabel(m: Rule['match']): string {
+  return `${m.method ? m.method.toUpperCase() + ' ' : ''}${m.url}${m.graphqlOperation ? ` · op ${m.graphqlOperation}` : ''}`;
 }
 
 /** Rules created through the Agent API are named "[agent] …" (CONTRACTS §8). */
@@ -950,7 +1032,7 @@ export function isAgentRule(r: Pick<Rule, 'name'> | undefined): boolean {
 export function ruleDisplayName(r: Rule): string {
   if (!isAgentRule(r)) return ruleLabel(r);
   const rest = r.name!.slice(AGENT_RULE_PREFIX.length).trim();
-  return rest || `${r.match.method ? r.match.method.toUpperCase() + ' ' : ''}${r.match.url}`;
+  return rest || matcherLabel(r.match);
 }
 
 export interface RuleForm {
@@ -971,6 +1053,10 @@ export interface RuleForm {
   throttle: ThrottleFields;
   fault: FaultKind;
   mutateOps: MutateRow[];
+  /** CONTRACTS §11: '' = any operation. */
+  graphqlOperation: string;
+  corsOrigin: string;           // '' = echo the request's Origin
+  corsCredentials: boolean;
   times: string;                // '' = unlimited; 1–1000
   expiresIn: string;            // '' = never
   expiresUnit: ExpiryUnit;
@@ -1004,6 +1090,9 @@ export function ruleToForm(rule?: Rule, now = Date.now()): RuleForm {
     throttle: { latencyMs: '400', kbps: '', dropPct: '' },
     fault: 'reset',
     mutateOps: [{ path: '', op: 'null', value: '' }],
+    graphqlOperation: rule?.match.graphqlOperation ?? '',
+    corsOrigin: '',
+    corsCredentials: false,
     times: rule?.times !== undefined ? String(rule.times) : '',
     expiresIn: '',
     expiresUnit: 'm',
@@ -1031,13 +1120,16 @@ export function ruleToForm(rule?: Rule, now = Date.now()): RuleForm {
   } else if (a?.kind === 'mutate') {
     // valueJson (byte-exact text) wins over value, like on the proxy.
     f.mutateOps = a.ops.map((o) => ({ path: o.path, op: o.op, value: o.op === 'set' ? o.valueJson ?? jsonText(o.value) : '' }));
+  } else if (a?.kind === 'cors') {
+    f.corsOrigin = a.allowOrigin ?? '';
+    f.corsCredentials = !!a.allowCredentials;
   }
   return f;
 }
 
 export type RuleFormField =
   | 'url' | 'method' | 'mockStatus' | 'mockDelayMs' | 'blockStatus' | 'mockHeaders'
-  | 'latencyMs' | 'kbps' | 'dropPct' | 'throttle' | 'times' | 'expiresIn' | 'mutate';
+  | 'latencyMs' | 'kbps' | 'dropPct' | 'throttle' | 'times' | 'expiresIn' | 'mutate' | 'graphqlOperation' | 'cors';
 
 export interface RuleFormValidation {
   errors: Partial<Record<RuleFormField, string>>;
@@ -1067,6 +1159,12 @@ export function validateRuleForm(f: RuleForm): RuleFormValidation {
     }
   }
   if (f.method.trim() && !/^[A-Za-z]+$/.test(f.method.trim())) errors.method = 'Letters only, e.g. GET';
+  const op = f.graphqlOperation.trim();
+  if (op && !/^[_A-Za-z][_0-9A-Za-z]*$/.test(op)) errors.graphqlOperation = 'A GraphQL operation name: letters, digits and _, e.g. getUser';
+  if (f.kind === 'cors') {
+    const c = corsActionError(f.corsOrigin, f.corsCredentials);
+    if (c) errors.cors = c;
+  }
   let json: JsonCheck | undefined;
   if (f.kind === 'mock') {
     if (!isStatus(f.mockStatus)) errors.mockStatus = '100–599';
@@ -1140,12 +1238,17 @@ export function formToRule(f: RuleForm, now = Date.now()): Rule {
         ? { path: r.path.trim(), op: 'set', value: JSON.parse(r.value), valueJson: r.value.trim() }
         : { path: r.path.trim(), op: r.op })),
     };
+  } else if (f.kind === 'cors') {
+    action = { kind: 'cors' };
+    if (f.corsOrigin.trim()) action.allowOrigin = f.corsOrigin.trim();
+    if (f.corsCredentials) action.allowCredentials = true;
   } else {
     action = { kind: 'breakpoint', phase: f.phase };
   }
   const rule: Rule = { id: f.id, enabled: f.enabled, match: { url: f.url.trim() }, action };
   if (f.name.trim()) rule.name = f.name.trim();
   if (f.method.trim()) rule.match.method = f.method.trim().toUpperCase();
+  if (f.graphqlOperation.trim()) rule.match.graphqlOperation = f.graphqlOperation.trim();
   if (f.times.trim()) rule.times = Number(f.times.trim());
   if (f.keepExpiresAt !== undefined) rule.expiresAt = f.keepExpiresAt;
   else if (f.expiresIn.trim()) rule.expiresAt = now + Math.round(Number(f.expiresIn.trim()) * EXPIRY_UNIT_MS[f.expiresUnit]);

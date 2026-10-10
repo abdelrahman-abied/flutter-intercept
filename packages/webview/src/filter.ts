@@ -13,6 +13,11 @@
  *   src:api.dart        a source frame's uri contains it
  *   contract:error      model check result (CONTRACTS §10.5): error | warning (worst is a warning) | ok |
  *                       unchecked (no result, or the host could not check it); prefix ok, comma = any of
+ *   kind:ws             CONTRACTS §11: ws (websocket) | sse | http (plain); prefix ok, comma = any of
+ *   op:getUser          GraphQL operation name, case-insensitive prefix; comma = any of
+ *   cors:problem        CORS diagnosis: problem | ok | preflight | patched (prefix ok, comma = any of)
+ *   captured:native     recorded from the app's HTTP profile (read-only); captured:proxy = the rest
+ *   browser:internal    Flutter Web: the browser's own traffic (hidden from the list unless asked for); browser:app = the rest
  *   -token              negates any of the above
  *
  * Tokens are AND-ed. A token with an empty value (`m:` while typing) is ignored; a token with an invalid
@@ -24,6 +29,7 @@
 import type { Body, ContractSummary, Exchange, ExchangeState } from './protocol';
 import { CONTRACT_STATUSES, contractStatus, type ContractStatus } from './contract';
 import { headerValue, isJsonContentType, statusClassOf } from './util';
+import { CORS_STATUSES, corsMatches, type CorsStatus } from './coverage';
 
 export type ContentClass = 'json' | 'html' | 'image' | 'text' | 'xml' | 'binary' | 'other';
 export const CONTENT_CLASSES: readonly ContentClass[] = ['json', 'html', 'image', 'text', 'xml', 'binary', 'other'];
@@ -34,17 +40,25 @@ const STATES: readonly ExchangeState[] = [
 /** Extra `state:` values that are not ExchangeState names. */
 const STATE_EXTRAS = ['simulated', 'resent', 'sent'] as const;
 
-export const FILTER_KEYS = ['m', 's', 't', 'body', 'h', 'state', 'src', 'contract'] as const;
+export const FILTER_KEYS = ['m', 's', 't', 'body', 'h', 'state', 'src', 'contract', 'kind', 'op', 'cors', 'captured', 'browser'] as const;
 type Key = (typeof FILTER_KEYS)[number];
 const ALIASES: Record<string, Key> = {
   m: 'm', method: 'm', s: 's', status: 's', t: 't', type: 't', body: 'body', h: 'h', header: 'h',
   state: 'state', is: 'state', src: 'src', source: 'src', contract: 'contract', model: 'contract',
+  kind: 'kind', op: 'op', operation: 'op', gql: 'op', cors: 'cors', captured: 'captured', browser: 'browser',
 };
+
+type KindValue = 'ws' | 'sse' | 'http';
+const KIND_VALUES: readonly { name: string; kind: KindValue }[] = [
+  { name: 'ws', kind: 'ws' }, { name: 'websocket', kind: 'ws' }, { name: 'sse', kind: 'sse' }, { name: 'http', kind: 'http' },
+];
+const kindOf = (e: Exchange): KindValue => (e.kind === 'websocket' ? 'ws' : e.kind === 'sse' ? 'sse' : 'http');
 
 export const FILTER_HINT =
   'Filter: words match the URL · m:POST · s:404 s:4xx s:error · t:json|html|image|text|xml|binary|other · ' +
   'body:token body:"a phrase" · h:name h:name=value · state:paused|mocked|blocked|error|simulated|resent · ' +
-  'src:file.dart · contract:error|warning|ok|unchecked · -token negates';
+  'src:file.dart · contract:error|warning|ok|unchecked · kind:ws|sse|http · op:getUser (GraphQL) · ' +
+  'cors:problem|ok|preflight · captured:native · browser:internal|app · -token negates';
 
 /** What a filter can see besides the exchange itself. */
 export interface FilterContext { contracts?: Record<string, ContractSummary> }
@@ -56,6 +70,8 @@ export interface ParsedFilter {
   errors: string[];
   /** True when nothing would be filtered (all tokens empty / invalid). */
   empty: boolean;
+  /** Canonical keys of the valid tokens (e.g. `browser`, which also un-hides browser-internal traffic). */
+  keys: Set<string>;
 }
 
 // ---------------------------------------------------------------- tokenizer
@@ -219,6 +235,46 @@ function contractPred(raw: string): Pred | string {
   return (e, x) => wanted.has(contractStatus(x.contracts?.[e.id]));
 }
 
+function kindPred(raw: string): Pred | string {
+  const wanted = new Set<KindValue>();
+  for (const v of raw.toLowerCase().split(',').filter(Boolean)) {
+    const hits = KIND_VALUES.filter((k) => k.name.startsWith(v));
+    if (!hits.length) return `kind:${raw} — use ws, sse or http`;
+    hits.forEach((k) => wanted.add(k.kind));
+  }
+  return (e) => wanted.has(kindOf(e));
+}
+
+function corsPred(raw: string): Pred | string {
+  const wanted: CorsStatus[] = [];
+  for (const v of raw.toLowerCase().split(',').filter(Boolean)) {
+    const hits = CORS_STATUSES.filter((c) => c.startsWith(v));
+    if (!hits.length) return `cors:${raw} — use ${CORS_STATUSES.join(', ')}`;
+    wanted.push(...hits);
+  }
+  return (e) => wanted.some((w) => corsMatches(e, w));
+}
+
+function capturedPred(raw: string): Pred | string {
+  const preds: Pred[] = [];
+  for (const v of raw.toLowerCase().split(',').filter(Boolean)) {
+    if ('native'.startsWith(v) || v === 'vm-profile' || v === 'profile') preds.push((e) => e.captured === 'vm-profile');
+    else if ('proxy'.startsWith(v)) preds.push((e) => !e.captured);
+    else return `captured:${raw} — use native or proxy`;
+  }
+  return preds.length === 1 ? preds[0] : (e, x) => preds.some((p) => p(e, x));
+}
+
+function browserPred(raw: string): Pred | string {
+  const preds: Pred[] = [];
+  for (const v of raw.toLowerCase().split(',').filter(Boolean)) {
+    if ('internal'.startsWith(v)) preds.push((e) => !!e.browserInternal);
+    else if ('app'.startsWith(v)) preds.push((e) => !e.browserInternal);
+    else return `browser:${raw} — use internal or app`;
+  }
+  return preds.length === 1 ? preds[0] : (e, x) => preds.some((p) => p(e, x));
+}
+
 function compileToken(t: RawToken): { pred: Pred; cost: number } | string | undefined {
   const key = t.key ? ALIASES[t.key] : undefined;
   const value = t.value;
@@ -263,6 +319,32 @@ function compileToken(t: RawToken): { pred: Pred; cost: number } | string | unde
       const p = contractPred(value);
       return typeof p === 'string' ? p : { pred: p, cost: 0 };
     }
+    case 'kind': {
+      const p = kindPred(value);
+      return typeof p === 'string' ? p : { pred: p, cost: 0 };
+    }
+    case 'op': {
+      const vs = value.toLowerCase().split(',').filter(Boolean);
+      return {
+        pred: (e) => {
+          const name = e.graphql?.operationName?.toLowerCase();
+          return name !== undefined && vs.some((v) => name.startsWith(v));
+        },
+        cost: 0,
+      };
+    }
+    case 'cors': {
+      const p = corsPred(value);
+      return typeof p === 'string' ? p : { pred: p, cost: 0 };
+    }
+    case 'captured': {
+      const p = capturedPred(value);
+      return typeof p === 'string' ? p : { pred: p, cost: 0 };
+    }
+    case 'browser': {
+      const p = browserPred(value);
+      return typeof p === 'string' ? p : { pred: p, cost: 0 };
+    }
     case 'body': {
       const v = value.toLowerCase();
       return { pred: (e) => lowerBodyText(e.requestBody).includes(v) || lowerBodyText(e.responseBody).includes(v), cost: 9 };
@@ -278,15 +360,17 @@ export function parseFilter(text: string): ParsedFilter {
   if (text === lastText && lastParsed) return lastParsed;
   const terms: Term[] = [];
   const errors: string[] = [];
+  const keys = new Set<string>();
   for (const tok of tokenize(text)) {
     const c = compileToken(tok);
     if (c === undefined) continue;
     if (typeof c === 'string') { errors.push(c); continue; }
     terms.push({ pred: c.pred, negate: tok.negate, cost: c.cost });
+    if (tok.key) keys.add(ALIASES[tok.key]);
   }
   // Cheap predicates first: `m:POST body:x` only searches bodies of POSTs.
   terms.sort((a, b) => a.cost - b.cost);
-  const parsed: ParsedFilter = { terms, errors, empty: terms.length === 0 };
+  const parsed: ParsedFilter = { terms, errors, empty: terms.length === 0, keys };
   lastText = text;
   lastParsed = parsed;
   return parsed;

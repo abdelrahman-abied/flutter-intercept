@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.5.0
+
+### Coverage: Web, WebSockets, SSE, GraphQL, native clients
+
+**Flutter Web**
+- Apps launched in Chrome from VS Code are intercepted too: the Chrome that `flutter run` starts gets Flutter
+  Intercept as its proxy and trusts only its CA. Your own browser is untouched. Setting `flutterIntercept.web.enabled`.
+- CORS: browser requests show why they would be blocked. Mocks answer their own preflights and carry the CORS
+  headers a browser needs. **Add CORS rule (dev only)** unblocks a real API while you develop.
+- Chrome's own background requests are hidden by default (**Show browser traffic**).
+- The `web-server` device can't be intercepted (you open the page in your own browser).
+
+**WebSockets and Server-Sent Events**
+- WebSocket connections are recorded with every message in both directions, and SSE streams with every event,
+  live in a **Messages** tab (filter, JSON view, binary hex, close codes). Block and fault rules work on sockets.
+
+**GraphQL**
+- The operation name shows in the list (`GQL getUser`), filter with `op:getUser`, and rules can match one
+  operation on a shared `/graphql` endpoint.
+
+**Native HTTP clients and background isolates**
+- Requests from `cupertino_http`, `cronet_http` and other `package:http_profile` clients bypass the proxy; they are
+  now listed read-only (marked `native`) from the app's HTTP profile, in debug and profile mode. Setting
+  `flutterIntercept.nativeClients`.
+- When the app starts a background isolate (`compute`, `Isolate.run`), a banner says its requests aren't intercepted.
+
+### Agent API
+- New tools: `get_frames` (WebSocket messages / SSE events, redacted) and `add_cors_rule` (dev only).
+- `list_requests` filters by `kind` and `graphqlOperation`; rule tools take `graphqlOperation`; `get_status`
+  includes session warnings. Browser-internal traffic is excluded unless `includeBrowserInternal`.
+
 ## 0.4.0
 
 ### Your models vs the real API

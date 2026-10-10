@@ -114,3 +114,14 @@ Contract: CONTRACTS §10 (types already in code). Same rules as v0.3.0.
 | H host + agent | `src/agent/**` (new tools, MCP resources + prompts), `src/ui/controller.ts`, `src/proxyHost.ts`, their tests, `test/integration/suite/agent.ts` |
 | W webview | `packages/webview/**` except `protocol.ts` |
 | lead | contract, `extension.ts`, extension `package.json`, docs, device E2E, review |
+
+## v0.5.0 — Coverage (started 2026-10-10, branch `feature/0.5.0`)
+Contract: CONTRACTS §11. Same rules as before.
+| Agent | Owns |
+|---|---|
+| P proxy | WebSocket/SSE recording, GraphQL detection + `graphqlOperation` matching, CORS diagnosis + preflight + `cors` action, `record()/update()` — `packages/proxy/**` except `types.ts`/`network.ts` |
+| B web | Flutter Web spike + `src/debug/**` web path, `src/ca.ts` (SPKI helper), new `samples/web_app/**`, a `web` integration suite (`test/integration/suite/web.ts` + its runTest.ts hook), docs/spikes/web.md |
+| V vm | VM service spike + `src/vm/**` (isolate warnings, native-client profile import), its tests, `samples/demo_app/{lib,pubspec.yaml}` scenarios (WebSocket, SSE, GraphQL, a native client, a background isolate), docs/spikes/vm-service.md |
+| H host + agent | `src/agent/**`, `src/ui/controller.ts`, `src/proxyHost.ts`, their tests, `test/integration/suite/agent.ts` |
+| W webview | `packages/webview/**` except `protocol.ts` |
+| lead | contract, `extension.ts`, extension `package.json`, docs, device E2E, review |

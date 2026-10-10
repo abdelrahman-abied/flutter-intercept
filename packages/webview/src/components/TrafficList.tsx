@@ -7,7 +7,8 @@ import type { ContractSummary, Rule } from '../protocol';
 import { contractBadgeTitle, contractStatus } from '../contract';
 import { bodyByteLength, formatBytes, formatDuration, isPaused, shortFrameLocation, splitUrl } from '../util';
 import { useExchangeActions } from './actions';
-import { AgentBadge, MenuList, PauseTimer, StateBadge, StatusText } from './bits';
+import { AgentBadge, CoverageBadges, MenuList, PauseTimer, StateBadge, StatusText } from './bits';
+import { frameTotal, hasFrames } from '../frames';
 
 export const ROW_HEIGHT = 22;
 const OVERSCAN = 8;
@@ -172,9 +173,13 @@ function Row({ ex, selected, gaveUp, agentRule, contract, onSelect, onOpen, onMe
       <span class="c-method">{ex.method}</span>
       <span class="c-status"><StatusText ex={ex} /></span>
       <span class="c-host" title={host}>{host}</span>
-      <span class="c-path" title={app ? `${ex.url}\nCalled from ${app.fn} (${shortFrameLocation(app)})` : ex.url}>{path}</span>
+      <span class="c-path" title={app ? `${ex.url}\nCalled from ${app.fn} (${shortFrameLocation(app)})` : ex.url}>
+        <CoverageBadges ex={ex} mini />{path}
+      </span>
       <span class="c-dur">{isPaused(ex) ? <PauseTimer ex={ex} /> : formatDuration(ex.durationMs)}</span>
-      <span class="c-size">{formatBytes(size)}{ex.responseBody?.truncated ? '+' : ''}</span>
+      {hasFrames(ex)
+        ? <span class="c-size" title={`${frameTotal(ex)} ${ex.kind === 'sse' ? 'events' : 'messages'}`}>{frameTotal(ex)} msg</span>
+        : <span class="c-size">{formatBytes(size)}{ex.responseBody?.truncated ? '+' : ''}</span>}
       <span class="c-state">
         <StateBadge ex={ex} gaveUp={gaveUp} />
         {agentRule && <AgentBadge title={`Matched agent rule “${ruleDisplayName(agentRule)}”`} />}

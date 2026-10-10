@@ -57,6 +57,11 @@ and the traffic shows up.
   sample of a route, and **Generate test fixture** (JSON fixtures + a http_mock_adapter / MockClient / mocktail
   test). Both open as unsaved editors.
 
+**WebSockets, SSE and GraphQL**
+- WebSocket connections and Server-Sent Events streams are recorded message by message, live, in a **Messages**
+  tab. Block and fault rules work on sockets.
+- GraphQL requests show their operation name; filter with `op:getUser` and match rules to one operation.
+
 **Copy and resend**
 - **Copy as cURL**, **Copy as Dart (http)** or **Copy as Dio** from the detail pane or a row's right-click menu.
 - **Resend** a request unchanged, or **Edit and resend** it. The new request is listed with a link to the original.
@@ -208,6 +213,8 @@ Cursor, and any client that speaks MCP (Model Context Protocol).
 | Generate a Dart model or a fixture test from recorded traffic | `generate_model`, `generate_fixture_test` |
 | Check traffic with pass/fail expectations (status, count, order, JSON paths, duration) | `assert_traffic` |
 | Change fields in real JSON responses (null, remove, set) | `add_mutation` |
+| Read WebSocket messages and SSE events | `get_frames` |
+| Add CORS headers to a real API while developing (Flutter Web) | `add_cors_rule` |
 
 Over MCP there are also resources (`intercept://exchange/{id}`, `intercept://paused`, `intercept://rules`,
 `intercept://contract/{id}`) and prompts (`debug-failing-request`, `test-error-states`, `verify-change`,
@@ -268,6 +275,20 @@ Running the command again updates it in place, and the rest of the file is left 
 - "Mock the feed endpoint with a 10-second delay and check the loading state."
 - "Pause the next checkout request, change the quantity to 3, and resume it."
 
+## Flutter Web
+
+Run your web app on **Chrome** from VS Code as usual. The Chrome that `flutter run` starts uses Flutter
+Intercept as its proxy and trusts only its CA (pinned by key); your everyday browser is not touched.
+
+- Browser requests show CORS problems ("No Access-Control-Allow-Origin header…"). Mocks answer their own
+  preflights. **Add CORS rule (dev only)** adds the CORS headers to a real API's responses while you develop —
+  your server still needs the right CORS setup for production.
+- Chrome's own background requests are hidden; **Show browser traffic** shows them.
+- Everything you open in that debug Chrome window goes through the proxy and is recorded (like any site you
+  browse there), so keep it to your app. Launches that use your own Chrome profile (`--user-data-dir`) are not
+  intercepted.
+- Not intercepted: the `web-server` device (you open the page in your own browser) and release builds.
+
 ## Settings and commands
 
 | Setting | Default | Description |
@@ -277,6 +298,8 @@ Running the command again updates it in place, and the rest of the file is left 
 | `flutterIntercept.agent.access` | `readWrite` | What AI agents may do: `readWrite`, `readOnly` or `off`. See [Use with AI agents](#use-with-ai-agents). |
 | `flutterIntercept.agent.redactSecrets` | `true` | Show secrets (auth headers, cookies, tokens, passwords) to agents as `[redacted]`. |
 | `flutterIntercept.captureSource` | `true` | Record which line of your code made each request (see [Where a request came from](#features)). Applies at the next launch. Flutter sessions only: plain Dart programs can't take the setting (the Dart VM rejects `--dart-define`) and always record. |
+| `flutterIntercept.web.enabled` | `true` | Intercept Flutter Web apps launched in Chrome from VS Code. |
+| `flutterIntercept.nativeClients` | `profile` | List requests of native HTTP clients (cupertino_http, cronet_http) read-only from the app's HTTP profile, or `off`. |
 | `flutterIntercept.contractCheck` | `true` | Check JSON responses against your json_serializable / freezed models and show fields that would make `fromJson` throw. |
 | `flutterIntercept.rewriteLocalhost` | `true` | Requests to `10.0.2.2` / `10.0.3.2` (the emulator's names for your Mac) go to your Mac's `localhost`. Never applies to iPhones. |
 | `flutterIntercept.agent.mcpPort` | `47823` | Port of the local MCP server for agents. If it's busy, the next free port is used. |
@@ -294,10 +317,12 @@ Running the command again updates it in place, and the rest of the file is left 
 
 What isn't intercepted, or behaves differently while intercepting:
 
-- **Flutter web**: it has no `dart:io`.
-- **Native HTTP stacks**: `cronet_http`, `cupertino_http`, `native_dio_adapter`. They bypass `dart:io`.
-- **Background isolates** (`compute`, `Isolate.spawn`): `HttpOverrides` apply per isolate, so clients created
-  there go direct.
+- **Flutter web**: only on Chrome launched from VS Code (not the `web-server` device). There is no direct
+  fallback: if the proxy stops, the page loses network until you restart the session.
+- **Native HTTP stacks**: `cronet_http`, `cupertino_http`, `native_dio_adapter` bypass `dart:io`. Their requests
+  are listed read-only (from the app's HTTP profile) but can't be mocked, paused or blocked.
+- **Background isolates** (`compute`, `Isolate.run`, `Isolate.spawn`): `HttpOverrides` apply per isolate, so
+  clients created there go direct. A banner tells you when the app starts one.
 - **Apps that install their own `HttpOverrides` zone** (`HttpOverrides.runWithHttpOverrides` or `runZoned`
   around their code): the inner zone wins.
   - Setting `HttpOverrides.global` is fine: your overrides still apply underneath.

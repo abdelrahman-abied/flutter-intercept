@@ -1,0 +1,25 @@
+{
+ "type": "VM",
+ "name": "vm",
+ "isolates": [
+  {
+   "type": "@Isolate",
+   "id": "isolates/2076393927106903",
+   "name": "main",
+   "number": "2076393927106903",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/891734549963539"
+  }
+ ],
+ "systemIsolates": [
+  {
+   "type": "@Isolate",
+   "id": "isolates/4709899782223187",
+   "name": "vm-service",
+   "number": "4709899782223187",
+   "isSystemIsolate": true,
+   "isolateGroupId": "isolateGroups/58965885280735"
+  }
+ ],
+ "version": "3.13.5 (stable) (Tue Sep 29 01:00:52 2026 -0700) on \"android_arm64\""
+}

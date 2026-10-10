@@ -49,6 +49,8 @@ Intercept skips all of that:
 | **Model check** | Each JSON response is checked against your json_serializable / freezed models; fields that would crash `fromJson` are flagged in your model file. |
 | **Break a field** | Make a field null, remove it or change it in real responses to reproduce crashes. |
 | **Generate code** | Dart models and fixture tests from recorded traffic. |
+| **Web, WebSockets, SSE, GraphQL** | Flutter Web on Chrome (with CORS help), WebSocket messages, SSE events, GraphQL operation names. |
+| **Native clients** | cupertino_http / cronet_http requests listed read-only; a banner for background isolates. |
 | **Rules** | Glob or `/regex/` URL matching plus method. First match wins. Saved per workspace. |
 | **Theme-aware** | Follows your VS Code theme: light, dark and high contrast. |
 
@@ -150,9 +152,9 @@ Read the full [security notes](packages/extension/README.md#security). To report
 
 These aren't intercepted:
 
-- Flutter web.
-- Native HTTP stacks such as `cronet_http`, `cupertino_http` and `native_dio_adapter`.
-- Clients created in background isolates (`compute`, `Isolate.spawn`).
+- Flutter web on the `web-server` device (Chrome from VS Code works).
+- Native HTTP stacks such as `cronet_http` and `cupertino_http` (listed read-only, not interceptable).
+- Clients created in background isolates (`compute`, `Isolate.spawn`) — a banner tells you.
 - Apps that wrap their code in their own `HttpOverrides` zone.
 
 Certificate pinning with Dio's `validateCertificate` and mTLS client certificates fail while intercepting. See

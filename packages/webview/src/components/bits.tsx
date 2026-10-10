@@ -2,6 +2,8 @@ import { Fragment, type ComponentChildren } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { Exchange, ExchangeState } from '../protocol';
 import { isPaused, pauseClock, statusClassOf } from '../util';
+import { gqlLabel, gqlTitle, isNative, NATIVE_READ_ONLY } from '../coverage';
+import { KIND_BADGE, kindTitle } from '../frames';
 
 const STATE_LABEL: Record<ExchangeState, string> = {
   'pending': 'pending',
@@ -36,6 +38,25 @@ export function StateBadge({ ex, gaveUp }: { ex: Pick<Exchange, 'state' | 'error
     <span class={`badge state state-${ex.state}`} title={ex.error ?? STATE_TITLE[ex.state] ?? ex.state}>
       {label}
     </span>
+  );
+}
+
+/**
+ * CONTRACTS §11.5 badges: WS / SSE, the GraphQL operation, `native` (read-only VM-profile capture) and a CORS
+ * problem marker. `mini` = the list row's compact form.
+ */
+export function CoverageBadges({ ex, mini }: {
+  ex: Pick<Exchange, 'kind' | 'frames' | 'framesDropped' | 'state' | 'graphql' | 'captured' | 'cors'>; mini?: boolean;
+}) {
+  const m = mini ? ' mini' : '';
+  const gql = gqlLabel(ex);
+  return (
+    <>
+      {ex.kind && <span class={`badge${m} kind-badge kb-${ex.kind}`} title={kindTitle(ex)}>{KIND_BADGE[ex.kind]}</span>}
+      {gql && <span class={`badge${m} gql-badge`} title={gqlTitle(ex)}>{gql}</span>}
+      {isNative(ex) && <span class={`badge${m} native-badge`} title={NATIVE_READ_ONLY}>native</span>}
+      {ex.cors?.problem && <span class={`badge${m} cors-badge`} title={`CORS: ${ex.cors.problem}`}>CORS</span>}
+    </>
   );
 }
 

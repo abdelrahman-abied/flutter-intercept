@@ -5,6 +5,7 @@
  * Engines stay ^1.90, whose typings predate the LM tools API: the API is feature-detected at runtime
  * (`vscode.lm.registerTool`) and typed with the minimal shim below.
  */
+import { corsPolicyText } from './corsPolicy';
 import { AgentToolError, AgentTools, isWriteTool, READ_TOOLS, ToolName, ToolResult, WRITE_TOOLS } from './types';
 
 export const LM_TOOL_PREFIX = 'flutter_intercept_';
@@ -72,7 +73,7 @@ const str = (v: unknown) => (typeof v === 'string' && v ? v : undefined);
 /** Inline code for MarkdownString (no backticks / newlines can break out). */
 const code = (v: unknown) => '`' + String(v).replace(/[`\r\n]/g, ' ').slice(0, 300) + '`';
 const methodOf = (i: Record<string, unknown>) => (str(i.method) ? String(i.method).toUpperCase() : 'any method');
-const target = (i: Record<string, unknown>) => `${methodOf(i)} ${code(i.url ?? '*')}`;
+const target = (i: Record<string, unknown>) => `${methodOf(i)} ${code(i.url ?? '*')}${str(i.graphqlOperation) ? ` (GraphQL operation ${code(i.graphqlOperation)})` : ''}`;
 
 /** Short status line shown while the tool runs. */
 export function invocationMessage(tool: ToolName, input: unknown): string {
@@ -136,6 +137,10 @@ export function invocationMessage(tool: ToolName, input: unknown): string {
       return `Checking traffic for ${m}${plain(i.url)}${Number(i.withinMs) > 0 ? ` (waiting up to ${Math.round(Math.min(Number(i.withinMs), 120_000) / 1000)} s)` : ''}`;
     case 'add_mutation':
       return `Adding response mutation for ${m}${plain(i.url)}`;
+    case 'get_frames':
+      return `Reading the frames of ${plain(i.id)}${typeof i.since === 'number' ? ` from #${i.since}` : ''}`;
+    case 'add_cors_rule':
+      return `Adding a development-only CORS rule for ${m}${plain(i.url)}`;
   }
 }
 
@@ -289,6 +294,16 @@ export function confirmationText(tool: ToolName, input: unknown, ruleName?: stri
           `For ${target(i)}: forward to the real server, then ${opsText(i.ops)} in the JSON response before the app gets it${named}${spendText(i)}.\n\n` +
           'Inserted as the first rule.',
       };
+    case 'add_cors_rule': {
+      const origin = str(i.allowOrigin);
+      return {
+        title: 'Add a CORS rule (development only)',
+        message:
+          `For ${target(i)}: answer the browser's CORS preflight locally and add CORS headers to the real responses${named}${spendText(i)}.\n\n` +
+          `${corsPolicyText(origin ? code(origin) : undefined, origin, i.allowCredentials === true)}\n\n` +
+          "Development only: the real server's CORS policy is **not** changed, so the same requests still fail without Flutter Intercept. Inserted as the first rule.",
+      };
+    }
     default:
       return { title: 'Flutter Intercept', message: invocationMessage(tool, input) };
   }

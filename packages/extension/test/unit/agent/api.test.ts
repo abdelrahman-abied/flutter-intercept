@@ -177,6 +177,8 @@ describe('read tools', () => {
       exchangeCount: 2,
       agentAccess: 'readWrite',
       networkProfile: { kind: 'none', label: 'No throttling' },
+      browserInternalHidden: 0,
+      warnings: [],
     });
   });
 

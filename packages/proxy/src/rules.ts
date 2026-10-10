@@ -1,8 +1,16 @@
 // Pure, dependency-free rule helpers (type-only imports). The webview imports this module
 // (`@flutter-intercept/proxy/rules`) so its preview can never disagree with the proxy.
 import type { Exchange, Matcher, Rule, RuleAction } from './types';
+import { graphqlOperationNames } from './graphql';
 
-export type CompiledMatcher = (method: string, url: string) => boolean;
+export { detectGraphql, graphqlOperationNames, scanOperations } from './graphql';
+export type { GraphqlDetection, GraphqlOperationRef, GraphqlRequest } from './graphql';
+
+/**
+ * `body` (the decoded request body text) matters only for matchers with `graphqlOperation` (CONTRACTS §11.2);
+ * without it such a matcher still works for GET requests (`?query=` / `?operationName=`).
+ */
+export type CompiledMatcher = (method: string, url: string, body?: string) => boolean;
 
 const REGEX_LITERAL = /^\/(.+)\/([a-z]*)$/s;
 
@@ -190,14 +198,32 @@ const URL_CACHE_MAX = 1000;
  * chars (incl. '/'), matched in linear time.
  */
 export function compileMatcher(m: Matcher): CompiledMatcher {
+  const base = compileBase(m);
+  const op = graphqlOperationOf(m);
+  if (op === undefined) return (method, url) => base(method, url);
+  return (method, url, body) => base(method, url) && graphqlOperationNames(method, url, body).includes(op);
+}
+
+/** Method + URL only (ignores `graphqlOperation`). */
+export function compileBase(m: Matcher): (method: string, url: string) => boolean {
   const wantMethod = (m.method ?? '').trim().toUpperCase();
   const anyMethod = wantMethod === '' || wantMethod === '*';
   const urlTest = compileUrl(m.url ?? '');
   return (method, url) => (anyMethod || method.toUpperCase() === wantMethod) && urlTest(url);
 }
 
-export function matches(m: Matcher, method: string, url: string): boolean {
-  return compileMatcher(m)(method, url);
+/** The matcher's GraphQL operation name, or undefined when it has none (empty / whitespace = none). */
+export function graphqlOperationOf(m: Matcher): string | undefined {
+  const op = typeof m.graphqlOperation === 'string' ? m.graphqlOperation.trim() : '';
+  return op === '' ? undefined : op;
+}
+
+/**
+ * Does the matcher match this request? `body` is the decoded request body text; it is only read when the
+ * matcher has `graphqlOperation` (the operation names of a batched request: any of them).
+ */
+export function matches(m: Matcher, method: string, url: string, body?: string): boolean {
+  return compileMatcher(m)(method, url, body);
 }
 
 function compileUrl(pattern: string): UrlTest {
@@ -242,15 +268,47 @@ export function isInvalidMatcher(m: Matcher): boolean {
 export interface CompiledRule {
   rule: Rule;
   test: CompiledMatcher;
+  /** Method + URL only. */
+  base: (method: string, url: string) => boolean;
+  /** Matcher.graphqlOperation, trimmed (undefined = none). */
+  graphqlOperation?: string;
 }
 
 export function compileRules(rules: Rule[]): CompiledRule[] {
-  return rules.map((rule) => ({ rule, test: compileMatcher(rule.match) }));
+  return rules.map((rule) => {
+    const op = graphqlOperationOf(rule.match);
+    return { rule, test: compileMatcher(rule.match), base: compileBase(rule.match), ...(op !== undefined ? { graphqlOperation: op } : {}) };
+  });
 }
 
 /** First enabled matching rule wins. */
-export function findRule(rules: CompiledRule[], method: string, url: string): Rule | undefined {
-  for (const r of rules) if (r.rule.enabled && r.test(method, url)) return r.rule;
+export function findRule(rules: CompiledRule[], method: string, url: string, body?: string): Rule | undefined {
+  for (const r of rules) if (r.rule.enabled && r.test(method, url, body)) return r.rule;
+  return undefined;
+}
+
+/** Rule actions that apply to a WebSocket upgrade (CONTRACTS §11.1); the others pass it through. */
+export const WEBSOCKET_ACTIONS: ReadonlySet<RuleAction['kind']> = new Set(['block', 'fault']);
+
+/**
+ * Why a rule can't do what it says, for rule editors and agent tools (undefined = fine). Today: a rule whose
+ * URL only matches WebSockets (`ws://` / `wss://`) with an action that doesn't apply to them (mock, breakpoint,
+ * mutate, throttle, cors, the truncate fault), or a `graphqlOperation` on such a rule (the operation of a
+ * GraphQL subscription is inside the frames, not in the upgrade request).
+ */
+export function ruleProblem(rule: Pick<Rule, 'match' | 'action'>): string | undefined {
+  const url = (rule.match?.url ?? '').trim();
+  if (!/^wss?:\/\//i.test(url)) return undefined;
+  const kind = rule.action?.kind;
+  if (graphqlOperationOf(rule.match) !== undefined) {
+    return 'GraphQL operation names are not visible on a WebSocket upgrade; match the URL only.';
+  }
+  if (kind === 'fault' && rule.action.kind === 'fault' && rule.action.fault === 'truncate') {
+    return 'The truncate fault does not apply to WebSockets; use reset, timeout or dns.';
+  }
+  if (kind && !WEBSOCKET_ACTIONS.has(kind)) {
+    return `${kind[0].toUpperCase()}${kind.slice(1)} rules do not apply to WebSocket connections (only block and fault do).`;
+  }
   return undefined;
 }
 
@@ -280,8 +338,9 @@ export class RuleFromExchangeError extends Error {
  *   throws RuleFromExchangeError ('truncated' | 'binary') when that body can't be a text mock.
  *   Multi-value headers (e.g. several set-cookie) are joined with ', ' because RuleAction mock
  *   headers are Record<string, string> (contract question raised in docs/spikes/proxy.md).
- * block = status 403; mutate = no ops yet (the caller adds them); anything else = a response-phase
- * breakpoint. The host inserts it FIRST.
+ * block = status 403; mutate = no ops yet (the caller adds them); cors = `{kind:'cors'}` matching any
+ * method (the preflight is OPTIONS); anything else = a response-phase breakpoint. A GraphQL exchange's rule
+ * also matches its `graphqlOperation` (except cors). The host inserts it FIRST.
  */
 export function ruleFromExchange(e: Exchange, kind: RuleAction['kind'], id: string): Rule {
   let base = e.url;
@@ -291,7 +350,9 @@ export function ruleFromExchange(e: Exchange, kind: RuleAction['kind'], id: stri
   } catch {
     base = e.url.split(/[?#]/)[0];
   }
-  const match: Matcher = { method: e.method, url: `${base}*` };
+  const match: Matcher = kind === 'cors' ? { url: `${base}*` } : { method: e.method, url: `${base}*` };
+  // A GraphQL endpoint serves every operation at one URL: scope the rule to this one.
+  if (e.graphql?.operationName && kind !== 'cors') match.graphqlOperation = e.graphql.operationName;
 
   let action: RuleAction;
   if (kind === 'mock') {
@@ -313,7 +374,14 @@ export function ruleFromExchange(e: Exchange, kind: RuleAction['kind'], id: stri
           'Cannot mock this response: its body is binary, and mock bodies are text.',
         );
       }
-      const body = e.responseBody?.text ?? '';
+      let body = e.responseBody?.text ?? '';
+      if (e.kind === 'sse' && !e.responseBody && e.frames?.length) {
+        // Event streams are recorded as frames only (CONTRACTS §11.1): rebuild the stream text.
+        if (e.framesDropped || e.frames.some((f) => f.truncated)) {
+          throw new RuleFromExchangeError('truncated', 'Cannot mock this event stream: some of its events were not fully recorded.');
+        }
+        body = e.frames.map(sseEventText).join('');
+      }
       action = { kind: 'mock', status: e.status, headers, body };
     } else {
       action = { kind: 'mock', status: 200, headers: { 'content-type': 'application/json' }, body: '{}' };
@@ -322,6 +390,8 @@ export function ruleFromExchange(e: Exchange, kind: RuleAction['kind'], id: stri
     action = { kind: 'block', mode: 'status', status: 403 };
   } else if (kind === 'mutate') {
     action = { kind: 'mutate', ops: [] }; // the caller fills in the ops (CONTRACTS §10.5 mutateField)
+  } else if (kind === 'cors') {
+    action = { kind: 'cors' }; // any method: the preflight (OPTIONS) and the request itself
   } else {
     action = { kind: 'breakpoint', phase: 'response' };
   }
@@ -333,4 +403,13 @@ export function ruleFromExchange(e: Exchange, kind: RuleAction['kind'], id: stri
     /* keep base */
   }
   return { id, enabled: true, name: `${kind} ${e.method} ${path}`, match, action };
+}
+
+/** One recorded SSE event as event-stream text. */
+function sseEventText(f: { event?: string; id?: string; text?: string }): string {
+  let out = '';
+  if (f.event !== undefined) out += `event: ${f.event}\n`;
+  if (f.id !== undefined) out += `id: ${f.id}\n`;
+  for (const line of (f.text ?? '').split('\n')) out += `data: ${line}\n`;
+  return `${out}\n`;
 }

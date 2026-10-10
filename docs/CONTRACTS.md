@@ -596,6 +596,9 @@ extension with a CSP nonce. It must use VSCode theme CSS variables (`--vscode-*`
 
 ## 4b. Debug configuration fields the provider adds
 - `flutterInterceptOriginalProgram` — the program before rewriting; source of truth on re-resolve.
+- `flutterInterceptWeb` (true on Flutter Web sessions) and `flutterInterceptWebFlags` (the exact `--web-browser-flag`
+  toolArgs we added, removed on re-resolve) — CONTRACTS §11.3. Web sessions also record port, host `127.0.0.1` and
+  the original program; `program` is never rewritten.
 - `flutterInterceptPort`, `flutterInterceptProxyHost` — the session's proxy address, passed via the `FLUTTER_INTERCEPT_PROXY` define (not baked into the entry).
 - `debuggerType` is pinned ("Flutter"/"Dart") when our hook runs before Dart-Code's, because
   Dart-Code treats any program under `.dart_tool/` as plain Dart. See docs/spikes/extension.md.
@@ -969,3 +972,117 @@ current snapshot); `rules` after `mutateField`; `error` on failures. The JSON tr
 - `selectPath(root, path, {limit?})` throws past 10 000 results; `applyOps(root, ops, {maxTargets?, maxWork?, inPlace?})`.
 - Contract index: regular files only, 1 MB per file, 64 MB total; `part of` only relative inside the workspace.
 - Redaction also by value: JWTs, Bearer/Basic credentials, long opaque tokens (§8 list extended).
+
+## 11. v0.5.0 additions — Coverage (2026-10-10)
+
+Plan: docs/ROADMAP.md §4 (0.5.0), owners in docs/PLAN.md "v0.5.0". Types already in code:
+`packages/proxy/src/types.ts` (`Exchange.kind/frames/framesDropped/graphql/cors/captured`, `Frame`, `GraphqlInfo`,
+`CorsInfo`, `Matcher.graphqlOperation`, `RuleAction` `cors`, `maxFramesPerExchange`), both `protocol.ts`
+(`Status.warnings`, `SessionWarning`), `packages/extension/src/vm/types.ts`. Spikes first where marked.
+
+### 11.1 WebSocket + SSE recording (proxy)
+- Replace the unrecorded `forAnyWebSocket().thenPassThrough` with recording through mockttp's
+  `websocket-request/accepted/message-received/message-sent/close` events: one `Exchange` per upgrade with
+  `kind: 'websocket'`, request headers, status 101 (or the refusal), `frames[]`, state `pending` while open →
+  `completed` on a clean close, `error` on abnormal close. Payloads: text ≤ 64 KB, binary as base64 ≤ 64 KB,
+  `truncated` beyond; newest `maxFramesPerExchange` (500) kept, `framesDropped` counts the rest. LAN guards,
+  `x-fi-id` stripping, `viaLan` unchanged. Rules: block / fault apply to the upgrade request; mock does not
+  (refuse at validation with a clear reason).
+- SSE: a response with `content-type: text/event-stream` gets `kind: 'sse'`; events are parsed incrementally
+  from the streaming taps (no buffering; works on the plain route) into `kind:'event'` frames (`event`, `id`,
+  data). The exchange stays `pending` until the stream ends.
+- 'exchange' events for frames are coalesced (≤ 1 per exchange per 100 ms) and the body byte budget counts
+  frame payloads.
+- As built: upgrades are recorded with `ws://` / `wss://` URLs and rules match those; mock / breakpoint /
+  mutate / throttle / cors / truncate never apply to an upgrade (passed through with a note, `times` not used);
+  block, reset/dns/timeout faults and the offline profile answer it locally. Close code 1006 on either side or a
+  refused upgrade → `error` (no body recorded). The app sees a clean close when the server dies (mockttp can't
+  forward 1006). SSE exchanges keep **no `responseBody`** — frames are the record; the app closing the stream →
+  `completed` with a note; the stream head is forwarded immediately.
+
+### 11.2 GraphQL awareness (proxy)
+- Detect GraphQL on POST `application/json` bodies with `query` (string) and/or `extensions.persistedQuery`,
+  batched arrays (first operation + count), `application/graphql` bodies, and GET `?query=` / `?operationName=`.
+  `operationType` from the document's first operation keyword (cheap scan; no GraphQL parser dependency),
+  `operationName` from the field or the document. Sets `Exchange.graphql` once the body is known.
+- `Matcher.graphqlOperation`: a rule with it needs the request body before routing → it routes like a request
+  breakpoint (body ≤ 5 MB, known length; else skipped with a note). Exposed in `matches()` via an optional
+  `body` argument so the webview preview agrees.
+
+### 11.3 Flutter Web (extension + proxy)
+- **Spike first** (docs/spikes/web.md): `flutter run -d chrome` with
+  `--web-browser-flag=--proxy-server=http://127.0.0.1:<port>` and
+  `--web-browser-flag=--ignore-certificate-errors-spki-list=<base64 sha256 of the install CA's SPKI>` (CA from
+  `src/ca.ts`); whether loopback must stay bypassed (the dev server, DWDS and the debug service run on
+  localhost: default keep Chrome's loopback bypass); `web-server` device (we can't set the browser's proxy →
+  skip with a one-time notice); Edge; what DevTools/Dart-Code expect.
+- Web sessions are **not** rewritten to the generated entry (no dart:io); only the browser flags are added to
+  `toolArgs` (and removed on re-resolve), `flutterInterceptProxyHost` = `127.0.0.1`. Status shows web sessions.
+- **CORS** (proxy, `src/cors.ts`, pure diagnosis + rule): requests with `Origin` get `Exchange.cors` —
+  preflights flagged; `problem` when the response would be blocked (no/mismatched ACAO, `*` with credentials,
+  missing allow-methods/headers on preflight, redirect on preflight). Mock/block rules **answer the preflight
+  themselves** (204 + allow-origin = request Origin, allow-methods/headers = requested, max-age 600) and add
+  `access-control-allow-origin` (+ `vary: origin`, expose-headers, allow-credentials unless the origin is `*`) to
+  mock and blocked-status responses that lack it (`cors.patched`); preflights don't use up `times`. The `cors`
+  rule action does the same for real responses (dev-only workaround, clearly labelled in UI).
+- **Browser-internal traffic**: the Chrome that flutter_tools starts makes its own requests (~13 of 22 at launch).
+  The proxy sets `Exchange.browserInternal` on requests from a web session's browser that carry
+  `sec-fetch-site: none`, or neither `Origin` nor `Referer`, to Google update/GCM/optimization hosts — only
+  when a web session is running (`setWebSessionActive(boolean)`). The panel hides them by default (toggle);
+  agent list/wait tools exclude them unless `includeBrowserInternal: true`.
+
+### 11.4 VM service: background isolates + native clients (extension, spike first)
+- **Spike** (docs/spikes/vm-service.md): get to the session's VM service — Dart-Code DAP custom request
+  `callService` vs the `dart.debuggerUris` custom event + a direct WebSocket (the `ws` module mockttp already
+  depends on may be bundled; no new npm dependency); stream `Isolate` events; `ext.dart.io.getHttpProfile`
+  (`updatedSince`) and `ext.dart.io.httpEnableTimelineLogging`; does `package:http_profile` (cupertino_http,
+  cronet_http, ok_http) show up there, and can dart:io entries already seen by the proxy be told apart (their
+  request headers contain `x-fi-id`)?
+- **Background isolates**: on `IsolateStart` of a non-main isolate in an intercepted session →
+  `SessionWarning {kind:'background-isolate'}` ("Requests from background isolate "<name>" are not intercepted
+  (HttpOverrides is per isolate)."), once per isolate name per session; cleared when the session ends.
+- **Native clients** (setting `flutterIntercept.nativeClients`: `"profile"` default | `"off"`): poll the HTTP
+  profile (≤ 1/s, only while the panel or an agent is watching is fine) and record entries that did NOT go through
+  the proxy as read-only exchanges `captured: 'vm-profile'` via `InterceptProxy.record()`; rules never apply;
+  a `SessionWarning {kind:'native-client'}` explains why they can't be mocked. Debug and profile mode only.
+- As built (docs/spikes/vm-service.md): Dart-Code's DAP `callService` in debug, a direct loopback WebSocket to
+  the `dart.debuggerUris` URI in profile mode (the URI/token is never logged). Imported: `package:http_profile`
+  entries, plus background-isolate dart:io entries without `x-fi-id` / `proxyDetails`; main-isolate dart:io
+  traffic is never imported (it went through the proxy, or DIRECT). Bodies ≤ 1 MB per side; dedupe keyed per
+  isolate (ids restart after hot restart). `compute`/`Isolate.run` isolates are too short-lived to import from:
+  warning only. `VmHostDeps` + `nativeClients()`, optional `isWatched()` and `webSocket` (CreateVmWatcherDeps).
+- Proxy API: `record(ex: Omit<Exchange,'id'>): string` (`rec-…` id; stored like others, evictable even while
+  pending, emits 'exchange'), `update(id, patch): boolean` (false for proxy-owned / evicted / unknown ids;
+  `undefined` in the patch deletes a field).
+- New exports: `/rules` — `ruleProblem(rule)`, `WEBSOCKET_ACTIONS`, `compileBase`, `graphqlOperationOf`,
+  `detectGraphql`, `graphqlOperationNames`, `scanOperations`; `findRule`/compiled matchers take an optional
+  `body`; `/cors` — `diagnoseCors` and header builders; index — `isBrowserInternal`, `BROWSER_SERVICE_HOSTS`.
+- `GraphqlInfo.batch?: number` for batched arrays.
+
+### 11.5 UI and agents
+- Webview: frames viewer (direction, time, size, text/JSON/binary, SSE event names; live while pending;
+  filter + search inside frames), list badges `WS`/`SSE`/`GQL op`/`native`, filter tokens `kind:ws|sse|http`,
+  `op:<name>` (GraphQL), `cors:problem`; CORS problems in the detail pane with "Add CORS rule (dev only)";
+  `SessionWarning` banners; rule editor: `graphqlOperation` field, `cors` action.
+- Agent tools: `get_frames {id, since?: index, limit?=100 (≤ 500), maxChars?}` (redacted text, base64 summarised);
+  `list_requests` gains `kind`, `graphqlOperation`; `get_request` shows `kind`, frame count, `graphql`, `cors`,
+  `captured`; rule tools accept `graphqlOperation`; `add_cors_rule {url, ...}` (W); `get_status` lists warnings.
+  Redaction applies to frames (JSON frames redacted structurally, others by regex) and `graphql.variables` never
+  leave unredacted.
+- As built: `get_frames` returns absolute indexes (dropped frames count), `next`, `total`, `dropped`, `more`, `open`,
+  `skipped`/`note`; 4 000 chars per frame by default, ≤ 200 000 per result; errors on plain HTTP. Summaries add
+  `kind`, `graphqlOperation`, `corsProblem`, `captured`; `get_request` adds `readOnly` (why rules can't apply).
+  WebSocket exchanges accept only block / fault rules; `vm-profile`, WebSocket and SSE exchanges can't be resent
+  or mutated. GraphQL documents are redacted for secret-named inline arguments; GET `?variables=` /
+  `?extensions=` structurally. The panel receives ≤ 200 frames / ~2 MB per exchange (rest folded into
+  `framesDropped`); agents read all kept frames. HAR exports carry `_webSocketMessages` / `_eventSourceMessages`.
+
+### 11.6 REVIEW-5 amendments
+- Automatic CORS reflects **loopback origins only** (http(s)://localhost | 127.0.0.1 | [::1], optional port);
+  never `null` or other sites; `Allow-Credentials` only from a `cors` rule with `allowCredentials: true`;
+  preflight max-age 5 s; `/cors` exports `isLoopbackOrigin`, `allowedOrigin`. `add_cors_rule` needs a URL with a host.
+- WebSocket messages ≤ 16 MB each way (1009 beyond). Frames ≤ 8 MB per exchange; SSE `event` ≤ 256, `id` ≤ 1 KB;
+  SSE parsing ≤ 64 MB decoded. Open streams shed frames before finished exchanges are evicted.
+- `browserInternal` only for the Google browser-service host list. A web launch with the user's own
+  `--user-data-dir` is not intercepted.
+- VM import: bodies only with known lengths ≤ 1 MB; every field validated; `isOurProxy(host, port)` dep.

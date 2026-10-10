@@ -13,6 +13,8 @@ export interface Status {
   agent?: AgentStatus;
   /** CONTRACTS §9.3: active network profile; absent = none. */
   networkProfile?: NetworkProfile;
+  /** CONTRACTS §11: things the user should know about the running sessions (e.g. background isolates). */
+  warnings?: SessionWarning[];
 }
 
 export interface AgentStatus {
@@ -67,4 +69,12 @@ export interface ContractSummary {
   via: 'retrofit' | 'chopper' | 'source' | 'user' | 'none';
   violations: { path: string; field: string; expected: string; actual: string; severity: 'error' | 'warning'; message: string }[];
   reason?: string;
+}
+
+/** CONTRACTS §11: a session-level warning shown as a banner (dismissable per id). */
+export interface SessionWarning {
+  id: string;           // stable, e.g. "isolate:<sessionId>:<isolateName>"
+  kind: 'background-isolate' | 'native-client' | 'web' | 'other';
+  text: string;         // one sentence, e.g. "Requests from background isolate \"worker\" are not intercepted."
+  sessionId?: string;
 }

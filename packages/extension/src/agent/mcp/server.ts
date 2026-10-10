@@ -239,7 +239,7 @@ function registerResources(server: McpServer, tools: AgentTools): void {
   server.registerResource(
     'rules',
     RESOURCE_URIS.rules,
-    { title: 'Intercept rules', description: 'Active mock / block / breakpoint / throttle / fault / mutate rules in priority order (as list_rules returns them).', mimeType: JSON_MIME },
+    { title: 'Intercept rules', description: 'Active mock / block / breakpoint / throttle / fault / mutate / cors rules in priority order (as list_rules returns them).', mimeType: JSON_MIME },
     (uri) => readVia(tools, uri, 'list_rules', {}),
   );
   server.registerResource(

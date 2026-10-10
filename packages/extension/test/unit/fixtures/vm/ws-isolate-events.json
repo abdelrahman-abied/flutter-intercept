@@ -1,0 +1,245 @@
+[
+ {
+  "type": "Event",
+  "kind": "IsolateStart",
+  "isolateGroup": {
+   "type": "@IsolateGroup",
+   "id": "isolateGroups/4663100228036762",
+   "name": "main.dart",
+   "number": "4663100228036762",
+   "isSystemIsolateGroup": false
+  },
+  "isolate": {
+   "type": "@Isolate",
+   "id": "isolates/3928578664869719",
+   "name": "demo_worker",
+   "number": "3928578664869719",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/4663100228036762"
+  },
+  "timestamp": 1791616248188
+ },
+ {
+  "type": "Event",
+  "kind": "IsolateStart",
+  "isolateGroup": {
+   "type": "@IsolateGroup",
+   "id": "isolateGroups/4663100228036762",
+   "name": "main.dart",
+   "number": "4663100228036762",
+   "isSystemIsolateGroup": false
+  },
+  "isolate": {
+   "type": "@Isolate",
+   "id": "isolates/5446784699234595",
+   "name": "demo_compute",
+   "number": "5446784699234595",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/4663100228036762"
+  },
+  "timestamp": 1791616248188
+ },
+ {
+  "type": "Event",
+  "kind": "ServiceExtensionAdded",
+  "isolateGroup": {
+   "type": "@IsolateGroup",
+   "id": "isolateGroups/4663100228036762",
+   "name": "main.dart",
+   "number": "4663100228036762",
+   "isSystemIsolateGroup": false
+  },
+  "isolate": {
+   "type": "@Isolate",
+   "id": "isolates/3928578664869719",
+   "name": "demo_worker",
+   "number": "3928578664869719",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/4663100228036762"
+  },
+  "timestamp": 1791616248188,
+  "extensionRPC": "ext.dart.io.httpEnableTimelineLogging"
+ },
+ {
+  "type": "Event",
+  "kind": "ServiceExtensionAdded",
+  "isolateGroup": {
+   "type": "@IsolateGroup",
+   "id": "isolateGroups/4663100228036762",
+   "name": "main.dart",
+   "number": "4663100228036762",
+   "isSystemIsolateGroup": false
+  },
+  "isolate": {
+   "type": "@Isolate",
+   "id": "isolates/5446784699234595",
+   "name": "demo_compute",
+   "number": "5446784699234595",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/4663100228036762"
+  },
+  "timestamp": 1791616248188,
+  "extensionRPC": "ext.dart.io.httpEnableTimelineLogging"
+ },
+ {
+  "type": "Event",
+  "kind": "IsolateRunnable",
+  "isolateGroup": {
+   "type": "@IsolateGroup",
+   "id": "isolateGroups/4663100228036762",
+   "name": "main.dart",
+   "number": "4663100228036762",
+   "isSystemIsolateGroup": false
+  },
+  "isolate": {
+   "type": "@Isolate",
+   "id": "isolates/3928578664869719",
+   "name": "demo_worker",
+   "number": "3928578664869719",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/4663100228036762"
+  },
+  "timestamp": 1791616248188
+ },
+ {
+  "type": "Event",
+  "kind": "IsolateRunnable",
+  "isolateGroup": {
+   "type": "@IsolateGroup",
+   "id": "isolateGroups/4663100228036762",
+   "name": "main.dart",
+   "number": "4663100228036762",
+   "isSystemIsolateGroup": false
+  },
+  "isolate": {
+   "type": "@Isolate",
+   "id": "isolates/5446784699234595",
+   "name": "demo_compute",
+   "number": "5446784699234595",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/4663100228036762"
+  },
+  "timestamp": 1791616248188
+ },
+ {
+  "type": "Event",
+  "kind": "IsolateExit",
+  "isolateGroup": {
+   "type": "@IsolateGroup",
+   "id": "isolateGroups/4663100228036762",
+   "name": "main.dart",
+   "number": "4663100228036762",
+   "isSystemIsolateGroup": false
+  },
+  "isolate": {
+   "type": "@Isolate",
+   "id": "isolates/3928578664869719",
+   "name": "demo_worker",
+   "number": "3928578664869719",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/4663100228036762"
+  },
+  "timestamp": 1791616248448
+ },
+ {
+  "type": "Event",
+  "kind": "IsolateExit",
+  "isolateGroup": {
+   "type": "@IsolateGroup",
+   "id": "isolateGroups/4663100228036762",
+   "name": "main.dart",
+   "number": "4663100228036762",
+   "isSystemIsolateGroup": false
+  },
+  "isolate": {
+   "type": "@Isolate",
+   "id": "isolates/5446784699234595",
+   "name": "demo_compute",
+   "number": "5446784699234595",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/4663100228036762"
+  },
+  "timestamp": 1791616248448
+ },
+ {
+  "type": "Event",
+  "kind": "IsolateStart",
+  "isolateGroup": {
+   "type": "@IsolateGroup",
+   "id": "isolateGroups/4663100228036762",
+   "name": "main.dart",
+   "number": "4663100228036762",
+   "isSystemIsolateGroup": false
+  },
+  "isolate": {
+   "type": "@Isolate",
+   "id": "isolates/2722465901259411",
+   "name": "demo_worker",
+   "number": "2722465901259411",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/4663100228036762"
+  },
+  "timestamp": 1791616258187
+ },
+ {
+  "type": "Event",
+  "kind": "ServiceExtensionAdded",
+  "isolateGroup": {
+   "type": "@IsolateGroup",
+   "id": "isolateGroups/4663100228036762",
+   "name": "main.dart",
+   "number": "4663100228036762",
+   "isSystemIsolateGroup": false
+  },
+  "isolate": {
+   "type": "@Isolate",
+   "id": "isolates/2722465901259411",
+   "name": "demo_worker",
+   "number": "2722465901259411",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/4663100228036762"
+  },
+  "timestamp": 1791616258187,
+  "extensionRPC": "ext.dart.io.httpEnableTimelineLogging"
+ },
+ {
+  "type": "Event",
+  "kind": "IsolateRunnable",
+  "isolateGroup": {
+   "type": "@IsolateGroup",
+   "id": "isolateGroups/4663100228036762",
+   "name": "main.dart",
+   "number": "4663100228036762",
+   "isSystemIsolateGroup": false
+  },
+  "isolate": {
+   "type": "@Isolate",
+   "id": "isolates/2722465901259411",
+   "name": "demo_worker",
+   "number": "2722465901259411",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/4663100228036762"
+  },
+  "timestamp": 1791616258187
+ },
+ {
+  "type": "Event",
+  "kind": "IsolateStart",
+  "isolateGroup": {
+   "type": "@IsolateGroup",
+   "id": "isolateGroups/4663100228036762",
+   "name": "main.dart",
+   "number": "4663100228036762",
+   "isSystemIsolateGroup": false
+  },
+  "isolate": {
+   "type": "@Isolate",
+   "id": "isolates/8253870675665103",
+   "name": "demo_compute",
+   "number": "8253870675665103",
+   "isSystemIsolate": false,
+   "isolateGroupId": "isolateGroups/4663100228036762"
+  },
+  "timestamp": 1791616258187
+ }
+]

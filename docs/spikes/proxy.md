@@ -730,6 +730,152 @@ tests in `test/lan.test.ts`. Suite: **174 passing**.
 Tests: `test/jsonpath.test.ts` (30), `test/mutate.test.ts` (31, 4 with the real Dart client), 3 REVIEW-4
 tests in `test/rules.test.ts`, 1 LAN test in `test/lan.test.ts`.
 
+## v0.5.0 additions (CONTRACTS §11.1–11.4, 2026-10-10)
+
+**WebSockets (§11.1).** `forAnyWebSocket().thenPassThrough` is replaced by two mockttp WebSocket rules with our
+own route matchers (`decideWs`, once per upgrade, like `decide`): `ws-pass` (mockttp's `PassThroughWebSocketStep`,
+same connection options, so the LAN guarded agents / rewriting / pooling are unchanged) and `ws-local` (block /
+fault rules, the offline profile). `ws-local` is a `RejectWebSocketStep` with an own `handle` property: mockttp
+builds steps with `Object.assign(Object.create(Impl.prototype), definition)`, so the own property wins.
+- One `Exchange` per upgrade, `kind:'websocket'`, **URL recorded and matched as `ws://` / `wss://`** (mockttp sees
+  `http(s)://`), method GET, request headers after `x-fi-id` stripping (preprocess hook, unchanged), `viaLan` from
+  the socket, `source` via the trace join. 101 + response headers from mockttp's public `websocket-accepted` event.
+- **Frames come from the `ws` objects themselves**, not mockttp's `websocket-message-*` events: mockttp emits
+  `'ws-upgrade'` on the client socket with the app-side `ws` (with `upstreamWebSocket` attached) — our listener is
+  registered in the route matcher, i.e. before mockttp's own tracking and before `pipeWebSocket`. That gives
+  pings / pongs, which side closed first and with what code, the upstream's own 1006, and recording in order with
+  no `setImmediate` + Buffer retention per message. If that hook ever doesn't fire, `websocket-accepted` notes
+  "Frames are not recorded (incompatible mockttp version)" in `error`.
+- Close: the side whose `close` fires first decides — server first → `receive` close frame with its code/reason,
+  else `send`. 1005 → frame without `closeCode`. **1006 on either side → state `error`** ("The server's
+  connection ended without a close frame…"). Measured: when the server dies, mockttp closes the app's side with a
+  *clean, code-less* close (pipeWebSocket can't forward 1006) — only the upstream hook shows it was abnormal.
+- Refused upgrade (server answers non-101; mockttp mirrors it and emits `response`) → `error`, status recorded
+  ("The WebSocket upgrade was refused: 401 Unauthorized"); no body (mockttp's parsed response has none). An
+  upgrade that never gets an answer (refused / DNS / TLS, or the app gave up) → mockttp's `abort` → `error`.
+- Rules: only `block` (status → `HTTP/1.1 <status>` written on the socket; reset) and `fault` (reset / dns =
+  close / timeout = held until the app leaves or `breakpointTimeoutMs`, then reset) apply to the upgrade; the
+  offline profile = dns. **mock / breakpoint / mutate / throttle / cors and the truncate fault are skipped
+  whatever their URL pattern** (they are not counted, `times` not spent), the upgrade passes through and `error`
+  says e.g. `Mock rule "x" does not apply to WebSocket connections; passed through.` GraphQL-scoped rules never
+  match an upgrade. `ruleProblem(rule)` in `/rules` reports this for `ws(s)://` patterns (for editors / agents).
+- Payloads: text ≤ 64 KB (cut at a character boundary), binary/ping/pong as base64 of the first 64 KB (ping/pong
+  payloads that are valid UTF-8 as text), `truncated` + full `size`. Newest `maxFramesPerExchange` (500) kept,
+  `framesDropped` counts the rest. Frame payloads count toward `maxStoredBodyBytes` (a finished socket over budget
+  is evicted at once; live ones never). `'exchange'` for frames is coalesced: ≤ 1 per exchange per 100 ms
+  (`touch()`); state changes (accepted, finished) emit immediately. Snapshots copy the `frames` array.
+- Measured (loopback, Node `ws` echo, 20 000 × 120-byte messages each way): direct 129 ms, through the proxy with
+  recording 280 ms, 5 `'exchange'` events, max event-loop gap 25 ms; 500 frames kept, 39 501 dropped.
+
+**SSE (§11.1).** Detected on the plain route (and h1 forwards) from the taps: a new response-head hook
+(`tap.onResponseHead`, a wrapper around the tracked response's `writeHead`, also called for implicit heads) sees
+the status and headers; for `text/event-stream` 2xx it sets `kind:'sse'`, stops the tap's body copy
+(`Capture.skip`, so **no `responseBody` for SSE** — the events are the record), **flushes the head at once**
+(Node otherwise holds it until the first body byte; measured: head at < 300 ms for a stream whose first event
+comes at 400 ms), and feeds the bytes going to the app (after shaping) to `SseRecorder` (src/sse.ts): streaming
+gunzip / inflate / brotli when encoded, `StringDecoder` for UTF-8 split across chunks, CRLF / LF / CR (CRLF split
+across chunks too), BOM, comments, `retry:`, multi-line `data:`, `event:`, `id:` (NUL ignored), events without
+data not dispatched, an unfinished event at the end discarded; a line / event over 64 KB is counted, not kept.
+Exchange stays `pending` with frames until the stream ends. The app closing the stream → `completed` with
+`error: "The app closed the event stream."`; the upstream dying mid-stream → `error` ("…failed mid-stream
+(ECONNRESET)"), events so far kept. Mock bodies and buffered (h2) bodies with `text/event-stream` are parsed into
+frames too. `ruleFromExchange(e,'mock')` rebuilds the stream text from the frames (throws `truncated` if any
+were dropped / cut). Tested with every 2-chunk split of a stream that has all features, 1-byte chunks, a chunked
+upstream with odd boundaries, gzip, a throttled stream, and the real Dart client (`fixtures/sse_client.dart`:
+first chunk ≥ 500 ms before the end).
+
+**GraphQL (§11.2).** `src/graphql.ts` (dependency-free, re-exported from `/rules`): a scanner over top-level
+definitions (operation keyword + name, `{}` shorthand, fragments skipped) that skips comments, strings, block
+strings (incl. `\"""`), variable defaults with braces, directives; anything else (SDL, `"shoes"`) = not GraphQL,
+so `?query=red+shoes` isn't misdetected. Batched arrays set `batch` (number of GraphQL operations, also for an array of one); `operationType` is the type of the operation named by `operationName`
+(else the first). Strict detection for `Exchange.graphql` (POST `application/json` / `+json` with `query` and/or
+`extensions.persistedQuery`, batched arrays, `application/graphql`, GET/HEAD `?query=` / `?extensions=`);
+lenient for matching (no content type known: JSON, else a document; no body → URL).
+- `matches(m, method, url, body?)`: unchanged without `graphqlOperation`; with it, matches if any operation of
+  the request (batch: any element) has that name. `CompiledMatcher` gained the optional `body` argument.
+- Routing: a GraphQL-scoped rule whose method + URL match needs the body → the request is routed like a request
+  breakpoint (`h1`, or `h2` if any candidate rule from there on is a response breakpoint / mutate) with
+  `flow.deferred`; `beforeRequest` re-runs `matchRule` with the decoded body (counting `times` only then) and turns
+  the chosen rule into the flow (mock / block / fault / breakpoint / throttle latency + kbps shaping / truncate
+  / cors / pass). GET and body-less requests decide from the URL synchronously. Chunked or > 5 MB bodies skip the
+  rule with a note ("GraphQL rule skipped: …") and later rules still apply. Cost of deferral: the request body is
+  buffered (≤ 5 MB) and, on `h2`, the response (≤ 32 MB, a streamed GraphQL response is held until its end).
+- `ruleFromExchange` adds `graphqlOperation` for GraphQL exchanges (a mock of one operation must not answer all).
+
+**CORS (§11.3).** `src/cors.ts` (dependency-free, `@flutter-intercept/proxy/cors`): `diagnoseCors(ex)` for
+requests with Origin that are cross-origin (and `Sec-Fetch-Mode: cors` when present; never websockets / records):
+ACAO missing / several values / another origin / `*` with credentials, ACAC for credentialed requests (a `Cookie`
+header = credentials; nothing on the wire says more), and for preflights status (2xx, never a redirect),
+allow-methods (safelisted methods free, `*`), allow-headers (`*` never covers Authorization). Computed on every
+emit (keeps `patched`). Preflights (`OPTIONS` + Origin + ACRM) whose *asked-about* request a mock / block / cors
+rule matches (GraphQL scope ignored, `times` not spent) are answered locally — **only for a loopback Origin or
+a cors rule's `allowOrigin`** (REVIEW-5 #3, below): 204, ACAO, methods / headers = requested, max-age 5 s,
+`Vary: Origin`; state `mocked`, `cors:{preflight, patched}`. Mock **and block-status** responses to CORS
+requests get ACAO + `Vary` + `Access-Control-Expose-Headers` (their own non-safelisted header names) under the
+same origin rule, unless they set ACAO themselves. The `cors` rule passes through on the streaming route and patches the real response head in
+the tap hook (replaces ACAO / ACAC / expose / merges Vary; expose = the response's header names), no buffering.
+`allowOrigin: '*'` never sends credentials. Browser-internal traffic: `setWebSessionActive(bool)`; while on,
+`browserInternal: true` only for a short list of Google browser-service hosts (`BROWSER_SERVICE_HOSTS` in
+src/browser.ts) with `Sec-Fetch-Site: none` or no Referer; never with Origin, never for LAN clients or requests
+that carried `x-fi-id`.
+
+**`record(ex)` / `update(id, patch)` (§11.4).** Ids `rec-<uuid>`, `captured` defaults to `vm-profile`, state
+defaults `completed`; bodies capped at 5 MB of text, frames at `maxFramesPerExchange`, headers copied. Stored in
+the ring buffer like anything else (evictable, `'removed'`, never "live" so even a pending record can be evicted),
+emit `'exchange'`, never routed, matched, counted or CORS-diagnosed. `update` only touches record ids (proxy
+exchanges and evicted / unknown ids → `false`); `undefined` in the patch deletes a field; `id` can't change.
+
+Tests: `websocket.test.ts` (20, 4 with a real Dart `WebSocket.connect` — ws:// and wss://, the latter with the
+install-CA trust on `SecurityContext.defaultContext` and no badCertificateCallback, server- and app-initiated
+closes), `sse.test.ts` (12, 1 real Dart), `graphql.test.ts` (17), `cors.test.ts` (13), `record.test.ts` (5), 2 in
+`rules.test.ts`. One v0.4 assertion changed: the plain SSE test now expects frames instead of a body copy.
+Suite: **308 passing**. Bundle smoke test (`npm run test:bundle`) passes with the new deep imports
+(`websocket-step-definitions`, `util/socket-util`).
+
+### REVIEW-5 fixes (P, 2026-10-10)
+
+- **#1 WebSocket message size** (`src/ws-limit.ts`): mockttp builds the server side with `maxPayload: 0` and a
+  PerMessageDeflate without a limit. We wrap `ws`'s `WebSocket#setSocket` (one `ws` in the tree and in the
+  bundle; `start()` refuses to run without the hook, like the taps) and, for the proxy's sockets only — the app
+  side's upgrade socket (marked in the route matcher) and mockttp's `createWebSocketFromStream` signature (client
+  mode, `maxPayload: 0`, `allowSynchronousEvents`, `skipUTF8Validation`) — cap the receiver's `maxPayload` and
+  every negotiated extension's `_maxPayload` (permessage-deflate checks it *while* inflating) at **16 MB**. The
+  side that gets the oversized message closes with 1009 (ws itself); our `error` listeners (registered before
+  mockttp's pipe) close the other side with 1009 too, before the pipe destroys it. Exchange → `error`: "A message
+  from the server was over the 16 MB limit; the connection was closed (1009, message too big)." Measured with the
+  reviewer's case (255 KB on the wire → 256 MB inflated): the app gets 1009, peak RSS **+16 MB** (was +795 MB).
+  App → server: 20 MB plain and compressed both refused with 1009; 15 MB passes. Other `ws` users in the
+  extension host (VM service client) are not affected.
+- **#3 CORS defaults** (`cors.ts`): automatic CORS (mock / block answers, local preflights) and a `cors` rule
+  without `allowOrigin` reflect the request Origin **only when it is a loopback origin**
+  (`http(s)://localhost|127.0.0.1|[::1][:port]`, exact origin — the Flutter dev server; `isLoopbackOrigin`); never
+  `null`, never another site. Otherwise nothing is added and a preflight goes to the real server. An explicit
+  `allowOrigin` wins. **No `Access-Control-Allow-Credentials` unless a cors rule sets `allowCredentials: true`**
+  (never with `*`). Preflight `max-age` **5 s**. `Access-Control-Allow-Private-Network` only for a loopback request
+  Origin. New pure helpers: `isLoopbackOrigin`, `allowedOrigin`; `preflightResponseHeaders` / `corsResponseHeaders`
+  return `undefined` when no origin may be allowed. Not done (not in the lead's decision): forwarding preflights
+  of GraphQL-scoped rules upstream.
+- **#4 Frame memory**: SSE `event:` cut at 256 chars and `id:` at 1 KB (`truncated`); a per-exchange frame budget
+  of **8 MB** (`frameCost`, oldest dropped, counted in `framesDropped`, also for `record()` input) on top of the
+  count cap; over the store budget, `evict()` first drops the oldest frames of **open** streams (down to 50 frames
+  each) before evicting finished exchanges (tested: a 6.5 MB open socket under a 4 MB budget keeps the earlier
+  finished exchange).
+- **#6 browserInternal**: the host list is required in all cases (no bare `Sec-Fetch-Site: none` path), and LAN
+  clients / requests with `x-fi-id` are never tagged.
+- **#9 operationName**: kept only when it is a GraphQL Name (`[_A-Za-z][_0-9A-Za-z]*`) of ≤ 200 chars (body field,
+  `?operationName=`, and names read from the document); otherwise unset (`isValidOperationName` in graphql.ts).
+- **#11 SSE inflate**: a content-encoded event stream is parsed for at most **64 MB decoded**; then decoding stops
+  (inflater destroyed) and `error` notes "Events not recorded past 64 MB of decoded stream."; the app still gets
+  every byte.
+- **#13 problem text**: server- and app-controlled values in `cors.problem` are `JSON.stringify`-quoted (controls
+  escaped) and cut at 200 chars.
+
+Tests added: 4 in `websocket.test.ts` (bomb, app-side 1009 plain + compressed, 8 MB budget, live trim before
+eviction), 2 in `sse.test.ts`, 1 in `graphql.test.ts`, 3 in `cors.test.ts` (loopback-only reflection incl. `null` /
+evil origins through the proxy, quoting, browser-internal host list); several CORS expectations updated (max-age 5,
+no default credentials, quoted values). Suite: **318 passing**; bundle smoke test passes (the ws hook installs in
+the minified bundle).
+
 ## Open issues
 
 - LAN mode: **IPv4 only** (per contract). The SSRF rule is route-based and macOS-only
@@ -743,7 +889,8 @@ tests in `test/rules.test.ts`, 1 LAN test in `test/lan.test.ts`.
 - Request breakpoints don't apply to **chunked (unknown-length) request bodies**. They are skipped
   with a note, because mockttp would drop data past its buffer limit. Most Dart clients (Dio, http)
   send a content-length; streamed uploads don't.
-- WebSockets are passed through but **not recorded**, and rules don't apply to them.
+- WebSockets (v0.5.0): recorded, but only block / fault rules apply; frames can't be edited, mocked or paused.
+  A refused upgrade's response body isn't recorded.
 - mockttp forwards a client's `Connection: close` upstream. That is harmless (Dart doesn't send
   it), but it defeats pooling for such clients.
 - An upstream that accepts but never answers: the proxy adds no timeout of its own, so the app's

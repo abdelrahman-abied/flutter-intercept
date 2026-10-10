@@ -187,3 +187,30 @@ describe('ruleFromExchange', () => {
     expect(ruleFromExchange(empty, 'mock', 'm').action).toMatchObject({ kind: 'mock', status: 201, body: '' });
   });
 });
+
+describe('v0.5.0 rule helpers', () => {
+  it('ruleProblem flags actions that cannot apply to ws:// / wss:// rules', async () => {
+    const { ruleProblem } = await import('../src/rules');
+    expect(ruleProblem({ match: { url: 'wss://chat/*' }, action: { kind: 'block', mode: 'reset' } })).toBeUndefined();
+    expect(ruleProblem({ match: { url: 'wss://chat/*' }, action: { kind: 'fault', fault: 'timeout' } })).toBeUndefined();
+    expect(ruleProblem({ match: { url: 'ws://chat/*' }, action: { kind: 'mock', status: 200, body: '' } })).toMatch(/Mock rules do not apply to WebSocket/);
+    expect(ruleProblem({ match: { url: 'ws://chat/*' }, action: { kind: 'fault', fault: 'truncate' } })).toMatch(/truncate/);
+    expect(ruleProblem({ match: { url: 'wss://x/*', graphqlOperation: 'S' }, action: { kind: 'block', mode: 'reset' } })).toMatch(/GraphQL/);
+    expect(ruleProblem({ match: { url: 'https://api/*' }, action: { kind: 'mock', status: 200, body: '' } })).toBeUndefined();
+  });
+
+  it('ruleFromExchange(mock) rebuilds an event stream from its frames', async () => {
+    const { ruleFromExchange } = await import('../src/rules');
+    const e = {
+      id: '1', startedAt: 0, method: 'GET', url: 'https://x/events', requestHeaders: {}, state: 'completed', status: 200,
+      responseHeaders: { 'content-type': 'text/event-stream' }, kind: 'sse',
+      frames: [
+        { dir: 'receive', at: 0, kind: 'event', text: 'a\nb', event: 'up', id: '1', size: 3 },
+        { dir: 'receive', at: 0, kind: 'event', text: 'c', size: 1 },
+      ],
+    } as const;
+    const r = ruleFromExchange(e as never, 'mock', 'r');
+    expect(r.action).toMatchObject({ kind: 'mock', status: 200, body: 'event: up\nid: 1\ndata: a\ndata: b\n\ndata: c\n\n' });
+    expect(() => ruleFromExchange({ ...e, framesDropped: 1 } as never, 'mock', 'r')).toThrow(/not fully recorded/);
+  });
+});

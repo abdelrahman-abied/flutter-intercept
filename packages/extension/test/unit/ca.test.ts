@@ -1,9 +1,10 @@
+import { execFileSync } from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { CA_FILE, caProblem, CaStore, loadOrCreateCa, mockttpCaGenerator } from '../../src/ca';
+import { CA_FILE, caProblem, CaStore, loadOrCreateCa, mockttpCaGenerator, spkiPin } from '../../src/ca';
 
 const dirs: string[] = [];
 const tmp = () => {
@@ -82,4 +83,34 @@ describe('per-install CA', () => {
     expect(await store.get()).toBe(a);
     expect(calls).toBe(2);
   }, 60_000);
+});
+
+/** openssl's SPKI pin of a PEM certificate, or undefined when openssl is not installed. */
+function opensslPin(certPem: string): string | undefined {
+  try {
+    const pub = execFileSync('openssl', ['x509', '-pubkey', '-noout'], { input: certPem });
+    const der = execFileSync('openssl', ['pkey', '-pubin', '-outform', 'der'], { input: pub });
+    const digest = execFileSync('openssl', ['dgst', '-sha256', '-binary'], { input: der });
+    return Buffer.from(digest).toString('base64');
+  } catch {
+    return undefined;
+  }
+}
+
+describe('spkiPin (CONTRACTS §11.3, Chrome --ignore-certificate-errors-spki-list)', () => {
+  it('equals openssl\'s base64(sha256(SPKI DER)) for the install CA', async () => {
+    const a = await mockttpCaGenerator('pin-a');
+    const pin = spkiPin(a.cert);
+    expect(pin).toMatch(/^[A-Za-z0-9+/]{43}=$/); // 32 bytes, no comma (flutter splits --web-browser-flag on commas)
+    const ref = opensslPin(a.cert);
+    if (ref === undefined) console.warn('openssl not found: SPKI pin not cross-checked');
+    else expect(pin).toBe(ref);
+    // Pins the key, not the certificate: another CA (other key) differs, the same cert is stable.
+    expect(spkiPin(a.cert)).toBe(pin);
+    expect(spkiPin((await mockttpCaGenerator('pin-b')).cert)).not.toBe(pin);
+  }, 60_000);
+
+  it('throws on garbage', () => {
+    expect(() => spkiPin('not a certificate')).toThrow();
+  });
 });

@@ -18,6 +18,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import { spkiPin } from '../ca';
 import { EntryPlan, findPubspecRoot, FsLike, isGeneratedEntry, isWithin, planEntry, PROXY_DEFINE, readPubspec } from '../entry/generator';
 
 export const ORIGINAL_PROGRAM_KEY = 'flutterInterceptOriginalProgram';
@@ -26,6 +27,12 @@ export const HOST_KEY = 'flutterInterceptProxyHost';
 /** `true` when the session uses the LAN listener (physical iOS, CONTRACTS §7). Never holds the token. */
 export const LAN_KEY = 'flutterInterceptLan';
 export const LAN_PROXY_USER = 'flutter-intercept';
+/** `true` on a Flutter Web session we intercept through browser flags (CONTRACTS §11.3): program untouched. */
+export const WEB_KEY = 'flutterInterceptWeb';
+/** The exact `toolArgs` entries we added for a web session: removed (only those) on re-resolve / restore. */
+export const WEB_FLAGS_KEY = 'flutterInterceptWebFlags';
+/** The browser reaches the proxy on loopback; Chrome keeps loopback DIRECT (dev server, DWDS, DevTools). */
+export const WEB_PROXY_HOST = '127.0.0.1';
 
 /** `flutter-intercept:<token>@<host>:<port>`: the FLUTTER_INTERCEPT_PROXY value for LAN sessions. */
 export function lanProxyAddress(lan: { host: string; port: number; token: string }): string {
@@ -87,6 +94,68 @@ export function withInterceptDefines(toolArgs: unknown, sha: string, proxyAddres
   ];
 }
 
+const WEB_BROWSER_FLAG = '--web-browser-flag';
+
+/** Every browser flag in `args` (both `--web-browser-flag=X` and `--web-browser-flag X`). */
+export function webBrowserFlags(args: unknown): string[] {
+  const list = Array.isArray(args) ? (args as unknown[]).map(String) : [];
+  const out: string[] = [];
+  for (let i = 0; i < list.length; i++) {
+    if (list[i] === WEB_BROWSER_FLAG && i + 1 < list.length) out.push(list[++i]);
+    else if (list[i].startsWith(`${WEB_BROWSER_FLAG}=`)) out.push(list[i].slice(WEB_BROWSER_FLAG.length + 1));
+  }
+  return out;
+}
+
+/** A browser flag that already decides the browser's proxy (the user's own proxy setup wins). */
+export function isBrowserProxyFlag(flag: string): boolean {
+  return /^--(proxy-server|proxy-pac-url)(=|$)|^--(no-proxy-server|proxy-auto-detect)$/.test(flag);
+}
+
+/**
+ * A browser flag that points the browser at a profile directory of the user's own choosing (REVIEW-5 #10).
+ * flutter_tools then launches Chrome on that directory instead of a fresh temp profile, so our proxy and CA pin
+ * would apply to a real, persistent profile (logins, mail, banking). `--profile-directory` only picks a profile
+ * *inside* the user-data-dir, which stays flutter's temp one without `--user-data-dir`: harmless on its own.
+ */
+export function isUserProfileFlag(flag: string): boolean {
+  return /^--user-data-dir(=|$)/.test(flag);
+}
+
+/**
+ * The `toolArgs` entries for a web session (CONTRACTS §11.3): Chrome/Edge proxy everything except loopback
+ * (its default bypass, kept: dev server, DWDS and DevTools run on localhost) through us, and accept
+ * certificates that chain to this install's CA (pinned by SPKI; applies only to this temp-profile browser).
+ * flutter_tools splits `--web-browser-flag` values on commas: neither value contains one.
+ */
+export function webInterceptFlags(proxyPort: number, caPin: string): string[] {
+  if (!Number.isInteger(proxyPort) || proxyPort <= 0 || proxyPort > 65535) throw new Error(`bad proxy port ${proxyPort}`);
+  if (!/^[A-Za-z0-9+/]{43}=$/.test(caPin)) throw new Error('bad SPKI pin');
+  return [
+    `${WEB_BROWSER_FLAG}=--proxy-server=http://${WEB_PROXY_HOST}:${proxyPort}`,
+    `${WEB_BROWSER_FLAG}=--ignore-certificate-errors-spki-list=${caPin}`,
+  ];
+}
+
+/** toolArgs without the exact entries in `ours` (what a previous web resolve recorded in WEB_FLAGS_KEY). */
+export function stripWebFlags(toolArgs: unknown, ours: unknown): string[] {
+  const args = Array.isArray(toolArgs) ? (toolArgs as unknown[]).map(String) : [];
+  const remove = new Set((Array.isArray(ours) ? (ours as unknown[]) : []).map(String));
+  if (!remove.size) return args;
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (remove.has(args[i])) continue;
+    if (args[i] === WEB_BROWSER_FLAG && i + 1 < args.length && remove.has(`${WEB_BROWSER_FLAG}=${args[i + 1]}`)) { i++; continue; }
+    out.push(args[i]);
+  }
+  return out;
+}
+
+/** Chromium devices flutter_tools launches itself (so it passes our --web-browser-flag). */
+export function isFlutterLaunchedBrowser(deviceId: unknown): deviceId is 'chrome' | 'edge' {
+  return deviceId === 'chrome' || deviceId === 'edge';
+}
+
 /** Dart-Code's DebuggerType enum (out/dist/extension.js, `var DebuggerType`). */
 export const DebuggerType = { Dart: 0, DartTest: 1, Flutter: 2, FlutterTest: 3, Web: 4, WebTest: 5 } as const;
 const debuggerTypeNames = Object.keys(DebuggerType) as (keyof typeof DebuggerType)[];
@@ -118,13 +187,38 @@ export interface RewriteContext {
   settingsToolArgs?: string[];
   /** Setting `flutterIntercept.captureSource` (default true); false adds `FLUTTER_INTERCEPT_TRACE=0` (Flutter only). */
   captureSource?: boolean;
+  /**
+   * Setting `flutterIntercept.web.enabled` (CONTRACTS §11.3). false/absent = web devices are not intercepted.
+   * Web sessions need `caCertPem` (its SPKI pin goes into the browser flags).
+   */
+  webEnabled?: boolean;
   /** fsPath of the active editor's file (only used in "before" mode when program is missing). */
   activeFile?: string;
   fs?: FsLike;
 }
 
 export type RewriteResult =
-  | { kind: 'skip'; reason: string; noLan?: boolean }
+  | {
+      kind: 'skip';
+      reason: string;
+      noLan?: boolean;
+      /** The `web-server` device (or another browser flutter does not launch): show the reason once. */
+      webServer?: boolean;
+      /** The launch starts the browser on the user's own profile (`--user-data-dir`): show the reason once. */
+      webUserProfile?: boolean;
+      /** A web session would be intercepted but `caCertPem` is not loaded yet: load it and resolve again. */
+      needsCa?: boolean;
+    }
+  /** Flutter Web (CONTRACTS §11.3): program untouched (no dart:io), only browser flags in `toolArgs`. */
+  | {
+      kind: 'web';
+      config: DebugConfig;
+      mode: 'after' | 'before' | 'already';
+      proxyHost: typeof WEB_PROXY_HOST;
+      deviceId: 'chrome' | 'edge';
+      /** The toolArgs entries added (also recorded in the config under WEB_FLAGS_KEY). */
+      flags: string[];
+    }
   /** Interception does not apply but the config points at our entry (e.g. Dart-Code's "rerun last session"): put the original back. */
   | { kind: 'restore'; reason: string; config: DebugConfig }
   | {
@@ -245,16 +339,21 @@ export function selectDebuggerType(program: string, projectRoot: string | undefi
 
 export function rewriteDebugConfig(input: DebugConfig, ctx: RewriteContext): RewriteResult {
   const result = rewriteOrSkip(input, ctx);
-  if (result.kind === 'skip' && input && isGeneratedEntry(input.program) && typeof input[ORIGINAL_PROGRAM_KEY] === 'string') {
-    const config: DebugConfig = { ...input, program: input[ORIGINAL_PROGRAM_KEY] };
-    delete config[ORIGINAL_PROGRAM_KEY];
-    delete config[MARKER_KEY];
-    delete config[HOST_KEY];
-    delete config[LAN_KEY];
-    if (Array.isArray(config.toolArgs)) config.toolArgs = stripDefines(config.toolArgs);
-    return { kind: 'restore', reason: result.reason, config };
-  }
+  if (result.kind !== 'skip' || !input) return result;
+  const ourEntry = isGeneratedEntry(input.program) && typeof input[ORIGINAL_PROGRAM_KEY] === 'string';
+  const ourWeb = input[WEB_KEY] === true || Array.isArray(input[WEB_FLAGS_KEY]);
+  // A web launch that only waits for the CA keeps everything: it is resolved again right away.
+  if ((ourEntry || ourWeb) && !result.needsCa) return { kind: 'restore', reason: result.reason, config: withoutInterception(input) };
   return result;
+}
+
+/** `config` as it was before we touched it: original program, none of our keys, defines or browser flags. */
+export function withoutInterception(input: DebugConfig): DebugConfig {
+  const config: DebugConfig = { ...input };
+  if (isGeneratedEntry(config.program) && typeof config[ORIGINAL_PROGRAM_KEY] === 'string') config.program = config[ORIGINAL_PROGRAM_KEY];
+  if (Array.isArray(config.toolArgs)) config.toolArgs = stripDefines(stripWebFlags(config.toolArgs, config[WEB_FLAGS_KEY]));
+  for (const k of [ORIGINAL_PROGRAM_KEY, MARKER_KEY, HOST_KEY, LAN_KEY, WEB_KEY, WEB_FLAGS_KEY]) delete config[k];
+  return config;
 }
 
 function rewriteOrSkip(input: DebugConfig, ctx: RewriteContext): RewriteResult {
@@ -266,7 +365,6 @@ function rewriteOrSkip(input: DebugConfig, ctx: RewriteContext): RewriteResult {
     // Never silently intercept a release build: the entry trusts this machine's CA and ignores app findProxy.
     return { kind: 'skip', reason: 'release build (flutterMode "release" / --release): never intercepted' };
   }
-  if (isWebDevice(input.deviceId)) return { kind: 'skip', reason: `web device ${input.deviceId}` };
   if (input.omitTargetFlag === true) return { kind: 'skip', reason: 'omitTargetFlag: program is not passed to the tool' };
   const explicitType = debuggerTypeName(input.debuggerType);
   if (explicitType && explicitType !== 'Dart' && explicitType !== 'Flutter') {
@@ -314,6 +412,7 @@ function rewriteOrSkip(input: DebugConfig, ctx: RewriteContext): RewriteResult {
 
   // Host depends on the device (CONTRACTS §2). Plain Dart runs on the host VM: always localhost.
   const deviceId = flutter ? (typeof config.deviceId === 'string' ? config.deviceId : ctx.selectedDeviceId) : undefined;
+  if (isWebDevice(deviceId)) return webSession(config, ctx, original, mode, deviceId!);
   const lan = flutter && ctx.physicalIos ? ctx.lan : undefined;
   if (flutter && ctx.physicalIos && !lan) {
     return { kind: 'skip', noLan: true, reason: 'physical iOS device, but this Mac has no LAN (Wi-Fi/Ethernet) IPv4 address the iPhone could reach' };
@@ -324,6 +423,12 @@ function rewriteOrSkip(input: DebugConfig, ctx: RewriteContext): RewriteResult {
   const plan = planEntry({ program: original, fallbackRoot: cwd ?? ctx.folder, proxyPort: ctx.proxyPort, caCertPem: ctx.caCertPem }, f);
   if (!plan) return { kind: 'skip', reason: 'no project root' };
 
+  if (config[WEB_KEY] !== undefined || config[WEB_FLAGS_KEY] !== undefined) {
+    // Re-resolved for a non-web device after a web resolve: drop the browser flags.
+    if (Array.isArray(config.toolArgs)) config.toolArgs = stripWebFlags(config.toolArgs, config[WEB_FLAGS_KEY]);
+    delete config[WEB_KEY];
+    delete config[WEB_FLAGS_KEY];
+  }
   config.program = plan.entryPath;
   config[ORIGINAL_PROGRAM_KEY] = original;
   config[MARKER_KEY] = proxyPort;
@@ -351,4 +456,50 @@ function rewriteOrSkip(input: DebugConfig, ctx: RewriteContext): RewriteResult {
     needsAdbReverse: flutter && !lan && proxyHost === 'localhost',
     lan: !!lan,
   };
+}
+
+/**
+ * Flutter Web on a browser flutter_tools launches (CONTRACTS §11.3, docs/spikes/web.md): the app's fetch/XHR
+ * go through the browser, so instead of an entry we start that browser with our proxy and the CA's SPKI pin.
+ * `program` stays the app's own (restored if it was our entry); our dart-defines are removed.
+ */
+function webSession(config: DebugConfig, ctx: RewriteContext, original: string, mode: 'after' | 'before' | 'already', deviceId: string): RewriteResult {
+  if (!isFlutterLaunchedBrowser(deviceId)) {
+    return {
+      kind: 'skip',
+      webServer: true,
+      reason: `${deviceId} device: Flutter does not start the browser, so its proxy can't be set. Use the Chrome (or Edge) device to intercept Flutter Web`,
+    };
+  }
+  if (!ctx.webEnabled) return { kind: 'skip', reason: 'flutterIntercept.web.enabled is false' };
+  const base = stripDefines(stripWebFlags(config.toolArgs, config[WEB_FLAGS_KEY]));
+  const own = [...webBrowserFlags(base), ...webBrowserFlags(ctx.settingsToolArgs)].find(isBrowserProxyFlag);
+  if (own) return { kind: 'skip', reason: `the launch already sets the browser's proxy (--web-browser-flag=${own})` };
+  // REVIEW-5 #10: never put our proxy + CA pin into a real, persistent browser profile.
+  if ([...webBrowserFlags(base), ...webBrowserFlags(ctx.settingsToolArgs)].some(isUserProfileFlag)) {
+    return {
+      kind: 'skip',
+      webUserProfile: true,
+      reason:
+        'this web launch opens Chrome on your own profile (--web-browser-flag=--user-data-dir=…), so Flutter Intercept does not ' +
+        'intercept it: everything browsed in that profile would go through the proxy. Remove --user-data-dir to intercept',
+    };
+  }
+  if (!ctx.caCertPem) return { kind: 'skip', needsCa: true, reason: 'web session: the CA certificate is not loaded yet' };
+  let pin: string;
+  try {
+    pin = spkiPin(ctx.caCertPem);
+  } catch (e) {
+    return { kind: 'skip', reason: `web session: unreadable CA certificate (${(e as Error).message})` };
+  }
+  const flags = webInterceptFlags(ctx.proxyPort, pin);
+  if (isGeneratedEntry(config.program)) config.program = original; // e.g. rerun of a mobile session on Chrome
+  config.toolArgs = [...base, ...flags];
+  config[ORIGINAL_PROGRAM_KEY] = original;
+  config[MARKER_KEY] = ctx.proxyPort;
+  config[HOST_KEY] = WEB_PROXY_HOST;
+  config[WEB_KEY] = true;
+  config[WEB_FLAGS_KEY] = flags;
+  delete config[LAN_KEY];
+  return { kind: 'web', config, mode, proxyHost: WEB_PROXY_HOST, deviceId, flags };
 }

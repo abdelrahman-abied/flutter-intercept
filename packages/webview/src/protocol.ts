@@ -6,6 +6,7 @@ export type { NetworkProfile } from '@flutter-intercept/proxy/network';
 
 export type {
   Body, BodyEncoding, Exchange, ExchangeState, Matcher, RequestEdit, ResponseEdit, Rule, RuleAction,
+  Frame, GraphqlInfo, CorsInfo,
 } from '@flutter-intercept/proxy/types';
 
 // host → webview
@@ -25,6 +26,7 @@ export interface Status {
   lan?: { host: string; port: number }; // present while the LAN listener is open (never the token)
   agent?: AgentStatus;                  // CONTRACTS §8 (never the MCP token)
   networkProfile?: NetworkProfile;      // CONTRACTS §9.3; absent = none
+  warnings?: SessionWarning[];          // CONTRACTS §11
 }
 export interface AgentStatus { access: string; mcpUrl?: string; clients: number; lastCall?: { tool: string; at: number } }
 
@@ -60,4 +62,12 @@ export interface ContractSummary {
   via: 'retrofit' | 'chopper' | 'source' | 'user' | 'none';
   violations: { path: string; field: string; expected: string; actual: string; severity: 'error' | 'warning'; message: string }[];
   reason?: string;
+}
+
+/** CONTRACTS §11: a session-level warning shown as a banner (dismissable per id). */
+export interface SessionWarning {
+  id: string;           // stable, e.g. "isolate:<sessionId>:<isolateName>"
+  kind: 'background-isolate' | 'native-client' | 'web' | 'other';
+  text: string;         // one sentence, e.g. "Requests from background isolate \"worker\" are not intercepted."
+  sessionId?: string;
 }

@@ -173,7 +173,9 @@ describe('pass-through recording', () => {
     expect(r.firstChunkMs).toBeLessThan(300);
     expect(r.totalMs).toBeGreaterThanOrEqual(550);
     const [ex] = (await settled(proxy));
-    expect(ex).toMatchObject({ state: 'completed', responseBody: { text: 'data: one\n\ndata: two\n\n' } });
+    // v0.5.0: an event stream is recorded as frames, not as a body copy (CONTRACTS §11.1).
+    expect(ex).toMatchObject({ state: 'completed', kind: 'sse', frames: [{ kind: 'event', text: 'one' }, { kind: 'event', text: 'two' }] });
+    expect(ex.responseBody).toBeUndefined();
   });
 
   it('reuses upstream connections across client connections (Dart opens a tunnel per request)', async () => {

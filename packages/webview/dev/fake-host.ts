@@ -29,9 +29,16 @@
  * every snapshot. `mutate` rules change the JSON response like the proxy (and set `simulated`); `mutateField`
  * inserts such a rule first; `pickModel` cycles the route through the models (then "don't check") and re-checks;
  * `openViolation` / `generateModel` / `generateFixture` only log (the webview shows its own notice).
+ *
+ * v0.5.0 (CONTRACTS §11): GraphQL requests (POST /graphql with `graphql` info; rules with `graphqlOperation` match
+ * on it), a Flutter Web request blocked by CORS plus its preflight (a `cors` rule patches them), read-only native
+ * exchanges (`captured: 'vm-profile'`, rules never apply), a live WebSocket (500+ frames: the oldest are dropped
+ * and counted), a closed one and an abnormally closed one, a live SSE stream, and session warnings (background
+ * isolate, native client), and the browser's own traffic (`browserInternal`, hidden by default). ?coverage=0
+ * turns all of it off; the dev bar's "+ws" opens another WebSocket and "warn" adds a warning.
  */
 import type {
-  Body, ContractSummary, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit, Rule, SendDraft, Status, ViewMsg,
+  Body, ContractSummary, CorsInfo, Frame, GraphqlInfo, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit, Rule, SendDraft, Status, ViewMsg,
 } from '../src/protocol';
 import type { MutateOp, SourceInfo, StackFrame } from '@flutter-intercept/proxy/types';
 import { applyOps } from '@flutter-intercept/proxy/jsonpath';
@@ -346,6 +353,14 @@ interface Template {
   weight: number;
   /** App call chain (innermost first): [function, path under package:shop/, line]. */
   src?: { http: 'dio' | 'http'; chain: [string, string, number][] };
+  // CONTRACTS §11
+  graphql?: GraphqlInfo;
+  /** The diagnosis when no `cors` rule patches it. */
+  cors?: CorsInfo;
+  /** Read-only native capture: rules never apply. */
+  native?: true;
+  /** Flutter Web: the browser's own traffic (hidden by default in the list). */
+  browser?: true;
 }
 
 // ---------------------------------------------------------------- fake source traces (CONTRACTS §9.2)
@@ -419,7 +434,44 @@ const TEMPLATES: Template[] = [
   { weight: 1, src: { http: 'dio', chain: [['FeedApi.load', 'data/feed_api.dart', 12], ['FeedController.refresh', 'state/feed_controller.dart', 40]] },
     method: 'GET', url: () => 'https://api.shop.example.com/v1/feed', reqHeaders: { ...UA, ...AUTH }, status: 200, resHeaders: JSON_RES,
     resBody: () => json({ sections: Array.from({ length: 150 }, (_, i) => ({ id: i, title: `Section ${i}`, items: [product(i), product(i + 1)], layout: { kind: 'carousel', columns: 2 } })) }), latency: [100, 600] },
+  ...(params.get('coverage') === '0' ? [] : COVERAGE_TEMPLATES()),
 ];
+
+/** CONTRACTS §11 traffic: GraphQL, a Flutter Web request blocked by CORS (+ its preflight), native captures. */
+function COVERAGE_TEMPLATES(): Template[] {
+  const GQL = 'https://api.shop.example.com/graphql';
+  const gqlHeaders = { ...UA, ...AUTH, 'content-type': 'application/json' };
+  const WEB = { origin: 'http://localhost:5000', referer: 'http://localhost:5000/', 'user-agent': 'Mozilla/5.0 (Macintosh) Chrome/129.0' };
+  return [
+    { weight: 2, src: { http: 'dio', chain: [['UserRepository.fetch', 'data/user_repository.dart', 22]] },
+      method: 'POST', url: () => GQL, reqHeaders: gqlHeaders, graphql: { operationName: 'getUser', operationType: 'query' },
+      reqBody: () => json({ operationName: 'getUser', query: 'query getUser($id: ID!) { user(id: $id) { id name avatarUrl } }', variables: { id: String(rnd(1, 99)) } }),
+      status: 200, resHeaders: JSON_RES, resBody: () => json({ data: { user: { id: '42', name: 'Ada Lovelace', avatarUrl: null } } }), latency: [40, 200] },
+    { weight: 1, src: { http: 'dio', chain: [['CartRepository.add', 'data/cart_repository.dart', 48]] },
+      method: 'POST', url: () => GQL, reqHeaders: gqlHeaders, graphql: { operationName: 'addToCart', operationType: 'mutation' },
+      reqBody: () => json({ operationName: 'addToCart', query: 'mutation addToCart($sku: String!) { addToCart(sku: $sku) { items total } }', variables: { sku: 'A-1' } }),
+      status: 200, resHeaders: JSON_RES, resBody: () => json({ data: { addToCart: { items: 3, total: 42.5 } } }), latency: [60, 300] },
+    { weight: 1, method: 'POST', url: () => GQL, reqHeaders: gqlHeaders, graphql: { operationName: 'productFeed', operationType: 'query', persisted: true },
+      reqBody: () => json({ operationName: 'productFeed', extensions: { persistedQuery: { version: 1, sha256Hash: 'ecf4edb46db40b5132295c0291d62fb65d6759a9eedfa4d5d612dd5ec54a6b38' } } }),
+      status: 200, resHeaders: JSON_RES, resBody: () => json({ data: { feed: [product(1), product(2)] } }), latency: [40, 160] },
+    { weight: 1, method: 'OPTIONS', url: () => 'https://api.shop.example.com/v1/cart',
+      reqHeaders: { ...WEB, 'access-control-request-method': 'POST', 'access-control-request-headers': 'authorization,content-type' },
+      cors: { preflight: true, problem: 'Preflight: no Access-Control-Allow-Origin for http://localhost:5000' },
+      status: 200, resHeaders: { allow: 'GET, POST', server: 'nginx' }, latency: [10, 40] },
+    { weight: 1, method: 'GET', url: () => 'https://api.shop.example.com/v1/cart', reqHeaders: { ...WEB, ...AUTH, cookie: 'session=abc' },
+      cors: { problem: 'no Access-Control-Allow-Origin for http://localhost:5000' },
+      status: 200, resHeaders: JSON_RES, resBody: () => json({ cartId: 'c_91', items: [] }), latency: [30, 120] },
+    { weight: 1, browser: true, method: 'POST', url: () => 'https://update.googleapis.com/service/update2/json?cup2key=13:abc',
+      reqHeaders: { 'user-agent': WEB['user-agent'], 'content-type': 'application/json' }, reqBody: () => json({ request: { protocol: '3.1', apps: [] } }),
+      status: 200, resHeaders: JSON_RES, resBody: () => json({ response: { protocol: '3.1', app: [] } }), latency: [80, 300] },
+    { weight: 1, browser: true, method: 'GET', url: () => 'https://optimizationguide-pa.googleapis.com/downloads?name=1&target=OPTIMIZATION_TARGET_PAGE_TOPICS',
+      reqHeaders: { 'user-agent': WEB['user-agent'] }, status: 200, resHeaders: { 'content-type': 'application/octet-stream' },
+      resBody: () => ({ text: 'AAECAwQ=', encoding: 'base64' }), latency: [40, 200] },
+    { weight: 1, native: true, method: 'GET', url: () => `https://img-api.shop.example.com/v2/thumbnails/${rnd(1, 300)}`,
+      reqHeaders: { 'user-agent': 'CFNetwork/1498 Darwin/24.0.0 (cupertino_http)' },
+      status: 200, resHeaders: JSON_RES, resBody: () => json({ url: 'https://cdn.shop.example.com/t/1.webp', w: 120, h: 120 }), latency: [30, 200] },
+  ];
+}
 
 function pickTemplate(): Template {
   const total = TEMPLATES.reduce((s, t) => s + t.weight, 0);
@@ -458,7 +510,11 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
   if (opts.initiator) ex.initiator = opts.initiator;
   if (opts.resentFrom) ex.resentFrom = opts.resentFrom;
   if (!ex.requestBody) delete ex.requestBody;
-  const rule = rules.find((r) => r.enabled && !isSpent(r) && matches(r.match, ex.method, ex.url));
+  if (t.graphql) ex.graphql = t.graphql;
+  if (t.native) ex.captured = 'vm-profile';
+  if (t.browser) ex.browserInternal = true;
+  const rule = t.native ? undefined : rules.find((r) => r.enabled && !isSpent(r) && matches(r.match, ex.method, ex.url)
+    && (!r.match.graphqlOperation || r.match.graphqlOperation === t.graphql?.operationName));
   if (rule) {
     ex.matchedRuleId = rule.id;
     hits.set(rule.id, (hits.get(rule.id) ?? 0) + 1);
@@ -468,7 +524,13 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
   const a = rule?.action;
 
   // Network profile (global) + throttle rule: what would reach the network is slowed or failed.
-  const reachesNetwork = !a || a.kind === 'breakpoint' || a.kind === 'throttle' || a.kind === 'mutate';
+  const reachesNetwork = !a || a.kind === 'breakpoint' || a.kind === 'throttle' || a.kind === 'mutate' || a.kind === 'cors';
+  if (t.cors) {
+    // A `cors` rule answers the preflight / adds the headers; a mock answers the preflight itself (CONTRACTS §11.3).
+    ex.cors = a?.kind === 'cors' || (a?.kind === 'mock' && t.cors.preflight)
+      ? { ...(t.cors.preflight ? { preflight: true } : {}), patched: true }
+      : t.cors;
+  }
   const profile: NetworkProfile = status.networkProfile ?? { kind: 'none' };
   let latency = rnd(...t.latency);
   const simulated: string[] = [];
@@ -502,6 +564,14 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
     }
     let body = t.resBody?.();
     const resp: Partial<Exchange> = { status: t.status, responseHeaders: t.resHeaders ?? {} };
+    if (a?.kind === 'cors') {
+      const origin = String(t.reqHeaders?.origin ?? '*');
+      resp.responseHeaders = {
+        ...resp.responseHeaders, 'access-control-allow-origin': a.allowOrigin ?? origin, vary: 'origin',
+        ...(a.allowCredentials ? { 'access-control-allow-credentials': 'true' } : {}),
+      };
+      if (t.method === 'OPTIONS') { resp.status = 204; resp.responseHeaders['access-control-allow-methods'] = 'GET, POST'; }
+    }
     if (a?.kind === 'mutate') {
       const m = mutateBody(body, a.ops);
       body = m.body;
@@ -681,6 +751,133 @@ function wire() {
 }
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire);
 else wire();
+
+// ---------------------------------------------------------------- WebSocket / SSE / warnings (CONTRACTS §11)
+
+const MAX_FRAMES = 500;
+const utf8Size = (t: string) => new TextEncoder().encode(t).length;
+const textFrame = (dir: Frame['dir'], at: number, text: string): Frame => ({ dir, at, kind: 'text', text, size: utf8Size(text) });
+
+/** Append frames like the proxy: the newest MAX_FRAMES are kept, `framesDropped` counts the rest. */
+function withFrames(ex: Exchange, add: Frame[]): Partial<Exchange> {
+  const all = [...(ex.frames ?? []), ...add];
+  const over = Math.max(0, all.length - MAX_FRAMES);
+  return { frames: over ? all.slice(over) : all, ...(over || ex.framesDropped ? { framesDropped: (ex.framesDropped ?? 0) + over } : {}) };
+}
+
+let tick = 0;
+function wsFrame(at: number): Frame {
+  tick++;
+  const r = random();
+  if (tick % 15 === 0) return { dir: 'send', at, kind: 'ping', size: 0 };
+  if (tick % 15 === 1 && tick > 1) return { dir: 'receive', at, kind: 'pong', size: 0 };
+  if (r < 0.06) {
+    const bytes = Uint8Array.from({ length: 48 + Math.floor(random() * 200) }, (_, i) => (i < 4 ? [0x08, 0x96, 0x01, 0x12][i] : Math.floor(random() * 256)));
+    let bin = '';
+    for (const b of bytes) bin += String.fromCharCode(b);
+    return { dir: 'receive', at, kind: 'binary', base64: btoa(bin), size: bytes.length };
+  }
+  if (r < 0.2) return textFrame('send', at, JSON.stringify({ type: 'subscribe', channel: `prices:${rnd(1, 300)}` }));
+  if (r < 0.25) return textFrame('receive', at, 'ok');
+  return textFrame('receive', at, JSON.stringify({
+    type: 'price', productId: rnd(1, 300), price: { amount: Math.round(random() * 10_000) / 100, currency: 'EUR' }, seq: tick,
+  }));
+}
+
+function openSocket(opts: { url: string; frames: number; spanMs: number; close?: { code: number; by: Frame['dir']; reason?: string }; live?: boolean }): string {
+  const id = `ex_${++seq}`;
+  const now = Date.now();
+  const started = now - opts.spanMs - 200;
+  let ex: Exchange = {
+    id, startedAt: started, method: 'GET', url: opts.url, kind: 'websocket', state: 'pending',
+    requestHeaders: { ...UA, ...AUTH, connection: 'Upgrade', upgrade: 'websocket', 'sec-websocket-version': '13', 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' },
+    status: 101, responseHeaders: { connection: 'Upgrade', upgrade: 'websocket', 'sec-websocket-accept': 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=' },
+  };
+  const initial: Frame[] = [textFrame('send', started + 50, JSON.stringify({ type: 'hello', token: 'eyJhbGciOi…', client: 'shop/1.4.0' }))];
+  for (let i = 1; i < opts.frames; i++) initial.push(wsFrame(started + 50 + Math.round((i / opts.frames) * opts.spanMs)));
+  ex = { ...ex, ...withFrames(ex, initial) };
+  if (opts.close) {
+    const at = started + opts.spanMs + 100;
+    const reason = opts.close.reason ?? '';
+    ex.frames = [...ex.frames!, { dir: opts.close.by, at, kind: 'close', closeCode: opts.close.code, text: reason || undefined, size: 2 + utf8Size(reason) }];
+    if (!ex.frames.at(-1)!.text) delete ex.frames.at(-1)!.text;
+    ex.durationMs = at - started;
+    ex.state = opts.close.code === 1000 || opts.close.code === 1001 ? 'completed' : 'error';
+    if (ex.state === 'error') ex.error = `WebSocket closed abnormally (${opts.close.code})`;
+  }
+  record(ex, true);
+  send({ type: 'exchange', exchange: ex });
+  if (opts.live) {
+    const timer = setInterval(() => {
+      const cur = find(id);
+      if (!cur || cur.state !== 'pending') { clearInterval(timer); return; }
+      if (!streaming) return;
+      const n = random() < 0.3 ? 2 : 1;
+      update(cur, withFrames(cur, Array.from({ length: n }, () => wsFrame(Date.now()))));
+    }, 450);
+  }
+  return id;
+}
+
+const SSE_EVENTS = ['order.updated', 'order.updated', 'shipment.moved', 'heartbeat'];
+let sseId = 1000;
+function sseFrame(at: number): Frame {
+  const event = pick(SSE_EVENTS);
+  const text = event === 'heartbeat' ? '' : JSON.stringify(event === 'order.updated'
+    ? { orderId: `o_${rnd(100, 999)}`, status: pick(['paid', 'packed', 'shipped']), at: new Date(at).toISOString() }
+    : { orderId: `o_${rnd(100, 999)}`, lat: 51.5 + random() / 10, lng: -0.12 + random() / 10 });
+  return { dir: 'receive', at, kind: 'event', event, id: String(++sseId), text, size: utf8Size(text) };
+}
+
+function openSse(): string {
+  const id = `ex_${++seq}`;
+  const started = Date.now() - 20_000;
+  let ex: Exchange = {
+    id, startedAt: started, method: 'GET', url: 'https://api.shop.example.com/v1/orders/stream', kind: 'sse', state: 'pending',
+    requestHeaders: { ...UA, ...AUTH, accept: 'text/event-stream', 'cache-control': 'no-cache' },
+    status: 200, responseHeaders: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' },
+    responseBody: { text: '', encoding: 'utf8' },
+  };
+  ex = { ...ex, ...withFrames(ex, Array.from({ length: 24 }, (_, i) => sseFrame(started + i * 800))) };
+  record(ex, true);
+  send({ type: 'exchange', exchange: ex });
+  const timer = setInterval(() => {
+    const cur = find(id);
+    if (!cur || cur.state !== 'pending') { clearInterval(timer); return; }
+    if (streaming) update(cur, withFrames(cur, [sseFrame(Date.now())]));
+  }, 1300);
+  return id;
+}
+
+const WARNINGS: NonNullable<Status['warnings']> = [
+  { id: 'isolate:s1:image_decoder', kind: 'background-isolate', sessionId: 's1',
+    text: 'Requests from background isolate "image_decoder" are not intercepted (HttpOverrides is per isolate).' },
+  { id: 'native:s1', kind: 'native-client', sessionId: 's1',
+    text: 'This app also uses a native HTTP client (cupertino_http): its requests appear read-only from the HTTP profile and can\'t be mocked or paused.' },
+];
+
+function startCoverage() {
+  if (params.get('coverage') === '0') return;
+  // Preloaded: a long-lived socket past the 500-frame cap (live), a clean close, an abnormal close; a live SSE stream.
+  openSocket({ url: 'wss://realtime.shop.example.com/v1/prices', frames: 540, spanMs: 240_000, live: true });
+  openSocket({ url: 'wss://realtime.shop.example.com/v1/chat', frames: 12, spanMs: 9_000, close: { code: 1000, by: 'send', reason: 'bye' } });
+  openSocket({ url: 'wss://realtime.shop.example.com/v1/notifications', frames: 6, spanMs: 4_000, close: { code: 1006, by: 'receive' } });
+  openSse();
+  status = { ...status, warnings: [...WARNINGS] };
+  send({ type: 'status', status });
+}
+setTimeout(startCoverage, 0);
+
+function addWarning() {
+  const n = (status.warnings?.length ?? 0) + 1;
+  status = { ...status, warnings: [...(status.warnings ?? []), {
+    id: `isolate:s1:worker_${n}`, kind: 'background-isolate', sessionId: 's1',
+    text: `Requests from background isolate "worker_${n}" are not intercepted (HttpOverrides is per isolate).`,
+  }] };
+  send({ type: 'status', status });
+}
+document.getElementById('dev-ws')?.addEventListener('click', () => openSocket({ url: 'wss://realtime.shop.example.com/v1/prices', frames: 3, spanMs: 1000, live: true }));
+document.getElementById('dev-warn')?.addEventListener('click', addWarning);
 
 // ---------------------------------------------------------------- contract check + mutate (CONTRACTS §10)
 

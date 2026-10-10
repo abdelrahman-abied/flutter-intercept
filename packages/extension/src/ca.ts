@@ -56,6 +56,18 @@ export function caProblem(pair: Partial<CaPair> | undefined, now: Date = new Dat
   return undefined;
 }
 
+/**
+ * base64(sha256(SubjectPublicKeyInfo DER)) of a PEM certificate: the value Chromium's
+ * `--ignore-certificate-errors-spki-list` takes (CONTRACTS §11.3), same as
+ * `openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64`.
+ * Given the install CA, Chrome accepts proxy leaf certificates that chain to it (docs/spikes/web.md).
+ * Throws on a certificate it can't parse.
+ */
+export function spkiPin(certPem: string): string {
+  const der = new crypto.X509Certificate(certPem).publicKey.export({ type: 'spki', format: 'der' });
+  return crypto.createHash('sha256').update(der).digest('base64');
+}
+
 async function readPair(file: string): Promise<CaPair | undefined> {
   try {
     return JSON.parse(await fs.promises.readFile(file, 'utf8')) as CaPair;

@@ -1,6 +1,19 @@
 export { InterceptProxy } from './intercept-proxy';
 export { lanIPv4Addresses } from './lan';
-export { matches, ruleFromExchange, compileMatcher, isInvalidMatcher, isSafeRegexSource, RuleFromExchangeError } from './rules';
+export {
+  matches,
+  ruleFromExchange,
+  compileMatcher,
+  isInvalidMatcher,
+  isSafeRegexSource,
+  ruleProblem,
+  RuleFromExchangeError,
+} from './rules';
+export { detectGraphql, graphqlOperationNames, scanOperations } from './graphql';
+export type { GraphqlDetection, GraphqlOperationRef, GraphqlRequest } from './graphql';
+export { diagnoseCors, isPreflight, isCorsRequest, preflightResponseHeaders, corsResponseHeaders } from './cors';
+export type { CorsOptions } from './cors';
+export { isBrowserInternal, BROWSER_SERVICE_HOSTS } from './browser';
 export type { RuleFromExchangeErrorCode } from './rules';
 export type {
   Body,
@@ -14,6 +27,9 @@ export type {
   Rule,
   RuleAction,
   FaultKind,
+  Frame,
+  GraphqlInfo,
+  CorsInfo,
   MutateOp,
   SendRequest,
   SourceInfo,

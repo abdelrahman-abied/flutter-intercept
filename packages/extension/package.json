@@ -66,6 +66,24 @@
           "default": true,
           "description": "Record where in your code each request was made (a stack trace sent out of band to the proxy), so you can jump from a request to its source line. Takes effect on the next launch. Flutter sessions only (plain Dart programs always record)."
         },
+        "flutterIntercept.web.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Also intercept Flutter Web apps launched in Chrome from VS Code (the browser is started with Flutter Intercept as its proxy). The web-server device can't be intercepted."
+        },
+        "flutterIntercept.nativeClients": {
+          "type": "string",
+          "enum": [
+            "profile",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Show requests from native HTTP clients (cupertino_http, cronet_http, ok_http) read-only, from the app's HTTP profile.",
+            "Don't read the app's HTTP profile."
+          ],
+          "default": "profile",
+          "description": "Requests made by native HTTP clients bypass the proxy, so they can't be mocked or paused. With \"profile\", they are still listed (read-only) from the app's HTTP profile in debug and profile mode."
+        },
         "flutterIntercept.contractCheck": {
           "type": "boolean",
           "default": true,
@@ -163,7 +181,7 @@
         "toolReferenceName": "interceptGetStatus",
         "canBeReferencedInPrompt": true,
         "userDescription": "Show proxy, session and traffic status.",
-        "modelDescription": "Get Flutter Intercept status: whether the intercepting proxy runs, the running debug sessions (device, program), how many requests are recorded and paused, and the agent access level. Call this first to see whether an app is running before using the other tools.",
+        "modelDescription": "Get Flutter Intercept status: whether the intercepting proxy runs, the running debug sessions (device, program), how many requests are recorded and paused, the agent access level, and warnings about traffic that is NOT intercepted (e.g. requests from a background isolate, native HTTP clients that are only listed read-only). Call this first to see whether an app is running before using the other tools.",
         "inputSchema": {
           "type": "object",
           "properties": {},
@@ -182,7 +200,7 @@
         "toolReferenceName": "interceptListRequests",
         "canBeReferencedInPrompt": true,
         "userDescription": "List recorded HTTP requests.",
-        "modelDescription": "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state or start time. Returns ids; call get_request for headers and bodies. Secrets are redacted.",
+        "modelDescription": "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state, start time, kind (\"websocket\", \"sse\", \"http\") or GraphQL operation name. Items show kind, the GraphQL operation and captured: \"vm-profile\" for read-only requests of native HTTP clients (no rules apply to them). Returns ids; call get_request for headers and bodies, get_frames for WebSocket messages / SSE events. Secrets are redacted.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -238,6 +256,26 @@
               "maximum": 9007199254740991,
               "description": "Only exchanges that started at or after this time (epoch milliseconds)."
             },
+            "kind": {
+              "description": "\"websocket\", \"sse\" (server-sent events) or \"http\" (everything else).",
+              "type": "string",
+              "enum": [
+                "http",
+                "websocket",
+                "sse"
+              ]
+            },
+            "graphqlOperation": {
+              "description": "Only GraphQL requests with this operation name (exact, case-sensitive).",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "pattern": "^[_A-Za-z][_0-9A-Za-z]*$"
+            },
+            "includeBrowserInternal": {
+              "description": "Flutter Web: also include the browser's own requests (Chrome updates, GCM, optimization guide), which are hidden by default.",
+              "type": "boolean"
+            },
             "limit": {
               "default": 50,
               "description": "Max items (newest first), 1-200.",
@@ -261,7 +299,7 @@
         "toolReferenceName": "interceptGetRequest",
         "canBeReferencedInPrompt": true,
         "userDescription": "Show one request with headers and bodies.",
-        "modelDescription": "Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), timings and error. Use after list_requests or wait_for_request. Pass snippet (\"curl\", \"dart_http\" or \"dio\") to also get the request as runnable code (redacted values stay \"[redacted]\"). For large JSON responses prefer get_body_shape first.",
+        "modelDescription": "Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), timings and error. Use after list_requests or wait_for_request. Pass snippet (\"curl\", \"dart_http\" or \"dio\") to also get the request as runnable code (redacted values stay \"[redacted]\"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: \"vm-profile\" (read-only, from a native HTTP client).",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -371,6 +409,10 @@
             "includeBodies": {
               "default": false,
               "type": "boolean"
+            },
+            "includeBrowserInternal": {
+              "description": "Flutter Web: also include the browser's own requests (Chrome updates, GCM, optimization guide), which are hidden by default.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -450,6 +492,10 @@
               "minimum": 0,
               "maximum": 9007199254740991,
               "description": "Only exchanges that started at or after this time (epoch milliseconds)."
+            },
+            "includeBrowserInternal": {
+              "description": "Flutter Web: also include the browser's own requests (Chrome updates, GCM, optimization guide), which are hidden by default.",
+              "type": "boolean"
             }
           },
           "additionalProperties": false
@@ -839,6 +885,10 @@
               },
               "additionalProperties": false,
               "description": "What must hold. Every given expectation is checked."
+            },
+            "includeBrowserInternal": {
+              "description": "Flutter Web: also include the browser's own requests (Chrome updates, GCM, optimization guide), which are hidden by default.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -855,12 +905,60 @@
         ]
       },
       {
+        "name": "flutter_intercept_get_frames",
+        "displayName": "Flutter Intercept: Get WebSocket / SSE frames",
+        "toolReferenceName": "interceptGetFrames",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Show the messages of a WebSocket or SSE stream.",
+        "modelDescription": "Read the messages of a recorded WebSocket connection or the events of a server-sent events (SSE) stream (list_requests kind \"websocket\" / \"sse\"): oldest first, each with index, dir (\"send\" = app → server, \"receive\"), at (epoch ms), kind (text, binary, ping, pong, close, event), size and text (SSE: event name and id). Binary payloads are summarised as \"[binary N bytes]\"; JSON messages are redacted structurally, other text by pattern (secrets read \"[redacted]\"). Page with since = the returned next; while the connection is open (state \"pending\") new frames keep arriving. Only the newest 500 frames per connection are kept (dropped counts the older ones).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "since": {
+              "description": "Return frames from this index on (the `next` of the previous call). Indexes count every frame of the connection, including dropped ones. Default: the oldest kept frame.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "limit": {
+              "default": 100,
+              "description": "Max frames to return, 1-500.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            },
+            "maxChars": {
+              "default": 4000,
+              "description": "Each frame's text is cut to this many characters (marked truncated).",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65536
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
         "name": "flutter_intercept_add_mock",
         "displayName": "Flutter Intercept: Add mock rule",
         "toolReferenceName": "interceptAddMock",
         "canBeReferencedInPrompt": true,
         "userDescription": "Add a rule that answers matching requests with a fake response.",
-        "modelDescription": "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins. Pass times (e.g. 1 = only the next request, to test a retry) or ttlMs to have it removed automatically; otherwise remove it with remove_rule when done.",
+        "modelDescription": "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins. Pass times (e.g. 1 = only the next request, to test a retry) or ttlMs to have it removed automatically; otherwise remove it with remove_rule when done. GraphQL: all operations share one URL, so pass graphqlOperation (e.g. \"GetUser\") to mock just that operation (list_requests shows the names).",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -875,6 +973,13 @@
               "maxLength": 20,
               "pattern": "^[A-Za-z]+$",
               "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "graphqlOperation": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "pattern": "^[_A-Za-z][_0-9A-Za-z]*$",
+              "description": "Only GraphQL requests with this operation name (exact, case-sensitive), e.g. \"GetUser\". The url glob still applies (usually the GraphQL endpoint, e.g. \"*/graphql\")."
             },
             "status": {
               "default": 200,
@@ -969,6 +1074,13 @@
               "pattern": "^[A-Za-z]+$",
               "description": "HTTP method (case-insensitive). Omit to match any method."
             },
+            "graphqlOperation": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "pattern": "^[_A-Za-z][_0-9A-Za-z]*$",
+              "description": "Only GraphQL requests with this operation name (exact, case-sensitive), e.g. \"GetUser\". The url glob still applies (usually the GraphQL endpoint, e.g. \"*/graphql\")."
+            },
             "mode": {
               "default": "status",
               "description": "\"status\" answers with `status`; \"reset\" drops the connection.",
@@ -1035,6 +1147,13 @@
               "maxLength": 20,
               "pattern": "^[A-Za-z]+$",
               "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "graphqlOperation": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "pattern": "^[_A-Za-z][_0-9A-Za-z]*$",
+              "description": "Only GraphQL requests with this operation name (exact, case-sensitive), e.g. \"GetUser\". The url glob still applies (usually the GraphQL endpoint, e.g. \"*/graphql\")."
             },
             "phase": {
               "default": "response",
@@ -1367,6 +1486,13 @@
               "pattern": "^[A-Za-z]+$",
               "description": "HTTP method (case-insensitive). Omit to match any method."
             },
+            "graphqlOperation": {
+              "description": "With url: only GraphQL requests with this operation name (exact, case-sensitive).",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "pattern": "^[_A-Za-z][_0-9A-Za-z]*$"
+            },
             "fault": {
               "description": "With url: make matching requests fail instead of slowing them: \"reset\" (connection reset), \"timeout\" (no answer until the client gives up), \"truncate\" (response cut mid-body), \"dns\" (lookup failure).",
               "type": "string",
@@ -1496,6 +1622,13 @@
               "pattern": "^[A-Za-z]+$",
               "description": "HTTP method (case-insensitive). Omit to match any method."
             },
+            "graphqlOperation": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "pattern": "^[_A-Za-z][_0-9A-Za-z]*$",
+              "description": "Only GraphQL requests with this operation name (exact, case-sensitive), e.g. \"GetUser\". The url glob still applies (usually the GraphQL endpoint, e.g. \"*/graphql\")."
+            },
             "ops": {
               "minItems": 1,
               "maxItems": 20,
@@ -1566,6 +1699,68 @@
           "network",
           "flutter-intercept"
         ]
+      },
+      {
+        "name": "flutter_intercept_add_cors_rule",
+        "displayName": "Flutter Intercept: Add CORS rule (development only)",
+        "toolReferenceName": "interceptAddCorsRule",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Add a development-only rule that adds CORS headers to matching responses.",
+        "modelDescription": "Flutter Web development only: let matching requests reach the real server, but answer the browser's CORS preflight (OPTIONS) locally and add Access-Control-Allow-Origin (default: the request's Origin; or allowOrigin), allow-methods/headers and optionally Allow-Credentials to the real response, so the app can be developed while the backend's CORS setup is wrong. By default only loopback pages (the Flutter Web dev server on localhost) are allowed, without credentials; pass allowOrigin / allowCredentials only when needed. The url must name a host. The real server is NOT changed: the same requests still fail in production until the backend sends the headers itself, so report the actual problem (get_request shows cors.problem). allowOrigin \"*\" cannot be combined with allowCredentials. Inserted first; times / ttlMs remove it automatically, otherwise use remove_rule.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "description": "URL glob WITH a host, e.g. \"https://api.example.com/*\" (match-all patterns such as \"*\" are refused)."
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "allowOrigin": {
+              "description": "Access-Control-Allow-Origin to send: one origin such as \"http://localhost:5000\", or \"*\" (any website). Default: the request's Origin, but only for loopback pages (localhost, 127.0.0.1, [::1]). \"null\" is refused.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            "allowCredentials": {
+              "description": "Also allow credentials (cookies): Access-Control-Allow-Credentials: true. Default false. Not allowed with allowOrigin \"*\".",
+              "type": "boolean"
+            },
+            "times": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "description": "Apply the rule to the first N matching requests only (1-1000); it is then removed automatically."
+            },
+            "ttlMs": {
+              "type": "integer",
+              "minimum": 1000,
+              "maximum": 86400000,
+              "description": "Remove the rule automatically after this many milliseconds (1000-86400000)."
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Optional label; it is shown as \"[agent] <name>\" in the rules list."
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
       }
     ],
     "mcpServerDefinitionProviders": [
@@ -1587,7 +1782,8 @@
   "dependencies": {
     "@flutter-intercept/proxy": "*",
     "@modelcontextprotocol/sdk": "^1.32.1",
-    "zod": "^4.6.5"
+    "zod": "^4.6.5",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "@types/vscode": "~1.90.0",

@@ -11,11 +11,16 @@
  * - CONTRACTS §9.2/9.4: forwards `send`, the network profile and the app package names (all re-applied
  *   when the proxy restarts) and re-emits `rule-spent`. Every new proxy member is optional, so an older
  *   proxy build degrades to a clear "not supported" error instead of crashing.
+ * - CONTRACTS §11.4: forwards `record` / `update` (read-only exchanges from the app's HTTP profile) and keeps the
+ *   per-session `SessionWarning`s (`setWarnings`, `warnings`, event 'warnings'); `vmHostDeps()` hands both to
+ *   the VM watcher (src/vm/**).
  */
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import type { Exchange, InterceptProxyOptions, Rule, SendRequest } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
+import type { SessionWarning } from './ui/protocol';
+import type { VmHostDeps } from './vm/types';
 
 export interface ProxyHost {
   /** Starts the proxy if needed (idempotent) and resolves with the port actually listened on. */
@@ -49,7 +54,17 @@ export interface ProxyLike {
   setAppPackages?(names: string[]): void;
   on(event: 'rule-spent', l: (ruleId: string, reason: 'times' | 'expired') => void): unknown;
   on(event: 'rule-hit', l: (ruleId: string, used: number) => void): unknown;
+  // CONTRACTS §11.4. Optional: older proxy builds can't hold read-only (VM profile) exchanges.
+  record?(ex: Omit<Exchange, 'id'>): string;
+  update?(id: string, patch: Partial<Exchange>): void;
+  // CONTRACTS §11.3: while a web session runs, the browser's own traffic is marked `browserInternal`.
+  setWebSessionActive?(active: boolean): void;
 }
+
+/** CONTRACTS §11.4: bounds for what the VM layer may put into Status.warnings. */
+export const MAX_WARNINGS_PER_SESSION = 50;
+const MAX_WARNING_TEXT = 500;
+const WARNING_KINDS = new Set<SessionWarning['kind']>(['background-isolate', 'native-client', 'web', 'other']);
 
 const NO_PROFILE: NetworkProfile = { kind: 'none' };
 
@@ -103,7 +118,8 @@ export interface InterceptProxyHostOptions {
 
 /**
  * Events: 'exchange' (Exchange), 'removed' (string[]), 'state' (running: boolean),
- * 'lan' ({host, port} | undefined — never the token), 'rule-spent' (ruleId, reason), 'rule-hit' (ruleId, used).
+ * 'lan' ({host, port} | undefined — never the token), 'rule-spent' (ruleId, reason), 'rule-hit' (ruleId, used),
+ * 'warnings' (SessionWarning[], the full current list — after every change).
  * Rules, the network profile and the app package names are kept here so they survive restarts and
  * apply from the first request.
  */
@@ -122,6 +138,10 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   /** The token was dropped on purpose (network change): issuing a new one is expected, not a surprise. */
   private lanTokenForgotten = false;
   private lanBusy: Promise<unknown> = Promise.resolve();
+  /** CONTRACTS §11.4: warnings per debug session id (insertion order kept). */
+  private readonly sessionWarnings = new Map<string, SessionWarning[]>();
+  private recordUnsupportedLogged = false;
+  private webSessionActive = false;
 
   constructor(private readonly opts: InterceptProxyHostOptions) {
     super();
@@ -178,6 +198,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       proxy.setRules(this.rules);
       if (this.profile.kind !== 'none') this.applyProfile(proxy); // a new proxy starts with none
       if (this.appPackages.length) proxy.setAppPackages?.(this.appPackages);
+      if (this.webSessionActive) proxy.setWebSessionActive?.(true);
       proxy.on('exchange', (e) => this.emit('exchange', e));
       proxy.on('removed', (ids) => this.emit('removed', ids));
       proxy.on('rule-spent', (ruleId, reason) => this.emit('rule-spent', ruleId, reason));
@@ -348,5 +369,108 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
 
   abort(id: string): void {
     this.proxy?.abort(id);
+  }
+
+  /**
+   * CONTRACTS §11.3: whether a Flutter Web session is running (the proxy then marks the browser's own requests
+   * `browserInternal`). Kept here and re-applied when the proxy (re)starts; a no-op on older proxy builds.
+   */
+  setWebSessionActive(active: boolean): void {
+    this.webSessionActive = active === true;
+    this.proxy?.setWebSessionActive?.(this.webSessionActive);
+  }
+
+  get webSession(): boolean {
+    return this.webSessionActive;
+  }
+
+  // ------------------------------------------------------------------ CONTRACTS §11.4 (VM service)
+
+  /**
+   * Adds read-only exchanges (`captured: 'vm-profile'`) to the running proxy's list; returns their ids in order.
+   * Nothing is recorded (empty result) while the proxy is stopped or when this proxy build can't record.
+   */
+  record(exchanges: Omit<Exchange, 'id'>[]): string[] {
+    const proxy = this.proxy;
+    if (!proxy || !exchanges.length) return [];
+    if (!proxy.record) {
+      if (!this.recordUnsupportedLogged) this.opts.log?.('this proxy build cannot record exchanges from the HTTP profile: native-client requests are not listed');
+      this.recordUnsupportedLogged = true;
+      return [];
+    }
+    const ids: string[] = [];
+    for (const ex of exchanges) {
+      try {
+        // Always read-only: rules never apply to these (CONTRACTS §11.4).
+        ids.push(proxy.record({ ...ex, captured: 'vm-profile' }));
+      } catch (e) {
+        this.opts.log?.(`recording a profile exchange failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    return ids;
+  }
+
+  /** Updates a previously recorded exchange (no-op when it is gone or the proxy can't). `id` is never changed. */
+  update(id: string, patch: Partial<Exchange>): void {
+    const proxy = this.proxy;
+    if (!proxy?.update) return;
+    const { id: _id, ...rest } = patch;
+    try {
+      proxy.update(id, rest);
+    } catch (e) {
+      this.opts.log?.(`updating exchange ${id} failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /**
+   * Replaces the warnings of one debug session (an empty list clears them; call it when the session ends).
+   * Malformed entries are dropped, texts are capped, at most MAX_WARNINGS_PER_SESSION per session.
+   * Emits 'warnings' only when the visible list changed.
+   */
+  setWarnings(sessionId: string, warnings: SessionWarning[]): void {
+    if (typeof sessionId !== 'string' || !sessionId) return;
+    const clean: SessionWarning[] = [];
+    const ids = new Set<string>();
+    for (const w of Array.isArray(warnings) ? warnings : []) {
+      if (!w || typeof w.id !== 'string' || !w.id || typeof w.text !== 'string' || !w.text.trim()) continue;
+      if (ids.has(w.id)) continue;
+      ids.add(w.id);
+      clean.push({
+        id: w.id.slice(0, 300),
+        kind: WARNING_KINDS.has(w.kind) ? w.kind : 'other',
+        text: w.text.replace(/[\r\n]+/g, ' ').trim().slice(0, MAX_WARNING_TEXT),
+        sessionId,
+      });
+      if (clean.length >= MAX_WARNINGS_PER_SESSION) break;
+    }
+    const before = JSON.stringify(this.warnings);
+    if (clean.length) this.sessionWarnings.set(sessionId, clean);
+    else this.sessionWarnings.delete(sessionId);
+    const after = this.warnings;
+    if (JSON.stringify(after) !== before) this.emit('warnings', after);
+  }
+
+  /** Every session's warnings, deduplicated by id (first wins). */
+  get warnings(): SessionWarning[] {
+    const seen = new Set<string>();
+    const out: SessionWarning[] = [];
+    for (const list of this.sessionWarnings.values()) {
+      for (const w of list) {
+        if (seen.has(w.id)) continue;
+        seen.add(w.id);
+        out.push(w);
+      }
+    }
+    return out;
+  }
+
+  /** The `VmHostDeps` the VM watcher needs (src/vm/types.ts), bound to this host. */
+  vmHostDeps(log: (msg: string) => void = (m) => this.opts.log?.(m)): VmHostDeps {
+    return {
+      record: (exchanges) => this.record(exchanges),
+      update: (id, patch) => this.update(id, patch),
+      setWarnings: (sessionId, warnings) => this.setWarnings(sessionId, warnings),
+      log,
+    };
   }
 }

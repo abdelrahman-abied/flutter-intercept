@@ -29,6 +29,10 @@
     "./jsonpath": {
       "types": "./dist/jsonpath.d.ts",
       "default": "./dist/jsonpath.js"
+    },
+    "./cors": {
+      "types": "./dist/cors.d.ts",
+      "default": "./dist/cors.js"
     }
   },
   "typesVersions": {
@@ -47,6 +51,9 @@
       ],
       "jsonpath": [
         "dist/jsonpath.d.ts"
+      ],
+      "cors": [
+        "dist/cors.d.ts"
       ]
     }
   },

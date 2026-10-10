@@ -2,15 +2,27 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { mockttpCaGenerator, spkiPin } from '../../src/ca';
 import {
   DebugConfig,
+  HOST_KEY,
+  isBrowserProxyFlag,
+  isUserProfileFlag,
+  LAN_KEY,
+  MARKER_KEY,
+  ORIGINAL_PROGRAM_KEY,
   proxyHostFor,
   rewriteDebugConfig,
   RewriteContext,
   selectDebuggerType,
   stripDefines,
   stripShaDefine,
+  stripWebFlags,
   TRACE_DEFINE,
+  WEB_FLAGS_KEY,
+  WEB_KEY,
+  webBrowserFlags,
+  webInterceptFlags,
   withInterceptDefines,
   withShaDefine,
 } from '../../src/debug/rewrite';
@@ -350,5 +362,186 @@ describe('captureSource (CONTRACTS §9.1)', () => {
   it('strips an earlier trace define', () => {
     const args = withInterceptDefines([`--dart-define=${TRACE_DEFINE}=0`, '--verbose'], 'abc', 'localhost:1');
     expect(args).toEqual(['--verbose', '--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=abc', '--dart-define=FLUTTER_INTERCEPT_PROXY=localhost:1']);
+  });
+});
+
+describe('Flutter Web (CONTRACTS §11.3): browser flags, program untouched', () => {
+  let caPem: string;
+  let pin: string;
+  beforeAll(async () => {
+    caPem = (await mockttpCaGenerator('web-test')).cert;
+    pin = spkiPin(caPem);
+  }, 60_000);
+  const main = () => path.join(flutterApp, 'lib', 'main.dart');
+  const webCtx = (over: Partial<RewriteContext> = {}) => ctx({ caCertPem: caPem, webEnabled: true, ...over });
+  const resolved = (over: DebugConfig = {}): DebugConfig => ({
+    type: 'dart',
+    request: 'launch',
+    program: main(),
+    cwd: flutterApp,
+    debuggerType: 2,
+    toolEnv: {},
+    deviceId: 'chrome',
+    toolArgs: ['--dart-define=A=1'],
+    ...over,
+  });
+  const flags = () => [
+    '--web-browser-flag=--proxy-server=http://127.0.0.1:9555',
+    `--web-browser-flag=--ignore-certificate-errors-spki-list=${pin}`,
+  ];
+
+  it('chrome: adds the proxy + CA SPKI flags, keeps program, records host/port', () => {
+    const r = rewriteDebugConfig(resolved(), webCtx());
+    expect(r.kind).toBe('web');
+    if (r.kind !== 'web') return;
+    expect(r.mode).toBe('after');
+    expect(r.deviceId).toBe('chrome');
+    expect(r.config.program).toBe(main());
+    expect(r.config.toolArgs).toEqual(['--dart-define=A=1', ...flags()]);
+    expect(r.flags).toEqual(flags());
+    expect(r.config[WEB_FLAGS_KEY]).toEqual(flags());
+    expect(r.config[WEB_KEY]).toBe(true);
+    expect(r.config[HOST_KEY]).toBe('127.0.0.1');
+    expect(r.config[MARKER_KEY]).toBe(9555);
+    expect(r.config[ORIGINAL_PROGRAM_KEY]).toBe(main());
+    expect(r.config.debuggerType).toBe(2);
+    // flutter_tools splits --web-browser-flag values on commas.
+    for (const f of r.flags) expect(f).not.toContain(',');
+  });
+
+  it('edge works the same way', () => {
+    expect(rewriteDebugConfig(resolved({ deviceId: 'edge' }), webCtx())).toMatchObject({ kind: 'web', deviceId: 'edge' });
+  });
+
+  it('is idempotent and follows a port change / new CA on re-resolve', () => {
+    const first = rewriteDebugConfig(resolved(), webCtx());
+    if (first.kind !== 'web') throw new Error(first.kind);
+    const again = rewriteDebugConfig({ ...first.config }, webCtx());
+    if (again.kind !== 'web') throw new Error(again.kind);
+    expect(again.config.toolArgs).toEqual(['--dart-define=A=1', ...flags()]);
+    const moved = rewriteDebugConfig({ ...first.config }, webCtx({ proxyPort: 9600 }));
+    if (moved.kind !== 'web') throw new Error(moved.kind);
+    expect(moved.config.toolArgs).toEqual(['--dart-define=A=1', '--web-browser-flag=--proxy-server=http://127.0.0.1:9600', flags()[1]]);
+    expect(moved.config[MARKER_KEY]).toBe(9600);
+  });
+
+  it('removes the flags and our keys when interception is off (re-resolve / rerun)', () => {
+    const first = rewriteDebugConfig(resolved(), webCtx());
+    if (first.kind !== 'web') throw new Error(first.kind);
+    for (const over of [{ enabled: false }, { webEnabled: false }]) {
+      const r = rewriteDebugConfig({ ...first.config }, webCtx(over));
+      expect(r.kind).toBe('restore');
+      if (r.kind !== 'restore') return;
+      expect(r.config.toolArgs).toEqual(['--dart-define=A=1']);
+      expect(r.config.program).toBe(main());
+      for (const k of [ORIGINAL_PROGRAM_KEY, MARKER_KEY, HOST_KEY, WEB_KEY, WEB_FLAGS_KEY]) expect(r.config).not.toHaveProperty(k);
+    }
+  });
+
+  it('removes only the exact flags we added (two-token form too), never the user\'s', () => {
+    const ours = flags();
+    const args = ['--web-browser-flag', ours[0].slice('--web-browser-flag='.length), '--web-browser-flag=--disable-gpu', ours[1], '-v'];
+    expect(stripWebFlags(args, ours)).toEqual(['--web-browser-flag=--disable-gpu', '-v']);
+    expect(stripWebFlags(args, undefined)).toEqual(args);
+    expect(webBrowserFlags(['--web-browser-flag', '--a', '--web-browser-flag=--b', '--c'])).toEqual(['--a', '--b']);
+  });
+
+  it('a mobile rerun on Chrome: original program back, entry defines removed', () => {
+    const mobile = rewriteDebugConfig(resolved({ deviceId: 'emulator-5554' }), webCtx());
+    if (mobile.kind !== 'rewrite') throw new Error(mobile.kind);
+    const r = rewriteDebugConfig({ ...mobile.config, deviceId: 'chrome' }, webCtx());
+    expect(r.kind).toBe('web');
+    if (r.kind !== 'web') return;
+    expect(r.mode).toBe('already');
+    expect(r.config.program).toBe(main());
+    expect(r.config.toolArgs).toEqual(['--dart-define=A=1', ...flags()]);
+    // ...and back to the emulator: the browser flags go, the entry comes back.
+    const back = rewriteDebugConfig({ ...r.config, deviceId: 'emulator-5554' }, webCtx());
+    if (back.kind !== 'rewrite') throw new Error(back.kind);
+    expect(back.config.program).toBe(entry(flutterApp, 'lib__main'));
+    expect(webBrowserFlags(back.config.toolArgs)).toEqual([]);
+    expect(back.config).not.toHaveProperty(WEB_KEY);
+    expect(back.config).not.toHaveProperty(WEB_FLAGS_KEY);
+  });
+
+  it('a LAN marker from an earlier iPhone session does not survive', () => {
+    const r = rewriteDebugConfig(resolved({ [LAN_KEY]: true }), webCtx());
+    expect(r.kind).toBe('web');
+    if (r.kind === 'web') expect(r.config).not.toHaveProperty(LAN_KEY);
+  });
+
+  it('before Dart-Code: the selected device decides; program is left for Dart-Code', () => {
+    const r = rewriteDebugConfig({ type: 'dart', request: 'launch', name: 'x' }, webCtx({ selectedDeviceId: 'chrome' }));
+    expect(r.kind).toBe('web');
+    if (r.kind !== 'web') return;
+    expect(r.mode).toBe('before');
+    expect(r.config.program).toBeUndefined();
+    expect(r.config.debuggerType).toBeUndefined();
+    expect(r.config[ORIGINAL_PROGRAM_KEY]).toBe(main());
+    expect(r.config.toolArgs).toEqual(flags());
+  });
+
+  it('first pass without the CA asks for it (needsCa) instead of launching unpinned', () => {
+    expect(rewriteDebugConfig(resolved(), webCtx({ caCertPem: '' }))).toMatchObject({ kind: 'skip', needsCa: true });
+    expect(rewriteDebugConfig(resolved(), webCtx({ caCertPem: FAKE_CA }))).toMatchObject({ kind: 'skip' });
+  });
+
+  it('web-server (and unknown web* devices): skipped with a one-time notice reason', () => {
+    for (const deviceId of ['web-server', 'web-javascript']) {
+      const r = rewriteDebugConfig(resolved({ deviceId }), webCtx());
+      expect(r).toMatchObject({ kind: 'skip', webServer: true });
+      if (r.kind === 'skip') expect(r.reason).toMatch(/Flutter does not start the browser/);
+    }
+  });
+
+  it('the user\'s own browser proxy wins (toolArgs or Dart-Code settings)', () => {
+    for (const own of ['--proxy-server=http://127.0.0.1:8888', '--proxy-pac-url=http://x/p.pac', '--no-proxy-server']) {
+      expect(rewriteDebugConfig(resolved({ toolArgs: [`--web-browser-flag=${own}`] }), webCtx())).toMatchObject({ kind: 'skip' });
+      expect(rewriteDebugConfig(resolved({ toolArgs: ['--web-browser-flag', own] }), webCtx())).toMatchObject({ kind: 'skip' });
+    }
+    expect(rewriteDebugConfig(resolved(), webCtx({ settingsToolArgs: ['--web-browser-flag=--proxy-server=socks5://h:1'] }))).toMatchObject({ kind: 'skip' });
+    expect(isBrowserProxyFlag('--proxy-bypass-list=x')).toBe(false);
+  });
+
+  it('REVIEW-5 #10: the user\'s own --user-data-dir (toolArgs or Dart-Code settings) is never intercepted', () => {
+    for (const toolArgs of [
+      ['--web-browser-flag=--user-data-dir=/Users/me/chrome-dev'],
+      ['--web-browser-flag', '--user-data-dir=/Users/me/chrome-dev'],
+      ['--web-browser-flag=--user-data-dir'],
+    ]) {
+      const r = rewriteDebugConfig(resolved({ toolArgs }), webCtx());
+      expect(r).toMatchObject({ kind: 'skip', webUserProfile: true });
+      if (r.kind === 'skip') expect(r.reason).toMatch(/your own profile.*--user-data-dir/);
+    }
+    expect(rewriteDebugConfig(resolved(), webCtx({ settingsToolArgs: ['--web-browser-flag=--user-data-dir=/p'] }))).toMatchObject({ kind: 'skip', webUserProfile: true });
+    // Re-resolve of an intercepted config after the user added it: our flags and keys go, theirs stay.
+    const first = rewriteDebugConfig(resolved(), webCtx());
+    if (first.kind !== 'web') throw new Error(first.kind);
+    const r = rewriteDebugConfig({ ...first.config, toolArgs: [...first.config.toolArgs, '--web-browser-flag=--user-data-dir=/p'] }, webCtx());
+    expect(r.kind).toBe('restore');
+    if (r.kind === 'restore') {
+      expect(r.config.toolArgs).toEqual(['--dart-define=A=1', '--web-browser-flag=--user-data-dir=/p']);
+      expect(r.config).not.toHaveProperty(WEB_FLAGS_KEY);
+    }
+  });
+
+  it('--profile-directory alone stays inside flutter\'s temp user-data-dir: intercepted', () => {
+    expect(isUserProfileFlag('--profile-directory=Default')).toBe(false);
+    expect(isUserProfileFlag('--user-data-dir=/x')).toBe(true);
+    expect(rewriteDebugConfig(resolved({ toolArgs: ['--web-browser-flag=--profile-directory=Profile 1'] }), webCtx())).toMatchObject({ kind: 'web' });
+  });
+
+  it('release, tests and disabled web stay untouched', () => {
+    expect(rewriteDebugConfig(resolved({ flutterMode: 'release' }), webCtx())).toMatchObject({ kind: 'skip' });
+    expect(rewriteDebugConfig(resolved({ debuggerType: 3 }), webCtx())).toMatchObject({ kind: 'skip' });
+    expect(rewriteDebugConfig(resolved({ program: path.join(flutterApp, 'test', 'widget_test.dart') }), webCtx())).toMatchObject({ kind: 'skip' });
+    expect(rewriteDebugConfig(resolved(), webCtx({ webEnabled: false }))).toMatchObject({ kind: 'skip', reason: 'flutterIntercept.web.enabled is false' });
+    expect(rewriteDebugConfig(resolved({ flutterMode: 'profile' }), webCtx())).toMatchObject({ kind: 'web' });
+  });
+
+  it('webInterceptFlags validates its inputs', () => {
+    expect(webInterceptFlags(9555, pin)).toEqual(flags());
+    expect(() => webInterceptFlags(0, pin)).toThrow();
+    expect(() => webInterceptFlags(9555, 'a,b')).toThrow();
   });
 });

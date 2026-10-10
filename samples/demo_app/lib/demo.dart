@@ -15,6 +15,7 @@ import 'api/catalog_api.dart';
 import 'api/local_api.dart';
 import 'api/orders_api.dart';
 import 'api/users_api.dart';
+import 'coverage.dart';
 import 'pinned_roots.dart';
 
 /// --dart-define=APP_SETS_OVERRIDES=true : the app installs its own
@@ -46,6 +47,14 @@ const appPinning = String.fromEnvironment('APP_PINNING');
 /// package:http client (label `attack`). Used to check that a server with an
 /// untrusted (self-signed) certificate is rejected.
 const evilUrl = String.fromEnvironment('EVIL_URL');
+
+/// --dart-define=COVERAGE=false : skip the coverage batch (WebSocket, SSE, GraphQL, background
+/// isolates; native clients only with NATIVE_HTTP=true) that runs once after the first batch.
+const coverage = bool.fromEnvironment('COVERAGE', defaultValue: true);
+
+/// --dart-define=COVERAGE_REPEAT_SECONDS=n : re-run the coverage batch every n seconds (e.g. to see
+/// native-client requests made after a debugger or tool attached).
+const coverageRepeatSeconds = int.fromEnvironment('COVERAGE_REPEAT_SECONDS');
 
 const _customClient = appFindProxy != '' || appPinning != '';
 
@@ -222,6 +231,29 @@ Future<void> prefs() => _timed('prefs', () async {
       return (200, {'launches': n});
     });
 
+// Coverage scenarios (lib/coverage.dart).
+Future<void> wsEcho() => _timed('ws_echo', webSocketEcho);
+Future<void> sseStream() => _timed('sse_events', sseEvents);
+Future<void> gqlCountry() => _timed('gql_country', () => graphqlCountry(_httpClient));
+Future<void> isolateGet() => _timed('isolate_todo', isolateTodo);
+Future<void> computeGet() => _timed('compute_todo', computeTodo);
+Future<void> nativeGetReq() => _timed('native_get', nativeGet);
+Future<void> nativePostReq() => _timed('native_post', nativePost);
+
+Future<void> runCoverage() async {
+  log('DEMO_COVERAGE start native=$nativeHttp');
+  await Future.wait([
+    wsEcho(),
+    sseStream(),
+    gqlCountry(),
+    isolateGet(),
+    computeGet(),
+    if (nativeHttp) nativeGetReq(),
+    if (nativeHttp) nativePostReq(),
+  ]);
+  log('DEMO_COVERAGE done');
+}
+
 Future<void> runBatch() async {
   _batch++;
   log('DEMO_BATCH start $_batch');
@@ -253,7 +285,11 @@ void runDemo({required String flavor}) {
   void start() {
     WidgetsFlutterBinding.ensureInitialized();
     runApp(DemoApp(flavor: flavor));
-    runBatch();
+    final first = runBatch();
+    if (coverage) first.then((_) => runCoverage());
+    if (coverage && coverageRepeatSeconds > 0) {
+      Timer.periodic(Duration(seconds: coverageRepeatSeconds), (_) => runCoverage());
+    }
     if (repeatSeconds > 0) {
       Timer.periodic(Duration(seconds: repeatSeconds), (_) => runBatch());
     }
@@ -281,6 +317,7 @@ class DemoApp extends StatelessWidget {
           children: [
             for (final (label, fn) in [
               ('Run all requests', runBatch),
+              ('Run coverage scenarios', runCoverage),
               ('Dio GET user', dioUser),
               ('http GET todo', httpTodo),
               ('Dio POST', dioPost),
@@ -290,6 +327,13 @@ class DemoApp extends StatelessWidget {
               ('http POST order', ordersCreate),
               ('Retrofit GET user (models)', retrofitUser),
               if (localPort > 0) ('GET host server /health', localHealth),
+              ('WebSocket echo', wsEcho),
+              ('SSE stream (3 events)', sseStream),
+              ('GraphQL POST CountryByCode', gqlCountry),
+              ('GET from Isolate.run (demo_worker)', isolateGet),
+              ('GET from compute (demo_compute)', computeGet),
+              if (nativeHttp) ('Native client GET', nativeGetReq),
+              if (nativeHttp) ('Native client POST', nativePostReq),
             ])
               Padding(
                 padding: const EdgeInsets.only(bottom: 8),

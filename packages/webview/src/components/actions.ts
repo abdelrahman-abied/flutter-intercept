@@ -4,6 +4,7 @@ import { contentClassOf } from '../filter';
 import type { Exchange, RuleAction, SnippetFormat } from '../protocol';
 import type { MutateOp } from '@flutter-intercept/proxy/types';
 import { canResend, describeMutateOp, resendRequest, SNIPPET_FORMATS, SNIPPET_LABEL, unsendableBody } from '../state';
+import { corsRuleFor, isNative, NATIVE_READ_ONLY, routeGlob } from '../coverage';
 import { splitUrl } from '../util';
 import type { MenuItem } from './bits';
 
@@ -25,6 +26,28 @@ export interface ExchangeActions {
   /** Everything, for the list's context menu. */
   menuItems: MenuItem[];
   resendDisabled?: string; // reason when "Resend" can't be used
+  /** Why each intercept action can't be used for this exchange (absent = it can). */
+  off: { mock?: string; block?: string; breakpoint?: string; edit?: string; generate?: string };
+  /** CONTRACTS §11.3: insert a dev-only `cors` rule for this route FIRST (undoable); credentials only if asked. */
+  addCorsRule: (credentials: boolean) => void;
+}
+
+const WS_NO_MOCK = 'Mock rules don\'t apply to WebSocket upgrades — block it or add a fault instead';
+const WS_NO_RESEND = 'A WebSocket connection can\'t be resent';
+
+/** Why "Mock this" / "Block this" / … can't be used for `ex` (native exchanges are read-only). */
+export function interceptOff(ex: Exchange): ExchangeActions['off'] {
+  if (isNative(ex)) {
+    return { mock: NATIVE_READ_ONLY, block: NATIVE_READ_ONLY, breakpoint: NATIVE_READ_ONLY, edit: NATIVE_READ_ONLY, generate: NATIVE_READ_ONLY };
+  }
+  const off: ExchangeActions['off'] = {};
+  if (ex.kind === 'websocket') {
+    off.mock = WS_NO_MOCK;
+    off.edit = WS_NO_RESEND;
+  } else if (!canResend(ex)) {
+    off.edit = 'Wait until the exchange has finished';
+  }
+  return off;
 }
 
 /** Why "Generate Dart model" can't be used for `ex`, if it can't. */
@@ -45,12 +68,17 @@ export function routeLabel(ex: Pick<Exchange, 'method' | 'url'>): string {
 }
 
 export function useExchangeActions(ex: Exchange): ExchangeActions {
-  const { dispatch, post } = useApp();
+  const { state, dispatch, post } = useApp();
+  const off = interceptOff(ex);
   const copy = (format: SnippetFormat) => {
     post({ type: 'copySnippet', id: ex.id, format });
     dispatch({ type: 'notice', text: `Copied as ${SNIPPET_LABEL[format]}`, short: true });
   };
-  const resendDisabled = !canResend(ex)
+  const resendDisabled = isNative(ex)
+    ? NATIVE_READ_ONLY
+    : ex.kind === 'websocket'
+      ? WS_NO_RESEND
+      : !canResend(ex)
     ? 'Wait until the exchange has finished'
     : unsendableBody(ex)
       ? 'The original body is binary or truncated — use “Edit and resend”'
@@ -65,6 +93,7 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
     post(f === undefined ? { type: 'openSource', id: ex.id } : { type: 'openSource', id: ex.id, frame: f });
   };
   const createRule = (kind: RuleAction['kind']) => {
+    if (isNative(ex)) return;
     dispatch({ type: 'awaitRule', kind });
     post({ type: 'createRuleFromExchange', id: ex.id, action: kind });
   };
@@ -86,8 +115,20 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
     post({ type: 'generateFixture', id: ex.id });
     dispatch({ type: 'notice', text: `Generating a test fixture for ${routeLabel(ex)} — the JSON and the test open in new editors.`, short: true });
   };
-  const modelOff = generateModelDisabled(ex);
-  const fixtureOff = generateFixtureDisabled(ex);
+  const addCorsRule = (credentials: boolean) => {
+    const rule = corsRuleFor(ex, { credentials });
+    if (!rule) return;
+    const rules = [rule, ...state.rules];
+    const origin = rule.action.kind === 'cors' ? rule.action.allowOrigin : '';
+    dispatch({
+      type: 'setRules', rules, undoable: true,
+      notice: `CORS rule added first: ${origin} may read ${routeGlob(ex.url)} responses, ` +
+        `credentials ${credentials ? 'ON (cookies included)' : 'off'} — development only, the server is not fixed.`,
+    });
+    post({ type: 'setRules', rules });
+  };
+  const modelOff = off.generate ?? generateModelDisabled(ex);
+  const fixtureOff = off.generate ?? generateFixtureDisabled(ex);
   const copyItems: MenuItem[] = SNIPPET_FORMATS.map((f) => ({ label: `Copy as ${SNIPPET_LABEL[f]}`, onSelect: () => copy(f) }));
   const generateItems: MenuItem[] = [
     { label: 'Generate Dart model', onSelect: generateModel, disabled: !!modelOff, title: modelOff ?? 'Dart model classes from every recorded response of this route' },
@@ -96,16 +137,16 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
   const menuItems: MenuItem[] = [
     ...copyItems,
     { label: 'Resend', onSelect: resend, disabled: !!resendDisabled, title: resendDisabled, separatorBefore: true },
-    { label: 'Edit and resend…', onSelect: editAndResend, disabled: !canResend(ex), title: canResend(ex) ? undefined : 'Wait until the exchange has finished' },
+    { label: 'Edit and resend…', onSelect: editAndResend, disabled: !!off.edit, title: off.edit },
     ...(ex.source ? [{ label: 'Open source', onSelect: () => openSource(), separatorBefore: true }] : []),
-    { label: 'Mock this', onSelect: () => createRule('mock'), separatorBefore: true },
-    { label: 'Block this', onSelect: () => createRule('block') },
-    { label: 'Break on this', onSelect: () => createRule('breakpoint') },
+    { label: 'Mock this', onSelect: () => createRule('mock'), separatorBefore: true, disabled: !!off.mock, title: off.mock },
+    { label: 'Block this', onSelect: () => createRule('block'), disabled: !!off.block, title: off.block },
+    { label: 'Break on this', onSelect: () => createRule('breakpoint'), disabled: !!off.breakpoint, title: off.breakpoint },
     { ...generateItems[0], separatorBefore: true },
     generateItems[1],
   ];
   return {
     copy, resend, editAndResend, openSource, createRule, mutateField, pickModel, openViolation, generateModel, generateFixture,
-    copyItems, generateItems, menuItems, resendDisabled,
+    copyItems, generateItems, menuItems, resendDisabled, off, addCorsRule,
   };
 }

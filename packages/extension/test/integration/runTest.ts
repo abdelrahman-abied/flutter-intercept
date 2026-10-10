@@ -66,12 +66,16 @@ async function main(): Promise<void> {
 
   for (const suite of suites) {
     // devices: the real sample app in place (no copy: keeps its Gradle/Xcode caches warm).
+    // web: samples/web_app in place, on the chrome device (FI_WEB_HEADFUL=1 shows the browser window).
+    const inPlace = suite === 'devices' || suite === 'agent' || suite === 'claude' || suite === 'web';
     const fixture =
-      suite === 'devices' || suite === 'agent' || suite === 'claude'
-        ? path.resolve(extRoot, '..', '..', 'samples', 'demo_app')
-        : path.join(workspaceRoot, suite === 'flutter' ? 'flutter_app' : 'dart_cli');
-    if (suite !== 'devices' && suite !== 'agent' && suite !== 'claude') fs.cpSync(path.join(extRoot, 'test', 'fixtures', path.basename(fixture)), fixture, { recursive: true });
-    if (suite === 'devices' || suite === 'agent' || suite === 'claude') {
+      suite === 'web'
+        ? path.resolve(extRoot, '..', '..', 'samples', 'web_app')
+        : inPlace
+          ? path.resolve(extRoot, '..', '..', 'samples', 'demo_app')
+          : path.join(workspaceRoot, suite === 'flutter' ? 'flutter_app' : 'dart_cli');
+    if (!inPlace) fs.cpSync(path.join(extRoot, 'test', 'fixtures', path.basename(fixture)), fixture, { recursive: true });
+    if (inPlace) {
       if (suite === 'devices' && !process.env.FI_DEVICES) throw new Error('FI_DEVICES=<deviceId,...> is required for the devices suite');
       if (!fs.existsSync(path.join(fixture, '.dart_tool', 'package_config.json'))) {
         execFileSync('flutter', ['pub', 'get', '--offline'], { cwd: fixture, stdio: 'inherit' });
@@ -146,6 +150,7 @@ async function main(): Promise<void> {
           FI_DEVICES: process.env.FI_DEVICES ?? '',
           FI_ALLOW_PHYSICAL_IOS: process.env.FI_ALLOW_PHYSICAL_IOS ?? '',
           FI_AGENT_DEVICES: process.env.FI_AGENT_DEVICES ?? '',
+          FI_WEB_HEADFUL: process.env.FI_WEB_HEADFUL ?? '',
           // TEST ONLY: lets the agent suite read the MCP token from the activate() API (src/agent/testExposure.ts).
           FI_TEST_EXPOSE_MCP_TOKEN: suite === 'agent' || suite === 'claude' ? '1' : '',
           FI_CLAUDE_EVIDENCE: process.env.FI_CLAUDE_EVIDENCE ?? '',

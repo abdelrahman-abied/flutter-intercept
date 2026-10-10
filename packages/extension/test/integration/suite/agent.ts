@@ -9,6 +9,9 @@
  * v0.4.0 (MCP door): check_contract on the demo's Retrofit/json_serializable User (clean, then with add_mutation
  * nulling the required email → error at $.email), assert_traffic pass + fail, generate_model,
  * generate_fixture_test, MCP resources (list, templates, read) and prompts (list, get).
+ * v0.5.0 (MCP door, the demo's coverage batch against local WebSocket / SSE servers): get_frames on the WebSocket echo (both directions, binary
+ * summarised, paging) and the SSE stream, list_requests kind / graphqlOperation, a mock matched by graphqlOperation
+ * (a decoy for another operation never matches), get_status warnings for the background isolates (cleared on stop).
  *
  * Two paths, chosen automatically:
  *  - "lm":     the extension registered `flutter_intercept_*` (lead wiring + package.json
@@ -18,7 +21,10 @@
  *              on top of a small AgentTools adapter over the real AppLauncher (src/agent/launch.ts) and
  *              the extension's public API (rules, exchanges). Only VS Code's registration is skipped.
  */
+import * as http from 'http';
+import type { AddressInfo } from 'net';
 import * as vscode from 'vscode';
+import { WebSocketServer } from 'ws';
 import type { Exchange, Rule } from '@flutter-intercept/proxy';
 import { createAppLauncher } from '../../../src/agent/launch';
 import { lmToolName, makeLmTool, LmVscode, registerLmTools } from '../../../src/agent/lmTools';
@@ -33,6 +39,54 @@ const SECRETS = ['demo-secret-123', 'demo-key-456'];
 const USERS1 = 'https://jsonplaceholder.typicode.com/users/1';
 // The demo's Retrofit request (label retrofit_user) has its own endpoint, so the users/1 cases above only see dio_user.
 const USERS3 = 'https://jsonplaceholder.typicode.com/users/3';
+
+/**
+ * Local servers for the v0.5.0 case (no public rate limits): a WebSocket echo at `/ws` (text and binary echoed
+ * as received) and an SSE stream at `/sse` (ten `event: time` events, 200 ms apart). Loopback only; the demo
+ * reaches them as `localhost` through the proxy (also from the Android emulator: rewriteLocalhost).
+ */
+async function startCoverageServers(): Promise<{ port: number; wsUrl: string; sseUrl: string; close(): Promise<void> }> {
+  const timers = new Set<ReturnType<typeof setInterval>>();
+  const server = http.createServer((req, res) => {
+    if (!req.url?.startsWith('/sse')) {
+      res.writeHead(404).end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+    res.write(': fi-suite\n\n');
+    let n = 0;
+    const t = setInterval(() => {
+      n++;
+      res.write(`event: time\nid: ${n}\ndata: ${new Date().toISOString()}\n\n`);
+      if (n >= 10) {
+        clearInterval(t);
+        timers.delete(t);
+        res.end();
+      }
+    }, 200);
+    timers.add(t);
+    req.on('close', () => {
+      clearInterval(t);
+      timers.delete(t);
+    });
+  });
+  const wss = new WebSocketServer({ server, path: '/ws' });
+  wss.on('connection', (sock) => sock.on('message', (data, isBinary) => sock.send(data, { binary: isBinary })));
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port;
+  return {
+    port,
+    wsUrl: `ws://localhost:${port}/ws`,
+    sseUrl: `http://localhost:${port}/sse`,
+    close: async () => {
+      for (const t of timers) clearInterval(t);
+      for (const c of wss.clients) c.terminate();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+      server.closeAllConnections?.();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
 
 function globToRegExp(glob: string): RegExp {
   return new RegExp('^' + glob.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
@@ -583,6 +637,166 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
         if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
         await client?.close().catch(() => undefined);
         client = undefined;
+      }
+      out.ms = Date.now() - t0;
+      results.push(out);
+      console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+    }
+
+    // v0.5.0 (CONTRACTS §11.5) over MCP, on the demo's coverage batch (lib/coverage.dart, runs once after the
+    // first batch and again on hot restart): ws_echo (a text + a binary message, echoed), sse_events (three `time`
+    // events) — both against the suite's local servers via --dart-define=WS_URL / SSE_URL (set through
+    // `dart.flutterRunAdditionalArgs` for this case) — gql_country (POST GraphQL CountryByCode to the public API; its
+    // status doesn't matter: detection and the mock rule don't need the network), isolate_todo / compute_todo (HTTP
+    // from background isolates "demo_worker" / "demo_compute": not intercepted → a session warning).
+    for (const dev of devices) {
+      const out: RunOutcome = { name: `AGENT ${dev} v0.5.0 over MCP: get_frames (WS + SSE), graphqlOperation filter + rule, isolate warnings`, output: '', proxyHits: [], failures: [], ms: 0 };
+      const f = out.failures;
+      const t0 = Date.now();
+      let sessionId: string | undefined;
+      const ruleIds: string[] = [];
+      const notes: string[] = [];
+      const GQL = 'https://countries.trevorblades.com/graphql';
+      /** Polls list_requests until `pick` finds an item (or the time is up). */
+      const findItem = async (input: Record<string, unknown>, pick: (i: any) => boolean, ms: number): Promise<any | undefined> => {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {
+          const l = await mcpCall('list_requests', { ...input, limit: 50 });
+          const hit = (l.result.items ?? []).find(pick);
+          if (hit) return hit;
+          await sleep(500);
+        }
+        return undefined;
+      };
+      const final = (i: any) => !['pending', 'paused-request', 'paused-response'].includes(i.state);
+      const dartCfg = vscode.workspace.getConfiguration('dart');
+      const runArgsBefore = dartCfg.inspect<string[]>('flutterRunAdditionalArgs')?.globalValue;
+      let servers: Awaited<ReturnType<typeof startCoverageServers>> | undefined;
+      try {
+        servers = await startCoverageServers();
+        await dartCfg.update(
+          'flutterRunAdditionalArgs',
+          [...(runArgsBefore ?? []), `--dart-define=WS_URL=${servers.wsUrl}`, `--dart-define=SSE_URL=${servers.sseUrl}`],
+          vscode.ConfigurationTarget.Global,
+        );
+        const onPort = new RegExp(`:${servers.port}/`);
+        client = await connect();
+        const since = Date.now();
+        const l = await mcpCall('launch_app', { deviceId: dev });
+        sessionId = l.result.sessionId;
+        if (l.isError || !sessionId) throw new Error(`launch_app: ${l.text.slice(0, 200)}`);
+
+        // WebSocket: one exchange per connection; frames in both directions, binary summarised.
+        const wsItem = await findItem({ kind: 'websocket', sinceMs: since }, (i) => onPort.test(i.url) && final(i), 120_000);
+        if (!wsItem) f.push(`no finished WebSocket exchange for ${servers.wsUrl} (list_requests kind:"websocket")`);
+        else {
+          const g = await mcpCall('get_request', { id: wsItem.id, includeBodies: false });
+          if (g.isError || g.result.kind !== 'websocket' || !(g.result.frameCount >= 3)) f.push(`get_request (ws): ${g.text.slice(0, 300)}`);
+          const fr = await mcpCall('get_frames', { id: wsItem.id });
+          const frames = (fr.result.frames ?? []) as any[];
+          const sentText = frames.some((x) => x.dir === 'send' && x.kind === 'text' && x.text === 'hello from demo_app');
+          const echoedText = frames.some((x) => x.dir === 'receive' && x.kind === 'text' && x.text === 'hello from demo_app');
+          const sentBin = frames.some((x) => x.dir === 'send' && x.kind === 'binary' && x.text === '[binary 6 bytes]');
+          const echoedBin = frames.some((x) => x.dir === 'receive' && x.kind === 'binary' && x.size === 6);
+          if (fr.isError || !sentText || !echoedText || !sentBin || !echoedBin) f.push(`get_frames (ws) both directions: ${fr.text.slice(0, 600)}`);
+          if (!frames.every((x, n) => n === 0 || x.index === frames[n - 1].index + 1)) f.push('get_frames indexes are not consecutive');
+          // Paging: since = next of a 1-frame page.
+          const p1 = await mcpCall('get_frames', { id: wsItem.id, limit: 1 });
+          const p2 = await mcpCall('get_frames', { id: wsItem.id, since: p1.result.next, limit: 1 });
+          if (p2.isError || p2.result.frames?.[0]?.index !== p1.result.next) f.push(`get_frames paging: ${p1.text.slice(0, 150)} / ${p2.text.slice(0, 150)}`);
+          notes.push(`ws ${wsItem.id}: ${frames.length} frames (${frames.map((x) => `${x.dir[0]}:${x.kind}`).join(' ')})`);
+        }
+
+        // SSE: events with names.
+        const sseItem = await findItem({ kind: 'sse', sinceMs: since }, (i) => onPort.test(i.url), 60_000);
+        if (!sseItem) f.push(`no SSE exchange for ${servers.sseUrl} (list_requests kind:"sse")`);
+        else {
+          let events: any[] = [];
+          for (let i = 0; i < 40 && events.filter((x) => x.event === 'time').length < 1; i++) {
+            events = ((await mcpCall('get_frames', { id: sseItem.id })).result.frames ?? []) as any[];
+            if (!events.some((x) => x.event === 'time')) await sleep(500);
+          }
+          if (!events.some((x) => x.kind === 'event' && x.event === 'time' && x.dir === 'receive')) f.push(`get_frames (sse): ${JSON.stringify(events).slice(0, 300)}`);
+          notes.push(`sse ${sseItem.id}: ${events.length} events (${[...new Set(events.map((x) => x.event))].join(', ')})`);
+        }
+
+        // GraphQL: filter by operation name.
+        // Any outcome of the public API counts (200, 429, an error): only detection is checked.
+        const gq = await findItem({ graphqlOperation: 'CountryByCode', sinceMs: since }, (i) => i.url === GQL && final(i), 90_000);
+        if (!gq || gq.graphqlOperation !== 'CountryByCode') f.push(`list_requests graphqlOperation: ${JSON.stringify(gq)}`);
+        else {
+          notes.push(`gql live: ${gq.status ?? gq.state}`);
+          const g = await mcpCall('get_request', { id: gq.id, includeBodies: false });
+          if (g.result.graphql?.operationName !== 'CountryByCode' || g.result.graphql?.operationType !== 'query') f.push(`get_request graphql: ${g.text.slice(0, 300)}`);
+        }
+        const none = await mcpCall('list_requests', { graphqlOperation: 'NoSuchOperation', sinceMs: since });
+        if (none.isError || none.result.total !== 0) f.push(`list_requests graphqlOperation (none): ${none.text.slice(0, 200)}`);
+
+        // Warnings: the background isolates are named.
+        let warnings: any[] = [];
+        for (let i = 0; i < 60; i++) {
+          warnings = ((await mcpCall('get_status')).result.warnings ?? []) as any[];
+          if (warnings.some((w) => w.kind === 'background-isolate' && /demo_worker|demo_compute/.test(w.text))) break;
+          await sleep(1000);
+        }
+        if (!warnings.some((w) => w.kind === 'background-isolate' && /demo_worker|demo_compute/.test(w.text))) f.push(`get_status warnings (background isolate): ${JSON.stringify(warnings).slice(0, 300)}`);
+        notes.push(`warnings: ${warnings.map((w) => w.kind).join(', ') || 'none'}`);
+
+        // A rule by graphqlOperation: a decoy for another operation never matches; the CountryByCode mock does.
+        const decoy = await mcpCall('add_block', { url: GQL, method: 'POST', graphqlOperation: 'SomeOtherOperation', name: 'decoy' });
+        if (decoy.isError || !decoy.result.ruleId) throw new Error(`add_block (decoy): ${decoy.text.slice(0, 200)}`);
+        ruleIds.push(decoy.result.ruleId);
+        const mk = await mcpCall('add_mock', {
+          url: GQL,
+          method: 'POST',
+          graphqlOperation: 'CountryByCode',
+          body: { data: { country: { name: 'Mockland', capital: 'Mock City', currency: 'MCK' } } },
+          name: 'gql mock',
+        });
+        if (mk.isError || !mk.result.ruleId) throw new Error(`add_mock (graphqlOperation): ${mk.text.slice(0, 200)}`);
+        ruleIds.push(mk.result.ruleId);
+        const rules = (await mcpCall('list_rules')).result.rules as Rule[];
+        if (rules[0]?.id !== mk.result.ruleId || rules[0]?.match.graphqlOperation !== 'CountryByCode') f.push(`list_rules: ${JSON.stringify(rules.slice(0, 2)).slice(0, 300)}`);
+        const session = sessions.get(sessionId!);
+        const from = session ? outputOf(session).length : 0;
+        const restartAt = Date.now();
+        const h = await mcpCall('hot_restart', { sessionId });
+        if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+        const w2 = await mcpCall('wait_for_request', { url: GQL, method: 'POST', sinceMs: restartAt, timeoutMs: 120_000 });
+        if (w2.isError || w2.result.timedOut) f.push(`wait_for_request (gql after restart): ${w2.text.slice(0, 200)}`);
+        else if (w2.result.matchedRuleId !== mk.result.ruleId || w2.result.state !== 'mocked') f.push(`graphqlOperation mock did not match: ${w2.text.slice(0, 300)}`);
+        if (session) {
+          await waitFor(() => /DEMO_RESULT gql_country 200 .*Mockland/.test(outputOf(session).slice(from)) || undefined, 60_000, 250).catch(() =>
+            f.push(`the app did not get the GraphQL mock: ${outputOf(session).slice(from).split(/\r?\n/).filter((x) => x.includes('gql_country')).join(' | ').slice(0, 300)}`),
+          );
+        }
+        notes.push(`gql mock → ${w2.result.state} (${w2.result.matchedRuleId === mk.result.ruleId ? 'rule matched' : 'no match'})`);
+
+        for (const id of ruleIds.splice(0)) {
+          const rm = await mcpCall('remove_rule', { ruleId: id });
+          if (rm.isError || rm.result.removed !== true) f.push(`remove_rule ${id}: ${rm.text.slice(0, 200)}`);
+        }
+        const s2 = await mcpCall('stop_app', { sessionId });
+        if (s2.isError || s2.result.stopped !== 1) f.push(`stop_app: ${s2.text.slice(0, 200)}`);
+        else sessionId = undefined;
+        // The session ended: its warnings are cleared.
+        let left: any[] = [];
+        for (let i = 0; i < 20; i++) {
+          left = ((await mcpCall('get_status')).result.warnings ?? []) as any[];
+          if (!left.some((w) => w.kind === 'background-isolate')) break;
+          await sleep(500);
+        }
+        if (left.some((w) => w.kind === 'background-isolate')) f.push(`warnings not cleared after stop_app: ${JSON.stringify(left).slice(0, 200)}`);
+        out.output = notes.join('; ');
+      } catch (e) {
+        f.push(`exception: ${(e as Error).message}`);
+      } finally {
+        for (const id of ruleIds) await mcpCall('remove_rule', { ruleId: id }).catch(() => undefined);
+        if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
+        await client?.close().catch(() => undefined);
+        client = undefined;
+        await dartCfg.update('flutterRunAdditionalArgs', runArgsBefore, vscode.ConfigurationTarget.Global).then(undefined, () => undefined);
+        await servers?.close().catch(() => undefined);
       }
       out.ms = Date.now() - t0;
       results.push(out);

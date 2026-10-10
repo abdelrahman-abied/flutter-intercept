@@ -49,6 +49,24 @@ export const MODEL_STYLES = ['freezed', 'json_serializable', 'plain'] as const;
 export const FIXTURE_STYLES = ['http_mock_adapter', 'mock_client', 'mocktail'] as const;
 export const JSON_TYPES = ['string', 'number', 'integer', 'boolean', 'null', 'object', 'array'] as const;
 export const MAX_MUTATE_OPS = 20;
+// CONTRACTS §11.5
+export const EXCHANGE_KINDS = ['http', 'websocket', 'sse'] as const;
+export const MAX_FRAMES_PER_CALL = 500;
+
+const includeBrowserInternal = z
+  .boolean()
+  .optional()
+  .describe("Flutter Web: also include the browser's own requests (Chrome updates, GCM, optimization guide), which are hidden by default.");
+
+const graphqlOperation = z
+  .string()
+  .min(1)
+  .max(200)
+  .regex(/^[_A-Za-z][_0-9A-Za-z]*$/, 'a GraphQL operation name such as GetUser')
+  .describe('GraphQL operation name (exact, case-sensitive), e.g. "GetUser". Requests are matched by url AND this name.');
+const ruleGraphql = graphqlOperation.describe(
+  'Only GraphQL requests with this operation name (exact, case-sensitive), e.g. "GetUser". The url glob still applies (usually the GraphQL endpoint, e.g. "*/graphql").',
+);
 
 const jsonPath = z
   .string()
@@ -118,6 +136,9 @@ export const toolSchemas = {
     status: statusFilter.optional(),
     state: z.enum(EXCHANGE_STATES).optional(),
     sinceMs: sinceMs.optional(),
+    kind: z.enum(EXCHANGE_KINDS).optional().describe('"websocket", "sse" (server-sent events) or "http" (everything else).'),
+    graphqlOperation: graphqlOperation.optional().describe('Only GraphQL requests with this operation name (exact, case-sensitive).'),
+    includeBrowserInternal,
     limit: z.number().int().min(1).max(200).default(50).describe('Max items (newest first), 1-200.'),
   }),
   get_request: z.strictObject({
@@ -141,12 +162,14 @@ export const toolSchemas = {
       ),
     timeoutMs: z.number().int().min(0).max(120_000).default(30_000).describe('Give up after this long (max 120000) and return {timedOut: true}.'),
     includeBodies: z.boolean().default(false),
+    includeBrowserInternal,
   }),
   list_paused: z.strictObject({}),
   list_rules: z.strictObject({}),
   add_mock: z.strictObject({
     url,
     method: method.optional(),
+    graphqlOperation: ruleGraphql.optional(),
     status: z.number().int().min(100).max(599).default(200),
     headers: headerMap.optional().describe('Response headers. content-type defaults to application/json when body is an object.'),
     body: z.union([z.string(), z.record(z.string(), z.unknown()), z.array(z.unknown())]).describe('Response body: text, or a JSON object/array (sent as JSON).'),
@@ -158,6 +181,7 @@ export const toolSchemas = {
   add_block: z.strictObject({
     url,
     method: method.optional(),
+    graphqlOperation: ruleGraphql.optional(),
     mode: z.enum(['status', 'reset']).default('status').describe('"status" answers with `status`; "reset" drops the connection.'),
     status: z.number().int().min(100).max(599).default(403),
     name: ruleName.optional(),
@@ -167,6 +191,7 @@ export const toolSchemas = {
   add_breakpoint: z.strictObject({
     url,
     method: method.optional(),
+    graphqlOperation: ruleGraphql.optional(),
     phase: z.enum(['request', 'response', 'both']).default('response'),
     name: ruleName.optional(),
     times: times.optional(),
@@ -176,7 +201,7 @@ export const toolSchemas = {
   resume_request: z.strictObject({ id, edit: editSchema.optional() }),
   abort_request: z.strictObject({ id }),
   clear_requests: z.strictObject({}),
-  export_har: z.strictObject({ url: url.optional(), method: method.optional(), sinceMs: sinceMs.optional() }),
+  export_har: z.strictObject({ url: url.optional(), method: method.optional(), sinceMs: sinceMs.optional(), includeBrowserInternal }),
   launch_app: z.strictObject({
     deviceId: z.string().min(1).max(200).optional().describe('Flutter device id (e.g. "emulator-5554", a simulator UDID). Omit to use the device selected in VS Code.'),
     program: z.string().min(1).max(4096).optional().describe('Entry point, e.g. "lib/main_dev.dart". Omit for the default (lib/main.dart).'),
@@ -205,6 +230,7 @@ export const toolSchemas = {
     dropRate: z.number().min(0).max(1).optional().describe('custom: share of requests that fail (0-1).'),
     url: url.optional().describe('Only affect requests matching this URL glob (adds a rule, inserted first). Omit to set the profile for ALL app traffic.'),
     method: method.optional(),
+    graphqlOperation: ruleGraphql.optional().describe('With url: only GraphQL requests with this operation name (exact, case-sensitive).'),
     fault: z
       .enum(FAULT_KINDS)
       .optional()
@@ -274,11 +300,39 @@ export const toolSchemas = {
         maxDurationMs: z.number().int().min(0).max(600_000).optional().describe('Every matched request finished within this many ms.'),
       })
       .describe('What must hold. Every given expectation is checked.'),
+    includeBrowserInternal,
   }),
   add_mutation: z.strictObject({
     url,
     method: method.optional(),
+    graphqlOperation: ruleGraphql.optional(),
     ops: z.array(mutateOp).min(1).max(MAX_MUTATE_OPS).describe('Changes applied in order to the real JSON response (1-20).'),
+    times: times.optional(),
+    ttlMs: ttlMs.optional(),
+    name: ruleName.optional(),
+  }),
+  // CONTRACTS §11.5
+  get_frames: z.strictObject({
+    id,
+    since: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe('Return frames from this index on (the `next` of the previous call). Indexes count every frame of the connection, including dropped ones. Default: the oldest kept frame.'),
+    limit: z.number().int().min(1).max(MAX_FRAMES_PER_CALL).default(100).describe(`Max frames to return, 1-${MAX_FRAMES_PER_CALL}.`),
+    maxChars: z.number().int().min(0).max(65_536).default(4000).describe('Each frame\'s text is cut to this many characters (marked truncated).'),
+  }),
+  add_cors_rule: z.strictObject({
+    url: url.describe('URL glob WITH a host, e.g. "https://api.example.com/*" (match-all patterns such as "*" are refused).'),
+    method: method.optional(),
+    allowOrigin: z
+      .string()
+      .min(1)
+      .max(500)
+      .optional()
+      .describe('Access-Control-Allow-Origin to send: one origin such as "http://localhost:5000", or "*" (any website). Default: the request\'s Origin, but only for loopback pages (localhost, 127.0.0.1, [::1]). "null" is refused.'),
+    allowCredentials: z.boolean().optional().describe('Also allow credentials (cookies): Access-Control-Allow-Credentials: true. Default false. Not allowed with allowOrigin "*".'),
     times: times.optional(),
     ttlMs: ttlMs.optional(),
     name: ruleName.optional(),
@@ -318,17 +372,17 @@ interface ToolDoc {
 export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   get_status: {
     title: 'Intercept status',
-    model: 'Get Flutter Intercept status: whether the intercepting proxy runs, the running debug sessions (device, program), how many requests are recorded and paused, and the agent access level. Call this first to see whether an app is running before using the other tools.',
+    model: 'Get Flutter Intercept status: whether the intercepting proxy runs, the running debug sessions (device, program), how many requests are recorded and paused, the agent access level, and warnings about traffic that is NOT intercepted (e.g. requests from a background isolate, native HTTP clients that are only listed read-only). Call this first to see whether an app is running before using the other tools.',
     user: 'Show proxy, session and traffic status.',
   },
   list_requests: {
     title: 'List HTTP requests',
-    model: "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state or start time. Returns ids; call get_request for headers and bodies. Secrets are redacted.",
+    model: "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state, start time, kind (\"websocket\", \"sse\", \"http\") or GraphQL operation name. Items show kind, the GraphQL operation and captured: \"vm-profile\" for read-only requests of native HTTP clients (no rules apply to them). Returns ids; call get_request for headers and bodies, get_frames for WebSocket messages / SSE events. Secrets are redacted.",
     user: 'List recorded HTTP requests.',
   },
   get_request: {
     title: 'Get HTTP request details',
-    model: 'Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), timings and error. Use after list_requests or wait_for_request. Pass snippet ("curl", "dart_http" or "dio") to also get the request as runnable code (redacted values stay "[redacted]"). For large JSON responses prefer get_body_shape first.',
+    model: 'Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), timings and error. Use after list_requests or wait_for_request. Pass snippet ("curl", "dart_http" or "dio") to also get the request as runnable code (redacted values stay "[redacted]"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: "vm-profile" (read-only, from a native HTTP client).',
     user: 'Show one request with headers and bodies.',
   },
   wait_for_request: {
@@ -353,7 +407,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   add_mock: {
     title: 'Add mock rule',
-    model: "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins. Pass times (e.g. 1 = only the next request, to test a retry) or ttlMs to have it removed automatically; otherwise remove it with remove_rule when done.",
+    model: "Make the app receive a fake response for matching requests (the real server is not contacted). Use it to test error states and edge cases (e.g. status 500, empty lists, slow responses via delayMs) without touching the backend. The rule is inserted first so it wins. Pass times (e.g. 1 = only the next request, to test a retry) or ttlMs to have it removed automatically; otherwise remove it with remove_rule when done. GraphQL: all operations share one URL, so pass graphqlOperation (e.g. \"GetUser\") to mock just that operation (list_requests shows the names).",
     user: 'Add a rule that answers matching requests with a fake response.',
   },
   add_block: {
@@ -450,6 +504,18 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
     model:
       "Let matching requests reach the real server, then change its JSON response before the app gets it: ops [{path: \"$.user.avatar_url\", op: \"null\"}, {path: \"$.items[*].price\", op: \"set\", value: \"9.99\"}, {path: \"$.email\", op: \"delete\"}]. For an exact number form use valueJson (JSON text written byte-exact) instead of value: \"1.0\" to send a double (an int-typed Dart field then throws), integers beyond 2^53. Use it to reproduce or test how the app handles a null/missing/mistyped field from the backend (e.g. \"Null is not a subtype of String\") without mocking the whole response. Non-JSON responses pass unchanged. The rule is inserted first; times (e.g. 1) or ttlMs remove it automatically, otherwise use remove_rule. Affected exchanges carry a \"simulated\" label; check_contract shows what the models make of them.",
     user: 'Add a rule that changes fields of real JSON responses.',
+  },
+  get_frames: {
+    title: 'Get WebSocket / SSE frames',
+    model:
+      'Read the messages of a recorded WebSocket connection or the events of a server-sent events (SSE) stream (list_requests kind "websocket" / "sse"): oldest first, each with index, dir ("send" = app → server, "receive"), at (epoch ms), kind (text, binary, ping, pong, close, event), size and text (SSE: event name and id). Binary payloads are summarised as "[binary N bytes]"; JSON messages are redacted structurally, other text by pattern (secrets read "[redacted]"). Page with since = the returned next; while the connection is open (state "pending") new frames keep arriving. Only the newest 500 frames per connection are kept (dropped counts the older ones).',
+    user: 'Show the messages of a WebSocket or SSE stream.',
+  },
+  add_cors_rule: {
+    title: 'Add CORS rule (development only)',
+    model:
+      'Flutter Web development only: let matching requests reach the real server, but answer the browser\'s CORS preflight (OPTIONS) locally and add Access-Control-Allow-Origin (default: the request\'s Origin; or allowOrigin), allow-methods/headers and optionally Allow-Credentials to the real response, so the app can be developed while the backend\'s CORS setup is wrong. By default only loopback pages (the Flutter Web dev server on localhost) are allowed, without credentials; pass allowOrigin / allowCredentials only when needed. The url must name a host. The real server is NOT changed: the same requests still fail in production until the backend sends the headers itself, so report the actual problem (get_request shows cors.problem). allowOrigin "*" cannot be combined with allowCredentials. Inserted first; times / ttlMs remove it automatically, otherwise use remove_rule.',
+    user: 'Add a development-only rule that adds CORS headers to matching responses.',
   },
 };
 
