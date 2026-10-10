@@ -171,3 +171,9 @@ Contract: CONTRACTS §14. Same rules as before.
 | W webview | tunnels, cert / passthrough status, upload throttle fields, WS/SSE recordings UI — `packages/webview/**` except `protocol.ts` |
 | lead | contract, types, `extension.ts`, extension `package.json`, docs, E2E, review |
 
+### v0.8.0 status (2026-10-10)
+Built and verified: unit tests (proxy 425, webview 415, extension 1714, cli 113) and the integration suites on the
+packaged VSIX — default 42/42, agent 19/19 (macOS + Android emulator), devices 24/24 (Android emulator, iOS simulator,
+macOS), web 8/8. Independent review: docs/REVIEW-8.md, all findings fixed or documented. Not verified on hardware: a
+physical iPhone in CI mode and iPhone screenshots via `devicectl` (no device connected), Edge.
+

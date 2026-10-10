@@ -93,8 +93,9 @@ headless/CI mode for `integration_test` (`packages/cli`), Postman / OpenAPI expo
 the panel in its own window, and background-isolate **interception** (0.5.0 shipped the warning only).
 **Ops (not code):** publish on Open VSX (Cursor users can't install today) — packaging ready, the owner publishes.
 
-### Next / considered (recorded 2026-10-10, after 0.7.0)
-Proposed **0.8.0**: the GitHub Action, mockable native clients, WebSocket/SSE in recordings, and the small items
+### 0.8.0 — Next / considered (built 2026-10-10, CONTRACTS §14, docs/REVIEW-8.md)
+Built in **0.8.0** (except: CLI not published to npm — owner; iOS-simulator native routing, profile-mode isolates and
+`spawnUri` — documented as not feasible without app or Mac changes; Android Studio — later). Originally proposed: the GitHub Action, mockable native clients, WebSocket/SSE in recordings, and the small items
 below. Same way of working: contract first, parallel owners, independent security review, README tutorials.
 
 | Item | Why / today | Effort | Notes |
