@@ -1139,7 +1139,9 @@ What isn't intercepted, or behaves differently while intercepting:
   unredacted recording is refused where git would track it.
 - **Only sessions you launch from VS Code** while interception is on.
   - It doesn't attach to running apps.
-  - It leaves test runs and web sessions alone.
+  - It leaves test runs alone. Flutter Web is intercepted only on the Chrome and Edge devices, through the
+    browser that `flutter` starts with its own temporary profile. The `web-server` device and launches that
+    open Chrome on your own profile (`--user-data-dir`) are left alone.
   - It never intercepts release launches.
 - **The app trusts one certificate authority.** It doesn't accept arbitrary certificates.
   - On first use the extension creates a CA unique to your installation. It's stored in VS Code's extension
