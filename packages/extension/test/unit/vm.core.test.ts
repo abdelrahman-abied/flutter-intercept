@@ -439,7 +439,7 @@ describe('REVIEW-5 hardening', () => {
       .on('getIsolate', (p) => (p.isolateId === MAIN ? { ...mainIsolate, libraries: libs } : { name: 'worker', extensionRPCs: [] }))
       .on('ext.dart.io.httpEnableTimelineLogging', () => ({ type: 'Success' }))
       .on('ext.dart.io.getHttpProfile', () => emptyProfile());
-    const core = createVmSessionCore('s', h.deps);
+    const core = createVmSessionCore('s', { ...h.deps, bypassWindowMs: 0 }); // §14.7 window: own test
     await core.start(t);
     await flush();
     expect(logging(t)).toEqual([]); // main without http_profile: nothing to find there

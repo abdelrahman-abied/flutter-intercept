@@ -3,9 +3,10 @@ import { AppContext, useApp } from '../context';
 import type { Host } from '../host';
 import type { HostMsg, Status } from '../protocol';
 import { agentLine } from '../util';
-import { FALLBACK_LABEL, pendingApprovalText, INSECURE_TITLE, SHARED_FILE, UPSTREAM_TITLE } from '../scenarios';
+import { FALLBACK_LABEL, pendingApprovalText, INSECURE_TITLE, SHARED_FILE } from '../scenarios';
+import { clientCertSummary, fromVsCodeProxy, passthroughSummary, upstreamLabel, upstreamTitle } from '../connection';
 import {
-  filterExchanges, findExchange, hasActiveFilters, hiddenBrowserCount, initialState, isProfileActive, pausedCount, profileLabel, reducer,
+  filterExchanges, findExchange, hasActiveFilters, hiddenBrowserCount, initialState, isProfileActive, pausedCount, profileDetails, profileLabel, reducer,
   toPersisted, visibleWarnings, type Persisted, type State,
 } from '../state';
 import { Button, useNow } from './bits';
@@ -189,6 +190,8 @@ function StatusLine() {
   const { status, exchanges, filters, connected, contracts } = state;
   const shown = useMemo(() => filterExchanges(exchanges, filters, contracts).length, [exchanges, filters, contracts]);
   const paused = pausedCount(exchanges);
+  const passthrough = passthroughSummary(status.tlsPassthrough);
+  const certs = clientCertSummary(status.clientCertificates);
   return (
     <footer class="statusline" role="status" aria-live="polite">
       <span class={`dot ${status.proxyRunning ? 'running' : 'stopped'}`} aria-hidden="true" />
@@ -201,7 +204,7 @@ function StatusLine() {
       </span>
       {paused > 0 && <span class="warn-text">{paused} paused</span>}
       {isProfileActive(status.networkProfile) && (
-        <span class="net-status" title="Network profile applied to everything this app sends through the proxy. Change it in the toolbar.">
+        <span class="net-status" title={`Network profile applied to everything this app sends through the proxy: ${profileDetails(status.networkProfile)}. Change it in the toolbar.`}>
           Network: {profileLabel(status.networkProfile)}
         </span>
       )}
@@ -211,11 +214,13 @@ function StatusLine() {
         </span>
       )}
       {status.upstreamProxy && (
-        <span class="upstream-status" title={UPSTREAM_TITLE(status.upstreamProxy)}>
-          via upstream proxy {status.upstreamProxy}
+        <span class={`upstream-status${fromVsCodeProxy(status) ? ' vscode-proxy' : ''}`} title={upstreamTitle(status)}>
+          {upstreamLabel(status)}
           {status.upstreamProxyInsecure && <span class="insecure" title={INSECURE_TITLE}> · certificate checks OFF</span>}
         </span>
       )}
+      {passthrough && <span class="passthrough-status" title={passthrough.title}>{passthrough.text}</span>}
+      {certs && <ClientCertStatus certs={status.clientCertificates!} summary={certs} />}
       {status.replay && (
         <span class="replay-status" title={`Answering requests from the recording “${status.replay.recording}”; unmatched requests ${FALLBACK_LABEL[status.replay.fallback]}.`}>
           Replaying {status.replay.recording}
@@ -223,6 +228,28 @@ function StatusLine() {
       )}
       {status.agent && <AgentStatusItem agent={status.agent} />}
     </footer>
+  );
+}
+
+const CERTS_SHOWN = 3;
+
+/** CONTRACTS §14.3: the configured client certificates by host pattern; a load problem is highlighted (never key material). */
+function ClientCertStatus({ certs, summary }: {
+  certs: NonNullable<Status['clientCertificates']>; summary: NonNullable<ReturnType<typeof clientCertSummary>>;
+}) {
+  // Problems first, so a broken certificate is never hidden behind "+N".
+  const sorted = [...certs.filter((c) => c.problem), ...certs.filter((c) => !c.problem)];
+  const shown = sorted.slice(0, CERTS_SHOWN);
+  return (
+    <span class={`cert-status${summary.problems ? ' has-problem' : ''}`} title={summary.title}>
+      {summary.problems ? `Client certificates (${summary.problems} problem${summary.problems === 1 ? '' : 's'}):` : 'Client certificates:'}
+      {shown.map((c, i) => (
+        <span key={i} class={`cert-host${c.problem ? ' cert-problem' : ''}`} title={c.problem ? `${c.host}: ${c.problem}` : c.host}>
+          {' '}{c.problem ? '✕ ' : ''}{c.host}{i < shown.length - 1 ? ',' : ''}
+        </span>
+      ))}
+      {sorted.length > CERTS_SHOWN && <span class="muted"> +{sorted.length - CERTS_SHOWN}</span>}
+    </span>
   );
 }
 
@@ -261,6 +288,8 @@ const WARNING_TITLE: Record<string, string> = {
   'background-isolate': 'HttpOverrides is set per isolate: requests made from a background isolate (compute(), Isolate.run, a worker) bypass the proxy.',
   'native-client': 'Native HTTP clients (cupertino_http, cronet_http, ok_http) don\'t use dart:io, so they bypass the proxy. Their requests are shown from the app\'s HTTP profile, read-only.',
   'web': 'Flutter Web: the browser talks to the proxy directly.',
+  'bypass': 'These requests showed up in the app\'s HTTP profile but never reached the proxy — usually an HttpOverrides zone ' +
+    'or a custom connectionFactory in the app. They can\'t be mocked, paused or recorded until they go through the proxy.',
 };
 
 /** CONTRACTS §11: session warnings (background isolates, native clients, web), dismissable per id. */

@@ -51,7 +51,7 @@ export function ActionEditor({ kind, f, v, set, uid, compact, bodyFile, scriptFi
   const throttleField = (key: keyof ThrottleFields, label: string, placeholder: string) => (
     <label class="field small-field">
       <span>{label}</span>
-      <input value={f.throttle[key]} inputMode="numeric" placeholder={placeholder} aria-invalid={!!v.errors[key]}
+      <input value={f.throttle[key] ?? ''} inputMode="numeric" placeholder={placeholder} aria-invalid={!!v.errors[key]}
         onInput={(e) => setThrottle({ [key]: (e.target as HTMLInputElement).value })} />
     </label>
   );
@@ -154,13 +154,17 @@ export function ActionEditor({ kind, f, v, set, uid, compact, bodyFile, scriptFi
     case 'throttle':
       return (
         <>
-          <div class="hint">Forwards to the real server, slowed down. “Fail” resets that share of the requests.</div>
+          <div class="hint">
+            Forwards to the real server, slowed down. Download paces responses, upload paces request bodies (and both
+            apply to WebSocket messages / SSE events). “Fail” resets that share of the requests.
+          </div>
           <div class="field-row">
             {throttleField('latencyMs', 'Latency (ms)', '0')}
-            {throttleField('kbps', 'Bandwidth (kbps)', 'unlimited')}
+            {throttleField('kbps', 'Download (kbps)', 'unlimited')}
+            {throttleField('uploadKbps', 'Upload (kbps)', 'unlimited')}
             {throttleField('dropPct', 'Fail (%)', '0')}
           </div>
-          {(['latencyMs', 'kbps', 'dropPct', 'throttle'] as const).map((k) => v.errors[k] && <div key={k} class="msg error">{v.errors[k]}</div>)}
+          {(['latencyMs', 'kbps', 'uploadKbps', 'dropPct', 'throttle'] as const).map((k) => v.errors[k] && <div key={k} class="msg error">{v.errors[k]}</div>)}
         </>
       );
 

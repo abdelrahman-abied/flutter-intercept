@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Body, Exchange } from '@flutter-intercept/proxy';
-import { Headers, redactBodyText, redactFrameText, redactHeaders, redactSecretValues, redactText, redactUrl } from './redact';
+import { Headers, redactBody, redactFrameText, redactHeaders, redactSecretValues, redactText, redactUrl } from './redact';
 
 export interface HarOptions {
   redact: boolean;
@@ -40,8 +40,11 @@ function bodyBytes(b: Body | undefined): number {
   return b.encoding === 'base64' ? Buffer.from(b.text, 'base64').length : Buffer.byteLength(b.text, 'utf8');
 }
 
-function bodyText(b: Body, headers: Headers | undefined, redact: boolean): string {
-  return b.encoding === 'utf8' && redact ? redactBodyText(b.text, headers) : b.text;
+/** The HAR `text` + `encoding` of a body (CONTRACTS §14.6: a binary multipart body is written parsed and redacted). */
+function bodyText(b: Body, headers: Headers | undefined, redact: boolean): { text: string; encoding?: 'base64' } {
+  if (!redact) return { text: b.text, ...(b.encoding === 'base64' ? { encoding: 'base64' as const } : {}) };
+  const r = redactBody(b, headers);
+  return { text: r.text, ...(r.encoding === 'base64' ? { encoding: 'base64' as const } : {}) };
 }
 
 /** REVIEW-5 #7: an ISO time for HAR even when `ms` is not a valid date (imported entries); epoch 0 then. */
@@ -136,8 +139,7 @@ export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string
             ? {
                 postData: {
                   mimeType: reqMime,
-                  text: bodyText(e.requestBody, e.requestHeaders, r),
-                  ...(e.requestBody.encoding === 'base64' ? { encoding: 'base64' } : {}),
+                  ...bodyText(e.requestBody, e.requestHeaders, r),
                 },
               }
             : {}),
@@ -152,7 +154,7 @@ export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string
             size: bodyBytes(e.responseBody),
             mimeType: resMime,
             ...(e.responseBody
-              ? { text: bodyText(e.responseBody, e.responseHeaders, r), ...(e.responseBody.encoding === 'base64' ? { encoding: 'base64' } : {}) }
+              ? bodyText(e.responseBody, e.responseHeaders, r)
               : {}),
             ...(e.responseBody?.truncated ? { comment: 'body truncated by Flutter Intercept (size cap)' } : {}),
           },

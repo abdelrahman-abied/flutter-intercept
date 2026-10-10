@@ -556,7 +556,8 @@ describe('recordings messages (CONTRACTS §12.4–12.5)', () => {
     host.exchanges = [
       ex('a'),
       ex('b', { state: 'pending', status: undefined }),
-      ex('ws', { kind: 'websocket' }),
+      ex('ws', { kind: 'websocket', state: 'pending' }), // open stream (closed ones are recorded since 0.8.0)
+      ex('t', { kind: 'tunnel', method: 'CONNECT' }),
       ex('vm', { captured: 'vm-profile' }),
       ex('chrome', { browserInternal: true }),
       ex('m', { state: 'mocked', status: 500 }),
@@ -647,7 +648,12 @@ describe('recordings messages (CONTRACTS §12.4–12.5)', () => {
     expect(isRecordable(ex('a'))).toBe(true);
     expect(isRecordable(ex('a', { state: 'error', status: undefined }))).toBe(true);
     expect(isRecordable(ex('a', { state: 'paused-response' }))).toBe(false);
-    expect(isRecordable(ex('a', { kind: 'sse' }))).toBe(false);
+    // CONTRACTS §14.5: finished streams are recordable since 0.8.0; open ones and tunnels are not.
+    expect(isRecordable(ex('a', { kind: 'sse' }))).toBe(true);
+    expect(isRecordable(ex('a', { kind: 'websocket', state: 'pending', status: 101 }))).toBe(false);
+    expect(isRecordable(ex('a', { kind: 'websocket', status: 101 }))).toBe(true);
+    expect(isRecordable(ex('a', { kind: 'websocket', status: 403 }))).toBe(false);
+    expect(isRecordable(ex('a', { kind: 'tunnel' }))).toBe(false);
   });
 });
 

@@ -243,3 +243,260 @@ export class ReverseTracker {
     return removed;
   }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// CONTRACTS §14.7 (docs/spikes/native-proxy.md): `flutterIntercept.nativeClients: "proxy"` on an Android EMULATOR
+// routes the platform's own HTTP stack (cronet_http, ok_http, HttpURLConnection) through the proxy with the
+// emulator-wide global proxy `settings put global http_proxy 10.0.2.2:<port>`, for the session only.
+// Measured: cronet honours it at once; HTTPS then works only when the app trusts the Flutter Intercept CA (a debug
+// `network_security_config`), which no adb command can arrange on a Play Store image (no root, user CAs need the
+// Settings UI and are ignored by apps without that config).
+// Revert = `put :0` (clears ConnectivityService's global proxy; a bare `delete` leaves it active), then `delete`
+// when the key was unset before, or the previous value. Every applied value is written to the store first, so a
+// crash is repaired by `recover()` on the next activation (or the next apply on that emulator).
+// ---------------------------------------------------------------------------------------------------------------
+
+/** The emulator's alias for the host loopback (CONTRACTS §2). */
+export const EMULATOR_HOST_ALIAS = '10.0.2.2';
+const EMULATOR_SERIAL = /^emulator-\d{1,5}$/;
+const CLEARED = ':0';
+const MAX_PROXY_RECORDS = 20;
+
+/** One emulator whose global proxy we set (persisted so a crash can be repaired). */
+export interface GlobalProxyRecord {
+  serial: string;
+  /** What we put (`10.0.2.2:<port>`). */
+  value: string;
+  /** `http_proxy` before we touched it (`null` = unset). */
+  previous: string | null;
+}
+
+/** Persistence for crash recovery (the host passes `context.globalState`-backed get / set). */
+export interface GlobalProxyStore {
+  get(): GlobalProxyRecord[];
+  set(records: GlobalProxyRecord[]): void | PromiseLike<void>;
+}
+
+export type GlobalProxyResult =
+  | { applied: true; serial: string; value: string }
+  | { applied: false; reason: 'not-emulator' | 'adb-missing' | 'not-connected' | 'user-proxy' | 'failed'; detail?: string };
+
+export interface AndroidGlobalProxyOptions extends AdbOptions {
+  store?: GlobalProxyStore;
+}
+
+/** `settings get` output → value, `null` when unset. */
+export function parseSettingValue(stdout: string): string | null {
+  const v = stdout.trim();
+  return v === '' || v === 'null' ? null : v;
+}
+
+function isValidRecord(r: unknown): r is GlobalProxyRecord {
+  const o = r as GlobalProxyRecord;
+  return (
+    !!o &&
+    typeof o.serial === 'string' &&
+    EMULATOR_SERIAL.test(o.serial) &&
+    typeof o.value === 'string' &&
+    /^10\.0\.2\.2:\d{1,5}$/.test(o.value) &&
+    (o.previous === null || (typeof o.previous === 'string' && o.previous.length <= 300))
+  );
+}
+
+/**
+ * Per-session global proxy on Android emulators. Reference-counted per emulator (two sessions on one emulator
+ * share it); reverted when the last session on it is released, on `releaseAll()` (deactivate) and by `recover()`.
+ * Never touches a proxy someone else set (a non-empty `http_proxy`, or a global proxy from a device policy), and on
+ * release never overwrites a value that changed meanwhile. Never throws.
+ */
+export class AndroidGlobalProxy {
+  private readonly sessions = new Map<string, string>(); // sessionId → serial
+  private readonly active = new Map<string, GlobalProxyRecord>(); // serial → record (applied by this process)
+  private chain: Promise<unknown> = Promise.resolve();
+
+  constructor(private readonly opts: AndroidGlobalProxyOptions = {}) {}
+
+  /** Whether this session's emulator is routed through the proxy right now. */
+  isRouted(sessionId: string): boolean {
+    const serial = this.sessions.get(sessionId);
+    return serial !== undefined && this.active.has(serial);
+  }
+
+  /** Emulators currently routed by us. */
+  get routed(): string[] {
+    return [...this.active.keys()];
+  }
+
+  /** Routes `serial` through `10.0.2.2:<port>` for this session. */
+  apply(sessionId: string, serial: string | undefined, port: number): Promise<GlobalProxyResult> {
+    return this.serial(() => this.doApply(sessionId, serial, port));
+  }
+
+  /** The session ended (or routing failed): reverts the emulator when no other session uses it. */
+  release(sessionId: string): Promise<void> {
+    return this.serial(async () => {
+      const serial = this.sessions.get(sessionId);
+      if (serial === undefined) return;
+      this.sessions.delete(sessionId);
+      if ([...this.sessions.values()].includes(serial)) return;
+      const rec = this.active.get(serial);
+      if (rec) await this.revert(rec);
+    });
+  }
+
+  /** Reverts everything this process applied (extension deactivate). */
+  releaseAll(): Promise<void> {
+    return this.serial(async () => {
+      this.sessions.clear();
+      for (const rec of [...this.active.values()]) await this.revert(rec);
+    });
+  }
+
+  /** Repairs emulators left routed by a previous run (crash / killed window). Returns how many were reverted. */
+  recover(): Promise<number> {
+    return this.serial(async () => {
+      const adb = this.adb();
+      if (!adb) return 0;
+      let connected: string[];
+      try {
+        connected = parseAdbDevices((await this.exec(adb, ['devices'])).stdout);
+      } catch {
+        return 0;
+      }
+      let n = 0;
+      for (const rec of this.stored()) {
+        if (this.active.has(rec.serial) || !connected.includes(rec.serial)) continue; // offline: kept for later
+        if (await this.revert(rec)) n++;
+      }
+      return n;
+    });
+  }
+
+  // ------------------------------------------------------------------------------------------------- internals
+
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const p = this.chain.then(fn, fn);
+    this.chain = p.catch(() => undefined);
+    return p;
+  }
+
+  private log(msg: string): void {
+    try {
+      this.opts.log?.(msg);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private adb(): string | undefined {
+    return this.opts.adbPath === null ? undefined : this.opts.adbPath ?? locateAdb();
+  }
+
+  private exec(adb: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+    return (this.opts.exec ?? defaultExec)(adb, args, this.opts.timeoutMs ?? 5000);
+  }
+
+  private async get(adb: string, serial: string, key: string): Promise<string | null> {
+    return parseSettingValue((await this.exec(adb, ['-s', serial, 'shell', 'settings', 'get', 'global', key])).stdout);
+  }
+
+  private stored(): GlobalProxyRecord[] {
+    try {
+      const v = this.opts.store?.get();
+      return Array.isArray(v) ? v.filter(isValidRecord) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private async save(records: GlobalProxyRecord[]): Promise<void> {
+    try {
+      await this.opts.store?.set(records.slice(-MAX_PROXY_RECORDS));
+    } catch (e) {
+      this.log(`native proxy: could not save the emulator proxy state (${errorText(e)})`);
+    }
+  }
+
+  private async doApply(sessionId: string, serial: string | undefined, port: number): Promise<GlobalProxyResult> {
+    if (!serial || !EMULATOR_SERIAL.test(serial)) return { applied: false, reason: 'not-emulator' };
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return { applied: false, reason: 'failed', detail: `invalid port ${port}` };
+    const adb = this.adb();
+    if (!adb) return { applied: false, reason: 'adb-missing' };
+    const value = `${EMULATOR_HOST_ALIAS}:${port}`;
+    const mine = this.active.get(serial);
+    try {
+      const connected = parseAdbDevices((await this.exec(adb, ['devices'])).stdout);
+      if (!connected.includes(serial)) return { applied: false, reason: 'not-connected' };
+      const current = await this.get(adb, serial, 'http_proxy');
+      let previous: string | null;
+      if (mine) {
+        if (current !== mine.value) {
+          // Changed behind our back: it isn't ours any more.
+          this.active.delete(serial);
+          await this.save(this.stored().filter((r) => r.serial !== serial));
+          this.log(`native proxy: ${serial} http_proxy changed outside Flutter Intercept; leaving it alone`);
+          return { applied: false, reason: 'user-proxy' };
+        }
+        previous = mine.previous;
+      } else {
+        const stale = this.stored().find((r) => r.serial === serial);
+        if (stale && current === stale.value) {
+          previous = stale.previous; // left by a previous run: its `previous` is the real one
+        } else if (current !== null && current !== CLEARED) {
+          this.log(`native proxy: ${serial} already has a global proxy; not changing it`);
+          return { applied: false, reason: 'user-proxy' };
+        } else {
+          const host = await this.get(adb, serial, 'global_http_proxy_host');
+          const pac = await this.get(adb, serial, 'global_proxy_pac_url');
+          if (host || pac) {
+            this.log(`native proxy: ${serial} has a global proxy from a device policy; not changing it`);
+            return { applied: false, reason: 'user-proxy' };
+          }
+          previous = current;
+        }
+      }
+      const rec: GlobalProxyRecord = { serial, value, previous };
+      // Persist first: a crash between `put` and the next save must still be repairable.
+      await this.save([...this.stored().filter((r) => r.serial !== serial), rec]);
+      if (current !== value) await this.exec(adb, ['-s', serial, 'shell', 'settings', 'put', 'global', 'http_proxy', value]);
+      const now = await this.get(adb, serial, 'http_proxy');
+      if (now !== value) {
+        await this.revert(rec);
+        return { applied: false, reason: 'failed', detail: `http_proxy reads ${now ?? 'null'} after the change` };
+      }
+      this.active.set(serial, rec);
+      this.sessions.set(sessionId, serial);
+      if (!mine) this.log(`native proxy: ${serial} http_proxy → ${value} (previously ${previous ?? 'unset'})`);
+      return { applied: true, serial, value };
+    } catch (e) {
+      const detail = errorText(e).slice(0, 300);
+      this.log(`native proxy: could not route ${serial} (${detail})`);
+      return { applied: false, reason: 'failed', detail };
+    }
+  }
+
+  /** Puts the previous value back if the current one is still ours. True when the emulator no longer uses ours. */
+  private async revert(rec: GlobalProxyRecord): Promise<boolean> {
+    this.active.delete(rec.serial);
+    for (const [sid, s] of this.sessions) if (s === rec.serial) this.sessions.delete(sid);
+    const adb = this.adb();
+    if (!adb) return false;
+    try {
+      const current = await this.get(adb, rec.serial, 'http_proxy');
+      if (current === rec.value) {
+        const put = (v: string) => this.exec(adb, ['-s', rec.serial, 'shell', 'settings', 'put', 'global', 'http_proxy', v]);
+        await put(CLEARED);
+        if (rec.previous === null) await this.exec(adb, ['-s', rec.serial, 'shell', 'settings', 'delete', 'global', 'http_proxy']);
+        else if (rec.previous !== CLEARED) await put(rec.previous);
+        this.log(`native proxy: ${rec.serial} http_proxy restored (${rec.previous ?? 'unset'})`);
+      } else {
+        this.log(`native proxy: ${rec.serial} http_proxy is no longer ours; left as is`);
+      }
+      await this.save(this.stored().filter((r) => r.serial !== rec.serial));
+      return true;
+    } catch (e) {
+      this.log(`native proxy: could not restore ${rec.serial} (${errorText(e).slice(0, 300)}); will retry on the next start`);
+      return false;
+    }
+  }
+}

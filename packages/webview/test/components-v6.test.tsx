@@ -430,8 +430,10 @@ describe('recordings', () => {
     expect($('.recordings-view')!.textContent).toContain('.dart_tool/flutter_intercept/recordings/');
   });
 
-  it('save current traffic: name, redact option, counts finished HTTP exchanges only', async () => {
-    const list = [ex({ id: 'a' }), ex({ id: 'b', state: 'pending' }), ex({ id: 'c', kind: 'websocket' }), ex({ id: 'd', state: 'mocked' })];
+  it('save current traffic: name, redact option, counts finished exchanges only', async () => {
+    // v0.8.0 (CONTRACTS §14.5): an open WebSocket is not saved (a closed one is), a TLS tunnel never is.
+    const list = [ex({ id: 'a' }), ex({ id: 'b', state: 'pending' }), ex({ id: 'c', kind: 'websocket', state: 'pending' }), ex({ id: 'd', state: 'mocked' }),
+      ex({ id: 't', kind: 'tunnel', method: 'CONNECT', url: 'https://bank.example:443/', status: undefined })];
     await view(list);
     await click(button(/Save current traffic/));
     const form = $('.rec-save')!;

@@ -14,10 +14,16 @@
  *  D. reloaded order (our hook before Dart-Code's): same launch result.
  *  E. flutterIntercept.web.enabled=false: no flags, app works, nothing recorded.
  *  F. web-server device: not intercepted, with the one-time notice reason.
+ *  v0.8.0 (CONTRACTS §14.7), in the A-C session:
+ *  G. web screenshot: `Page.captureScreenshot` over CDP on the debug Chrome's port (`--web-browser-debug-port` we add).
+ *  H. DIRECT fallback: the proxy is stopped mid-session; after a hot restart every call still works (PAC
+ *     `PROXY 127.0.0.1:<port>; DIRECT`) and nothing is recorded; the proxy is started again afterwards.
  */
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { Exchange } from '@flutter-intercept/proxy';
+import { webBrowserDebugPortOf } from '../../../src/debug/rewrite';
+import { captureWebPng } from '../../../src/web/screenshot';
 import { activateBoth, freePort, outputOf, registerOutputTracker, RunOutcome, sleep, startSession, stopSession, waitFor } from './helpers';
 
 const JP = 'https://jsonplaceholder.typicode.com';
@@ -118,9 +124,12 @@ export async function runWebSuite(): Promise<RunOutcome[]> {
     if (c.flutterInterceptPort !== api.proxyHost.port) failures.push(`port ${c.flutterInterceptPort} != proxy ${api.proxyHost.port}`);
     if (c.debuggerType !== 2) failures.push(`debuggerType ${c.debuggerType} (want Flutter 2)`);
     const args = (c.toolArgs ?? []) as string[];
-    const proxy = args.filter((a) => a.startsWith('--web-browser-flag=--proxy-server='));
+    const proxy = args.filter((a) => /^--web-browser-flag=--proxy-(server|pac-url)=/.test(a));
     const pin = args.filter((a) => a.startsWith('--web-browser-flag=--ignore-certificate-errors-spki-list='));
-    if (proxy.length !== 1 || proxy[0] !== `--web-browser-flag=--proxy-server=http://127.0.0.1:${api.proxyHost.port}`) failures.push(`proxy flags ${JSON.stringify(proxy)}`);
+    // v0.8.0: a loopback PAC URL (DIRECT fallback) for this proxy port.
+    const pac = new RegExp(`^--web-browser-flag=--proxy-pac-url=http://127\\.0\\.0\\.1:\\d+/flutter-intercept-${api.proxyHost.port}\\.pac$`);
+    if (proxy.length !== 1 || !pac.test(proxy[0])) failures.push(`proxy flags ${JSON.stringify(proxy)}`);
+    if (args.filter((a) => a.startsWith('--web-browser-debug-port=')).length !== 1 || !webBrowserDebugPortOf(c)) failures.push(`debug port flag missing: ${args.join(' ')}`);
     if (pin.length !== 1 || !/=[A-Za-z0-9+/]{43}=$/.test(pin[0])) failures.push(`SPKI flags ${JSON.stringify(pin)}`);
     if (args.some((a) => a.includes('FLUTTER_INTERCEPT_'))) failures.push(`entry defines on a web session: ${args.join(' ')}`);
     for (const a of userArgs) if (!args.includes(a)) failures.push(`user toolArg ${a} lost`);
@@ -218,8 +227,40 @@ export async function runWebSuite(): Promise<RunOutcome[]> {
       output: evidence(text2),
       proxyHits: recorded2.map((e) => `${e.state} ${e.status ?? '-'} ${e.method} ${e.url}`),
     });
+
+    // G. web screenshot over CDP (loopback, the debug port the provider gave the browser).
+    t0 = Date.now();
+    failures = [];
+    let shotInfo = '';
+    try {
+      const png = await captureWebPng(webBrowserDebugPortOf(session.configuration) ?? 0);
+      shotInfo = `${png.readUInt32BE(16)}x${png.readUInt32BE(20)} ${png.length} bytes`;
+      if (png.length < 1000) failures.push(`tiny screenshot ${shotInfo}`);
+    } catch (e) {
+      failures.push(`screenshot: ${(e as Error).message}`);
+    }
+    check('FI-W G web screenshot over CDP', failures, t0, { mode: shotInfo });
+
+    // H. DIRECT fallback: stop the proxy mid-session, hot restart, the app keeps its network.
+    t0 = Date.now();
+    failures = [];
+    api.setRules([]);
+    await api.proxyHost.stop();
+    await sleep(1000);
+    const from3 = outputOf(session).length;
+    since = Date.now();
+    await session.customRequest('hotRestart');
+    const text3 = await waitBatch(session, from3);
+    const res3 = webResults(text3);
+    for (const [l, want] of Object.entries({ http_todo: '200', dio_user: '200', dio_post: '201', http_post: '201', dio_profile: '200' })) {
+      if (res3[l]?.status !== want) failures.push(`${l} with the proxy stopped: ${res3[l]?.status} ${res3[l]?.body?.slice(0, 120)} (want ${want}, DIRECT)`);
+    }
+    const leaked = api.getExchanges().filter((e) => e.startedAt >= since && e.url.startsWith(JP));
+    if (leaked.length) failures.push(`${leaked.length} requests recorded while the proxy was stopped`);
+    await api.proxyHost.start();
+    check('FI-W H DIRECT fallback (proxy stopped mid-session, hot restart)', failures, t0, { output: evidence(text3) });
   } catch (e) {
-    check('FI-W A-C', [...failures, `exception: ${(e as Error).message}`], t0, { output: session ? evidence(outputOf(session)) : '' });
+    check('FI-W A-H', [...failures, `exception: ${(e as Error).message}`], t0, { output: session ? evidence(outputOf(session)) : '' });
   } finally {
     vscode.debug.removeBreakpoints([bp]);
     api.setRules([]);
@@ -258,7 +299,7 @@ export async function runWebSuite(): Promise<RunOutcome[]> {
     session = await launch('FI-W off');
     const text = await waitBatch(session, 0);
     const c = session.configuration;
-    if ((c.toolArgs ?? []).some((a: string) => /proxy-server|spki-list/.test(a))) failures.push(`browser flags present: ${c.toolArgs}`);
+    if ((c.toolArgs ?? []).some((a: string) => /proxy-server|proxy-pac-url|spki-list|web-browser-debug-port/.test(a))) failures.push(`browser flags present: ${c.toolArgs}`);
     if (c.flutterInterceptPort !== undefined) failures.push('flutterInterceptPort set');
     const res = webResults(text);
     if (res.http_todo?.status !== '200') failures.push(`app without interception: http_todo ${res.http_todo?.status}`);

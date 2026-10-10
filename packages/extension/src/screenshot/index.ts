@@ -8,8 +8,10 @@
  *    and macOS; Flutter content only — no system UI or platform views), then the engine's `_flutter.screenshot`
  *    (fails with Impeller: "Could not capture image screenshot", kept for Skia builds).
  * 2. The device's own tool: `adb -s <id> exec-out screencap -p` (Android), `xcrun simctl io <udid> screenshot`
- *    (iOS simulator).
- * 3. Otherwise (macOS / Linux / Windows desktop, web, physical iOS): a clear "not supported" error.
+ *    (iOS simulator); physical iPhones (CONTRACTS §14.7): `xcrun devicectl device capture screenshot` (Xcode's
+ *    CoreDevice tool, Xcode 27+), then libimobiledevice's `idevicescreenshot` when it is installed (PATH, Homebrew).
+ *    Flutter's bundled copy is not used: it is x86_64-only and needs Rosetta.
+ * 3. Otherwise (macOS / Linux / Windows desktop, web): a clear "not supported" error.
  * Saved under `<project>/.dart_tool/flutter_intercept/screenshots/<timestamp>.png` (realpath-checked folders,
  * `wx`, ≤ 16 MB). App screens show personal data and one-time codes (REVIEW-7 #13): files 0600 in a 0700 folder,
  * only the newest `MAX_SCREENSHOTS` kept.
@@ -35,6 +37,9 @@ const VM_CALL_TIMEOUT_MS = 10_000;
 const TOOL_TIMEOUT_MS = 20_000;
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const OBJECT_GROUP = 'flutter-intercept-screenshot';
+/** Where `idevicescreenshot` may be when VS Code was started from the Dock (minimal PATH). */
+const IDEVICE_DIRS = ['/opt/homebrew/bin', '/usr/local/bin'];
+type Method = Screenshot['method'];
 
 /** Thrown when neither the VM service nor a device tool can take one (the message says why). */
 export class ScreenshotUnsupportedError extends Error {}
@@ -155,19 +160,73 @@ async function viaAdb(deviceId: string, deps: ScreenshotDeps, adb: string): Prom
 }
 
 async function viaSimctl(udid: string, deps: ScreenshotDeps): Promise<Buffer> {
-  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'fi-shot-'));
-  try {
+  return inTempDir(async (tmp) => {
     const file = path.join(tmp, 'screenshot.png');
     await deps.exec('xcrun', ['simctl', 'io', udid, 'screenshot', '--type=png', file], { timeoutMs: TOOL_TIMEOUT_MS });
-    const st = await fs.promises.lstat(file);
-    if (!st.isFile()) throw new Error('simctl: no screenshot file');
-    if (st.size > MAX_SCREENSHOT_BYTES) throw new Error('simctl: image larger than 16 MB');
-    const png = await fs.promises.readFile(file);
-    if (!pngSize(png)) throw new Error('simctl: not a PNG');
-    return png;
+    return readToolPng(file, 'simctl');
+  });
+}
+
+/** Reads a PNG a tool wrote into `file` (regular file, ≤ 16 MB, PNG signature). */
+async function readToolPng(file: string, what: string): Promise<Buffer> {
+  const st = await fs.promises.lstat(file);
+  if (!st.isFile()) throw new Error(`${what}: no screenshot file`);
+  if (st.size > MAX_SCREENSHOT_BYTES) throw new Error(`${what}: image larger than 16 MB`);
+  const png = await fs.promises.readFile(file);
+  if (!pngSize(png)) throw new Error(`${what}: not a PNG`);
+  return png;
+}
+
+async function inTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'fi-shot-'));
+  try {
+    return await fn(tmp);
   } finally {
     await fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+/** Physical iPhone through Xcode's CoreDevice (`devicectl device capture screenshot`, Xcode 27+). */
+async function viaDevicectl(udid: string, deps: ScreenshotDeps): Promise<Buffer> {
+  return inTempDir(async (tmp) => {
+    const file = path.join(tmp, 'screenshot.png');
+    await deps.exec('xcrun', ['devicectl', 'device', 'capture', 'screenshot', '--quiet', '--device', udid, '--destination', file], { timeoutMs: TOOL_TIMEOUT_MS });
+    return readToolPng(file, 'devicectl');
+  });
+}
+
+export interface LocateToolEnv {
+  env: NodeJS.ProcessEnv;
+  platform: NodeJS.Platform;
+  exists: (p: string) => boolean;
+}
+
+/** `idevicescreenshot` on PATH or in the Homebrew folders; undefined when not installed (never Flutter's x86_64 copy). */
+export function locateIdeviceScreenshot(le: LocateToolEnv = { env: process.env, platform: process.platform, exists: isFile }): string | undefined {
+  if (le.platform === 'win32') return undefined;
+  const dirs = [...(le.env.PATH ?? '').split(':').filter((d) => d && path.isAbsolute(d) && !/[/\\]bin[/\\]cache[/\\]artifacts[/\\]/.test(d)), ...IDEVICE_DIRS];
+  for (const dir of dirs) {
+    const candidate = path.join(dir, 'idevicescreenshot');
+    if (le.exists(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function isFile(p: string): boolean {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Physical iPhone through libimobiledevice (needs the developer disk image mounted, as after any Xcode run). */
+async function viaIdeviceScreenshot(udid: string, deps: ScreenshotDeps, tool: string): Promise<Buffer> {
+  return inTempDir(async (tmp) => {
+    const file = path.join(tmp, 'screenshot.png');
+    await deps.exec(tool, ['-u', udid, file], { timeoutMs: TOOL_TIMEOUT_MS });
+    return readToolPng(file, 'idevicescreenshot'); // old iOS versions answer TIFF: "not a PNG"
+  });
 }
 
 /** Sort key: timestamp, then the same-millisecond counter (`x.png` = 1, `x-2.png` = 2, …). */
@@ -222,6 +281,10 @@ export async function saveScreenshot(projectRoot: string, png: Buffer, now: Date
 export interface TakeScreenshotOptions {
   /** adb executable (default: `locateAdb()`, else `adb` on PATH). */
   adbPath?: string;
+  /** `idevicescreenshot` (default: `locateIdeviceScreenshot()`); null = not installed (tests). */
+  idevicePath?: string | null;
+  /** Host platform (default `process.platform`): devicectl / idevicescreenshot only on macOS. */
+  platform?: NodeJS.Platform;
   now?: () => Date;
 }
 
@@ -231,7 +294,7 @@ export async function takeScreenshotWith(target: ScreenshotTarget, deps: Screens
   const deviceId = target.deviceId?.trim();
   const reasons: string[] = [];
   let png: Buffer | undefined;
-  let method: Screenshot['method'] | undefined;
+  let method: Method | undefined;
   if (deps.callService) {
     try {
       png = await viaVmService(target.sessionId, deps.callService);
@@ -255,20 +318,39 @@ export async function takeScreenshotWith(target: ScreenshotTarget, deps: Screens
     } catch (e) {
       reasons.push(`simctl: ${errText(e)}`);
     }
+  } else if (!png && deviceId && kind === 'ios-device' && (opts.platform ?? process.platform) === 'darwin') {
+    try {
+      png = await viaDevicectl(deviceId, deps);
+      method = 'devicectl';
+    } catch (e) {
+      reasons.push(`devicectl: ${errText(e)}`);
+    }
+    if (!png) {
+      const tool = opts.idevicePath === null ? undefined : opts.idevicePath ?? locateIdeviceScreenshot();
+      if (!tool) reasons.push('idevicescreenshot: not installed');
+      else {
+        try {
+          png = await viaIdeviceScreenshot(deviceId, deps, tool);
+          method = 'idevicescreenshot';
+        } catch (e) {
+          reasons.push(`idevicescreenshot: ${errText(e)}`);
+        }
+      }
+    }
   }
   if (!png || !method) {
-    const tool = kind === 'android' || kind === 'ios-simulator';
+    const tool = kind === 'android' || kind === 'ios-simulator' || kind === 'ios-device';
     const why = reasons.length ? ` (${reasons.join('; ')})` : '';
     if (tool) throw new Error(`Could not take a screenshot of ${kindLabel[kind]}${why}.`);
     throw new ScreenshotUnsupportedError(
-      `Screenshots of ${kindLabel[kind]} are not supported: only Android devices / emulators and iOS simulators, or any app whose Flutter VM service can render one (debug sessions)${why}.`,
+      `Screenshots of ${kindLabel[kind]} are not supported: only Android devices / emulators, iOS simulators and iPhones, or any app whose Flutter VM service can render one (debug sessions)${why}.`,
     );
   }
   const takenAt = now();
   const size = pngSize(png);
   const file = await saveScreenshot(target.projectRoot, png, takenAt);
   deps.log(`screenshot: ${method}, ${size ? `${size.width}×${size.height}, ` : ''}${png.length} bytes`);
-  return { path: file, png, width: size?.width, height: size?.height, takenAt: takenAt.getTime(), method };
+  return { path: file, png, width: size?.width, height: size?.height, takenAt: takenAt.getTime(), method: method as Screenshot['method'] };
 }
 
 /** CONTRACTS §13.8 entry point. */

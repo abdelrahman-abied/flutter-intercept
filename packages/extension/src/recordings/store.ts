@@ -1,9 +1,9 @@
 /**
- * RecordingService (CONTRACTS §12.4): finished HTTP exchanges saved to
+ * RecordingService (CONTRACTS §12.4, §14.5): finished HTTP, WebSocket and SSE exchanges saved to
  * `<project>/.dart_tool/flutter_intercept/recordings/<id>.json`, listed, loaded, removed, exported. No `vscode`;
  * the file system is injected (defaults to node's).
  *
- * File format (JSON, version 1). The first line holds the metadata so `list()` reads only the head of each file:
+ * File format (JSON, version 1 — or 2 when it holds WebSocket / SSE exchanges, see validate.ts). The first line holds the metadata so `list()` reads only the head of each file:
  *
  *     {"version":1,"id":"login-flow","name":"Login flow","createdAt":1760000000000,"exchanges":2,"redacted":false,
  *     "entries":[
@@ -20,11 +20,12 @@ import * as path from 'path';
 import { randomBytes } from 'crypto';
 import type { Exchange, ReplayOptions } from '@flutter-intercept/proxy';
 import { redactExchange } from '../agent/samples';
+import { capFrames, copyFrame, redactFrame } from './frames';
 import { diff, diffText } from './diff';
 import { gitIgnoreStatus, type GitignoreFs } from './gitignore';
 import { replayOptionsFor, toReplay } from './replay';
 import type { Recording, RecordingDiffEntry, RecordingMeta, RecordingService } from './types';
-import { isValidId, MAX_ENTRIES, RECORDING_VERSION, RecordingFormatError, validateRecording, validEntry, validName } from './validate';
+import { isValidId, MAX_ENTRIES, recordingVersionFor, RecordingFormatError, SUPPORTED_RECORDING_VERSIONS, validateRecording, validEntry, validName } from './validate';
 
 export const RECORDINGS_DIR = path.join('.dart_tool', 'flutter_intercept', 'recordings');
 export const DEFAULT_MAX_RECORDING_BYTES = 200 * 1024 * 1024;
@@ -95,10 +96,14 @@ export class RecordingError extends Error {
   readonly name = 'RecordingError';
 }
 
-/** Finished, plain HTTP exchanges from the app (no WebSocket / SSE / vm-profile / browser-internal / unfinished). */
+/**
+ * Finished exchanges from the app a recording keeps: plain HTTP, WebSocket (cleanly closed upgrade, status 101) and
+ * SSE (CONTRACTS §14.5) — not tunnels, vm-profile captures, browser-internal, unfinished or failed ones.
+ */
 export function isRecordable(e: Exchange): boolean {
+  if (e.kind && e.kind !== 'websocket' && e.kind !== 'sse') return false;
+  if (e.kind === 'websocket' && e.status !== 101) return false;
   return (
-    !e.kind &&
     e.captured !== 'vm-profile' &&
     !e.browserInternal &&
     (e.state === 'completed' || e.state === 'mocked') &&
@@ -119,7 +124,26 @@ export function slugify(name: string): string {
   return s || 'recording';
 }
 
-/** The fields a recording keeps (no stack traces, pause state, frames, errors, LAN marks). */
+/**
+ * The fields a recording keeps (no stack traces, pause state, errors, LAN marks); WebSocket / SSE frames within the
+ * proxy's caps. `redact`: secrets redacted like agent views, frames included (CONTRACTS §14.5).
+ */
+export function recordedExchange(e: Exchange, redact = false): Exchange {
+  const src = redact ? redactExchange(e) : e;
+  const out = pick(src);
+  if (e.kind === 'websocket' || e.kind === 'sse') {
+    out.kind = e.kind;
+    const frames = (e.frames ?? []).map(redact ? redactFrame : copyFrame);
+    const capped = capFrames(frames, e.framesDropped ?? 0);
+    out.frames = capped.frames;
+    if (capped.dropped) out.framesDropped = capped.dropped;
+    // SSE keeps no response body (the events are the record); WebSocket has none
+    delete out.responseBody;
+    if (e.kind === 'websocket') delete out.requestBody;
+  }
+  return out;
+}
+
 function pick(e: Exchange): Exchange {
   return {
     id: e.id,
@@ -140,17 +164,30 @@ function pick(e: Exchange): Exchange {
   };
 }
 
+/** CONTRACTS §14.5 `RecordingMeta.streams` / `frames`: WebSocket / SSE exchanges and their frames; {} when none. */
+export function streamCounts(entries: readonly Exchange[]): { streams?: number; frames?: number } {
+  let streams = 0;
+  let frames = 0;
+  for (const e of entries) {
+    if (e.kind !== 'websocket' && e.kind !== 'sse') continue;
+    streams++;
+    frames += e.frames?.length ?? 0;
+  }
+  return streams ? { streams, frames } : {};
+}
+
 const mb = (n: number) => (n >= 1024 * 1024 ? `${Math.round(n / (1024 * 1024))} MB` : `${Math.ceil(n / 1024)} KB`);
 
-/** The file text (metadata on line 1). Throws RecordingError beyond `maxBytes`. */
+/** The file text (metadata on line 1; `streams` / `frames` only when it holds WebSocket / SSE exchanges). Throws RecordingError beyond `maxBytes`. */
 export function serializeRecording(meta: Omit<RecordingMeta, 'path'>, entries: Exchange[], maxBytes: number): string {
   const head = JSON.stringify({
-    version: RECORDING_VERSION,
+    version: recordingVersionFor(entries),
     id: meta.id,
     name: meta.name,
     createdAt: meta.createdAt,
     exchanges: entries.length,
     redacted: meta.redacted,
+    ...streamCounts(entries),
   });
   const parts = [`${head.slice(0, -1)},\n"entries":[\n`];
   let size = Buffer.byteLength(parts[0]);
@@ -180,7 +217,7 @@ export function parseHead(head: string): Omit<RecordingMeta, 'id' | 'path'> | un
   }
   if (typeof data !== 'object' || data === null) return undefined;
   const d = data as Record<string, unknown>;
-  if (d.version !== RECORDING_VERSION || typeof d.redacted !== 'boolean') return undefined;
+  if (!SUPPORTED_RECORDING_VERSIONS.includes(d.version as number) || typeof d.redacted !== 'boolean') return undefined;
   if (typeof d.createdAt !== 'number' || !Number.isFinite(d.createdAt) || d.createdAt < 0) return undefined;
   if (!Number.isInteger(d.exchanges) || (d.exchanges as number) < 0 || (d.exchanges as number) > MAX_ENTRIES) return undefined;
   let name: string;
@@ -189,7 +226,16 @@ export function parseHead(head: string): Omit<RecordingMeta, 'id' | 'path'> | un
   } catch {
     return undefined;
   }
-  return { name, createdAt: d.createdAt, exchanges: d.exchanges as number, redacted: d.redacted };
+  const count = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
+  if (d.streams !== undefined && (!count(d.streams) || (d.streams as number) > (d.exchanges as number))) return undefined;
+  if (d.frames !== undefined && !count(d.frames)) return undefined;
+  return {
+    name,
+    createdAt: d.createdAt,
+    exchanges: d.exchanges as number,
+    redacted: d.redacted,
+    ...(d.streams ? { streams: d.streams as number, frames: (d.frames as number | undefined) ?? 0 } : {}),
+  };
 }
 
 const isNotFound = (e: unknown) => {
@@ -371,7 +417,7 @@ export function createRecordingService(deps: RecordingServiceDeps): RecordingSto
           }
           // Reformatted by hand: read and validate the whole file.
           const rec = await readRecording(file, id);
-          out.push({ id, name: rec.name, createdAt: rec.createdAt, exchanges: rec.exchanges, path: file, redacted: rec.redacted });
+          out.push({ id, name: rec.name, createdAt: rec.createdAt, exchanges: rec.exchanges, path: file, redacted: rec.redacted, ...streamCounts(rec.entries) });
         } catch {
           // unreadable or invalid: not listed (load() reports why)
         }
@@ -391,17 +437,17 @@ export function createRecordingService(deps: RecordingServiceDeps): RecordingSto
       const entries: Exchange[] = [];
       for (const e of exchanges) {
         if (!isRecordable(e)) continue;
-        const kept = pick(redacted ? redactExchange(e) : e);
+        const kept = recordedExchange(e, redacted);
         try {
           entries.push(validEntry(JSON.parse(JSON.stringify(kept)), 'entry'));
         } catch {
           // something load() would refuse (e.g. a non-http URL): left out
         }
       }
-      if (!entries.length) throw new RecordingError('Nothing to save: no finished HTTP exchanges (WebSocket, SSE and native-client traffic are not recorded).');
+      if (!entries.length) throw new RecordingError('Nothing to save: no finished HTTP, WebSocket or SSE exchanges (open streams, failed requests and native-client traffic are not recorded).');
       if (entries.length > MAX_ENTRIES) throw new RecordingError(`Too many exchanges (${entries.length}; the limit is ${MAX_ENTRIES}).`);
       entries.sort((a, b) => a.startedAt - b.startedAt);
-      const meta = { id: '', name: checkedName, createdAt: now(), exchanges: entries.length, redacted };
+      const meta: Omit<RecordingMeta, 'path'> = { id: '', name: checkedName, createdAt: now(), exchanges: entries.length, redacted, ...streamCounts(entries) };
       const d = (await safeDir(true))!;
       meta.id = await uniqueId(d, slugify(checkedName));
       const file = fileOf(d, meta.id);
@@ -452,7 +498,7 @@ export function createRecordingService(deps: RecordingServiceDeps): RecordingSto
       if (!(rec.redacted || redact) && (await gitIgnoreStatus(target, gitFs)) === 'not-ignored') {
         throw notIgnored(dest, 'Export it redacted, or choose a folder outside the repository.');
       }
-      const entries = redact ? rec.entries.map((e) => pick(redactExchange(e))) : rec.entries;
+      const entries = redact ? rec.entries.map((e) => recordedExchange(e, true)) : rec.entries;
       const text = serializeRecording({ id: rec.id, name: rec.name, createdAt: rec.createdAt, exchanges: entries.length, redacted: rec.redacted || redact }, entries, maxBytes);
       await atomicWrite(target, text);
       return target;

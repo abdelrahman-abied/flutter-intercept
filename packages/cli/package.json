@@ -1,20 +1,47 @@
 {
-  "name": "@flutter-intercept/cli",
+  "name": "flutter-intercept-cli",
   "version": "0.7.0",
-  "private": true,
-  "description": "Headless Flutter Intercept for CI: run integration tests through the proxy with shared rules, replay and assertions.",
+  "description": "Headless Flutter Intercept for CI: run Flutter integration tests through a local MITM proxy with shared mock rules, replay, network profiles and traffic assertions. No app code changes.",
+  "keywords": [
+    "flutter",
+    "dart",
+    "proxy",
+    "mitm",
+    "http",
+    "mock",
+    "har",
+    "integration-test",
+    "ci"
+  ],
+  "author": "Abdulrahman Obaid",
   "license": "MIT",
+  "homepage": "https://github.com/abdelrahman-abied/flutter-intercept/tree/main/packages/cli#readme",
+  "bugs": {
+    "url": "https://github.com/abdelrahman-abied/flutter-intercept/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abdelrahman-abied/flutter-intercept.git",
+    "directory": "packages/cli"
+  },
   "type": "commonjs",
   "bin": {
     "flutter-intercept": "dist/cli.js"
+  },
+  "files": [
+    "dist/cli.js"
+  ],
+  "engines": {
+    "node": ">=18"
   },
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc -p . --noEmit",
     "test": "vitest run",
-    "test:devices": "bash test/e2e.sh"
+    "test:devices": "bash test/e2e.sh",
+    "prepublishOnly": "npm --prefix ../proxy run build && node build.mjs"
   },
-  "dependencies": {
+  "devDependencies": {
     "@flutter-intercept/proxy": "*"
   }
 }

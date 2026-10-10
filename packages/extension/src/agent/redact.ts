@@ -21,7 +21,11 @@
  *   `?variables=` / `?extensions=` JSON parameter. `variables` in JSON bodies are covered by the structural pass.
  * - CONTRACTS §11.5 (frames): WebSocket / SSE text is redacted like a body (`redactFrameText`), plus
  *   `name: value` lines with a sensitive name (STOMP-style headers).
+ * - CONTRACTS §14.6 (multipart): `multipart/form-data` bodies (boundary from the content-type, ≤ 5 MB) are parsed:
+ *   secret-named fields → "[redacted]", file parts → "[file <name>, N bytes]", other fields redacted like a body of
+ *   their own content-type; also when the body was recorded as binary (`redactBody`). Unparseable → the text rules.
  */
+import type { Body } from '@flutter-intercept/proxy';
 
 export const REDACTED = '[redacted]';
 
@@ -487,10 +491,15 @@ function headerValue(headers: Headers | undefined, name: string): string | undef
   return undefined;
 }
 
-/** Redacts a decoded text body according to its content type (JSON, urlencoded, or JSON-ish text). */
+/** Redacts a decoded text body according to its content type (JSON, urlencoded, multipart, or JSON-ish text). */
 export function redactBodyText(text: string, headers?: Headers): string {
-  const ct = (headerValue(headers, 'content-type') ?? '').toLowerCase();
+  const rawCt = headerValue(headers, 'content-type') ?? '';
+  const ct = rawCt.toLowerCase();
   if (ct.includes('application/x-www-form-urlencoded')) return redactQueryString(text);
+  if (ct.includes('multipart/form-data') && text.length <= MAX_MULTIPART_BYTES) {
+    const out = redactMultipart(Buffer.from(text, 'utf8'), rawCt);
+    if (out !== undefined) return out;
+  }
   if (ct.includes('application/graphql')) return redactGraphqlDocument(text);
   const trimmed = text.trimStart();
   if (trimmed.startsWith('{') || trimmed.startsWith('[') || ct.includes('json')) {
@@ -559,4 +568,187 @@ export function redactLogLine(line: string): string {
       return isOpaqueToken(m[2]) || TOKEN_PREFIX.test(m[2]) ? `${m[1]}${REDACTED}${m[3]}` : word;
     })
     .join('');
+}
+
+// ------------------------------------------------------------------ CONTRACTS §14.6 multipart/form-data
+
+/** Multipart bodies larger than this are not parsed (the text rules apply). */
+export const MAX_MULTIPART_BYTES = 5 * 1024 * 1024;
+/** At most this many parts are shown; the rest are summarised. */
+export const MAX_MULTIPART_PARTS = 1000;
+
+/** The `boundary` parameter of a multipart content-type (RFC 2046: 1-70 characters), or undefined. */
+export function multipartBoundary(contentType: string): string | undefined {
+  const m = /;\s*boundary\s*=\s*(?:"([^"]{1,70})"|([^\s;"]{1,70}))(?=\s*(?:;|$))/i.exec(contentType);
+  const b = m?.[1] ?? m?.[2];
+  return b && !/[\r\n]/.test(b) ? b : undefined;
+}
+
+function dispositionParam(disposition: string, name: string): string | undefined {
+  // filename*=UTF-8''…  (RFC 5987) wins over filename=
+  const ext = new RegExp(`;\\s*${name}\\*\\s*=\\s*([^;]+)`, 'i').exec(disposition);
+  if (ext) {
+    const v = ext[1].trim().replace(/^[A-Za-z0-9_-]*'[A-Za-z-]*'/, '');
+    try {
+      return decodeURIComponent(v);
+    } catch {
+      return v;
+    }
+  }
+  const m = new RegExp(`;\\s*${name}\\s*=\\s*(?:"((?:[^"\\\\]|\\\\.)*)"|([^;\\s]*))`, 'i').exec(disposition);
+  if (!m) return undefined;
+  return m[1] !== undefined ? m[1].replace(/\\(.)/g, '$1') : m[2];
+}
+
+/** latin1 (byte) string → UTF-8 text when it is valid UTF-8, else undefined. */
+function utf8Of(bytes: string): string | undefined {
+  const buf = Buffer.from(bytes, 'latin1');
+  const text = buf.toString('utf8');
+  return Buffer.byteLength(text, 'utf8') === buf.length && !text.includes('\uFFFD') ? text : undefined;
+}
+
+function cleanName(v: string): string {
+  return (utf8Of(v) ?? v).replace(/[\r\n"\\]+/g, ' ').slice(0, 200);
+}
+
+/**
+ * A `multipart/form-data` body as agents see it (CONTRACTS §14.6), rebuilt with the same boundary: part headers kept
+ * (Content-Disposition with names; other part headers redacted like headers), values replaced — secret-named fields →
+ * "[redacted]", file parts (a `filename`) → "[file <name>, N bytes]", binary values → "[binary N bytes]", other text
+ * redacted like a body of the part's content-type. `bytes` is the raw body; undefined when it has no boundary, is
+ * larger than MAX_MULTIPART_BYTES or doesn't parse (the caller falls back to the text rules). A truncated body ends
+ * with the parts that were complete plus "[truncated]".
+ */
+export function redactMultipart(bytes: Buffer, contentType: string): string | undefined {
+  if (bytes.length > MAX_MULTIPART_BYTES) return undefined;
+  const boundary = multipartBoundary(contentType);
+  if (!boundary) return undefined;
+  const s = bytes.toString('latin1');
+  const delim = `--${boundary}`;
+  let pos: number;
+  if (s.startsWith(delim)) pos = 0;
+  else {
+    const at = s.indexOf(`\n${delim}`);
+    if (at === -1) return undefined;
+    pos = at + 1;
+  }
+  const out: string[] = [];
+  let parts = 0;
+  let closed = false;
+  let truncated = false;
+  while (pos < s.length) {
+    // at a delimiter line
+    let p = pos + delim.length;
+    if (s.startsWith('--', p)) {
+      closed = true;
+      break;
+    }
+    while (s[p] === ' ' || s[p] === '\t') p++;
+    if (s.startsWith('\r\n', p)) p += 2;
+    else if (s[p] === '\n') p += 1;
+    else if (p >= s.length) {
+      truncated = true;
+      break;
+    } else return undefined; // not a delimiter after all
+    // part headers
+    let headEnd = s.indexOf('\r\n\r\n', p);
+    let bodyStart = headEnd + 4;
+    const lf = s.indexOf('\n\n', p);
+    if (lf !== -1 && (headEnd === -1 || lf < headEnd)) {
+      headEnd = lf;
+      bodyStart = lf + 2;
+    }
+    if (headEnd === -1) {
+      truncated = true;
+      break;
+    }
+    const headerLines = s.slice(p, headEnd).split(/\r?\n/).filter((l) => l.length > 0);
+    // part body: up to the next delimiter line
+    const nextCrlf = s.indexOf(`\r\n${delim}`, bodyStart);
+    const nextLf = s.indexOf(`\n${delim}`, bodyStart);
+    let bodyEnd: number;
+    let next: number;
+    if (nextCrlf !== -1 && (nextLf === -1 || nextCrlf <= nextLf)) {
+      bodyEnd = nextCrlf;
+      next = nextCrlf + 2;
+    } else if (nextLf !== -1) {
+      bodyEnd = nextLf;
+      next = nextLf + 1;
+    } else {
+      bodyEnd = s.length;
+      next = s.length;
+      truncated = true;
+    }
+    parts++;
+    if (parts > MAX_MULTIPART_PARTS) {
+      let more = 1;
+      let q = next;
+      while (q < s.length && !s.startsWith('--', q + delim.length)) {
+        more++;
+        const n2 = s.indexOf(`\n${delim}`, q + 1);
+        if (n2 === -1) break;
+        q = n2 + 1;
+      }
+      out.push(`${delim}\r\n\r\n[${more} more parts]`);
+      closed = true;
+      break;
+    }
+    const headers: Record<string, string> = {};
+    const shownHeaders: string[] = [];
+    for (const line of headerLines) {
+      const c = line.indexOf(':');
+      if (c <= 0) return undefined;
+      const name = line.slice(0, c).trim();
+      const value = line.slice(c + 1).trim();
+      headers[name.toLowerCase()] = value;
+      const lower = name.toLowerCase();
+      if (lower === 'content-disposition') {
+        shownHeaders.push(`${name}: ${(utf8Of(value) ?? value).replace(/(;\s*filename\*?\s*=\s*)("(?:[^"\\]|\\.)*"|[^;]*)/gi, (_m, pre: string, v: string) => `${pre}${redactSecretValues(v)}`)}`);
+      } else if (lower === 'content-type') {
+        shownHeaders.push(`${name}: ${value}`);
+      } else {
+        const r = redactHeaders({ [name]: utf8Of(value) ?? value }) ?? {};
+        shownHeaders.push(`${name}: ${String(r[name])}`);
+      }
+    }
+    const disposition = headers['content-disposition'] ?? '';
+    const field = dispositionParam(disposition, 'name');
+    const filename = dispositionParam(disposition, 'filename');
+    const raw = s.slice(bodyStart, bodyEnd);
+    const size = raw.length; // latin1: one char per byte
+    let value: string;
+    const partCt = headers['content-type'] ?? '';
+    if (filename !== undefined) {
+      value = `[file ${redactSecretValues(cleanName(filename)) || 'unnamed'}, ${size} bytes]`;
+    } else if (field !== undefined && isSensitiveField(cleanName(field))) {
+      value = REDACTED;
+    } else {
+      const text = utf8Of(raw);
+      if (text === undefined || /^(image|audio|video|font)\/|octet-stream|application\/(zip|pdf|gzip|x-protobuf|protobuf)/i.test(partCt)) value = `[binary ${size} bytes]`;
+      else if (/multipart\//i.test(partCt)) value = `[nested multipart, ${size} bytes]`;
+      else {
+        const whole = redactSecretValues(text, true);
+        value = whole !== text && whole === REDACTED ? REDACTED : redactBodyText(text, partCt ? { 'content-type': partCt } : undefined);
+      }
+    }
+    out.push(`${delim}\r\n${shownHeaders.join('\r\n')}${shownHeaders.length ? '\r\n' : ''}\r\n${value}${truncated && bodyEnd === s.length ? ' [truncated]' : ''}`);
+    pos = next;
+  }
+  if (!parts && !closed) return undefined;
+  return `${out.join('\r\n')}\r\n${closed && !truncated ? `${delim}--\r\n` : '[truncated]'}`;
+}
+
+/**
+ * A recorded body as agents see it with redaction on: text bodies through `redactBodyText`; a binary (`base64`)
+ * `multipart/form-data` body parsed by `redactMultipart` and returned as text (`encoding: 'utf8'`); other binary
+ * bodies unchanged (callers summarise them).
+ */
+export function redactBody(b: Body, headers?: Headers): Body {
+  if (b.encoding === 'utf8') return { ...b, text: redactBodyText(b.text, headers) };
+  const ct = headerValue(headers, 'content-type') ?? '';
+  if (!/multipart\/form-data/i.test(ct)) return b;
+  // base64 text is 4/3 of the bytes: skip the decode when it can't fit
+  if (b.text.length > Math.ceil((MAX_MULTIPART_BYTES * 4) / 3) + 4) return b;
+  const out = redactMultipart(Buffer.from(b.text, 'base64'), ct);
+  return out === undefined ? b : { text: out, encoding: 'utf8', ...(b.truncated ? { truncated: true } : {}) };
 }

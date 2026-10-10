@@ -2,7 +2,8 @@ import * as http from 'http';
 import * as https from 'https';
 import * as tls from 'tls';
 import { createUpstreamAgents, retireAgents, type UpstreamAgents, type UpstreamProxySpec } from './upstream-proxy';
-import { timedAgent, type TimingSink } from './timing';
+import { requestView, type RequestPlan } from './upstream-request';
+import { keepAliveOptions } from './idle';
 
 /*
  * Upstream connection pooling across client connections.
@@ -64,9 +65,14 @@ interface Pool {
   lan?: LanUpstream;
   /** CONTRACTS §12.6: pass-through traffic goes via this HTTP proxy. */
   upstream?: UpstreamAgents;
-  /** CONTRACTS §13.2: where the phases of the request served for a downstream connection go (src/timing.ts). */
-  timings?: (connection: unknown) => TimingSink | undefined;
+  /**
+   * What to do with the upstream request a downstream connection is about to make (timings, upload pacing), and a
+   * chance to note its target (client certificates). Called once per upstream request.
+   */
+  plan?: RequestPlanLookup;
 }
+
+export type RequestPlanLookup = (connection: unknown, target: { protocol?: string; hostname?: string; port?: number }) => RequestPlan | undefined;
 
 export interface LanUpstream {
   /**
@@ -200,9 +206,15 @@ function installHook(): boolean {
       // so the upgrade carries an agent of ours (timed, and kept clear of the editor's request patch below).
       if (agent === false && (o.protocol === 'ws:' || o.protocol === 'wss:')) agent = o.protocol === 'wss:' ? new https.Agent() : new http.Agent();
       if (!agent || typeof agent !== 'object' || 'http2' in agent || !(agent instanceof http.Agent)) return agent;
-      // Our rules only: a per-request view of the agent that reports the upstream phases (CONTRACTS §13.2).
-      const sink = pool.timings?.(o?.connection);
-      const out = sink ? timedAgent(agent, sink) : agent;
+      // Our rules only: a per-request view of the agent (upstream-request.ts): phase timings (CONTRACTS §13.2), upload
+      // pacing (§14.4) and the reused-socket retry (§14.6).
+      let plan: RequestPlan | undefined;
+      try {
+        plan = pool.plan?.(o?.connection, { protocol: o?.protocol, hostname: o?.hostname, port: o?.port });
+      } catch {
+        plan = undefined;
+      }
+      const out = requestView(agent, plan ?? {});
       ownAgents.add(out);
       return out;
     };
@@ -224,8 +236,8 @@ export interface UpstreamPool {
   /** Route pass-through traffic via an HTTP proxy (undefined = direct). Connections in use finish first. */
   setUpstream(spec: UpstreamProxySpec | undefined): void;
   readonly upstream: UpstreamProxySpec | undefined;
-  /** CONTRACTS §13.2: the timing sink for the request a downstream connection is serving (undefined = none). */
-  setTimings(lookup: ((connection: unknown) => TimingSink | undefined) | undefined): void;
+  /** The plan (timings, upload pacing) for the upstream request a downstream connection is about to make. */
+  setRequestPlan(lookup: RequestPlanLookup | undefined): void;
   destroy(): void;
 }
 
@@ -233,8 +245,8 @@ export function createUpstreamPool(opts: { rewriteLocalhost?: boolean } = {}): U
   const active = installHook();
   const rewrite = opts.rewriteLocalhost ?? true;
   const pool: Pool = {
-    http: rewrite ? new RewritingHttpAgent({ keepAlive: true }) : new http.Agent({ keepAlive: true }),
-    https: rewrite ? new RewritingHttpsAgent({ keepAlive: true }) : new https.Agent({ keepAlive: true }),
+    http: rewrite ? new RewritingHttpAgent(keepAliveOptions()) : new http.Agent(keepAliveOptions()),
+    https: rewrite ? new RewritingHttpsAgent(keepAliveOptions()) : new https.Agent(keepAliveOptions()),
     rewrite,
   };
   const proxyConfig: ProxySettingCallback = () => undefined;
@@ -252,8 +264,8 @@ export function createUpstreamPool(opts: { rewriteLocalhost?: boolean } = {}): U
     get upstream() {
       return pool.upstream?.spec;
     },
-    setTimings(lookup) {
-      pool.timings = lookup;
+    setRequestPlan(lookup) {
+      pool.plan = lookup;
     },
     destroy() {
       pools.delete(proxyConfig);

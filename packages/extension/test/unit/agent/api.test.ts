@@ -696,8 +696,8 @@ describe('get_body_shape', () => {
 describe('simulate_network', () => {
   it('global profiles: presets, custom, offline, none; get_status reports it', async () => {
     const { api, host } = setup();
-    expect(await api.call('simulate_network', { profile: 'slow-3g' })).toEqual({ profile: { kind: 'throttle', preset: 'slow-3g', latencyMs: 400, kbps: 400, label: 'Slow 3G' } });
-    expect(host.networkProfile).toEqual({ kind: 'throttle', preset: 'slow-3g', latencyMs: 400, kbps: 400 });
+    expect(await api.call('simulate_network', { profile: 'slow-3g' })).toEqual({ profile: { kind: 'throttle', preset: 'slow-3g', latencyMs: 400, kbps: 400, uploadKbps: 400, label: 'Slow 3G' } });
+    expect(host.networkProfile).toEqual({ kind: 'throttle', preset: 'slow-3g', latencyMs: 400, kbps: 400, uploadKbps: 400 });
     expect(await api.call('get_status', {})).toMatchObject({ networkProfile: { kind: 'throttle', label: 'Slow 3G' } });
     await api.call('simulate_network', { profile: 'custom', latencyMs: 300, kbps: 800 });
     expect(host.networkProfile).toEqual({ kind: 'throttle', latencyMs: 300, kbps: 800 });

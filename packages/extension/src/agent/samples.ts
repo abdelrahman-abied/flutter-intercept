@@ -11,7 +11,7 @@ import { JsonDouble, parseJsonSample } from '../codegen/json';
 import { parsePubspecDeps } from '../codegen/pubspec';
 import type { FixtureApi } from '../codegen/types';
 import type { ApiEndpoint, ContractResult, ContractViolation } from '../contract/types';
-import { isSensitiveField, REDACTED, redactBodyText, redactHeaders, redactSecretValues, redactUrl } from './redact';
+import { isSensitiveField, REDACTED, redactBody, redactHeaders, redactSecretValues, redactUrl } from './redact';
 
 export const FINAL_STATES = new Set<Exchange['state']>(['completed', 'mocked', 'blocked', 'aborted', 'error']);
 
@@ -131,11 +131,6 @@ export function redactJsonValue(v: unknown): unknown {
   // REVIEW-4 #9: JWTs / Bearer credentials / long opaque tokens under any key
   if (typeof v === 'string') return redactSecretValues(v, true);
   return v;
-}
-
-function redactBody(b: Body | undefined, h: Exchange['requestHeaders'] | undefined): Body | undefined {
-  if (!b || b.encoding !== 'utf8') return b;
-  return { ...b, text: redactBodyText(b.text, h) };
 }
 
 /** The exchange as agents see it with redaction on: URL query, headers and bodies (CONTRACTS §8). */

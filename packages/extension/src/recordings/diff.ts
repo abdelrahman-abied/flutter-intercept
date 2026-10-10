@@ -7,10 +7,16 @@
  * changes, array element shape — `1.0` is a double, `1` an int, as Dart decodes them), body value changes (a count
  * only, never the values) and timing (median more than 2× slower).
  *
+ * CONTRACTS §14.5: WebSocket routes are labelled `WS /path`, SSE routes `GET /path (SSE)`. For them `diff` also
+ * reports frame counts per direction (change `count`, "frames: 12 → 15 (sent 3 → 3, received 9 → 12)"), message
+ * types that appeared or disappeared (change `shape`: "+message type receive binary", "-SSE event price_update") and
+ * close-code changes (change `status`: "close 1000 → 1011").
+ *
  * `diffText(rec)` is a normalised text of one recording for a side-by-side `vscode.diff`: exchanges ordered by route
  * then time, headers sorted with volatile ones (date, request ids, trace ids, …) dropped and cookie values
  * removed, secrets redacted like agent views (tokens change on every run, and the text lands in an editor), JSON
- * bodies pretty-printed without touching their number literals.
+ * bodies pretty-printed without touching their number literals; WebSocket / SSE frames one per line (frames.ts
+ * `frameLines`: times relative to the exchange start, volatile ids masked, SSE ids dropped).
  */
 import { createHash } from 'crypto';
 import type { Body, Exchange } from '@flutter-intercept/proxy';
@@ -18,6 +24,7 @@ import { redactBodyText, redactHeaders, redactUrl } from '../agent/redact';
 import { inferShape, mergeShapes, type Shape } from '../codegen/infer';
 import { JsonDouble, parseJsonSample, prettyJson } from '../codegen/json';
 import { isIdSegment, routeTemplate } from '../codegen/route';
+import { frameLines, frameSummary } from './frames';
 import { requestBodyHash } from './replay';
 import type { Recording, RecordingDiffEntry } from './types';
 
@@ -31,8 +38,10 @@ const CHANGE_ORDER: RecordingDiffEntry['change'][] = ['removed', 'added', 'statu
 
 // ------------------------------------------------------------------ routes
 
+/** The origin, with ws / wss counted as http / https (a WebSocket on the API's host is not another origin). */
 function originOf(url: string): string {
-  return /^([a-z][a-z0-9+.-]*:\/\/[^/?#]*)/i.exec(url)?.[1]?.toLowerCase() ?? '';
+  const o = /^([a-z][a-z0-9+.-]*:\/\/[^/?#]*)/i.exec(url)?.[1]?.toLowerCase() ?? '';
+  return o.replace(/^ws(s?):/, 'http$1:');
 }
 
 interface RouteInfo {
@@ -49,6 +58,8 @@ function routeOf(e: Exchange, withOrigin: boolean): RouteInfo {
   }
   template = redactUrl(template);
   const op = e.graphql?.operationName ? ` (${e.graphql.operationName})` : '';
+  if (e.kind === 'websocket') return { key: `${template}${op}\u0000WS`, label: `WS ${template}${op}` };
+  if (e.kind === 'sse') return { key: `${template}${op}\u0000${method}\u0000SSE`, label: `${method} ${template}${op} (SSE)` };
   return { key: `${template}${op}\u0000${method}`, label: `${method} ${template}${op}` };
 }
 
@@ -236,12 +247,37 @@ function routeChanges(route: string, a: Exchange[], b: Exchange[]): RecordingDif
     });
   }
 
+  if (a.some((e) => e.kind) || b.some((e) => e.kind)) out.push(...frameChanges(route, a, b));
+
   // timing
   const ma = median(a.flatMap((e) => (typeof e.durationMs === 'number' ? [e.durationMs] : [])));
   const mb = median(b.flatMap((e) => (typeof e.durationMs === 'number' ? [e.durationMs] : [])));
   if (ma !== undefined && mb !== undefined && mb > ma * SLOWER_FACTOR && mb - ma >= MIN_SLOWER_MS) {
     out.push({ route, change: 'timing', detail: `${Math.round(ma)} ms → ${Math.round(mb)} ms (median, ${(mb / Math.max(ma, 1)).toFixed(1)}× slower)` });
   }
+  return out;
+}
+
+const SSE_EVENT = /^event /;
+
+/** CONTRACTS §14.5: frame counts, message types and close codes of a WebSocket / SSE route. */
+function frameChanges(route: string, a: Exchange[], b: Exchange[]): RecordingDiffEntry[] {
+  const out: RecordingDiffEntry[] = [];
+  const x = frameSummary(a);
+  const y = frameSummary(b);
+  const ca = x.closeCodes.join('/');
+  const cb = y.closeCodes.join('/');
+  if (ca !== cb) out.push({ route, change: 'status', detail: `close ${ca || 'no code'} → ${cb || 'no code'}` });
+  if (x.sent !== y.sent || x.received !== y.received) {
+    const parts = [];
+    if (x.sent || y.sent) parts.push(`sent ${x.sent} → ${y.sent}`);
+    if (x.received || y.received) parts.push(`received ${x.received} → ${y.received}`);
+    const dropped = x.dropped || y.dropped ? `; older frames not recorded: ${x.dropped} → ${y.dropped}` : '';
+    out.push({ route, change: 'count', detail: `frames: ${x.sent + x.received} → ${y.sent + y.received} (${parts.join(', ')}${dropped})` });
+  }
+  const label = (t: string) => (SSE_EVENT.test(t) ? `SSE ${t}` : `message type ${t}`);
+  for (const t of [...x.types].sort()) if (!y.types.has(t)) out.push({ route, change: 'shape', detail: `-${label(t)}` });
+  for (const t of [...y.types].sort()) if (!x.types.has(t)) out.push({ route, change: 'shape', detail: `+${label(t)}` });
   return out;
 }
 
@@ -275,6 +311,7 @@ const VOLATILE_HEADERS = new Set([
   'cf-ray', 'x-cache', 'x-cache-hits', 'x-served-by', 'x-timer', 'via', 'server-timing', 'x-runtime', 'x-response-time',
   'x-envoy-upstream-service-time', 'x-github-request-id', 'report-to', 'nel', 'alt-svc', 'x-ratelimit-remaining',
   'x-ratelimit-reset', 'ratelimit-remaining', 'ratelimit-reset', 'if-none-match', 'if-modified-since', 'x-powered-by-request',
+  'sec-websocket-key', 'sec-websocket-accept', 'last-event-id',
 ]);
 const VOLATILE_PREFIX = /^x-b3-/;
 
@@ -354,6 +391,7 @@ export function diffText(rec: Recording): string {
       out.push(...headerLines(e.responseHeaders).map(indent));
       const rs = bodyLines(e.responseBody, e.responseHeaders);
       if (rs.length) out.push('', ...rs.map(indent));
+      if (e.kind) out.push('', ...frameLines(e).map(indent));
       out.push('');
     }
   }

@@ -3,11 +3,27 @@
  * may have been edited or come from someone else, so nothing in it is trusted: every field is checked and the
  * result is rebuilt from the checked fields only (unknown fields dropped, header objects without prototypes
  * tricks, no CR/LF in header values, base64 that really is base64). Pure.
+ *
+ * CONTRACTS §14.5: entries may be WebSocket (`kind: "websocket"`, a ws(s):// URL, status 101, no bodies) or SSE
+ * (`kind: "sse"`, http(s), no response body) exchanges with `frames` (frames.ts `validFrames`) and `framesDropped`.
+ * File versions: 1 = HTTP entries only (0.6 / 0.7 files, and HTTP-only files written now, so 0.7 can still read
+ * them); 2 = has WebSocket / SSE entries (an older extension then refuses the file by its version, not an entry).
+ * A version 1 file with stream entries is refused; unknown versions are refused with a clear message.
  */
 import type { Body, Exchange } from '@flutter-intercept/proxy';
+import { FrameFormatError, validFrames, type StreamKind } from './frames';
 import type { Recording } from './types';
 
+/** HTTP-only recordings (0.6 / 0.7 format). */
 export const RECORDING_VERSION = 1;
+/** Recordings with WebSocket / SSE entries (CONTRACTS §14.5). */
+export const RECORDING_VERSION_STREAMS = 2;
+export const SUPPORTED_RECORDING_VERSIONS: readonly number[] = [RECORDING_VERSION, RECORDING_VERSION_STREAMS];
+
+/** The version a file holding `entries` is written with: 2 when any entry is a WebSocket / SSE exchange, else 1. */
+export function recordingVersionFor(entries: readonly Pick<Exchange, 'kind'>[]): 1 | 2 {
+  return entries.some((e) => e.kind === 'websocket' || e.kind === 'sse') ? RECORDING_VERSION_STREAMS : RECORDING_VERSION;
+}
 export const MAX_NAME_CHARS = 200;
 export const MAX_ENTRIES = 100_000;
 export const MAX_URL_CHARS = 64 * 1024;
@@ -74,7 +90,7 @@ function validBody(v: unknown, where: string): Body {
   return { text: v.text, encoding: v.encoding, ...(v.truncated ? { truncated: true } : {}) };
 }
 
-function validUrl(v: unknown, where: string): string {
+function validUrl(v: unknown, where: string, kind?: StreamKind): string {
   if (typeof v !== 'string' || v.length > MAX_URL_CHARS) fail(where, 'must be a URL string');
   if (/[\0-\x20\x7f]/.test(v)) fail(where, 'must not contain spaces or control characters');
   let u: URL;
@@ -83,7 +99,9 @@ function validUrl(v: unknown, where: string): string {
   } catch {
     fail(where, 'is not a valid URL');
   }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') fail(where, 'must be an http(s) URL');
+  if (kind === 'websocket') {
+    if (u.protocol !== 'ws:' && u.protocol !== 'wss:') fail(where, 'must be a ws(s) URL for a WebSocket exchange');
+  } else if (u.protocol !== 'http:' && u.protocol !== 'https:') fail(where, 'must be an http(s) URL');
   return v;
 }
 
@@ -94,9 +112,18 @@ export function validEntry(v: unknown, where: string): Exchange {
   if (!finite(v.startedAt) || v.startedAt < 0) fail(`${where}.startedAt`, 'must be a time (epoch ms)');
   if (v.durationMs !== undefined && (!finite(v.durationMs) || v.durationMs < 0)) fail(`${where}.durationMs`, 'must be a non-negative number');
   if (typeof v.method !== 'string' || !METHOD.test(v.method)) fail(`${where}.method`, 'must be an HTTP method');
-  const url = validUrl(v.url, `${where}.url`);
+  if (v.kind !== undefined && v.kind !== 'websocket' && v.kind !== 'sse') fail(`${where}.kind`, 'must be "websocket" or "sse" (or absent for HTTP)');
+  const kind = v.kind as StreamKind | undefined;
+  const url = validUrl(v.url, `${where}.url`, kind);
   if (!Number.isInteger(v.status) || (v.status as number) < 100 || (v.status as number) > 599) fail(`${where}.status`, 'must be an HTTP status (100–599)');
   if (typeof v.state !== 'string' || !ENTRY_STATES.has(v.state)) fail(`${where}.state`, 'must be "completed" or "mocked"');
+  if (kind === 'websocket') {
+    if (v.method.toUpperCase() !== 'GET') fail(`${where}.method`, 'must be GET for a WebSocket exchange');
+    if (v.status !== 101) fail(`${where}.status`, 'must be 101 for a WebSocket exchange');
+    if (v.requestBody !== undefined || v.responseBody !== undefined) fail(where, 'must not have bodies (a WebSocket exchange records frames)');
+  }
+  if (kind === 'sse' && v.responseBody !== undefined) fail(`${where}.responseBody`, 'must be absent for an SSE exchange (the events are its frames)');
+  if (!kind && (v.frames !== undefined || v.framesDropped !== undefined)) fail(`${where}.frames`, 'are only allowed on WebSocket and SSE exchanges');
   const e: Exchange = {
     id: v.id,
     startedAt: v.startedAt,
@@ -110,6 +137,19 @@ export function validEntry(v: unknown, where: string): Exchange {
     ...(v.responseBody !== undefined ? { responseBody: validBody(v.responseBody, `${where}.responseBody`) } : {}),
     state: v.state as Exchange['state'],
   };
+  if (kind) {
+    e.kind = kind;
+    try {
+      e.frames = validFrames(v.frames ?? [], kind, `${where}.frames`);
+    } catch (err) {
+      if (err instanceof FrameFormatError) throw new RecordingFormatError(err.message);
+      throw err;
+    }
+    if (v.framesDropped !== undefined) {
+      if (!Number.isSafeInteger(v.framesDropped) || (v.framesDropped as number) < 0) fail(`${where}.framesDropped`, 'must be a non-negative integer');
+      if (v.framesDropped) e.framesDropped = v.framesDropped as number;
+    }
+  }
   if (v.matchedRuleId !== undefined) {
     if (typeof v.matchedRuleId !== 'string' || v.matchedRuleId.length > 200) fail(`${where}.matchedRuleId`, 'must be a string');
     e.matchedRuleId = v.matchedRuleId;
@@ -153,12 +193,34 @@ export function validEntry(v: unknown, where: string): Exchange {
  */
 export function validateRecording(data: unknown, id: string, path: string): Recording {
   if (!isObj(data)) fail('recording', 'must be a JSON object');
-  if (data.version !== RECORDING_VERSION) fail('version', `must be ${RECORDING_VERSION} (this file has ${JSON.stringify(data.version)})`);
+  if (!SUPPORTED_RECORDING_VERSIONS.includes(data.version as number)) {
+    const newer = typeof data.version === 'number' && Number.isInteger(data.version) && data.version > RECORDING_VERSION_STREAMS;
+    fail('version', `must be 1 or 2 (this file has ${JSON.stringify(data.version)}${newer ? ': it was saved by a newer Flutter Intercept — update the extension to load it' : ''})`);
+  }
+  const version = data.version as 1 | 2;
   const name = validName(data.name);
   if (!finite(data.createdAt) || data.createdAt < 0) fail('createdAt', 'must be a time (epoch ms)');
   if (typeof data.redacted !== 'boolean') fail('redacted', 'must be a boolean');
   if (!Array.isArray(data.entries)) fail('entries', 'must be an array');
   if (data.entries.length > MAX_ENTRIES) fail('entries', `has more than ${MAX_ENTRIES} exchanges`);
   const entries = data.entries.map((x, i) => validEntry(x, `entries[${i}]`));
-  return { version: RECORDING_VERSION, id, name, createdAt: data.createdAt, exchanges: entries.length, path, redacted: data.redacted, entries };
+  let streams = 0;
+  let frames = 0;
+  for (const [i, e] of entries.entries()) {
+    if (!e.kind) continue;
+    if (version === RECORDING_VERSION) fail(`entries[${i}].kind`, 'is not allowed in a version 1 recording (WebSocket / SSE entries need version 2)');
+    streams++;
+    frames += e.frames?.length ?? 0;
+  }
+  return {
+    version,
+    id,
+    name,
+    createdAt: data.createdAt,
+    exchanges: entries.length,
+    path,
+    redacted: data.redacted,
+    ...(streams ? { streams, frames } : {}),
+    entries,
+  };
 }

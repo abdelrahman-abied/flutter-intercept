@@ -9,6 +9,7 @@ import { bodyByteLength, formatBytes, formatDuration, isPaused, shortFrameLocati
 import { useExchangeActions } from './actions';
 import { AgentBadge, CoverageBadges, MenuList, PauseTimer, StateBadge, StatusText } from './bits';
 import { frameTotal, hasFrames } from '../frames';
+import { isTunnel, tunnelBytesShort, tunnelBytesText, tunnelTitle } from '../connection';
 import { barGeometry, phaseClass, timeRange, timingTooltip, type TimeRange } from '../timing';
 
 export const ROW_HEIGHT = 22;
@@ -185,7 +186,7 @@ function Row({ ex, selected, gaveUp, agentRule, contract, range, now, onSelect, 
       id={`ex-${ex.id}`}
       role="option"
       aria-selected={selected}
-      class={`row cols st-${ex.state}${selected ? ' selected' : ''}`}
+      class={`row cols st-${ex.state}${selected ? ' selected' : ''}${isTunnel(ex) ? ' tunnel-row' : ''}`}
       onClick={onSelect}
       onDblClick={onOpen}
       onContextMenu={(e) => { e.preventDefault(); onMenu(e.clientX, e.clientY); }}
@@ -193,11 +194,13 @@ function Row({ ex, selected, gaveUp, agentRule, contract, range, now, onSelect, 
       <span class="c-method">{ex.method}</span>
       <span class="c-status"><StatusText ex={ex} /></span>
       <span class="c-host" title={host}>{host}</span>
-      <span class="c-path" title={app ? `${ex.url}\nCalled from ${app.fn} (${shortFrameLocation(app)})` : ex.url}>
+      <span class="c-path" title={isTunnel(ex) ? tunnelTitle(ex) : app ? `${ex.url}\nCalled from ${app.fn} (${shortFrameLocation(app)})` : ex.url}>
         <CoverageBadges ex={ex} mini />{path}
       </span>
       <span class="c-dur">{isPaused(ex) ? <PauseTimer ex={ex} /> : formatDuration(ex.durationMs)}</span>
-      {hasFrames(ex)
+      {isTunnel(ex)
+        ? <span class="c-size tunnel-bytes" title={tunnelBytesText(ex)}>{tunnelBytesShort(ex)}</span>
+        : hasFrames(ex)
         ? <span class="c-size" title={`${frameTotal(ex)} ${ex.kind === 'sse' ? 'events' : 'messages'}`}>{frameTotal(ex)} msg</span>
         : <span class="c-size">{formatBytes(size)}{ex.responseBody?.truncated ? '+' : ''}</span>}
       <span class="c-state">

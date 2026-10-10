@@ -22,10 +22,15 @@
  *   file can't be read (or, for a shared rule, isn't approved with these contents) never reaches the proxy (fail
  *   closed). Both resolvers get the rule id: a shared rule's files resolve in its own workspace folder.
  *   Timings (§13.2) need nothing here.
+ * - CONTRACTS §14 (v0.8.0): forwards the TLS passthrough hosts (§14.2) and the client certificates (§14.3, loaded by
+ *   src/ui/clientCerts.ts — key material is held here only to re-apply it after a restart, never logged or emitted),
+ *   both also as constructor options so they apply from the first connection; `applyUpstreamSettings` (§14.6) uses
+ *   VS Code's `http.proxy` (user settings, injected `vscodeHttpProxy`) when `flutterIntercept.upstreamProxy` is empty,
+ *   with `http.noProxy` hosts going direct (`noProxy` on the upstream config) and `upstreamProxySource` for Status.
  */
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
-import type { Exchange, InterceptProxyOptions, ReplayEntry, ReplayOptions, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
+import type { ClientCertificate, Exchange, InterceptProxyOptions, ReplayEntry, ReplayOptions, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 import type { SessionWarning } from './ui/protocol';
 import type { VmHostDeps } from './vm/types';
@@ -73,6 +78,9 @@ export interface ProxyLike {
   setUpstreamProxy?(cfg: UpstreamProxy | undefined): void;
   /** The upstream proxy in use (`http://host:port`, never credentials). */
   readonly upstreamProxy?: { url: string; ignoreCertErrors: boolean };
+  // CONTRACTS §14.2 / §14.3. Optional: older proxy builds lack them (the host then logs and shows a problem).
+  setTlsPassthrough?(hosts: string[]): void;
+  setClientCertificates?(certs: ClientCertificate[]): void;
 }
 
 /** REVIEW-6 #1: `host:port` of an upstream proxy URL — never user info, path or query. */
@@ -86,8 +94,134 @@ export function upstreamDisplay(url: string | undefined): string | undefined {
   }
 }
 
-/** CONTRACTS §12.6: `InterceptProxyOptions.upstreamProxy`. */
-export type UpstreamProxy = NonNullable<InterceptProxyOptions['upstreamProxy']>;
+/**
+ * CONTRACTS §12.6: `InterceptProxyOptions.upstreamProxy`, plus (§14.6) `noProxy`: hosts that go direct instead of
+ * through the upstream proxy (from VS Code's `http.noProxy`; see `normalizeNoProxy` for the accepted forms).
+ */
+export type UpstreamProxy = NonNullable<InterceptProxyOptions['upstreamProxy']> & { noProxy?: string[] };
+
+/** CONTRACTS §14.6: where the upstream proxy came from (`Status.upstreamProxySource`). */
+export type UpstreamSource = 'flutterIntercept' | 'http.proxy';
+
+/** CONTRACTS §14.6: VS Code's own proxy settings, from **user** settings only (never a workspace's). */
+export interface VscodeHttpProxy {
+  /** `http.proxy` (`http://[user:pass@]host:port`); empty / undefined = none. */
+  url?: string;
+  /** `http.noProxy`: hosts that go direct. */
+  noProxy?: string[];
+}
+
+/** CONTRACTS §14.3: one configured client certificate as Status shows it (the host pattern; never paths or keys). */
+export interface ClientCertificateStatus {
+  host: string;
+  problem?: string;
+}
+
+/** Bounds for the §14.2 / §14.6 host lists. */
+export const MAX_HOST_PATTERNS = 200;
+const HOST_GLOB = /^(\*\.)?[a-z0-9_*]([a-z0-9_*.-]{0,251}[a-z0-9_*])?$/;
+const HOST_PORT = /^(?<host>[^:]+)(?::(?<port>\d{1,5}))?$/;
+
+/**
+ * CONTRACTS §14.2: the `flutterIntercept.tlsPassthrough` setting → lower-case hostname globs (`api.example.com`,
+ * `*.bank.example`, `*`), deduplicated, at most MAX_HOST_PATTERNS. Anything else (ports, schemes, paths, spaces) is
+ * reported in `problems` and left out.
+ */
+export function normalizeTlsPassthrough(input: unknown): { hosts: string[]; problems: string[] } {
+  const hosts: string[] = [];
+  const problems: string[] = [];
+  if (input === undefined || input === null) return { hosts, problems };
+  if (!Array.isArray(input)) return { hosts, problems: ['flutterIntercept.tlsPassthrough must be a list of host names'] };
+  for (const raw of input) {
+    if (typeof raw !== 'string') {
+      problems.push('flutterIntercept.tlsPassthrough: entries must be strings');
+      continue;
+    }
+    const h = raw.trim().toLowerCase().replace(/\.+$/, '');
+    if (!h) continue;
+    if (h.length > 253 || !HOST_GLOB.test(h) || h.includes('..')) {
+      problems.push(`flutterIntercept.tlsPassthrough: "${raw.replace(/[\r\n]+/g, ' ').slice(0, 100)}" is not a host name glob (e.g. api.example.com or *.example.com)`);
+      continue;
+    }
+    if (!hosts.includes(h)) hosts.push(h);
+    if (hosts.length >= MAX_HOST_PATTERNS) {
+      problems.push(`flutterIntercept.tlsPassthrough: only the first ${MAX_HOST_PATTERNS} hosts are used`);
+      break;
+    }
+  }
+  return { hosts, problems };
+}
+
+/**
+ * CONTRACTS §14.6: VS Code's `http.noProxy` → the upstream proxy's `noProxy` list: lower-case `host`, `.suffix` /
+ * `*.suffix` (the domain and its subdomains), `*` (everything), IP literals, each optionally `:port`; at most
+ * MAX_HOST_PATTERNS. CIDR ranges and other forms are dropped (they go through the proxy).
+ */
+export function normalizeNoProxy(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  const out: string[] = [];
+  for (const raw of input) {
+    if (typeof raw !== 'string') continue;
+    for (const part of raw.split(/[\s,]+/)) {
+      let p = part.trim().toLowerCase();
+      if (!p) continue;
+      if (p === '*') {
+        if (!out.includes(p)) out.push(p);
+        continue;
+      }
+      const v6 = /^\[([0-9a-f:.]+)\](?::(\d{1,5}))?$/.exec(p);
+      if (v6) {
+        p = v6[2] ? `[${v6[1]}]:${v6[2]}` : `[${v6[1]}]`;
+      } else {
+        const m = HOST_PORT.exec(p);
+        if (!m?.groups) continue;
+        let host = m.groups.host;
+        if (host.startsWith('.')) host = `*${host}`;
+        if (host.length > 253 || !HOST_GLOB.test(host) || host.includes('..') || host.slice(1).includes('*')) continue;
+        const port = m.groups.port;
+        if (port !== undefined && (Number(port) < 1 || Number(port) > 65535)) continue;
+        p = port ? `${host}:${port}` : host;
+      }
+      if (!out.includes(p)) out.push(p);
+      if (out.length >= MAX_HOST_PATTERNS) return out;
+    }
+  }
+  return out;
+}
+
+/**
+ * CONTRACTS §14.6: the upstream proxy to use. Ours (`flutterIntercept.upstreamProxy`, user settings) wins; when it
+ * is empty, VS Code's `http.proxy` (user settings) is used with its `http.noProxy` hosts going direct.
+ * `http.proxyStrictSSL: false` does NOT turn certificate checks off: only `ignoreCertErrors`
+ * (`flutterIntercept.upstreamProxyIgnoreCertErrors`) does. Throws (readable) when OUR setting is invalid; a VS Code
+ * proxy that can't be chained (https://, socks://, malformed) gives `problem` and no proxy (direct).
+ */
+export function resolveUpstreamProxy(
+  ours: { url?: string; ignoreCertErrors?: boolean },
+  vscodeProxy: VscodeHttpProxy | undefined,
+): { cfg?: UpstreamProxy; source?: UpstreamSource; problem?: string } {
+  const own = typeof ours.url === 'string' ? ours.url.trim() : '';
+  const ignore = ours.ignoreCertErrors === true;
+  if (own) return { cfg: checkUpstreamProxy({ url: own, ...(ignore ? { ignoreCertErrors: true } : {}) }), source: 'flutterIntercept' };
+  const vs = typeof vscodeProxy?.url === 'string' ? vscodeProxy.url.trim() : '';
+  if (!vs) return {};
+  let scheme = '';
+  try {
+    scheme = new URL(vs).protocol;
+  } catch {
+    // reported below
+  }
+  if (scheme && scheme !== 'http:') {
+    return { problem: `VS Code's http.proxy is a ${scheme.replace(/:$/, '')}:// proxy, which Flutter Intercept can't chain to: the app's traffic goes direct. Set flutterIntercept.upstreamProxy to an http:// proxy to use one.` };
+  }
+  try {
+    const noProxy = normalizeNoProxy(vscodeProxy?.noProxy);
+    const cfg = checkUpstreamProxy({ url: vs, ...(ignore ? { ignoreCertErrors: true } : {}), ...(noProxy.length ? { noProxy } : {}) });
+    return { cfg, source: 'http.proxy' };
+  } catch (e) {
+    return { problem: `VS Code's http.proxy can't be used by Flutter Intercept (${(e as Error).message.replace(/^upstreamProxy\.url/, 'it')}): the app's traffic goes direct.` };
+  }
+}
 
 /** CONTRACTS §12.4: what is being replayed (`Status.replay` + the recording id). */
 export interface ReplayState {
@@ -101,7 +235,7 @@ export interface ReplayState {
 export function checkUpstreamProxy(cfg: unknown): UpstreamProxy | undefined {
   if (cfg === undefined || cfg === null) return undefined;
   if (typeof cfg !== 'object' || Array.isArray(cfg)) throw new Error('upstreamProxy must be an object {url, ignoreCertErrors?}');
-  const { url, ignoreCertErrors } = cfg as Record<string, unknown>;
+  const { url, ignoreCertErrors, noProxy } = cfg as Record<string, unknown>;
   if (typeof url !== 'string' || !url.trim()) throw new Error('upstreamProxy.url must be a URL such as http://127.0.0.1:8888');
   let u: URL;
   try {
@@ -112,7 +246,9 @@ export function checkUpstreamProxy(cfg: unknown): UpstreamProxy | undefined {
   if (u.protocol !== 'http:') throw new Error('upstreamProxy.url must be an http:// proxy URL (HTTPS goes through it with CONNECT)');
   if ((u.pathname && u.pathname !== '/') || u.search || u.hash) throw new Error('upstreamProxy.url must be just http://host:port');
   if (ignoreCertErrors !== undefined && typeof ignoreCertErrors !== 'boolean') throw new Error('upstreamProxy.ignoreCertErrors must be a boolean');
-  return { url: url.trim(), ...(ignoreCertErrors === true ? { ignoreCertErrors: true } : {}) };
+  if (noProxy !== undefined && !Array.isArray(noProxy)) throw new Error('upstreamProxy.noProxy must be a list of hosts');
+  const bypass = normalizeNoProxy(noProxy);
+  return { url: url.trim(), ...(ignoreCertErrors === true ? { ignoreCertErrors: true } : {}), ...(bypass.length ? { noProxy: bypass } : {}) };
 }
 
 /** Does this rule (or one of its sequence steps) take its mock body from a file? */
@@ -143,7 +279,7 @@ export function filesOf(rule: Rule): string[] {
 /** CONTRACTS §11.4: bounds for what the VM layer may put into Status.warnings. */
 export const MAX_WARNINGS_PER_SESSION = 50;
 const MAX_WARNING_TEXT = 500;
-const WARNING_KINDS = new Set<SessionWarning['kind']>(['background-isolate', 'native-client', 'web', 'other']);
+const WARNING_KINDS = new Set<SessionWarning['kind']>(['background-isolate', 'native-client', 'web', 'bypass', 'other']);
 
 const NO_PROFILE: NetworkProfile = { kind: 'none' };
 
@@ -193,13 +329,19 @@ export interface InterceptProxyHostOptions {
   onLanTokenRotatedWhileLive?: () => void;
   /** CONTRACTS §9.2 `rewriteLocalhost` (setting `flutterIntercept.rewriteLocalhost`), read at each proxy start. */
   rewriteLocalhost?: () => boolean;
+  /**
+   * CONTRACTS §14.6: VS Code's `http.proxy` / `http.noProxy` from USER settings only (`inspect().globalValue`), read by
+   * `applyUpstreamSettings`. Absent = VS Code's proxy is never used.
+   */
+  vscodeHttpProxy?: () => VscodeHttpProxy | undefined;
 }
 
 /**
  * Events: 'exchange' (Exchange), 'removed' (string[]), 'state' (running: boolean),
  * 'lan' ({host, port} | undefined — never the token), 'rule-spent' (ruleId, reason), 'rule-hit' (ruleId, used),
  * 'warnings' (SessionWarning[], the full current list — after every change), 'replay' (ReplayState | undefined),
- * 'upstream' ({display, ignoreCertErrors} | undefined).
+ * 'upstream' ({display, ignoreCertErrors} | undefined), 'tlsPassthrough' (string[]), 'clientCertificates'
+ * (ClientCertificateStatus[] — never key material).
  * Rules, the network profile and the app package names are kept here so they survive restarts and
  * apply from the first request.
  */
@@ -232,6 +374,14 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private bodyWarnings: SessionWarning[] = [];
   private replayState?: ReplayState & { list: ReplayEntry[]; opts: ReplayOptions };
   private upstream?: UpstreamProxy;
+  private upstreamSource?: UpstreamSource;
+  // CONTRACTS §14
+  private tlsHosts: string[] = [];
+  /** Loaded certificates (key material: re-applied after a restart, never logged or emitted). */
+  private clientCerts: ClientCertificate[] = [];
+  private clientCertStatus: ClientCertificateStatus[] = [];
+  private tlsUnsupportedLogged = false;
+  private certsUnsupportedLogged = false;
 
   constructor(private readonly opts: InterceptProxyHostOptions) {
     super();
@@ -278,6 +428,8 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         ...(ca ? { ca } : {}),
         ...(rewrite !== undefined ? { rewriteLocalhost: rewrite } : {}),
         ...(this.upstream ? { upstreamProxy: this.upstream } : {}),
+        ...(this.tlsHosts.length ? { tlsPassthrough: [...this.tlsHosts] } : {}),
+        ...(this.clientCerts.length ? { clientCertificates: [...this.clientCerts] } : {}),
       });
       try {
         await proxy.start();
@@ -287,7 +439,21 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         throw e;
       }
       proxy.setRules(this.proxyRules);
-      if (this.upstream) proxy.setUpstreamProxy?.(this.upstream);
+      if (this.upstream) {
+        try {
+          proxy.setUpstreamProxy?.(this.upstream);
+        } catch (e) {
+          // e.g. it points at this proxy: report it, go direct, never fail the start over it
+          this.opts.log?.(`upstream proxy not used: ${e instanceof Error ? e.message : String(e)}`);
+          try {
+            proxy.setUpstreamProxy?.(undefined);
+          } catch {
+            // nothing more to do
+          }
+        }
+      }
+      if (this.tlsHosts.length) this.applyTlsPassthrough(proxy);
+      if (this.clientCerts.length) this.applyClientCertificates(proxy);
       this.applyReplay(proxy);
       if (this.profile.kind !== 'none') this.applyProfile(proxy); // a new proxy starts with none
       if (this.appPackages.length) proxy.setAppPackages?.(this.appPackages);
@@ -571,11 +737,22 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     this.proxy?.resetSequences?.();
   }
 
-  /** CONTRACTS §12.6: chain pass-through traffic to another proxy (undefined = direct). Kept across restarts. */
-  setUpstreamProxy(cfg: UpstreamProxy | undefined): void {
+  /**
+   * CONTRACTS §12.6: chain pass-through traffic to another proxy (undefined = direct). Kept across restarts.
+   * `source` (§14.6, default `flutterIntercept`) is what Status shows as `upstreamProxySource`.
+   */
+  setUpstreamProxy(cfg: UpstreamProxy | undefined, source: UpstreamSource = 'flutterIntercept'): void {
     const next = checkUpstreamProxy(cfg);
-    if (JSON.stringify(next) === JSON.stringify(this.upstream)) return;
+    const nextSource = next ? source : undefined;
+    if (JSON.stringify(next) === JSON.stringify(this.upstream)) {
+      if (nextSource !== this.upstreamSource) {
+        this.upstreamSource = nextSource;
+        this.emit('upstream', this.upstreamProxyInfo);
+      }
+      return;
+    }
     this.upstream = next;
+    this.upstreamSource = nextSource;
     const proxy = this.proxy;
     if (proxy) {
       if (proxy.setUpstreamProxy) proxy.setUpstreamProxy(next);
@@ -586,6 +763,107 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
 
   get upstreamProxy(): UpstreamProxy | undefined {
     return this.upstream;
+  }
+
+  /**
+   * CONTRACTS §14.6: applies the user's upstream settings — ours if set, else VS Code's `http.proxy` (via the injected
+   * `vscodeHttpProxy`, user settings only) with `http.noProxy` hosts direct. Throws (readable) when OUR setting is
+   * invalid (nothing changes then); a VS Code proxy that can't be used is returned as `problem` (traffic goes direct).
+   * Call it at activation and whenever `flutterIntercept.upstreamProxy*`, `http.proxy` or `http.noProxy` change.
+   */
+  applyUpstreamSettings(ours: { url?: string; ignoreCertErrors?: boolean }): { source?: UpstreamSource; problem?: string } {
+    let vs: VscodeHttpProxy | undefined;
+    try {
+      vs = this.opts.vscodeHttpProxy?.();
+    } catch {
+      vs = undefined;
+    }
+    const r = resolveUpstreamProxy(ours, vs);
+    this.setUpstreamProxy(r.cfg, r.source);
+    if (r.problem) this.opts.log?.(r.problem);
+    return { ...(r.source ? { source: r.source } : {}), ...(r.problem ? { problem: r.problem } : {}) };
+  }
+
+  /** CONTRACTS §14.6: `Status.upstreamProxySource` (undefined when traffic goes direct). */
+  get upstreamProxySource(): UpstreamSource | undefined {
+    return this.upstream ? (this.upstreamSource ?? 'flutterIntercept') : undefined;
+  }
+
+  // ------------------------------------------------------------------ CONTRACTS §14.2 / §14.3
+
+  /**
+   * CONTRACTS §14.2: hosts whose TLS is passed through undecrypted (normalised with `normalizeTlsPassthrough`; the
+   * problems are returned and logged). Kept across restarts. Emits 'tlsPassthrough' when the list changed.
+   */
+  setTlsPassthrough(input: unknown): { hosts: string[]; problems: string[] } {
+    const r = normalizeTlsPassthrough(input);
+    for (const p of r.problems) this.opts.log?.(p);
+    if (JSON.stringify(r.hosts) === JSON.stringify(this.tlsHosts)) return r;
+    this.tlsHosts = r.hosts;
+    if (this.proxy) this.applyTlsPassthrough(this.proxy);
+    this.emit('tlsPassthrough', this.tlsPassthrough);
+    return r;
+  }
+
+  /** `Status.tlsPassthrough`: the hosts in use (a copy). */
+  get tlsPassthrough(): string[] {
+    return [...this.tlsHosts];
+  }
+
+  private applyTlsPassthrough(proxy: ProxyLike): void {
+    if (proxy.setTlsPassthrough) {
+      try {
+        proxy.setTlsPassthrough([...this.tlsHosts]);
+      } catch (e) {
+        this.opts.log?.(`TLS passthrough not applied: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    } else if (this.tlsHosts.length && !this.tlsUnsupportedLogged) {
+      this.tlsUnsupportedLogged = true;
+      this.opts.log?.('this proxy build cannot pass TLS through: flutterIntercept.tlsPassthrough is ignored');
+    }
+  }
+
+  /**
+   * CONTRACTS §14.3: the client certificates to present on upstream TLS (from src/ui/clientCerts.ts
+   * `loadClientCertificates`) and the per-entry status Status shows (`status`; default: every cert's host, no problem).
+   * Kept across restarts; key material is never logged or emitted. Emits 'clientCertificates' with the status.
+   */
+  setClientCertificates(certs: ClientCertificate[], status?: ClientCertificateStatus[]): void {
+    this.clientCerts = (Array.isArray(certs) ? certs : []).filter((c) => c && typeof c.host === 'string' && c.host.length > 0);
+    const st = (status ?? this.clientCerts.map((c): ClientCertificateStatus => ({ host: c.host })))
+      .filter((s) => s && typeof s.host === 'string')
+      .slice(0, MAX_HOST_PATTERNS)
+      .map((s) => ({ host: s.host.slice(0, 300), ...(s.problem ? { problem: String(s.problem).replace(/[\r\n]+/g, ' ').slice(0, MAX_WARNING_TEXT) } : {}) }));
+    if (this.proxy) this.applyClientCertificates(this.proxy);
+    else if (this.clientCerts.length) this.opts.log?.(`${this.clientCerts.length} client certificate(s) apply when the proxy starts`);
+    const before = JSON.stringify(this.clientCertStatus);
+    this.clientCertStatus = this.withSupportProblem(st);
+    if (JSON.stringify(this.clientCertStatus) !== before) this.emit('clientCertificates', this.clientCertificateStatus);
+  }
+
+  /** `Status.clientCertificates`: host pattern + problem per configured entry (a copy; never paths or key material). */
+  get clientCertificateStatus(): ClientCertificateStatus[] {
+    return this.clientCertStatus.map((s) => ({ ...s }));
+  }
+
+  /** A running proxy build without mTLS support: every loaded certificate gets that problem. */
+  private withSupportProblem(st: ClientCertificateStatus[]): ClientCertificateStatus[] {
+    if (!this.proxy || this.proxy.setClientCertificates) return st;
+    return st.map((s) => (s.problem ? s : { ...s, problem: 'this proxy build cannot present client certificates' }));
+  }
+
+  private applyClientCertificates(proxy: ProxyLike): void {
+    if (proxy.setClientCertificates) {
+      try {
+        proxy.setClientCertificates([...this.clientCerts]);
+      } catch (e) {
+        // never include the certificate objects in the message
+        this.opts.log?.(`client certificates not applied: ${e instanceof Error ? e.message.slice(0, 200) : 'error'}`);
+      }
+    } else if (this.clientCerts.length && !this.certsUnsupportedLogged) {
+      this.certsUnsupportedLogged = true;
+      this.opts.log?.('this proxy build cannot present client certificates: flutterIntercept.clientCertificates is ignored');
+    }
   }
 
   /**

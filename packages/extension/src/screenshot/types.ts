@@ -18,7 +18,7 @@ export interface Screenshot {
   height?: number;
   takenAt: number;
   /** How it was taken. */
-  method: 'vm-service' | 'adb' | 'simctl' | 'screencapture';
+  method: 'vm-service' | 'adb' | 'simctl' | 'screencapture' | 'devtools' | 'idevicescreenshot' | 'devicectl';
 }
 
 export interface ScreenshotDeps {

@@ -27,7 +27,8 @@ export function requestBodyHash(body: Body | undefined): string | undefined {
 function normalizeUrl(url: string): URL | undefined {
   try {
     const u = new URL(url);
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return undefined;
+    // ws: / wss: = recorded WebSocket connections (CONTRACTS §14.5), looked up by the upgrade's ws(s):// URL.
+    if (u.protocol !== 'http:' && u.protocol !== 'https:' && u.protocol !== 'ws:' && u.protocol !== 'wss:') return undefined;
     u.hash = '';
     return u;
   } catch {
@@ -43,7 +44,11 @@ function validEntry(e: unknown): e is ReplayEntry {
   const x = e as ReplayEntry;
   if (typeof x.method !== 'string' || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(x.method)) return false;
   if (typeof x.url !== 'string' || !normalizeUrl(x.url)) return false;
-  if (!Number.isInteger(x.status) || x.status < 200 || x.status > 599) return false;
+  const ws = /^wss?:/i.test(x.url);
+  if (x.kind !== undefined && x.kind !== 'websocket' && x.kind !== 'sse') return false;
+  if ((x.kind === 'websocket') !== ws) return false; // ws(s):// URLs are WebSocket recordings and nothing else
+  if (x.frames !== undefined && !Array.isArray(x.frames)) return false;
+  if (x.kind === 'websocket' ? x.status !== 101 && x.status !== undefined : !Number.isInteger(x.status) || x.status < 200 || x.status > 599) return false;
   if (x.headers !== undefined && (typeof x.headers !== 'object' || x.headers === null)) return false;
   if (x.body !== undefined && (typeof x.body !== 'object' || x.body === null || typeof x.body.text !== 'string')) return false;
   if (x.requestBodyHash !== undefined && typeof x.requestBodyHash !== 'string') return false;
@@ -108,6 +113,14 @@ export class ReplayStore {
       return { entry: candidates[index], tier, index, of: candidates.length };
     }
     return undefined;
+  }
+
+  /** CONTRACTS §14.5: does an exact (or template) group for this request hold a recorded event stream? */
+  hasStream(method: string, url: string): boolean {
+    const u = normalizeUrl(url);
+    if (!u) return false;
+    const groups = [this.exact.get(exactKey(method, u)), this.matchTemplates ? this.template.get(templateKey(method, u)) : undefined];
+    return groups.some((g) => g?.some((e) => e.kind === 'sse'));
   }
 
   /** Start every key from its first response again. */

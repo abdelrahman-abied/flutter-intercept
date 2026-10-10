@@ -75,8 +75,9 @@ Without it the list starts with Google update traffic on every web launch.
 
 - CanvasKit (`canvaskit.wasm`, ~7 MB) and the Roboto font are app traffic through the proxy on every cold start
   (MITM'd, recorded). No measurable start-up penalty in these runs (≈ 20 s either way, dominated by DDC).
-- No DIRECT fallback: Chrome's `--proxy-server` has none, and the fallback list syntax needs a comma (see 6).
-  If the proxy stops while a web session runs, the page loses network until relaunch. The extension only
+- No DIRECT fallback (v0.5.0): Chrome's `--proxy-server` has none, and the fallback list syntax needs a comma (see 6).
+  If the proxy stops while a web session runs, the page loses network until relaunch. **Fixed in v0.8.0** with a
+  loopback PAC server (section "v0.8.0" below). The extension only
   restarts the proxy when no intercepted session is live, so web sessions must count as intercepted sessions
   (they do: `flutterInterceptOriginalProgram` is set).
 - `--release` web runs are skipped like every release launch (consistency; nothing is baked into a web build,
@@ -144,3 +145,132 @@ completed 200 GET     https://en.wikipedia.org/w/api.php?action=query&meta=sitei
 
 - §4b: add `flutterInterceptWeb` (true on web sessions) and `flutterInterceptWebFlags` (the toolArgs we added).
 - §11.3: browser-internal request tagging (see "Noise").
+
+---
+
+# v0.8.0 — DIRECT fallback, web-server notice, web screenshots (CONTRACTS §14.7)
+
+Agent B, 2026-10-10. Same machine: Flutter 3.47.6, Chrome 154.0.8037.98 (macOS arm64), the real `InterceptProxy`
+(`packages/proxy/dist`) with a mockttp CA. Throwaway harnesses (session scratchpad, not in the repo): a proxy child, a
+temp-profile headless Chrome driven over CDP (navigate `https://example.com`, `fetch` jsonplaceholder, loopback fetches,
+stop the proxy, fetch again, restart the proxy on the same port), and `flutter run -d chrome` on `samples/web_app`.
+
+## Verdict: GO with a PAC URL served by the extension on loopback
+
+```
+--web-browser-flag=--proxy-pac-url=http://127.0.0.1:<pacPort>/flutter-intercept-<proxyPort>.pac
+--web-browser-flag=--ignore-certificate-errors-spki-list=<pin>          (unchanged)
+--web-browser-debug-port=<free loopback port>                           (new: web screenshots)
+```
+
+The script: loopback (`localhost`, `*.localhost`, `127.*`, `::1`) → `DIRECT`; everything else →
+`PROXY 127.0.0.1:<proxyPort>; DIRECT`.
+
+| PAC source | Chrome honours it | Proxy up | Proxy stopped | Verdict |
+|---|---|---|---|---|
+| `--proxy-server=http://127.0.0.1:P` (v0.5.0, control) | — | all intercepted | `ERR_PROXY_CONNECTION_FAILED`, every fetch fails | no fallback |
+| `--proxy-pac-url=data:application/x-ns-proxy-autoconfig;base64,…` | **yes** (Chrome direct) | all intercepted | everything works DIRECT | **unusable**: a data URL needs a comma and flutter_tools splits `--web-browser-flag` values on commas (package:args 2.7.0 `splitCommas: true`, `parser.dart:342` `value.split(',')`, no escaping; v0.5.0 run 6) |
+| `--proxy-pac-url=file:///…/proxy.pac` | **no**: nothing reached the proxy, all DIRECT | — | — | Chrome ignores file:// PAC |
+| `--proxy-pac-url=http://127.0.0.1:P/…pac` (the proxy itself) | fetch → mockttp `500 Passthrough loop detected` → Chrome uses DIRECT for everything | nothing intercepted | DIRECT | would need a proxy (agent P) route; and if the proxy is down the PAC fetch fails anyway |
+| **`--proxy-pac-url=http://127.0.0.1:<own port>/…pac`** (separate loopback server) | **yes**, fetched once at start (3 GETs) | all intercepted, loopback not | everything works DIRECT | **shipped** |
+
+Evidence, separate PAC server (CDP harness):
+
+```
+[0.6s] PAC fetched /proxy.pac  (x3)
+[5.3s] proxy up   https://jsonplaceholder.typicode.com/todos/1 -> HTTP 200   (recorded by the proxy, Origin https://example.com)
+[5.3s] loopback   http://127.0.0.1:<lo>/x, http://localhost:<lo>/y -> HTTP 200 (not recorded)
+--- stopping proxy
+[7.5s] proxy DOWN https://jsonplaceholder.typicode.com/todos/2 -> HTTP 200
+[10.3s] navigate https://example.org/ -> ok
+[10.7s] proxy DOWN https://httpbin.org/get -> HTTP 200
+```
+
+Through flutter_tools (`flutter run -d chrome --web-browser-flag=--headless=new --web-browser-flag=--proxy-pac-url=<PacServer URL>
+--web-browser-flag=--ignore-certificate-errors-spki-list=<pin> --web-browser-debug-port=<p>`, the real `PacServer` bundled from
+`src/debug/pacServer.ts`): the URL survives the comma split; launch → `WEB_START` 17.5 s; all 6 results as before
+(`http_todo 200`, `dio_user 200`, `dio_post 201`, `http_post 201`, `dio_profile 200`, `cors_blocked ERR`); the proxy recorded
+CanvasKit, the font, all 9 app requests + 3 preflights with `Origin: http://localhost:<devport>`, no loopback. Then the proxy
+was killed and `R` (hot restart): **the same 6 results** (`http_todo 200 ms=413` …), the proxy (stopped) recorded 0.
+
+### Trade-off measured: Chrome remembers a dead proxy for ~5 minutes
+
+After the proxy comes back on the **same** port, Chrome keeps going DIRECT until its bad-proxy retry expires: probes every
+20 s were not intercepted from 1.4 s to 307 s, intercepted again at 328 s (Chrome's 5-minute proxy retry delay). So a
+proxy crash/restart during a web session means up to ~5 min of **unrecorded** (but working) traffic, instead of v0.5.0's
+broken network. The extension only restarts the proxy on purpose when no intercepted session is live; relaunch the web
+session to be intercepted immediately. If the proxy comes back on another port, the PAC server serves 404 for the old port
+(Chrome's next PAC fetch → DIRECT) — never a stale `PROXY` line for a port someone else might own.
+
+### Rules kept (REVIEW-5)
+- Only the temp-profile browser flutter_tools starts gets the flags; `--user-data-dir` launches stay skipped (#10).
+- The SPKI pin is still only for this install's CA; the PAC changes routing, not trust.
+- The user's own `--proxy-pac-url` / `--proxy-server` / `--no-proxy-server` / `--proxy-auto-detect` still wins (skip).
+- Re-resolve strips exactly the recorded `flutterInterceptWebFlags` (now including the PAC flag and the debug-port flag).
+
+### Implementation
+- `src/debug/pacServer.ts` — `pacScript(port)`, `PacServer` (binds 127.0.0.1:0, `unref`'d, Host must be
+  `127.0.0.1:<pacPort>` else 403, GET/HEAD only, serves `/flutter-intercept-<port>.pac` only while `currentPort()` is that
+  port, else 404; `no-store`). Not served by the proxy: a crash of the proxy must not take the PAC down with it.
+- `rewrite.ts` — `webInterceptFlags(port, pin, {pacUrl, debugPort})`, `isOurPacUrl` (loopback, `.pac`, no comma),
+  `webDebugPortArg`, `webBrowserDebugPortOf(config)`; `RewriteContext.webPacUrl` / `webDebugPort`. No PAC URL → the
+  v0.5.0 `--proxy-server` flag (graceful). The user's own `--web-browser-debug-port` is kept and used.
+- `provider.ts` — for web launches (first pass `needsCa`, or the status-bar device is a web device): PAC URL from
+  `PrepareDeps.webPac` (default: one lazily started `PacServer` per deps object, serving the port `proxyHost.start()` returned
+  while `proxyHost.running`) and a free loopback port (`PrepareDeps.freePort`, default the OS); each bounded to 2 s and
+  falling back (logged) without failing the launch.
+- Edge: same `ChromiumLauncher` flags in flutter_tools (Windows only); not runnable here, code-read only.
+
+## web-server device: one-time notice with the manual flags (never automatic)
+
+`src/debug/webServerNotice.ts` `createWebServerNotice(deps)` is the `PrepareDeps.webServerSkipped` handler. First call:
+information message "<reason> To intercept it anyway, open the app in a separate Chrome started with Flutter Intercept's
+proxy flags (a fresh throwaway profile, never your own)." + button **Copy Chrome Command**. Only on click: start the
+proxy (`deps.proxy()`), create a fresh `flutter-intercept-chrome-*` dir in the OS temp dir, copy e.g.
+
+```
+open -na "Google Chrome" --args --user-data-dir=/var/folders/…/flutter-intercept-chrome-Ab12 \
+  --proxy-server=http://127.0.0.1:<port> --ignore-certificate-errors-spki-list=<pin> --no-first-run --no-default-browser-check
+```
+
+(`google-chrome …` on Linux, `start "" chrome …` on Windows). `--proxy-server` (not the PAC URL) on purpose: that browser is
+the user's and may outlive the extension host. Chrome honours the SPKI pin only with an explicit `--user-data-dir`, so the
+fresh profile is both required and the REVIEW-5 #10 guarantee. Nothing is ever run by us.
+
+## Web screenshots over CDP
+
+flutter_tools starts Chrome with `--remote-debugging-port=<findFreePort()>` unless `--web-browser-debug-port` is given
+(`chrome.dart` `launch`, `web_device.dart:146`); the port is not exposed by DWDS or the daemon. So the provider passes
+`--web-browser-debug-port=<free loopback port>` (recorded and stripped like the browser flags) and
+`webBrowserDebugPortOf(session.configuration)` reads it back (ours or the user's own).
+
+`src/web/screenshot.ts`: `GET http://127.0.0.1:<port>/json/list` (≤ 1 MB, 5 s) → the `page` target on a loopback origin
+(the dev server; else any http(s) page; never devtools:// / chrome://; id `[A-Za-z0-9_-]{1,128}`) → WebSocket rebuilt as
+`ws://127.0.0.1:<port>/devtools/page/<id>` (the advertised `webSocketDebuggerUrl` host is never used; no Origin header, so
+Chrome's `--remote-allow-origins` check does not apply; `maxPayload` ~21 MB) → `Page.captureScreenshot {format: png,
+fromSurface: true}` (15 s) → PNG checked (IHDR, ≤ 16 MB) → `saveScreenshot` (0600, `.dart_tool/flutter_intercept/screenshots/`).
+Measured in the flutter run above: 54 638 bytes, 756×413 (headless window), the sample's text rendered.
+
+## Integration suite (`FI_SUITE=web`), v0.8.0 additions
+A now expects the PAC flag + the debug-port flag; **G** captures a screenshot over CDP from the A–C session; **H** stops the
+proxy mid-session, hot-restarts, expects every call to still work and nothing recorded, then starts the proxy again.
+
+Command: `cd packages/extension && node build.mjs && npm run package && node build.mjs --tests && FI_VSIX=flutter-intercept.vsix FI_SUITE=web node dist-test/runTest.js`
+
+Result (2026-10-10, packaged VSIX, random proxy port): **8/8 passed** (first run).
+
+```
+[suite] ok   FI-W A launch on chrome (flags, all requests recorded, breakpoint) (46744 ms) exchanges=21 breakpoint=hit
+[suite] ok   FI-W B CORS diagnosis (preflights flagged, refused call explained) (0 ms)
+[suite] ok   FI-W C mock answers the preflight + cors rule, after hot restart (9488 ms)
+[suite] ok   FI-W G web screenshot over CDP (33 ms) 756x413 49479 bytes
+[suite] ok   FI-W H DIRECT fallback (proxy stopped mid-session, hot restart) (11939 ms)
+[suite] ok   FI-W D reloaded (our hook before Dart-Code) (21676 ms) web dartCodeRanFirst=false
+[suite] ok   FI-W E flutterIntercept.web.enabled=false (21146 ms)
+[suite] ok   FI-W F web-server skipped with a reason (1 ms)
+[suite] web: 8/8 runs passed
+```
+
+Side note: on a headless hot restart the framework sometimes prints a debug assertion
+(`org-dartlang-sdk:///lib/_engine/engine/window.dart:99:12`) before restarting. It happened in the manual run with the
+proxy stopped. It has nothing to do with networking, and the restarted batch then completed normally.

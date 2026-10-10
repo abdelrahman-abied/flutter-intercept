@@ -151,3 +151,33 @@ Measured failure modes, and what the code does:
 4. The 0.5.0 agent integration check (`suite/agent.ts`, "the background isolates are named") expects
    `background-isolate` warnings for `demo_worker` / `demo_compute`. With `"intercept"` there are none: that
    check should set `flutterIntercept.backgroundIsolates` to `"warn"` first, or expect no warning.
+
+## 0.8.0 follow-up: profile mode and `Isolate.spawnUri` (CONTRACTS §14.7)
+
+Date: 2026-10-10, macOS desktop, `flutter run --profile` of the demo with the v5 entry, a scratch Node client on
+the VM service WebSocket (the `A Dart VM Service … is available at` URI), `scripts/e2e/mitm_proxy.dart --ca`.
+
+**Profile mode: it works, but it can't be made safe → not shipped, warning kept.**
+- In profile mode nothing pauses isolates at start. The VM service accepts `setFlag pause_isolates_on_start true`
+  at runtime (`Success`; it is one of the few flags `setFlag` may change).
+- With the flag set, every new isolate (`Isolate.run` / `compute` / `Isolate.spawn`) stopped at PauseStart, and
+  `invoke {targetId: rootLib.id, selector: 'flutterInterceptInstall'}` **works in AOT** (the function is kept by
+  `@pragma('vm:entry-point')`; the root library of these isolates is the generated entry), answering `Null`. Then
+  `resume`. Held 4–5 ms per isolate. `isolate_todo` / `compute_todo` / `spawn_todo` printed
+  `"overridesInIsolate":false` in the batches before the client connected and `true` in every batch after, and
+  their requests reached the proxy.
+- **Failure mode (measured):** the flag lives in the VM. A second run took DDS resume permissions
+  (`requirePermissionToResume {onPauseStart: true}`, then `readyToResume` per isolate, like the debug-mode
+  installer) and then closed its WebSocket **without** resetting the flag. DDS released nothing later: the next
+  batch's isolates stayed paused for good (`spawn_todo ERR TimeoutException after 0:00:30`, the other two never
+  finished). Any way our client can go away without `setFlag … false` (VS Code killed, the extension host crashing,
+  the socket dropping, the Mac sleeping with a device app still running) leaves the app's future background
+  isolates frozen until it restarts. That breaks the rule "never leave an isolate paused", so profile mode keeps
+  the v0.5.0 warning. (In debug the flag is the tool's own `--start-paused`, and the DAP keeps resuming isolates
+  when our client is gone.)
+
+**`Isolate.spawnUri`: not installable → documented, warning kept.** Flutter doesn't support it (AOT refuses it,
+and Flutter apps can't spawn another program); in plain Dart the spawned program is another isolate group whose
+root library is not our entry. The function doesn't exist there (`NoSuchMethodError`, 0.7.0), expression
+evaluation can't declare the `HttpOverrides` subclass the install needs, and `HttpOverrides.runZoned` only covers
+code run inside its zone, not the isolate's `main`. The installer resumes such isolates at once (0.7.0 behaviour).

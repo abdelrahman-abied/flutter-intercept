@@ -895,19 +895,39 @@ export function isProfileActive(p: NetworkProfile | undefined): boolean {
   return !!p && p.kind !== 'none';
 }
 
+/** Short label: the preset's name, "Offline", or "+300 ms, 800 kbps down / 200 up, 5% fail" (CONTRACTS §14.4 upload). */
 export function profileLabel(p: NetworkProfile | undefined): string {
+  if (p?.kind === 'throttle' && !(p.preset && NETWORK_PRESETS.some((x) => x.id === p.preset))) return describeThrottle(p);
   return describeProfile(p ?? { kind: 'none' });
 }
 
-export interface ThrottleFields { latencyMs: string; kbps: string; dropPct: string }
+/** The numbers behind a profile, presets included: "+400 ms, 400 kbps down / 400 up" (for tooltips). */
+export function profileDetails(p: NetworkProfile | undefined): string {
+  if (p?.kind !== 'throttle') return profileLabel(p);
+  return describeThrottle(p);
+}
+
+/** "+300 ms, 800 kbps", "+300 ms, 800 kbps down / 200 up, 5% fail", "200 kbps up". Mirrors the proxy's describeProfile. */
+export function describeThrottle(v: { latencyMs?: number; kbps?: number; uploadKbps?: number; dropRate?: number }): string {
+  const parts: string[] = [];
+  if (v.latencyMs) parts.push(`+${v.latencyMs} ms`);
+  if (v.kbps && v.uploadKbps) parts.push(`${v.kbps} kbps down / ${v.uploadKbps} up`);
+  else if (v.kbps) parts.push(`${v.kbps} kbps`);
+  else if (v.uploadKbps) parts.push(`${v.uploadKbps} kbps up`);
+  if (v.dropRate) parts.push(`${Math.round(v.dropRate * 100)}% fail`);
+  return parts.join(', ') || 'No throttling';
+}
+
+/** Rule / profile throttle form. `uploadKbps` (CONTRACTS §14.4) is optional: drafts saved before 0.8.0 lack it. */
+export interface ThrottleFields { latencyMs: string; kbps: string; dropPct: string; uploadKbps?: string }
 export interface ThrottleCheck {
   errors: Partial<Record<keyof ThrottleFields | 'all', string>>;
-  value: { latencyMs?: number; kbps?: number; dropRate?: number };
+  value: { latencyMs?: number; kbps?: number; dropRate?: number; uploadKbps?: number };
 }
 
 const isInt = (s: string) => /^\d+$/.test(s.trim());
 
-/** Latency 0–60 000 ms, bandwidth 1–1 000 000 kbps (empty = unlimited), failure 0–100 %. At least one set. */
+/** Latency 0–60 000 ms, download / upload 1–1 000 000 kbps (empty = unlimited), failure 0–100 %. At least one set. */
 export function checkThrottle(f: ThrottleFields): ThrottleCheck {
   const errors: ThrottleCheck['errors'] = {};
   const value: ThrottleCheck['value'] = {};
@@ -921,21 +941,27 @@ export function checkThrottle(f: ThrottleFields): ThrottleCheck {
     if (!isInt(kbps) || +kbps < 1 || +kbps > 1_000_000) errors.kbps = '1–1000000 kbps (empty = unlimited)';
     else value.kbps = +kbps;
   }
+  const up = (f.uploadKbps ?? '').trim();
+  if (up) {
+    if (!isInt(up) || +up < 1 || +up > 1_000_000) errors.uploadKbps = 'Upload: 1–1000000 kbps (empty = unlimited)';
+    else value.uploadKbps = +up;
+  }
   const drop = f.dropPct.trim();
   if (drop) {
     const n = Number(drop);
     if (!/^\d+(\.\d+)?$/.test(drop) || n > 100) errors.dropPct = '0–100 %';
     else if (n > 0) value.dropRate = Math.round(n * 100) / 10_000;
   }
-  if (!Object.keys(errors).length && !Object.keys(value).length) errors.all = 'Set a latency, a bandwidth limit or a failure rate.';
+  if (!Object.keys(errors).length && !Object.keys(value).length) errors.all = 'Set a latency, a bandwidth limit (download or upload) or a failure rate.';
   return { errors, value };
 }
 
-export function throttleFieldsOf(v: { latencyMs?: number; kbps?: number; dropRate?: number } | undefined): ThrottleFields {
+export function throttleFieldsOf(v: { latencyMs?: number; kbps?: number; dropRate?: number; uploadKbps?: number } | undefined): ThrottleFields {
   return {
     latencyMs: v?.latencyMs ? String(v.latencyMs) : '',
     kbps: v?.kbps ? String(v.kbps) : '',
     dropPct: v?.dropRate ? String(Math.round(v.dropRate * 10_000) / 100) : '',
+    ...(v?.uploadKbps ? { uploadKbps: String(v.uploadKbps) } : {}),
   };
 }
 
@@ -1032,7 +1058,7 @@ export function describeAction(a: RuleAction): string {
     case 'mock': return `Mock ${a.status}${a.bodyFile ? ` from ${a.bodyFile}` : ''}${a.delayMs ? ` after ${a.delayMs} ms` : ''}`;
     case 'block': return a.mode === 'reset' ? 'Block (connection reset)' : `Block with ${a.status ?? 403}`;
     case 'breakpoint': return a.phase === 'both' ? 'Break on request + response' : `Break on ${a.phase}`;
-    case 'throttle': return `Throttle (${describeProfile({ kind: 'throttle', latencyMs: a.latencyMs, kbps: a.kbps, dropRate: a.dropRate })})`;
+    case 'throttle': return `Throttle (${describeThrottle(a)})`;
     case 'fault': return `Fault: ${FAULT_LABEL[a.fault]}`;
     case 'mutate': return `Mutate: ${describeMutateOps(a.ops)}`;
     case 'cors': return describeCors(a);
@@ -1283,7 +1309,7 @@ export function ruleToForm(rule?: Rule, now = Date.now()): RuleForm {
 
 export type RuleFormField =
   | 'url' | 'method' | 'mockStatus' | 'mockDelayMs' | 'blockStatus' | 'mockHeaders'
-  | 'latencyMs' | 'kbps' | 'dropPct' | 'throttle' | 'times' | 'expiresIn' | 'mutate' | 'graphqlOperation' | 'cors'
+  | 'latencyMs' | 'kbps' | 'uploadKbps' | 'dropPct' | 'throttle' | 'times' | 'expiresIn' | 'mutate' | 'graphqlOperation' | 'cors'
   | 'mockBodyFile' | 'mapTo' | 'rewrite' | 'sequence' | 'count' | 'scriptCode' | 'scriptFile';
 
 /** Validation of one action's fields (the rule's, or one sequence step's). */
@@ -1329,6 +1355,7 @@ export function validateActionFields(kind: RuleAction['kind'] | StepKind, f: Act
     const t = checkThrottle(f.throttle);
     if (t.errors.latencyMs) errors.latencyMs = t.errors.latencyMs;
     if (t.errors.kbps) errors.kbps = t.errors.kbps;
+    if (t.errors.uploadKbps) errors.uploadKbps = t.errors.uploadKbps;
     if (t.errors.dropPct) errors.dropPct = t.errors.dropPct;
     if (t.errors.all) errors.throttle = t.errors.all;
   } else if (kind === 'mutate') {

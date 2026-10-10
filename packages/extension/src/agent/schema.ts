@@ -50,7 +50,7 @@ export const FIXTURE_STYLES = ['http_mock_adapter', 'mock_client', 'mocktail'] a
 export const JSON_TYPES = ['string', 'number', 'integer', 'boolean', 'null', 'object', 'array'] as const;
 export const MAX_MUTATE_OPS = 20;
 // CONTRACTS §11.5
-export const EXCHANGE_KINDS = ['http', 'websocket', 'sse'] as const;
+export const EXCHANGE_KINDS = ['http', 'websocket', 'sse', 'tunnel'] as const; // tunnel: CONTRACTS §14.2
 export const MAX_FRAMES_PER_CALL = 500;
 // CONTRACTS §12.7
 export const MAX_SEQUENCE_STEPS = 50;
@@ -209,7 +209,10 @@ export const toolSchemas = {
     status: statusFilter.optional(),
     state: z.enum(EXCHANGE_STATES).optional(),
     sinceMs: sinceMs.optional(),
-    kind: z.enum(EXCHANGE_KINDS).optional().describe('"websocket", "sse" (server-sent events) or "http" (everything else).'),
+    kind: z
+      .enum(EXCHANGE_KINDS)
+      .optional()
+      .describe('"websocket", "sse" (server-sent events), "tunnel" (a TLS connection passed through undecrypted for a flutterIntercept.tlsPassthrough host) or "http" (everything else).'),
     graphqlOperation: graphqlOperation.optional().describe('Only GraphQL requests with this operation name (exact, case-sensitive).'),
     includeBrowserInternal,
     // CONTRACTS §13.2
@@ -424,7 +427,7 @@ export const toolSchemas = {
   get_auth_flows: z.strictObject({ sinceMs: sinceMs.optional() }),
   save_recording: z.strictObject({
     name: z.string().trim().min(1).max(100).describe('A name for the recording, e.g. "checkout happy path".'),
-    url: url.optional().describe('Only exchanges whose URL matches this glob. Omit for every finished HTTP request.'),
+    url: url.optional().describe('Only exchanges whose URL matches this glob. Omit for every finished HTTP request and closed WebSocket / SSE stream.'),
     sinceMs: sinceMs.optional(),
     redact: z
       .boolean()
@@ -513,17 +516,17 @@ interface ToolDoc {
 export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   get_status: {
     title: 'Intercept status',
-    model: 'Get Flutter Intercept status: whether the intercepting proxy runs, the running debug sessions (device, program), how many requests are recorded and paused, the agent access level, and warnings about traffic that is NOT intercepted (e.g. requests from a background isolate, native HTTP clients that are only listed read-only). Call this first to see whether an app is running before using the other tools.',
+    model: 'Get Flutter Intercept status: whether the intercepting proxy runs, the running debug sessions (device, program), how many requests are recorded and paused, the agent access level, and warnings about traffic that is NOT intercepted (e.g. requests from a background isolate, native HTTP clients that are only listed read-only, requests that bypass the proxy). Also: upstreamProxy (host:port the traffic is chained through; upstreamProxySource "http.proxy" = VS Code\'s proxy setting), tlsPassthrough (host globs whose HTTPS is passed through undecrypted, listed as kind "tunnel") and clientCertificates ([{host, loaded, problem?}] — mutual-TLS certificates the proxy presents; a problem means it did not load and the server will likely reject the connection). Call this first to see whether an app is running before using the other tools.',
     user: 'Show proxy, session and traffic status.',
   },
   list_requests: {
     title: 'List HTTP requests',
-    model: "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state, start time, kind (\"websocket\", \"sse\", \"http\"), GraphQL operation name, or slowerThanMs (only requests that took longer). Items show kind, the GraphQL operation and captured: \"vm-profile\" for read-only requests of native HTTP clients (no rules apply to them). Returns ids; call get_request for headers and bodies, get_frames for WebSocket messages / SSE events. Secrets are redacted.",
+    model: "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state, start time, kind (\"websocket\", \"sse\", \"http\"), GraphQL operation name, or slowerThanMs (only requests that took longer). Items show kind, the GraphQL operation and captured: \"vm-profile\" for read-only requests of native HTTP clients (no rules apply to them); kind \"tunnel\" items are TLS connections to a flutterIntercept.tlsPassthrough host, passed through undecrypted (notDecrypted: true, bytesSent / bytesReceived, no status, headers or bodies). Returns ids; call get_request for headers and bodies, get_frames for WebSocket messages / SSE events. Secrets are redacted.",
     user: 'List recorded HTTP requests.',
   },
   get_request: {
     title: 'Get HTTP request details',
-    model: 'Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), error, and timings (ms per phase: requestMs = receiving the app\'s request, pausedMs = held at breakpoints, delayMs = added by a mock delay / throttle, dnsMs / connectMs / tlsMs on a new upstream connection or reused: true, sendMs, waitMs = time to first byte from the server, receiveMs = downloading the response; a missing phase did not happen or is unknown). scriptLog holds the lines a user\'s script rule logged (redacted). Use after list_requests or wait_for_request. Pass snippet ("curl", "dart_http" or "dio") to also get the request as runnable code (redacted values stay "[redacted]"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: "vm-profile" (read-only, from a native HTTP client).',
+    model: 'Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), error, and timings (ms per phase: requestMs = receiving the app\'s request, pausedMs = held at breakpoints, delayMs = added by a mock delay / throttle, dnsMs / connectMs / tlsMs on a new upstream connection or reused: true, sendMs, waitMs = time to first byte from the server, receiveMs = downloading the response; a missing phase did not happen or is unknown). scriptLog holds the lines a user\'s script rule logged (redacted). Use after list_requests or wait_for_request. Pass snippet ("curl", "dart_http" or "dio") to also get the request as runnable code (redacted values stay "[redacted]"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: "vm-profile" (read-only, from a native HTTP client). A tunnel (kind "tunnel") has no headers or bodies: tunnel {notDecrypted: why, bytesSent, bytesReceived} explains that the host is passed through without decryption (usually because the app pins its certificate) — remove it from flutterIntercept.tlsPassthrough to inspect it. clientCertificate is the host pattern of the mutual-TLS client certificate the proxy presented upstream. multipart/form-data bodies are shown parsed: secret fields "[redacted]", file parts "[file <name>, N bytes]".',
     user: 'Show one request with headers and bodies.',
   },
   wait_for_request: {
@@ -676,12 +679,12 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   save_recording: {
     title: 'Save a traffic recording',
-    model: 'Save the finished HTTP exchanges (optionally only those matching url / since sinceMs; WebSocket, SSE and read-only native-client traffic is not recorded) as a named recording under the project\'s .dart_tool/flutter_intercept/recordings/. Secrets are saved as "[redacted]" unless you pass redact: false. Use recordings to replay a backend state offline (replay_recording) or to compare traffic before and after a change (diff_recordings). Returns {id, name, exchanges}.',
+    model: 'Save the finished HTTP exchanges and closed WebSocket / SSE streams with their messages (optionally only those matching url / since sinceMs; open connections, TLS tunnels and read-only native-client traffic are not recorded) as a named recording under the project\'s .dart_tool/flutter_intercept/recordings/. Secrets are saved as "[redacted]" unless you pass redact: false. Use recordings to replay a backend state offline (replay_recording: WebSocket / SSE streams replay as a scripted server with the recorded timing) or to compare traffic before and after a change (diff_recordings). Returns {id, name, exchanges, streams?, frames?} (streams = WebSocket / SSE exchanges among them).',
     user: 'Save the recorded traffic as a recording.',
   },
   replay_recording: {
     title: 'Replay a recording',
-    model: 'Answer the app\'s requests from a saved recording instead of the real server: the same method + URL (and request body) gets the recorded response; several recorded responses for one request are served in order; requests whose path differs only in ids (/users/42 vs /users/7) match by path template. Rules still win. fallback decides what unmatched requests do: "passthrough" (real server, default) or "fail" (like offline — a fully offline demo). Replayed exchanges carry simulated: "Replayed from <name>". Call it without id to stop replaying (do this when done); get_status / list_recordings show what is being replayed.',
+    model: 'Answer the app\'s requests from a saved recording instead of the real server: the same method + URL (and request body) gets the recorded response; several recorded responses for one request are served in order; requests whose path differs only in ids (/users/42 vs /users/7) match by path template. Rules still win. fallback decides what unmatched requests do: "passthrough" (real server, default) or "fail" (like offline — a fully offline demo). Recorded WebSocket / SSE streams are replayed too: the proxy answers the upgrade / stream itself and sends the recorded server messages with their timing (WebSocket: in step with the app\'s messages). Replayed exchanges carry simulated: "Replayed from <name>". Call it without id to stop replaying (do this when done); get_status / list_recordings show what is being replayed.',
     user: 'Answer requests from a saved recording (or stop replaying).',
   },
   add_sequence: {
@@ -712,7 +715,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   take_screenshot: {
     title: 'Take a screenshot of the app',
-    model: "Take a screenshot of the running Flutter app (the debug session's device; pass sessionId when several apps run) to see what the UI shows after a change or a mocked response. Returns the PNG image plus {path, width, height, takenAt, method, recentRequests}: recentRequests are the (at most 10) requests that started in the 5 s before the screenshot (redacted summaries; read them with get_request). The user confirms every screenshot and can turn the tool off (setting flutterIntercept.agent.screenshots). Supported on Android devices/emulators and iOS simulators (and wherever the Flutter VM service can render one); other devices answer \"not supported\".",
+    model: "Take a screenshot of the running Flutter app (the debug session's device; pass sessionId when several apps run) to see what the UI shows after a change or a mocked response. Returns the PNG image plus {path, width, height, takenAt, method, recentRequests}: recentRequests are the (at most 10) requests that started in the 5 s before the screenshot (redacted summaries; read them with get_request). The user confirms every screenshot and can turn the tool off (setting flutterIntercept.agent.screenshots). Supported on Android devices/emulators, iOS simulators, macOS and Flutter Web in Chrome (and wherever the Flutter VM service can render one); other devices answer \"not supported\".",
     user: 'Take a screenshot of the running app (asks first).',
   },
   add_rewrite: {

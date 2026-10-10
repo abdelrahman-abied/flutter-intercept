@@ -4,10 +4,11 @@ import { FILTER_HINT, parseFilter } from '../filter';
 import type { NetworkProfile } from '../protocol';
 import {
   checkThrottle, customProfile, filterExchanges, hasActiveFilters, hiddenBrowserCount, isProfileActive, pausedCount, PROFILE_CHOICES, profileChoice,
-  profileForChoice, profileLabel, throttleFieldsOf, type ProfileChoice, type ThrottleFields,
+  profileDetails, profileForChoice, profileLabel, throttleFieldsOf, type ProfileChoice, type ThrottleFields,
 } from '../state';
 import { STATUS_CLASSES } from '../util';
-import { authAlerts, INSECURE_TITLE, UPSTREAM_TITLE } from '../scenarios';
+import { authAlerts, INSECURE_TITLE } from '../scenarios';
+import { fromVsCodeProxy, upstreamLabel, upstreamTitle } from '../connection';
 import { EXPORT_FORMATS, EXPORT_LABEL, EXPORT_TITLE, exportScope } from '../exporting';
 import { Button, MenuButton, type MenuItem } from './bits';
 import { Icon } from './Icon';
@@ -129,9 +130,9 @@ export function Toolbar() {
       <NetworkPicker profile={status.networkProfile} onSet={(profile) => post({ type: 'setNetworkProfile', profile })} />
 
       {status.upstreamProxy && (
-        <span class={`upstream-chip${status.upstreamProxyInsecure ? ' insecure' : ''}`}
-          title={status.upstreamProxyInsecure ? `${UPSTREAM_TITLE(status.upstreamProxy)}\n\n${INSECURE_TITLE}` : UPSTREAM_TITLE(status.upstreamProxy)}>
-          <span class="dot" aria-hidden="true" />via upstream proxy {status.upstreamProxy}
+        <span class={`upstream-chip${status.upstreamProxyInsecure ? ' insecure' : ''}${fromVsCodeProxy(status) ? ' vscode-proxy' : ''}`}
+          title={status.upstreamProxyInsecure ? `${upstreamTitle(status)}\n\n${INSECURE_TITLE}` : upstreamTitle(status)}>
+          <span class="dot" aria-hidden="true" />{upstreamLabel(status)}
           {status.upstreamProxyInsecure && <strong class="insecure-text"> · certificate checks OFF</strong>}
         </span>
       )}
@@ -199,7 +200,8 @@ export function NetworkPicker({ profile, onSet }: { profile?: NetworkProfile; on
   return (
     <span class={`net-picker${active ? ' active' : ''}`}>
       <label class="net-label" title={active
-        ? `Network profile: ${profileLabel(profile)}. Applies to everything this app sends through the proxy (mocks and blocks still answer as set).`
+        ? `Network profile: ${profileLabel(profile)}${profileDetails(profile) !== profileLabel(profile) ? ` (${profileDetails(profile)})` : ''}. ` +
+          'Applies to everything this app sends through the proxy (mocks and blocks still answer as set).'
         : 'Simulate a slow, flaky or offline network for this app only'}>
         {active && <span class="dot" aria-hidden="true" />}
         Network
@@ -210,7 +212,8 @@ export function NetworkPicker({ profile, onSet }: { profile?: NetworkProfile; on
             else { setCustom(false); onSet(profileForChoice(v)); }
           }}>
           {PROFILE_CHOICES.map((c) => (
-            <option key={c.value} value={c.value}>
+            <option key={c.value} value={c.value}
+              title={c.value !== 'custom' && c.value !== 'none' && c.value !== 'offline' ? profileDetails(profileForChoice(c.value)) : undefined}>
               {c.value === 'custom' && choice === 'custom' ? `Custom: ${profileLabel(profile)}` : c.label}
             </option>
           ))}
@@ -237,7 +240,7 @@ function CustomProfileForm({ initial, onApply, onCancel }: {
   const field = (key: keyof ThrottleFields, label: string, placeholder: string) => (
     <label class="field small-field">
       <span>{label}</span>
-      <input ref={key === 'latencyMs' ? first : undefined} value={f[key]} inputMode="numeric" placeholder={placeholder}
+      <input ref={key === 'latencyMs' ? first : undefined} value={f[key] ?? ''} inputMode="numeric" placeholder={placeholder}
         aria-invalid={!!check.errors[key]} title={check.errors[key]}
         onInput={(e) => setF({ ...f, [key]: (e.target as HTMLInputElement).value })} />
     </label>
@@ -249,9 +252,11 @@ function CustomProfileForm({ initial, onApply, onCancel }: {
       onKeyDown={(e) => { if (e.key === 'Escape') { e.preventDefault(); onCancel(); } }}>
       <div class="field-row">
         {field('latencyMs', 'Latency (ms)', '0')}
-        {field('kbps', 'Bandwidth (kbps)', 'unlimited')}
+        {field('kbps', 'Download (kbps)', 'unlimited')}
+        {field('uploadKbps', 'Upload (kbps)', 'unlimited')}
         {field('dropPct', 'Fail (%)', '0')}
       </div>
+      <div class="hint">Upload paces request bodies and the messages the app sends; download paces responses. Empty = unlimited.</div>
       {Object.values(check.errors).map((m) => <div key={m} class="msg error">{m}</div>)}
       <div class="re-actions">
         <Button kind="primary" type="submit" disabled={Object.keys(check.errors).length > 0}>Apply</Button>

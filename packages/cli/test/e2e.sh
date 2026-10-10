@@ -7,7 +7,8 @@
 # fixture rules (one mock applied, one map-remote skipped for approval), writes HAR + JUnit, and checks
 #   1. the passing expectations → exit code 0, HAR with entries, JUnit without failures;
 #   2. a failing expectation → exit code 1 (flutter's tests still pass).
-# Physical iOS devices are refused by the CLI (exit code 2); boot simulators yourself and shut them down after.
+# Physical iPhones use the LAN listener (the Mac needs a private LAN address; allow Local Network on the device once);
+# boot simulators yourself and shut them down after.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"

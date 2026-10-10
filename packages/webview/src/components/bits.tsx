@@ -4,6 +4,8 @@ import type { Exchange, ExchangeState } from '../protocol';
 import { isPaused, pauseClock, statusClassOf } from '../util';
 import { gqlLabel, gqlTitle, isNative, NATIVE_READ_ONLY } from '../coverage';
 import { KIND_BADGE, kindTitle } from '../frames';
+import { TUNNEL_LABEL } from '../connection';
+import { Icon } from './Icon';
 
 const STATE_LABEL: Record<ExchangeState, string> = {
   'pending': 'pending',
@@ -46,13 +48,19 @@ export function StateBadge({ ex, gaveUp }: { ex: Pick<Exchange, 'state' | 'error
  * problem marker. `mini` = the list row's compact form.
  */
 export function CoverageBadges({ ex, mini }: {
-  ex: Pick<Exchange, 'kind' | 'frames' | 'framesDropped' | 'state' | 'graphql' | 'captured' | 'cors'>; mini?: boolean;
+  ex: Pick<Exchange, 'kind' | 'frames' | 'framesDropped' | 'state' | 'graphql' | 'captured' | 'cors'> & Partial<Pick<Exchange, 'url' | 'tunnelBytes'>>;
+  mini?: boolean;
 }) {
   const m = mini ? ' mini' : '';
   const gql = gqlLabel(ex);
   return (
     <>
-      {ex.kind && <span class={`badge${m} kind-badge kb-${ex.kind}`} title={kindTitle(ex)}>{KIND_BADGE[ex.kind]}</span>}
+      {ex.kind === 'tunnel' ? (
+        // CONTRACTS §14.2: a lock — the connection was passed through, not decrypted.
+        <span class={`badge${m} kind-badge kb-tunnel`} title={kindTitle(ex)} aria-label={TUNNEL_LABEL}>
+          <Icon name="lock" />{mini ? KIND_BADGE.tunnel : TUNNEL_LABEL}
+        </span>
+      ) : ex.kind && <span class={`badge${m} kind-badge kb-${ex.kind}`} title={kindTitle(ex)}>{KIND_BADGE[ex.kind]}</span>}
       {gql && <span class={`badge${m} gql-badge`} title={gqlTitle(ex)}>{gql}</span>}
       {isNative(ex) && <span class={`badge${m} native-badge`} title={NATIVE_READ_ONLY}>native</span>}
       {ex.cors?.problem && <span class={`badge${m} cors-badge`} title={`CORS: ${ex.cors.problem}`}>CORS</span>}
@@ -60,8 +68,11 @@ export function CoverageBadges({ ex, mini }: {
   );
 }
 
-export function StatusText({ ex }: { ex: Pick<Exchange, 'state' | 'status'> }) {
+export function StatusText({ ex }: { ex: Pick<Exchange, 'state' | 'status'> & Partial<Pick<Exchange, 'kind'>> }) {
   const cls = statusClassOf(ex) ?? 'none';
+  if (ex.kind === 'tunnel' && ex.status === undefined && ex.state !== 'error' && ex.state !== 'blocked' && ex.state !== 'aborted') {
+    return <span class="status sc-none" title="No HTTP status: the TLS connection was tunnelled, not decrypted">{ex.state === 'pending' ? '…' : '—'}</span>;
+  }
   const text = ex.status ?? (ex.state === 'error' || ex.state === 'aborted' || ex.state === 'blocked' ? '✕' : '…');
   return <span class={`status sc-${cls}`}>{text}</span>;
 }
@@ -184,19 +195,20 @@ export function MenuList({ items, onClose, label, at }: {
 }
 
 /** A button that opens a MenuList below it. */
-export function MenuButton({ label, title, items, children, class: cls }: {
-  label: string; title?: string; items: MenuItem[]; children: ComponentChildren; class?: string;
+export function MenuButton({ label, title, items, children, class: cls, disabled }: {
+  label: string; title?: string; items: MenuItem[]; children: ComponentChildren; class?: string; disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const btn = useRef<HTMLButtonElement>(null);
   return (
     <span class={`menu-anchor${cls ? ' ' + cls : ''}`}>
-      <button ref={btn} type="button" class="btn btn-secondary" title={title} aria-haspopup="menu" aria-expanded={open}
+      <button ref={btn} type="button" class="btn btn-secondary" title={title} aria-haspopup="menu" aria-expanded={open && !disabled}
+        disabled={disabled}
         onClick={() => setOpen(!open)}
         onKeyDown={(e) => { if (e.key === 'ArrowDown' && !open) { e.preventDefault(); setOpen(true); } }}>
         {children}
       </button>
-      {open && (
+      {open && !disabled && (
         <MenuList label={label} items={items} onClose={(restore) => { setOpen(false); if (restore) btn.current?.focus(); }} />
       )}
     </span>

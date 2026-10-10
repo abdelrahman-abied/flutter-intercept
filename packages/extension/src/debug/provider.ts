@@ -1,8 +1,10 @@
+import * as net from 'net';
 import * as vscode from 'vscode';
 import { ReverseTracker, withSoftTimeout } from '../adb';
 import { writeEntry } from '../entry/generator';
 import type { LanOpening, ProxyHost } from '../proxyHost';
 import { LanDeps, prepareLan } from './lanPrepare';
+import { PacServer, WebPacSource } from './pacServer';
 import { DebugConfig, isWebDevice, MARKER_KEY, ORIGINAL_PROGRAM_KEY, rewriteDebugConfig, RewriteResult } from './rewrite';
 
 export interface InterceptEvent {
@@ -38,6 +40,61 @@ export interface PrepareDeps {
    * Called on every such launch; the host shows it once. Falls back to `webServerSkipped` when absent.
    */
   webUserProfileSkipped?: (message: string) => void;
+  /**
+   * PAC URLs for Flutter Web sessions (DIRECT fallback, CONTRACTS §14.7). Default: one lazily started loopback
+   * `PacServer` per deps object, serving only the port `proxyHost.start()` last returned while it runs. A source that
+   * resolves undefined (or fails) falls back to `--proxy-server` (no fallback when the proxy stops).
+   */
+  webPac?: WebPacSource;
+  /** Free loopback TCP port for the web browser's remote debugging (web screenshots). Default: the OS picks one. */
+  freePort?: () => Promise<number>;
+}
+
+const defaultPac = new WeakMap<PrepareDeps, { pac: PacServer; port?: number }>();
+
+/** The PAC source for `deps` (see `PrepareDeps.webPac`); the default one records `proxyPort` as the port it may serve. */
+function pacFor(deps: PrepareDeps, proxyPort: number): WebPacSource {
+  if (deps.webPac) return deps.webPac;
+  let entry = defaultPac.get(deps);
+  if (!entry) {
+    const e: { pac: PacServer; port?: number } = {
+      pac: new PacServer({ currentPort: () => (deps.proxyHost.running ? e.port : undefined), log: deps.log }),
+    };
+    entry = e;
+    defaultPac.set(deps, e);
+  }
+  entry.port = proxyPort;
+  return entry.pac;
+}
+
+/** A port the OS reports free on 127.0.0.1 (what flutter_tools does itself when it picks the browser's debug port). */
+export function freeLoopbackPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const port = (srv.address() as net.AddressInfo).port;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+/** PAC URL + browser debug port for a web launch; each falls back to undefined (logged) when it can't be had. */
+async function webExtras(deps: PrepareDeps, proxyPort: number): Promise<{ webPacUrl?: string; webDebugPort?: number }> {
+  const out: { webPacUrl?: string; webDebugPort?: number } = {};
+  try {
+    out.webPacUrl = await withSoftTimeout(pacFor(deps, proxyPort).urlFor(proxyPort), 2000);
+    if (!out.webPacUrl) deps.log('Flutter Web: no PAC URL, using --proxy-server (no DIRECT fallback)');
+  } catch (e) {
+    deps.log(`Flutter Web: PAC server unavailable (${(e as Error)?.message ?? e}), using --proxy-server (no DIRECT fallback)`);
+  }
+  try {
+    out.webDebugPort = await withSoftTimeout((deps.freePort ?? freeLoopbackPort)(), 2000);
+  } catch (e) {
+    deps.log(`Flutter Web: no free debug port (${(e as Error)?.message ?? e}); web screenshots won't find the browser`);
+  }
+  return out;
 }
 
 export function readSettings(folder?: vscode.WorkspaceFolder): { enabled: boolean; port: number; webEnabled: boolean } {
@@ -75,6 +132,7 @@ function rewriteFor(
   selected: string | undefined,
   caCertPem: string,
   lan: { physicalIos?: boolean; lan?: LanOpening } = {},
+  web: { webPacUrl?: string; webDebugPort?: number } = {},
 ): RewriteResult {
   const active = vscode.window.activeTextEditor?.document.uri;
   return rewriteDebugConfig(config, {
@@ -85,6 +143,8 @@ function rewriteFor(
     selectedDeviceId: selected,
     physicalIos: lan.physicalIos,
     lan: lan.lan,
+    webPacUrl: web.webPacUrl,
+    webDebugPort: web.webDebugPort,
     settingsToolArgs: dartSettingsToolArgs(folder),
     captureSource: vscode.workspace.getConfiguration('flutterIntercept', folder?.uri).get<boolean>('captureSource', true),
     folder: folder?.uri.fsPath,
@@ -120,7 +180,10 @@ export async function prepareLaunch(
         const sdkHint = typeof config.flutterSdkPath === 'string' ? config.flutterSdkPath : vscode.workspace.getConfiguration('dart', folder?.uri).get<string>('flutterSdkPath');
         lanInfo = await prepareLan(deps.lan, typeof config.deviceId === 'string' ? config.deviceId : selected, deps.log, sdkHint || undefined);
       }
-      result = rewriteFor(folder, config, settings, port, selected, caCertPem, lanInfo);
+      // Flutter Web (CONTRACTS §14.7): a PAC URL with DIRECT fallback and a known browser debug port.
+      const webLaunch = (result.kind === 'skip' && result.needsCa) || isWebDevice(selected);
+      const web = webLaunch ? await webExtras(deps, port) : {};
+      result = rewriteFor(folder, config, settings, port, selected, caCertPem, lanInfo, web);
       if ((result.kind === 'skip' && result.noLan) || (result.kind === 'restore' && lanInfo.physicalIos && !lanInfo.lan)) {
         const message = `Flutter Intercept: ${lanInfo.problem ?? result.reason}, so this iPhone session runs without interception.`;
         deps.log(message);
@@ -143,7 +206,7 @@ export async function prepareLaunch(
     }
     if (result.kind === 'web') {
       // CONTRACTS §11.3: the program is not rewritten; Chrome/Edge get our proxy + CA pin as browser flags.
-      deps.log(`[${hook}] mode=${result.mode} Flutter Web device=${result.deviceId} program ${result.config[ORIGINAL_PROGRAM_KEY]} (unchanged), browser proxy ${result.proxyHost}:${result.config[MARKER_KEY]}`);
+      deps.log(`[${hook}] mode=${result.mode} Flutter Web device=${result.deviceId} program ${result.config[ORIGINAL_PROGRAM_KEY]} (unchanged), browser proxy ${result.proxyHost}:${result.config[MARKER_KEY]}${result.flags.some((f) => f.includes('--proxy-pac-url=')) ? ' (PAC, DIRECT fallback)' : ''}`);
       deps.events.push({ time: Date.now(), hook, result: 'rewrite', mode: 'web', program: result.config.program, originalProgram: result.config[ORIGINAL_PROGRAM_KEY], dartCodeRanFirst });
       // Replace, not merge: the result may have dropped keys (an earlier entry rewrite, LAN marker).
       for (const k of Object.keys(config)) if (!(k in result.config)) delete config[k];

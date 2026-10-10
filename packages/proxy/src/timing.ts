@@ -44,7 +44,7 @@ export function timedAgent<A extends http.Agent>(agent: A, sink: TimingSink): A 
 }
 
 /** Request options' headers (object, flat array or pairs) include `Upgrade`. */
-function hasUpgradeHeader(h: unknown): boolean {
+export function hasUpgradeHeader(h: unknown): boolean {
   if (Array.isArray(h)) {
     if (h.length && Array.isArray(h[0])) return h.some((p) => String(p?.[0]).toLowerCase() === 'upgrade');
     for (let i = 0; i < h.length; i += 2) if (String(h[i]).toLowerCase() === 'upgrade') return true;
@@ -53,11 +53,14 @@ function hasUpgradeHeader(h: unknown): boolean {
   return !!h && typeof h === 'object' && Object.keys(h).some((k) => k.toLowerCase() === 'upgrade');
 }
 
-function watchRequest(req: http.ClientRequest, sink: TimingSink, upgrade: boolean): void {
+/** Watch one upstream request; `cancel()` stops reporting (a retried request reports from its replacement). */
+export function watchRequest(req: http.ClientRequest, sink: TimingSink, upgrade: boolean): { cancel(): void } {
   const created = now();
   let ready: number | undefined;
   let finished: number | undefined;
+  let cancelled = false;
   const emit = (p: TimingPatch) => {
+    if (cancelled) return;
     try {
       sink(p);
     } catch {
@@ -120,4 +123,9 @@ function watchRequest(req: http.ClientRequest, sink: TimingSink, upgrade: boolea
   });
   // Only on upgrade requests: an 'upgrade' listener changes how Node treats a 101 answer.
   if (upgrade) req.prependOnceListener('upgrade', () => void onHead());
+  return {
+    cancel() {
+      cancelled = true;
+    },
+  };
 }

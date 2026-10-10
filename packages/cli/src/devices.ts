@@ -40,10 +40,11 @@ export function classifyDevice(d: FlutterDevice): DeviceKind {
 }
 
 export type ProxyRoute =
-  | { ok: true; host: string; adbReverse: boolean; note?: string }
+  /** `lan`: the device reaches the proxy's LAN listener (CONTRACTS §7, §14.1); `host` is then decided at run time. */
+  | { ok: true; host: string; adbReverse: boolean; lan?: true; note?: string }
   | { ok: false; reason: string };
 
-/** `PROXY_HOST` for the dart-define and whether an adb reverse is needed (CONTRACTS §2). */
+/** `PROXY_HOST` for the dart-define, whether an adb reverse is needed, or the LAN listener (CONTRACTS §2, §14.1). */
 export function proxyRouteFor(kind: DeviceKind, deviceId: string): ProxyRoute {
   switch (kind) {
     case 'android-emulator':
@@ -54,10 +55,7 @@ export function proxyRouteFor(kind: DeviceKind, deviceId: string): ProxyRoute {
     case 'desktop':
       return { ok: true, host: 'localhost', adbReverse: false };
     case 'ios-physical':
-      return {
-        ok: false,
-        reason: `${deviceId} is a physical iOS device: not supported headless (it would need LAN mode, which is editor-only). Use an iOS simulator, macOS or Android.`,
-      };
+      return { ok: true, host: '', adbReverse: false, lan: true };
     case 'web':
       return { ok: false, reason: `${deviceId} is a web device: Flutter Web runs are not supported headless yet. Use macOS, an iOS simulator or Android.` };
     default:

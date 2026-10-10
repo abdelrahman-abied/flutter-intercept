@@ -15,12 +15,12 @@ import type { AuthAnalysis } from '../analysis/types';
 import type { RecordingService } from '../recordings/types';
 import type { ExportResult, ToOpenApi, ToPostman } from '../export/types';
 import type { Screenshot, ScreenshotTarget } from '../screenshot/types';
-import { checkMapTarget, expireTokenRule, fixtureApi, isRecordable, readOnlyReason, sanitizeSendHeaders, validateEdit, validateRule } from '../ui/controller';
+import { checkMapTarget, expireTokenRule, fixtureApi, isRecordable, readOnlyReason, sanitizeSendHeaders, tunnelReason, validateEdit, validateRule } from '../ui/controller';
 import type { SessionWarning } from '../ui/protocol';
 import { buildHar, writeExportFile, writeHar } from './har';
 import { pathError, select } from './paths';
 import { corsPolicyShort, urlGlobHasHost } from './corsPolicy';
-import { isSensitiveField, isSensitiveHeader, REDACTED, redactBodyText, redactLogLine, redactFrameText, redactHeaders, redactQueryString, redactSecretValues, redactText, redactUrl } from './redact';
+import { isSensitiveField, isSensitiveHeader, REDACTED, redactBody, redactBodyText, redactLogLine, redactFrameText, redactHeaders, redactQueryString, redactSecretValues, redactText, redactUrl } from './redact';
 import { parsePath, type PathSegment } from '@flutter-intercept/proxy/jsonpath';
 import {
   contractForAgent,
@@ -62,6 +62,14 @@ function insideRedacted(path: string): boolean {
   return segs.slice(0, -1).some((s) => 'key' in s && isSensitiveField(s.key));
 }
 
+/** CONTRACTS §14.5: a recording's WebSocket / SSE stream and frame counts, when it has any. */
+function streamCounts(m: { streams?: number; frames?: number }): { streams?: number; frames?: number } {
+  return {
+    ...(typeof m.streams === 'number' && m.streams > 0 ? { streams: m.streams } : {}),
+    ...(typeof m.frames === 'number' && m.frames > 0 ? { frames: m.frames } : {}),
+  };
+}
+
 /** CONTRACTS §9.4 (src/source/resolve.ts): a stack frame resolved to a file. `path` may be absolute. */
 export type ResolvedFrame = StackFrame & { path?: string; inProject: boolean };
 /** get_request_source's `uri` for frames outside the project that are not package/SDK URIs. */
@@ -90,6 +98,13 @@ export interface AgentApiDeps {
     setReplay?(entries: ReplayEntry[] | undefined, opts?: ReplayOptions, meta?: { id?: string; name: string }): void;
     /** REVIEW-6 #1 (InterceptProxyHost.upstreamProxyInfo): `host:port` of the upstream proxy, never credentials. */
     readonly upstreamProxyInfo?: { display: string; ignoreCertErrors: boolean };
+    // CONTRACTS §14 (InterceptProxyHost). Optional on older builds.
+    /** §14.6: `http.proxy` = the upstream proxy is VS Code's own setting (ours is empty). */
+    readonly upstreamProxySource?: 'flutterIntercept' | 'http.proxy';
+    /** §14.2: hostname globs whose TLS is passed through undecrypted. */
+    readonly tlsPassthrough?: string[];
+    /** §14.3: host pattern + problem per configured client certificate (never paths or key material). */
+    readonly clientCertificateStatus?: { host: string; problem?: string }[];
   };
   /**
    * CONTRACTS §9.4: resolves `package:` / `file:` frames to files (src/source/resolve.ts `resolveFrames` bound
@@ -231,7 +246,7 @@ type ExchangeFilter = {
   method?: string;
   status?: StatusFilter;
   sinceMs?: number;
-  kind?: 'http' | 'websocket' | 'sse';
+  kind?: 'http' | 'websocket' | 'sse' | 'tunnel';
   graphqlOperation?: string;
   /** CONTRACTS §11.3: the web browser's own traffic is excluded unless true. */
   includeBrowserInternal?: boolean;
@@ -446,6 +461,14 @@ export class AgentApi implements AgentTools {
 
   private bodyView(b: Body | undefined, headers: Exchange['requestHeaders'] | undefined, maxChars: number): Record<string, unknown> | undefined {
     if (!b) return undefined;
+    // CONTRACTS §14.6: a binary multipart/form-data body is shown parsed (fields redacted, files summarised).
+    if (b.encoding === 'base64' && this.redact) {
+      const parsed = redactBody(b, headers);
+      if (parsed.encoding === 'utf8') {
+        const cut = parsed.text.length > maxChars;
+        return { text: cut ? parsed.text.slice(0, maxChars) : parsed.text, multipart: true, ...(cut || b.truncated ? { truncated: true } : {}), ...(cut ? { totalChars: parsed.text.length } : {}) };
+      }
+    }
     if (b.encoding === 'base64') {
       const n = Buffer.from(b.text, 'base64').length;
       return { text: `[binary ${n} bytes]`, binary: true, bytes: n, ...(b.truncated ? { truncated: true } : {}) };
@@ -474,6 +497,9 @@ export class AgentApi implements AgentTools {
       ...(e.cors?.problem ? { corsProblem: true } : {}),
       ...(e.captured ? { captured: e.captured } : {}),
       ...(e.browserInternal ? { browserInternal: true } : {}),
+      // CONTRACTS §14.2 / §14.3
+      ...(e.kind === 'tunnel' ? { notDecrypted: true, ...(e.tunnelBytes ? { bytesSent: e.tunnelBytes.sent, bytesReceived: e.tunnelBytes.received } : {}) } : {}),
+      ...(e.clientCertificate ? { clientCertificate: e.clientCertificate } : {}),
     };
   }
 
@@ -492,7 +518,9 @@ export class AgentApi implements AgentTools {
       ...(e.resentFrom ? { resentFrom: e.resentFrom } : {}),
       ...(e.source?.frames?.length ? { hasSource: true } : {}),
       // CONTRACTS §11.5: frames are read with get_frames.
-      ...(e.kind ? { frameCount: e.frames?.length ?? 0 } : {}),
+      ...(e.kind === 'websocket' || e.kind === 'sse' ? { frameCount: e.frames?.length ?? 0 } : {}),
+      // CONTRACTS §14.2: a passed-through TLS connection has no request / response to show — say why.
+      ...(e.kind === 'tunnel' ? { tunnel: { notDecrypted: tunnelReason(e), bytesSent: e.tunnelBytes?.sent ?? 0, bytesReceived: e.tunnelBytes?.received ?? 0 } } : {}),
       ...(e.framesDropped ? { framesDropped: e.framesDropped } : {}),
       ...(e.graphql ? { graphql: { ...e.graphql } } : {}),
       ...(e.cors ? { cors: { ...e.cors, ...(e.cors.problem ? { problem: this.text(e.cors.problem) } : {}) } } : {}),
@@ -523,9 +551,32 @@ export class AgentApi implements AgentTools {
       // CONTRACTS §12
       ...this.replayView(),
       sharedRules: this.deps.host.getRules().filter((r) => r.shared).length,
-      // REVIEW-6 #1: pass-through traffic goes via this proxy (host:port only).
+      // REVIEW-6 #1: pass-through traffic goes via this proxy (host:port only); §14.6 where the setting came from.
       ...(this.deps.host.upstreamProxyInfo
-        ? { upstreamProxy: this.deps.host.upstreamProxyInfo.display, ...(this.deps.host.upstreamProxyInfo.ignoreCertErrors ? { upstreamProxyInsecure: true } : {}) }
+        ? {
+            upstreamProxy: this.deps.host.upstreamProxyInfo.display,
+            ...(this.deps.host.upstreamProxyInfo.ignoreCertErrors ? { upstreamProxyInsecure: true } : {}),
+            ...(this.deps.host.upstreamProxySource ? { upstreamProxySource: this.deps.host.upstreamProxySource } : {}),
+          }
+        : {}),
+      ...this.tlsView(),
+    };
+  }
+
+  /** CONTRACTS §14.2 / §14.3: passthrough hosts and client certificates — host patterns and problems only. */
+  private tlsView(): Record<string, unknown> {
+    const hosts = this.deps.host.tlsPassthrough ?? [];
+    const certs = this.deps.host.clientCertificateStatus ?? [];
+    return {
+      ...(hosts.length ? { tlsPassthrough: [...hosts] } : {}),
+      ...(certs.length
+        ? {
+            clientCertificates: certs.map((c) => ({
+              host: c.host,
+              loaded: !c.problem,
+              ...(c.problem ? { problem: this.redact ? redactText(c.problem) : c.problem } : {}),
+            })),
+          }
         : {}),
     };
   }
@@ -959,6 +1010,7 @@ export class AgentApi implements AgentTools {
     if (ro) return `exchange "${e.id}": ${ro}`;
     if (e.kind === 'websocket') return `exchange "${e.id}" is a WebSocket connection; only plain HTTP requests can be resent`;
     if (e.kind === 'sse') return `exchange "${e.id}" is a server-sent event stream; resending it would hold a stream open, so only plain HTTP requests can be resent`;
+    if (e.kind === 'tunnel') return `exchange "${e.id}" is a TLS connection passed through without decryption (flutterIntercept.tlsPassthrough); its request was never seen, so it can't be resent`;
     if (e.initiator) return `exchange "${e.id}" was itself sent by ${e.initiator === 'agent' ? 'an agent' : 'the editor'}; resend the app's original request instead`;
     if (/^(lan|tls)-/.test(e.id)) return `exchange "${e.id}" is a connection-level record (refused LAN or TLS connection), not a request that reached a server`;
     if (e.viaLan) return `exchange "${e.id}" came from a physical device over the LAN; resending it from this computer would bypass the LAN safeguards`;
@@ -1391,6 +1443,9 @@ export class AgentApi implements AgentTools {
     if (!e.kind) {
       throw new AgentToolError(`exchange "${e.id}" is a plain HTTP request, not a WebSocket or SSE stream; read it with get_request`, 'invalid');
     }
+    if (e.kind === 'tunnel') {
+      throw new AgentToolError(`exchange "${e.id}" is a TLS connection passed through without decryption (flutterIntercept.tlsPassthrough): it has no messages to read; get_request shows its byte counts`, 'invalid');
+    }
     const frames = e.frames ?? [];
     const dropped = e.framesDropped ?? 0;
     const total = dropped + frames.length;
@@ -1476,7 +1531,7 @@ export class AgentApi implements AgentTools {
   private async listRecordings(): Promise<ToolResult> {
     const list = await this.recordingsOrThrow().list();
     return {
-      recordings: list.map((m) => ({ id: m.id, name: m.name, createdAt: m.createdAt, exchanges: m.exchanges, redacted: m.redacted })),
+      recordings: list.map((m) => ({ id: m.id, name: m.name, createdAt: m.createdAt, exchanges: m.exchanges, redacted: m.redacted, ...streamCounts(m) })),
       ...this.replayView(),
     };
   }
@@ -1486,13 +1541,13 @@ export class AgentApi implements AgentTools {
     const keep = this.filter({ url: i.url, sinceMs: i.sinceMs });
     const list = this.deps.host.getExchanges().filter((e) => isRecordable(e) && keep(e));
     if (!list.length) {
-      throw new AgentToolError(`no finished HTTP request${i.url ? ` matches ${i.url}` : ' is recorded'}${i.sinceMs !== undefined ? ' since sinceMs' : ''} (WebSocket, SSE and native-client traffic is not recorded)`, 'not_found');
+      throw new AgentToolError(`no finished HTTP request, WebSocket or SSE stream${i.url ? ` matches ${i.url}` : ' is recorded'}${i.sinceMs !== undefined ? ' since sinceMs' : ''} (open connections, TLS tunnels and native-client traffic are not recorded)`, 'not_found');
     }
     // Agents save redacted unless they ask otherwise (the user's panel default is unredacted).
     const meta = await svc.save(i.name, list, { redact: i.redact });
     this.changed();
     const where = this.projectPath(meta.path);
-    return { id: meta.id, name: meta.name, exchanges: meta.exchanges, redacted: meta.redacted, ...(where ? { path: where } : {}) };
+    return { id: meta.id, name: meta.name, exchanges: meta.exchanges, redacted: meta.redacted, ...streamCounts(meta), ...(where ? { path: where } : {}) };
   }
 
   private async replayRecording(i: ToolInput<'replay_recording'>): Promise<ToolResult> {

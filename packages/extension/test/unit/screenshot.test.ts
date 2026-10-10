@@ -5,6 +5,7 @@ import * as zlib from 'zlib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   deviceKind,
+  locateIdeviceScreenshot,
   MAX_SCREENSHOT_BYTES,
   MAX_SCREENSHOTS,
   pruneScreenshots,
@@ -91,8 +92,9 @@ function fake(over: { vm?: Record<string, (p?: Record<string, unknown>) => unkno
       execs.push({ cmd, args, opts });
       const r = over.exec ? over.exec(cmd, args) : new Error(`${cmd}: not found`);
       if (r instanceof Error) throw r;
-      if (cmd === 'xcrun') fs.writeFileSync(args[args.length - 1], r);
-      return { stdout: cmd === 'xcrun' ? Buffer.alloc(0) : r, stderr: '' };
+      const toFile = cmd === 'xcrun' || cmd.endsWith('idevicescreenshot');
+      if (toFile) fs.writeFileSync(args[args.length - 1], r);
+      return { stdout: toFile ? Buffer.alloc(0) : r, stderr: '' };
     },
   };
 }
@@ -195,14 +197,66 @@ describe('takeScreenshot (CONTRACTS §13.8)', () => {
     await expect(saveScreenshot(root, big)).rejects.toThrow(/larger than 16 MB/);
   });
 
-  it('macOS / web / physical iOS without a working VM route: "not supported", no tool is run', async () => {
-    for (const deviceId of ['macos', 'chrome', '00008000-0000000000000000', undefined]) {
+  it('macOS / web without a working VM route: "not supported", no tool is run', async () => {
+    for (const deviceId of ['macos', 'chrome', undefined]) {
       const d = fake({ vm: { getVM: () => new Error('no answer') }, exec: () => png(1, 1) });
       const p = takeScreenshotWith({ sessionId: 's', deviceId, projectRoot: root }, d);
       await expect(p).rejects.toBeInstanceOf(ScreenshotUnsupportedError);
       await expect(p).rejects.toThrow(/not supported/);
       expect(d.execs).toEqual([]);
     }
+  });
+
+  it('physical iPhone (§14.7): devicectl into a temp file when the VM route fails', async () => {
+    const udid = '00008000-0000000000000000';
+    const d = fake({ noVm: true, exec: () => png(1320, 2868) });
+    const shot = await takeScreenshotWith({ sessionId: 's', deviceId: udid, projectRoot: root }, d, { now: () => NOW, platform: 'darwin', idevicePath: null });
+    expect(shot.method).toBe('devicectl');
+    expect([shot.width, shot.height]).toEqual([1320, 2868]);
+    const { cmd, args } = d.execs[0];
+    expect(cmd).toBe('xcrun');
+    expect(args.slice(0, 8)).toEqual(['devicectl', 'device', 'capture', 'screenshot', '--quiet', '--device', udid, '--destination']);
+    expect(path.basename(args[8])).toBe('screenshot.png');
+    expect(fs.existsSync(path.dirname(args[8]))).toBe(false);
+    expect(fs.statSync(shot.path).mode & 0o777).toBe(0o600);
+  });
+
+  it('physical iPhone: idevicescreenshot when devicectl fails (older Xcode), VM route first', async () => {
+    const udid = '00008000-0000000000000000';
+    const d = fake({ vm: { getVM: () => new Error('no answer') }, exec: (cmd) => (cmd === 'xcrun' ? new Error('Unknown subcommand capture') : png(1170, 2532)) });
+    const shot = await takeScreenshotWith({ sessionId: 's', deviceId: udid, projectRoot: root }, d, { now: () => NOW, platform: 'darwin', idevicePath: '/opt/homebrew/bin/idevicescreenshot' });
+    expect(shot.method).toBe('idevicescreenshot');
+    expect(d.calls[0].method).toBe('getVM');
+    expect(d.execs.map((e) => e.cmd)).toEqual(['xcrun', '/opt/homebrew/bin/idevicescreenshot']);
+    expect(d.execs[1].args.slice(0, 2)).toEqual(['-u', udid]);
+    expect(fs.existsSync(path.dirname(d.execs[1].args[2]))).toBe(false);
+  });
+
+  it('physical iPhone: the VM route wins when it works; tools fail → a clear error naming each route', async () => {
+    const udid = 'a'.repeat(40);
+    const ok = fake({ exec: () => png(1, 1) });
+    expect((await takeScreenshotWith({ sessionId: 's', deviceId: udid, projectRoot: root }, ok, { now: () => NOW, platform: 'darwin' })).method).toBe('vm-service');
+    expect(ok.execs).toEqual([]);
+    const tiff = Buffer.from('MM\u0000*not a png');
+    const bad = fake({ noVm: true, exec: (cmd) => (cmd === 'xcrun' ? new Error('device not connected') : tiff) });
+    await expect(takeScreenshotWith({ sessionId: 's', deviceId: udid, projectRoot: root }, bad, { platform: 'darwin', idevicePath: '/usr/local/bin/idevicescreenshot' })).rejects.toThrow(
+      /Could not take a screenshot of a physical iOS device \(devicectl: device not connected; idevicescreenshot: idevicescreenshot: not a PNG\)/,
+    );
+    const none = fake({ noVm: true, exec: () => new Error('Unknown subcommand capture') });
+    await expect(takeScreenshotWith({ sessionId: 's', deviceId: udid, projectRoot: root }, none, { platform: 'darwin', idevicePath: null })).rejects.toThrow(/idevicescreenshot: not installed/);
+    const linux = fake({ noVm: true, exec: () => png(1, 1) });
+    await expect(takeScreenshotWith({ sessionId: 's', deviceId: udid, projectRoot: root }, linux, { platform: 'linux' })).rejects.toThrow(/Could not take a screenshot/);
+    expect(linux.execs).toEqual([]);
+  });
+
+  it('locateIdeviceScreenshot: PATH, then Homebrew; never Flutter\'s x86_64 copy', () => {
+    const has = new Set(['/flutter/bin/cache/artifacts/libimobiledevice/idevicescreenshot', '/opt/homebrew/bin/idevicescreenshot']);
+    const exists = (p: string) => has.has(p);
+    expect(locateIdeviceScreenshot({ env: { PATH: '/flutter/bin/cache/artifacts/libimobiledevice:/usr/bin' }, platform: 'darwin', exists })).toBe('/opt/homebrew/bin/idevicescreenshot');
+    has.add('/usr/bin/idevicescreenshot');
+    expect(locateIdeviceScreenshot({ env: { PATH: 'relative:/usr/bin' }, platform: 'darwin', exists })).toBe('/usr/bin/idevicescreenshot');
+    expect(locateIdeviceScreenshot({ env: { PATH: '/usr/bin' }, platform: 'win32', exists })).toBeUndefined();
+    expect(locateIdeviceScreenshot({ env: {}, platform: 'linux', exists: () => false })).toBeUndefined();
   });
 
   it('never passes an option-like device id to a tool', async () => {

@@ -288,10 +288,50 @@ export function pendingApprovalText(sr: NonNullable<Status['sharedRules']>): str
 
 // ---------------------------------------------------------------- recordings (§12.4–12.5)
 
-/** What a recording keeps: finished HTTP exchanges (no WebSocket / SSE, no native captures, nothing in flight). */
+/**
+ * What a recording keeps: finished HTTP exchanges and (CONTRACTS §14.5) finished WebSocket / SSE streams with their
+ * frames — no TLS passthrough tunnels, no native captures, nothing in flight (an open stream is not saved).
+ */
 export function isRecordable(ex: Pick<Exchange, 'state' | 'kind' | 'captured'>): boolean {
-  if (ex.kind || ex.captured === 'vm-profile') return false;
+  if (ex.kind === 'tunnel' || ex.captured === 'vm-profile') return false;
   return ex.state !== 'pending' && ex.state !== 'paused-request' && ex.state !== 'paused-response';
+}
+
+/** A WebSocket or SSE exchange (recorded with its frames, CONTRACTS §14.5). */
+export function isStream(ex: Pick<Exchange, 'kind'>): boolean {
+  return ex.kind === 'websocket' || ex.kind === 'sse';
+}
+
+/** What "Save" would write: exchanges, of which WebSocket / SSE streams, and their frames (the kept window). */
+export function recordingCounts(list: readonly Pick<Exchange, 'kind' | 'frames'>[]): { exchanges: number; streams: number; frames: number } {
+  let streams = 0;
+  let frames = 0;
+  for (const e of list) {
+    if (!isStream(e)) continue;
+    streams++;
+    frames += e.frames?.length ?? 0;
+  }
+  return { exchanges: list.length, streams, frames };
+}
+
+/** "2 WebSocket / SSE · 134 frames" (empty when there are no streams). */
+export function streamCountText(c: { streams?: number; frames?: number }): string {
+  if (!c.streams) return '';
+  const f = c.frames ?? 0;
+  return `${c.streams} WebSocket / SSE${c.frames !== undefined ? ` · ${f} frame${f === 1 ? '' : 's'}` : ''}`;
+}
+
+/**
+ * A recording summary as the panel shows it. `streams` / `frames` (WebSocket / SSE exchanges and their frames) are
+ * optional: hosts that report them get the counts shown (CONTRACTS §14.5).
+ */
+export type RecordingRowSummary = RecordingSummary & { streams?: number; frames?: number };
+
+/** "42 exchanges · 2 WebSocket / SSE · 134 frames". */
+export function recordingCountText(rec: RecordingRowSummary): string {
+  const base = `${rec.exchanges} exchange${rec.exchanges === 1 ? '' : 's'}`;
+  const streams = streamCountText(rec);
+  return streams ? `${base} · ${streams}` : base;
 }
 
 export function sortRecordings(list: RecordingSummary[]): RecordingSummary[] {

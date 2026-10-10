@@ -12,6 +12,9 @@
  *   redacted, embedded verbatim; over `maxExampleChars` it is cut and becomes a string example with a note).
  *   Non-JSON (or binary, or truncated) bodies: the media type only.
  * - `operationId` from method + path, unique. GraphQL: one path; the operations seen are listed in the description.
+ * - CONTRACTS §14.6: `components.securitySchemes` inferred from the credentials' header / query NAMES (bearer, basic,
+ *   API key in a header or the query; security.ts) and each operation's `security`; no value is ever included, and a
+ *   query parameter that is an API key is described by its scheme instead of `parameters` (no example).
  */
 import type { Body, Exchange } from '@flutter-intercept/proxy';
 import type { ExportOptions, ExportResult, ToOpenApi } from './types';
@@ -20,6 +23,7 @@ import { parseJsonSample } from '../codegen/json';
 import { isIdSegment } from '../codegen/route';
 import { pascalCase } from '../codegen/naming';
 import { redactBodyText, redactSecretValues, redactUrl, REDACTED } from '../agent/redact';
+import { SecuritySchemes, securityRequirements, type Credential } from './security';
 import {
   bodyMediaType,
   cut,
@@ -149,6 +153,7 @@ function operationIdBase(method: string, template: string): string {
 
 class Builder {
   readonly notes: string[] = [];
+  readonly security = new SecuritySchemes();
   private readonly redact: boolean;
   private readonly maxChars: number;
   private cutExamples = 0;
@@ -206,7 +211,7 @@ class Builder {
     return media;
   }
 
-  parameters(op: Operation): Json[] {
+  parameters(op: Operation, skipQuery: ReadonlySet<string> = new Set()): Json[] {
     const out: Json[] = [];
     const latest = op.samples[op.samples.length - 1];
     // path parameters
@@ -250,6 +255,7 @@ class Builder {
       latestParams = undefined;
     }
     for (const [name, q] of seen) {
+      if (skipQuery.has(name)) continue; // an API key: its security scheme describes it (CONTRACTS §14.6)
       const item = valueSchema(q.values);
       const schema = q.repeated ? { type: 'array', items: item } : item;
       const param: Json = { name, in: 'query', required: q.count === op.samples.length, schema };
@@ -267,7 +273,9 @@ class Builder {
     const description: string[] = [`Recorded ${plural(n, 'time')}.`];
     if (graphql) description.push(graphqlDescription(op.samples));
     out.description = description.join('\n\n');
-    const parameters = this.parameters(op);
+    const creds: Credential[][] = op.samples.map((s) => this.security.add(s.e));
+    const apiKeyQuery = new Set(creds.flat().filter((c) => c.kind === 'query').map((c) => c.name));
+    const parameters = this.parameters(op, apiKeyQuery);
     if (parameters.length) out.parameters = parameters;
     // request body
     const withBody = op.samples.filter((s) => hasBody(s.e.requestBody));
@@ -295,6 +303,8 @@ class Builder {
       responses[key] = res;
     }
     out.responses = responses;
+    const security = securityRequirements(creds);
+    if (security) out.security = security;
     return out;
   }
 }
@@ -382,6 +392,7 @@ export const toOpenApi: ToOpenApi = (exchanges: readonly Exchange[], opts: Expor
     },
     servers: origins.map((url) => ({ url })),
     paths,
+    ...(b.security.size ? { components: { securitySchemes: b.security.components() } } : {}),
   };
   return { text: jsonWithRaw(doc), exchanges: used, routes: ops.size, notes: b.notes };
 };

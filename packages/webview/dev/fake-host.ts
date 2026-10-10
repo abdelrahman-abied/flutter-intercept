@@ -47,9 +47,15 @@
  * `authFlows` (a retry that gets 401 again is a problem). Dev bar: "401 flow" forces a stampede, "pending" holds
  * back another shared rule. ?replay=1 starts replaying the first recording; ?upstream=127.0.0.1:8888 shows the
  * upstream-proxy indicator (REVIEW-6 #1); "Create file" with a secret-looking body is refused like the host does.
+ *
+ * v0.8.0 (CONTRACTS §14): TLS passthrough tunnels (`kind: 'tunnel'`, a live one whose byte counts grow, a closed one,
+ * a failed one) for `Status.tlsPassthrough` hosts, an mTLS exchange with `clientCertificate`, `Status.clientCertificates`
+ * with one load problem, a `bypass` session warning, a recording with WebSocket / SSE streams (`streams` / `frames`,
+ * also counted on save), and `uploadKbps` in custom profiles. ?upstream=…&upstreamSource=vscode shows "via VS Code
+ * proxy"; ?v8=0 turns the v0.8.0 data off; the dev bar's "+tunnel" opens another tunnel.
  */
 import type {
-  AuthFlowSummary, Body, ContractSummary, CorsInfo, Frame, GraphqlInfo, Exchange, HostMsg, NetworkProfile, RecordingSummary, RequestEdit, ResponseEdit,
+  AuthFlowSummary, Body, ContractSummary, CorsInfo, Frame, GraphqlInfo, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit,
   Rule, RuleAction, SendDraft, Status, Timings, ViewMsg,
 } from '../src/protocol';
 import type { MutateOp, SourceInfo, StackFrame } from '@flutter-intercept/proxy/types';
@@ -57,7 +63,7 @@ import { applyOps } from '@flutter-intercept/proxy/jsonpath';
 import { parsePath, formatPath } from '../src/jsonpath';
 import { describeMutateOps } from '../src/state';
 import { SCRIPT_TEMPLATE } from '../src/scripts';
-import { bodySecretHint, isRecordable, needsApproval, SHARED_FILE, type StepAction } from '../src/scenarios';
+import { bodySecretHint, isRecordable, needsApproval, recordingCounts, SHARED_FILE, type RecordingRowSummary, type StepAction } from '../src/scenarios';
 import { matches, ruleFromExchange } from '@flutter-intercept/proxy/rules';
 import { describeProfile, presetProfile, type NetworkPresetId } from '@flutter-intercept/proxy/network';
 
@@ -202,8 +208,8 @@ function sequenceStep(rule: Rule, a: Extract<RuleAction, { kind: 'sequence' }>):
 }
 
 // CONTRACTS §12.4: recordings and replay.
-let recordings: RecordingSummary[] = [
-  { id: 'rec_checkout', name: 'Checkout happy path', createdAt: Date.now() - 5 * 86_400_000, exchanges: 42, redacted: false },
+let recordings: RecordingRowSummary[] = [
+  { id: 'rec_checkout', name: 'Checkout happy path', createdAt: Date.now() - 5 * 86_400_000, exchanges: 42, redacted: false, streams: 2, frames: 134 },
   { id: 'rec_staging', name: 'Staging before deploy', createdAt: Date.now() - 2 * 3_600_000, exchanges: 118, redacted: true },
 ];
 /** Routes the fake recordings contain. */
@@ -427,9 +433,10 @@ function onViewMsg(msg: ViewMsg) {
       console.info('[fake-host] would open the panel as an editor and move it to a new window');
       break;
     case 'saveRecording': {
-      const count = msg.ids?.length ?? exchanges.filter(isRecordable).length;
+      const saved = msg.ids ? exchanges.filter((e) => msg.ids!.includes(e.id) && isRecordable(e)) : exchanges.filter(isRecordable);
+      const { exchanges: count, streams, frames } = recordingCounts(saved);
       const id = `rec_${Date.now().toString(36)}`;
-      recordings = [{ id, name: msg.name, createdAt: Date.now(), exchanges: count, redacted: !!msg.redact }, ...recordings];
+      recordings = [{ id, name: msg.name, createdAt: Date.now(), exchanges: count, redacted: !!msg.redact, ...(streams ? { streams, frames } : {}) }, ...recordings];
       console.info(`[fake-host] saved .dart_tool/flutter_intercept/recordings/${id}.json (${count} exchanges${msg.redact ? ', redacted' : ''})`);
       send({ type: 'recordings', recordings });
       break;
@@ -1359,6 +1366,72 @@ if (params.get('empty') !== '1') {
 }
 syncSharedStatus();
 resetChangedSequences();
-if (params.get('upstream')) status = { ...status, upstreamProxy: params.get('upstream')!, ...(params.get('insecure') === '1' ? { upstreamProxyInsecure: true as const } : {}) };
+if (params.get('upstream')) {
+  status = {
+    ...status, upstreamProxy: params.get('upstream')!,
+    upstreamProxySource: params.get('upstreamSource') === 'vscode' ? 'http.proxy' : 'flutterIntercept',
+    ...(params.get('insecure') === '1' ? { upstreamProxyInsecure: true as const } : {}),
+  };
+}
 if (params.get('replay') === '1') status = { ...status, replay: { recording: recordings[0].name, fallback: 'passthrough' } };
 booted = true;
+
+// ---------------------------------------------------------------- v0.8.0 (CONTRACTS §14)
+
+const PASSTHROUGH = ['*.bank.example', 'pinned.example.com'];
+
+/** A TLS connection passed through undecrypted (CONTRACTS §14.2): CONNECT, no headers / bodies, byte counts only. */
+function openTunnel(host: string, opts: { live?: boolean; error?: string; port?: number } = {}): string {
+  const id = `ex_${++seq}`;
+  const started = Date.now() - (opts.live ? 15_000 : 40_000);
+  const ex: Exchange = {
+    id, startedAt: started, method: 'CONNECT', url: `https://${host}:${opts.port ?? 443}/`, kind: 'tunnel',
+    requestHeaders: {}, state: opts.error ? 'error' : opts.live ? 'pending' : 'completed',
+    durationMs: 60 + rnd(10, 90),
+    timings: { requestMs: 2, dnsMs: rnd(5, 30), connectMs: rnd(15, 60), sendMs: 0, waitMs: 0, receiveMs: 0 },
+    ...(opts.error ? { error: opts.error } : { tunnelBytes: { sent: rnd(800, 4000), received: rnd(4000, 90_000) } }),
+  };
+  record(ex, true);
+  send({ type: 'exchange', exchange: ex });
+  if (opts.live) {
+    const timer = setInterval(() => {
+      const cur = find(id);
+      if (!cur || cur.state !== 'pending') { clearInterval(timer); return; }
+      if (!streaming) return;
+      const b = cur.tunnelBytes ?? { sent: 0, received: 0 };
+      update(cur, { tunnelBytes: { sent: b.sent + rnd(0, 600), received: b.received + rnd(200, 9000) } });
+    }, 1500);
+  }
+  return id;
+}
+
+function startV8() {
+  if (params.get('v8') === '0') return;
+  status = {
+    ...status,
+    tlsPassthrough: [...PASSTHROUGH],
+    clientCertificates: [
+      { host: 'api.corp.example' },
+      { host: '*.partner.example:8443', problem: 'Could not read certs/partner.p12: wrong passphrase — set it with “Set Client Certificate Passphrase…”' },
+    ],
+    warnings: [...(status.warnings ?? []), {
+      id: 'bypass:s1:metrics.shop.example.com', kind: 'bypass', sessionId: 's1',
+      text: 'Requests to metrics.shop.example.com bypass the proxy — an HttpOverrides zone or a custom connectionFactory in the app.',
+    }],
+  };
+  openTunnel('pay.bank.example', { live: true });
+  openTunnel('pinned.example.com');
+  openTunnel('auth.bank.example', { error: 'Tunnel to auth.bank.example:443 failed: ECONNRESET' });
+  // An mTLS request: the proxy presented the client certificate configured for api.corp.example.
+  const mtls: Exchange = {
+    id: `ex_${++seq}`, startedAt: Date.now() - 8000, method: 'GET', url: 'https://api.corp.example/v1/inventory',
+    requestHeaders: { ...UA, host: 'api.corp.example' }, state: 'completed', status: 200, durationMs: 142,
+    responseHeaders: JSON_RES, responseBody: json({ items: [{ sku: 'A-1', stock: 4 }] }), clientCertificate: 'api.corp.example',
+    timings: fakeTimings(120, 22),
+  };
+  record(mtls, true);
+  send({ type: 'exchange', exchange: mtls });
+  send({ type: 'status', status });
+}
+setTimeout(startV8, 0);
+document.getElementById('dev-tunnel')?.addEventListener('click', () => openTunnel(pick(['pay.bank.example', 'cards.bank.example', 'pinned.example.com']), { live: true }));

@@ -1,4 +1,5 @@
-// Bundles src/main.ts (and the vscode-free extension modules it imports) into one dist/cli.js.
+// Bundles src/main.ts (and the vscode-free extension modules it imports) into one dist/cli.js, and src/action.ts
+// (the GitHub Action's entry, root action.yml) into dist/action.js, which loads dist/cli.js at run time.
 // Same mockttp handling as packages/extension/build.mjs: optional native/wasm deps stay external, unreachable
 // upstream-proxy agents are stubbed, and mockttp's admin server / remote client must never be bundled.
 import * as esbuild from 'esbuild';
@@ -57,7 +58,8 @@ const result = await esbuild.build({
   plugins: [stubPlugin],
   minify: true,
   keepNames: true,
-  sourcemap: 'linked',
+  // external: the map stays out of the npm package (files: dist/cli.js) and the bundle has no dangling map URL
+  sourcemap: 'external',
   metafile: true,
   logLevel: 'warning',
 });
@@ -68,3 +70,15 @@ if (bad.length) {
   process.exit(1);
 }
 fs.chmodSync(path.join(here, 'dist/cli.js'), 0o755);
+
+// The GitHub Action entry: small, readable, loads ./cli.js at run time (not bundled twice). Not in the npm package.
+await esbuild.build({
+  entryPoints: [path.join(here, 'src/action.ts')],
+  bundle: true,
+  platform: 'node',
+  target: 'node18',
+  format: 'cjs',
+  outfile: path.join(here, 'dist/action.js'),
+  plugins: [stubPlugin],
+  logLevel: 'warning',
+});

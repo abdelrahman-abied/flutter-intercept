@@ -1,5 +1,6 @@
 import { execFile } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { Exchange, InterceptProxy, Rule } from '@flutter-intercept/proxy';
@@ -26,17 +27,22 @@ import { createCodegenService } from './codegen/service';
 import type { GeneratedFile } from './codegen/types';
 import { createContractService, DONT_CHECK } from './contract/service';
 import { openFrame } from './source/open';
-import { takeScreenshot } from './screenshot';
-import { createVmWatcher } from './vm';
+import { AndroidGlobalProxy } from './adb';
+import { deviceKind, takeScreenshot } from './screenshot';
+import { webScreenshot } from './web/screenshot';
+import { PacServer } from './debug/pacServer';
+import { webBrowserDebugPortOf } from './debug/rewrite';
+import { createWebServerNotice } from './debug/webServerNotice';
+import { createVmWatcher, matchesProxyExchange } from './vm';
 import { checkSourcePath, packageRootsFor, resolveFrames } from './source/resolve';
 import { InterceptController, validateRule, validateRules } from './ui/controller';
 import { analyzeAuth } from './analysis/auth';
 import { createRecordingService } from './recordings/store';
 import { disposeRecordingDiffs, openRecordingDiff } from './recordings/vscodeDiff';
 import { createSharedRulesService } from './rules/service';
-import { checkUpstreamProxy } from './proxyHost';
 import { toOpenApi, toPostman } from './export';
 import { registerNotifications } from './notify';
+import { clientCertHosts, loadClientCertificates, PASSPHRASE_SECRET_PREFIX, passphraseSecretKey } from './ui/clientCerts';
 import { TrafficPanel } from './ui/panel';
 import { TrafficViewProvider, VIEW_ID } from './ui/view';
 
@@ -83,9 +89,24 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   const events: InterceptEvent[] = [];
   const reverses = new ReverseTracker({ log });
   const intercepted = new Set<string>(); // ids of live debug sessions running our entry
+  const debugSessions = new Map<string, vscode.DebugSession>(); // intercepted sessions by id (web screenshots need their config)
   const webSessions = new Set<string>(); // the Flutter Web ones among them (CONTRACTS §11.3)
   // Per-install CA (key file 0600 in global storage), created on the first intercepted launch.
   const ca = new CaStore(context.globalStorageUri.fsPath, { log });
+  // CONTRACTS §14.7: native clients on Android emulators via the emulator's global proxy (always restored).
+  const nativeRoutes = new AndroidGlobalProxy({
+    log,
+    store: {
+      get: () => context.globalState.get('flutterIntercept.emulatorProxies', []),
+      set: (r) => context.globalState.update('flutterIntercept.emulatorProxies', r),
+    },
+  });
+  void nativeRoutes.recover().catch((e: unknown) => log(`emulator proxy recovery failed: ${String(e)}`)); // repairs a crashed run
+  context.subscriptions.push({ dispose: () => void nativeRoutes.releaseAll() });
+  const nativeMode = (): 'profile' | 'proxy' | 'off' => {
+    const v = vscode.workspace.getConfiguration('flutterIntercept').get<string>('nativeClients', 'profile');
+    return v === 'off' ? 'off' : v === 'proxy' ? 'proxy' : 'profile';
+  };
   const proxyHost: InterceptProxyHost = new InterceptProxyHost({
     getPort: () => readSettings().port,
     getCa: () => ca.get(),
@@ -95,7 +116,16 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       const { InterceptProxy: Proxy } = require('@flutter-intercept/proxy') as { InterceptProxy: typeof InterceptProxy };
       return new Proxy(opts);
     },
-    onStop: () => reverses.removeAll(),
+    onStop: async () => {
+      await nativeRoutes.releaseAll().catch((e: unknown) => log(`emulator proxy release failed: ${String(e)}`));
+      await reverses.removeAll();
+    },
+    // CONTRACTS §14.6: VS Code's proxy from user settings only (a workspace must not route the app's traffic).
+    vscodeHttpProxy: () => {
+      const c = vscode.workspace.getConfiguration('http');
+      if (c.get<string>('proxySupport') === 'off') return undefined;
+      return { url: c.inspect<string>('proxy')?.globalValue, noProxy: c.inspect<string[]>('noProxy')?.globalValue };
+    },
     rewriteLocalhost: () => vscode.workspace.getConfiguration('flutterIntercept').get<boolean>('rewriteLocalhost', true),
     // A changed flutterIntercept.port takes effect on the next launch when no intercepted session is live.
     canRestart: () => intercepted.size === 0,
@@ -152,17 +182,21 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   }
   proxyHost.setRules(saved);
   deactivateHooks = [() => proxyHost.stop()];
-  let webServerNoticeShown = false;
   let webProfileNoticeShown = false;
+  // CONTRACTS §14.7: the PAC (proxy, then DIRECT) for web sessions' Chrome, served on loopback.
+  const webPac = new PacServer({ currentPort: () => proxyHost.port, log });
+  context.subscriptions.push({ dispose: () => webPac.dispose() });
   const deps: PrepareDeps = {
     proxyHost,
     log,
-    webServerSkipped: (message) => {
-      log(message);
-      if (webServerNoticeShown) return;
-      webServerNoticeShown = true;
-      void vscode.window.showInformationMessage(message);
-    },
+    webPac,
+    // CONTRACTS §14.7: shown once; only a click starts the proxy and copies a Chrome command (never run by us).
+    webServerSkipped: createWebServerNotice({
+      show: (m, ...a) => vscode.window.showInformationMessage(m, ...a),
+      copy: (t) => vscode.env.clipboard.writeText(t),
+      proxy: async () => ({ port: await proxyHost.start(), caCertPem: (await ca.get()).cert }),
+      log,
+    }),
     webUserProfileSkipped: (message) => {
       log(message);
       if (webProfileNoticeShown) return;
@@ -212,11 +246,17 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   context.subscriptions.push(shared.onDidChangeBodyFile((p) => proxyHost.refreshBodyFiles(p)));
   const recordings = createRecordingService({ root: () => flutterProjectRoot() });
   context.subscriptions.push({ dispose: disposeRecordingDiffs });
+  let upstreamProblemShown: string | undefined;
   const applyUpstreamProxy = () => {
     // REVIEW-6 #1: user settings only — a cloned repo's .vscode/settings.json must not route the app's traffic.
-    const url = (userSetting<string>('upstreamProxy') ?? '').trim();
+    // CONTRACTS §14.6: VS Code's own http.proxy (user settings) is the default when ours is empty.
     try {
-      proxyHost.setUpstreamProxy(url ? checkUpstreamProxy({ url, ignoreCertErrors: userSetting<boolean>('upstreamProxyIgnoreCertErrors') === true }) : undefined);
+      const r = proxyHost.applyUpstreamSettings({ url: userSetting<string>('upstreamProxy'), ignoreCertErrors: userSetting<boolean>('upstreamProxyIgnoreCertErrors') === true });
+      if (r.problem && r.problem !== upstreamProblemShown) {
+        upstreamProblemShown = r.problem;
+        log(`upstream proxy: ${r.problem}`);
+        void vscode.window.showWarningMessage(`Flutter Intercept: ${r.problem}`);
+      }
     } catch (e) {
       const msg = `Flutter Intercept: ignoring flutterIntercept.upstreamProxy: ${(e as Error).message}`;
       log(msg);
@@ -224,6 +264,51 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     }
   };
   applyUpstreamProxy();
+  // CONTRACTS §14.2: hosts whose TLS is passed through undecrypted (a repo may set it: it only reduces decryption).
+  const applyTlsPassthrough = () => {
+    proxyHost.setTlsPassthrough(vscode.workspace.getConfiguration('flutterIntercept').get('tlsPassthrough', []));
+  };
+  applyTlsPassthrough();
+  // CONTRACTS §14.3: client certificates for mTLS (user settings only; passphrases in secret storage).
+  const applyClientCertificates = async () => {
+    const r = await loadClientCertificates(userSetting<unknown>('clientCertificates'), {
+      workspaceFolders: () => (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+      getPassphrase: (h) => Promise.resolve(context.secrets.get(passphraseSecretKey(h))),
+      log,
+    });
+    proxyHost.setClientCertificates(r.certs, r.status);
+  };
+  void applyClientCertificates().catch((e: unknown) => log(`client certificates: ${String(e)}`));
+  context.subscriptions.push(
+    context.secrets.onDidChange((e) => {
+      if (e.key.startsWith(PASSPHRASE_SECRET_PREFIX)) void applyClientCertificates().catch((err: unknown) => log(`client certificates: ${String(err)}`));
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => void applyClientCertificates().catch((err: unknown) => log(`client certificates: ${String(err)}`))),
+    // CONTRACTS §14.7: the public CA certificate (never the key), e.g. for an app's debug network_security_config.
+    vscode.commands.registerCommand('flutterIntercept.saveCaCertificate', async () => {
+      const root = flutterProjectRoot();
+      const target = await vscode.window.showSaveDialog({
+        defaultUri: vscode.Uri.file(path.join(root ?? os.homedir(), 'flutter_intercept_ca.pem')),
+        filters: { 'PEM certificate': ['pem', 'crt'] },
+      });
+      if (!target) return;
+      await fs.promises.writeFile(target.fsPath, (await ca.get()).cert, { encoding: 'utf8' });
+      void vscode.window.showInformationMessage(`Flutter Intercept: saved the CA certificate (public part only) to ${target.fsPath}. Only debug builds should trust it.`);
+    }),
+    vscode.commands.registerCommand('flutterIntercept.setClientCertificatePassphrase', async () => {
+      const hosts = clientCertHosts(userSetting<unknown>('clientCertificates'));
+      if (!hosts.length) {
+        void vscode.window.showInformationMessage('Flutter Intercept: add a client certificate to flutterIntercept.clientCertificates (user settings) first.');
+        return;
+      }
+      const host = hosts.length === 1 ? hosts[0] : await vscode.window.showQuickPick(hosts, { placeHolder: 'Client certificate (host pattern)' });
+      if (!host) return;
+      const value = await vscode.window.showInputBox({ prompt: `Passphrase for the client certificate of ${host} (empty = remove it)`, password: true, ignoreFocusOut: true });
+      if (value === undefined) return;
+      if (value) await context.secrets.store(passphraseSecretKey(host), value);
+      else await context.secrets.delete(passphraseSecretKey(host));
+    }),
+  );
   // A cloned repo must not silently route the app's authenticated traffic elsewhere (CONTRACTS §12.1).
   const sharedDeps = {
     state: () => shared.state(),
@@ -266,7 +351,10 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   // CONTRACTS §11.4: background-isolate warnings and read-only native-client traffic from the app's HTTP profile.
   const vm = createVmWatcher({
     ...proxyHost.vmHostDeps(log),
-    nativeClients: () => (vscode.workspace.getConfiguration('flutterIntercept').get<string>('nativeClients', 'profile') === 'off' ? 'off' : 'profile'),
+    nativeClients: nativeMode,
+    nativeRouted: (sid) => nativeRoutes.isRouted(sid),
+    nativeRouteFailed: (sid) => void nativeRoutes.release(sid),
+    proxySaw: (q) => proxyHost.getExchanges().some((x) => matchesProxyExchange(x, q)),
     // CONTRACTS §13.3: install the entry's overrides in new isolates (debug), or only warn.
     backgroundIsolates: () => (vscode.workspace.getConfiguration('flutterIntercept').get<string>('backgroundIsolates', 'intercept') === 'warn' ? 'warn' : 'intercept'),
     // dart:io entries whose proxyDetails name this proxy already are in the list.
@@ -386,7 +474,9 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('flutterIntercept.contractCheck')) controller.recheckContracts();
-      if (e.affectsConfiguration('flutterIntercept.upstreamProxy') || e.affectsConfiguration('flutterIntercept.upstreamProxyIgnoreCertErrors')) applyUpstreamProxy();
+      if (e.affectsConfiguration('flutterIntercept.upstreamProxy') || e.affectsConfiguration('flutterIntercept.upstreamProxyIgnoreCertErrors') || e.affectsConfiguration('http.proxy') || e.affectsConfiguration('http.noProxy') || e.affectsConfiguration('http.proxySupport')) applyUpstreamProxy();
+      if (e.affectsConfiguration('flutterIntercept.tlsPassthrough')) applyTlsPassthrough();
+      if (e.affectsConfiguration('flutterIntercept.clientCertificates')) void applyClientCertificates().catch((err: unknown) => log(`client certificates: ${String(err)}`));
     }),
   );
   async function pickModel(ex: Exchange): Promise<string | undefined | null> {
@@ -448,8 +538,14 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     version,
     exporters,
     // CONTRACTS §13.8: VM-service screenshot first, adb / simctl as fallbacks (argument arrays, no shell).
+    // Flutter Web: the debug Chrome's DevTools port (loopback only, CONTRACTS §14.7).
     takeScreenshot: (target) =>
-      takeScreenshot(target, {
+      deviceKind(target.deviceId) === 'web'
+        ? webScreenshot(target, {
+            devToolsPort: (id) => webBrowserDebugPortOf(debugSessions.get(id)?.configuration),
+            log,
+          })
+        : takeScreenshot(target, {
         callService: (sessionId, method, params) => vm.callService(sessionId, method, params),
         exec: (cmd, args, opts) =>
           new Promise((resolve, reject) =>
@@ -596,6 +692,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       const conf = session.configuration as DebugConfig;
       if (session.type !== 'dart' || !conf[ORIGINAL_PROGRAM_KEY]) return;
       intercepted.add(session.id);
+      debugSessions.set(session.id, session);
       refreshAppPackages(); // pubspec names may have changed since activation
       controller.setSessions(intercepted.size);
       if (!revealed) {
@@ -616,6 +713,9 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       const deviceId = typeof conf.deviceId === 'string' ? conf.deviceId : undefined;
       const host = typeof conf[HOST_KEY] === 'string' ? conf[HOST_KEY] : 'localhost';
       log(`session started: ${session.name} program=${conf.program} deviceId=${deviceId ?? '-'} proxyHost=${host}${conf[LAN_KEY] ? ' (LAN)' : ''}`);
+      if (nativeMode() === 'proxy' && /^emulator-\d+$/.test(deviceId ?? '') && ((conf.flutterMode as string | undefined) ?? 'debug') === 'debug') {
+        void nativeRoutes.apply(session.id, deviceId!, port).catch((e: unknown) => log(`emulator proxy failed: ${String(e)}`));
+      }
       if (conf[LAN_KEY] === true) {
         lanLife.started(session.id);
         // Closed meanwhile (grace timer during a >15 min build, or the network changed): never reopen
@@ -643,6 +743,8 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       }
     }),
     vscode.debug.onDidTerminateDebugSession((session) => {
+      debugSessions.delete(session.id);
+      void nativeRoutes.release(session.id).catch((e: unknown) => log(`emulator proxy release failed: ${String(e)}`));
       lanLife.ended(session.id); // also on crash / app killed: closes the LAN listener after the last iPhone session
       if (webSessions.delete(session.id) && webSessions.size === 0) proxyHost.setWebSessionActive(false);
       vm.detach(session.id);

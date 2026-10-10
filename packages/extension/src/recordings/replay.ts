@@ -1,5 +1,5 @@
 /**
- * Recording → proxy replay entries (CONTRACTS §12.4). Pure.
+ * Recording → proxy replay entries (CONTRACTS §12.4, §14.5). Pure.
  */
 import { createHash } from 'crypto';
 import type { Body, Exchange, ReplayEntry, ReplayOptions } from '@flutter-intercept/proxy';
@@ -7,6 +7,12 @@ import type { Recording } from './types';
 
 /** Headers that describe the wire framing of the recorded bytes, not the body replay sends. */
 const FRAMING_HEADERS = new Set(['content-length', 'transfer-encoding', 'connection', 'keep-alive']);
+
+/**
+ * WebSocket handshake headers the local server must compute itself (`sec-websocket-accept` answers the app's key;
+ * an extension such as permessage-deflate is only real when the server negotiates it).
+ */
+const WS_HANDSHAKE_HEADERS = new Set(['upgrade', 'sec-websocket-accept', 'sec-websocket-extensions', 'sec-websocket-version']);
 
 /** Encodings the proxy decodes for display when they are the only one (packages/proxy/src/body.ts `DECODERS`). */
 const DISPLAY_DECODED = new Set(['gzip', 'x-gzip', 'deflate', 'br']);
@@ -57,9 +63,33 @@ export function requestBodyHash(body: Body | undefined): string | undefined {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-/** True when this exchange can be replayed faithfully (finished HTTP with a status and a complete body). */
+/**
+ * True when this exchange can be replayed faithfully: finished HTTP with a status and a complete body, a WebSocket
+ * upgrade (101) or an SSE stream (CONTRACTS §14.5).
+ */
 export function isReplayable(e: Exchange): boolean {
-  return typeof e.status === 'number' && !e.kind && !e.responseBody?.truncated;
+  if (typeof e.status !== 'number') return false;
+  if (e.kind === 'websocket') return e.status === 101;
+  if (e.kind === 'sse') return true;
+  return !e.kind && !e.responseBody?.truncated;
+}
+
+function copyFrames(e: Exchange): NonNullable<ReplayEntry['frames']> {
+  const keep = e.kind === 'sse' ? (k: string) => k === 'event' : (k: string) => k !== 'event';
+  return (e.frames ?? [])
+    .filter((f) => keep(f.kind))
+    .map((f) => ({
+      dir: f.dir,
+      at: f.at,
+      kind: f.kind,
+      size: f.size,
+      ...(f.text !== undefined ? { text: f.text } : {}),
+      ...(f.base64 !== undefined ? { base64: f.base64 } : {}),
+      ...(f.truncated ? { truncated: true as const } : {}),
+      ...(f.event !== undefined ? { event: f.event } : {}),
+      ...(f.id !== undefined ? { id: f.id } : {}),
+      ...(f.closeCode !== undefined ? { closeCode: f.closeCode } : {}),
+    }));
 }
 
 /**
@@ -68,6 +98,12 @@ export function isReplayable(e: Exchange): boolean {
  * decoded body and kept when the body is still encoded (`isStillEncoded`). Exchanges whose
  * response body was truncated by the 5 MB display cap are skipped: replaying half a body would be worse than the
  * fallback. A request body that was truncated gives no hash (it could never match).
+ *
+ * CONTRACTS §14.5: a WebSocket exchange becomes `{kind: 'websocket', frames, method, url (ws/wss), status: 101,
+ * headers}` without the handshake headers the local server computes (`sec-websocket-accept`, `-extensions`,
+ * `-version`, `upgrade`; `sec-websocket-protocol` is kept); an SSE exchange becomes `{kind: 'sse', frames, …}` with
+ * its head minus framing and `content-encoding` (the events are decoded text) and the request body hash of a POST
+ * stream. Frames are copies in recorded order (`at` epoch ms; the proxy uses the gaps).
  */
 export function toReplay(rec: Recording): ReplayEntry[] {
   return [...rec.entries]
@@ -76,16 +112,21 @@ export function toReplay(rec: Recording): ReplayEntry[] {
     .filter(({ e }) => isReplayable(e))
     .map(({ e }) => {
       const headers: Record<string, string | string[]> = {};
-      const keepEncoding = isStillEncoded(e.responseBody, e.responseHeaders);
+      const stream = e.kind === 'websocket' || e.kind === 'sse' ? e.kind : undefined;
+      const keepEncoding = !stream && isStillEncoded(e.responseBody, e.responseHeaders);
       for (const [k, v] of Object.entries(e.responseHeaders ?? {})) {
         const lk = k.toLowerCase();
         if (FRAMING_HEADERS.has(lk) || (lk === 'content-encoding' && !keepEncoding)) continue;
+        if (stream === 'websocket' && WS_HANDSHAKE_HEADERS.has(lk)) continue;
         Object.defineProperty(headers, k, { value: Array.isArray(v) ? [...v] : v, enumerable: true, writable: true, configurable: true });
       }
       const hash = e.requestBody?.truncated ? undefined : requestBodyHash(e.requestBody);
       const entry: ReplayEntry = { method: e.method.toUpperCase(), url: e.url, status: e.status!, headers };
-      if (e.responseBody) entry.body = { text: e.responseBody.text, encoding: e.responseBody.encoding };
-      if (hash) entry.requestBodyHash = hash;
+      if (stream) {
+        entry.kind = stream;
+        entry.frames = copyFrames(e);
+      } else if (e.responseBody) entry.body = { text: e.responseBody.text, encoding: e.responseBody.encoding };
+      if (hash && stream !== 'websocket') entry.requestBodyHash = hash;
       return entry;
     });
 }

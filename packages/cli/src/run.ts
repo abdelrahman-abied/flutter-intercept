@@ -4,6 +4,8 @@
  * Every step after the proxy starts is undone in `finally` (proxy stopped, adb reverse removed, wrappers and the CA
  * deleted), also on Ctrl-C (SIGINT / SIGTERM / SIGHUP); `onExit` removes the temp CA, wrappers and adb reverse if the
  * process ends any other way (REVIEW-7 #13).
+ * Physical iPhone (`test` only, CONTRACTS §14.1): the proxy also listens on the LAN address with a per-run token
+ * (lan.ts), closed in `finally`; the token is never printed and never written to an output.
  */
 import { execFileSync, spawn as nodeSpawn } from 'child_process';
 import * as fs from 'fs';
@@ -21,6 +23,7 @@ import { kindFromId, listFlutterDevices, pickDevice, proxyRouteFor, type Flutter
 import { isIntegrationTestPath, prepareEntries, resolveRunTargets, resolveTestTargets, type PreparedEntries } from './entries';
 import { toJunitXml } from './junit';
 import { loadReplay, writeHarFile, writeOutput, writeRecording } from './outputs';
+import { isVerboseFlutter, LAN_NOTES, lanAddressForIphone, lanProxyAddress, newRunToken, resolveLanHost, withoutProxyAuthorization, type LanAddress } from './lan';
 import { loadRules } from './rules';
 import { assertionsTable, trafficTable } from './summary';
 import type { CliOptions, CliResult } from './types';
@@ -60,6 +63,10 @@ export interface RunDeps {
   onExit?(fn: () => void): () => void;
   /** Grace period before a signal is forwarded to flutter, and before it is killed. */
   killGraceMs?: { forward: number; kill: number };
+  /** This machine's LAN address for a physical iPhone (default: the default-route RFC 1918 IPv4). */
+  lanAddress?(): Promise<LanAddress>;
+  /** The LAN token (default: 32 random bytes, base64url). */
+  newToken?(): string;
 }
 
 export function defaultDeps(version: string): RunDeps {
@@ -80,6 +87,8 @@ export function defaultDeps(version: string): RunDeps {
       process.on('exit', fn);
       return () => process.off('exit', fn);
     },
+    lanAddress: () => lanAddressForIphone(),
+    newToken: newRunToken,
   };
 }
 
@@ -185,6 +194,19 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
   }
   const route = device ? proxyRouteFor(device.kind, device.id) : { ok: true as const, host: 'localhost', adbReverse: false };
   if (!route.ok) throw new SetupError(route.reason);
+  let lanHost: string | undefined;
+  if (route.lan) {
+    if (o.command === 'run') {
+      throw new SetupError(
+        `${device!.id} is a physical iPhone: \`run\` would have to print the LAN token in the flutter command, so it only works with \`test\` (or the editor). Use an iOS simulator for \`run\`.`,
+      );
+    }
+    try {
+      lanHost = await resolveLanHost(deps.lanAddress ?? (() => lanAddressForIphone()));
+    } catch (e) {
+      throw new SetupError((e as Error).message);
+    }
+  }
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'flutter-intercept-run-'));
   fs.chmodSync(tmp, 0o700);
@@ -194,6 +216,7 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
   let evicted = 0;
   let interrupted: Signal | undefined;
   let reversedOn: string | undefined;
+  let lanOpen = false;
   let child: ChildLike | undefined;
   let stopWaiting: (() => void) | undefined;
   let forwardTimer: NodeJS.Timeout | undefined;
@@ -247,7 +270,24 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
       throw new SetupError(`could not start the proxy${o.port ? ` on port ${o.port}` : ''}: ${(e as Error).message}`);
     }
     const port = proxy.port;
-    log(`proxy on 127.0.0.1:${port}${device ? `, device ${device.id} (${device.kind}) reaches it at ${route.host}:${port}` : ''}`);
+    let proxyAddr = `${route.host}:${port}`;
+    if (lanHost && device) {
+      const token = (deps.newToken ?? newRunToken)();
+      let bound: { host: string; port: number };
+      try {
+        bound = await proxy.openLan({ host: lanHost, token });
+      } catch (e) {
+        throw new SetupError(`physical iPhone: could not listen on ${lanHost}: ${(e as Error).message}`);
+      }
+      lanOpen = true;
+      proxyAddr = lanProxyAddress({ ...bound, token });
+      proxy.on('lan-peer', (ip: string) => log(`iPhone connected from ${ip}; the LAN listener now accepts only that address`));
+      log(`proxy on 127.0.0.1:${port}, device ${device.id} (${device.kind}) reaches it over the LAN at ${bound.host}:${bound.port} (token-protected, this run only)`);
+      for (const n of LAN_NOTES) log(n);
+      if (isVerboseFlutter(o.flutterArgs)) log('flutter -v prints dart-define values, which include this run\'s LAN token (it stops working when the run ends)');
+    } else {
+      log(`proxy on 127.0.0.1:${port}${device ? `, device ${device.id} (${device.kind}) reaches it at ${route.host}:${port}` : ''}`);
+    }
 
     let loaded;
     try {
@@ -286,7 +326,6 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
     }
 
     entries = await prepareEntries({ programs, projectRoot, proxyPort: port, caCertPem: ca.cert, wrap: o.command === 'test' });
-    const proxyAddr = `${route.host}:${port}`;
     const { args: extra, dropped } = stripOwnDefines(o.flutterArgs);
     for (const d of dropped) log(`ignored ${d} (set by flutter-intercept)`);
 
@@ -319,6 +358,8 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
     // let the last responses finish recording
     await settle(proxy, 2000);
     exchanges = proxy.getExchanges();
+    // Plain-HTTP requests from the iPhone carry the token in Proxy-Authorization: never in a HAR / recording.
+    if (lanOpen) exchanges = withoutProxyAuthorization(exchanges);
   } finally {
     clearTimeout(forwardTimer);
     clearTimeout(killTimer);
@@ -328,6 +369,7 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
     entries?.cleanup();
     await adb.removeAll().catch(() => undefined);
     reversedOn = undefined;
+    if (lanOpen) await proxy?.closeLan().catch((e) => log(`closing the LAN listener: ${(e as Error).message}`));
     await proxy?.stop().catch((e) => log(`proxy stop: ${(e as Error).message}`));
     fs.rmSync(tmp, { recursive: true, force: true });
     removeExitHook?.();

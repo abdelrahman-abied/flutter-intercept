@@ -18,7 +18,11 @@ import {
 
 export type DapRequest = (command: string, args: unknown) => PromiseLike<unknown>;
 
-export interface VmWatcherDeps extends VmCoreDeps {
+export interface VmWatcherDeps extends Omit<VmCoreDeps, 'nativeRouted' | 'nativeRouteFailed'> {
+  /** CONTRACTS §14.7: the host routes this session's native clients through the proxy (Android emulator global proxy). */
+  nativeRouted?(sessionId: string): boolean;
+  /** CONTRACTS §14.7: a routed native client of this session rejected the proxy's certificate: stop routing it. */
+  nativeRouteFailed?(sessionId: string, client: string | undefined): void;
   /** WebSocket constructor for the direct transport (profile mode, background-isolate install); undefined = DAP only. */
   webSocket?: WebSocketCtor;
   /** Per-isolate budget of the background-isolate installer, ms (tests). */
@@ -176,8 +180,11 @@ export function createSessionWatcher(deps: VmWatcherDeps): VmWatcher & SessionFe
         return;
       }
       e.transport = transport;
+      const { nativeRouted, nativeRouteFailed, ...coreDeps } = deps;
       e.core = createVmSessionCore(sessionId, {
-        ...deps,
+        ...coreDeps,
+        nativeRouted: nativeRouted ? () => nativeRouted(sessionId) : undefined,
+        nativeRouteFailed: nativeRouteFailed ? (client) => nativeRouteFailed(sessionId, client) : undefined,
         installStatus: (isolateId) => (e.installer ? e.installer.status(isolateId, INSTALL_STATUS_WAIT_MS) : Promise.resolve(undefined)),
       });
       deps.log(`vm[${sessionId.slice(0, 8)}]: watching via ${transport.kind === 'dap' ? "Dart-Code's debug adapter" : 'the VM service WebSocket'}`);

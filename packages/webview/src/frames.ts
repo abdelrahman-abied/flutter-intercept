@@ -11,6 +11,7 @@
 import type { Exchange, Frame } from './protocol';
 import { formatJson } from './json';
 import { formatBytes } from './util';
+import { tunnelTitle } from './connection';
 
 export type { Frame } from './protocol';
 
@@ -24,10 +25,11 @@ export function frameTotal(ex: Pick<Exchange, 'frames' | 'framesDropped'>): numb
   return (ex.framesDropped ?? 0) + (ex.frames?.length ?? 0);
 }
 
-export const KIND_BADGE: Record<NonNullable<Exchange['kind']>, string> = { websocket: 'WS', sse: 'SSE' };
+export const KIND_BADGE: Record<NonNullable<Exchange['kind']>, string> = { websocket: 'WS', sse: 'SSE', tunnel: 'TLS' };
 
-/** Tooltip of a WS / SSE list badge: "WebSocket · 12 messages (3 dropped) · open". */
-export function kindTitle(ex: Pick<Exchange, 'kind' | 'frames' | 'framesDropped' | 'state'>): string {
+/** Tooltip of a WS / SSE list badge: "WebSocket · 12 messages (3 dropped) · open" (tunnels: CONTRACTS §14.2). */
+export function kindTitle(ex: Pick<Exchange, 'kind' | 'frames' | 'framesDropped' | 'state'> & Partial<Pick<Exchange, 'url' | 'tunnelBytes'>>): string {
+  if (ex.kind === 'tunnel') return tunnelTitle({ url: ex.url ?? '', state: ex.state, tunnelBytes: ex.tunnelBytes });
   const what = ex.kind === 'websocket' ? 'WebSocket' : 'Server-sent events';
   const n = frameTotal(ex);
   const unit = ex.kind === 'sse' ? 'event' : 'message';

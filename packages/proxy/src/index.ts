@@ -22,8 +22,14 @@ export {
 } from './rules';
 export type { PickedStep, StepAction } from './rules';
 export { requestBodyHash } from './replay';
-export { parseUpstreamProxy } from './upstream-proxy';
+export { parseUpstreamProxy, parseNoProxy } from './upstream-proxy';
 export type { UpstreamProxyConfig } from './upstream-proxy';
+// v0.8.0 (CONTRACTS §14)
+export { parseHostPattern, matchesHostPattern } from './hosts';
+export type { HostPattern } from './hosts';
+export { loadClientCertificate } from './intercept-proxy';
+export { MAX_REPLAY_GAP_MS } from './replay-stream';
+export { IDLE_SOCKET_TIMEOUT_MS } from './idle';
 export { detectGraphql, graphqlOperationNames, scanOperations } from './graphql';
 export type { GraphqlDetection, GraphqlOperationRef, GraphqlRequest } from './graphql';
 export { diagnoseCors, isPreflight, isCorsRequest, preflightResponseHeaders, corsResponseHeaders } from './cors';

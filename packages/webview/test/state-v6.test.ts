@@ -303,7 +303,9 @@ describe('scenarios helpers', () => {
     expect(isRecordable(ex({ state: 'mocked' }))).toBe(true);
     expect(isRecordable(ex({ state: 'pending' }))).toBe(false);
     expect(isRecordable(ex({ state: 'paused-response' }))).toBe(false);
-    expect(isRecordable(ex({ kind: 'websocket' }))).toBe(false);
+    expect(isRecordable(ex({ kind: 'websocket' }))).toBe(true); // CONTRACTS §14.5: closed streams are recorded
+    expect(isRecordable(ex({ kind: 'websocket', state: 'pending' }))).toBe(false);
+    expect(isRecordable(ex({ kind: 'tunnel' }))).toBe(false);
     expect(isRecordable(ex({ captured: 'vm-profile' }))).toBe(false);
     expect(sortRecordings([rec('b', 1, { name: 'B' }), rec('a', 1, { name: 'A' }), rec('c', 2)]).map((r) => r.id)).toEqual(['c', 'a', 'b']);
     expect(recordingNameError('  ')).toMatch(/name/);

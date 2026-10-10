@@ -25,8 +25,9 @@ Commands:
 
 Options:
   -d, --device <id>              Flutter device id. Android emulators use 10.0.2.2, physical Android
-                                 devices adb reverse, macOS / iOS simulators localhost. Physical iOS
-                                 devices are not supported (LAN mode is editor-only).
+                                 devices adb reverse, macOS / iOS simulators localhost. A physical
+                                 iPhone (test only) reaches a token-protected listener on this
+                                 machine's LAN address for the length of the run.
   -p, --project <dir>            Flutter project root (default: nearest pubspec.yaml from the cwd).
       --port <n>                 Proxy port on 127.0.0.1 (default: a free port).
       --rules <file>             Shared rules file (default: .vscode/flutter-intercept.json when present).

@@ -11,11 +11,16 @@ export interface RecordingMeta {
   /** Where it lives: `.dart_tool/flutter_intercept/recordings/<id>.json` (not committed) unless the user exported it. */
   path: string;
   redacted: boolean;     // saved with secrets redacted (replay then sends "[redacted]" values)
+  /** CONTRACTS §14.5: WebSocket / SSE exchanges among `exchanges`, and their frames in total (absent in 0.6/0.7 files). */
+  streams?: number;
+  frames?: number;
 }
 
 export interface Recording extends RecordingMeta {
-  version: 1;
-  entries: Exchange[];   // finished HTTP exchanges only (no WebSocket / SSE / vm-profile)
+  /** 1 = HTTP only (0.6/0.7); 2 = may contain WebSocket / SSE entries with frames (CONTRACTS §14.5). Older versions
+   * refuse 2 by its number instead of failing on an entry. */
+  version: 1 | 2;
+  entries: Exchange[];   // finished HTTP, WebSocket and SSE exchanges (no tunnels / vm-profile / browser-internal)
 }
 
 export interface RecordingDiffEntry {

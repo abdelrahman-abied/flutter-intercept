@@ -1441,3 +1441,38 @@ counts per route and message-type changes. Agents: `save_recording` includes the
 - **Flutter Web DIRECT fallback**: replace `--proxy-server` with `--proxy-pac-url=data:…` returning
   `PROXY 127.0.0.1:<port>; DIRECT` (loopback still bypassed) if Chrome honours it for a temp profile; `web-server` device:
   a one-time notice with the manual browser flags (never automatic).
+
+### 14.8 As built (v0.8.0)
+- **CI** (docs/spikes/ci.md): root `action.yml` builds from the action checkout (`npm ci --ignore-scripts`, proxy + CLI),
+  passes inputs only as `FI_INPUT_*` env, runs `dist/action.js` (in-process `cli.main`), uploads with
+  `actions/upload-artifact@v7` (`if: always()`); extra inputs `replay-fallback`, `artifact-name`, `upload-artifacts`, outputs
+  `exit-code`, `har`, `junit`, `record`; no `no-redact` input. Physical iPhones: LAN listener on the private
+  default-route IPv4 only, token masked everywhere (`flutter-intercept:***@…`), `run -d <iPhone>` refused. npm name
+  `flutter-intercept-cli` (not published), the proxy bundled (devDependency).
+- **TLS passthrough** (docs/spikes/proxy-0.8.md): our own `connect` listener replaces mockttp's on the combo server and
+  hands other CONNECTs back unchanged. Tunnel URLs always carry the port; open tunnels are `pending` with no status.
+  Block / faults / offline / replay-`fail` cut the tunnel **after** the real TLS handshake, at the app's first record
+  (failing the CONNECT would make dart:io fall back to DIRECT); a status block becomes a reset with a note. Rules match
+  method CONNECT on the tunnel URL (port 443 also without the port). Host patterns: `*` matches dots, bare `*` refused.
+- **mTLS**: a lookup feeds mockttp's per-host client-certificate map, first matching pattern wins;
+  `setClientCertificates()` returns per-entry status (plain-words problems, never throws for a bad entry). The host loads
+  files (`src/ui/clientCerts.ts`: workspace-relative paths stay inside their folder, regular files ≤ 1 MB, opened
+  non-blocking, test-loaded with `tls.createSecureContext`); passphrases under `flutterIntercept.clientCertificatePassphrase:<host>`.
+- **Throttling**: throttle rules and the profile apply to `ws(s)://` (frames paced per direction, `dropRate` resets the
+  upgrade); SSE events delayed by latency (first event 2×). Presets: Slow 3G 400/400, Fast 3G 1600/750 kbps.
+- **WS/SSE recordings**: format `version: 2` when a recording contains streams (1 otherwise); WebSocket replay is keyed to
+  the order of the app's messages; redacted binary frames replay as zero bytes of the recorded size (≤ 64 KB).
+- **Upstream**: `noProxy` on `setUpstreamProxy`; VS Code's `http.proxy` / `http.noProxy` read from user settings only
+  (ignored when `http.proxySupport` is `off`); `https://` / `socks://` VS Code proxies → a problem, traffic direct.
+  Idle pooled sockets close after 30 s; one retry on a reused socket for idempotent requests (body ≤ 1 MB).
+- **Web** (docs/spikes/web.md): `data:` PAC URLs are split by flutter_tools at commas, so a loopback `PacServer` serves
+  `/flutter-intercept-<port>.pac` (`PROXY 127.0.0.1:<port>; DIRECT`, 404 for stale ports, Host-checked); Chrome stays
+  DIRECT ~5 min after the proxy returns on the same port. Web sessions also get `--web-browser-debug-port=<free port>`
+  (CDP screenshots, loopback only, method `devtools`). The web-server notice copies a manual Chrome command (temp
+  profile, `--proxy-server`) only on click.
+- **Native / vm** (docs/spikes/native-proxy.md, background-isolates.md): `nativeClients: "proxy"` routes Android
+  **emulators** only (global proxy `put :0` then delete on release, state persisted for `recover()`, never over someone
+  else's proxy, turned off on the first TLS trust failure); HTTPS needs the app's debug `network_security_config` to
+  trust the CA (**Save CA Certificate…**). iOS simulators can't be routed without changing the Mac's proxy; profile-mode
+  isolates and `spawnUri` stay warn-only. Bypass detection watches main-isolate HTTP logging for 60 s after each main
+  isolate start (all session when package:http_profile is loaded). Screenshots: VM route → `devicectl` → `idevicescreenshot`.

@@ -22,6 +22,7 @@ import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
 import * as os from 'os';
+import { keepAliveOptions } from './idle';
 import { currentRoutes, type RouteTable } from './routes';
 import { isTraceHost } from './trace';
 
@@ -474,6 +475,19 @@ export function onComboConnection(socket: net.Socket): void {
   if (info.gate.closed || info.state === 'plain') socket.destroy();
 }
 
+/**
+ * CONTRACTS §14.2: may a CONNECT on this socket be tunnelled by the proxy itself (TLS passthrough)? Not on a closed
+ * gate's socket, nor a CONNECT that follows plain requests on a LAN keep-alive connection (it never went through the
+ * gate; onComboConnection refuses those too). Non-LAN sockets: yes.
+ */
+export function lanConnectAllowed(socket: unknown): boolean {
+  const raw = lanSockets.get(socket as object);
+  const info = raw ?? walk(socket);
+  if (!info) return true;
+  if (info.gate.closed) return false;
+  return !raw || info.state === 'connect' || info.state === 'connect-handing';
+}
+
 // ---------------------------------------------------------------- gate
 
 export interface LanGateCallbacks {
@@ -504,8 +518,8 @@ export class LanGate {
     private readonly cb: LanGateCallbacks,
   ) {
     this.agents = {
-      http: new GuardedHttpAgent({ keepAlive: true }, host),
-      https: new GuardedHttpsAgent({ keepAlive: true }, host),
+      http: new GuardedHttpAgent(keepAliveOptions(), host),
+      https: new GuardedHttpsAgent(keepAliveOptions(), host),
     };
   }
 

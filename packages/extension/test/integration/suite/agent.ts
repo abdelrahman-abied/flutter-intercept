@@ -1046,6 +1046,71 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
       console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
     }
 
+    // v0.8.0 (CONTRACTS §14.2 / §14.3) over MCP: a TLS passthrough host is listed as a tunnel (not decrypted, bytes
+    // counted, get_request explains, get_frames refused); get_status lists the passthrough hosts and a client
+    // certificate that can't load (pattern + problem, never the path).
+    for (const dev of devices) {
+      const out: RunOutcome = { name: `AGENT ${dev} v0.8.0 over MCP: TLS passthrough tunnel, client-certificate status`, output: '', proxyHits: [], failures: [], ms: 0 };
+      const f = out.failures;
+      const t0 = Date.now();
+      let sessionId: string | undefined;
+      const notes: string[] = [];
+      const fiCfg = vscode.workspace.getConfiguration('flutterIntercept');
+      const HOST = 'jsonplaceholder.typicode.com';
+      const MISSING = `/nonexistent-fi-suite-${Date.now()}/client.p12`;
+      try {
+        await fiCfg.update('tlsPassthrough', [HOST], vscode.ConfigurationTarget.Global);
+        await fiCfg.update('clientCertificates', [{ host: 'mtls.fi-suite.invalid', pfx: MISSING }], vscode.ConfigurationTarget.Global);
+        await sleep(1000);
+        client = await connect();
+        const st = await mcpCall('get_status', {});
+        if (st.isError || !(st.result.tlsPassthrough ?? []).includes(HOST)) f.push(`get_status tlsPassthrough: ${JSON.stringify(st.result.tlsPassthrough)}`);
+        const certs: any[] = st.result.clientCertificates ?? [];
+        const c0 = certs.find((c) => c.host === 'mtls.fi-suite.invalid');
+        if (!c0 || c0.loaded !== false || !/not found/.test(c0.problem ?? '')) f.push(`get_status clientCertificates: ${JSON.stringify(certs).slice(0, 300)}`);
+        if (st.text.includes(MISSING)) f.push('get_status leaks the certificate path');
+        const since = Date.now();
+        const l = await mcpCall('launch_app', { deviceId: dev });
+        sessionId = l.result.sessionId;
+        if (l.isError || !sessionId) throw new Error(`launch_app: ${l.text.slice(0, 200)}`);
+        let tunnel: any;
+        for (const deadline = Date.now() + 120_000; !tunnel && Date.now() < deadline; ) {
+          const r = await mcpCall('list_requests', { kind: 'tunnel', sinceMs: since });
+          // the app keeps its connection alive: an open tunnel that already carried the response counts too
+          tunnel = (r.result.items ?? []).find((i: any) => String(i.url).includes(HOST) && (i.bytesReceived ?? 0) > 0);
+          if (!tunnel) await sleep(500);
+        }
+        if (!tunnel) f.push(`no tunnel to ${HOST} carried data`);
+        if (tunnel) {
+          if (tunnel.method !== 'CONNECT' || tunnel.notDecrypted !== true || !(tunnel.bytesSent > 0)) f.push(`tunnel summary: ${JSON.stringify(tunnel).slice(0, 300)}`);
+          const d = await mcpCall('get_request', { id: tunnel.id });
+          if (d.isError || !/without decryption/.test(d.result.tunnel?.notDecrypted ?? '') || d.result.responseBody || d.result.requestBody) f.push(`get_request tunnel: ${d.text.slice(0, 300)}`);
+          const fr = await mcpCall('get_frames', { id: tunnel.id });
+          if (!fr.isError) f.push('get_frames on a tunnel was not refused');
+          notes.push(`tunnel ${tunnel.bytesSent}/${tunnel.bytesReceived} bytes`);
+        }
+        // Nothing to the passthrough host was decrypted.
+        const plain = await mcpCall('list_requests', { url: `https://${HOST}/*`, kind: 'http', sinceMs: since });
+        if (plain.isError || plain.result.total !== 0) f.push(`decrypted requests to a passthrough host: ${plain.text.slice(0, 200)}`);
+        const s2 = await mcpCall('stop_app', { sessionId });
+        if (s2.isError || s2.result.stopped !== 1) f.push(`stop_app: ${s2.text.slice(0, 200)}`);
+        else sessionId = undefined;
+        out.output = notes.join('; ');
+      } catch (e) {
+        f.push(`exception: ${(e as Error).message}`);
+        out.output = notes.join('; ');
+      } finally {
+        if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
+        await Promise.resolve(fiCfg.update('tlsPassthrough', undefined, vscode.ConfigurationTarget.Global)).catch(() => undefined);
+        await Promise.resolve(fiCfg.update('clientCertificates', undefined, vscode.ConfigurationTarget.Global)).catch(() => undefined);
+        await client?.close().catch(() => undefined);
+        client = undefined;
+      }
+      out.ms = Date.now() - t0;
+      results.push(out);
+      console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+    }
+
     // Access: readOnly blocks writes on both doors; off stops the MCP server.
     {
       const out: RunOutcome = { name: 'AGENT access: readOnly blocks add_mock (LM + MCP), off stops MCP', output: '', proxyHits: [], failures: [], ms: 0 };

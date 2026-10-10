@@ -107,6 +107,17 @@ export function openApiProblems(doc: Json): string[] {
         }
       };
       if (o.requestBody) content((o.requestBody as Json).content, `${where} request`);
+      // CONTRACTS §14.6: every security requirement names a declared scheme with an empty scope list
+      const schemes = ((doc.components as Json | undefined)?.securitySchemes ?? {}) as Json;
+      if (o.security !== undefined) {
+        if (!Array.isArray(o.security) || !o.security.length) out.push(`${where}: security`);
+        for (const req of (o.security as Json[]) ?? []) {
+          for (const [name, scopes] of Object.entries(req)) {
+            if (!(name in schemes)) out.push(`${where}: security scheme ${name} not declared`);
+            if (!Array.isArray(scopes) || scopes.length) out.push(`${where}: security scopes for ${name}`);
+          }
+        }
+      }
       const responses = o.responses as Json;
       if (!responses || !Object.keys(responses).length) out.push(`${where}: no responses`);
       for (const [code, r] of Object.entries(responses ?? {})) {
@@ -115,6 +126,16 @@ export function openApiProblems(doc: Json): string[] {
         content((r as Json).content, `${where} ${code}`);
       }
     }
+  }
+  for (const [name, sc] of Object.entries(((doc.components as Json | undefined)?.securitySchemes ?? {}) as Json)) {
+    if (!/^[A-Za-z0-9._-]+$/.test(name)) out.push(`securityScheme name ${name}`);
+    const s = sc as Json;
+    if (s.type === 'http') {
+      if (s.scheme !== 'bearer' && s.scheme !== 'basic') out.push(`securityScheme ${name}: scheme`);
+    } else if (s.type === 'apiKey') {
+      if (s.in !== 'header' && s.in !== 'query') out.push(`securityScheme ${name}: in`);
+      if (typeof s.name !== 'string' || !s.name) out.push(`securityScheme ${name}: name`);
+    } else out.push(`securityScheme ${name}: type`);
   }
   return out;
 }

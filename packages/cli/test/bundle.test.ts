@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { beforeAll, describe, expect, it } from 'vitest';
 
@@ -38,4 +39,43 @@ describe('dist/cli.js', () => {
     expect(bad.status).toBe(2);
     expect(bad.stderr).toContain('unknown option --nope');
   });
+
+  it.skipIf(process.platform === 'win32')('dist/action.js (the GitHub Action entry) runs dist/cli.js with the FI_INPUT_* inputs and writes the outputs', () => {
+    const action = path.join(root, 'dist', 'action.js');
+    expect(fs.statSync(action).size).toBeLessThan(200 * 1024); // loads cli.js at run time, doesn't bundle it
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fi-action-e2e-')));
+    try {
+      fs.writeFileSync(path.join(dir, 'pubspec.yaml'), 'name: app\ndependencies:\n  flutter:\n    sdk: flutter\ndev_dependencies:\n  integration_test:\n    sdk: flutter\n');
+      fs.mkdirSync(path.join(dir, 'integration_test'));
+      fs.writeFileSync(path.join(dir, 'integration_test', 'app_test.dart'), 'void main() {}\n');
+      fs.writeFileSync(path.join(dir, 'expect.json'), JSON.stringify([{ name: 'never', url: 'http://never.test/*', expect: {} }]));
+      fs.mkdirSync(path.join(dir, 'sdk', 'bin'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'sdk', 'bin', 'flutter'), '#!/bin/sh\necho "fake flutter $*" > "$FAKE_LOG"\nexit 0\n', { mode: 0o755 });
+      const outFile = path.join(dir, 'github_output');
+      const r = spawnSync(process.execPath, [action], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: {
+          PATH: process.env.PATH,
+          FLUTTER_ROOT: path.join(dir, 'sdk'),
+          FAKE_LOG: path.join(dir, 'flutter.log'),
+          GITHUB_OUTPUT: outFile,
+          FI_INPUT_DEVICE: 'macos',
+          FI_INPUT_HAR: 'build/t.har',
+          FI_INPUT_ASSERT: 'expect.json',
+          FI_INPUT_JUNIT: 'build/j.xml',
+          FI_INPUT_FLUTTER_ARGS: '--flavor dev',
+        },
+      });
+      expect(r.status).toBe(1); // the expectation fails → the step fails
+      expect(fs.readFileSync(path.join(dir, 'flutter.log'), 'utf8')).toMatch(/^fake flutter test integration_test\/\.flutter_intercept\/\S+_fi\.dart -d macos --flavor dev --dart-define=FLUTTER_INTERCEPT_PROXY=localhost:\d+ /);
+      expect(fs.existsSync(path.join(dir, 'build', 't.har'))).toBe(true);
+      expect(fs.readFileSync(path.join(dir, 'build', 'j.xml'), 'utf8')).toContain('failures="1"');
+      const outputs = fs.readFileSync(outFile, 'utf8');
+      expect(outputs).toMatch(/^exit-code<<(\S+)\n1\n\1$/m);
+      expect(outputs).toContain(`${path.join(dir, 'build', 't.har')}\n${path.join(dir, 'build', 'j.xml')}`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

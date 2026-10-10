@@ -88,3 +88,28 @@ const shot = await takeScreenshot(
 
 - Flutter Web (DWDS): not tried; the inspector route may work through Dart-Code there, otherwise "not supported".
 - Physical iPhone / Android device: same code paths as the simulator / emulator (VM route, adb), not run here.
+
+## 0.8.0: physical iPhones (CONTRACTS §14.7)
+
+Order for a physical iPhone (`00008xxx-…` / 40-hex UDID), macOS only, after the VM route (kept first, as for every
+device: Flutter content only, ~10× smaller PNGs, works in every debug session):
+1. `xcrun devicectl device capture screenshot --quiet --device <udid> --destination <tmp>/screenshot.png` —
+   Xcode's CoreDevice tool (present in Xcode 27; older Xcodes have no `capture` subcommand, which fails fast and
+   falls through). Checked against the booted iPhone 17 Pro simulator, which devicectl also lists: 1206×2622 PNG
+   in 1.26 s. Not run on a physical iPhone (none connected).
+2. `idevicescreenshot -u <udid> <tmp>/screenshot.png` (libimobiledevice) when installed: PATH, then
+   `/opt/homebrew/bin`, `/usr/local/bin` (VS Code started from the Dock has a minimal PATH). Flutter ships a copy in
+   `bin/cache/artifacts/libimobiledevice/`, but it is x86_64-only and its dylibs are found only through the
+   tool's `DYLD_LIBRARY_PATH`; on this Apple Silicon Mac without Rosetta it fails with "bad CPU type", so PATH
+   entries under `bin/cache/artifacts/` are skipped. Old iOS versions answer TIFF: refused as "not a PNG". Needs
+   the developer disk image mounted (true after any Xcode run on the device). Not installed here: unit-tested with
+   fakes only.
+Both write into a fresh `mkdtemp` folder that is removed afterwards; the file is `lstat`ed (regular, ≤ 16 MB) and
+checked for the PNG signature; the result is saved with the REVIEW-7 rules (0600 in a 0700 folder, newest 50 kept).
+Failures list every route ("devicectl: …; idevicescreenshot: not installed"). Deviation from the spec's wording
+("idevicescreenshot when installed, else the VM route"): the VM route stays first for consistency with Android /
+simulators, and devicectl comes before idevicescreenshot because it needs no extra install and supports current
+iOS through CoreDevice.
+
+`Screenshot.method` needs `'devicectl'` as well (lead-owned `src/screenshot/types.ts` has `'idevicescreenshot'`; the code
+casts until then).

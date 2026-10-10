@@ -6,6 +6,7 @@ import type { MutateOp } from '@flutter-intercept/proxy/types';
 import { canResend, describeMutateOp, resendRequest, SNIPPET_FORMATS, SNIPPET_LABEL, unsendableBody } from '../state';
 import { corsRuleFor, isNative, NATIVE_READ_ONLY, routeGlob } from '../coverage';
 import { splitUrl } from '../util';
+import { isTunnel, TUNNEL_NO_ACTION } from '../connection';
 import { expireTokenLabel } from '../scenarios';
 import type { MenuItem } from './bits';
 
@@ -28,7 +29,7 @@ export interface ExchangeActions {
   menuItems: MenuItem[];
   resendDisabled?: string; // reason when "Resend" can't be used
   /** Why each intercept action can't be used for this exchange (absent = it can). */
-  off: { mock?: string; block?: string; breakpoint?: string; edit?: string; generate?: string };
+  off: { mock?: string; block?: string; breakpoint?: string; edit?: string; generate?: string; copy?: string; expire?: string };
   /** CONTRACTS §11.3: insert a dev-only `cors` rule for this route FIRST (undoable); credentials only if asked. */
   addCorsRule: (credentials: boolean) => void;
   /** CONTRACTS §12.3 preset: the next `count` requests to `url` get 401 token_expired, then pass through. */
@@ -41,7 +42,11 @@ const WS_NO_RESEND = 'A WebSocket connection can\'t be resent';
 /** Why "Mock this" / "Block this" / … can't be used for `ex` (native exchanges are read-only). */
 export function interceptOff(ex: Exchange): ExchangeActions['off'] {
   if (isNative(ex)) {
-    return { mock: NATIVE_READ_ONLY, block: NATIVE_READ_ONLY, breakpoint: NATIVE_READ_ONLY, edit: NATIVE_READ_ONLY, generate: NATIVE_READ_ONLY };
+    return { mock: NATIVE_READ_ONLY, block: NATIVE_READ_ONLY, breakpoint: NATIVE_READ_ONLY, edit: NATIVE_READ_ONLY, generate: NATIVE_READ_ONLY, expire: NATIVE_READ_ONLY };
+  }
+  // CONTRACTS §14.2: a TLS passthrough tunnel has no request to mock, pause, copy or resend — only Block applies.
+  if (isTunnel(ex)) {
+    return { mock: TUNNEL_NO_ACTION, breakpoint: TUNNEL_NO_ACTION, edit: TUNNEL_NO_ACTION, generate: TUNNEL_NO_ACTION, copy: TUNNEL_NO_ACTION, expire: TUNNEL_NO_ACTION };
   }
   const off: ExchangeActions['off'] = {};
   if (ex.kind === 'websocket') {
@@ -74,11 +79,14 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
   const { state, dispatch, post } = useApp();
   const off = interceptOff(ex);
   const copy = (format: SnippetFormat) => {
+    if (off.copy) return;
     post({ type: 'copySnippet', id: ex.id, format });
     dispatch({ type: 'notice', text: `Copied as ${SNIPPET_LABEL[format]}`, short: true });
   };
   const resendDisabled = isNative(ex)
     ? NATIVE_READ_ONLY
+    : isTunnel(ex)
+      ? TUNNEL_NO_ACTION
     : ex.kind === 'websocket'
       ? WS_NO_RESEND
       : !canResend(ex)
@@ -96,7 +104,7 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
     post(f === undefined ? { type: 'openSource', id: ex.id } : { type: 'openSource', id: ex.id, frame: f });
   };
   const createRule = (kind: RuleAction['kind']) => {
-    if (isNative(ex)) return;
+    if (isNative(ex) || (kind !== 'block' && isTunnel(ex))) return;
     dispatch({ type: 'awaitRule', kind });
     post({ type: 'createRuleFromExchange', id: ex.id, action: kind });
   };
@@ -131,13 +139,15 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
     post({ type: 'setRules', rules });
   };
   const expireToken = (url: string, count: number) => {
-    if (isNative(ex)) return;
+    if (off.expire) return;
     dispatch({ type: 'awaitRule', kind: 'sequence', label: expireTokenLabel(url, count) });
     post({ type: 'expireToken', url, count });
   };
   const modelOff = off.generate ?? generateModelDisabled(ex);
   const fixtureOff = off.generate ?? generateFixtureDisabled(ex);
-  const copyItems: MenuItem[] = SNIPPET_FORMATS.map((f) => ({ label: `Copy as ${SNIPPET_LABEL[f]}`, onSelect: () => copy(f) }));
+  const copyItems: MenuItem[] = SNIPPET_FORMATS.map((f) => ({
+    label: `Copy as ${SNIPPET_LABEL[f]}`, onSelect: () => copy(f), ...(off.copy ? { disabled: true, title: off.copy } : {}),
+  }));
   const generateItems: MenuItem[] = [
     { label: 'Generate Dart model', onSelect: generateModel, disabled: !!modelOff, title: modelOff ?? 'Dart model classes from every recorded response of this route' },
     { label: 'Generate test fixture', onSelect: generateFixture, disabled: !!fixtureOff, title: fixtureOff ?? 'A JSON fixture and a test that mocks this request' },

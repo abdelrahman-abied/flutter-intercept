@@ -8,11 +8,17 @@
  * - Redaction (default on): sensitive request header values become `{{<header name>}}` variables, declared empty
  *   in `variable` for the user to fill in; other header values, URLs and bodies are redacted like HAR exports
  *   (CONTRACTS §8). Bodies (requests and examples) longer than `maxExampleChars` are cut, with a note.
+ * - CONTRACTS §14.6: a request that carried a credential (security.ts: bearer, basic, API key in a header or the
+ *   query) gets Postman `auth` with `{{variable}}` placeholders (`bearerToken`, `basicUsername` / `basicPassword`,
+ *   the API-key header's or parameter's name) instead of that header / query parameter; one per request, by priority
+ *   bearer → basic → other Authorization → header → query (any others stay headers / parameters). The variables are
+ *   declared empty with redaction on, and hold the latest recorded value with "Keep values".
  */
 import type { Body, Exchange } from '@flutter-intercept/proxy';
 import type { ExportOptions, ExportResult, ToPostman } from './types';
 import { prettyJson } from '../codegen/json';
 import { isSensitiveHeader, redactBodyText, redactHeaders, redactSecretValues, redactUrl, REDACTED } from '../agent/redact';
+import { credentialsOf, type Credential } from './security';
 import {
   bodyMediaType,
   cut,
@@ -57,6 +63,11 @@ function headerVariable(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9_.-]+/g, '_');
 }
 
+/** A variable name for an API-key query parameter (its name, made readable like header variables). */
+function queryVariable(name: string): string {
+  return name.replace(/[^A-Za-z0-9_.-]+/g, '_');
+}
+
 /** Postman's raw-body language from a media type. */
 function rawLanguage(mt: string): string {
   if (isJsonMediaType(mt)) return 'json';
@@ -66,10 +77,22 @@ function rawLanguage(mt: string): string {
   return 'text';
 }
 
+function authParam(key: string, value: string): Json {
+  return { key, value, type: 'string' };
+}
+
+/** Basic credentials (`base64(user:pass)`) → user and password; undefined when it doesn't decode to `user:pass`. */
+function basicParts(b64: string): { user: string; pass: string } | undefined {
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) return undefined;
+  const text = Buffer.from(b64, 'base64').toString('utf8');
+  const i = text.indexOf(':');
+  return i < 0 ? undefined : { user: text.slice(0, i), pass: text.slice(i + 1) };
+}
+
 class Builder {
   readonly notes: string[] = [];
-  /** Header variables to declare (empty), in first-use order. */
-  readonly headerVars: string[] = [];
+  /** Variables to declare, in first-use order: secret headers (empty) and request auth (empty, or the value kept). */
+  readonly vars = new Map<string, string>();
   private readonly redact: boolean;
   private readonly maxChars: number;
   /** Bodies counted for the notes (each once, though a sample's request appears in its item and examples). */
@@ -87,21 +110,51 @@ class Builder {
   finishNotes(): void {
     if (this.cutBodies.size) this.notes.push(`${plural(this.cutBodies.size, 'body', 'bodies')} cut at ${this.maxChars} characters`);
     if (this.binaryBodies.size) this.notes.push(`${plural(this.binaryBodies.size, 'binary body', 'binary bodies')} left out (Postman raw bodies are text)`);
-    if (this.redact && this.headerVars.length) {
-      this.notes.push(`Secret headers are variables to fill in: ${this.headerVars.map((v) => `{{${v}}}`).join(', ')}`);
+    if (this.redact && this.vars.size) {
+      this.notes.push(`Secrets are variables to fill in: ${[...this.vars.keys()].map((v) => `{{${v}}}`).join(', ')}`);
     }
   }
 
-  private requestHeaders(h: Headers | undefined): Json[] {
+  /** Declares `{{name}}`: empty with redaction on, else the first recorded value. */
+  private variable(name: string, value = ''): string {
+    if (!this.vars.has(name)) this.vars.set(name, this.redact ? '' : value);
+    return `{{${name}}}`;
+  }
+
+  /** Postman `auth` for a credential, with `{{variable}}` placeholders (CONTRACTS §14.6). */
+  private auth(c: Credential): Json {
+    switch (c.kind) {
+      case 'bearer':
+        return { type: 'bearer', bearer: [authParam('token', this.variable('bearerToken', c.value))] };
+      case 'basic': {
+        const parts = basicParts(c.value);
+        return {
+          type: 'basic',
+          basic: [authParam('username', this.variable('basicUsername', parts?.user ?? '')), authParam('password', this.variable('basicPassword', parts?.pass ?? ''))],
+        };
+      }
+      default:
+        return {
+          type: 'apikey',
+          apikey: [
+            authParam('key', c.name),
+            authParam('value', this.variable(c.kind === 'query' ? queryVariable(c.name) : headerVariable(c.name), c.value)),
+            authParam('in', c.kind === 'query' ? 'query' : 'header'),
+          ],
+        };
+    }
+  }
+
+  private requestHeaders(h: Headers | undefined, skip?: string): Json[] {
     const out: Json[] = [];
     const safe = this.redact ? redactHeaders(h) : h;
     for (const [name, v] of Object.entries(h ?? {})) {
       const lower = name.toLowerCase();
-      if (DROP_HEADERS.has(lower) || name.startsWith(':')) continue;
+      if (DROP_HEADERS.has(lower) || name.startsWith(':') || lower === skip) continue;
       const values = Array.isArray(v) ? v : [v];
       if (this.redact && isSensitiveHeader(name)) {
         const variable = headerVariable(name);
-        if (!this.headerVars.includes(variable)) this.headerVars.push(variable);
+        this.variable(variable);
         for (let i = 0; i < values.length; i++) out.push({ key: name, value: `{{${variable}}}` });
         continue;
       }
@@ -142,7 +195,7 @@ class Builder {
     return { text: c.text, mediaType };
   }
 
-  url(route: Route, s: Sample): Json {
+  url(route: Route, s: Sample, skipQuery?: string): Json {
     let u: URL | undefined;
     try {
       u = new URL(this.redact ? redactUrl(s.e.url) : s.e.url);
@@ -152,14 +205,23 @@ class Builder {
     const base = `{{${this.baseVar(route.origin)}}}`;
     const path = route.postmanPath.split('/').slice(1);
     const query: Json[] = [];
-    u?.searchParams.forEach((value, key) => query.push({ key, value }));
+    u?.searchParams.forEach((value, key) => {
+      if (key !== skipQuery) query.push({ key, value });
+    });
     const variable: Json[] = [];
     s.params.forEach((name, i) => {
       if (!name) return;
       const raw = safeDecode(s.segments[i]);
       variable.push({ key: name, value: this.redact && redactSecretValues(raw, true) !== raw ? REDACTED : raw });
     });
-    const search = u?.search ?? '';
+    let search = u?.search ?? '';
+    if (skipQuery !== undefined && search) {
+      const kept = search
+        .slice(1)
+        .split('&')
+        .filter((pair) => new URLSearchParams(pair).keys().next().value !== skipQuery);
+      search = kept.length ? `?${kept.join('&')}` : '';
+    }
     return {
       raw: `${base}${route.postmanPath}${search}`,
       host: [base],
@@ -170,7 +232,12 @@ class Builder {
   }
 
   request(route: Route, s: Sample): Json {
-    const req: Json = { method: route.method, header: this.requestHeaders(s.e.requestHeaders), url: this.url(route, s) };
+    // one credential becomes the request's auth; it is left out of the headers / query
+    const cred = credentialsOf(s.e)[0];
+    const skipHeader = cred && cred.kind !== 'query' ? cred.name.toLowerCase() : undefined;
+    const skipQuery = cred?.kind === 'query' ? cred.name : undefined;
+    const req: Json = { method: route.method, header: this.requestHeaders(s.e.requestHeaders, skipHeader), url: this.url(route, s, skipQuery) };
+    if (cred) req.auth = this.auth(cred);
     const body = this.bodyText(s.e.requestBody, s.e.requestHeaders);
     if (body) req.body = { mode: 'raw', raw: body.text, options: { raw: { language: rawLanguage(body.mediaType) } } };
     return req;
@@ -247,14 +314,14 @@ export const toPostman: ToPostman = (exchanges: readonly Exchange[], opts: Expor
   const redact = opts.redact !== false;
   const variable: Json[] = [
     ...origins.map((o) => ({ key: baseVars.get(o)!, value: o, type: 'string' })),
-    ...b.headerVars.map((key) => ({ key, value: '', type: 'string' })),
+    ...[...b.vars].map(([key, value]) => ({ key, value, type: 'string' })),
   ];
   const collection: Json = {
     info: {
       name: opts.title || 'Recorded API',
       description:
         `Generated by Flutter Intercept from ${plural(samples.length, 'recorded request')}.` +
-        (redact && b.headerVars.length ? ' Secret header values are collection variables: fill them in under Variables.' : '') +
+        (redact && b.vars.size ? ' Secret header values and credentials are collection variables: fill them in under Variables.' : '') +
         (redact ? ' Secrets in URLs and bodies are redacted.' : ''),
       schema: POSTMAN_SCHEMA,
     },

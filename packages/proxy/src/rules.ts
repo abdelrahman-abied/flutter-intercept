@@ -288,13 +288,16 @@ export function findRule(rules: CompiledRule[], method: string, url: string, bod
   return undefined;
 }
 
-/** Rule actions that apply to a WebSocket upgrade (CONTRACTS §11.1, §12.6); the others pass it through. */
-export const WEBSOCKET_ACTIONS: ReadonlySet<RuleAction['kind']> = new Set(['block', 'fault', 'mapRemote']);
+/**
+ * Rule actions that apply to a WebSocket upgrade (CONTRACTS §11.1, §12.6; throttle paces the frames, §14.4); the
+ * others pass it through.
+ */
+export const WEBSOCKET_ACTIONS: ReadonlySet<RuleAction['kind']> = new Set(['block', 'fault', 'mapRemote', 'throttle']);
 
 /**
  * Why a rule can't do what it says, for rule editors and agent tools (undefined = fine). Today: a rule whose
  * URL only matches WebSockets (`ws://` / `wss://`) with an action that doesn't apply to them (mock, breakpoint,
- * mutate, throttle, cors, script, the truncate fault), or a `graphqlOperation` on such a rule (the operation of a
+ * mutate, cors, script, the truncate fault), or a `graphqlOperation` on such a rule (the operation of a
  * GraphQL subscription is inside the frames, not in the upgrade request); a sequence step that can't be one
  * (breakpoint, sequence, script); a script without code or over MAX_SCRIPT_BYTES.
  */
@@ -311,7 +314,7 @@ export function ruleProblem(rule: Pick<Rule, 'match' | 'action'>): string | unde
     return 'The truncate fault does not apply to WebSockets; use reset, timeout or dns.';
   }
   if (kind && !WEBSOCKET_ACTIONS.has(kind)) {
-    return `${kind[0].toUpperCase()}${kind.slice(1)} rules do not apply to WebSocket connections (only block, fault and mapRemote do).`;
+    return `${kind[0].toUpperCase()}${kind.slice(1)} rules do not apply to WebSocket connections (only block, fault, throttle and mapRemote do).`;
   }
   return undefined;
 }

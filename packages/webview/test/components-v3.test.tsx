@@ -249,7 +249,7 @@ describe('network profile picker and simulation (WP5)', () => {
     await emit({ type: 'snapshot', exchanges: [ex()], rules: [], status });
     await choose($('select[aria-label="Network profile"]')!, 'custom');
     const dlg = $('.net-custom')!;
-    const [lat, kbps, drop] = Array.from(dlg.querySelectorAll('input'));
+    const [lat, kbps, , drop] = Array.from(dlg.querySelectorAll('input')); // latency, download, upload, fail
     await type(lat, '250');
     await type(kbps, '');
     await type(drop, '10');
@@ -285,7 +285,7 @@ describe('throttle / fault rules and rule lifetime (WP5, WP7)', () => {
     await click(throttle);
     const field = (label: string) => Array.from(form.querySelectorAll('label.field')).find((l) => l.querySelector('span')?.textContent === label)!.querySelector('input')!;
     await type(field('Latency (ms)'), '800');
-    await type(field('Bandwidth (kbps)'), '64');
+    await type(field('Download (kbps)'), '64');
     await type(field('Only first N requests'), '2');
     await type(field('Expires in'), '10');
     const before = Date.now();

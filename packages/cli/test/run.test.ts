@@ -1,10 +1,13 @@
+import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as http from 'http';
 import type { AddressInfo } from 'net';
 import * as os from 'os';
 import * as path from 'path';
+import * as net from 'net';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { lanIPv4Addresses } from '@flutter-intercept/proxy';
 import { flutterExecutable, flutterTestArgs, networkProfileFor, runCli, SetupError, stripOwnDefines, type ChildLike, type RunDeps } from '../src/run';
 import type { CliOptions } from '../src/types';
 
@@ -162,13 +165,13 @@ describe('runCli (fake flutter)', () => {
     expect(r.assertions).toEqual({ passed: 0, failed: 1 });
   });
 
-  it('maps the Android emulator to 10.0.2.2 and refuses physical iOS before starting anything', async () => {
+  it('maps the Android emulator to 10.0.2.2 and refuses web devices before starting anything', async () => {
     const f = fake((_a, c) => c.exit(0));
     await runCli(base({ device: 'emulator-5554' }), f.deps);
     expect(proxyOf(f.calls[0].args)).toMatch(/^10\.0\.2\.2:\d+$/);
-    const ios = fake((_a, c) => c.exit(0), [{ id: 'PHONE', targetPlatform: 'ios', emulator: false } as never]);
-    await expect(runCli(base({ device: 'PHONE' }), ios.deps)).rejects.toThrow(/physical iOS device: not supported/);
-    expect(ios.calls).toHaveLength(0);
+    const web = fake((_a, c) => c.exit(0), [{ id: 'chrome', targetPlatform: 'web-javascript' }]);
+    await expect(runCli(base({ device: 'chrome' }), web.deps)).rejects.toThrow(/web device/);
+    expect(web.calls).toHaveLength(0);
   });
 
   it('stops flutter and cleans up on SIGTERM', async () => {
@@ -258,6 +261,92 @@ describe('runCli (fake flutter)', () => {
     await expect(runCli(base({ targets: ['integration_test/missing_test.dart'] }), f.deps)).rejects.toThrow(/not found/);
     await expect(runCli(base({ project: os.tmpdir() }), f.deps)).rejects.toThrow(/no pubspec\.yaml/);
     expect(f.calls).toHaveLength(0);
+  });
+});
+
+describe('physical iPhone: LAN listener (CONTRACTS §7, §14.1)', () => {
+  const IPHONE = [{ id: 'IPHONE', name: 'Test iPhone', targetPlatform: 'ios', emulator: false }];
+  const lanIp = lanIPv4Addresses().find((a) => !a.startsWith('169.254.'));
+
+  /** GET through the LAN listener, with `auth` as Proxy-Authorization (or none). */
+  function viaLan(host: string, port: number, url: string, auth?: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const headers: Record<string, string> = { host: new URL(url).host };
+      if (auth) headers['proxy-authorization'] = auth;
+      const req = http.request({ host, port, path: url, headers, agent: false }, (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode ?? 0));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+  }
+
+  it('refuses without a LAN address, before anything starts', async () => {
+    const f = fake((_a, c) => c.exit(0), IPHONE);
+    f.deps.lanAddress = async () => undefined;
+    await expect(runCli(base({ device: 'IPHONE' }), f.deps)).rejects.toThrow(/physical iPhone: this machine has no LAN address/);
+    f.deps.lanAddress = async () => ({ problem: "this Mac's network address 100.64.0.2 (en0) is not a private (RFC 1918) LAN address" });
+    await expect(runCli(base({ device: 'IPHONE' }), f.deps)).rejects.toThrow(/not a private \(RFC 1918\) LAN address/);
+    expect(f.calls).toHaveLength(0);
+    expect(f.exitHooks).toHaveLength(0);
+  });
+
+  it('`run` is refused (it would have to print the token)', async () => {
+    fs.mkdirSync(path.join(dir, 'lib'));
+    fs.writeFileSync(path.join(dir, 'lib', 'main.dart'), 'void main() {}\n');
+    const f = fake(() => undefined, IPHONE);
+    f.deps.lanAddress = async () => ({ address: '192.168.1.20', iface: 'en0' });
+    await expect(runCli({ command: 'run', targets: [], flutterArgs: [], device: 'IPHONE' }, f.deps)).rejects.toThrow(/only works with `test`/);
+  });
+
+  it.skipIf(!lanIp)('opens a token-gated LAN listener for the run, never prints or writes the token, closes it after', async () => {
+    fs.mkdirSync(path.join(dir, '.vscode'));
+    fs.writeFileSync(
+      path.join(dir, '.vscode', 'flutter-intercept.json'),
+      JSON.stringify({ version: 1, rules: [{ id: 'm', name: 'Mock', match: { url: 'http://mocked.test/*' }, action: { kind: 'mock', status: 201, body: '{}' } }] }),
+    );
+    const token = crypto.randomBytes(32).toString('base64url');
+    let seen: { define: string; noAuth: number; wrong: number; ok: number } | undefined;
+    let lanPort = 0;
+    const f = fake(async (args, child) => {
+      const define = args.find((a) => a.startsWith('--dart-define=FLUTTER_INTERCEPT_PROXY='))!.slice('--dart-define=FLUTTER_INTERCEPT_PROXY='.length);
+      const m = /^flutter-intercept:([^@]+)@([\d.]+):(\d+)$/.exec(define)!;
+      lanPort = Number(m[3]);
+      const basic = (t: string) => `Basic ${Buffer.from(`flutter-intercept:${t}`).toString('base64')}`;
+      seen = {
+        define,
+        noAuth: await viaLan(m[2], lanPort, 'http://mocked.test/none'),
+        wrong: await viaLan(m[2], lanPort, 'http://mocked.test/wrong', basic('nope-nope-nope-nope')),
+        ok: await viaLan(m[2], lanPort, 'http://mocked.test/ok', basic(m[1])),
+      };
+      child.exit(0);
+    }, IPHONE);
+    f.deps.lanAddress = async () => ({ address: lanIp!, iface: 'en0' });
+    f.deps.newToken = () => token;
+    const r = await runCli(base({ device: 'IPHONE', har: 'out/run.har', noRedact: true, record: 'out/rec.json', flutterArgs: ['-v'] }), f.deps);
+
+    expect(seen).toEqual({ define: `flutter-intercept:${token}@${lanIp}:${lanPort}`, noAuth: 407, wrong: 407, ok: 201 });
+    expect(r.exitCode).toBe(0);
+    const printed = [...f.logs, ...f.out].join('\n');
+    expect(printed).not.toContain(token);
+    expect(printed).toContain(`--dart-define=FLUTTER_INTERCEPT_PROXY=flutter-intercept:***@${lanIp}:${lanPort}`);
+    expect(f.logs.filter((l) => l.includes('Local Network'))).toHaveLength(1);
+    expect(printed).toMatch(/flutter -v prints dart-define values/);
+    const b64 = Buffer.from(`flutter-intercept:${token}`).toString('base64');
+    for (const out of ['out/run.har', 'out/rec.json']) {
+      const text = fs.readFileSync(path.join(dir, out), 'utf8');
+      expect(text).toContain('mocked.test/ok');
+      expect(text).not.toContain(token);
+      expect(text).not.toContain(b64);
+    }
+    // the listener is gone with the run
+    await expect(
+      new Promise<void>((resolve, reject) => {
+        const s = net.connect(lanPort, lanIp!, () => (s.destroy(), resolve()));
+        s.on('error', reject);
+      }),
+    ).rejects.toThrow(/ECONNREFUSED/);
   });
 });
 

@@ -153,8 +153,10 @@ describe('toPostman', () => {
       const { res, col } = build(exchanges());
       for (const secret of ['hunter2', 'tok-1', 'k123', 'key-9', 'abcdefghijklmnop123', 's3cr3t', jwt, 'a=1']) expect(res.text).not.toContain(secret);
       const login = col.item[0].item.find((i: Json) => i.name === 'POST /login');
+      // the bearer token is the request's auth (CONTRACTS §14.6); the other credentials stay headers / parameters
+      expect(login.request.auth).toEqual({ type: 'bearer', bearer: [{ key: 'token', value: '{{bearerToken}}', type: 'string' }] });
+      expect(login.response[0].originalRequest.auth).toEqual(login.request.auth);
       expect(login.request.header).toEqual([
-        { key: 'Authorization', value: '{{authorization}}' },
         { key: 'X-Api-Key', value: '{{x-api-key}}' },
         { key: 'Cookie', value: '{{cookie}}' },
         { key: 'Cookie', value: '{{cookie}}' },
@@ -163,9 +165,9 @@ describe('toPostman', () => {
       ]);
       expect(col.variable).toEqual([
         { key: 'baseUrl', value: API, type: 'string' },
-        { key: 'authorization', value: '', type: 'string' },
         { key: 'x-api-key', value: '', type: 'string' },
         { key: 'cookie', value: '', type: 'string' },
+        { key: 'bearerToken', value: '', type: 'string' },
       ]);
       expect(login.request.url.query).toEqual([
         { key: 'api_key', value: '[redacted]' },
@@ -177,14 +179,88 @@ describe('toPostman', () => {
       // a JWT path segment is a path variable with a redacted value
       const reset = col.item[0].item.find((i: Json) => i.name === 'GET /reset/:id');
       expect(reset.request.url.variable).toEqual([{ key: 'id', value: '[redacted]' }]);
-      expect(res.notes).toContain('Secret headers are variables to fill in: {{authorization}}, {{x-api-key}}, {{cookie}}');
+      expect(res.notes).toContain('Secrets are variables to fill in: {{x-api-key}}, {{cookie}}, {{bearerToken}}');
     });
 
-    it('redact: false keeps every value and declares no header variables', () => {
+    it('redact: false keeps every value: no header variables, the auth variable holds the recorded token', () => {
       const { res, col } = build(exchanges(), { redact: false });
       for (const secret of ['hunter2', 'tok-1', 'k123', 'key-9', 'abcdefghijklmnop123', 's3cr3t', jwt]) expect(res.text).toContain(secret);
-      expect(col.variable).toEqual([{ key: 'baseUrl', value: API, type: 'string' }]);
+      expect(col.variable).toEqual([
+        { key: 'baseUrl', value: API, type: 'string' },
+        { key: 'bearerToken', value: 'abcdefghijklmnop123', type: 'string' },
+      ]);
       expect(res.notes).toEqual([]);
+    });
+  });
+
+  describe('auth (CONTRACTS §14.6)', () => {
+    // Fake credentials, built at run time.
+    const opaque = ['sk', 'live', 'Qa12Ws34Ed56Rf78Tg90Yh12Uj34Ik56'].join('_');
+    const basic = Buffer.from(['ada', 'p:ss'].join(':')).toString('base64');
+    const h = (headers: Record<string, string>) => ({ requestHeaders: { accept: 'application/json', ...headers } });
+    const items = (col: Json) => Object.fromEntries((col.item[0].item as Json[]).map((i) => [i.name, i]));
+
+    it('basic, header API key and query API key become auth with {{variable}} placeholders, removed from headers / query', () => {
+      const { res, col } = build([
+        ex('POST', `${API}/session`, 200, {}, h({ Authorization: `Basic ${basic}` })),
+        ex('GET', `${API}/items`, 200, [], h({ 'X-API-Key': opaque })),
+        ex('GET', `${API}/maps?q=cafe&api_key=${opaque}&page=2`, 200, {}),
+        ex('GET', `${API}/public`, 200, {}),
+      ]);
+      expect(res.text).not.toContain(opaque);
+      expect(res.text).not.toContain(basic);
+      const it = items(col);
+      expect(it['POST /session'].request.auth).toEqual({
+        type: 'basic',
+        basic: [
+          { key: 'username', value: '{{basicUsername}}', type: 'string' },
+          { key: 'password', value: '{{basicPassword}}', type: 'string' },
+        ],
+      });
+      expect(it['POST /session'].request.header).toEqual([{ key: 'accept', value: 'application/json' }]);
+      expect(it['GET /items'].request.auth).toEqual({
+        type: 'apikey',
+        apikey: [
+          { key: 'key', value: 'X-API-Key', type: 'string' },
+          { key: 'value', value: '{{x-api-key}}', type: 'string' },
+          { key: 'in', value: 'header', type: 'string' },
+        ],
+      });
+      expect(it['GET /items'].request.header).toEqual([{ key: 'accept', value: 'application/json' }]);
+      const maps = it['GET /maps'].request;
+      expect(maps.auth.apikey).toEqual([
+        { key: 'key', value: 'api_key', type: 'string' },
+        { key: 'value', value: '{{api_key}}', type: 'string' },
+        { key: 'in', value: 'query', type: 'string' },
+      ]);
+      expect(maps.url.query).toEqual([
+        { key: 'q', value: 'cafe' },
+        { key: 'page', value: '2' },
+      ]);
+      expect(maps.url.raw).toBe('{{baseUrl}}/maps?q=cafe&page=2');
+      expect(it['GET /public'].request).not.toHaveProperty('auth');
+      expect(col.variable.map((v: Json) => [v.key, v.value])).toEqual([
+        // first-use order (requests sorted by path)
+        ['baseUrl', API],
+        ['x-api-key', ''],
+        ['api_key', ''],
+        ['basicUsername', ''],
+        ['basicPassword', ''],
+      ]);
+    });
+
+    it('with "Keep values" the variables hold the recorded credentials (basic split into user and password)', () => {
+      const { col } = build([
+        ex('POST', `${API}/session`, 200, {}, h({ Authorization: `Basic ${basic}` })),
+        ex('GET', `${API}/maps?api_key=${opaque}`, 200, {}),
+      ], { redact: false });
+      expect(col.variable.map((v: Json) => [v.key, v.value])).toEqual([
+        ['baseUrl', API],
+        ['api_key', opaque],
+        ['basicUsername', 'ada'],
+        ['basicPassword', 'p:ss'],
+      ]);
+      expect(items(col)['GET /maps'].request.url.raw).toBe('{{baseUrl}}/maps');
     });
   });
 

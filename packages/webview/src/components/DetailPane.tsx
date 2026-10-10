@@ -3,7 +3,7 @@ import { useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Exchange } from '../protocol';
 import { clientGaveUp, describeAction, findExchange, initiatorLabel, isAgentRule, ruleDisplayName } from '../state';
-import { formatDuration, formatTime, fullFrameLocation, isFrameworkFrame, isPaused, shortFrameLocation } from '../util';
+import { formatBytes, formatDuration, formatTime, fullFrameLocation, isFrameworkFrame, isPaused, shortFrameLocation } from '../util';
 import { normalizePath } from '../jsonpath';
 import { useExchangeActions, type ExchangeActions } from './actions';
 import { ContractSection } from './ContractSection';
@@ -17,6 +17,9 @@ import { Icon } from './Icon';
 import { BodyView, HeadersTable, type TreeFieldActions } from './Viewers';
 import { ADDED_PHASES, hasTimings, PHASE_LABEL, PHASE_TITLE, phaseClass, phaseRows } from '../timing';
 import { scriptErrorLine } from '../scripts';
+import {
+  clientCertTitle, isTunnel, matchingPassthrough, TLS_PASSTHROUGH_SETTING, TUNNEL_LABEL, tunnelBytesText, tunnelTarget,
+} from '../connection';
 
 const PAUSE_TEXT = {
   'paused-request': 'Paused before the request reaches the server. Edit it and resume, or abort.',
@@ -26,8 +29,12 @@ const PAUSE_TEXT = {
 export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLElement> }) {
   const { state, dispatch } = useApp();
   const framed = hasFrames(ex);
-  const tab = state.detailTab === 'messages' && !framed ? 'response' : state.detailTab;
-  const tabs = framed ? (['request', 'response', 'messages', 'timing'] as const) : (['request', 'response', 'timing'] as const);
+  const tunnel = isTunnel(ex);
+  // CONTRACTS §14.2: a tunnel has no request / response to show — one "Tunnel" tab (on the `request` slot) + Timing.
+  const tab = tunnel ? (state.detailTab === 'timing' ? 'timing' : 'request')
+    : state.detailTab === 'messages' && !framed ? 'response' : state.detailTab;
+  const tabs = tunnel ? (['request', 'timing'] as const)
+    : framed ? (['request', 'response', 'messages', 'timing'] as const) : (['request', 'response', 'timing'] as const);
   const gaveUp = clientGaveUp(state, ex);
   const rule = ex.matchedRuleId ? state.rules.find((r) => r.id === ex.matchedRuleId) : undefined;
   const ruleIndex = rule ? state.rules.indexOf(rule) : -1;
@@ -51,6 +58,9 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
           <span class="url" title={ex.url}>{ex.url}</span>
           <StateBadge ex={ex} gaveUp={gaveUp} />
           <CoverageBadges ex={ex} />
+          {ex.clientCertificate && (
+            <span class="badge cert-badge" title={clientCertTitle(ex.clientCertificate)}>client certificate: {ex.clientCertificate}</span>
+          )}
           <span class="spacer" />
           <Button kind="icon" title="Close details (Esc)" onClick={() => dispatch({ type: 'select', id: undefined })}>
             <Icon name="close" />
@@ -63,12 +73,13 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             title={actions.off.block ?? 'Create a rule that blocks requests like this one'}>Block this</Button>
           <Button onClick={() => create('breakpoint')} disabled={!!actions.off.breakpoint}
             title={actions.off.breakpoint ?? 'Create a breakpoint rule that pauses requests like this one'}>Break on this</Button>
-          <Button onClick={() => setExpiring(!expiring)} pressed={expiring} disabled={isNative(ex)}
-            title={isNative(ex) ? NATIVE_READ_ONLY : 'Make the next request(s) like this one get 401 token_expired — test how the app refreshes its token'}>
+          <Button onClick={() => setExpiring(!expiring)} pressed={expiring} disabled={!!actions.off.expire}
+            title={actions.off.expire ?? 'Make the next request(s) like this one get 401 token_expired — test how the app refreshes its token'}>
             Expire token…
           </Button>
           <span class="sep" aria-hidden="true" />
-          <MenuButton label="Copy request as" title="Copy this request as code (cURL, Dart http, Dio)" items={actions.copyItems}>
+          <MenuButton label="Copy request as" title={actions.off.copy ?? 'Copy this request as code (cURL, Dart http, Dio)'} items={actions.copyItems}
+            disabled={!!actions.off.copy}>
             <Icon name="copy" /> Copy as… <Icon name="chevronDown" />
           </MenuButton>
           <Button onClick={actions.resend} disabled={!!actions.resendDisabled}
@@ -79,7 +90,8 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             title={actions.off.edit ?? 'Edit method, URL, headers or body, then send it through the proxy'}>
             <Icon name="edit" /> Edit and resend
           </Button>
-          <MenuButton label="Generate" title="Generate a Dart model or a test fixture from this exchange" items={actions.generateItems}>
+          <MenuButton label="Generate" title={tunnel ? actions.off.generate : 'Generate a Dart model or a test fixture from this exchange'}
+            items={actions.generateItems} disabled={tunnel}>
             Generate… <Icon name="chevronDown" />
           </MenuButton>
           <span class="detail-facts">
@@ -116,7 +128,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             )}
           </span>
         </div>
-        {expiring && !isNative(ex) && (
+        {expiring && !actions.off.expire && (
           <ExpireTokenForm key={ex.id} url={ex.url} onCancel={() => setExpiring(false)}
             onSubmit={(url, count) => { setExpiring(false); actions.expireToken(url, count); }} />
         )}
@@ -124,6 +136,12 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
         {isNative(ex) && (
           <div class="msg info native-note" role="note">
             <span class="badge mini native-badge">native</span> {NATIVE_READ_ONLY}
+          </div>
+        )}
+        {tunnel && (
+          <div class="msg info tunnel-note" role="note">
+            <Icon name="lock" /> {TUNNEL_LABEL}: the app's TLS went straight to the server, so there are no headers or bodies
+            to show, and no rule applies except Block.
           </div>
         )}
         {ex.cors && (ex.cors.problem || ex.cors.preflight || ex.cors.patched) && (
@@ -155,7 +173,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
         {tabs.map((t) => (
           <button key={t} type="button" role="tab" class="tab" aria-selected={tab === t}
             onClick={() => dispatch({ type: 'setDetailTab', tab: t })}>
-            {t === 'request' ? 'Request' : t === 'response' ? 'Response' : t === 'timing' ? 'Timing'
+            {t === 'request' ? (tunnel ? 'Tunnel' : 'Request') : t === 'response' ? 'Response' : t === 'timing' ? 'Timing'
               : `${ex.kind === 'sse' ? 'Events' : 'Messages'} (${frameTotal(ex)})`}
             {t === 'messages' && ex.state === 'pending' && <span class="tab-dot live" title="Open — live" />}
             {((t === 'request' && ex.state === 'paused-request') || (t === 'response' && ex.state === 'paused-response')) && (
@@ -166,7 +184,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
       </div>
 
       <div class="tab-body" role="tabpanel">
-        {tab === 'request' ? <RequestTab ex={ex} />
+        {tab === 'request' ? (tunnel ? <TunnelTab ex={ex} /> : <RequestTab ex={ex} />)
           : tab === 'messages' ? <FramesView key={ex.id} ex={ex} />
           : tab === 'timing' ? <TimingSection ex={ex} />
           : <ResponseTab ex={ex} actions={actions} />}
@@ -237,6 +255,47 @@ export function TimingSection({ ex }: { ex: Exchange }) {
           <div class="hint">No phase timings for this exchange{running ? ' yet' : ''}.</div>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * CONTRACTS §14.2: a TLS passthrough tunnel — what it is, why it isn't decrypted, and how to undo it
+ * (`flutterIntercept.tlsPassthrough`).
+ */
+export function TunnelTab({ ex }: { ex: Exchange }) {
+  const { state } = useApp();
+  const { host, port } = tunnelTarget(ex);
+  const pattern = matchingPassthrough(ex, state.status.tlsPassthrough);
+  const b = ex.tunnelBytes;
+  return (
+    <div class="tunnel pad" aria-label="TLS passthrough">
+      <table class="kv tunnel-facts">
+        <tbody>
+          <tr><th scope="row">Server</th><td class="mono">{host}:{port}</td></tr>
+          <tr><th scope="row">Sent by the app</th><td>{b ? formatBytes(b.sent) : '—'}</td></tr>
+          <tr><th scope="row">Received</th><td>{b ? formatBytes(b.received) : '—'}</td></tr>
+          <tr><th scope="row">State</th><td>{ex.state === 'pending' ? 'open' : ex.state === 'error' ? `failed${ex.error ? `: ${ex.error}` : ''}` : ex.state === 'blocked' ? 'blocked by a rule' : 'closed'}</td></tr>
+        </tbody>
+      </table>
+      <p class="hint">{tunnelBytesText(ex)}.</p>
+      <h4 class="section-title">Why it isn't decrypted</h4>
+      <p>
+        {pattern ? <><code>{host}</code> matches <code>{pattern}</code> in </> : <><code>{host}</code> is listed in </>}
+        the <code>{TLS_PASSTHROUGH_SETTING}</code> setting, so the proxy tunnelled the connection to the server without
+        decrypting it — for hosts whose certificate the app pins itself (Dio <code>validateCertificate</code>, native
+        pinning), which would otherwise refuse the proxy's certificate.
+      </p>
+      <p class="muted">
+        Only the timing up to the tunnel opening and the encrypted byte counts are known. Mock, breakpoint, rewrite and
+        script rules never apply; a Block rule (or a fault) on this host still does.
+      </p>
+      <h4 class="section-title">To see this traffic</h4>
+      <p>
+        Remove {pattern ? <code>{pattern}</code> : 'the host'} from <code>{TLS_PASSTHROUGH_SETTING}</code> (Settings →
+        Flutter Intercept). New connections are then decrypted and listed as normal requests — restart the app if it keeps
+        an open connection. The app's own certificate pinning must allow the proxy's CA for that to work.
+      </p>
     </div>
   );
 }

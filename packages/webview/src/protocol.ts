@@ -103,7 +103,7 @@ export interface SessionWarning {
 }
 
 /** CONTRACTS §12.7 */
-export interface RecordingSummary { id: string; name: string; createdAt: number; exchanges: number; redacted: boolean }
+export interface RecordingSummary { id: string; name: string; createdAt: number; exchanges: number; redacted: boolean; streams?: number; frames?: number } // streams/frames: CONTRACTS §14.5 (WebSocket / SSE)
 export interface AuthFlowSummary {
   steps: { exchangeId: string; role: 'unauthorized' | 'refresh' | 'retry' | 'other' }[];
   stampede?: { refreshCalls: number; windowMs: number };

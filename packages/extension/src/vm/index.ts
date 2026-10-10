@@ -10,12 +10,21 @@ import type { VmHostDeps, VmWatcher } from './types';
 import type { NativeClientsMode } from './core';
 import { createSessionWatcher } from './watcher';
 import { defaultWebSocketCtor, type WebSocketCtor } from './transport';
+import type { BypassQuery } from './profile';
 
 export type { NativeClientsMode } from './core';
+export { BYPASS_WINDOW_MS } from './core';
+export { matchesProxyExchange, type BypassQuery } from './profile';
 
 export interface CreateVmWatcherDeps extends VmHostDeps {
-  /** `flutterIntercept.nativeClients`: "profile" (default) | "off". Read on every poll. */
+  /** `flutterIntercept.nativeClients`: "profile" (default) | "proxy" | "off". Read on every poll. */
   nativeClients(): NativeClientsMode;
+  /** CONTRACTS §14.7: whether this session's native clients are routed through the proxy now (`AndroidGlobalProxy.isRouted`). */
+  nativeRouted?(sessionId: string): boolean;
+  /** CONTRACTS §14.7: a routed native client rejected the proxy's certificate: release the routing (`AndroidGlobalProxy.release`). */
+  nativeRouteFailed?(sessionId: string, client: string | undefined): void;
+  /** CONTRACTS §14.7 bypass check for plain http: did the proxy record this request (`matchesProxyExchange`)? */
+  proxySaw?(q: BypassQuery): boolean | undefined;
   /** Optional: poll only while the panel or an agent is watching (entries are caught up afterwards). */
   isWatched?(): boolean;
   /** Whether a dart:io `proxyDetails` host:port is our proxy (background-isolate dedupe); absent = never. */

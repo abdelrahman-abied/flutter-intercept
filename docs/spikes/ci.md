@@ -141,3 +141,97 @@ expectation → exit 1 with flutter's tests passing. `packages/cli/test/e2e.sh m
   template bump on its own.
 - Root `package.json`: nothing needed (`npm run build` / `npm test` already run every workspace; the CLI's build
   needs `packages/proxy/dist`, which the workspace order builds first).
+
+## v0.8.0 (CONTRACTS §14.1): GitHub Action, physical iPhones, npm-ready package
+
+### GitHub Action (root `action.yml`)
+
+Composite action, `uses: abdelrahman-abied/flutter-intercept@v0.8.0`.
+
+- **Build step** (`working-directory: ${{ github.action_path }}`): skipped when `packages/cli/dist/cli.js` and
+  `dist/action.js` already exist (self-hosted runners keep action folders); else checks Node ≥ 18 on PATH, then
+  `npm ci --no-audit --no-fund --ignore-scripts`, `npm run build --workspace packages/proxy`, `npm run build
+  --workspace packages/cli`. Measured from a clean copy of the repository: 534 packages, 255 MB, about 5 s with a warm
+  npm cache. `--workspace` filters on `npm ci` did not reduce the install (534 against 536 packages), so they're
+  left out. `--ignore-scripts` is fine: esbuild finds its platform binary through its optional dependency.
+- **Run step** (`id: run`, `working-directory: ${{ inputs.working-directory }}`): every CLI input reaches the
+  process as `FI_INPUT_<NAME>`; no `${{ }}` inside any script (a unit test checks this). `exec node
+  "$GITHUB_ACTION_PATH/packages/cli/dist/action.js"`: `src/action.ts` (bundled separately, 18 KB) builds the argv
+  (`--name=value`, so a value that starts with `-` stays a value; list inputs: one per line, or space-separated on one
+  line; `rules: none` → `--no-rules`; strict booleans; targets that look like options refused), writes
+  `artifacts` / `har` / `junit` / `record` to `$GITHUB_OUTPUT` (random heredoc delimiter) before running, then
+  `require('./cli.js').main(argv)` **in the same process**: the CLI's own SIGINT / SIGTERM / exit-hook cleanup apply
+  with no signal forwarding, and the runner's cancel signal reaches it directly. `exit-code` is written after. Input
+  errors → `::error::` (workflow-command data escaped) and exit 2.
+- **Upload step**: `actions/upload-artifact@v7` (current major, checked 2026-10-10), `if: always() &&
+  inputs.upload-artifacts == 'true' && steps.run.outputs.artifacts != ''`, `if-no-files-found: ignore`,
+  `include-hidden-files: true`. Uploads the HAR (redacted), the JUnit report, and the recording only when `record`
+  is a `.json` path (it is unredacted, and the user chose to write it).
+- Extra inputs beyond the contract: `replay-fallback`, `artifact-name` (v4+ artifact names must be unique per run:
+  matrix jobs set it), `upload-artifacts`. No `no-redact` input on purpose (uploaded HARs stay redacted).
+- Outputs: `exit-code`, `har`, `junit`, `record`.
+- Tests: `test/action.test.ts` parses action.yml with a dependency-free YAML subset parser (`test/yaml-subset.ts`;
+  anything outside the subset throws) and checks the inputs against §14.1 and `CLI_INPUTS`, the env mapping, no
+  expressions in scripts, `shell: bash`, the build order, the pinned upload action and its `always()`, that every
+  `inputs.*` / `steps.*` reference exists and outputs map to what action.js writes, and that the README's workflow
+  examples use only declared inputs. `test/bundle.test.ts` runs the built `dist/action.js` end to end with a fake
+  flutter (`FLUTTER_ROOT`), checking the flutter argv, the HAR / JUnit files, the `$GITHUB_OUTPUT` entries and exit
+  code 1 for a failed expectation.
+- Real run (2026-10-10): the build step's script, run verbatim on a clean copy of the repository (with the refreshed
+  lock file, below), then that copy's `dist/action.js` with `FI_INPUT_DEVICE=macos`, `HAR`, `ASSERT`, `JUNIT`,
+  `RECORD` on a copy of `samples/demo_app`: build + `All tests passed!`, 2 exchanges, 2/2 assertions, HAR / JUnit /
+  recording written, `$GITHUB_OUTPUT` with the three paths and `exit-code` 0, wrapper folder removed. Not run on
+  GitHub's runners yet: that needs the tag (`v0.8.0`) on the public repository.
+
+### Physical iPhones (`test -d <udid>`)
+
+- Detection: `flutter devices --machine`, `targetPlatform: ios` and `emulator: false` → `ios-physical` →
+  `proxyRouteFor` returns `{ lan: true }` (it used to refuse).
+- Before anything starts: `lanAddressForIphone()` (packages/extension/src/lanAddress.ts, vscode-free: default-route
+  interface, VPN tunnels skipped, RFC 1918 only). None → exit 2 "this machine has no LAN address …"; a non-private
+  address → exit 2 with the reason. `run -d <iPhone>` → exit 2 (it would have to print the token).
+- After the loopback proxy starts: `proxy.openLan({host, token})` with a new 32-byte base64url token per run
+  (`crypto.randomBytes`), define `FLUTTER_INTERCEPT_PROXY=flutter-intercept:<token>@<ip>:<lanPort>`
+  (`lanProxyAddress` from `debug/rewrite.ts`). The proxy's LAN gate does the rest (§7): exact bind, constant-time
+  `Proxy-Authorization`, the first authenticated peer pinned (logged: "iPhone connected from …"), SSRF guard.
+- `closeLan()` in `finally` (before `stop()`); process exit closes the socket anyway.
+- The token is never printed: `maskArgs` shows our defines with `user:***@` (`maskProxyCredentials`); `-v` /
+  `--verbose` in the flutter args prints a warning (flutter's verbose build output contains define values). As
+  defence in depth, `Proxy-Authorization` request headers are dropped from the exchanges before the HAR / recording
+  / assertions (measured: the proxy does not record them today; the test checks the token and its base64 form are in
+  neither the unredacted HAR nor the recording).
+- The Local Network / firewall notes are printed once per run (`LAN_NOTES`).
+- Tests (`test/run.test.ts`, `test/lan.test.ts`): refusal without / with a non-private LAN address before anything
+  starts; `run` refused; with this machine's real LAN IPv4 (skipped when it has none): the define's form, 407 without
+  and with a wrong token, the mock answered with the right one, token absent from every log line and both output files,
+  notes printed once, the listener closed after the run (ECONNREFUSED).
+- **Pending: verification on a real iPhone** (none was connected): signing, the Local Network prompt on first run,
+  and the macOS firewall prompt for `node` are expected to behave as in the editor's LAN mode, but are unmeasured
+  headless. A security review item (§14.1).
+
+### npm-ready package
+
+`packages/cli/package.json`: name `flutter-intercept-cli` (the owner decides), no `private`, `bin` →
+`dist/cli.js`, `files: ["dist/cli.js"]`, `engines.node >= 18`, `repository` (with `directory`), `homepage`, `bugs`,
+`license: MIT`, `prepublishOnly` (`npm --prefix ../proxy run build && node build.mjs`), and
+`@flutter-intercept/proxy` moved to `devDependencies` (it is bundled, and private). `packages/cli/LICENSE` is a copy
+of the root one. The source map is now `external` (no `sourceMappingURL` in the bundle; the map stays out of the
+package). `npm pack --dry-run`: `LICENSE`, `README.md`, `dist/cli.js` (1.8 MB, 0755), `package.json`
+(`test/pack.test.ts`). The bundle copied alone to an empty folder runs a whole `test` (fake flutter) with no
+`node_modules`: mockttp's optional `brotli-wasm` / `zstd-codec` / `bufferutil` / `utf-8-validate` /
+`tls-impersonate` are only required lazily. Not published.
+
+### Requested from the lead
+
+- **Root `package-lock.json`**: refresh after the rename (`npm install --package-lock-only --ignore-scripts` at the
+  root). Until then `npm ci` (and so the action's build step) fails with "Missing: flutter-intercept-cli@0.7.0 from
+  lock file". The expected diff is small: the workspace link `node_modules/@flutter-intercept/cli` →
+  `node_modules/flutter-intercept-cli`, the package entry's name, dependencies → devDependencies, `engines`.
+- **`packages/cli/src/types.ts`**: the `device` comment still says "physical iOS is refused"; it now gets the LAN
+  listener (`test` only).
+- **CONTRACTS §14.1 / §13.11** as built: the action's extra inputs (`replay-fallback`, `artifact-name`,
+  `upload-artifacts`) and outputs, `upload-artifact@v7`, the `run` refusal for physical iPhones, the
+  `Proxy-Authorization` scrub.
+- **Release**: the `v0.8.0` tag must exist on the public repository for `uses: …@v0.8.0`; consider a moving `v0`
+  tag later. Before publishing to npm, consider the third-party notices of the bundled dependencies (mockttp and
+  its tree are MIT / Apache-2.0; esbuild keeps only `@license` comments).

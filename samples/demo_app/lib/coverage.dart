@@ -129,11 +129,15 @@ Future<Outcome> spawnTodo() async {
 /// ok_http). Off by default: these never go through the proxy (read-only in Flutter Intercept).
 const nativeHttp = bool.fromEnvironment('NATIVE_HTTP');
 
+/// --dart-define=NATIVE_URL=<https url> : the URL of the native GET (default jsonplaceholder). Used to check
+/// whether the platform stack trusts a test CA (docs/spikes/native-proxy.md).
+const nativeUrl = String.fromEnvironment('NATIVE_URL', defaultValue: 'https://jsonplaceholder.typicode.com/posts/1');
+
 Future<Outcome> nativeGet() async {
   final client = nativeHttpClient();
   if (client == null) return (-1, 'no native client on this platform');
   try {
-    final r = await client.get(Uri.parse('https://jsonplaceholder.typicode.com/posts/1'),
+    final r = await client.get(Uri.parse(nativeUrl),
         headers: {'x-demo-client': nativeClientName});
     return (r.statusCode, r.body);
   } finally {

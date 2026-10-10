@@ -46,15 +46,17 @@ afterEach(() => {
 });
 
 describe('RecordingService.save', () => {
-  it('saves only finished HTTP exchanges, sorted, with metadata on the first line, mode 0600', async () => {
+  it('saves only finished exchanges, sorted, with metadata on the first line, mode 0600', async () => {
     const s = svc();
     const ok2 = ex({ startedAt: 200 });
     const ok1 = ex({ startedAt: 100, state: 'mocked', matchedRuleId: 'r1' });
     const meta = await s.save('Login flow', [
       ok2,
       ok1,
-      ex({ kind: 'websocket' }),
-      ex({ kind: 'sse' }),
+      ex({ kind: 'tunnel', method: 'CONNECT' }),
+      ex({ kind: 'websocket', url: 'wss://api.example.com/ws', state: 'error', status: undefined }),
+      ex({ kind: 'websocket', url: 'wss://api.example.com/ws', status: 403 }),
+      ex({ kind: 'sse', state: 'pending' }),
       ex({ captured: 'vm-profile' }),
       ex({ browserInternal: true }),
       ex({ state: 'pending', status: undefined }),
@@ -193,7 +195,8 @@ describe('RecordingService.list / load / remove / export', () => {
       fs.writeFileSync(meta.path, JSON.stringify(d));
     };
     const bad: [string, (d: any) => void, RegExp][] = [
-      ['version', (d) => (d.version = 2), /version must be 1/],
+      ['version', (d) => (d.version = 3), /version must be 1 or 2 \(this file has 3: it was saved by a newer Flutter Intercept/],
+      ['version type', (d) => (d.version = '1'), /version must be 1 or 2 \(this file has "1"\)/],
       ['name', (d) => (d.name = 5), /name must be a non-empty string/],
       ['entries', (d) => (d.entries = {}), /entries must be an array/],
       ['status', (d) => (d.entries[0].status = 999), /entries\[0\]\.status/],

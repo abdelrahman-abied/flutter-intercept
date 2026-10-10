@@ -123,7 +123,8 @@ describe('save_recording / list_recordings / replay_recording (CONTRACTS §12.4)
     const { api, host, recordings, changed } = setup();
     const a = ex();
     const b = ex({ url: 'https://cdn.example.com/x.png' });
-    host.exchanges = [a, b, ex({ kind: 'websocket' }), ex({ captured: 'vm-profile' }), ex({ state: 'pending', status: undefined }), ex({ browserInternal: true })];
+    // CONTRACTS §14.5: finished WebSocket / SSE streams are recorded since 0.8.0 (see api.v080.test.ts); tunnels never.
+    host.exchanges = [a, b, ex({ kind: 'websocket', state: 'pending' }), ex({ kind: 'tunnel', method: 'CONNECT' }), ex({ captured: 'vm-profile' }), ex({ state: 'pending', status: undefined }), ex({ browserInternal: true })];
     const r = (await api.call('save_recording', { name: 'Happy path' })) as any;
     expect(r).toEqual({ id: 'happy-path', name: 'Happy path', exchanges: 2, redacted: true, path: '.dart_tool/flutter_intercept/recordings/happy-path.json' });
     expect(recordings.saves[0]).toEqual({ name: 'Happy path', ids: [a.id, b.id], redact: true });

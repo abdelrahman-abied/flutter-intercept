@@ -13,7 +13,8 @@
  *   src:api.dart        a source frame's uri contains it
  *   contract:error      model check result (CONTRACTS §10.5): error | warning (worst is a warning) | ok |
  *                       unchecked (no result, or the host could not check it); prefix ok, comma = any of
- *   kind:ws             CONTRACTS §11: ws (websocket) | sse | http (plain); prefix ok, comma = any of
+ *   kind:ws             CONTRACTS §11: ws (websocket) | sse | http (plain) | tunnel (TLS passthrough, §14.2); prefix ok,
+ *                       comma = any of
  *   op:getUser          GraphQL operation name, case-insensitive prefix; comma = any of
  *   cors:problem        CORS diagnosis: problem | ok | preflight | patched (prefix ok, comma = any of)
  *   captured:native     recorded from the app's HTTP profile (read-only); captured:proxy = the rest
@@ -48,16 +49,18 @@ const ALIASES: Record<string, Key> = {
   kind: 'kind', op: 'op', operation: 'op', gql: 'op', cors: 'cors', captured: 'captured', browser: 'browser',
 };
 
-type KindValue = 'ws' | 'sse' | 'http';
+type KindValue = 'ws' | 'sse' | 'http' | 'tunnel';
 const KIND_VALUES: readonly { name: string; kind: KindValue }[] = [
   { name: 'ws', kind: 'ws' }, { name: 'websocket', kind: 'ws' }, { name: 'sse', kind: 'sse' }, { name: 'http', kind: 'http' },
+  { name: 'tunnel', kind: 'tunnel' }, { name: 'passthrough', kind: 'tunnel' },
 ];
-const kindOf = (e: Exchange): KindValue => (e.kind === 'websocket' ? 'ws' : e.kind === 'sse' ? 'sse' : 'http');
+const kindOf = (e: Exchange): KindValue =>
+  (e.kind === 'websocket' ? 'ws' : e.kind === 'sse' ? 'sse' : e.kind === 'tunnel' ? 'tunnel' : 'http');
 
 export const FILTER_HINT =
   'Filter: words match the URL · m:POST · s:404 s:4xx s:error · t:json|html|image|text|xml|binary|other · ' +
   'body:token body:"a phrase" · h:name h:name=value · state:paused|mocked|blocked|error|simulated|resent · ' +
-  'src:file.dart · contract:error|warning|ok|unchecked · kind:ws|sse|http · op:getUser (GraphQL) · ' +
+  'src:file.dart · contract:error|warning|ok|unchecked · kind:ws|sse|http|tunnel · op:getUser (GraphQL) · ' +
   'cors:problem|ok|preflight · captured:native · browser:internal|app · -token negates';
 
 /** What a filter can see besides the exchange itself. */
@@ -239,7 +242,7 @@ function kindPred(raw: string): Pred | string {
   const wanted = new Set<KindValue>();
   for (const v of raw.toLowerCase().split(',').filter(Boolean)) {
     const hits = KIND_VALUES.filter((k) => k.name.startsWith(v));
-    if (!hits.length) return `kind:${raw} — use ws, sse or http`;
+    if (!hits.length) return `kind:${raw} — use ws, sse, http or tunnel`;
     hits.forEach((k) => wanted.add(k.kind));
   }
   return (e) => wanted.has(kindOf(e));

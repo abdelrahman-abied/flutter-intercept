@@ -1231,3 +1231,36 @@ textarea.script-code { width: 100%; min-height: 160px; tab-size: 2; white-space:
   body:not(.fi-panel):not(.fi-sidebar) .tab-body { padding: 0 12px 12px; }
   body:not(.fi-panel):not(.fi-sidebar) .rules-view.has-editor .rules-list { flex-basis: 40%; }
 }
+
+/* ------------------------------------------------------------------ v0.8.0 (CONTRACTS §14) */
+
+/* §14.2 TLS passthrough tunnels: a lock, muted (nothing was decrypted). */
+.kind-badge.kb-tunnel {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--fi-muted);
+  border-color: var(--fi-muted);
+  font-weight: normal;
+}
+.kind-badge.kb-tunnel .icon { width: 11px; height: 11px; }
+.detail-title .kind-badge.kb-tunnel .icon { width: 12px; height: 12px; }
+.c-size.tunnel-bytes { font-size: 11px; color: var(--fi-muted); }
+.row.tunnel-row .c-path { color: var(--fi-muted); }
+.list-scroll:focus .row.selected.tunnel-row .c-path,
+.list-scroll:focus .row.selected .c-size.tunnel-bytes { color: inherit; }
+.tunnel-note { margin-top: 6px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.tunnel-note .icon { width: 14px; height: 14px; color: var(--fi-muted); }
+.tunnel p { margin: 4px 0 8px; overflow-wrap: anywhere; }
+.tunnel-facts { max-width: 520px; margin-bottom: 4px; }
+
+/* §14.3 client certificates */
+.cert-badge { background: transparent; color: var(--vscode-charts-green); border: 1px solid var(--vscode-charts-green); }
+.cert-status { overflow: hidden; text-overflow: ellipsis; }
+.cert-status.has-problem { color: var(--vscode-errorForeground); font-weight: 600; }
+.cert-host.cert-problem { color: var(--vscode-errorForeground); font-weight: 600; }
+.cert-status.has-problem .cert-host:not(.cert-problem) { color: var(--fi-muted); font-weight: normal; }
+
+/* §14.2 passthrough hosts, §14.6 upstream from VS Code's http.proxy */
+.passthrough-status { overflow: hidden; text-overflow: ellipsis; }
+.rec-streams { margin-top: 2px; }

@@ -1,9 +1,9 @@
 // CONTRACTS §12.4–12.5: save the current traffic, replay a recording, diff two, delete.
 import { useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
-import type { RecordingSummary } from '../protocol';
 import {
-  defaultRecordingName, diffPair, FALLBACK_LABEL, formatDate, isRecordable, isReplaying, MAX_RECORDING_NAME, recordingNameError,
+  defaultRecordingName, diffPair, FALLBACK_LABEL, formatDate, isRecordable, isReplaying, MAX_RECORDING_NAME, recordingCountText,
+  recordingCounts, recordingNameError, streamCountText, type RecordingRowSummary,
 } from '../scenarios';
 import { filterExchanges, hasActiveFilters } from '../state';
 import { Button } from './bits';
@@ -35,7 +35,7 @@ export function RecordingsView() {
         </span>
         <span class="spacer" />
         <Button kind="primary" pressed={saving} onClick={() => setSaving(!saving)}
-          title="Save the finished HTTP exchanges listed in Traffic as a recording">
+          title="Save the finished HTTP exchanges and WebSocket / SSE streams listed in Traffic as a recording">
           <Icon name="plus" /> Save current traffic
         </Button>
       </div>
@@ -55,7 +55,7 @@ export function RecordingsView() {
             </span>
             <span class="spacer" />
             <Button disabled={!pair} onClick={diff}
-              title={pair ? 'Routes added / removed, status, JSON shape, call count and timing changes — opens in a diff editor' : 'Tick exactly two recordings'}>
+              title={pair ? 'Routes added / removed, status, JSON shape, call count, timing and WebSocket / SSE frame changes — opens in a diff editor' : 'Tick exactly two recordings'}>
               Diff selected
             </Button>
             {recordingPicks.length > 0 && <Button onClick={() => dispatch({ type: 'clearRecordingPicks' })}>Clear selection</Button>}
@@ -85,12 +85,15 @@ function SaveForm({ onDone }: { onDone: () => void }) {
     [filtered, state.exchanges, state.filters, state.contracts, all],
   );
   const useShown = filtered && onlyShown;
-  const count = useShown ? shown.length : all.length;
+  const picked = useShown ? shown : all;
+  const count = picked.length;
+  const counts = useMemo(() => recordingCounts(picked), [picked]);
+  const streams = streamCountText(counts);
   const error = recordingNameError(name);
   const save = () => {
     if (error || !count) return;
     post({ type: 'saveRecording', name: name.trim(), ...(redact ? { redact: true } : {}), ...(useShown ? { ids: shown.map((e) => e.id) } : {}) });
-    dispatch({ type: 'notice', short: true, text: `Saving “${name.trim()}” (${count} exchange${count === 1 ? '' : 's'})…` });
+    dispatch({ type: 'notice', short: true, text: `Saving “${name.trim()}” (${count} exchange${count === 1 ? '' : 's'}${streams ? `, ${streams}` : ''})…` });
     onDone();
   };
   return (
@@ -119,8 +122,10 @@ function SaveForm({ onDone }: { onDone: () => void }) {
         {redact
           ? 'Secrets are replaced with “[redacted]” — safe to share, but a replay then answers with those placeholders.'
           : 'Saved as recorded, secrets included, so a replay is faithful. The file stays on this machine.'}
-        {' '}Finished HTTP exchanges only — WebSocket / SSE streams and native captures are not recorded.
+        {' '}Finished HTTP exchanges and closed WebSocket / SSE streams (with their messages, replayed at their recorded
+        pace) — open streams, TLS passthrough tunnels and native captures are not recorded.
       </div>
+      {streams && <div class="hint rec-streams">Includes {streams}.</div>}
       <div class="re-actions">
         <Button kind="primary" type="submit" disabled={!!error || !count}>
           Save {count} exchange{count === 1 ? '' : 's'}
@@ -132,7 +137,7 @@ function SaveForm({ onDone }: { onDone: () => void }) {
 }
 
 function RecordingRow({ rec, picked, replaying, otherReplay }: {
-  rec: RecordingSummary; picked: boolean; replaying: boolean; otherReplay: boolean;
+  rec: RecordingRowSummary; picked: boolean; replaying: boolean; otherReplay: boolean;
 }) {
   const { dispatch, post } = useApp();
   const [mode, setMode] = useState<'idle' | 'replay' | 'delete'>('idle');
@@ -154,7 +159,7 @@ function RecordingRow({ rec, picked, replaying, otherReplay }: {
               <span class="badge redacted-badge" title="Saved with secrets redacted: a replay answers with “[redacted]” placeholders">redacted</span>
             )}
           </div>
-          <div class="rec-sub">{formatDate(rec.createdAt)} · {rec.exchanges} exchange{rec.exchanges === 1 ? '' : 's'}</div>
+          <div class="rec-sub">{formatDate(rec.createdAt)} · {recordingCountText(rec)}</div>
         </div>
         <div class="rule-buttons">
           {replaying ? (
@@ -186,6 +191,7 @@ function RecordingRow({ rec, picked, replaying, otherReplay }: {
               ? 'Demo mode: anything not recorded fails as if the device were offline — nothing reaches a server.'
               : 'Anything not recorded is sent to the real server as usual.'}
             {' '}Requests are matched by method + URL (and body); repeated calls get the recorded responses in order. Your rules still apply first.
+            {rec.streams ? ' WebSocket / SSE streams are answered locally from the recorded messages, at their recorded pace (gaps capped at 5 s).' : ''}
           </div>
           <div class="re-actions">
             <Button kind="primary" onClick={start}><Icon name="play" /> Start replay</Button>

@@ -340,13 +340,12 @@ describe('rules on WebSocket upgrades', () => {
     expect(ex.simulated).toMatch(/the app gave up/);
   });
 
-  it('mock / breakpoint / mutate / cors / throttle rules do not apply: passed through with a note, not spent', async () => {
+  it('mock / breakpoint / mutate / cors rules do not apply: passed through with a note, not spent', async () => {
     for (const action of [
       { kind: 'mock', status: 200, body: '{}' },
       { kind: 'breakpoint', phase: 'both' },
       { kind: 'mutate', ops: [] },
       { kind: 'cors' },
-      { kind: 'throttle', latencyMs: 2000 },
       { kind: 'fault', fault: 'truncate' },
     ] as const) {
       // Written for https:// too: an http(s) pattern can't break a socket either.

@@ -6,3 +6,4 @@ out/
 .dart_tool/
 build/
 coverage/
+.DS_Store

@@ -37,9 +37,8 @@ describe('devices', () => {
     expect(proxyRouteFor('android-physical', 'PIXEL0001')).toEqual({ ok: true, host: 'localhost', adbReverse: true });
     expect(proxyRouteFor('ios-simulator', 'sim')).toEqual({ ok: true, host: 'localhost', adbReverse: false });
     expect(proxyRouteFor('desktop', 'macos')).toEqual({ ok: true, host: 'localhost', adbReverse: false });
-    const ios = proxyRouteFor('ios-physical', 'phone');
-    expect(ios.ok).toBe(false);
-    expect(!ios.ok && ios.reason).toMatch(/physical iOS device: not supported/);
+    // physical iPhones use the LAN listener (CONTRACTS §14.1): the host is the LAN address, found at run time
+    expect(proxyRouteFor('ios-physical', 'phone')).toEqual({ ok: true, host: '', adbReverse: false, lan: true });
     expect(proxyRouteFor('web', 'chrome').ok).toBe(false);
     expect(proxyRouteFor('unknown', 'x').ok).toBe(false);
   });

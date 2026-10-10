@@ -259,7 +259,9 @@ describe('toOpenApi: redaction', () => {
     expect(op.requestBody.content['application/json'].example).toEqual({ user: 'ada', password: '[redacted]' });
     expect(op.requestBody.content['application/json'].schema.properties.password).toEqual({ type: 'string' });
     expect(op.responses['200'].content['application/json'].example).toEqual({ access_token: '[redacted]', user: { id: 1, password: '[redacted]' } });
-    expect(op.parameters.find((p: Json) => p.name === 'api_key').example).toBe('[redacted]');
+    // an API-key query parameter is a security scheme, not a parameter (CONTRACTS §14.6)
+    expect(op.parameters.find((p: Json) => p.name === 'api_key')).toBeUndefined();
+    expect(op.security).toEqual([{ apiKeyQuery_api_key: [], bearerAuth: [] }]);
     expect(op.parameters.find((p: Json) => p.name === 'page').example).toBe(1);
     // a JWT path segment is a parameter, never part of the path, and has no example
     expect(Object.keys(doc.paths)).toContain('/reset/{id}');
@@ -271,7 +273,13 @@ describe('toOpenApi: redaction', () => {
     const { res, doc } = build(exchanges(), { redact: false });
     expect(res.text).toContain('hunter2');
     expect(res.text).toContain('tok-1');
-    expect(doc.paths['/login'].post.parameters.find((p: Json) => p.name === 'api_key').example).toBe('k123');
+    // security schemes never carry values, redacted or not
+    expect(res.text).not.toContain('k123');
+    expect(res.text).not.toContain('abcdefghijklmnop123');
+    expect(doc.components.securitySchemes).toEqual({
+      apiKeyQuery_api_key: { type: 'apiKey', in: 'query', name: 'api_key' },
+      bearerAuth: { type: 'http', scheme: 'bearer' },
+    });
     expect(Object.keys(doc.paths)).toContain('/reset/{id}');
   });
 });
@@ -300,5 +308,63 @@ describe('shapeToSchema', () => {
       type: 'array',
       items: { type: 'object', properties: { a: { type: 'integer' }, b: { type: 'integer' } }, required: ['a'] },
     });
+  });
+});
+
+describe('toOpenApi: securitySchemes (CONTRACTS §14.6)', () => {
+  // Fake credentials, built at run time.
+  const jwt = ['eyJhbGciOiJIUzI1NiJ9', 'eyJzdWIiOiI0MiJ9', 'c2lnbmF0dXJlLXZhbHVl'].join('.');
+  const opaque = ['sk', 'live', 'Zx98Yw76Vu54Ts32Rq10Po98Nm76Lk54'].join('_');
+  const basic = Buffer.from(['ada', 'hunter2'].join(':')).toString('base64');
+  const h = (headers: Record<string, string | string[]>) => ({ requestHeaders: { 'user-agent': 'Dart/3.5', ...headers } });
+
+  it('infers bearer (JWT format), basic, header and query API keys; references them per operation; never includes values', () => {
+    const { res, doc } = build([
+      ex('GET', `${API}/me`, 200, { id: 1 }, h({ Authorization: `Bearer ${jwt}` })),
+      ex('GET', `${API}/me`, 200, { id: 1 }, h({ authorization: `bearer ${jwt}` })),
+      ex('POST', `${API}/session`, 200, { ok: true }, h({ Authorization: `Basic ${basic}` })),
+      ex('GET', `${API}/maps?key=${opaque}&q=cafe`, 200, { r: [] }),
+      ex('GET', `${API}/items`, 200, [], h({ 'X-API-Key': opaque })),
+      ex('GET', `${API}/items`, 200, [], h({ 'x-api-key': opaque, 'Ocp-Apim-Subscription-Key': opaque })),
+      ex('GET', `${API}/public`, 200, {}),
+    ], { redact: false });
+    for (const secret of [jwt, opaque, basic, 'hunter2']) expect(res.text).not.toContain(secret);
+    expect(doc.components.securitySchemes).toEqual({
+      'apiKeyQuery_key': { type: 'apiKey', in: 'query', name: 'key' },
+      'apiKey_ocp-apim-subscription-key': { type: 'apiKey', in: 'header', name: 'Ocp-Apim-Subscription-Key' },
+      'apiKey_x-api-key': { type: 'apiKey', in: 'header', name: 'X-API-Key' },
+      basicAuth: { type: 'http', scheme: 'basic' },
+      bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
+    });
+    expect(doc.paths['/me'].get.security).toEqual([{ bearerAuth: [] }]);
+    expect(doc.paths['/session'].post.security).toEqual([{ basicAuth: [] }]);
+    expect(doc.paths['/maps'].get.security).toEqual([{ apiKeyQuery_key: [] }]);
+    expect(doc.paths['/maps'].get.parameters.map((p: Json) => p.name)).toEqual(['q']);
+    // two combinations seen: one key, then both keys
+    expect(doc.paths['/items'].get.security).toEqual([{ 'apiKey_x-api-key': [] }, { 'apiKey_ocp-apim-subscription-key': [], 'apiKey_x-api-key': [] }]);
+    expect(doc.paths['/public'].get).not.toHaveProperty('security');
+    expect(doc).not.toHaveProperty('security');
+  });
+
+  it('optional auth: requests with and without credentials → the scheme or {}', () => {
+    const { doc } = build([ex('GET', `${API}/feed`, 200, [], h({ Authorization: 'Bearer short-token-1' })), ex('GET', `${API}/feed`, 200, [])]);
+    expect(doc.paths['/feed'].get.security).toEqual([{ bearerAuth: [] }, {}]);
+    // not every token was a JWT: no bearerFormat
+    expect(doc.components.securitySchemes.bearerAuth).toEqual({ type: 'http', scheme: 'bearer' });
+  });
+
+  it('other Authorization schemes are an API key in the Authorization header; names that are not keys are ignored', () => {
+    const { doc } = build([
+      ex('GET', `${API}/a`, 200, {}, h({ Authorization: 'Token abc123' })),
+      ex('GET', `${API}/b?page_token=x&keyword=y&token=`, 200, {}, h({ 'x-csrf-token': 'c', 'idempotency-key': 'i', 'x-request-id': 'r' })),
+    ]);
+    expect(doc.components.securitySchemes).toEqual({ authorizationHeader: { type: 'apiKey', in: 'header', name: 'Authorization' } });
+    expect(doc.paths['/b'].get).not.toHaveProperty('security');
+    expect(doc.paths['/b'].get.parameters.map((p: Json) => p.name)).toEqual(['page_token', 'keyword', 'token']);
+  });
+
+  it('no credentials anywhere → no components', () => {
+    const { doc } = build([ex('GET', `${API}/a`, 200, {})]);
+    expect(doc).not.toHaveProperty('components');
   });
 });

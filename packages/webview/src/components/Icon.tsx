@@ -16,6 +16,7 @@ const PATHS = {
   export: 'M8 2.5v8M5 5.5l3-3 3 3M3 10.5v3h10v-3',
   window: 'M7 3.5H3.5v9h9V9M9.5 2.5h4v4M13.5 2.5 8 8',
   timing: 'M2.5 4h5M4.5 8h7M7.5 12h6',
+  lock: 'M4 7.5h8v6H4zM5.5 7.5V5.5a2.5 2.5 0 0 1 5 0v2',
 } as const;
 
 export type IconName = keyof typeof PATHS;

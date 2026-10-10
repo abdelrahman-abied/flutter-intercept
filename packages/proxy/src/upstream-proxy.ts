@@ -2,6 +2,7 @@ import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
 import * as tls from 'tls';
+import { keepAliveOptions } from './idle';
 import { normalizeIp } from './lan';
 
 /*
@@ -21,6 +22,18 @@ import { normalizeIp } from './lan';
 export interface UpstreamProxyConfig {
   url: string;
   ignoreCertErrors?: boolean;
+  /**
+   * CONTRACTS §14.6: hosts that go direct instead (VS Code's `http.noProxy`): `host`, `*.suffix` (subdomains), `*`
+   * (everything), IP literals (`[v6]` for IPv6), each optionally `:port`. Case-insensitive.
+   */
+  noProxy?: string[];
+}
+
+/** One parsed `noProxy` entry. */
+export interface NoProxyEntry {
+  /** Exact host, or a `.suffix` (from `*.suffix`), or '*' (any). */
+  host: string;
+  port?: number;
 }
 
 export interface UpstreamProxySpec {
@@ -31,6 +44,53 @@ export interface UpstreamProxySpec {
   ignoreCertErrors: boolean;
   /** `http://host:port` (no credentials), for messages. */
   label: string;
+  /** Targets that bypass the upstream proxy (connect directly; LAN clients stay SSRF-guarded). */
+  noProxy?: NoProxyEntry[];
+}
+
+/** Parse `noProxy` entries; throws a readable error on a malformed one. */
+export function parseNoProxy(list: unknown): NoProxyEntry[] {
+  if (list === undefined || list === null) return [];
+  if (!Array.isArray(list)) throw new Error('Upstream proxy: noProxy must be a list of host names');
+  const out: NoProxyEntry[] = [];
+  for (const raw of list) {
+    if (typeof raw !== 'string') throw new Error('Upstream proxy: noProxy entries must be strings');
+    let e = raw.trim().toLowerCase();
+    if (!e) continue;
+    let port: number | undefined;
+    const v6 = /^\[([^\]]+)\](?::(\d+))?$/.exec(e);
+    if (v6) {
+      e = v6[1];
+      if (v6[2] !== undefined) port = Number(v6[2]);
+    } else if ((e.match(/:/g) ?? []).length === 1) {
+      const i = e.indexOf(':');
+      if (!/^\d+$/.test(e.slice(i + 1))) throw new Error(`Upstream proxy: invalid noProxy entry "${raw.slice(0, 100)}"`);
+      port = Number(e.slice(i + 1));
+      e = e.slice(0, i);
+    }
+    if (port !== undefined && (port < 1 || port > 65535)) throw new Error(`Upstream proxy: invalid noProxy port in "${raw.slice(0, 100)}"`);
+    e = e.replace(/\.+$/, '');
+    if (e.startsWith('*.')) e = e.slice(1);
+    else if (e.startsWith('.')) e = e; // curl style ".example.com" = subdomains
+    if (e !== '*' && !(net.isIP(e) || /^\.?[a-z0-9_-]+(?:\.[a-z0-9_-]+)*$/.test(e))) {
+      throw new Error(`Upstream proxy: invalid noProxy entry "${raw.slice(0, 100)}"`);
+    }
+    out.push({ host: net.isIP(e) ? normalizeIp(e) : e, ...(port !== undefined ? { port } : {}) });
+  }
+  return out;
+}
+
+/** Does `host:port` bypass the upstream proxy (noProxy)? */
+export function bypassesProxy(spec: UpstreamProxySpec | undefined, hostIn: string, port: number): boolean {
+  if (!spec?.noProxy?.length) return false;
+  const raw = String(hostIn ?? '').trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+  const host = net.isIP(raw) ? normalizeIp(raw) : raw;
+  return spec.noProxy.some((e) => {
+    if (e.port !== undefined && e.port !== port) return false;
+    if (e.host === '*') return true;
+    if (e.host.startsWith('.')) return host.endsWith(e.host);
+    return host === e.host;
+  });
 }
 
 /**
@@ -61,6 +121,7 @@ export function parseUpstreamProxy(cfg: UpstreamProxyConfig): UpstreamProxySpec 
     ...(u.username || u.password ? { auth: `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}` } : {}),
     ignoreCertErrors: cfg.ignoreCertErrors === true,
     label: `http://${u.host}`,
+    ...(cfg.noProxy !== undefined ? { noProxy: parseNoProxy(cfg.noProxy) } : {}),
   };
 }
 
@@ -154,9 +215,17 @@ export class ProxiedHttpAgent extends http.Agent {
     const { host, port } = targetOf(options, 80);
     const add = (o: any) => (http.Agent.prototype as any).addRequest.call(this, req, o);
     const alias = this.alias?.(host);
-    if (!this.guard && (alias || isLoopbackHost(host))) {
-      // Loopback / emulator-alias targets connect directly, never via the upstream proxy (REVIEW-6 #10).
+    if (!this.guard && (alias || isLoopbackHost(host) || bypassesProxy(this.spec, host, port))) {
+      // Loopback / emulator-alias / noProxy targets connect directly, never via the upstream proxy (REVIEW-6 #10).
       return add(alias ? { ...options, host: alias, hostname: alias } : options);
+    }
+    if (this.guard && bypassesProxy(this.spec, host, port)) {
+      // noProxy for a LAN client: directly, to the address the guard checked.
+      this.guard(host, port).then(
+        (ip) => add(ip ? { ...options, host: ip, hostname: ip } : options),
+        (e: Error) => (req as unknown as { onSocket(s: unknown, err: Error): void }).onSocket(undefined, e),
+      );
+      return;
     }
     const r = req as http.ClientRequest & {
       _header?: string | null;
@@ -220,11 +289,31 @@ export class TunnelHttpsAgent extends https.Agent {
   override createConnection(options: any, cb?: any): any {
     const { host, port } = targetOf(options, 443);
     const alias = this.alias?.(host);
-    if (!this.guard && (alias || isLoopbackHost(host))) {
-      // Direct (REVIEW-6 #10); an alias still verifies the certificate against the name the app used.
+    if (!this.guard && (alias || isLoopbackHost(host) || bypassesProxy(this.spec, host, port))) {
+      // Direct (REVIEW-6 #10, noProxy); an alias still verifies the certificate against the name the app used.
       const direct = { ...options, host: alias ?? host, hostname: alias ?? host };
       if (alias && !options.checkServerIdentity) direct.checkServerIdentity = (_h: string, cert: tls.PeerCertificate) => tls.checkServerIdentity(host, cert);
       return (https.Agent.prototype as any).createConnection.call(this, direct, cb);
+    }
+    if (this.guard && bypassesProxy(this.spec, host, port)) {
+      // noProxy for a LAN client: TLS directly to the checked address, verified against the name.
+      this.guard(host, port).then(
+        (ip) => {
+          const to = ip ?? host;
+          const direct = { ...options, host: to, hostname: to };
+          if (!direct.servername && !net.isIP(host)) direct.servername = host;
+          if (!options.checkServerIdentity) direct.checkServerIdentity = (_h: string, cert: tls.PeerCertificate) => tls.checkServerIdentity(host, cert);
+          let s: unknown;
+          try {
+            s = (https.Agent.prototype as any).createConnection.call(this, direct);
+          } catch (e) {
+            return cb?.(e);
+          }
+          cb?.(null, s);
+        },
+        (e: Error) => cb?.(e),
+      );
+      return undefined;
     }
     const open = (connectHost: string) =>
       connectTunnel(this.spec, connectHost, port, (err, socket) => {
@@ -265,8 +354,23 @@ export class TunnelHttpAgent extends http.Agent {
   override createConnection(options: any, cb?: any): any {
     const { host, port } = targetOf(options, 80);
     const alias = this.alias?.(host);
-    if (!this.guard && (alias || isLoopbackHost(host))) {
+    if (!this.guard && (alias || isLoopbackHost(host) || bypassesProxy(this.spec, host, port))) {
       return (http.Agent.prototype as any).createConnection.call(this, { ...options, host: alias ?? host, hostname: alias ?? host }, cb);
+    }
+    if (this.guard && bypassesProxy(this.spec, host, port)) {
+      this.guard(host, port).then(
+        (ip) => {
+          let s: unknown;
+          try {
+            s = (http.Agent.prototype as any).createConnection.call(this, { ...options, host: ip ?? host, hostname: ip ?? host });
+          } catch (e) {
+            return cb?.(e);
+          }
+          cb?.(null, s);
+        },
+        (e: Error) => cb?.(e),
+      );
+      return undefined;
     }
     const open = (connectHost: string) =>
       connectTunnel(this.spec, connectHost, port, (err, socket) => {
@@ -292,8 +396,8 @@ export interface UpstreamAgents {
 export function createUpstreamAgents(spec: UpstreamProxySpec, guard?: TargetGuard, alias?: (host: string) => string | undefined): UpstreamAgents {
   return {
     spec,
-    http: new ProxiedHttpAgent(spec, { keepAlive: true }, guard, alias),
-    https: new TunnelHttpsAgent(spec, { keepAlive: true }, guard, alias),
+    http: new ProxiedHttpAgent(spec, keepAliveOptions(), guard, alias),
+    https: new TunnelHttpsAgent(spec, keepAliveOptions(), guard, alias),
     ws: (secure) => (secure ? new TunnelHttpsAgent(spec, {}, guard, alias) : new TunnelHttpAgent(spec, {}, guard, alias)),
   };
 }

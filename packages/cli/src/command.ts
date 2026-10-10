@@ -1,7 +1,8 @@
 /**
  * Starting flutter and showing its command line (REVIEW-7 #10, #11).
  * - `maskArgs`: what may be printed — user dart-define values become `***` (CI passes API keys that way and Flutter
- *   itself never prints them); other secret-looking values are redacted.
+ *   itself never prints them); our own defines are shown without credentials (the LAN token, §14.1); other
+ *   secret-looking values are redacted.
  * - `spawnPlan`: never `shell: true`. A `.bat` / `.cmd` (Windows `flutter.bat`) runs through `cmd.exe /d /s /c` with
  *   every argument quoted and caret-escaped (the cross-spawn rules), so `& | < > ^ %` and spaces stay data.
  */
@@ -10,11 +11,19 @@ import { ENTRY_SHA_DEFINE_NAME, PROXY_DEFINE_NAME } from './names';
 
 const OWN = new Set([PROXY_DEFINE_NAME, ENTRY_SHA_DEFINE_NAME]);
 
+/**
+ * `user:secret@host:port` → `user:***@host:port`. The physical-iPhone proxy define carries the run's LAN token
+ * (CONTRACTS §7, §14.1): ours are shown, but never their credentials.
+ */
+export function maskProxyCredentials(value: string): string {
+  return value.replace(/^([^:@/\s]*):[^@]*@/, '$1:***@');
+}
+
 function maskDefine(def: string): string {
   const eq = def.indexOf('=');
   if (eq < 0) return def;
   const name = def.slice(0, eq);
-  return OWN.has(name) ? def : `${name}=***`;
+  return OWN.has(name) ? `${name}=${maskProxyCredentials(def.slice(eq + 1))}` : `${name}=***`;
 }
 
 /** Arguments safe to print: `--dart-define=NAME=***` (ours shown), other values passed through `redactText`. */

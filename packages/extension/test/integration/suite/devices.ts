@@ -16,7 +16,13 @@
  *  H. flutterIntercept.captureSource=false → FLUTTER_INTERCEPT_TRACE=0 define, no exchange gets a source.
  *  I. (in A's session) CONTRACTS §13.3: the coverage batch's requests from Isolate.run / compute / Isolate.spawn
  *     isolates go through the proxy (template v5 installed at isolate start), no background-isolate warning for
- *     them; §13.8: src/screenshot through Dart-Code's callService (VM service) and through the device tool.
+ *     them, and no §14.7 `bypass` warning; §13.8: src/screenshot through Dart-Code's callService (VM service) and through the device tool.
+ *  J. Android emulator, CONTRACTS §14.7 (docs/spikes/native-proxy.md): APP_ZONE_OVERRIDES=true + NATIVE_HTTP=true.
+ *     Bypass detection: the extension's own VM watcher shows `bypass` warnings for the app's own-zone HttpClient
+ *     hosts. Native routing (src/adb.ts AndroidGlobalProxy + a src/vm watcher with nativeClients "proxy", built
+ *     here so the check doesn't depend on the host wiring): cronet goes to the proxy, rejects its CA (the demo has
+ *     no debug network_security_config), the core reports the trust failure, routing is released and
+ *     `http_proxy` is back to its previous value. `FI_DEVICES_ONLY=J` runs only this check.
  *
  * Request → source (CONTRACTS §9, template v4), in A and after the hot restart in B: a Dio request made
  * through interceptors (CatalogApi.fetchAlbum) and a package:http request (OrdersApi.createOrder) carry
@@ -40,7 +46,9 @@ import { kindFromId } from '../../../src/iosDevices';
 import { defaultRouteIPv4 } from '../../../src/lanAddress';
 import { resolveFrames } from '../../../src/source/resolve';
 import { takeScreenshot, type ScreenshotDeps } from '../../../src/screenshot';
-import { vmCallService } from '../../../src/vm';
+import { createVmWatcher, vmCallService } from '../../../src/vm';
+import { AndroidGlobalProxy } from '../../../src/adb';
+import type { SessionWarning } from '../../../src/ui/protocol';
 import { activateBoth, freePort, outputOf, registerOutputTracker, RunOutcome, sleep, startSession, stopSession, waitFor } from './helpers';
 
 const JP = 'https://jsonplaceholder.typicode.com';
@@ -257,6 +265,10 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
     const wantHost = physicalIos ? lanIp ?? '(no LAN address)' : isEmu ? '10.0.2.2' : 'localhost';
     await api.setRules([]);
 
+    // ---- J. bypass detection + native clients through the proxy (§14.7) ----
+    if (isEmu) await checkJ(dev, tag);
+    if (process.env.FI_DEVICES_ONLY === 'J') continue;
+
     // ---- A. launch like F5 (deviceId only) ----
     let session: vscode.DebugSession | undefined;
     let t0 = Date.now();
@@ -324,6 +336,9 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
         }
         const warned = (api.controller.status().warnings ?? []).filter((w) => w.kind === 'background-isolate' && /demo_(worker|compute|spawn)/.test(w.text));
         if (warned.length) failures.push(`background-isolate warnings although intercepted: ${warned.map((w) => w.text).join(' | ')}`);
+        // §14.7: nothing in a normal intercepted session bypasses the proxy (no false positives).
+        const bypassed = (api.controller.status().warnings ?? []).filter((w) => w.kind === 'bypass' && w.sessionId === s.id);
+        if (bypassed.length) failures.push(`bypass warnings in an intercepted session: ${bypassed.map((w) => w.text).join(' | ')}`);
         // Screenshots: VM service through Dart-Code, then the device tool alone.
         const exec: ScreenshotDeps['exec'] = (cmd, args, opts) =>
           new Promise((resolve, reject) =>
@@ -445,6 +460,68 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
     }
   }
   return results;
+
+  async function checkJ(dev: string, tag: string) {
+    const name = `DEV ${tag} J bypass warnings + native clients routed (Android global proxy)`;
+    const t0 = Date.now();
+    const failures: string[] = [];
+    const notes: string[] = [];
+    const adb = (...args: string[]) => execFileSync('adb', ['-s', dev, ...args], { encoding: 'utf8' }).trim();
+    const before = adb('shell', 'settings', 'get', 'global', 'http_proxy');
+    const key = 'suite-J';
+    const gp = new AndroidGlobalProxy({ log: (m) => notes.push(m) });
+    const routeFailures: (string | undefined)[] = [];
+    const ownWarnings = new Map<string, SessionWarning[]>();
+    const watcher = createVmWatcher({
+      record: () => [],
+      update: () => undefined,
+      setWarnings: (sid, w) => ownWarnings.set(sid, w),
+      log: () => undefined,
+      nativeClients: () => 'proxy',
+      backgroundIsolates: () => 'warn', // the extension's own watcher installs; this one only reads
+      nativeRouted: () => gp.isRouted(key),
+      nativeRouteFailed: (_sid, client) => {
+        routeFailures.push(client);
+        void gp.release(key);
+      },
+    });
+    let session: vscode.DebugSession | undefined;
+    try {
+      const applied = await gp.apply(key, dev, api.proxyHost.port || port);
+      if (!applied.applied) failures.push(`global proxy not applied: ${JSON.stringify(applied)}`);
+      notes.push(`http_proxy during: ${adb('shell', 'settings', 'get', 'global', 'http_proxy')}`);
+      session = await launch(`FI-D J ${tag}`, dev, { toolArgs: ['--dart-define=APP_ZONE_OVERRIDES=true', '--dart-define=NATIVE_HTTP=true'] });
+      void watcher.attach({ sessionId: session.id });
+      const s = session;
+      await waitFor(() => (/DEMO_COVERAGE done/.test(outputOf(s)) ? true : undefined), 600_000, 250);
+      await sleep(4000);
+      const res = demoResults(outputOf(s));
+      const bypass = (api.controller.status().warnings ?? []).filter((w) => w.kind === 'bypass' && w.sessionId === s.id);
+      if (!bypass.some((w) => /jsonplaceholder\.typicode\.com bypass the proxy: an HttpOverrides zone/.test(w.text))) {
+        failures.push(`no bypass warning for jsonplaceholder.typicode.com: ${bypass.map((w) => w.text).join(' | ') || 'none'}`);
+      }
+      notes.push(`bypass hosts: ${bypass.map((w) => /Requests to (\S+)/.exec(w.text)?.[1]).join(',')}`);
+      const ng = res.native_get;
+      if (!ng || ng.status !== 'ERR' || !/CERT_AUTHORITY_INVALID/.test(ng.body)) failures.push(`native_get through the proxy should fail the CA check: ${ng ? `${ng.status} ${ng.body.slice(0, 120)}` : 'no result'}`);
+      if (!routeFailures.includes('cronet_http')) failures.push(`trust failure not reported (${JSON.stringify(routeFailures)})`);
+      const route = (ownWarnings.get(s.id) ?? []).find((w) => w.id === `native-route:${s.id}`);
+      if (!route || !/^cronet_http rejected the proxy's certificate/.test(route.text)) failures.push(`route warning: ${route?.text ?? 'none'}`);
+      await waitFor(() => (gp.isRouted(key) ? undefined : true), 10_000).catch(() => failures.push('routing not released after the trust failure'));
+      const after = adb('shell', 'settings', 'get', 'global', 'http_proxy');
+      if (after !== before) failures.push(`http_proxy ${after} after release (was ${before})`);
+      if (adb('shell', 'settings', 'get', 'global', 'global_http_proxy_host') !== '' && before === 'null') failures.push('ConnectivityService global proxy still set');
+    } catch (e) {
+      failures.push(`exception: ${(e as Error).message}`);
+    } finally {
+      watcher.dispose();
+      await gp.releaseAll();
+      if (session) await stopSession(session).catch(() => false);
+      await sleep(1500);
+      const end = adb('shell', 'settings', 'get', 'global', 'http_proxy');
+      if (end !== before) failures.push(`http_proxy ${end} at the end (was ${before})`);
+    }
+    check(name, failures, t0, { mode: notes.filter((n) => !/^native proxy:/.test(n)).join(' ') });
+  }
 
   async function runSimple(
     name: string,

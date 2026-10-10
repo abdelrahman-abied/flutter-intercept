@@ -6,7 +6,14 @@
  *   is needed (background isolates; the main isolate only when it loaded package:http_profile), turned off again
  *   on stop, the HTTP profile polled (≤ 1/s, backing off when idle or failing, one call in flight per isolate),
  *   entries the proxy did not see recorded as read-only `captured:'vm-profile'` exchanges, plus a
- *   `SessionWarning {kind:'native-client'}`.
+ *   `SessionWarning {kind:'native-client'}`;
+ * - `"proxy"` (CONTRACTS §14.7): the same, except that while the host routes this session's emulator through the
+ *   proxy (`nativeRouted()`), finished native entries came through the proxy and are not imported; failed ones are,
+ *   and a TLS trust failure reports `nativeRouteFailed()` once (the host then stops routing) with a warning;
+ * - bypass detection (CONTRACTS §14.7): main-isolate dart:io entries that never reached the proxy →
+ *   `SessionWarning {kind:'bypass'}` once per host (≤ 10, then a summary). Logging in the main isolate costs app
+ *   memory, so unless the app loaded package:http_profile it is on only for `BYPASS_WINDOW_MS` after each main
+ *   isolate starts (launch, hot restart), then turned off again.
  * Everything degrades to nothing when a call fails or answers in an unexpected shape.
  */
 import type { Exchange } from '@flutter-intercept/proxy';
@@ -18,18 +25,26 @@ import {
   asHttpProfile,
   bodiesPatch,
   bodyPlan,
+  bypassText,
+  bypassVerdict,
   classifyEntry,
   cleanText,
   clientName,
   diffExchange,
+  entryError,
+  hasTraceHeader,
   isFinished,
   isPackageEntry,
+  isTrustError,
+  moreBypassText,
   toExchange,
+  type BypassQuery,
   type IsOurProxy,
   type ProfileEntry,
 } from './profile';
 
-export type NativeClientsMode = 'profile' | 'off';
+/** `flutterIntercept.nativeClients`. "proxy" also routes native clients through the proxy where the host can. */
+export type NativeClientsMode = 'profile' | 'proxy' | 'off';
 
 export interface VmCoreDeps extends VmHostDeps {
   /** Current `flutterIntercept.nativeClients` (read on every poll). */
@@ -48,6 +63,16 @@ export interface VmCoreDeps extends VmHostDeps {
    * `installed` → no background-isolate warning, and its dart:io traffic is treated like the main isolate's.
    */
   installStatus?(isolateId: string): Promise<InstallStatus | undefined>;
+  /** CONTRACTS §14.7: the host routes this session's native clients through the proxy right now (Android emulator). */
+  nativeRouted?(): boolean;
+  /** CONTRACTS §14.7: a routed native client rejected the proxy's certificate; the host should stop routing. Called once. */
+  nativeRouteFailed?(client: string | undefined): void;
+  /** CONTRACTS §14.7: whether the proxy recorded this request (plain-http bypass check); undefined = can't tell. */
+  proxySaw?(q: BypassQuery): boolean | undefined;
+  /** Clock (tests). */
+  now?(): number;
+  /** Main-isolate HTTP logging window for bypass detection, ms (default `BYPASS_WINDOW_MS`; 0 = no window). */
+  bypassWindowMs?: number;
 }
 
 export const POLL_MS = 1000;
@@ -59,6 +84,12 @@ const MAX_ISOLATES = 500;
 const MAX_ISOLATE_WARNINGS = 10;
 const MAX_SEEN_NAMES = 1000;
 const MAX_CLIENTS = 5;
+/** Main-isolate HTTP timeline logging after each main isolate starts, for bypass detection (CONTRACTS §14.7). */
+export const BYPASS_WINDOW_MS = 60_000;
+/** After logging is turned off in an isolate, it is still polled this long (responses of requests already logged). */
+const DRAIN_MS = 10_000;
+const MAX_BYPASS_WARNINGS = 10;
+const MAX_BYPASS_HOSTS = 1000;
 
 interface IsolateState {
   id: string;
@@ -71,6 +102,10 @@ interface IsolateState {
   /** dart:io registered its extensions (we can enable logging / poll). */
   hasIo: boolean;
   logging: 'off' | 'enabling' | 'on';
+  /** Main isolate: end of the bypass-detection logging window (epoch ms). */
+  bypassUntil?: number;
+  /** Logging was turned off again (window over); polled until then. */
+  drainUntil?: number;
   since?: number;
   inFlight: boolean;
   dead: boolean;
@@ -104,6 +139,15 @@ export function moreIsolatesText(n: number): string {
   return `Requests from ${n} more background isolate${n === 1 ? '' : 's'} are not intercepted either.`;
 }
 
+export function nativeRouteText(): string {
+  return 'Native HTTP clients on this emulator go through the proxy (Android global proxy, restored when the session ends); HTTPS needs the app to trust the Flutter Intercept CA.';
+}
+
+export function nativeTrustText(client: string | undefined): string {
+  const who = client ? safeName(client) : 'A native HTTP client';
+  return `${who} rejected the proxy's certificate: the app needs a debug network_security_config trusting the Flutter Intercept CA. Routing is off for this session.`.slice(0, 200);
+}
+
 export function nativeClientText(clients: string[]): string {
   const who = clients.length ? clients.slice(0, MAX_CLIENTS).map(safeName).join(', ') : 'a native HTTP client';
   return `Requests from ${who} bypass the proxy: shown read-only from the app's HTTP profile; rules don't apply to them.`.slice(0, 200);
@@ -121,6 +165,20 @@ export function createVmSessionCore(sessionId: string, deps: VmCoreDeps): VmSess
   const isolates = new Map<string, IsolateState>();
   const tracked = new Map<string, Tracked>();
   let nativeWarning: SessionWarning | undefined;
+  let routeWarning: SessionWarning | undefined;
+  let routeFailed = false;
+  const bypassWarnings = new Map<string, SessionWarning>(); // ≤ MAX_BYPASS_WARNINGS
+  const bypassHosts = new Set<string>(); // ≤ MAX_BYPASS_HOSTS
+  let moreBypass = 0;
+  let traced = false;
+  const now = () => {
+    try {
+      return deps.now ? deps.now() : Date.now();
+    } catch {
+      return Date.now();
+    }
+  };
+  const bypassWindowMs = deps.bypassWindowMs ?? BYPASS_WINDOW_MS;
   const isolateWarnings = new Map<string, SessionWarning>(); // ≤ MAX_ISOLATE_WARNINGS
   const seenNames = new Set<string>(); // ≤ MAX_SEEN_NAMES
   let moreIsolates = 0;
@@ -169,7 +227,10 @@ export function createVmSessionCore(sessionId: string, deps: VmCoreDeps): VmSess
   function pushWarnings(): void {
     if (stopped) return;
     const list: SessionWarning[] = [];
+    if (routeWarning) list.push(routeWarning);
     if (nativeWarning) list.push(nativeWarning);
+    list.push(...bypassWarnings.values());
+    if (moreBypass > 0) list.push({ id: `bypass:${sessionId}:+more`, kind: 'bypass', text: moreBypassText(moreBypass), sessionId });
     list.push(...isolateWarnings.values());
     if (moreIsolates > 0) list.push({ id: `isolate:${sessionId}:+more`, kind: 'background-isolate', text: moreIsolatesText(moreIsolates), sessionId });
     deps.setWarnings(sessionId, list);
@@ -199,23 +260,80 @@ export function createVmSessionCore(sessionId: string, deps: VmCoreDeps): VmSess
 
   function mode(): NativeClientsMode {
     try {
-      return deps.nativeClients() === 'off' ? 'off' : 'profile';
+      const m = deps.nativeClients();
+      return m === 'off' ? 'off' : m === 'proxy' ? 'proxy' : 'profile';
     } catch {
       return 'off';
     }
   }
 
-  /** Timeline logging costs app memory (every dart:io request + body is kept): only where it can find something. */
+  /** CONTRACTS §14.7: native clients of this session currently go through the proxy. */
+  function routed(): boolean {
+    if (routeFailed || mode() !== 'proxy' || !deps.nativeRouted) return false;
+    try {
+      return deps.nativeRouted() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  function updateRouteWarning(): void {
+    if (routeFailed) return;
+    const r = routed();
+    if (r && !routeWarning) {
+      routeWarning = { id: `native-route:${sessionId}`, kind: 'native-client', text: nativeRouteText(), sessionId };
+      pushWarnings();
+    } else if (!r && routeWarning) {
+      routeWarning = undefined;
+      pushWarnings();
+    }
+  }
+
+  function noteTrustFailure(e: ProfileEntry): void {
+    if (routeFailed) return;
+    routeFailed = true;
+    const client = clientName(e);
+    routeWarning = { id: `native-route:${sessionId}`, kind: 'native-client', text: nativeTrustText(client), sessionId };
+    log(`native client ${client ?? '?'} rejected the proxy's certificate; asking the host to stop routing`);
+    try {
+      deps.nativeRouteFailed?.(client);
+    } catch {
+      /* ignore */
+    }
+    pushWarnings();
+  }
+
+  function warnBypass(host: string, cause: Parameters<typeof bypassText>[1]): void {
+    const key = host.slice(0, 300);
+    if (bypassHosts.has(key)) return;
+    if (bypassHosts.size >= MAX_BYPASS_HOSTS) return;
+    bypassHosts.add(key);
+    if (bypassWarnings.size < MAX_BYPASS_WARNINGS) {
+      const id = `bypass:${sessionId}:${safeName(key)}`;
+      bypassWarnings.set(id, { id, kind: 'bypass', text: bypassText(key, cause), sessionId });
+      log(`requests to ${safeName(key)} bypass the proxy (${cause})`);
+    } else {
+      moreBypass++;
+    }
+    pushWarnings();
+  }
+
+  /**
+   * Timeline logging costs app memory (every dart:io request + body is kept): only where it can find something —
+   * background isolates, isolates that loaded package:http_profile, and the main isolate during its bypass window.
+   */
   function needsLogging(iso: IsolateState): boolean {
-    return !(iso.main || iso.installed) || iso.httpProfile !== false;
+    if (!(iso.main || iso.installed) || iso.httpProfile !== false) return true;
+    return iso.main && bypassWindowMs > 0 && (iso.bypassUntil === undefined || now() < iso.bypassUntil);
   }
 
   async function enableLogging(iso: IsolateState): Promise<void> {
-    if (iso.dead || !iso.hasIo || iso.logging !== 'off' || mode() !== 'profile' || !needsLogging(iso)) return;
+    if (iso.dead || !iso.hasIo || iso.logging !== 'off' || iso.drainUntil !== undefined || mode() === 'off' || !needsLogging(iso)) return;
     iso.logging = 'enabling';
     try {
       await call(LOGGING_RPC, { isolateId: iso.id, enabled: 'true' });
       iso.logging = 'on';
+      if (iso.main && iso.httpProfile === false && iso.bypassUntil === undefined) iso.bypassUntil = now() + bypassWindowMs;
       emptyPolls = 0;
       reschedule(0);
     } catch (e) {
@@ -230,7 +348,24 @@ export function createVmSessionCore(sessionId: string, deps: VmCoreDeps): VmSess
       if (iso.logging !== 'on' || iso.dead) continue;
       iso.logging = 'off';
       iso.since = undefined;
+      if (iso.drainUntil !== undefined) continue; // already off in the VM
       await call(LOGGING_RPC, { isolateId: iso.id, enabled: 'false' }).catch(() => undefined);
+    }
+  }
+
+  /** Main isolate past its bypass window: logging off in the VM, polled a little longer, then forgotten. */
+  function closeWindows(): void {
+    const t = now();
+    for (const iso of isolates.values()) {
+      if (iso.dead || iso.logging !== 'on') continue;
+      if (iso.drainUntil !== undefined) {
+        if (t >= iso.drainUntil) iso.logging = 'off';
+        continue;
+      }
+      if (needsLogging(iso)) continue;
+      iso.drainUntil = t + DRAIN_MS;
+      log(`HTTP profiling in the main isolate turned off after ${Math.round(bypassWindowMs / 1000)} s (bypass detection window)`);
+      void call(LOGGING_RPC, { isolateId: iso.id, enabled: 'false' }).catch(() => undefined);
     }
   }
 
@@ -375,6 +510,8 @@ export function createVmSessionCore(sessionId: string, deps: VmCoreDeps): VmSess
       modeOff = false;
       for (const iso of isolates.values()) void enableLogging(iso);
     }
+    closeWindows();
+    updateRouteWarning();
     if (deps.isWatched && !deps.isWatched()) {
       reschedule(IDLE_POLL_MS[0]);
       return;
@@ -424,6 +561,24 @@ export function createVmSessionCore(sessionId: string, deps: VmCoreDeps): VmSess
       tracked.set(key, t);
     }
     if (t && (t.done || !t.exchangeId)) return false;
+    if (!t && !isPackageEntry(entry) && (iso.main || iso.installed)) {
+      // CONTRACTS §14.7: main-isolate dart:io traffic is never imported; it is only checked for a bypass.
+      if (hasTraceHeader(entry)) traced = true;
+      const b = bypassVerdict(entry, { isOurProxy: deps.isOurProxy, proxySaw: deps.proxySaw, traced });
+      if (b.verdict === 'wait') return false;
+      if (b.verdict === 'bypass') warnBypass(b.host, b.cause);
+      remember(key, { done: true });
+      return false;
+    }
+    if (!t && isPackageEntry(entry) && routed()) {
+      // Routed through the proxy: a finished request is a proxy exchange already; only failures are imported.
+      if (!isFinished(entry)) return false;
+      if (!entryError(entry)) {
+        remember(key, { done: true });
+        return false;
+      }
+      if (isTrustError(entry)) noteTrustFailure(entry);
+    }
     if (!t) {
       const verdict = classifyEntry(entry, { main: iso.main || Boolean(iso.installed) }, deps.isOurProxy);
       if (verdict === 'wait') return false;

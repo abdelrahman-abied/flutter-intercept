@@ -3,12 +3,15 @@ import * as http from 'http';
 import { STATUS_CODES } from 'http';
 import { randomUUID } from 'crypto';
 import * as net from 'net';
+import * as tls from 'tls';
 // Deep imports on purpose: mockttp's index also loads its admin server and remote client
 // (express, GraphQL, body-parser, …), ~2 MB of bundle and ~100 ms of module init we never use.
 import type * as mockttp from 'mockttp';
 import { MockttpServer } from 'mockttp/dist/server/mockttp-server';
 import { generateCACertificate } from 'mockttp/dist/util/certificates';
 import { CallbackStep, PassThroughStep } from 'mockttp/dist/rules/requests/request-step-definitions';
+import { StepLookup } from 'mockttp/dist/rules/requests/request-step-impls';
+import WebSocket from 'ws';
 import { PassThroughWebSocketStep, RejectWebSocketStep } from 'mockttp/dist/rules/websockets/websocket-step-definitions';
 import { Always } from 'mockttp/dist/rules/completion-checkers';
 import { resetOrDestroy } from 'mockttp/dist/util/socket-util';
@@ -39,7 +42,11 @@ import {
   type CompiledRule,
 } from './rules';
 import { ReplayStore, requestBodyHash, type BodyKey } from './replay';
+import { framePayload, sseEventText, sseSchedule, wsScript, type TimedStep } from './replay-stream';
 import { createUpstreamAgents, isLoopbackHost, parseUpstreamProxy, retireAgents, type UpstreamAgents, type UpstreamProxyConfig, type UpstreamProxySpec } from './upstream-proxy';
+import { matchesHostPattern, normalizeHostname, parseHostPattern, splitHostPort, type HostPattern } from './hosts';
+import { openTunnelUpstream, relay } from './tunnel';
+import { isShaped, LinkQueue, type LinkShape } from './pace';
 import { detectGraphql, graphqlOperationNames } from './graphql';
 import {
   allowedOrigin,
@@ -65,7 +72,8 @@ import { SseParser, SseRecorder } from './sse';
 import { isBrowserInternal } from './browser';
 import { installWsLimit, markProxySocket, WS_MAX_MESSAGE_BYTES } from './ws-limit';
 import { boundAddressMatches, rebindIfNeeded, runWithListenHost } from './listen-host';
-import { createUpstreamPool, type UpstreamPool } from './upstream-pool';
+import { createUpstreamPool, HOST_ALIASES, type UpstreamPool } from './upstream-pool';
+import type { RequestPlan } from './upstream-request';
 import { refreshRoutes } from './routes';
 import { captured, getTap, installTaps, isComplete, RESPONSE_PAUSE_LIMIT_BYTES, type HeadPatch, type Tap } from './taps';
 import {
@@ -77,9 +85,11 @@ import {
   lanTesting,
   normalizeIp,
   onComboConnection,
+  lanConnectAllowed,
   refuse,
   resolveCheckedTarget,
   RESPONSE_407,
+  SsrfError,
   SSRF_MARKER,
 } from './lan';
 import { describeProfile, NO_PROFILE, type NetworkProfile } from './network';
@@ -102,6 +112,7 @@ import {
 } from './script';
 import type {
   Body,
+  ClientCertificate,
   Exchange,
   FaultKind,
   Frame,
@@ -151,7 +162,7 @@ type Decision =
  * - ws-pass / ws-local: WebSocket upgrades (CONTRACTS §11.1), passed through and recorded frame by frame, or
  *   answered locally (block / fault rules, the offline profile).
  */
-type Route = 'plain' | 'h1' | 'h2' | 'denied' | 'trace' | 'ws-pass' | 'ws-local';
+type Route = 'plain' | 'h1' | 'h2' | 'denied' | 'trace' | 'ws-pass' | 'ws-local' | 'replay-stream' | 'ws-replay' | 'tunnel';
 
 /** A fault applied to a request: a fault rule, the `offline` profile ('dns'), or a throttle drop ('drop' = reset). */
 type FlowFault = FaultKind | 'drop';
@@ -175,7 +186,7 @@ interface Flow {
   send?: SendMeta;
   fault?: FlowFault;
   /** Throttle (a throttle rule, or the network profile) for a request that reaches the network. */
-  throttle?: { latencyMs?: number; kbps?: number };
+  throttle?: { latencyMs?: number; kbps?: number; uploadKbps?: number };
   /** Exchange.simulated. */
   simulated?: string;
   /** Plain route with latency: resolves when the request may be forwarded (false = the app left). */
@@ -241,8 +252,10 @@ interface MatchOptions {
   body?: () => string | undefined;
   /** Treat GraphQL-scoped rules as matching on method + URL alone (preflights). */
   ignoreGraphql?: boolean;
-  /** A WebSocket upgrade: only block / fault rules apply, GraphQL-scoped rules never do. */
+  /** A WebSocket upgrade: only block / fault / throttle / mapRemote rules apply, GraphQL-scoped rules never do. */
   ws?: boolean;
+  /** A TLS passthrough CONNECT (CONTRACTS §14.2): only block and fault rules apply. */
+  tunnel?: boolean;
 }
 
 interface MatchResult {
@@ -311,9 +324,22 @@ const FAULT_LABELS: Record<FlowFault, string> = {
   drop: 'Dropped',
 };
 
-function throttleLabel(t: { latencyMs?: number; kbps?: number; dropRate?: number }): string {
-  const label = describeProfile({ kind: 'throttle', ...t });
+type ThrottleProfile = Extract<NetworkProfile, { kind: 'throttle' }>;
+
+function throttleLabel(t: { latencyMs?: number; kbps?: number; dropRate?: number; uploadKbps?: number }): string {
+  const label = withUpload(describeProfile({ kind: 'throttle', latencyMs: t.latencyMs, kbps: t.kbps, dropRate: t.dropRate }), t.uploadKbps);
   return label === describeProfile(NO_PROFILE) ? 'Throttle' : label;
+}
+
+/** describeProfile, plus the upload rate for custom profiles ("+300 ms, 800 kbps, 200 kbps up"). */
+function profileLabel(p: ThrottleProfile): string {
+  return p.preset ? describeProfile(p) : withUpload(describeProfile(p), p.uploadKbps);
+}
+
+function withUpload(label: string, uploadKbps: number | undefined): string {
+  if (!uploadKbps || uploadKbps <= 0) return label;
+  const up = `${uploadKbps} kbps up`;
+  return label === describeProfile(NO_PROFILE) ? up : `${label}, ${up}`;
 }
 
 /** Request bodies a request breakpoint may hold (and that can be edited). Same as the display cap. */
@@ -445,6 +471,26 @@ export class InterceptProxy extends EventEmitter {
   private readonly connRequest = new WeakMap<object, string>();
   /** CONTRACTS §13.4: the worker that runs script rules (started on the first hook call). */
   private readonly scripts = new ScriptRunner();
+  /** CONTRACTS §14.2: hostname patterns whose CONNECTs are tunnelled undecrypted. */
+  private passthrough: HostPattern[] = [];
+  /** The CONNECT hook is installed (start()). */
+  private connectHook = false;
+  /** Upstream sockets of open passthrough tunnels (destroyed by stop()). */
+  private readonly tunnelSockets = new Set<net.Socket>();
+  /** CONTRACTS §14.3: usable client certificates (first match wins) and every configured one's status. */
+  private certs: LoadedCert[] = [];
+  private certStatus: { host: string; problem?: string }[] = [];
+  /**
+   * mockttp's `clientCertificateHostMap`, looked up as `map["host:port"] || map[host] || map["*"]` for every upstream
+   * TLS connection (requests and WebSocket upgrades): answered from `certs` by pattern, so it follows
+   * setClientCertificates. Only "host:port" keys resolve.
+   */
+  private readonly certMap: Record<string, unknown> = new Proxy({} as Record<string, unknown>, {
+    get: (_t, key) => (typeof key === 'string' ? this.certOptions(key) : undefined),
+  });
+  /** CONTRACTS §14.5: answers replayed WebSocket upgrades; the subprotocol each recorded connection chose. */
+  private wsReplayServer?: WebSocket.Server;
+  private readonly wsReplayProtocols = new WeakMap<object, string>();
 
   constructor(private readonly opts: InterceptProxyOptions) {
     super();
@@ -455,6 +501,8 @@ export class InterceptProxy extends EventEmitter {
     const mf = opts.maxFramesPerExchange ?? DEFAULT_MAX_FRAMES;
     this.maxFrames = Number.isFinite(mf) ? Math.max(0, Math.floor(mf)) : DEFAULT_MAX_FRAMES;
     if (opts.upstreamProxy) this.upstreamSpec = parseUpstreamProxy(opts.upstreamProxy);
+    if (opts.tlsPassthrough) this.setTlsPassthrough(opts.tlsPassthrough);
+    if (opts.clientCertificates) this.setClientCertificates(opts.clientCertificates);
   }
 
   /** Actual port after start() (0 before). */
@@ -481,10 +529,11 @@ export class InterceptProxy extends EventEmitter {
       maxBodySize: BODY_CAP_BYTES,
     });
     const pool = createUpstreamPool({ rewriteLocalhost: this.opts.rewriteLocalhost ?? true });
-    pool.setTimings((connection) => this.timingSink(connection));
+    pool.setRequestPlan((conn, target) => this.requestPlan(conn, target));
     const connection = {
       proxyConfig: pool.proxyConfig, // marks our rules for the shared upstream pool
       ignoreHostHttpsErrors: this.opts.ignoreUpstreamCertErrors ?? false,
+      clientCertificateHostMap: this.certMap as never, // CONTRACTS §14.3
       // Upstream failure (refused, DNS, TLS, reset) → mockttp answers 502 with the error text;
       // the exchange is recorded as 'error'. The app never hangs on a dead upstream.
       simulateConnectionErrors: false,
@@ -541,6 +590,12 @@ export class InterceptProxy extends EventEmitter {
         throw new Error('not serializable');
       },
     } as unknown as RequestMatcher;
+    // CONTRACTS §14.5: a replayed event stream is written by us, event by event (a beforeRequest answer is one body).
+    // Same trick as the WebSocket steps below: an own `handle` replaces the step implementation's.
+    const passthroughImpl = StepLookup.passthrough.fromDefinition(new PassThroughStep(connection));
+    const replayStreamStep = Object.assign(new CallbackStep(() => ({ statusCode: 500 })), {
+      handle: (req: OngoingRequest, res: http.ServerResponse, options: unknown) => this.onReplayStream(req, res, passthroughImpl, options),
+    });
     await server.addRequestRules(
       {
         matchers: [unauthorized],
@@ -563,6 +618,11 @@ export class InterceptProxy extends EventEmitter {
         matchers: [lanDeny],
         completionChecker: new Always(),
         steps: [new CallbackStep((req) => this.onLanDenied(req))],
+      },
+      {
+        matchers: [route('replay-stream')],
+        completionChecker: new Always(),
+        steps: [replayStreamStep],
       },
       {
         matchers: [route('h1')],
@@ -615,8 +675,12 @@ export class InterceptProxy extends EventEmitter {
         return proxy.connectWsMapped(this, req, socket, head, options, map);
       },
     });
+    const replayWsStep = Object.assign(new RejectWebSocketStep(500), {
+      handle: (req: OngoingRequest, socket: net.Socket, head: Buffer) => this.onWsReplay(req, socket, head),
+    });
     await (server as unknown as { addWebSocketRules: (...r: unknown[]) => Promise<unknown> }).addWebSocketRules(
       { matchers: [wsRoute('ws-local')], completionChecker: new Always(), steps: [localWsStep] },
+      { matchers: [wsRoute('ws-replay')], completionChecker: new Always(), steps: [replayWsStep] },
       { matchers: [wsRoute('ws-pass')], completionChecker: new Always(), steps: [passWsStep] },
     );
     // A 'response' listener makes mockttp consume (and, past maxBodySize, discard) its internal
@@ -663,6 +727,7 @@ export class InterceptProxy extends EventEmitter {
       };
       this.lanHooks = true;
       raw.on('connection', (s: net.Socket) => onComboConnection(s));
+      this.installConnectHook(raw);
       // LAN sockets get their gate's guarded agents — always, whether or not LAN mode is on now.
       pool.setLan({
         agentFor: (connection, protocol) => {
@@ -713,7 +778,11 @@ export class InterceptProxy extends EventEmitter {
     for (const settle of [...this.holds.values()]) settle(false);
     for (const c of this.sendClients) c.destroy();
     this.sendClients.clear();
+    for (const t of this.tunnelSockets) t.destroy();
+    this.tunnelSockets.clear();
     this.scripts.stop();
+    this.wsReplayServer?.close();
+    this.wsReplayServer = undefined;
     await server.stop();
     this.pool?.destroy();
     this.pool = undefined;
@@ -947,10 +1016,70 @@ export class InterceptProxy extends EventEmitter {
     return s ? s.label.replace(/^http:\/\//, '') : undefined;
   }
 
-  /** The upstream proxy in use (`http://host:port`, never credentials). */
-  get upstreamProxy(): { url: string; ignoreCertErrors: boolean } | undefined {
+  /** The upstream proxy in use (`http://host:port`, never credentials), with its normalised noProxy entries. */
+  get upstreamProxy(): { url: string; ignoreCertErrors: boolean; noProxy?: string[] } | undefined {
     const s = this.upstreamSpec;
-    return s ? { url: s.label, ignoreCertErrors: s.ignoreCertErrors } : undefined;
+    if (!s) return undefined;
+    const noProxy = s.noProxy?.map((e) => `${e.host.startsWith('.') ? `*${e.host}` : net.isIPv6(e.host) ? `[${e.host}]` : e.host}${e.port !== undefined ? `:${e.port}` : ''}`);
+    return { url: s.label, ignoreCertErrors: s.ignoreCertErrors, ...(noProxy?.length ? { noProxy } : {}) };
+  }
+
+  /**
+   * CONTRACTS §14.2: CONNECTs to these hosts (hostname globs, optional `:port`, see src/hosts.ts) are tunnelled to
+   * the real server undecrypted: the app sees the server's own certificate (its pinning keeps working), each tunnel
+   * is one exchange (`kind: 'tunnel'`, method CONNECT, url `https://host:port/`, `tunnelBytes`), no headers / bodies.
+   * Only block and fault rules apply (after the TLS handshake, see src/tls-records.ts), plus the network profile.
+   * Throws on an invalid pattern (nothing changes then). Applies to CONNECTs from now on; open tunnels stay.
+   */
+  setTlsPassthrough(hosts: string[] | undefined): void {
+    if (hosts !== undefined && hosts !== null && !Array.isArray(hosts)) throw new Error('TLS passthrough: expected a list of host names');
+    const parsed: HostPattern[] = [];
+    for (const h of hosts ?? []) {
+      try {
+        parsed.push(parseHostPattern(h));
+      } catch (e) {
+        throw new Error(`TLS passthrough: ${(e as Error).message}`);
+      }
+    }
+    this.passthrough = parsed;
+  }
+
+  /** The TLS passthrough patterns in use. */
+  get tlsPassthrough(): string[] {
+    return this.passthrough.map((p) => p.pattern);
+  }
+
+  /** False only when mockttp's CONNECT handling could not be hooked (then passthrough hosts are intercepted as usual). */
+  get tlsPassthroughAvailable(): boolean {
+    return !this.server || this.connectHook;
+  }
+
+  /**
+   * CONTRACTS §14.3: client certificates for upstream mTLS. The first entry whose `host` pattern (glob, optional
+   * `:port`) matches the server is presented on every upstream TLS connection to it (requests and WebSocket upgrades,
+   * through the pool, LAN-guarded and upstream-proxy agents alike; each certificate gets its own pooled connections).
+   * Returns one status per entry, in order: `problem` set = not usable (bad pattern, unreadable PKCS#12 / PEM, wrong
+   * passphrase, key not matching the certificate…) and skipped; the others are used. Never throws for a bad entry;
+   * key material and passphrases never appear in problems, exchanges or events. Exchanges that presented one carry
+   * `clientCertificate` = the pattern. Applies to connections opened from now on.
+   */
+  setClientCertificates(certs: ClientCertificate[] | undefined): { host: string; problem?: string }[] {
+    if (certs !== undefined && certs !== null && !Array.isArray(certs)) throw new Error('Client certificates: expected a list');
+    const loaded: LoadedCert[] = [];
+    const status: { host: string; problem?: string }[] = [];
+    for (const c of certs ?? []) {
+      const r = loadClientCertificate(c);
+      status.push(r.problem ? { host: r.host, problem: r.problem } : { host: r.host });
+      if (r.cert) loaded.push(r.cert);
+    }
+    this.certs = loaded;
+    this.certStatus = status;
+    return status.map((x) => ({ ...x }));
+  }
+
+  /** Status of the configured client certificates (see setClientCertificates). */
+  get clientCertificates(): { host: string; problem?: string }[] {
+    return this.certStatus.map((x) => ({ ...x }));
   }
 
   private checkUpstreamLoop(spec: UpstreamProxySpec): void {
@@ -1436,7 +1565,7 @@ export class InterceptProxy extends EventEmitter {
       const { rule, base, graphqlOperation: op } = this.compiled[i];
       if (!rule.enabled || this.spentReason(rule, now) || !base(method, url)) continue;
       if (op !== undefined && !o.ignoreGraphql) {
-        if (o.ws) continue; // the operation of a subscription is inside the frames
+        if (o.ws || o.tunnel) continue; // the operation of a subscription is inside the frames
         if (o.body) {
           names ??= graphqlOperationNames(method, url, o.body());
         } else if (!o.headers || !hasRequestBody(o.headers)) {
@@ -1450,6 +1579,14 @@ export class InterceptProxy extends EventEmitter {
           return { deferred: true, needsResponseHook: this.responseHookFrom(i, method, url, now), note };
         }
         if (!names.includes(op)) continue;
+      }
+      if (o.tunnel) {
+        const a = rule.action;
+        if ((a.kind !== 'block' && a.kind !== 'fault') || (a.kind === 'fault' && a.fault === 'truncate')) {
+          const what = a.kind === 'fault' ? 'The truncate fault' : `${capitalize(a.kind)} rule`;
+          note ??= `${what}${rule.name ? ` "${rule.name}"` : ''} does not apply to TLS passthrough tunnels (not decrypted); passed through.`;
+          continue;
+        }
       }
       if (o.ws) {
         const a = rule.action;
@@ -1641,7 +1778,7 @@ export class InterceptProxy extends EventEmitter {
       // truncate forwards and cuts the response (streaming route); the others never reach the server.
       flow = { route: action.fault === 'truncate' ? 'plain' : 'h1', rule, action, fault: action.fault, simulated: FAULT_LABELS[action.fault] };
     } else if (action.kind === 'throttle') {
-      flow = { route: 'plain', rule, action, throttle: { latencyMs: action.latencyMs, kbps: action.kbps }, simulated: throttleLabel(action) };
+      flow = { route: 'plain', rule, action, throttle: { latencyMs: action.latencyMs, kbps: action.kbps, uploadKbps: action.uploadKbps }, simulated: throttleLabel(action) };
       dropRate = action.dropRate;
     } else if (action.kind === 'cors') {
       // Streams like a pass-through; the taps patch the response head (CONTRACTS §11.3).
@@ -1698,8 +1835,8 @@ export class InterceptProxy extends EventEmitter {
       flow = { route: 'h1', rule, fault: 'dns', simulated: describeProfile(p) };
       dropRate = undefined;
     } else if (reachesNetwork && !flow.localError && p.kind === 'throttle' && k !== 'throttle') {
-      flow.throttle = { latencyMs: p.latencyMs, kbps: p.kbps };
-      flow.simulated = flow.simulated ? `${describeProfile(p)} · ${flow.simulated}` : describeProfile(p);
+      flow.throttle = { latencyMs: p.latencyMs, kbps: p.kbps, uploadKbps: p.uploadKbps };
+      flow.simulated = flow.simulated ? `${profileLabel(p)} · ${flow.simulated}` : profileLabel(p);
       dropRate = p.dropRate;
     }
     if (dropRate && dropRate > 0 && Math.random() < dropRate) {
@@ -1719,8 +1856,11 @@ export class InterceptProxy extends EventEmitter {
   private replayFlow(method: string, url: string, headers: HeaderBag, body: BodyKey, note?: string): Flow {
     const store = this.replayStore!;
     const hit = store.lookup(method, url, body, true);
-    if (hit === 'needs-body') return { route: 'h1', replay: 'deferred', ...(note ? { note } : {}) };
-    if (hit) return { route: 'h1', replay: hit.entry, simulated: `Replayed from ${store.name ?? 'a recording'}`, ...(note ? { note } : {}) };
+    // CONTRACTS §14.5: recorded event streams are written event by event (route replay-stream, onReplayStream).
+    if (hit === 'needs-body') return { route: store.hasStream(method, url) ? 'replay-stream' : 'h1', replay: 'deferred', ...(note ? { note } : {}) };
+    if (hit && hit.entry.kind !== 'websocket') {
+      return { route: hit.entry.kind === 'sse' ? 'replay-stream' : 'h1', replay: hit.entry, simulated: `Replayed from ${store.name ?? 'a recording'}`, ...(note ? { note } : {}) };
+    }
     if (store.fallback === 'fail') {
       // Like the offline profile: closed without a response inside the tunnel, so dart:io has no DIRECT to fall back to.
       return { route: 'h1', fault: 'dns', simulated: `Not in the recording${store.name ? ` "${store.name}"` : ''} (replay: fail)`, ...(note ? { note } : {}) };
@@ -1875,6 +2015,9 @@ export class InterceptProxy extends EventEmitter {
     );
     live.stream = { ...live.stream, sse: rec };
     tap.onResponseData = (buf) => rec.push(buf);
+    // CONTRACTS §14.4: every event arrives `latencyMs` late (the shaper starts with the first body byte).
+    const latency = live.flow.throttle?.latencyMs;
+    if (latency && latency > 0) tap.shaping = { ...tap.shaping, latencyMs: latency };
     this.emitChange(ex);
   }
 
@@ -1946,7 +2089,7 @@ export class InterceptProxy extends EventEmitter {
           (cause ? `The connection to the server failed${live.stream?.sse ? ' mid-stream' : ''} (${cause}).` : `Failed with status ${res.statusCode}`),
       );
     } else {
-      this.finish(ex, 'completed');
+      this.finish(ex, flow.route === 'replay-stream' ? 'mocked' : 'completed');
     }
   }
 
@@ -1970,10 +2113,10 @@ export class InterceptProxy extends EventEmitter {
       // An event stream usually ends when the app stops listening: that is not an error.
       void sse.end().then(() => {
         if (this.live.get(id)?.ex !== ex) return;
-        if (message) this.fail(ex, message);
+        if (message && live.flow.route !== 'replay-stream') this.fail(ex, message);
         else {
           ex.error ??= 'The app closed the event stream.';
-          this.finish(ex, 'completed');
+          this.finish(ex, live.flow.route === 'replay-stream' ? 'mocked' : 'completed');
         }
       });
       return;
@@ -2629,9 +2772,30 @@ export class InterceptProxy extends EventEmitter {
       } catch (e) {
         flow = { route: 'ws-local', rule: m.rule, action, localError: `Map Remote rule: ${(e as Error).message}` };
       }
-    } else if (!m.rule && this.replayStore?.fallback === 'fail') {
-      flow = { route: 'ws-local', fault: 'dns', simulated: 'Not in the recording (replay: fail)' };
+    } else if (!m.rule && this.replayStore) {
+      // CONTRACTS §14.5: a recorded WebSocket for this URL answers as a scripted server.
+      const store = this.replayStore;
+      const hit = store.lookup('GET', url, {}, true);
+      if (hit && hit !== 'needs-body' && hit.entry.kind === 'websocket') {
+        flow = { route: 'ws-replay', replay: hit.entry, simulated: `Replayed from ${store.name ?? 'a recording'}` };
+      } else if (store.fallback === 'fail') {
+        flow = { route: 'ws-local', fault: 'dns', simulated: 'Not in the recording (replay: fail)' };
+      }
     } else if (m.rule) flow.rule = m.rule;
+    if (flow.route === 'ws-pass') {
+      // CONTRACTS §14.4: a throttle rule (or the throttle profile) paces the frames, each direction (watchWebSocket).
+      const t = action?.kind === 'throttle' ? action : this.profile.kind === 'throttle' ? this.profile : undefined;
+      if (t) {
+        const label = action?.kind === 'throttle' ? throttleLabel(action) : profileLabel(this.profile as ThrottleProfile);
+        if ((t.latencyMs ?? 0) > 0 || (t.kbps ?? 0) > 0 || (t.uploadKbps ?? 0) > 0) {
+          flow.throttle = { latencyMs: t.latencyMs, kbps: t.kbps, uploadKbps: t.uploadKbps };
+          flow.simulated = flow.simulated ? `${label} · ${flow.simulated}` : label;
+        }
+        if (t.dropRate && t.dropRate > 0 && Math.random() < t.dropRate) {
+          flow = { route: 'ws-local', rule: m.rule, fault: 'drop', simulated: `${label}: dropped` };
+        }
+      }
+    }
     if (m.note) flow.note = m.note;
     if (meta?.traceId) flow.traceId = meta.traceId;
     const socket = (req as unknown as { socket?: unknown }).socket;
@@ -2666,6 +2830,13 @@ export class InterceptProxy extends EventEmitter {
       if (!live || live.ex !== ex) return;
       const st: StreamState = (live.stream = { ...live.stream, wsDirect: true });
       const up = ws.upstreamWebSocket;
+      const th = live.flow.throttle;
+      if (th && up) {
+        // Before mockttp's pipe starts (it is attached after this event): what the pipe sends to the app is paced
+        // like a download, what it sends to the server like an upload.
+        paceWebSocket(ws, { latencyMs: th.latencyMs, kbps: th.kbps });
+        paceWebSocket(up, { latencyMs: th.latencyMs, kbps: th.uploadKbps });
+      }
       ws.on('message', (data, isBinary) => this.addFrame(ex, payloadFrame('send', isBinary ? 'binary' : 'text', toBuffer(data))));
       ws.on('ping', (d) => this.addFrame(ex, payloadFrame('send', 'ping', toBuffer(d))));
       ws.on('pong', (d) => this.addFrame(ex, payloadFrame('send', 'pong', toBuffer(d))));
@@ -2835,6 +3006,425 @@ export class InterceptProxy extends EventEmitter {
     const raw = (req as unknown as { rawHeaders: Array<[string, string]> }).rawHeaders;
     const rawHeaders = rewritePairs(Array.isArray(raw) ? raw.slice() : [], { remove: ['host'], set: [['Host', map.host]] });
     await step.connectUpstream(destination, map.url, req, rawHeaders, socket, head, options);
+  }
+
+  // ---------------------------------------------------------------- client certificates (CONTRACTS §14.3)
+
+  /** The first usable certificate for a server. */
+  private certFor(hostname: string, port: number): LoadedCert | undefined {
+    return this.certs.find((c) => matchesHostPattern(c.pattern, hostname, port));
+  }
+
+  /** mockttp's clientCertificateHostMap lookup: "host:port" → TLS options (pfx / cert + key, passphrase). */
+  private certOptions(key: string): LoadedCert['options'] | undefined {
+    const i = key.lastIndexOf(':');
+    if (i <= 0 || !/^\d+$/.test(key.slice(i + 1))) return undefined;
+    return this.certFor(key.slice(0, i), Number(key.slice(i + 1)))?.options;
+  }
+
+  /**
+   * The pool asks before each upstream request of our rules (upstream-pool.ts): phase timings, upload pacing
+   * (CONTRACTS §14.4), and the client certificate the connection presents (CONTRACTS §14.3).
+   */
+  private requestPlan(connection: unknown, target: { protocol?: string; hostname?: string; port?: number }): RequestPlan | undefined {
+    const id = connection && typeof connection === 'object' ? this.connRequest.get(connection) : undefined;
+    if (!id) return undefined;
+    const live = this.live.get(id);
+    const flow = live?.flow ?? this.flows.get(id);
+    if (live && (target.protocol === 'https:' || target.protocol === 'wss:') && target.hostname) {
+      const c = this.certFor(target.hostname, Number(target.port) || 443);
+      if (c) live.ex.clientCertificate = c.host;
+      else delete live.ex.clientCertificate;
+    }
+    const up = flow?.throttle?.uploadKbps;
+    return { timings: (p) => this.addTimings(id, p), ...(up && up > 0 ? { uploadKbps: up } : {}) };
+  }
+
+  // ---------------------------------------------------------------- TLS passthrough (CONTRACTS §14.2)
+
+  /**
+   * Take over CONNECT handling: mockttp's combo server answers every CONNECT itself ('connect' listener in
+   * http-combo-server.js: "200", then the socket goes back in as a new connection to be MITM'd). We remove its
+   * listener(s) from the server (httpolyglot mirrors listeners onto its sub-servers, so removing from the outer server
+   * removes them everywhere) and install one that tunnels passthrough hosts and hands everything else to mockttp's.
+   * LAN clients reach this too: the LAN gate hands authenticated sockets to the same server.
+   */
+  private installConnectHook(raw: net.Server): void {
+    const original = raw.listeners('connect') as Array<(...a: unknown[]) => void>;
+    if (!original.length) return;
+    for (const l of original) raw.removeListener('connect', l);
+    raw.on('connect', (req: http.IncomingMessage, socket: unknown, head: Buffer) => {
+      let handled = false;
+      try {
+        handled = this.onConnect(req, socket, head);
+      } catch {
+        handled = false;
+      }
+      if (!handled) for (const l of original) l.call(raw, req, socket, head);
+    });
+    this.connectHook = true;
+  }
+
+  /** A CONNECT to a passthrough host: tunnel it (true), else mockttp handles it (false). */
+  private onConnect(req: http.IncomingMessage, socket: unknown, head: Buffer | undefined): boolean {
+    if (!this.passthrough.length || !(socket instanceof net.Socket) || socket instanceof tls.TLSSocket) return false;
+    const t = splitHostPort(req.url ?? '');
+    if (!t) return false;
+    const host = normalizeHostname(t.host);
+    if (!host || !this.passthrough.some((p) => matchesHostPattern(p, host, t.port))) return false;
+    void this.runTunnel(req, socket, head ?? Buffer.alloc(0), host, t.port).catch(() => socket.destroy());
+    return true;
+  }
+
+  private async runTunnel(req: http.IncomingMessage, socket: net.Socket, head: Buffer, host: string, port: number): Promise<void> {
+    socket.on('error', () => undefined);
+    if (!lanConnectAllowed(socket)) {
+      socket.destroy();
+      return;
+    }
+    const gate = lanGateOf(socket);
+    const label = net.isIPv6(host) ? `[${host}]` : host;
+    const url = `https://${label}:${port}/`;
+    // Rules: block and fault only. Matched as method CONNECT on the tunnel's own URL (a rule made from a tunnel,
+    // `https://host:port/*`), and on `https://host/` for port 443 so a rule written for the site applies too.
+    let m: MatchResult = {};
+    let note: string | undefined;
+    for (const u of port === 443 ? [url, `https://${label}/`] : [url]) {
+      const probe = this.matchRule('CONNECT', u, { count: false, tunnel: true });
+      note ??= probe.note;
+      if (probe.rule) {
+        m = this.matchRule('CONNECT', u, { count: true, tunnel: true });
+        break;
+      }
+    }
+    const flow: Flow = { route: 'tunnel', ...(m.rule ? { rule: m.rule } : {}), ...(gate ? { viaLan: true } : {}) };
+    const a = m.action;
+    let cut: FlowFault | undefined;
+    let simulated: string | undefined;
+    let up: LinkShape | undefined;
+    let down: LinkShape | undefined;
+    let latency = 0;
+    const p = this.profile;
+    if (a?.kind === 'block') {
+      cut = 'reset';
+      if (a.mode === 'status') note ??= "A block with a status can't be answered inside an undecrypted tunnel; the connection was reset after the TLS handshake instead.";
+    } else if (a?.kind === 'fault') {
+      cut = a.fault;
+      simulated = FAULT_LABELS[a.fault];
+    } else if (p.kind === 'offline') {
+      cut = 'dns';
+      simulated = describeProfile(p);
+    } else if (!m.rule && this.replayStore?.fallback === 'fail') {
+      cut = 'dns';
+      simulated = `Not in the recording${this.replayStore.name ? ` "${this.replayStore.name}"` : ''} (replay: fail)`;
+    } else if (p.kind === 'throttle') {
+      simulated = profileLabel(p);
+      latency = p.latencyMs ?? 0;
+      down = { latencyMs: p.latencyMs, kbps: p.kbps };
+      up = { latencyMs: p.latencyMs, kbps: p.uploadKbps };
+      if (p.dropRate && p.dropRate > 0 && Math.random() < p.dropRate) {
+        cut = 'drop';
+        simulated = `${simulated}: dropped`;
+      }
+    }
+    if (cut) flow.fault = cut;
+    const requestHeaders = cleanHeaders(req.headers as HeaderBag);
+    delete requestHeaders['proxy-authorization']; // the LAN token
+    const ex: Exchange = {
+      id: `tunnel-${randomUUID()}`,
+      startedAt: Date.now(),
+      method: 'CONNECT',
+      url,
+      requestHeaders,
+      state: 'pending',
+      kind: 'tunnel',
+      tunnelBytes: { sent: 0, received: 0 },
+      ...(m.rule ? { matchedRuleId: m.rule.id } : {}),
+      ...(note ? { error: note } : {}),
+      ...(simulated ? { simulated } : {}),
+      ...(gate ? { viaLan: true as const } : {}),
+    };
+    this.track(ex, flow);
+    const isLive = () => this.live.get(ex.id)?.ex === ex;
+    let relaying = false;
+    socket.once('close', () => {
+      if (!relaying && isLive()) this.fail(ex, 'The app closed the connection before the tunnel was open.');
+    });
+    if (latency > 0) {
+      const from = performance.now();
+      await sleep(latency);
+      if (!isLive()) return;
+      this.addPhase(ex, 'delayMs', performance.now() - from);
+    }
+    let server: net.Socket;
+    try {
+      server = await openTunnelUpstream({
+        host,
+        port,
+        ...(gate ? { lan: { listenerHost: gate.host, closed: () => gate.closed } } : {}),
+        upstream: this.upstreamSpec,
+        ...((this.opts.rewriteLocalhost ?? true) ? { alias: (h: string) => HOST_ALIASES[h] } : {}),
+        timings: (t) => this.addTimings(ex.id, t),
+      });
+    } catch (e) {
+      if (!isLive()) return;
+      const forbidden = e instanceof SsrfError || (e as { statusCode?: number }).statusCode === 403;
+      const message = e instanceof SsrfError ? e.message : forbidden ? `${SSRF_MARKER}: ${(e as Error).message}` : `Could not open the tunnel to ${label}:${port}: ${(e as Error).message}`;
+      ex.status = forbidden ? 403 : 502;
+      this.fail(ex, message);
+      refuse(socket, `HTTP/1.1 ${ex.status} ${STATUS_CODES[ex.status]}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+      return;
+    }
+    if (socket.destroyed || !isLive()) {
+      server.destroy();
+      return;
+    }
+    this.tunnelSockets.add(server);
+    server.once('close', () => this.tunnelSockets.delete(server));
+    relaying = true;
+    socket.write('HTTP/1.1 200 Connection established\r\n\r\n');
+    this.emitChange(ex);
+    relay({
+      app: socket,
+      server,
+      head,
+      up,
+      down,
+      ...(cut ? { onAppData: () => this.cutTunnel(ex, socket, server, cut!) } : {}),
+      onBytes: (sent, received) => {
+        if (!isLive()) return;
+        ex.tunnelBytes = { sent, received };
+        this.touch(ex);
+      },
+      onClose: (error) => {
+        if (!isLive()) return;
+        if (error) this.fail(ex, error);
+        else this.finish(ex, 'completed');
+      },
+    });
+  }
+
+  /** A block / fault on a passthrough tunnel, at the app's first request record (after the TLS handshake). */
+  private cutTunnel(ex: Exchange, socket: net.Socket, server: net.Socket, fault: FlowFault): void {
+    server.destroy();
+    if (this.live.get(ex.id)?.ex !== ex) return void socket.destroy();
+    if (fault === 'timeout') {
+      const settle = (appLeft: boolean) => {
+        if (this.holds.get(ex.id) !== settle) return;
+        clearTimeout(timer);
+        this.holds.delete(ex.id);
+        if (this.live.get(ex.id)?.ex !== ex) return void socket.destroy();
+        const secs = ((Date.now() - ex.startedAt) / 1000).toFixed(1);
+        ex.simulated = appLeft ? `${FAULT_LABELS.timeout} (the app gave up after ${secs} s)` : `${FAULT_LABELS.timeout} (reset after ${secs} s)`;
+        this.finish(ex, 'blocked');
+        if (!appLeft) resetOrDestroy(socket as never);
+      };
+      const timer = setTimeout(() => settle(false), this.breakpointTimeoutMs);
+      timer.unref?.();
+      this.holds.set(ex.id, settle);
+      socket.once('close', () => settle(true));
+      return;
+    }
+    this.finish(ex, 'blocked');
+    if (fault === 'dns') socket.end();
+    else resetOrDestroy(socket as never);
+  }
+
+  // ---------------------------------------------------------------- stream replay (CONTRACTS §14.5)
+
+  /**
+   * A recorded event stream, answered event by event at the recorded gaps (≤ 5 s). Entries whose request body
+   * matters (POST streams) are chosen here, once the body is read; a non-stream answer is written whole, and a miss
+   * follows the replay fallback (the real server, or closed like offline).
+   */
+  private async onReplayStream(req: OngoingRequest, res: http.ServerResponse, passthrough: { handle(...a: unknown[]): Promise<unknown> }, options: unknown): Promise<void> {
+    const flow = this.flows.get(req.id);
+    if (!flow) {
+      res.writeHead(502).end();
+      return;
+    }
+    let entry = flow.replay;
+    if (entry === 'deferred') {
+      let key: BodyKey = 'unreadable';
+      try {
+        const buf: Buffer = await (req as unknown as { body: { asDecodedBuffer(): Promise<Buffer> } }).body.asDecodedBuffer();
+        const b = await decodeForDisplay(buf, undefined, true);
+        key = b?.truncated ? 'unreadable' : { hash: requestBodyHash(b) };
+      } catch {
+        key = 'unreadable';
+      }
+      const r = this.replayFlow(req.method, req.url, req.headers as HeaderBag, key, flow.note);
+      Object.assign(flow, { route: r.route, replay: r.replay, fault: r.fault, simulated: r.simulated, throttle: r.throttle, note: r.note });
+      entry = r.replay === 'deferred' ? undefined : r.replay;
+      if (!entry) {
+        if (r.fault) {
+          // replay fallback "fail": closed without a response, like the offline profile.
+          const ex = this.newExchange(req, flow);
+          this.track(ex, flow);
+          this.finish(ex, 'blocked');
+          res.socket?.end();
+          return;
+        }
+        // Not in the recording: the real server, recorded like any pass-through.
+        flow.route = 'plain';
+        this.track(this.newExchange(req, flow), flow);
+        const tap = getTap(req.id);
+        if (tap) this.applyShaping(tap, flow);
+        await passthrough.handle(req, res, options);
+        return;
+      }
+      if (entry.kind !== 'sse') {
+        const ex = this.newExchange(req, flow);
+        const out = await this.answerReplay(ex, flow, entry);
+        const r2 = out.response as { statusCode: number; statusMessage?: string; headers: HeaderBag; rawBody: Buffer };
+        res.writeHead(r2.statusCode, r2.statusMessage ?? '', r2.headers as http.OutgoingHttpHeaders);
+        res.end(r2.rawBody);
+        return;
+      }
+    }
+    if (!entry) {
+      res.writeHead(502).end();
+      return;
+    }
+    const ex = this.newExchange(req, flow);
+    this.setRequestMs(ex, (req as unknown as { timingEvents?: RequestTimingEvents }).timingEvents, performance.now());
+    this.track(ex, flow);
+    const headers: HeaderBag = {};
+    for (const [k, v] of Object.entries(entry.headers ?? {})) {
+      const lk = k.toLowerCase();
+      if (!HTTP_TOKEN.test(k) || REPLAY_DROPPED_HEADERS.has(lk) || lk === 'content-encoding') continue;
+      const vals = (Array.isArray(v) ? v : [v]).filter((x) => typeof x === 'string' && !/[\r\n\0]/.test(x));
+      if (vals.length) headers[k] = vals.length === 1 ? vals[0] : vals;
+    }
+    if (!getHeader(headers, 'content-type')) headers['content-type'] = 'text/event-stream';
+    if (!getHeader(headers, 'cache-control')) headers['cache-control'] = 'no-cache';
+    this.addCorsToLocalResponse(ex, headers);
+    const steps = sseSchedule(entry.frames);
+    await new Promise<void>((resolve) => {
+      let timer: NodeJS.Timeout | undefined;
+      let i = 0;
+      res.once('close', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      // The taps see the head (an event stream: SSE recording, flushed at once) and every event written.
+      res.writeHead(entry.status, STATUS_CODES[entry.status] ?? '', headers as http.OutgoingHttpHeaders);
+      const next = () => {
+        if (res.destroyed || res.writableEnded) return resolve();
+        if (i >= steps.length) {
+          res.end();
+          return resolve();
+        }
+        const step = steps[i++];
+        timer = setTimeout(() => {
+          if (res.destroyed) return resolve();
+          res.write(sseEventText(step.frame));
+          next();
+        }, step.delayMs);
+      };
+      next();
+    });
+  }
+
+  /** A recorded WebSocket: accept the upgrade here and play the server's side (src/replay-stream.ts). */
+  private async onWsReplay(req: OngoingRequest, socket: net.Socket, head: Buffer): Promise<void> {
+    const live = this.live.get(req.id);
+    const entry = live?.flow.replay;
+    if (!live || !entry || entry === 'deferred') {
+      socket.destroy();
+      return;
+    }
+    const { ex } = live;
+    socket.on('error', () => undefined);
+    let upgraded = false;
+    socket.once('close', () => {
+      if (!upgraded && this.live.get(ex.id)?.ex === ex) this.fail(ex, 'The replayed WebSocket upgrade was refused (an invalid upgrade request?).');
+    });
+    const protocol = getHeader((entry.headers ?? {}) as HeaderBag, 'sec-websocket-protocol')?.split(',')[0]?.trim();
+    const wss = (this.wsReplayServer ??= new WebSocket.Server({
+      noServer: true,
+      perMessageDeflate: false,
+      maxPayload: WS_MAX_MESSAGE_BYTES,
+      handleProtocols: (offered: Set<string>, request: unknown) => {
+        const want = this.wsReplayProtocols.get(request as object);
+        if (want && offered.has(want)) return want;
+        return offered.values().next().value ?? false;
+      },
+    }));
+    if (protocol) this.wsReplayProtocols.set(req as unknown as object, protocol);
+    wss.handleUpgrade(req as unknown as http.IncomingMessage, socket, head, (ws) => {
+      upgraded = true;
+      this.runWsReplay(ex, entry, ws);
+    });
+  }
+
+  private runWsReplay(ex: Exchange, entry: ReplayEntry, ws: WebSocket): void {
+    const isLive = () => this.live.get(ex.id)?.ex === ex;
+    ex.status = 101;
+    ex.responseHeaders = { upgrade: 'websocket', connection: 'Upgrade', ...(ws.protocol ? { 'sec-websocket-protocol': ws.protocol } : {}) };
+    this.emitChange(ex);
+    const script = wsScript(entry.frames);
+    const timers = new Set<NodeJS.Timeout>();
+    let closed = false;
+    let closeSent = false;
+    let chain = Promise.resolve();
+    const wait = (ms: number) =>
+      new Promise<void>((r) => {
+        const t = setTimeout(() => {
+          timers.delete(t);
+          r();
+        }, ms);
+        timers.add(t);
+      });
+    const send = (f: Frame) => {
+      if (f.kind === 'close') {
+        closeSent = true;
+        const code = f.closeCode !== undefined && f.closeCode !== 1005 && f.closeCode !== 1006 ? f.closeCode : undefined;
+        if (isLive()) this.addFrame(ex, closeFrame('receive', code, f.text));
+        try {
+          if (code !== undefined) ws.close(code, (f.text ?? '').slice(0, 120));
+          else ws.close();
+        } catch {
+          ws.close();
+        }
+        return;
+      }
+      const { data, binary } = framePayload(f);
+      const buf = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
+      if (f.kind === 'ping') ws.ping(buf);
+      else if (f.kind === 'pong') ws.pong(buf);
+      else if (f.kind === 'text' || f.kind === 'binary') ws.send(data, { binary });
+      else return;
+      if (isLive()) this.addFrame(ex, payloadFrame('receive', f.kind, buf));
+    };
+    const play = (steps: TimedStep[]) => {
+      chain = chain.then(async () => {
+        for (const s of steps) {
+          if (closed || closeSent) return;
+          if (s.delayMs > 0) await wait(s.delayMs);
+          if (closed || closeSent || ws.readyState !== WebSocket.OPEN) return;
+          send(s.frame);
+        }
+      });
+    };
+    let messages = 0;
+    ws.on('message', (data, isBinary) => {
+      if (isLive()) this.addFrame(ex, payloadFrame('send', isBinary ? 'binary' : 'text', toBuffer(data)));
+      const reply = script.replies[messages++];
+      if (reply) play(reply);
+    });
+    ws.on('ping', (d) => isLive() && this.addFrame(ex, payloadFrame('send', 'ping', toBuffer(d))));
+    ws.on('pong', (d) => isLive() && this.addFrame(ex, payloadFrame('send', 'pong', toBuffer(d))));
+    ws.on('error', () => undefined);
+    ws.once('close', (code, reason) => {
+      closed = true;
+      for (const t of timers) clearTimeout(t);
+      timers.clear();
+      if (!isLive()) return;
+      if (!closeSent) this.addFrame(ex, closeFrame('send', code === 1005 ? undefined : code, toBuffer(reason)));
+      this.finish(ex, 'mocked');
+    });
+    play(script.opening);
   }
 
   private onTlsError(f: TlsHandshakeFailure): void {
@@ -3007,12 +3597,14 @@ function validateProfile(p: NetworkProfile): NetworkProfile {
   const latencyMs = num(p.latencyMs, 'latencyMs', 10 * 60 * 1000);
   const kbps = num(p.kbps, 'kbps', 10_000_000);
   const dropRate = num(p.dropRate, 'dropRate', 1);
+  const uploadKbps = num(p.uploadKbps, 'uploadKbps', 10_000_000);
   return {
     kind: 'throttle',
     ...(p.preset ? { preset: p.preset } : {}),
     ...(latencyMs !== undefined ? { latencyMs } : {}),
     ...(kbps ? { kbps } : {}),
     ...(dropRate !== undefined ? { dropRate } : {}),
+    ...(uploadKbps ? { uploadKbps } : {}),
   };
 }
 
@@ -3194,4 +3786,104 @@ async function replaceInBody(raw: Buffer, contentEncoding: string | undefined, l
   }
   const out = Buffer.from(text, 'utf8');
   return { kind: 'done', decoded: bom ? Buffer.concat([decoded.subarray(0, 3), out]) : out, unmatched };
+}
+
+// ---------------------------------------------------------------- v0.8.0 helpers (CONTRACTS §14)
+
+/** A usable client certificate (CONTRACTS §14.3). `options` go into the upstream TLS options; never logged. */
+interface LoadedCert {
+  pattern: HostPattern;
+  /** The pattern as configured (Exchange.clientCertificate). */
+  host: string;
+  options: { pfx?: Buffer; cert?: string; key?: string; passphrase?: string };
+}
+
+/** Validate one configured certificate by building a TLS context from it. Problems never quote key material. */
+export function loadClientCertificate(c: ClientCertificate): { host: string; cert?: LoadedCert; problem?: string } {
+  const host = c && typeof c === 'object' && typeof c.host === 'string' ? c.host.trim() : '';
+  if (!c || typeof c !== 'object') return { host, problem: 'Not a certificate entry.' };
+  let pattern: HostPattern;
+  try {
+    pattern = parseHostPattern(c.host);
+  } catch (e) {
+    return { host, problem: `Invalid host: ${(e as Error).message}.` };
+  }
+  const hasPfx = c.pfx !== undefined && c.pfx !== null;
+  const hasPem = c.cert !== undefined || c.key !== undefined;
+  if (hasPfx && hasPem) return { host, problem: 'Give either a PKCS#12 file (pfx) or a PEM certificate and key, not both.' };
+  if (!hasPfx && !hasPem) return { host, problem: 'No certificate: give a PKCS#12 file (pfx) or a PEM certificate and key.' };
+  if (c.passphrase !== undefined && typeof c.passphrase !== 'string') return { host, problem: 'The passphrase must be text.' };
+  const options: LoadedCert['options'] = {};
+  if (hasPfx) {
+    if (!(c.pfx instanceof Uint8Array) || !c.pfx.length) return { host, problem: 'The PKCS#12 file is empty or not binary data.' };
+    options.pfx = Buffer.from(c.pfx);
+  } else {
+    if (typeof c.cert !== 'string' || !c.cert.trim()) return { host, problem: 'The PEM certificate is missing.' };
+    if (typeof c.key !== 'string' || !c.key.trim()) return { host, problem: 'The PEM private key is missing.' };
+    options.cert = c.cert;
+    options.key = c.key;
+  }
+  if (c.passphrase) options.passphrase = c.passphrase;
+  try {
+    tls.createSecureContext(options);
+  } catch (e) {
+    return { host, problem: certProblem(e, hasPfx) };
+  }
+  return { host, cert: { pattern, host: pattern.pattern, options } };
+}
+
+/** OpenSSL's error, in words (codes stripped; it never contains the key or passphrase, but is cut short anyway). */
+function certProblem(e: unknown, pfx: boolean): string {
+  const raw = String((e as Error)?.message ?? e);
+  const what = pfx ? 'PKCS#12 file' : 'PEM certificate / key';
+  if (/mac verify failure/i.test(raw)) return `Could not open the ${what}: wrong passphrase (or a damaged file).`;
+  if (/bad decrypt|bad password|interrupted or cancelled/i.test(raw)) return `Could not decrypt the private key: wrong or missing passphrase.`;
+  if (/key values mismatch/i.test(raw)) return 'The private key does not belong to the certificate.';
+  if (/unsupported/i.test(raw) && pfx) {
+    return 'Unsupported PKCS#12 encryption (a legacy algorithm such as RC2-40); export it again with AES (openssl pkcs12 -export -keypbe AES-256-CBC -certpbe AES-256-CBC).';
+  }
+  if (/no start line|PEM routines|bad base64|DECODER routines/i.test(raw)) return `Could not read the ${what}: not valid PEM.`;
+  if (/not enough data|wrong tag|asn1|header too long/i.test(raw)) return `Could not read the ${what}: not a valid file.`;
+  const clean = raw.replace(/error:[0-9A-Fa-f]+:[^:]*:[^:]*:/g, '').trim().slice(0, 200);
+  return `Could not load the ${what}: ${clean || 'unknown error'}.`;
+}
+
+interface PacedWs {
+  readyState: number;
+  send(data: unknown, opts?: unknown, cb?: unknown): void;
+  ping(data?: unknown, mask?: unknown, cb?: unknown): void;
+  pong(data?: unknown, mask?: unknown, cb?: unknown): void;
+  close(code?: number, reason?: unknown): void;
+  once(event: 'close', l: () => void): unknown;
+}
+
+const byteSize = (d: unknown): number =>
+  typeof d === 'string' ? Buffer.byteLength(d) : Buffer.isBuffer(d) || d instanceof Uint8Array ? d.byteLength : d instanceof ArrayBuffer ? d.byteLength : Array.isArray(d) ? d.reduce((n: number, x) => n + byteSize(x), 0) : 0;
+
+/**
+ * CONTRACTS §14.4: deliver what is sent on a `ws` socket through a LinkQueue (latency + bandwidth), in order —
+ * messages, pings / pongs and the close. Anything due after the socket closed is dropped (its callback still runs).
+ */
+function paceWebSocket(w: unknown, shape: LinkShape): void {
+  if (!isShaped(shape)) return;
+  const ws = w as PacedWs;
+  const q = new LinkQueue(shape);
+  const send = ws.send.bind(ws);
+  const ping = ws.ping.bind(ws);
+  const pong = ws.pong.bind(ws);
+  const close = ws.close.bind(ws);
+  const open = () => ws.readyState === WebSocket.OPEN;
+  const cbOf = (...a: unknown[]) => a.find((x) => typeof x === 'function') as ((e?: Error) => void) | undefined;
+  ws.send = (data, opts, cb) => q.push(byteSize(data), () => (open() ? send(data, opts, cb) : cbOf(opts, cb)?.()));
+  ws.ping = (data, mask, cb) => q.push(byteSize(data), () => (open() ? ping(data, mask, cb) : cbOf(mask, cb)?.()));
+  ws.pong = (data, mask, cb) => q.push(byteSize(data), () => (open() ? pong(data, mask, cb) : cbOf(mask, cb)?.()));
+  ws.close = (code, reason) =>
+    q.push(2 + byteSize(reason), () => {
+      try {
+        close(code, reason);
+      } catch {
+        close();
+      }
+    });
+  ws.once('close', () => q.close());
 }

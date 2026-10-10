@@ -35,6 +35,10 @@
  * `export {format, ids?}` asks redact-or-keep every time (injected `pickOne`), then a save dialog, writes the file and
  * replies `exported`; `openScriptFile` (like `openBodyFile`, `.js` only) and `openInNewWindow` go through injected deps;
  * `select(id)` (a notification's "Show") posts `select` to every attached view.
+ *
+ * CONTRACTS §14 (v0.8.0): `Status.upstreamProxySource` / `tlsPassthrough` / `clientCertificates` come from the host
+ * (re-broadcast on its 'tlsPassthrough' / 'clientCertificates' events); tunnel exchanges (`kind: 'tunnel'`, TLS passed
+ * through undecrypted) only get block rules and can't be resent; finished WebSocket / SSE exchanges are recordable.
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -92,6 +96,15 @@ export interface ControllerHost {
   readonly upstreamProxyInfo?: { display: string; ignoreCertErrors: boolean };
   /** Fires after the upstream proxy changed. */
   on(event: 'upstream', l: (info: unknown) => void): unknown;
+  // CONTRACTS §14 (InterceptProxyHost). Optional on older hosts.
+  /** §14.6: where the upstream proxy came from (`http.proxy` = VS Code's setting). */
+  readonly upstreamProxySource?: 'flutterIntercept' | 'http.proxy';
+  /** §14.2: hosts whose TLS is passed through undecrypted. */
+  readonly tlsPassthrough?: string[];
+  /** §14.3: host pattern + problem per configured client certificate (never paths or key material). */
+  readonly clientCertificateStatus?: { host: string; problem?: string }[];
+  /** Fire after the passthrough hosts / client certificates changed. */
+  on(event: 'tlsPassthrough' | 'clientCertificates', l: (info: unknown) => void): unknown;
 }
 
 /**
@@ -251,12 +264,23 @@ function checkRuleId(v: unknown, where: string): string | undefined {
 }
 
 /** CONTRACTS §12.4: the exchanges a recording keeps — finished plain HTTP traffic the app made through the proxy. */
+/** CONTRACTS §12.4 / §14.5: finished HTTP, WebSocket and SSE exchanges (not tunnels, native-client or browser traffic). */
 export function isRecordable(e: Exchange): boolean {
-  return FINAL_STATES.has(e.state) && !e.kind && e.captured !== 'vm-profile' && !e.browserInternal;
+  if (e.kind === 'websocket' && e.status !== 101) return false; // an upgrade that never opened (the store agrees)
+  return FINAL_STATES.has(e.state) && e.kind !== 'tunnel' && e.captured !== 'vm-profile' && !e.browserInternal;
 }
 
 export function recordingSummary(m: RecordingMeta): RecordingSummary {
-  return { id: m.id, name: m.name, createdAt: m.createdAt, exchanges: m.exchanges, redacted: m.redacted };
+  return {
+    id: m.id,
+    name: m.name,
+    createdAt: m.createdAt,
+    exchanges: m.exchanges,
+    redacted: m.redacted,
+    // CONTRACTS §14.5: WebSocket / SSE exchanges among them and their frames (absent in older recordings)
+    ...(typeof m.streams === 'number' && m.streams > 0 ? { streams: m.streams } : {}),
+    ...(typeof m.frames === 'number' && m.frames > 0 ? { frames: m.frames } : {}),
+  };
 }
 
 export function authFlowSummaries(a: AuthAnalysis | undefined): AuthFlowSummary[] {
@@ -376,6 +400,37 @@ export function readOnlyReason(e: Exchange): string | undefined {
     return "this request was made by a native HTTP client (read from the app's HTTP profile); it never went through the proxy, so rules can't change it and it can't be resent from here";
   }
   return undefined;
+}
+
+/**
+ * CONTRACTS §14.2: a block rule for a passed-through TLS connection: every connection to that origin (any method, so
+ * it also covers the CONNECT), 403.
+ */
+export function tunnelBlockRule(e: Exchange, id: string): Rule {
+  // The authority exactly as the proxy recorded it (`https://host:port`), so the rule matches the tunnel's own URL
+  // whether or not the proxy spells out the default port; no method, so it also covers the CONNECT.
+  const m = /^(https?:\/\/[^/?#\s*]+)/i.exec(e.url ?? '');
+  let ok = false;
+  try {
+    ok = !!m && !!new URL(m[1]).hostname;
+  } catch {
+    ok = false;
+  }
+  if (!m || !ok) throw new Error("Can't create a rule from this connection: its address is not a URL.");
+  const authority = m[1];
+  return { id, enabled: true, name: `block ${authority.replace(/^https?:\/\//i, '')} (TLS passthrough)`, match: { url: `${authority}/*` }, action: { kind: 'block', mode: 'status', status: 403 } };
+}
+
+/** CONTRACTS §14.2: why a tunnel's contents are not shown (agents' `get_request`, the panel). */
+export function tunnelReason(e: Exchange): string | undefined {
+  if (e.kind !== 'tunnel') return undefined;
+  let host = '';
+  try {
+    host = new URL(e.url).hostname;
+  } catch {
+    // keep generic
+  }
+  return `the TLS connection${host ? ` to ${host}` : ''} was passed through without decryption because the host matches flutterIntercept.tlsPassthrough (for apps that pin certificates); only the bytes each way and the timing are known, no request, headers or bodies. Only block rules (and faults) apply to it.`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -934,6 +989,8 @@ export class InterceptController {
     deps.host.on('warnings', () => this.broadcastStatus());
     deps.host.on('replay', () => this.broadcastStatus());
     deps.host.on('upstream', () => this.broadcastStatus());
+    deps.host.on('tlsPassthrough', () => this.broadcastStatus());
+    deps.host.on('clientCertificates', () => this.broadcastStatus());
     this.modelsSub = deps.contract?.onDidChangeModels(() => this.recheckContracts());
   }
 
@@ -965,14 +1022,30 @@ export class InterceptController {
       ...this.replayStatus(),
       ...this.sharedStatus(),
       ...this.upstreamStatus(),
+      ...this.tlsStatus(),
     };
   }
 
-  /** REVIEW-6 #1: the upstream proxy (`host:port`) and whether its certificate checks are off. */
-  private upstreamStatus(): Pick<Status, 'upstreamProxy' | 'upstreamProxyInsecure'> {
+  /** REVIEW-6 #1: the upstream proxy (`host:port`) and whether its certificate checks are off; §14.6 its source. */
+  private upstreamStatus(): Pick<Status, 'upstreamProxy' | 'upstreamProxyInsecure' | 'upstreamProxySource'> {
     const info = this.deps.host.upstreamProxyInfo;
     if (!info?.display) return {};
-    return { upstreamProxy: info.display, ...(info.ignoreCertErrors ? { upstreamProxyInsecure: true as const } : {}) };
+    const source = this.deps.host.upstreamProxySource;
+    return {
+      upstreamProxy: info.display,
+      ...(info.ignoreCertErrors ? { upstreamProxyInsecure: true as const } : {}),
+      ...(source === 'http.proxy' || source === 'flutterIntercept' ? { upstreamProxySource: source } : {}),
+    };
+  }
+
+  /** CONTRACTS §14.2 / §14.3: passthrough hosts and client-certificate status (host patterns + problems only). */
+  private tlsStatus(): Pick<Status, 'tlsPassthrough' | 'clientCertificates'> {
+    const hosts = this.deps.host.tlsPassthrough;
+    const certs = this.deps.host.clientCertificateStatus;
+    return {
+      ...(hosts?.length ? { tlsPassthrough: [...hosts] } : {}),
+      ...(certs?.length ? { clientCertificates: certs.map((c) => ({ host: c.host, ...(c.problem ? { problem: c.problem } : {}) })) } : {}),
+    };
   }
 
   private replayStatus(): Pick<Status, 'replay'> {
@@ -1085,9 +1158,12 @@ export class InterceptController {
           if (ex.kind === 'websocket' && msg.action !== 'block') {
             throw new Error(`Can't create ${msg.action === 'mock' ? 'a mock' : 'a breakpoint'} rule from a WebSocket: WebSocket connections can only be blocked (or failed with a fault rule).`);
           }
+          if (ex.kind === 'tunnel' && msg.action !== 'block') {
+            throw new Error(`Can't create ${msg.action === 'mock' ? 'a mock' : 'a breakpoint'} rule from a passed-through TLS connection: it isn't decrypted, so it can only be blocked (or failed with a fault rule). Remove the host from flutterIntercept.tlsPassthrough to mock it.`);
+          }
           let rule: Rule;
           try {
-            rule = validateRule(ruleFromExchange(ex, msg.action, this.newRuleId()));
+            rule = validateRule(ex.kind === 'tunnel' ? tunnelBlockRule(ex, this.newRuleId()) : ruleFromExchange(ex, msg.action, this.newRuleId()));
           } catch (e) {
             throw new Error(ruleFromExchangeErrorMessage(e, msg.action));
           }
@@ -1101,6 +1177,7 @@ export class InterceptController {
             const from = this.deps.host.getExchanges().find((e) => e.id === fromId);
             const ro = from && readOnlyReason(from);
             if (ro) throw new Error(`Can't resend this request: ${ro}.`);
+            if (from?.kind === 'tunnel') throw new Error("Can't resend a passed-through TLS connection: its request was never decrypted.");
           }
           if (!this.deps.host.send) throw new Error('This proxy build cannot send requests.');
           const { id } = await this.deps.host.send({ ...request, initiator: 'editor', ...(msg.resentFrom ? { resentFrom: msg.resentFrom } : {}) });
@@ -1486,7 +1563,7 @@ export class InterceptController {
       ids = new Set(msg.ids as string[]);
     }
     const list = this.deps.host.getExchanges().filter((e) => isRecordable(e) && (!ids || ids.has(e.id)));
-    if (!list.length) throw new Error('There is no finished HTTP request to save (WebSocket, SSE and native-client traffic is not recorded).');
+    if (!list.length) throw new Error('There is no finished HTTP request, WebSocket or SSE stream to save (open connections, TLS tunnels and native-client traffic are not recorded).');
     await recordings.save(msg.name.trim(), list, { redact: msg.redact === true });
     await this.refreshRecordings();
   }

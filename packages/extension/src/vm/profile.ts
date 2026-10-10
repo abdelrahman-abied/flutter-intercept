@@ -342,3 +342,123 @@ export function asHttpProfile(v: unknown): HttpProfile | undefined {
   if (typeof p.timestamp !== 'number' || !Array.isArray(p.requests)) return undefined;
   return { type: p.type, timestamp: p.timestamp, requests: p.requests.filter((r) => r && typeof r === 'object' && typeof r.id === 'string') };
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// CONTRACTS §14.7: bypass detection. Main-isolate dart:io traffic runs under the generated entry's HttpOverrides
+// and so goes through the proxy; an entry that did NOT is a bypass: an `HttpOverrides.runZoned` /
+// `runWithHttpOverrides` zone in the app (its own HttpClient: no `x-fi-id`, no proxy), a custom
+// `connectionFactory` (our `x-fi-id`, but the app's own socket), the DIRECT fallback while the proxy was
+// unreachable, or another proxy set by the app's own overrides.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** The entry's trace side channel (CONTRACTS §9.1): never a bypass. */
+export const TRACE_HOST = 'trace.flutter-intercept.invalid';
+
+export type BypassCause = 'no-overrides' | 'connection' | 'other-proxy' | 'unknown';
+
+export interface BypassQuery {
+  method: string;
+  url: string;
+  /** Epoch ms (device clock). */
+  startedAt: number;
+}
+
+export interface BypassOptions {
+  isOurProxy?: IsOurProxy;
+  /** Whether the proxy recorded this request (true / false), undefined = can't tell. */
+  proxySaw?: (q: BypassQuery) => boolean | undefined;
+  /** Requests of this session carry `x-fi-id` (source capture on): a plain-http one without it didn't come through us. */
+  traced?: boolean;
+}
+
+export type BypassVerdict = { verdict: 'wait' } | { verdict: 'ok' } | { verdict: 'bypass'; host: string; cause: BypassCause };
+
+export function hasTraceHeader(e: ProfileEntry): boolean {
+  const h = e.request?.headers;
+  return !!h && typeof h === 'object' && Object.keys(h).some((k) => k.toLowerCase() === TRACE_HEADER);
+}
+
+/**
+ * Whether a main-isolate dart:io entry went around the proxy. Decided once the response ended (`wait` before):
+ * - https: through the proxy it is always tunnelled (`proxyDetails`), so no `proxyDetails` = bypass, and
+ *   `proxyDetails` naming another proxy = bypass;
+ * - plain http: through the proxy it has no `proxyDetails` either, so `proxySaw` decides; without an answer, a
+ *   request without `x-fi-id` in a traced session is a bypass, anything else is not reported.
+ * Failed requests, CONNECT records, package:http_profile entries and the trace channel are never reported.
+ */
+export function bypassVerdict(e: ProfileEntry, opts: BypassOptions = {}): BypassVerdict {
+  if (!e || typeof e.id !== 'string' || typeof e.method !== 'string' || typeof e.uri !== 'string') return { verdict: 'ok' };
+  if (isPackageEntry(e) || e.method.toUpperCase() === 'CONNECT') return { verdict: 'ok' };
+  const url = cleanUrl(e.uri);
+  if (!url) return { verdict: 'ok' };
+  const parsed = new URL(url);
+  const host = parsed.hostname.toLowerCase();
+  if (!host || host === TRACE_HOST) return { verdict: 'ok' };
+  if (entryError(e)) return { verdict: 'ok' };
+  if (!isFinished(e)) return { verdict: 'wait' };
+  if (!e.request || typeof e.request !== 'object') return { verdict: 'ok' };
+  const traced = hasTraceHeader(e);
+  const pd = e.request.proxyDetails;
+  if (pd && typeof pd === 'object' && typeof pd.host === 'string' && typeof pd.port === 'number') {
+    if (!opts.isOurProxy || opts.isOurProxy(pd.host, pd.port)) return { verdict: 'ok' };
+    return { verdict: 'bypass', host, cause: 'other-proxy' };
+  }
+  const cause: BypassCause = traced ? 'connection' : 'no-overrides';
+  if (parsed.protocol === 'https:') return { verdict: 'bypass', host, cause };
+  let saw: boolean | undefined;
+  try {
+    saw = opts.proxySaw?.({ method: e.method.toUpperCase(), url, startedAt: usToMs(e.startTime) ?? Date.now() });
+  } catch {
+    saw = undefined;
+  }
+  if (saw === true) return { verdict: 'ok' };
+  if (saw === false) return { verdict: 'bypass', host, cause };
+  if (!traced && opts.traced) return { verdict: 'bypass', host, cause: 'no-overrides' };
+  return { verdict: 'ok' };
+}
+
+/** How far apart the device's and the proxy's clocks may be when matching a request (ms). */
+export const PROXY_MATCH_WINDOW_MS = 120_000;
+
+function sameUrl(a: string, b: string): boolean {
+  try {
+    return new URL(a).href === new URL(b).href;
+  } catch {
+    return a === b;
+  }
+}
+
+/**
+ * Host helper for `proxySaw`: whether a proxy exchange is this request (same method and URL, recorded by the proxy
+ * itself — not imported from the profile — within `PROXY_MATCH_WINDOW_MS`). Wire as
+ * `proxySaw: (q) => proxyHost.getExchanges().some((x) => matchesProxyExchange(x, q))`.
+ */
+export function matchesProxyExchange(x: Pick<Exchange, 'method' | 'url' | 'startedAt' | 'captured'>, q: BypassQuery): boolean {
+  if (!x || x.captured === 'vm-profile') return false;
+  if (String(x.method).toUpperCase() !== q.method.toUpperCase()) return false;
+  if (Math.abs(x.startedAt - q.startedAt) > PROXY_MATCH_WINDOW_MS) return false;
+  return sameUrl(x.url, q.url);
+}
+
+const BYPASS_CAUSES: Record<BypassCause, string> = {
+  'no-overrides': 'an HttpOverrides zone in the app (HttpOverrides.runZoned / runWithHttpOverrides) creates its own HttpClient',
+  connection: 'a custom connectionFactory in the app, or the proxy was unreachable (DIRECT fallback)',
+  'other-proxy': "the app's own HttpOverrides sends them to another proxy",
+  unknown: 'an HttpOverrides zone or a custom connectionFactory in the app',
+};
+
+/** One sentence (≤ 200 characters): the host and the likely cause. */
+export function bypassText(host: string, cause: BypassCause): string {
+  const h = cleanText(host, 100).replace(/[^A-Za-z0-9.:[\]_-]/g, '?');
+  return `Requests to ${h} bypass the proxy: ${BYPASS_CAUSES[cause] ?? BYPASS_CAUSES.unknown}.`.slice(0, 200);
+}
+
+export function moreBypassText(n: number): string {
+  return `Requests to ${n} more host${n === 1 ? '' : 's'} bypass the proxy too.`;
+}
+
+/** Whether a native client's failure is a TLS trust failure (the app doesn't trust the proxy's CA). */
+export function isTrustError(e: ProfileEntry): boolean {
+  const err = entryError(e);
+  return !!err && /ERR_CERT_|CERT_AUTHORITY|certificate|trust anchor|SSLHandshake|handshake failed|-1202|NSURLErrorServerCertificate/i.test(err);
+}

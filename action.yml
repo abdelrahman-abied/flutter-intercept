@@ -1,0 +1,133 @@
+name: Flutter Intercept
+description: Run Flutter integration tests through the Flutter Intercept proxy with shared mock rules, replay, network profiles and traffic assertions; uploads the HAR and JUnit report.
+author: Abdulrahman Obaid
+branding:
+  icon: shield
+  color: blue
+
+# Builds the CLI (packages/cli) from this action's own checkout: no package is downloaded from npm except the
+# locked dependencies. Inputs reach the CLI as environment variables, never interpolated into a script.
+inputs:
+  working-directory:
+    description: Flutter project root (where pubspec.yaml is). Relative paths in the other inputs are relative to it.
+    required: false
+    default: "."
+  device:
+    description: Flutter device id (-d), e.g. macos, emulator-5554, an iOS simulator or a physical iPhone UDID. Empty = the only connected device.
+    required: false
+    default: ""
+  targets:
+    description: Integration test files or directories. One per line, or separated by spaces on a single line. Empty = integration_test/.
+    required: false
+    default: ""
+  har:
+    description: Write a HAR of the run to this path (secrets redacted) and upload it.
+    required: false
+    default: ""
+  record:
+    description: Save the run as a recording. A path ending in .json is written there and uploaded (not redacted); a name is saved in the project's recordings.
+    required: false
+    default: ""
+  assert:
+    description: Expectations file (JSON array of assert_traffic inputs). Any failed expectation fails the step.
+    required: false
+    default: ""
+  junit:
+    description: Write the assertion results as JUnit XML to this path and upload it (needs assert).
+    required: false
+    default: ""
+  replay:
+    description: Answer requests from a recording (an id in .dart_tool/flutter_intercept/recordings, or a file path).
+    required: false
+    default: ""
+  replay-fallback:
+    description: What unmatched requests do while replaying, passthrough or fail. Empty = passthrough.
+    required: false
+    default: ""
+  network-profile:
+    description: Simulate a network, one of offline, slow-3g, fast-3g, flaky. Empty = none.
+    required: false
+    default: ""
+  rules:
+    description: Shared rules file. Empty = .vscode/flutter-intercept.json when present; none = no rules.
+    required: false
+    default: ""
+  approve-shared-rules:
+    description: Also apply shared rules that need approval in the editor (map remote to another host, request header rewrites, scripts). Only for pipelines you control.
+    required: false
+    default: "false"
+  flutter-args:
+    description: Extra arguments for flutter test (e.g. --flavor dev). One per line, or separated by spaces on a single line. No shell quoting.
+    required: false
+    default: ""
+  artifact-name:
+    description: Name of the uploaded artifact. Must be unique in the workflow run (set it per matrix job).
+    required: false
+    default: flutter-intercept
+  upload-artifacts:
+    description: Upload the HAR, JUnit report and recording (when their paths are set) with actions/upload-artifact.
+    required: false
+    default: "true"
+
+outputs:
+  exit-code:
+    description: Exit code of flutter-intercept (0 passed, 1 an expectation failed, 2 setup error, otherwise flutter's).
+    value: ${{ steps.run.outputs.exit-code }}
+  har:
+    description: Absolute path of the HAR, when har is set.
+    value: ${{ steps.run.outputs.har }}
+  junit:
+    description: Absolute path of the JUnit report, when junit is set.
+    value: ${{ steps.run.outputs.junit }}
+  record:
+    description: Absolute path of the recording, when record is a file path.
+    value: ${{ steps.run.outputs.record }}
+
+runs:
+  using: composite
+  steps:
+    - name: Build flutter-intercept
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        if [ -f packages/cli/dist/cli.js ] && [ -f packages/cli/dist/action.js ]; then
+          echo "flutter-intercept is already built"
+          exit 0
+        fi
+        major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+        if [ "$major" -lt 18 ]; then
+          echo "::error title=flutter-intercept::Node.js 18 or later is needed on PATH (add actions/setup-node before this step)"
+          exit 1
+        fi
+        npm ci --no-audit --no-fund --ignore-scripts
+        npm run build --workspace packages/proxy
+        npm run build --workspace packages/cli
+
+    - name: Run integration tests through Flutter Intercept
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        FI_INPUT_DEVICE: ${{ inputs.device }}
+        FI_INPUT_TARGETS: ${{ inputs.targets }}
+        FI_INPUT_HAR: ${{ inputs.har }}
+        FI_INPUT_RECORD: ${{ inputs.record }}
+        FI_INPUT_ASSERT: ${{ inputs.assert }}
+        FI_INPUT_JUNIT: ${{ inputs.junit }}
+        FI_INPUT_REPLAY: ${{ inputs.replay }}
+        FI_INPUT_REPLAY_FALLBACK: ${{ inputs.replay-fallback }}
+        FI_INPUT_NETWORK_PROFILE: ${{ inputs.network-profile }}
+        FI_INPUT_RULES: ${{ inputs.rules }}
+        FI_INPUT_APPROVE_SHARED_RULES: ${{ inputs.approve-shared-rules }}
+        FI_INPUT_FLUTTER_ARGS: ${{ inputs.flutter-args }}
+      run: exec node "$GITHUB_ACTION_PATH/packages/cli/dist/action.js"
+
+    - name: Upload traffic
+      if: ${{ always() && inputs.upload-artifacts == 'true' && steps.run.outputs.artifacts != '' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.run.outputs.artifacts }}
+        if-no-files-found: ignore
+        include-hidden-files: true

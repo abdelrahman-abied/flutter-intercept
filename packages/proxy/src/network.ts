@@ -14,12 +14,14 @@ export interface NetworkPreset {
   label: string;
   latencyMs: number;
   kbps?: number;
+  /** CONTRACTS §14.4: upload bandwidth. */
+  uploadKbps?: number;
   dropRate?: number;
 }
 
 export const NETWORK_PRESETS: readonly NetworkPreset[] = [
-  { id: 'slow-3g', label: 'Slow 3G', latencyMs: 400, kbps: 400 },
-  { id: 'fast-3g', label: 'Fast 3G', latencyMs: 150, kbps: 1600 },
+  { id: 'slow-3g', label: 'Slow 3G', latencyMs: 400, kbps: 400, uploadKbps: 400 },
+  { id: 'fast-3g', label: 'Fast 3G', latencyMs: 150, kbps: 1600, uploadKbps: 750 },
   { id: 'flaky', label: 'Flaky (20% fail)', latencyMs: 200, dropRate: 0.2 },
 ];
 
@@ -33,6 +35,7 @@ export function presetProfile(id: NetworkPresetId): NetworkProfile {
     preset: p.id,
     latencyMs: p.latencyMs,
     ...(p.kbps !== undefined ? { kbps: p.kbps } : {}),
+    ...(p.uploadKbps !== undefined ? { uploadKbps: p.uploadKbps } : {}),
     ...(p.dropRate !== undefined ? { dropRate: p.dropRate } : {}),
   };
 }

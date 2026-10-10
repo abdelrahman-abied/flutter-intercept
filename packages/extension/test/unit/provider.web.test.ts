@@ -25,7 +25,7 @@ vi.mock('vscode', () => ({
 
 import { mockttpCaGenerator, spkiPin } from '../../src/ca';
 import { InterceptEvent, prepareLaunch, PrepareDeps } from '../../src/debug/provider';
-import { WEB_FLAGS_KEY } from '../../src/debug/rewrite';
+import { webBrowserDebugPortOf, WEB_FLAGS_KEY } from '../../src/debug/rewrite';
 
 let app: string;
 let ca: string;
@@ -53,6 +53,8 @@ function deps() {
     reverses: { reverse: async () => void calls.reverse++ } as unknown as PrepareDeps['reverses'],
     webServerSkipped: (m) => calls.webServer.push(m),
     webUserProfileSkipped: (m) => calls.profile.push(m),
+    webPac: { urlFor: async (port) => `http://127.0.0.1:7000/flutter-intercept-${port}.pac` },
+    freePort: async () => 7001,
   };
   return { d, calls, events };
 }
@@ -79,9 +81,11 @@ describe('prepareLaunch: Flutter Web', () => {
     expect(config.program).toBe(path.join(app, 'lib', 'main.dart'));
     expect(config.toolArgs).toEqual([
       '--web-port=5000',
-      '--web-browser-flag=--proxy-server=http://127.0.0.1:9123',
+      '--web-browser-flag=--proxy-pac-url=http://127.0.0.1:7000/flutter-intercept-9123.pac',
       `--web-browser-flag=--ignore-certificate-errors-spki-list=${spkiPin(ca)}`,
+      '--web-browser-debug-port=7001',
     ]);
+    expect(webBrowserDebugPortOf(config)).toBe(7001);
     expect(config.flutterInterceptProxyHost).toBe('127.0.0.1');
     expect(config.flutterInterceptPort).toBe(9123);
     expect(calls).toMatchObject({ start: 1, ca: 1, reverse: 0 });
@@ -95,7 +99,8 @@ describe('prepareLaunch: Flutter Web', () => {
     const config: any = { type: 'dart', request: 'launch', name: 'web' };
     await prepareLaunch(d, folder(), config, 'resolveDebugConfigurationWithSubstitutedVariables');
     expect(config.program).toBeUndefined();
-    expect(config[WEB_FLAGS_KEY]).toHaveLength(2);
+    expect(config[WEB_FLAGS_KEY]).toHaveLength(3);
+    expect(config[WEB_FLAGS_KEY][0]).toBe('--web-browser-flag=--proxy-pac-url=http://127.0.0.1:7000/flutter-intercept-9123.pac');
     expect(config.toolArgs).toEqual(config[WEB_FLAGS_KEY]);
     expect(fs.existsSync(path.join(app, '.dart_tool', 'flutter_intercept'))).toBe(false);
   });
@@ -147,5 +152,40 @@ describe('prepareLaunch: Flutter Web', () => {
     await prepareLaunch(d, folder(), config, 'resolveDebugConfigurationWithSubstitutedVariables');
     expect(config).toEqual(resolved());
     expect(calls.profile).toHaveLength(1);
+  });
+  it('no PAC URL / PAC server failure / no free port: --proxy-server, no debug port, launch still intercepted', async () => {
+    for (const webPac of [{ urlFor: async () => undefined }, { urlFor: async () => Promise.reject(new Error('EADDRINUSE')) }]) {
+      const { d } = deps();
+      d.webPac = webPac;
+      d.freePort = async () => Promise.reject(new Error('no port'));
+      const config: any = resolved();
+      await prepareLaunch(d, folder(), config, 'resolveDebugConfigurationWithSubstitutedVariables');
+      expect(config.toolArgs).toEqual(['--web-browser-flag=--proxy-server=http://127.0.0.1:9123', `--web-browser-flag=--ignore-certificate-errors-spki-list=${spkiPin(ca)}`]);
+    }
+  });
+
+  it("the user's own --web-browser-debug-port is kept (no second one)", async () => {
+    const { d } = deps();
+    const config: any = resolved({ toolArgs: ['--web-browser-debug-port', '9333'] });
+    await prepareLaunch(d, folder(), config, 'resolveDebugConfigurationWithSubstitutedVariables');
+    expect(config.toolArgs.filter((a: string) => a.startsWith('--web-browser-debug-port'))).toEqual(['--web-browser-debug-port']);
+    expect(webBrowserDebugPortOf(config)).toBe(9333);
+  });
+
+  it('default PAC source: a real loopback PacServer serving the current proxy port only', async () => {
+    const { d } = deps();
+    delete d.webPac;
+    let running = true;
+    d.proxyHost = { start: async () => 9123, get running() { return running; } } as unknown as PrepareDeps['proxyHost'];
+    const config: any = resolved();
+    await prepareLaunch(d, folder(), config, 'resolveDebugConfigurationWithSubstitutedVariables');
+    const flag = config.toolArgs.find((a: string) => a.includes('--proxy-pac-url='));
+    const url = flag.slice(flag.indexOf('--proxy-pac-url=') + '--proxy-pac-url='.length);
+    expect(url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/flutter-intercept-9123\.pac$/);
+    const res = await fetch(url);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('PROXY 127.0.0.1:9123; DIRECT');
+    running = false;
+    expect((await fetch(url)).status).toBe(404);
   });
 });

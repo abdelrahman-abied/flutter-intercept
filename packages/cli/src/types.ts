@@ -10,7 +10,7 @@ export interface CliOptions {
   project?: string;
   /** Integration test target(s), e.g. integration_test/app_test.dart (default: integration_test/). */
   targets: string[];
-  /** Flutter device id (-d). Android emulators get 10.0.2.2, physical Android adb reverse; physical iOS is refused. */
+  /** Flutter device id (-d). Android emulators get 10.0.2.2, physical Android adb reverse; a physical iPhone gets the LAN listener (CONTRACTS §14.1). */
   device?: string;
   /** Proxy port (default: a free port). */
   port?: number;

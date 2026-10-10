@@ -21,7 +21,10 @@ import {
   TRACE_DEFINE,
   WEB_FLAGS_KEY,
   WEB_KEY,
+  isOurPacUrl,
+  webBrowserDebugPortOf,
   webBrowserFlags,
+  webDebugPortArg,
   webInterceptFlags,
   withInterceptDefines,
   withShaDefine,
@@ -407,6 +410,51 @@ describe('Flutter Web (CONTRACTS §11.3): browser flags, program untouched', () 
     expect(r.config.debuggerType).toBe(2);
     // flutter_tools splits --web-browser-flag values on commas.
     for (const f of r.flags) expect(f).not.toContain(',');
+  });
+
+  it('v0.8.0 PAC URL (DIRECT fallback) + browser debug port: comma-free, recorded, replaced on re-resolve', () => {
+    const pacUrl = 'http://127.0.0.1:41234/flutter-intercept-9555.pac';
+    const r = rewriteDebugConfig(resolved(), webCtx({ webPacUrl: pacUrl, webDebugPort: 41235 }));
+    if (r.kind !== 'web') throw new Error(r.kind);
+    const want = [`--web-browser-flag=--proxy-pac-url=${pacUrl}`, flags()[1], '--web-browser-debug-port=41235'];
+    expect(r.flags).toEqual(want);
+    expect(r.config.toolArgs).toEqual(['--dart-define=A=1', ...want]);
+    for (const f of r.flags) expect(f).not.toContain(',');
+    expect(webBrowserDebugPortOf(r.config)).toBe(41235);
+    // Re-resolve with a new PAC server / debug port: only ours are replaced.
+    const again = rewriteDebugConfig({ ...r.config }, webCtx({ webPacUrl: 'http://127.0.0.1:5/flutter-intercept-9555.pac', webDebugPort: 6 }));
+    if (again.kind !== 'web') throw new Error(again.kind);
+    expect(again.config.toolArgs).toEqual(['--dart-define=A=1', '--web-browser-flag=--proxy-pac-url=http://127.0.0.1:5/flutter-intercept-9555.pac', flags()[1], '--web-browser-debug-port=6']);
+    // Off: everything of ours goes, including the debug port.
+    const off = rewriteDebugConfig({ ...r.config }, webCtx({ webEnabled: false }));
+    expect(off.kind).toBe('restore');
+    if (off.kind === 'restore') expect(off.config.toolArgs).toEqual(['--dart-define=A=1']);
+  });
+
+  it('a PAC URL that is not our loopback one is ignored (falls back to --proxy-server)', () => {
+    for (const bad of ['http://10.0.0.2:1/x.pac', 'data:application/x-ns-proxy-autoconfig,x', 'http://127.0.0.1:1/a,b.pac', 'file:///tmp/x.pac']) {
+      expect(isOurPacUrl(bad)).toBe(false);
+      const r = rewriteDebugConfig(resolved(), webCtx({ webPacUrl: bad }));
+      if (r.kind !== 'web') throw new Error(r.kind);
+      expect(r.flags).toEqual(flags());
+    }
+    expect(() => webInterceptFlags(9555, pin, { pacUrl: 'http://evil:1/x.pac' })).toThrow(/PAC/);
+    expect(() => webInterceptFlags(9555, pin, { debugPort: 70000 })).toThrow(/debug port/);
+  });
+
+  it("the user's own --web-browser-debug-port (toolArgs or settings) wins; parsing", () => {
+    const r = rewriteDebugConfig(resolved({ toolArgs: ['--web-browser-debug-port=9222'] }), webCtx({ webDebugPort: 41235 }));
+    if (r.kind !== 'web') throw new Error(r.kind);
+    expect(r.flags).toEqual(flags());
+    expect(webBrowserDebugPortOf(r.config)).toBe(9222);
+    const s = rewriteDebugConfig(resolved(), webCtx({ webDebugPort: 41235, settingsToolArgs: ['--web-browser-debug-port', '9223'] }));
+    if (s.kind !== 'web') throw new Error(s.kind);
+    expect(s.flags).toEqual(flags());
+    expect(webDebugPortArg(['--web-browser-debug-port', '1', '--web-browser-debug-port=2'])).toBe(2);
+    expect(webDebugPortArg(['--web-browser-debug-port=0', '--web-browser-debug-port=x', '--web-browser-debug-port'])).toBeUndefined();
+    expect(webBrowserDebugPortOf({ deviceId: 'emulator-5554', toolArgs: ['--web-browser-debug-port=3'] })).toBeUndefined();
+    expect(webBrowserDebugPortOf({ deviceId: 'edge', toolArgs: ['--web-browser-debug-port=3'] })).toBe(3);
+    expect(webBrowserDebugPortOf(undefined)).toBeUndefined();
   });
 
   it('edge works the same way', () => {

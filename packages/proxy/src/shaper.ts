@@ -27,7 +27,15 @@ export interface Shaping {
   truncate?: boolean;
   /** Called once when the body was cut, with the body bytes delivered before the cut. */
   onTruncated?(delivered: number): void;
+  /**
+   * CONTRACTS §14.4: deliver each chunk this much later than it arrived (event streams: every event is `latencyMs`
+   * late, without the delays adding up). Writers are held back only beyond LATENCY_QUEUE_BYTES.
+   */
+  latencyMs?: number;
 }
+
+/** With a latency, chunks may wait this many bytes deep before the writer (the upstream) is paused. */
+const LATENCY_QUEUE_BYTES = 1024 * 1024;
 
 type Res = http.ServerResponse & { getHeaders(): http.OutgoingHttpHeaders };
 type WriteFn = (chunk: Buffer, cb?: (e?: Error | null) => void) => boolean;
@@ -36,6 +44,8 @@ type EndFn = (cb?: () => void) => unknown;
 interface Queued {
   buf: Buffer;
   cb?: (e?: Error | null) => void;
+  /** performance.now() before which it is not delivered (latency). */
+  at: number;
 }
 
 export class ResponseShaper {
@@ -77,11 +87,11 @@ export class ResponseShaper {
     }
     this.initCut(chunk.length);
     if (chunk.length) {
-      this.queue.push({ buf: chunk, cb });
+      this.queue.push({ buf: chunk, cb, at: this.readyAt() });
       this.queuedBytes += chunk.length;
     } else if (cb) process.nextTick(cb);
     this.pump();
-    if (this.queuedBytes > 0) {
+    if (this.queuedBytes > (this.shaping.latencyMs ? LATENCY_QUEUE_BYTES : 0)) {
       this.needDrain = true;
       return false;
     }
@@ -92,7 +102,7 @@ export class ResponseShaper {
     if (this.ending || this.cut || this.gone) return;
     if (chunk?.length) {
       this.initCut(chunk.length);
-      this.queue.push({ buf: chunk });
+      this.queue.push({ buf: chunk, at: this.readyAt() });
       this.queuedBytes += chunk.length;
     } else {
       this.initCut(0);
@@ -101,6 +111,10 @@ export class ResponseShaper {
     // mockttp's handler checks writableEnded as soon as the upstream ended (see the header comment).
     Object.defineProperty(this.res, 'writableEnded', { configurable: true, get: () => true });
     this.pump();
+  }
+
+  private readyAt(): number {
+    return performance.now() + (this.shaping.latencyMs ?? 0);
   }
 
   private initCut(firstChunkLength: number): void {
@@ -115,8 +129,14 @@ export class ResponseShaper {
     let budget = this.bytesPerTick;
     // The real socket is backed up: let it drain, keep the pace.
     const blocked = (this.res as { writableNeedDrain?: boolean }).writableNeedDrain === true && this.bytesPerTick !== Infinity;
+    let wait = TICK_MS;
     while (!blocked && this.queue.length && budget > 0 && !this.cut) {
       const head = this.queue[0];
+      const early = head.at - performance.now();
+      if (early > 1) {
+        wait = early;
+        break;
+      }
       let n = Math.min(head.buf.length, budget);
       if (this.cutAt !== undefined) n = Math.min(n, this.cutAt - this.delivered);
       if (n > 0) {
@@ -139,6 +159,10 @@ export class ResponseShaper {
       }
     }
     if (this.cut) return;
+    if (this.needDrain && this.queuedBytes <= (this.shaping.latencyMs ? LATENCY_QUEUE_BYTES : 0) && this.queue.length) {
+      this.needDrain = false;
+      this.res.emit('drain');
+    }
     if (!this.queue.length) {
       if (this.needDrain) {
         this.needDrain = false;
@@ -154,7 +178,7 @@ export class ResponseShaper {
     this.timer = setTimeout(() => {
       this.timer = undefined;
       this.pump();
-    }, TICK_MS);
+    }, wait);
   }
 
   private finishEnd(): void {
