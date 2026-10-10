@@ -13,6 +13,8 @@ import { matchesFilter, parseFilter } from './filter';
 import { checkPath } from './jsonpath';
 import { corsActionError } from './coverage';
 import { hasFrames } from './frames';
+import { EXPORT_LABEL } from './exporting';
+import { describeScript, scriptCodeError, scriptFileError, scriptMatchError } from './scripts';
 import {
   bodyFileError, checkMapTarget, describeRewrite, emptyRewriteForm, MAX_STEPS, rewriteError, rewriteFromForm, rewriteToForm, sequencePreview,
   sortRecordings, stepCountError, togglePick, type PreviewStep, type RewriteForm, type SequenceThen, type StepAction, type StepKind,
@@ -28,8 +30,12 @@ export const MAX_HOST_ERRORS = 5;
 /** CONTRACTS §12.7 adds Recordings and Auth flows. */
 export type View = 'traffic' | 'rules' | 'recordings' | 'auth';
 export const VIEWS: readonly View[] = ['traffic', 'rules', 'recordings', 'auth'];
-/** `messages` = WebSocket messages / SSE events (CONTRACTS §11.5), only for exchanges with a `kind`. */
-export type DetailTab = 'request' | 'response' | 'messages';
+/**
+ * `messages` = WebSocket messages / SSE events (CONTRACTS §11.5), only for exchanges with a `kind`;
+ * `timing` = the phase breakdown (CONTRACTS §13.2).
+ */
+export type DetailTab = 'request' | 'response' | 'messages' | 'timing';
+const DETAIL_TABS: readonly DetailTab[] = ['request', 'response', 'messages', 'timing'];
 
 export interface Filters {
   text: string;                 // whitespace-separated terms matched against the URL, "-term" excludes
@@ -91,6 +97,10 @@ export interface State {
   recordingPicks: string[];
   /** CONTRACTS §12.3: 401 → refresh → retry flows found by the host. */
   authFlows: AuthFlowSummary[];
+  /** CONTRACTS §13.2: the waterfall column in the traffic list (a view preference, remembered). */
+  showWaterfall: boolean;
+  /** Bumped when the host asks to show an exchange (`select`): the list scrolls to it even if already selected. */
+  revealSeq: number;
 }
 
 export const NEW_RULE = '__new__';
@@ -116,16 +126,19 @@ export function initialState(): State {
     recordings: [],
     recordingPicks: [],
     authFlows: [],
+    showWaterfall: true,
+    revealSeq: 0,
   };
 }
 
 /** The part of State worth keeping across webview reloads (vscode.setState). */
 export type Persisted = Pick<State,
-  'filters' | 'view' | 'detailTab' | 'selectedId' | 'splitPct' | 'drafts' | 'editingRuleId' | 'composer' | 'dismissedWarnings'>;
+  'filters' | 'view' | 'detailTab' | 'selectedId' | 'splitPct' | 'drafts' | 'editingRuleId' | 'composer' | 'dismissedWarnings' | 'showWaterfall'>;
 export function toPersisted(s: State): Persisted {
   return {
     filters: s.filters, view: s.view, detailTab: s.detailTab, selectedId: s.selectedId, splitPct: s.splitPct,
     drafts: s.drafts, editingRuleId: s.editingRuleId, composer: s.composer, dismissedWarnings: s.dismissedWarnings,
+    showWaterfall: s.showWaterfall,
   };
 }
 
@@ -156,7 +169,8 @@ export type Action =
   | { type: 'composerSending' }
   | { type: 'dismissWarning'; id: string }
   | { type: 'pickRecording'; id: string }
-  | { type: 'clearRecordingPicks' };
+  | { type: 'clearRecordingPicks' }
+  | { type: 'toggleWaterfall' };
 
 let noticeSeq = 0;
 let errorSeq = 0;
@@ -175,13 +189,14 @@ export function reducer(state: State, action: Action): State {
         ...state,
         filters: p.filters ? { ...EMPTY_FILTERS, ...p.filters } : state.filters,
         view: p.view && VIEWS.includes(p.view) ? p.view : state.view,
-        detailTab: p.detailTab ?? state.detailTab,
+        detailTab: p.detailTab && DETAIL_TABS.includes(p.detailTab) ? p.detailTab : state.detailTab,
         selectedId: p.selectedId ?? state.selectedId,
         splitPct: p.splitPct ?? state.splitPct,
         drafts: p.drafts ?? state.drafts,
         editingRuleId: p.editingRuleId ?? state.editingRuleId,
         composer: p.composer ? { ...p.composer, sending: false } : state.composer,
         dismissedWarnings: Array.isArray(p.dismissedWarnings) ? p.dismissedWarnings.filter((x) => typeof x === 'string') : state.dismissedWarnings,
+        showWaterfall: typeof p.showWaterfall === 'boolean' ? p.showWaterfall : state.showWaterfall,
       };
     }
 
@@ -314,6 +329,9 @@ export function reducer(state: State, action: Action): State {
 
     case 'clearRecordingPicks':
       return state.recordingPicks.length ? { ...state, recordingPicks: [] } : state;
+
+    case 'toggleWaterfall':
+      return { ...state, showWaterfall: !state.showWaterfall };
   }
 }
 
@@ -510,7 +528,36 @@ function applyHostMsg(state: State, msg: HostMsg): State {
 
     case 'authFlows':
       return { ...state, authFlows: msg.flows };
+
+    case 'select':
+      return revealExchange(state, msg.id);
+
+    case 'exported':
+      return { ...state, notice: notice(`Exported ${EXPORT_LABEL[msg.format] ?? msg.format} to ${msg.path}`) };
   }
+}
+
+/**
+ * CONTRACTS §13.6 `select` (a notification's "Show"): open the traffic view on that exchange with its details. Filters
+ * that hide it are cleared (with a note); an exchange no longer listed gets a note instead.
+ */
+function revealExchange(state: State, id: string): State {
+  const ex = findExchange(state, id);
+  if (!ex) return { ...state, notice: notice('That request is no longer listed (cleared, or dropped from the history).') };
+  const visible = filterExchanges(state.exchanges, state.filters, state.contracts).some((e) => e.id === id);
+  const next: State = {
+    ...state,
+    view: 'traffic',
+    selectedId: ex.id,
+    detailTab: tabForSelect(ex, state.detailTab),
+    composer: hideComposer(state.composer),
+    revealSeq: state.revealSeq + 1,
+  };
+  if (!visible) {
+    next.filters = { ...EMPTY_FILTERS, showBrowser: state.filters.showBrowser || !!ex.browserInternal };
+    next.notice = notice('Filters cleared to show the request.', undefined, true);
+  }
+  return next;
 }
 
 function pick<T>(rec: Record<string, T>, keep: Map<string, unknown>): Record<string, T> {
@@ -550,6 +597,7 @@ function tabFor(ex: Exchange | undefined, current: DetailTab): DetailTab {
 function tabForSelect(ex: Exchange | undefined, current: DetailTab): DetailTab {
   const t = tabFor(ex, current);
   if (!ex || t !== current || (ex.state === 'paused-request' || ex.state === 'paused-response')) return t;
+  if (current === 'timing') return 'timing'; // every exchange has a Timing tab: stay on it
   if (hasFrames(ex)) return 'messages';
   return current === 'messages' ? 'response' : current;
 }
@@ -991,6 +1039,7 @@ export function describeAction(a: RuleAction): string {
     case 'sequence': return `Sequence: ${sequencePreview(a.steps, a.then)}`;
     case 'mapRemote': return `Map to ${a.to}${a.preserveHost ? ' (keep Host)' : ''}`;
     case 'rewrite': return describeRewrite(a);
+    case 'script': return describeScript(a);
   }
 }
 
@@ -1095,6 +1144,10 @@ export interface ActionFields {
   mapTo: string;
   mapPreserveHost: boolean;
   rewrite: RewriteForm;
+  /** CONTRACTS §13.4 (kind 'script'; not a sequence step). With `scriptUseFile`, the code lives in `scriptFile`. */
+  scriptCode: string;
+  scriptUseFile: boolean;
+  scriptFile: string;
 }
 
 /** One `sequence` step: an action (or the real server) answering `count` matching requests. */
@@ -1146,6 +1199,9 @@ export function defaultActionFields(): ActionFields {
     mapTo: '',
     mapPreserveHost: false,
     rewrite: emptyRewriteForm(),
+    scriptCode: '',
+    scriptUseFile: false,
+    scriptFile: '',
   };
 }
 
@@ -1186,6 +1242,9 @@ function fillActionFields<F extends ActionFields>(f: F, a: RuleAction | StepActi
     f.mapPreserveHost = !!a.preserveHost;
   } else if (a.kind === 'rewrite') {
     f.rewrite = rewriteToForm(a);
+  } else if (a.kind === 'script') {
+    f.scriptCode = a.code;
+    if (a.file !== undefined) { f.scriptUseFile = true; f.scriptFile = a.file; }
   }
   return f;
 }
@@ -1225,7 +1284,7 @@ export function ruleToForm(rule?: Rule, now = Date.now()): RuleForm {
 export type RuleFormField =
   | 'url' | 'method' | 'mockStatus' | 'mockDelayMs' | 'blockStatus' | 'mockHeaders'
   | 'latencyMs' | 'kbps' | 'dropPct' | 'throttle' | 'times' | 'expiresIn' | 'mutate' | 'graphqlOperation' | 'cors'
-  | 'mockBodyFile' | 'mapTo' | 'rewrite' | 'sequence' | 'count';
+  | 'mockBodyFile' | 'mapTo' | 'rewrite' | 'sequence' | 'count' | 'scriptCode' | 'scriptFile';
 
 /** Validation of one action's fields (the rule's, or one sequence step's). */
 export interface ActionValidation {
@@ -1283,6 +1342,9 @@ export function validateActionFields(kind: RuleAction['kind'] | StepKind, f: Act
   } else if (kind === 'rewrite') {
     const r = rewriteError(f.rewrite);
     if (r) errors.rewrite = r;
+  } else if (kind === 'script') {
+    const e = f.scriptUseFile ? scriptFileError(f.scriptFile) : scriptCodeError(f.scriptCode);
+    if (e) errors[f.scriptUseFile ? 'scriptFile' : 'scriptCode'] = e;
   }
   return { errors, json, opErrors };
 }
@@ -1314,6 +1376,10 @@ export function validateRuleForm(f: RuleForm): RuleFormValidation {
     } else {
       urlHint = 'Case-sensitive glob on the full URL — * matches any characters, including /.';
     }
+  }
+  if (f.kind === 'script' && !head.url) {
+    const w = scriptMatchError(url);
+    if (w) head.url = w;
   }
   if (f.method.trim() && !/^[A-Za-z]+$/.test(f.method.trim())) head.method = 'Letters only, e.g. GET';
   const op = f.graphqlOperation.trim();
@@ -1397,6 +1463,12 @@ export function fieldsToAction(kind: Exclude<RuleAction['kind'], 'sequence'> | S
       return f.mapPreserveHost ? { kind: 'mapRemote', to: f.mapTo.trim(), preserveHost: true } : { kind: 'mapRemote', to: f.mapTo.trim() };
     case 'rewrite':
       return rewriteFromForm(f.rewrite);
+    case 'script': {
+      // File-backed: the host reads the file into `code` (like mock.bodyFile); the last known content travels along.
+      const action: Extract<RuleAction, { kind: 'script' }> = { kind: 'script', code: f.scriptCode };
+      if (f.scriptUseFile && f.scriptFile.trim()) action.file = f.scriptFile.trim();
+      return action;
+    }
     case 'passthrough':
       return { kind: 'passthrough' };
     case 'breakpoint':

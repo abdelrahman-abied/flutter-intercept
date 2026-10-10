@@ -16,6 +16,9 @@ export {
   routeTemplate,
   isIdSegment,
   MAX_BODY_REPLACEMENTS,
+  // v0.7.0 (CONTRACTS §13.4)
+  MAX_SCRIPT_BYTES,
+  SCRIPT_TEMPLATE,
 } from './rules';
 export type { PickedStep, StepAction } from './rules';
 export { requestBodyHash } from './replay';

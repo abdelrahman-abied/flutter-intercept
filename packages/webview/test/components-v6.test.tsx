@@ -373,7 +373,8 @@ describe('shared rules', () => {
     await mount();
     await emit({ type: 'snapshot', exchanges: [], rules: [], status: { ...status, sharedRules: { count: 2, problems: [], pendingApproval: 1 } } });
     const banner = $('.approval-banner')!;
-    expect(banner.textContent).toContain('1 shared rule from .vscode/flutter-intercept.json is held back');
+    expect(banner.textContent).toContain('1 rule waits for your approval');
+    expect(banner.textContent).toContain('.vscode/flutter-intercept.json');
     expect(banner.textContent).toContain('authenticated traffic');
     expect($('.approval-list')).toBeNull();
     await click(button('Review file', banner));

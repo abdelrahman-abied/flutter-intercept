@@ -5,6 +5,8 @@
  * Watching: per workspace folder one watcher for `.vscode/flutter-intercept.json` and `pubspec.yaml` (root or one
  * level down — which folders count can change); events are debounced (a git checkout touches many files at once).
  * Body files get a watcher each once a rule refers to them; a change fires `onDidChangeBodyFile(<bodyFile value>)`.
+ * Script files (CONTRACTS §13.4) are watched the same way; a change to a rule's script file reloads first (holding
+ * the rule until its new contents are approved, REVIEW-7 #1), then fires `onDidChangeBodyFile(<file value>)`.
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -16,6 +18,7 @@ import type { ValidateRule } from './file';
 import { PendingSnapshot, SharedRulesCore, SharedRulesStatus } from './core';
 
 export { mergeRules, toPersonalRule } from './core';
+export type { PendingItem, PendingScript, PendingSnapshot } from './core';
 export { isSharedRuleId } from './file';
 
 export interface SharedRulesDeps {
@@ -45,12 +48,32 @@ export interface SharedRulesHost extends SharedRulesService, vscode.Disposable {
   /** REVIEW-6 #5: why `text` must not be written to a body file (looks like a credential), or undefined. Call before
    *  writing any body file ("Edit body in a file" / "Create file"). `createBodyFile` refuses on its own. */
   checkBodyFileContent(text: string): string | undefined;
-  /** `rules` with every `mock.bodyFile` read into `body`; rules whose file can't be used are left out with a problem. */
+  /**
+   * CONTRACTS §13.4: resolves `script.file` (`.js`, inside the workspace, ≤ 256 KB). Pass the rule id: a shared rule's
+   * file resolves in its own folder. Only approved contents resolve (REVIEW-7 #1): otherwise it throws, and a
+   * personal rule is listed in `state().pendingApproval` (onDidChange fires).
+   */
+  resolveScriptFile(path: string, ruleId?: string): Promise<string>;
+  /** REVIEW-7 #1: the personal rules, whenever they change (their unapproved script files are held). */
+  setPersonalRules(rules: Rule[]): Promise<void>;
+  /** REVIEW-7 #1: approve the current contents of a script file (call right after creating it from the panel). */
+  approveScriptFile(rel: string, ruleId?: string): Promise<void>;
+  /** REVIEW-7 #1: from onDidSaveTextDocument — approves a saved script file a rule uses (or one approved before). */
+  noteScriptFileSaved(absPath: string): Promise<boolean>;
+  /** `rules` with every `mock.bodyFile` read into `body` and `script.file` into `code`; rules whose file can't be used
+   *  are left out with a problem. */
   resolveBodies(rules: Rule[]): Promise<{ rules: Rule[]; problems: string[] }>;
   /** "Edit body in a file": creates `.vscode/flutter-intercept/mocks/<name>.json`, returns the `bodyFile` value. */
   createBodyFile(rule: Rule, text: string): Promise<string>;
   /** Absolute path of a rule's body file (for opening it in an editor); undefined for an invalid path. */
   bodyFilePath(bodyFile: string, ruleId?: string): string | undefined;
+  /**
+   * CONTRACTS §13.4 "Edit script in a file": creates `.vscode/flutter-intercept/scripts/<name>.js` with `code` (default:
+   * the template from scriptFile.ts `scriptTemplate`), returns the `script.file` value. Refuses credential-like code.
+   */
+  createScriptFile(rule: Rule, code?: string): Promise<string>;
+  /** Why `code` must not be written to a script file (looks like a credential), or undefined. */
+  checkScriptFileContent(code: string): string | undefined;
   /** Moves a personal rule into the file; returns it as shared. */
   share(rule: Rule): Promise<Rule>;
   /** Removes a shared rule from the file; returns its personal copy (to add to the personal list). */
@@ -104,7 +127,12 @@ export function createSharedRulesService(deps: SharedRulesDeps): SharedRulesHost
       setTimeout(() => {
         bodyTimers.delete(abs);
         core.invalidateBodyFile();
-        for (const rel of rels) bodyChanged.fire(rel);
+        const fire = () => {
+          for (const rel of rels) bodyChanged.fire(rel);
+        };
+        // a rule's script file: re-hold the rule (new contents) before anyone re-reads the file
+        if (core.isScriptFile(abs)) void reload().then(fire);
+        else fire();
       }, debounceMs),
     );
   };
@@ -137,6 +165,7 @@ export function createSharedRulesService(deps: SharedRulesDeps): SharedRulesHost
     memento: deps.workspaceState,
     log,
     watchBodyFile,
+    requestReload: () => scheduleReload(),
   });
 
   const reload = async () => {
@@ -208,6 +237,12 @@ export function createSharedRulesService(deps: SharedRulesDeps): SharedRulesHost
     resolveBodyFile: (p, ruleId?: string) => core.readBodyFile(p, core.folderPathFor(ruleId)),
     resolveBodies: (rules) => core.resolveBodies(rules),
     createBodyFile: (rule, text) => core.createBodyFile(rule, text),
+    resolveScriptFile: (p, ruleId?: string) => after(core.readScriptFile(p, core.folderPathFor(ruleId), ruleId)),
+    setPersonalRules: (rules) => after(core.setPersonalRules(rules)).then(() => undefined),
+    approveScriptFile: (rel, ruleId?: string) => after(core.approveScriptFile(rel, ruleId)).then(() => undefined),
+    noteScriptFileSaved: (abs) => after(core.noteScriptFileSaved(abs)),
+    createScriptFile: (rule, code) => core.createScriptFile(rule, code),
+    checkScriptFileContent: (code) => core.checkScriptFileContent(code),
     bodyFilePath: (bodyFile, ruleId) => core.bodyFilePath(bodyFile, ruleId),
     reload,
     dispose: () => {

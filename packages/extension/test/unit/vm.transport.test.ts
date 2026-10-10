@@ -127,7 +127,7 @@ describe('WebSocket transport', () => {
 
 describe('session watcher (transport selection)', () => {
   const vmWithMain = { type: 'VM', isolates: [{ id: 'isolates/1', name: 'main', isSystemIsolate: false }] };
-  function deps() {
+  function deps(backgroundIsolates: 'intercept' | 'warn' = 'warn') {
     const warnings: [string, SessionWarning[]][] = [];
     const logs: string[] = [];
     return {
@@ -139,6 +139,7 @@ describe('session watcher (transport selection)', () => {
         setWarnings: (sid: string, w: SessionWarning[]) => warnings.push([sid, w]),
         log: (m: string) => logs.push(m),
         nativeClients: () => 'off' as const,
+        backgroundIsolates: () => backgroundIsolates,
         webSocket: FakeWs,
       },
     };
@@ -215,6 +216,82 @@ describe('session watcher (transport selection)', () => {
     expect(warnings.at(-1)).toEqual(['s4', [expect.objectContaining({ id: 'isolate:s4:bg', kind: 'background-isolate' })]]);
     w.sessionEnded('s4');
     expect(warnings.at(-1)).toEqual(['s4', []]);
+  });
+
+  it('"intercept": opens its own DDS client in debug (Debug stream, resume permission), no install log on failure paths', async () => {
+    const { d, logs } = deps('intercept');
+    const w = createSessionWatcher(d);
+    const request = async (_cmd: string, args: unknown) => ((args as { method: string }).method === 'getVM' ? vmWithMain : { name: 'main', extensionRPCs: [] });
+    FakeWs.answers.getVM = vmWithMain;
+    FakeWs.answers.getIsolate = { type: 'Isolate', name: 'main', pauseEvent: { kind: 'Resume' } };
+    w.sessionStarted('s6', request);
+    await w.attach({ sessionId: 's6' });
+    expect(FakeWs.last).toBeUndefined(); // no VM service URI yet
+    w.customEvent('s6', 'dart.debuggerUris', { vmServiceUri: 'ws://127.0.0.1:5000/tok=/ws' }, request);
+    await vi.advanceTimersByTimeAsync(20);
+    const ws = FakeWs.last!;
+    expect(ws.url).toBe('ws://127.0.0.1:5000/tok=/ws');
+    expect(ws.sent.map((m) => m.method)).toEqual(['streamListen', 'setClientName', 'requirePermissionToResume', 'getVM', 'getIsolate']);
+    expect(ws.sent[0].params).toEqual({ streamId: 'Debug' });
+    expect(ws.sent[2].params).toEqual({ onPauseStart: true });
+    expect(logs.join('\n')).toContain('installing the entry\'s overrides at isolate start');
+    expect(logs.join('\n')).toContain("watching via Dart-Code's debug adapter");
+    expect(logs.join('\n')).not.toContain('tok=');
+    // A paused-at-start background isolate of the entry: installed, then resumed.
+    FakeWs.answers.getIsolate = { type: 'Isolate', name: 'demo_worker', rootLib: { id: 'libraries/1', uri: 'file:///app/.dart_tool/flutter_intercept/entry_lib__main.dart' } };
+    FakeWs.answers.invoke = { type: '@Instance', kind: 'Null' };
+    ws.onmessage?.({ data: JSON.stringify({ jsonrpc: '2.0', method: 'streamNotify', params: { streamId: 'Debug', event: { kind: 'PauseStart', isolate: { id: 'isolates/5', name: 'demo_worker' } } } }) });
+    await vi.advanceTimersByTimeAsync(20);
+    expect(ws.sent.slice(-3).map((m) => m.method)).toEqual(['getIsolate', 'invoke', 'readyToResume']);
+    expect(logs.join('\n')).toContain('"demo_worker" go through the proxy');
+    w.detach('s6');
+    expect(ws.readyState).toBe(3); // DDS resumes anything still waiting for us
+  });
+
+  it('"warn": no DDS client of its own in debug', async () => {
+    const { d } = deps('warn');
+    const w = createSessionWatcher(d);
+    const request = async (_cmd: string, args: unknown) => ((args as { method: string }).method === 'getVM' ? vmWithMain : { name: 'main' });
+    w.sessionStarted('s7', request);
+    await w.attach({ sessionId: 's7' });
+    w.customEvent('s7', 'dart.debuggerUris', { vmServiceUri: 'ws://127.0.0.1:5000/tok=/ws' }, request);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(FakeWs.last).toBeUndefined();
+    w.dispose();
+  });
+
+  it('"intercept" without DDS: one log line, the connection is closed, warnings as before', async () => {
+    const { d, logs, warnings } = deps('intercept');
+    const w = createSessionWatcher(d);
+    const request = async (_c: string, args: unknown) => {
+      const m = (args as { method: string }).method;
+      return m === 'getVM' ? vmWithMain : (args as { params: { isolateId: string } }).params.isolateId === 'isolates/1' ? { name: 'main' } : { name: 'bg' };
+    };
+    FakeWs.answers.requirePermissionToResume = new Error('Method not found');
+    w.sessionStarted('s8', request);
+    await w.attach({ sessionId: 's8' });
+    w.customEvent('s8', 'dart.debuggerUris', { vmServiceUri: 'ws://127.0.0.1:5000/tok=/ws' }, request);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(FakeWs.last!.readyState).toBe(3);
+    expect(logs.join('\n')).toContain("background isolates can't be intercepted (no DDS resume permissions");
+    w.customEvent('s8', 'dart.serviceExtensionAdded', { extensionRPC: 'ext.dart.io.httpEnableTimelineLogging', isolateId: 'isolates/2' }, request);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(warnings.at(-1)).toEqual(['s8', [expect.objectContaining({ id: 'isolate:s8:bg' })]]);
+    w.dispose();
+  });
+
+  it('callService goes through the session\'s debug adapter; rejects for unknown sessions / no answer', async () => {
+    const { d } = deps();
+    const w = createSessionWatcher(d);
+    const seen: unknown[] = [];
+    w.sessionStarted('s9', async (cmd, args) => {
+      seen.push([cmd, args]);
+      return (args as { method: string }).method === 'getVM' ? vmWithMain : undefined;
+    });
+    expect(await w.callService('s9', 'getVM')).toEqual(vmWithMain);
+    expect(seen[0]).toEqual(['callService', { method: 'getVM', params: {} }]);
+    await expect(w.callService('s9', 'ext.x', { a: 1 })).rejects.toThrow(/no answer from the debug adapter/);
+    await expect(w.callService('nope', 'getVM')).rejects.toThrow(/not a running Dart debug session/);
   });
 
   it('a session that is never attached is never touched', async () => {

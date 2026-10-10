@@ -218,7 +218,7 @@ describe('per-rule approval (REVIEW-6 #2)', () => {
     await core.reload();
     const snap = core.pendingSnapshot();
     expect(snap.items).toEqual([
-      { folder: '.vscode/flutter-intercept.json', name: '"Staging Verified"', match: 'any method https://api.example.com/*', reason: "sends the app's requests to https://staging.example.com instead of the real server" },
+      { id: 'shared:m', folder: '.vscode/flutter-intercept.json', name: '"Staging Verified"', match: 'any method https://api.example.com/*', reason: "sends the app's requests to https://staging.example.com instead of the real server" },
     ]);
     // the file changes while the modal is open
     fs.put(FILE, fileJson([{ ...mapRemote('m'), name: 'Staging\u202e\nVerified' }, attacker('x')]));

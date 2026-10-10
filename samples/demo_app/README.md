@@ -31,9 +31,12 @@ close; result status 101), `sse_events` (package:http streaming GET `https://ech
 three `time` events, then hangs up), `gql_country` (package:http POST to
 `https://countries.trevorblades.com/graphql`, `operationName` `CountryByCode`, variables `{"code":"EG"}`),
 `isolate_todo` (package:http GET /todos/2 from `Isolate.run(..., debugName: 'demo_worker')`) and `compute_todo`
-(GET /todos/3 from Flutter's `compute(..., debugLabel: 'demo_compute')`). The isolate results include
-`"overridesInIsolate":false`: background isolates have their own statics, so the generated entry's
-`HttpOverrides` does not reach them and those requests go DIRECT (Flutter Intercept warns about them).
+(GET /todos/3 from Flutter's `compute(..., debugLabel: 'demo_compute')`) and `spawn_todo` (from
+`Isolate.spawn(..., debugName: 'demo_spawn')`). Background isolates have their own statics, so the entry's
+`HttpOverrides` only reaches them when Flutter Intercept installs it at isolate start (debug sessions,
+`flutterIntercept.backgroundIsolates: "intercept"`, the default): the results then show
+`"overridesInIsolate":true` and the requests go through the proxy. Otherwise (profile mode, `"warn"`) they show
+`false`, go DIRECT, and Flutter Intercept warns about them.
 With `NATIVE_HTTP=true`, also `native_get` (GET /posts/1, header `x-demo-client`) and `native_post` (POST /posts)
 through the platform's HTTP stack (`lib/native_client.dart`): cupertino_http (NSURLSession) on iOS/macOS,
 cronet_http (Cronet from Google Play services) on Android; elsewhere they print `-1`. They bypass dart:io and the

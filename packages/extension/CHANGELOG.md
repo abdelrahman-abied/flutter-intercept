@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.7.0
+
+### Timing, scripts, exports and more
+
+**Timing waterfall**
+- A **Waterfall** column in the traffic list and a **Timing** tab show where each request's time went: DNS,
+  connect, TLS, sending, waiting for the server and downloading, plus time held at breakpoints or added by a
+  simulated network. Reused connections are marked. HAR exports carry the same timings.
+
+**JavaScript scripts**
+- **Script (JS)** rules run `onRequest` / `onResponse` hooks on matching traffic: edit requests and responses, or
+  answer locally. Scripts run in an isolated worker with a 200 ms limit per call and no access to files, the network
+  or modules; their log lines show on the request. A script can live in a workspace file.
+- Shared scripts from the repo wait for your approval, like other rules that change traffic. AI agents can't add,
+  change or read scripts.
+
+**Background isolates are intercepted**
+- Requests from `compute`, `Isolate.run` and `Isolate.spawn` now go through Flutter Intercept in debug sessions:
+  each new isolate is set up before it runs. `flutterIntercept.backgroundIsolates: "warn"` restores the old warning.
+
+**Export to OpenAPI and Postman**
+- **Export…** writes the recorded traffic as an OpenAPI 3.1 document (paths with parameters, schemas inferred from
+  every sample, examples), a Postman collection or a HAR file. Secrets are redacted unless you choose to keep them.
+
+**Notifications and windows**
+- A notification tells you when the app's requests fail while the panel is hidden, with **Show** to jump to the
+  request (`flutterIntercept.notifications`: `errors`, `all` or `off`).
+- **Open Traffic in New Window** moves the traffic view into its own window; **Open Traffic in Editor** opens it as
+  a tab.
+
+**CI mode**
+- `flutter-intercept test` (in `packages/cli`) runs integration tests through the proxy on macOS, Android and the iOS
+  simulator, with shared rules, replay, network profiles, HAR and recording output, and traffic assertions with a
+  JUnit report.
+
+**Editors**
+- Open VSX packaging, for Cursor, Windsurf and VSCodium. **Connect AI Agent** has a Windsurf entry.
+
+### Fixes
+- Inside VS Code, the proxy's own connections to servers were taken over by VS Code's proxy support. That disabled
+  connection reuse, the connect-time address check for iPhone (LAN) traffic, `flutterIntercept.upstreamProxy` for
+  remote servers, and the emulator's `10.0.2.2` → your Mac rewrite. They work again. Your app's traffic no longer
+  follows VS Code's `http.proxy` setting; use `flutterIntercept.upstreamProxy` to chain to a proxy.
+
+### Security
+- Script files, personal or shared, run only with content you approved: created in the panel, saved in VS Code, or
+  approved after review. The approval dialog shows the scripts.
+- Notification text can't contain links; `flutterIntercept.notifications` is read from user settings only.
+- Unredacted exports default to `.dart_tool/flutter_intercept/exports/` with private file permissions and a warning
+  when git would track them. Independent review: docs/REVIEW-7.md.
+
+### Agent API
+- New tools: `export_openapi`, `export_postman`, `take_screenshot` (asks for confirmation; setting
+  `flutterIntercept.agent.screenshots`).
+- `get_request` returns timing phases and the script log (redacted); `list_requests` takes `slowerThanMs`.
+
 ## 0.6.0
 
 ### Teams and scenarios

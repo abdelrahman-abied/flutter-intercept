@@ -11,7 +11,8 @@
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc -p . --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:devices": "bash test/e2e.sh"
   },
   "dependencies": {
     "@flutter-intercept/proxy": "*"

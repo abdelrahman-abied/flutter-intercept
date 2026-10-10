@@ -2,10 +2,11 @@
  * Policy for shared rules (CONTRACTS §12.1, REVIEW-6 #4/#6/#8). Pure.
  *
  * - Approval gate: a rule from a cloned repo must not silently send the app's (authenticated) traffic elsewhere,
- *   redirect it, change what the real server receives, or serve pages / scripts to the Flutter Web debug browser.
+ *   redirect it, change what the real server receives, serve pages / scripts to the Flutter Web debug browser, or run
+ *   JavaScript in the proxy (every shared `script` rule, CONTRACTS §13.4).
  *   Held back until the user approves that rule (src/rules/core.ts): see `approvalReasons` for the list; sequence
  *   steps are inspected the same way.
- * - Secrets: shared rules and body files are committed with the code, so writing them is refused when a value looks
+ * - Secrets: shared rules, body files and script files are committed with the code, so writing them is refused when a value looks
  *   like a credential: JWTs, Bearer/Basic credentials, long random tokens, AWS access key ids, PEM private keys,
  *   `user:pass@` in URLs, and any non-placeholder value under a credential name (JSON key, form field, query
  *   parameter, header such as authorization / cookie / x-api-key). Placeholders ("fake-token", "<token>", "xxx",
@@ -134,6 +135,11 @@ function actionApprovalReasons(a: AnyAction): string[] {
       else if (!hasType && !a.bodyFile && a.body.trimStart().startsWith('<')) out.push('serves what looks like an HTML page');
       break;
     }
+    case 'script':
+      // CONTRACTS §13.4: every shared script needs approval (the approval hash covers the script file's contents).
+      // REVIEW-7 #5: say what a script can do, not just where it comes from
+      out.push(`runs JavaScript that can read, change and redirect every matching request, including its credentials (${typeof a.file === 'string' ? cleanText(a.file, 120) : 'inline code in the shared rules file'})`);
+      break;
     case 'cors':
       out.push(`lets other websites read these responses (CORS for ${a.allowOrigin ? q(a.allowOrigin, 60) : 'any origin'}${a.allowCredentials ? ', with cookies' : ''})`);
       break;
@@ -283,6 +289,27 @@ export function bodySecretKind(text: string): string | undefined {
   return textSecretKind(text);
 }
 
+/** `key = "value"`, `key: 'value'`, `headers['x-api-key'] = "value"` in JavaScript (string literals only). */
+const JS_PAIR = /(?:\b([A-Za-z_$][\w$]*)|(["'`])([^"'`\\\r\n]{1,100})\2)\s*\]?\s*[:=]\s*(["'`])([^"'`\\\r\n]*)\4/g;
+
+/**
+ * What script code contains that looks like a credential: the mock-body checks (`bodySecretKind`), plus string
+ * literals assigned to a credential name (`token = "…"`, `{ apiKey: '…' }`, `headers['authorization'] = 'Bearer …'`).
+ * Template literals with `${…}` and placeholders stay allowed.
+ */
+export function scriptSecretKind(code: string): string | undefined {
+  const k = bodySecretKind(code);
+  if (k) return k;
+  for (const m of code.matchAll(JS_PAIR)) {
+    const key = m[1] ?? m[3];
+    if (!isSensitiveKey(key) && !isCredentialHeader(key)) continue;
+    const value = m[5].replace(/^(bearer|basic|token|digest|apikey|api-key)\s+/i, '');
+    if (value.includes('${') || isPlaceholder(value)) continue;
+    return `a credential (in ${q(key, 40)})`;
+  }
+  return undefined;
+}
+
 /** What a URL / URL pattern carries that looks like a credential (userinfo, credential query values, tokens). */
 export function urlSecretKind(url: string): string | undefined {
   if (/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*@/i.test(url)) return 'a user name / password';
@@ -335,6 +362,13 @@ function actionSecret(a: AnyAction, bodyFileText: (path: string) => string | und
       }
       return undefined;
     }
+    case 'script': {
+      // a file reference stays a reference; its content is committed too, so it is checked when readable
+      const text = typeof a.file === 'string' ? bodyFileText(a.file) : a.code;
+      const k = typeof text === 'string' ? scriptSecretKind(text) : undefined;
+      if (k) return typeof a.file === 'string' ? `the script file ${cleanText(a.file, 120)} contains what looks like ${k}` : `the script contains what looks like ${k}`;
+      return undefined;
+    }
     case 'sequence':
       for (const [i, step] of (a.steps ?? []).entries()) {
         const r = actionSecret(step.action, bodyFileText);
@@ -350,7 +384,7 @@ const PLACEHOLDER_HINT = 'Replace it with a placeholder (for example "test-token
 
 /**
  * Why this rule must not be written to the shared file (it would commit a credential), or undefined.
- * `bodyFileText` returns a `bodyFile`'s content when it can be read (it is committed too).
+ * `bodyFileText` returns a `bodyFile`'s (or `script.file`'s) content when it can be read (it is committed too).
  */
 export function secretProblem(rule: Rule, bodyFileText: (path: string) => string | undefined = () => undefined): string | undefined {
   const n = typeof rule.name === 'string' ? textSecretKind(rule.name) : undefined;
@@ -366,4 +400,11 @@ export function bodyFileSecretProblem(text: string): string | undefined {
   const k = bodySecretKind(text);
   if (!k) return undefined;
   return `Not written: the body contains what looks like ${k}. Body files under .vscode/ are usually committed with the code, so a real credential would end up in the repository. ${PLACEHOLDER_HINT} first.`;
+}
+
+/** Why `code` must not be written to a script file under `.vscode/` (usually committed), or undefined. */
+export function scriptFileSecretProblem(code: string): string | undefined {
+  const k = scriptSecretKind(code);
+  if (!k) return undefined;
+  return `Not written: the script contains what looks like ${k}. Script files under .vscode/ are usually committed with the code, so a real credential would end up in the repository. ${PLACEHOLDER_HINT} first.`;
 }

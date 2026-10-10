@@ -87,10 +87,14 @@ flutter_tools and mockttp 4.6.3.
   (`vscode.diff`; agent tool `diff_recordings`).
 - **Map Remote / header & body rewrite**, **upstream proxy chaining** (keep Charles / Burp in the loop).
 
-### Later / considered
+### 0.7.0 — Later / considered (built 2026-10-10, CONTRACTS §13)
 JS scripting hooks (Proxyman/mitmproxy style), timing waterfall, `take_screenshot` linked to exchanges,
-headless/CI mode for `integration_test`, Postman / OpenAPI export, error notifications, Windsurf.
-**Ops (not code):** publish on Open VSX (Cursor users can't install today).
+headless/CI mode for `integration_test` (`packages/cli`), Postman / OpenAPI export, error notifications, Windsurf,
+the panel in its own window, and background-isolate **interception** (0.5.0 shipped the warning only).
+**Ops (not code):** publish on Open VSX (Cursor users can't install today) — packaging ready, the owner publishes.
+
+### Next / considered
+Publish the CLI on npm (owner decision), a GitHub Action wrapping it, physical iPhones in CI mode.
 
 ## 5. Spikes and decisions before building
 - Dio's async stack depth for request → source (0.3).

@@ -274,11 +274,16 @@ export function needsApproval(a: RuleAction): string | undefined {
   return undefined;
 }
 
+/**
+ * The approval banner. Held rules are shared rules (map remote elsewhere / request headers / scripts, CONTRACTS §12.1,
+ * §13.4) and — REVIEW-7 #1 — personal script rules whose file content you haven't approved; the list says which.
+ */
 export function pendingApprovalText(sr: NonNullable<Status['sharedRules']>): string {
   const n = sr.pendingApproval;
-  return `${plural(n, 'shared rule')} from ${sr.file ?? SHARED_FILE} ${n === 1 ? 'is' : 'are'} held back: ` +
-    `${n === 1 ? 'it maps' : 'they map'} requests to another server or ${n === 1 ? 'sets' : 'set'} request headers. ` +
-    'A cloned repository must not silently send the app\'s authenticated traffic elsewhere — review the file, then approve.';
+  return `${plural(n, 'rule')} ${n === 1 ? 'waits' : 'wait'} for your approval and ${n === 1 ? "doesn't" : "don't"} run yet: ` +
+    `shared rules from ${sr.file ?? SHARED_FILE} that send requests to another server, set request headers or run ` +
+    'scripts, and script rules whose file content you haven\'t approved (written outside this editor, e.g. by git). ' +
+    'A cloned repository must not silently send the app\'s authenticated traffic elsewhere or run its own code — review, then approve.';
 }
 
 // ---------------------------------------------------------------- recordings (§12.4–12.5)

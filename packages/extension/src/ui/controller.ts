@@ -30,7 +30,14 @@
  * change and sent on `ready`; `authFlows` (injected `analyzeAuth`) at most every `authDebounceMs` (1 s) after
  * exchange changes while a panel is attached, and on `ready`. `Status.replay` / `Status.sharedRules` come from the
  * host / the shared service.
+ *
+ * CONTRACTS §13 (v0.7.0): `script` rule actions are validated here (the proxy host reads `script.file` into `code`);
+ * `export {format, ids?}` asks redact-or-keep every time (injected `pickOne`), then a save dialog, writes the file and
+ * replies `exported`; `openScriptFile` (like `openBodyFile`, `.js` only) and `openInNewWindow` go through injected deps;
+ * `select(id)` (a notification's "Show") posts `select` to every attached view.
  */
+import * as fs from 'fs';
+import * as path from 'path';
 import type { Exchange, ReplayEntry, ReplayOptions, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 import { ruleFromExchange, ruleProblem } from '@flutter-intercept/proxy/rules';
@@ -42,7 +49,11 @@ import type { ContractResult, ContractService } from '../contract/types';
 import type { AuthAnalysis } from '../analysis/types';
 import type { Recording, RecordingMeta, RecordingService } from '../recordings/types';
 import type { SharedRulesService, SharedRulesState } from '../rules/types';
-import type { AgentStatus, AuthFlowSummary, ContractSummary, HostMsg, RecordingSummary, SendDraft, SessionWarning, SnippetFormat, Status, ViewMsg } from './protocol';
+import type { ToOpenApi, ToPostman } from '../export/types';
+import { scriptFileOf, scriptFileSyntaxError, scriptTemplate } from '../rules/scriptFile';
+import { buildHar, ensureDirInside, EXPORT_DIR } from '../agent/har';
+import { gitIgnoreStatus, type GitignoreFs } from '../recordings/gitignore';
+import type { AgentStatus, AuthFlowSummary, ContractSummary, ExportFormat, HostMsg, RecordingSummary, SendDraft, SessionWarning, SnippetFormat, Status, ViewMsg } from './protocol';
 
 export type Sink = (msg: HostMsg) => void;
 
@@ -162,8 +173,81 @@ export interface ControllerDeps {
   authDebounceMs?: number;
   /** Opens `.vscode/flutter-intercept.json` (creating it when missing is up to the implementation). */
   openSharedRules?: () => Promise<unknown>;
-  /** Opens a workspace-relative mock body file; with `create`, creates it with that content when missing (never overwrites). */
-  openBodyFile?: (path: string, create?: { content: string }) => Promise<unknown>;
+  /**
+   * Opens a workspace-relative mock body file; with `create`, creates it with that content when missing (never
+   * overwrites). REVIEW-7 #6: `ruleId` = resolve in that rule's workspace folder (a shared rule's own folder).
+   */
+  openBodyFile?: (path: string, create?: { content: string }, ruleId?: string) => Promise<unknown>;
+
+  // ---- CONTRACTS §13 (v0.7.0). All optional: without them the matching messages answer with an `error`.
+  /** OpenAPI / Postman builders (src/export/**, pure). HAR is built here (src/agent/har.ts). */
+  exporters?: { openapi?: ToOpenApi; postman?: ToPostman };
+  /** A QuickPick of plain labels (`vscode.window.showQuickPick`); undefined = cancelled. */
+  pickOne?: (items: string[], placeHolder: string) => Promise<string | undefined>;
+  /** Save dialog (`vscode.window.showSaveDialog`) starting at `defaultPath`; resolves the chosen absolute path. */
+  showSaveDialog?: (defaultPath: string, format: ExportFormat) => Promise<string | undefined>;
+  /**
+   * Writes an export the user chose to save. `private` (REVIEW-7 #9: values kept) = owner-only (0600). Default:
+   * fs.promises.writeFile + chmod.
+   */
+  writeFile?: (file: string, text: string, opts: { private: boolean }) => Promise<unknown>;
+  /** REVIEW-7 #9: a modal warning with one confirming button; resolves true when it was clicked. */
+  confirmWarning?: (message: string, button: string) => Promise<boolean>;
+  /** Reads for the "would git commit this file?" check (default: the real file system). */
+  gitFs?: GitignoreFs;
+  /** Extension version (HAR creator). */
+  version?: string;
+  /**
+   * Opens a workspace-relative `.js` script file (inside the workspace only); with `create`, creates it with that
+   * content — and fails when the file already exists (REVIEW-7 #1; the error reaches the view). REVIEW-7 #6:
+   * `ruleId` = resolve in that rule's workspace folder.
+   */
+  openScriptFile?: (path: string, create?: { content: string }, ruleId?: string) => Promise<unknown>;
+  /** Opens the panel as an editor in its own window (src/ui/panel.ts `openInNewWindow`). */
+  openInNewWindow?: () => unknown;
+}
+
+/** CONTRACTS §13.5: the redaction choice offered on every export from the panel / commands. */
+export const EXPORT_REDACT = 'Redact secrets (recommended)';
+export const EXPORT_KEEP = 'Keep values';
+/** CONTRACTS §13.5: default file name suffix per format. */
+export const EXPORT_SUFFIX: Record<ExportFormat, string> = { openapi: '.openapi.json', postman: '.postman_collection.json', har: '.har' };
+const EXPORT_FORMATS = new Set<ExportFormat>(['openapi', 'postman', 'har']);
+/** REVIEW-7 #9: asked when an export with live values would land in a file git would commit. */
+export const EXPORT_GIT_WARNING = 'This file would be committed with live credentials: it is inside a git repository and not ignored. Save it there anyway?';
+export const EXPORT_GIT_CONFIRM = 'Save Anyway';
+
+const nodeGitFs: GitignoreFs = {
+  async kind(p) {
+    try {
+      const st = await fs.promises.lstat(p);
+      return st.isSymbolicLink() ? 'symlink' : st.isFile() ? 'file' : st.isDirectory() ? 'dir' : 'other';
+    } catch {
+      return undefined;
+    }
+  },
+  readFile: (p) => fs.promises.readFile(p, 'utf8'),
+};
+
+/** The real path of `file` (it need not exist yet): its folder's real path + its name. */
+async function realTarget(file: string): Promise<string> {
+  try {
+    return path.join(await fs.promises.realpath(path.dirname(file)), path.basename(file));
+  } catch {
+    return path.resolve(file);
+  }
+}
+
+async function writeExport(file: string, text: string, opts: { private: boolean }): Promise<void> {
+  await fs.promises.writeFile(file, text, { encoding: 'utf8', ...(opts.private ? { mode: 0o600 } : {}) });
+  if (opts.private) await fs.promises.chmod(file, 0o600); // `mode` only applies to a new file
+}
+
+/** REVIEW-7 #6: an optional rule id on a view message. */
+function checkRuleId(v: unknown, where: string): string | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== 'string' || !v || v.length > 200) fail(where, 'ruleId must be a rule id');
+  return v;
 }
 
 /** CONTRACTS §12.4: the exchanges a recording keeps — finished plain HTTP traffic the app made through the proxy. */
@@ -456,8 +540,11 @@ export function validateRule(raw: unknown, where = 'rule'): Rule {
   const out: Record<string, unknown> = { ...raw, action };
   delete out.used;
   // CONTRACTS §11.1 / REVIEW-5 #16: refuse rules the proxy can never apply (e.g. a mock or a truncate fault on a
-  // ws:// URL, a GraphQL operation on a WebSocket upgrade).
-  const problem = ruleProblem(out as unknown as Rule);
+  // ws:// URL, a GraphQL operation on a WebSocket upgrade, a script on a WebSocket). CONTRACTS §13.4: a script whose
+  // `file` supplies the code is checked as if it had code (the host reads the file before the proxy gets it).
+  const probe =
+    action.kind === 'script' && action.file !== undefined && !action.code.trim() ? { ...out, action: { ...action, code: '/* read from file */' } } : out;
+  const problem = ruleProblem(probe as unknown as Rule);
   if (problem) fail(where, problem);
   return out as unknown as Rule;
 }
@@ -564,6 +651,17 @@ function validateAction(a: unknown, aw: string, inStep: boolean): RuleAction {
       if (text > MAX_REWRITE_TEXT_TOTAL) fail(aw, 'the find and replace texts of one rewrite must total at most 256 KB');
       break;
     }
+    case 'script': {
+      // CONTRACTS §13.4: never inside a sequence; `code` may be empty when `file` supplies it (read by the host).
+      if (inStep) fail(aw, 'a sequence step cannot be a script');
+      onlyKeys(a, ['kind', 'code', 'file'], aw);
+      if (a.file !== undefined) checkScriptFile(a.file, aw);
+      if (a.code !== undefined && typeof a.code !== 'string') fail(aw, 'code must be a string (the JavaScript source)');
+      if (a.code === undefined && a.file === undefined) fail(aw, 'a script needs code or a file');
+      if (a.file === undefined && typeof a.code === 'string' && !a.code.trim()) fail(aw, 'a script needs code (define onRequest and / or onResponse) or a file');
+      if (typeof a.code === 'string' && Buffer.byteLength(a.code, 'utf8') > MAX_SCRIPT_BYTES) fail(aw, 'code must be at most 256 KB');
+      return { ...a, code: (a.code as string | undefined) ?? '' } as RuleAction;
+    }
     default:
       fail(aw, `unknown kind ${JSON.stringify(a.kind)}`);
   }
@@ -577,6 +675,20 @@ export function checkBodyFile(v: unknown, where: string, field = 'bodyFile'): st
   if (/^[\\/]/.test(v) || /^[A-Za-z]:/.test(v) || /^~/.test(v)) fail(where, `${field} must be relative to the workspace folder (no absolute path)`);
   if (v.split(/[\\/]+/).some((seg) => seg === '..')) fail(where, `${field} must stay inside the workspace (no ".." segments)`);
   return v;
+}
+
+/** CONTRACTS §13.4: the most a script (inline code or a new script file) may hold. */
+export const MAX_SCRIPT_BYTES = 256 * 1024;
+
+/**
+ * CONTRACTS §13.4: `script.file` = a workspace-relative `.js` path (no absolute path, `..`, control characters; the
+ * shared-rules service's `scriptFileSyntaxError`). The disk checks (inside the workspace, ≤ 256 KB) happen on read.
+ */
+export function checkScriptFile(v: unknown, where: string, field = 'file'): string {
+  const p = checkBodyFile(v, where, field);
+  const bad = scriptFileSyntaxError(p);
+  if (bad) fail(where, `${field} ${bad}`);
+  return p;
 }
 
 /** CONTRACTS §12.2: the most a new body file may hold (the proxy's body cap). */
@@ -1069,8 +1181,9 @@ export class InterceptController {
             if (Buffer.byteLength(content, 'utf8') > MAX_BODY_FILE_BYTES) fail('openBodyFile', 'create.content must be at most 5 MB');
             create = { content };
           }
+          const ruleId = checkRuleId(msg.ruleId, 'openBodyFile');
           if (!this.deps.openBodyFile) throw new Error('Opening body files is not available in this editor.');
-          await this.deps.openBodyFile(p, create);
+          await this.deps.openBodyFile(p, create, ruleId);
           return;
         }
         case 'saveRecording':
@@ -1095,6 +1208,34 @@ export class InterceptController {
         case 'expireToken':
           this.expireToken(msg.url, msg.count);
           return;
+        // ---- CONTRACTS §13.7
+        case 'export': {
+          const file = await this.exportTraffic(msg.format, msg.ids);
+          if (file) this.send(reply, { type: 'exported', format: msg.format, path: file });
+          return;
+        }
+        case 'openScriptFile': {
+          const p = checkScriptFile(msg.path, 'openScriptFile', 'path');
+          const ruleId = checkRuleId(msg.ruleId, 'openScriptFile');
+          let create: { content: string } | undefined;
+          if (msg.create !== undefined) {
+            if (!isObj(msg.create)) fail('openScriptFile', 'create must be an object {content}');
+            onlyKeys(msg.create, ['content'], 'openScriptFile.create');
+            const content = msg.create.content;
+            if (typeof content !== 'string') fail('openScriptFile', 'create.content must be a string');
+            if (Buffer.byteLength(content, 'utf8') > MAX_SCRIPT_BYTES) fail('openScriptFile', 'create.content must be at most 256 KB');
+            // Empty content: the starter template, naming the rule that uses this file (if one does).
+            const owner = this.deps.host.getRules().find((r) => (ruleId !== undefined ? r.id === ruleId : scriptFileOf(r) === p));
+            create = { content: content.trim() ? content : scriptTemplate(owner) };
+          }
+          if (!this.deps.openScriptFile) throw new Error('Opening script files is not available in this editor.');
+          await this.deps.openScriptFile(p, create, ruleId);
+          return;
+        }
+        case 'openInNewWindow':
+          if (!this.deps.openInNewWindow) throw new Error('Opening the traffic view in a new window is not available in this editor.');
+          await this.deps.openInNewWindow();
+          return;
         default:
           return;
       }
@@ -1103,6 +1244,73 @@ export class InterceptController {
       this.deps.log?.(`webview action ${msg.type} failed: ${message}`);
       this.send(reply, { type: 'error', message });
     }
+  }
+
+  /**
+   * CONTRACTS §13.6: focus one exchange in every attached view (a notification's "Show"). Pending updates are flushed
+   * first so the views know the exchange.
+   */
+  select(id: string): void {
+    if (typeof id !== 'string' || !id) return;
+    this.flush();
+    this.broadcast({ type: 'select', id });
+  }
+
+  /**
+   * CONTRACTS §13.5: exports the given exchanges (default: every finished one except the browser's own) as OpenAPI,
+   * Postman or HAR. Asks "Redact secrets (recommended)" / "Keep values" every time, then where to save (default
+   * `<project>/<name><suffix>`), writes the file and resolves its path; undefined when the user cancelled. Also used by
+   * the `flutterIntercept.exportOpenApi` / `exportPostman` commands. Throws a readable Error otherwise.
+   */
+  async exportTraffic(format: unknown, ids?: unknown): Promise<string | undefined> {
+    if (typeof format !== 'string' || !EXPORT_FORMATS.has(format as ExportFormat)) fail('export', `unknown format ${JSON.stringify(format)}`);
+    const fmt = format as ExportFormat;
+    let pick: Set<string> | undefined;
+    if (ids !== undefined) {
+      if (!Array.isArray(ids) || ids.length > 100_000 || !ids.every((x) => typeof x === 'string')) fail('export', 'ids must be a list of exchange ids');
+      pick = new Set(ids as string[]);
+    }
+    const builder = fmt === 'openapi' ? this.deps.exporters?.openapi : fmt === 'postman' ? this.deps.exporters?.postman : undefined;
+    if (fmt !== 'har' && !builder) throw new Error(`${fmt === 'openapi' ? 'OpenAPI' : 'Postman'} export is not available in this build.`);
+    if (!this.deps.pickOne || !this.deps.showSaveDialog) throw new Error('Exporting is not available in this editor.');
+    // Default: every finished exchange the app made, without the browser's own; OpenAPI / Postman also skip
+    // WebSocket / SSE (the exporters do too), HAR keeps their frames.
+    const list = this.deps.host
+      .getExchanges()
+      .filter((e) => (pick ? pick.has(e.id) : FINAL_STATES.has(e.state) && !e.browserInternal && (fmt === 'har' || !e.kind)));
+    if (!list.length) throw new Error('There is no recorded traffic to export.');
+
+    const choice = await this.deps.pickOne([EXPORT_REDACT, EXPORT_KEEP], 'Secrets in the export (Authorization, cookies, tokens, passwords)');
+    if (choice === undefined) return undefined;
+    const redact = choice !== EXPORT_KEEP;
+    const root = this.deps.projectRoot?.();
+    const title = this.deps.appPackageName?.() || (root ? path.basename(root) : '') || 'Flutter app';
+    let text: string;
+    if (fmt === 'har') {
+      text = JSON.stringify(buildHar(list, { redact, creatorVersion: this.deps.version }), null, 2);
+    } else {
+      const r = builder!(list, { title, redact });
+      if (!r.exchanges) throw new Error(`Nothing to export as ${fmt === 'openapi' ? 'OpenAPI' : 'Postman'}: no finished HTTP request (WebSocket and SSE traffic is skipped).`);
+      text = r.text;
+    }
+    const name = `${title.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^[._]+/, '') || 'traffic'}${EXPORT_SUFFIX[fmt]}`;
+    // REVIEW-7 #9: live values default to the project's (ignored) .dart_tool/flutter_intercept/exports/ folder.
+    let folder = root;
+    if (root && !redact) {
+      try {
+        folder = await ensureDirInside(root, EXPORT_DIR);
+      } catch (e) {
+        this.deps.log?.(`export folder unavailable, offering the project folder: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    const file = await this.deps.showSaveDialog(folder ? path.join(folder, name) : name, fmt);
+    if (!file) return undefined;
+    if (!redact && (await gitIgnoreStatus(await realTarget(file), this.deps.gitFs ?? nodeGitFs)) === 'not-ignored') {
+      if (!this.deps.confirmWarning) throw new Error('Not saved: this file would be committed with live credentials (it is inside a git repository and not ignored). Choose another place or redact secrets.');
+      if (!(await this.deps.confirmWarning(EXPORT_GIT_WARNING, EXPORT_GIT_CONFIRM))) return undefined;
+    }
+    await (this.deps.writeFile ?? writeExport)(file, text, { private: !redact });
+    return file;
   }
 
   /** Also used by the `flutterIntercept.clear` command. */

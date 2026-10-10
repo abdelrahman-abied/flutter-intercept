@@ -11,6 +11,8 @@ export type VmTransportEvent =
   | { kind: 'isolate-start'; isolateId: string; name?: string }
   | { kind: 'isolate-exit'; isolateId: string }
   | { kind: 'extension-added'; isolateId: string; rpc: string }
+  /** `Debug` stream (only when subscribed, see `connectWsTransport` `streams`): an isolate paused at start. */
+  | { kind: 'pause-start'; isolateId: string; name?: string }
   | { kind: 'closed' };
 
 export interface VmTransport {
@@ -101,8 +103,11 @@ export function toWsUri(uri: string): string {
   return uri;
 }
 
-/** Opens the WebSocket, subscribes to the Isolate stream. Never logs the URI (it embeds the auth token). */
-export async function connectWsTransport(uri: string, Ctor: WebSocketCtor, opts: { timeoutMs?: number } = {}): Promise<VmTransport> {
+/**
+ * Opens the WebSocket, subscribes to `streams` (default the Isolate stream). Never logs the URI (it embeds the auth
+ * token).
+ */
+export async function connectWsTransport(uri: string, Ctor: WebSocketCtor, opts: { timeoutMs?: number; streams?: ('Isolate' | 'Debug')[] } = {}): Promise<VmTransport> {
   const timeoutMs = opts.timeoutMs ?? 5000;
   const events = new Emitter();
   const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
@@ -137,7 +142,7 @@ export async function connectWsTransport(uri: string, Ctor: WebSocketCtor, opts:
   ws.onerror = () => fail('VM service WebSocket error');
   ws.onclose = () => fail('VM service WebSocket closed');
   ws.onmessage = (ev) => {
-    let msg: { id?: unknown; result?: unknown; error?: { message?: string; data?: { details?: string } }; method?: string; params?: { streamId?: string; event?: Record<string, unknown> } };
+    let msg: { id?: unknown; result?: unknown; error?: { code?: unknown; message?: string; data?: { details?: string } }; method?: string; params?: { streamId?: string; event?: Record<string, unknown> } };
     try {
       msg = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data));
     } catch {
@@ -146,8 +151,14 @@ export async function connectWsTransport(uri: string, Ctor: WebSocketCtor, opts:
     if (msg.id !== undefined && pending.has(String(msg.id))) {
       const p = pending.get(String(msg.id))!;
       pending.delete(String(msg.id));
-      if (msg.error) p.reject(new Error(msg.error.data?.details || msg.error.message || 'VM service error'));
+      if (msg.error) p.reject(Object.assign(new Error(msg.error.data?.details || msg.error.message || 'VM service error'), { code: msg.error.code }));
       else p.resolve(msg.result);
+      return;
+    }
+    if (msg.method === 'streamNotify' && msg.params?.streamId === 'Debug' && msg.params.event) {
+      const e = msg.params.event as { kind?: string; isolate?: { id?: string; name?: string } };
+      const isolateId = e.isolate?.id;
+      if (e.kind === 'PauseStart' && typeof isolateId === 'string') events.emit({ kind: 'pause-start', isolateId, name: typeof e.isolate?.name === 'string' ? e.isolate.name : undefined });
       return;
     }
     if (msg.method === 'streamNotify' && msg.params?.streamId === 'Isolate' && msg.params.event) {
@@ -185,10 +196,12 @@ export async function connectWsTransport(uri: string, Ctor: WebSocketCtor, opts:
       fail('transport closed');
     },
   };
-  try {
-    await transport.call('streamListen', { streamId: 'Isolate' });
-  } catch {
-    // "Stream already subscribed" is fine; otherwise there are no isolate events, but calls still work.
+  for (const streamId of opts.streams ?? ['Isolate']) {
+    try {
+      await transport.call('streamListen', { streamId });
+    } catch {
+      // "Stream already subscribed" is fine; otherwise there are no such events, but calls still work.
+    }
   }
   return transport;
 }

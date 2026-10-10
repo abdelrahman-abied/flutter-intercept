@@ -15,6 +15,8 @@ import { expireTokenError, expireTokenLabel } from '../scenarios';
 import { PauseEditor } from './Editors';
 import { Icon } from './Icon';
 import { BodyView, HeadersTable, type TreeFieldActions } from './Viewers';
+import { ADDED_PHASES, hasTimings, PHASE_LABEL, PHASE_TITLE, phaseClass, phaseRows } from '../timing';
+import { scriptErrorLine } from '../scripts';
 
 const PAUSE_TEXT = {
   'paused-request': 'Paused before the request reaches the server. Edit it and resume, or abort.',
@@ -25,7 +27,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
   const { state, dispatch } = useApp();
   const framed = hasFrames(ex);
   const tab = state.detailTab === 'messages' && !framed ? 'response' : state.detailTab;
-  const tabs = framed ? (['request', 'response', 'messages'] as const) : (['request', 'response'] as const);
+  const tabs = framed ? (['request', 'response', 'messages', 'timing'] as const) : (['request', 'response', 'timing'] as const);
   const gaveUp = clientGaveUp(state, ex);
   const rule = ex.matchedRuleId ? state.rules.find((r) => r.id === ex.matchedRuleId) : undefined;
   const ruleIndex = rule ? state.rules.indexOf(rule) : -1;
@@ -146,13 +148,15 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
         ) : (
           ex.error && <div class="msg error">{ex.error}</div>
         )}
+        {ex.scriptLog && ex.scriptLog.length > 0 && <ScriptLog key={ex.id} ex={ex} />}
       </header>
 
       <div class="tabs" role="tablist" aria-label="Message">
         {tabs.map((t) => (
           <button key={t} type="button" role="tab" class="tab" aria-selected={tab === t}
             onClick={() => dispatch({ type: 'setDetailTab', tab: t })}>
-            {t === 'request' ? 'Request' : t === 'response' ? 'Response' : `${ex.kind === 'sse' ? 'Events' : 'Messages'} (${frameTotal(ex)})`}
+            {t === 'request' ? 'Request' : t === 'response' ? 'Response' : t === 'timing' ? 'Timing'
+              : `${ex.kind === 'sse' ? 'Events' : 'Messages'} (${frameTotal(ex)})`}
             {t === 'messages' && ex.state === 'pending' && <span class="tab-dot live" title="Open — live" />}
             {((t === 'request' && ex.state === 'paused-request') || (t === 'response' && ex.state === 'paused-response')) && (
               <span class="tab-dot" title="Paused here" />
@@ -164,9 +168,92 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
       <div class="tab-body" role="tabpanel">
         {tab === 'request' ? <RequestTab ex={ex} />
           : tab === 'messages' ? <FramesView key={ex.id} ex={ex} />
+          : tab === 'timing' ? <TimingSection ex={ex} />
           : <ResponseTab ex={ex} actions={actions} />}
       </div>
     </section>
+  );
+}
+
+/**
+ * CONTRACTS §13.2 "Timing": one row per known phase (bar on the exchange's own time axis + ms), reused connection,
+ * breakpoint / added delay marked as added by the tool, and the total. Without timings: the total only.
+ */
+export function TimingSection({ ex }: { ex: Exchange }) {
+  const rows = phaseRows(ex.timings);
+  const total = ex.durationMs;
+  const running = total === undefined && (ex.state === 'pending' || isPaused(ex));
+  const sum = rows.reduce((n, r) => n + r.ms, 0);
+  const scale = Math.max(total ?? 0, sum, 1);
+  const other = total !== undefined && rows.length ? total - sum : 0;
+  const pct = (n: number) => `${Math.round((n / scale) * 10000) / 100}%`;
+  return (
+    <div class="timing" aria-label="Timing">
+      <div class="timing-facts muted">
+        Started {formatTime(ex.startedAt)}
+        {ex.timings?.reused && <> · <span class="badge mini reused-badge" title={PHASE_TITLE.connect}>reused connection</span></>}
+      </div>
+      {hasTimings(ex) ? (
+        <table class="timing-table">
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.phase} class={`timing-row${ADDED_PHASES.has(r.phase) ? ' added' : ''}`} title={PHASE_TITLE[r.phase]}>
+                <th scope="row">
+                  <span class={`swatch ${phaseClass(r.phase)}`} aria-hidden="true" />
+                  {PHASE_LABEL[r.phase]}
+                  {ADDED_PHASES.has(r.phase) && <span class="added-note"> — {r.phase === 'paused' ? 'by you' : 'simulated'}</span>}
+                </th>
+                <td class="timing-track">
+                  <span class={`timing-bar ${phaseClass(r.phase)}`} style={{ left: pct(r.offset), width: r.ms > 0 ? pct(r.ms) : '1px' }} />
+                </td>
+                <td class="timing-ms">{formatDuration(r.ms)}</td>
+              </tr>
+            ))}
+            {other > 0 && (
+              <tr class="timing-row other" title="Time the phases above don't cover (proxy work between phases)">
+                <th scope="row"><span class="swatch ph-other" aria-hidden="true" />Other</th>
+                <td class="timing-track"><span class="timing-bar ph-other" style={{ left: pct(sum), width: pct(other) }} /></td>
+                <td class="timing-ms">{formatDuration(other)}</td>
+              </tr>
+            )}
+            {ex.timings?.reused && !rows.some((r) => r.phase === 'dns' || r.phase === 'connect' || r.phase === 'tls') && (
+              <tr class="timing-row reused">
+                <th scope="row"><span class="swatch" aria-hidden="true" />Connection</th>
+                <td class="timing-track muted" colSpan={2}>reused from the pool — no DNS, connect or TLS</td>
+              </tr>
+            )}
+          </tbody>
+          <tfoot>
+            <tr class="timing-total">
+              <th scope="row">Total</th>
+              <td />
+              <td class="timing-ms">{total !== undefined ? formatDuration(total) : running ? 'in progress…' : '—'}</td>
+            </tr>
+          </tfoot>
+        </table>
+      ) : (
+        <div class="timing-none">
+          <div><strong>Total</strong> {total !== undefined ? formatDuration(total) : running ? 'in progress…' : '—'}</div>
+          <div class="hint">No phase timings for this exchange{running ? ' yet' : ''}.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** CONTRACTS §13.4: what the script rule logged (`context.log`), its error line highlighted. */
+export function ScriptLog({ ex }: { ex: Exchange }) {
+  const log = ex.scriptLog!;
+  const errLine = scriptErrorLine(ex);
+  return (
+    <details class="script-log" open={errLine >= 0 || undefined} aria-label="Script log">
+      <summary>Script log <span class="muted">({log.length} line{log.length === 1 ? '' : 's'})</span></summary>
+      <ol class="script-lines code">
+        {log.map((line, i) => (
+          <li key={i} class={i === errLine ? 'script-error' : undefined} title={i === errLine ? 'The script failed: the app got 502' : undefined}>{line}</li>
+        ))}
+      </ol>
+    </details>
   );
 }
 

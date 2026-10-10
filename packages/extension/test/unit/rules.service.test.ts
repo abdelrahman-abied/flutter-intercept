@@ -134,6 +134,69 @@ describe('createSharedRulesService', () => {
     svc.dispose();
   });
 
+  it('a shared script file change reloads (re-holding the rule) before onDidChangeBodyFile fires (CONTRACTS §13.4)', async () => {
+    fs.put(`${ROOT}/s/a.js`, 'function onRequest() {}');
+    fs.put(FILE, fileJson([{ id: 's', match: { url: '*' }, action: { kind: 'script', file: 's/a.js' } }]));
+    const svc = create();
+    await svc.ready;
+    expect(svc.pendingReasons()).toEqual(['Rule "s" (any method *): runs JavaScript that can read, change and redirect every matching request, including its credentials (s/a.js)']);
+    await svc.approvePending();
+    expect(svc.state().rules.map((r) => r.id)).toEqual(['shared:s']);
+    expect(await svc.resolveScriptFile('s/a.js', 'shared:s')).toBe('function onRequest() {}');
+    expect((await svc.resolveBodies(svc.state().rules)).rules.map((r) => (r.action as { code: string }).code)).toEqual(['function onRequest() {}']);
+
+    const seen: { path: string; pending: number }[] = [];
+    svc.onDidChangeBodyFile((p) => seen.push({ path: p, pending: svc.state().pendingApproval.length }));
+    const w = vs.watchers.find((x) => x.base === `${ROOT}/s` && x.pattern === '*')!;
+    fs.put(`${ROOT}/s/a.js`, 'function onRequest() { /* changed */ }');
+    w.change.forEach((l) => l({ fsPath: `${ROOT}/s/a.js`, scheme: 'file' }));
+    await vi.advanceTimersByTimeAsync(300);
+    await vi.waitFor(() => expect(seen).toEqual([{ path: 's/a.js', pending: 1 }]));
+    await expect(svc.resolveScriptFile('s/a.js', 'shared:s')).rejects.toThrow('is not approved for this shared rule');
+    svc.dispose();
+  });
+
+  it('personal script files: held until approved, onDidChange fires, approval and saves in VS Code release them (REVIEW-7 #1)', async () => {
+    fs.put(`${ROOT}/s/p.js`, 'function onRequest() {}');
+    const svc = create();
+    await svc.ready;
+    const changes: string[][] = [];
+    svc.onDidChange((st) => changes.push(st.pendingApproval.map((r) => r.id)));
+    const rule = { id: 'p', enabled: true, match: { url: '*' }, action: { kind: 'script' as const, code: '', file: 's/p.js' } };
+    await expect(svc.resolveScriptFile('s/p.js', 'p')).rejects.toThrow(/waits for your approval/);
+    expect(changes).toEqual([['p']]);
+    await svc.setPersonalRules([rule]);
+    expect(changes).toEqual([['p']]); // same holds: no event
+    await svc.approvePending(svc.pendingSnapshot().hash);
+    expect(changes).toEqual([['p'], []]);
+    expect(await svc.resolveScriptFile('s/p.js', 'p')).toBe('function onRequest() {}');
+
+    // a change from outside: the watcher reloads (holding the rule) before onDidChangeBodyFile fires
+    const seen: number[] = [];
+    svc.onDidChangeBodyFile(() => seen.push(svc.state().pendingApproval.length));
+    const w = vs.watchers.find((x) => x.base === `${ROOT}/s` && x.pattern === '*')!;
+    fs.put(`${ROOT}/s/p.js`, 'function onRequest() { /* pulled */ }');
+    w.change.forEach((l) => l({ fsPath: `${ROOT}/s/p.js`, scheme: 'file' }));
+    await vi.advanceTimersByTimeAsync(300);
+    await vi.waitFor(() => expect(seen).toEqual([1]));
+    expect(await svc.noteScriptFileSaved(`${ROOT}/s/p.js`)).toBe(true);
+    expect(svc.state().pendingApproval).toEqual([]);
+    fs.put(`${ROOT}/s/p.js`, 'function onRequest() { /* again */ }');
+    await svc.approveScriptFile('s/p.js', 'p');
+    expect(svc.state().pendingApproval).toEqual([]);
+    svc.dispose();
+  });
+
+  it('createScriptFile / checkScriptFileContent', async () => {
+    const svc = create();
+    await svc.ready;
+    const rel = await svc.createScriptFile({ id: 'r', enabled: true, name: 'Hdr', match: { url: '*' }, action: { kind: 'script', code: '' } });
+    expect(rel).toBe('.vscode/flutter-intercept/scripts/hdr.js');
+    expect(fs.text(`${ROOT}/${rel}`)).toContain('function onRequest(request, context)');
+    expect(svc.checkScriptFileContent('const password = "s3cr3t-pa55";')).toMatch(/^Not written:/);
+    svc.dispose();
+  });
+
   it('never uses a body file path as a glob (REVIEW-6 #12)', async () => {
     const svc = create();
     await svc.ready;

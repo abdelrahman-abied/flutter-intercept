@@ -10,6 +10,7 @@ import {
   FAULT_LABEL, newStep, stepsPreview, type ActionFields, type ActionValidation, type MutateRow, type StepForm, type ThrottleFields,
 } from '../state';
 import { useState } from 'preact/hooks';
+import { nextScriptFile, SCRIPT_TEMPLATE } from '../scripts';
 import { Button } from './bits';
 import { BodyEditor, HeadersEditor } from './Editors';
 import { Icon } from './Icon';
@@ -29,9 +30,17 @@ export interface ActionEditorProps {
     /** The host's error for the last "Create file" / "Open file" (e.g. it refused a body with a detected secret). */
     error?: string;
   };
+  /** Rule editor, kind `script` (CONTRACTS §13.4): "Edit script in a file". `knownContent` = scriptCode is the file's content. */
+  scriptFile?: FileHooks;
 }
 
-export function ActionEditor({ kind, f, v, set, uid, compact, bodyFile }: ActionEditorProps) {
+export interface FileHooks {
+  suggest: () => string; knownContent: boolean; open: (path: string, createWith?: string) => void; error?: string;
+  /** The error answers "Create file" (e.g. the file already exists: the host never reuses one). */
+  errorOnCreate?: boolean;
+}
+
+export function ActionEditor({ kind, f, v, set, uid, compact, bodyFile, scriptFile }: ActionEditorProps) {
   const radio = <K extends 'blockMode' | 'phase' | 'fault'>(key: K, value: ActionFields[K], label: string) => (
     <label class="radio">
       <input type="radio" name={`${uid}-${key}`} checked={f[key] === value} onChange={() => set({ [key]: value } as Partial<ActionFields>)} />
@@ -233,6 +242,9 @@ export function ActionEditor({ kind, f, v, set, uid, compact, bodyFile }: Action
     case 'rewrite':
       return <RewriteEditor uid={uid} value={f.rewrite} error={v.errors.rewrite} onChange={(rewrite) => set({ rewrite })} />;
 
+    case 'script':
+      return <ScriptEditor uid={uid} f={f} v={v} set={set} file={scriptFile} />;
+
     case 'passthrough':
       return <div class="hint">The request goes to the real server, unchanged.</div>;
 
@@ -277,6 +289,102 @@ function BodyFileActions({ path, body, disabled, open, error }: {
       )}
       {error && <div class="msg error body-file-error" role="alert">{error}</div>}
     </>
+  );
+}
+
+// ---------------------------------------------------------------- script (CONTRACTS §13.4)
+
+/**
+ * The `script` action: inline code (monospace, the template as placeholder) or a workspace `.js` file the host reads
+ * into the rule. "Create file" writes the inline script — or, when it is empty, the host's template — and never
+ * overwrites an existing file.
+ */
+export function ScriptEditor({ uid, f, v, set, file }: {
+  uid: string; f: ActionFields; v: ActionValidation; set: (patch: Partial<ActionFields>) => void; file?: FileHooks;
+}) {
+  const path = f.scriptFile.trim();
+  return (
+    <div class="script-editor">
+      <div class="hint">
+        JavaScript hooks run in the proxy on every matching request: <code>onRequest(request, context)</code> can edit
+        the request or answer it locally; <code>onResponse(response, request, context)</code> can edit the response.
+        Synchronous plain JavaScript only (no <code>require</code>, timers or <code>fetch</code>), 200 ms per call. A script
+        that throws or times out gives the app a 502 and shows its error in the exchange's script log. Scripts are your
+        own trusted code — not a sandbox. AI agents can't read or change them.
+      </div>
+      {file && (
+        <div class="radios" role="radiogroup" aria-label="Script source">
+          <label class="radio">
+            <input type="radio" name={`${uid}-scriptSource`} checked={!f.scriptUseFile} onChange={() => set({ scriptUseFile: false })} />
+            Inline
+          </label>
+          <label class="radio">
+            <input type="radio" name={`${uid}-scriptSource`} checked={f.scriptUseFile}
+              onChange={() => set({ scriptUseFile: true, ...(path ? {} : { scriptFile: file.suggest() }) })} />
+            Edit script in a file
+          </label>
+        </div>
+      )}
+      {file && f.scriptUseFile ? (
+        <>
+          <label class="field">
+            <span>File <span class="muted">(workspace-relative .js)</span></span>
+            <input class="mono" value={f.scriptFile} spellcheck={false} aria-invalid={!!v.errors.scriptFile}
+              placeholder=".vscode/flutter-intercept/scripts/auth.js"
+              onInput={(e) => set({ scriptFile: (e.target as HTMLInputElement).value })} />
+          </label>
+          <div class="file-actions">
+            <Button disabled={!!v.errors.scriptFile} onClick={() => file.open(path)} title="Open the script in the editor">Open file</Button>
+            {/* Empty content = the host's starter template (CONTRACTS §13.4); otherwise the inline script moves into the file. */}
+            <Button disabled={!!v.errors.scriptFile} onClick={() => file.open(path, f.scriptCode.trim() ? f.scriptCode : '')}
+              title={f.scriptCode.trim()
+                ? 'Create the file with the current script and open it (an existing file is never overwritten)'
+                : 'Create the file from a template and open it (an existing file is never overwritten)'}>
+              Create file
+            </Button>
+          </div>
+          {file.error && (
+            <div class="msg error script-file-error" role="alert">
+              {file.error}
+              {file.errorOnCreate && !v.errors.scriptFile && (
+                <div class="script-file-retry">
+                  “Create file” never reuses an existing file — pick another name, or use “Open file” to review that one.{' '}
+                  <button type="button" class="link" onClick={() => set({ scriptFile: nextScriptFile(path) })}>
+                    Use {nextScriptFile(path)}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+          {v.errors.scriptFile
+            ? <div class="msg error">{v.errors.scriptFile}</div>
+            : (
+              <div class="hint">
+                The extension reads this file into the rule and re-reads it whenever it changes (up to 256 KB) — edit it in
+                the editor, with JavaScript support. “Create file” always makes a new file; “Open file” opens an existing
+                one — review it first: the rule runs whatever the file contains. A script file you didn't write here, or
+                one changed outside the editor (git pull, checkout), waits for your approval before it runs.
+              </div>
+            )}
+          {file.knownContent && (
+            <details class="file-content">
+              <summary>Current content of the file</summary>
+              <pre class="code">{f.scriptCode || '(empty)'}</pre>
+            </details>
+          )}
+        </>
+      ) : (
+        <>
+          <textarea class="code-input script-code" rows={14} spellcheck={false} aria-label="Script" placeholder={SCRIPT_TEMPLATE}
+            aria-invalid={!!v.errors.scriptCode} value={f.scriptCode}
+            onInput={(e) => set({ scriptCode: (e.target as HTMLTextAreaElement).value })} />
+          {!f.scriptCode.trim() && (
+            <button type="button" class="link" onClick={() => set({ scriptCode: SCRIPT_TEMPLATE })}>Start from the template</button>
+          )}
+          {v.errors.scriptCode && f.scriptCode.trim() && <div class="msg error">{v.errors.scriptCode}</div>}
+        </>
+      )}
+    </div>
   );
 }
 

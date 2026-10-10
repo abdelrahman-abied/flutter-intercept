@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "user-1",
+      "name": "Mock user 1",
+      "match": { "method": "GET", "url": "https://jsonplaceholder.typicode.com/users/1" },
+      "action": { "kind": "mock", "status": 200, "headers": { "content-type": "application/json" }, "body": "{\"id\":1,\"name\":\"Mocked User\"}" }
+    },
+    {
+      "id": "staging",
+      "name": "Todos to staging (needs approval: skipped)",
+      "match": { "url": "https://jsonplaceholder.typicode.com/todos/*" },
+      "action": { "kind": "mapRemote", "to": "https://staging.example.com" }
+    }
+  ]
+}

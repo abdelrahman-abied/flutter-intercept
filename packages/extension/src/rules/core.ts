@@ -16,6 +16,15 @@
  * skipped (duplicates, past the limit, unknown kinds) are never approved implicitly: when they become valid they are
  * new hashes, so pending. Hashes of rules no longer in a (readable) file are pruned. The user's own personal rules
  * being shared are approved as they are written.
+ *
+ * Scripts (CONTRACTS §13.4, REVIEW-7 #1/#5): script FILE contents are approved per file (folder + path → approved
+ * content hashes, SCRIPT_APPROVALS_KEY), separately from the rule. A shared `script` rule is always gated: active when
+ * the rule is approved and, with `script.file`, the file's current contents are approved. A PERSONAL rule with
+ * `script.file` is held (listed in `pendingApproval`) while the file's contents were never approved here — created by
+ * Flutter Intercept (`createScriptFile`), approved (`approveScriptFile`, the approval prompt) or saved by the user in
+ * VS Code (`noteScriptFileSaved`); a planted file or a change from outside (git pull / checkout) holds it again.
+ * Inline personal code needs no approval (the user typed it). Resolving a script file (`readScriptFile` with the rule
+ * id) re-checks the contents, so a change between the watcher event and the reload never runs.
  */
 import * as path from 'path';
 import type { Rule } from '@flutter-intercept/proxy';
@@ -27,12 +36,15 @@ import {
   bodyFileLocation,
   bodyFileStem,
   bodyFileSyntaxError,
-  checkBodyFile,
-  decodeBodyFile,
+  BODY_FILE_SPEC,
+  checkWorkspaceFile,
+  decodeWorkspaceFile,
   MAX_BODY_FILE_BYTES,
   MOCKS_DIR,
   RulesFs,
+  WorkspaceFileSpec,
 } from './bodyFile';
+import { MAX_SCRIPT_FILE_BYTES, SCRIPT_FILE_SPEC, ScriptFileError, scriptFileActions, scriptFileOf, scriptFileStem, scriptFileSyntaxError, SCRIPTS_DIR, scriptTemplate } from './scriptFile';
 import {
   canonicalJson,
   contentHash,
@@ -47,10 +59,16 @@ import {
   toFileRule,
   ValidateRule,
 } from './file';
-import { approvalReason, approvalReasons, bodyFileSecretProblem, matchLabel, ruleLabel, secretProblem } from './policy';
+import { approvalReason, approvalReasons, bodyFileSecretProblem, cleanText, matchLabel, ruleLabel, scriptFileSecretProblem, secretProblem } from './policy';
 
 /** workspaceState: `{ [folder path]: approved rule hashes[] }`. */
 export const APPROVALS_KEY = 'flutterIntercept.sharedRulesApprovedRules';
+/** workspaceState: `{ [folder path]: { [script file, "/"-separated]: approved content hashes[] } }` (REVIEW-7 #1). */
+export const SCRIPT_APPROVALS_KEY = 'flutterIntercept.approvedScriptFiles';
+/** Approved versions remembered per script file (oldest dropped first). */
+export const MAX_SCRIPT_APPROVALS_PER_FILE = 10;
+/** Script code carried in a pending snapshot item for review (REVIEW-7 #5). */
+export const MAX_REVIEW_CODE_CHARS = 64 * 1024;
 
 /** The approval unit: one rule's canonical content (without `enabled`), its file id and its folder. */
 export function ruleApprovalHash(folderPath: string, fileId: string, rule: Rule): string {
@@ -58,10 +76,51 @@ export function ruleApprovalHash(folderPath: string, fileId: string, rule: Rule)
   return contentHash({ folder: folderPath, id: fileId, rule: content });
 }
 
+/** What the approval of a script file covers: the file's text (sha256), or why it couldn't be read. */
+export function scriptContentHash(read: { text: string } | { error: string }): string {
+  return 'text' in read ? contentHash({ text: read.text }) : contentHash({ unreadable: read.error });
+}
+
+/** REVIEW-7 #5: the script the user approves, to review before approving. */
+export interface PendingScript {
+  /** Workspace-folder-relative `script.file`; absent for inline code. */
+  file?: string;
+  /** Absolute path of the file in the rule's own folder (open this one, never a same-named file elsewhere). */
+  path?: string;
+  /** The code being approved (file contents or inline code), at most MAX_REVIEW_CODE_CHARS characters. */
+  code: string;
+  /** The code was cut at MAX_REVIEW_CODE_CHARS. */
+  truncated?: true;
+  /** Why the file couldn't be read (the approval then covers "unreadable"; nothing runs until it can be read). */
+  error?: string;
+}
+
+export interface PendingItem {
+  /** The shared file's label, or "personal rules". */
+  folder: string;
+  name: string;
+  match: string;
+  reason: string;
+  /** Rule id (shared ids are namespaced). */
+  id: string;
+  /** A personal rule held for its script file. */
+  personal?: true;
+  /** Script rules: what is being approved. */
+  script?: PendingScript;
+}
+
 export interface PendingSnapshot {
-  /** Identifies exactly this set of held rules; pass it to `approvePending`. */
+  /** Identifies exactly this set of held rules and script contents; pass it to `approvePending`. */
   hash: string;
-  items: { folder: string; name: string; match: string; reason: string }[];
+  items: PendingItem[];
+}
+
+/** Label of personal holds in pending items. */
+export const PERSONAL_LABEL = 'personal rules';
+
+/** Reason shown for a held personal script rule. */
+export function personalScriptReason(file: string): string {
+  return `runs a script file you haven't approved yet, or that changed outside VS Code (${cleanText(file, 120)})`;
 }
 
 export interface WorkspaceFolderInfo {
@@ -84,8 +143,10 @@ export interface SharedRulesCoreDeps {
   /** workspaceState: approvals by content hash. */
   memento: MementoLike;
   log?(msg: string): void;
-  /** Called for every body file a rule refers to (resolved or not yet existing), so it can be watched. */
+  /** Called for every body / script file a rule refers to (resolved or not yet existing), so it can be watched. */
   watchBodyFile?(folder: string, rel: string): void;
+  /** A shared rule's script file no longer matches its approval: reload soon (re-holds the rule). */
+  requestReload?(): void;
 }
 
 interface Folder {
@@ -146,13 +207,42 @@ export function toPersonalRule(rule: Rule): Rule {
   return { ...rest, id: rule.id.replace(/^shared(@[^:]*)?:/, '') };
 }
 
+interface ScriptRead {
+  hash: string;
+  text?: string;
+  error?: string;
+}
+
+interface PendingInfo {
+  label: string;
+  folderPath: string;
+  /** The rule's approval hash (gated shared rules). */
+  ruleHash?: string;
+  /** The script file contents to approve. */
+  script?: { file: string; hash: string };
+  personal?: true;
+}
+
+const normRel = (rel: string) => rel.replace(/\\/g, '/');
+const scriptKey = (folderPath: string, rel: string) => `${folderPath}\0${normRel(rel)}`;
+
 export class SharedRulesCore {
   private folderStates: FolderState[] = [];
   private current: SharedRulesState = emptyState();
   private queue: Promise<unknown> = Promise.resolve();
   private bodyCache = new Map<string, { size: number; mtimeMs: number; text: string }>();
-  /** Held rules (id → folder + approval hash), from the last recompute. */
-  private pendingInfo = new Map<string, { folder: Folder; hash: string }>();
+  /** Held rules (id → what approving them records), from the last recompute. */
+  private pendingInfo = new Map<string, PendingInfo>();
+  /** Script files the rules refer to (`scriptKey` → hash + text or error), from the last read. */
+  private scriptReads = new Map<string, ScriptRead>();
+  /** Active (approved) shared script rules with a file: id → the file ("/"-separated). */
+  private activeScripts = new Map<string, string>();
+  /** Absolute locations of the rules' script files (a change there reloads before anything else). */
+  private scriptPaths = new Set<string>();
+  /** The user's personal rules (REVIEW-7 #1: those with `script.file` are held while the file isn't approved). */
+  private personalRules: Rule[] = [];
+  /** Personal rule ids seen only through `readScriptFile` (not passed to `setPersonalRules`) → their script file. */
+  private unknownPersonal = new Map<string, string>();
 
   constructor(private readonly deps: SharedRulesCoreDeps) {}
 
@@ -163,7 +253,7 @@ export class SharedRulesCore {
   /** For `Status.sharedRules`: undefined when there is no file and nothing to report. */
   status(): SharedRulesStatus | undefined {
     const s = this.current;
-    if (!s.file && !s.problems.length) return undefined;
+    if (!s.file && !s.problems.length && !s.pendingApproval.length) return undefined;
     return { file: s.file, count: s.rules.length, problems: s.problems, pendingApproval: s.pendingApproval.length };
   }
 
@@ -172,21 +262,51 @@ export class SharedRulesCore {
    * bidi characters, quoted, capped), and a hash identifying exactly this set for `approvePending`.
    */
   pendingSnapshot(): PendingSnapshot {
-    const items: PendingSnapshot['items'] = [];
+    const items: PendingItem[] = [];
     const hashes: string[] = [];
     for (const r of this.current.pendingApproval) {
       const info = this.pendingInfo.get(r.id);
       if (!info) continue;
-      hashes.push(info.hash);
-      items.push({ folder: info.folder.label, name: ruleLabel(r), match: matchLabel(r), reason: approvalReasons(r).join('; ') });
+      hashes.push(canonicalJson({ id: r.id, folder: info.folderPath, personal: !!info.personal, rule: info.ruleHash, script: info.script }));
+      const item: PendingItem = {
+        folder: info.label,
+        name: ruleLabel(r),
+        match: matchLabel(r),
+        reason: info.personal && info.script ? personalScriptReason(info.script.file) : approvalReasons(r).join('; '),
+        id: r.id,
+      };
+      if (info.personal) item.personal = true;
+      const script = this.pendingScript(r, info);
+      if (script) item.script = script;
+      items.push(item);
     }
     return { hash: contentHash(hashes.sort()), items };
+  }
+
+  /** REVIEW-7 #5: the code a held script rule would run (the exact text whose hash gets approved). */
+  private pendingScript(rule: Rule, info: PendingInfo): PendingScript | undefined {
+    const a = rule.action;
+    if (a.kind !== 'script') return undefined;
+    const cap = (code: string, out: PendingScript): PendingScript => {
+      if (code.length > MAX_REVIEW_CODE_CHARS) {
+        out.code = code.slice(0, MAX_REVIEW_CODE_CHARS);
+        out.truncated = true;
+      } else out.code = code;
+      return out;
+    };
+    if (info.script) {
+      const read = this.scriptReads.get(scriptKey(info.folderPath, info.script.file));
+      const out: PendingScript = { file: info.script.file, path: bodyFileLocation(info.script.file, info.folderPath), code: '' };
+      if (read?.error !== undefined) out.error = read.error;
+      return cap(read?.text ?? '', out);
+    }
+    return cap(typeof a.code === 'string' ? a.code : '', { code: '' });
   }
 
   /** One readable line per held rule: `Rule "Staging" (GET https://api.example.com/*): sends … [file]`. */
   pendingReasons(): string[] {
     const multi = this.folderStates.length > 1;
-    return this.pendingSnapshot().items.map((i) => `Rule ${i.name} (${i.match}): ${i.reason}${multi ? ` [${i.folder}]` : ''}`);
+    return this.pendingSnapshot().items.map((i) => `Rule ${i.name} (${i.match}): ${i.reason}${multi || i.personal ? ` [${i.folder}]` : ''}`);
   }
 
   /** Every valid shared rule in file order (active and awaiting approval): the base for a `save` that edits one rule. */
@@ -273,6 +393,140 @@ export class SharedRulesCore {
     return out;
   }
 
+  // ------------------------------------------------------------------ script file approvals (REVIEW-7 #1)
+
+  private scriptApprovals(): Record<string, Record<string, string[]>> {
+    const v = this.deps.memento.get<unknown>(SCRIPT_APPROVALS_KEY);
+    const out: Record<string, Record<string, string[]>> = {};
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      for (const [folder, files] of Object.entries(v)) {
+        if (!files || typeof files !== 'object' || Array.isArray(files)) continue;
+        const f: Record<string, string[]> = {};
+        for (const [rel, list] of Object.entries(files)) if (Array.isArray(list)) f[rel] = list.filter((x): x is string => typeof x === 'string');
+        out[folder] = f;
+      }
+    }
+    return out;
+  }
+
+  private isScriptApproved(folderPath: string, rel: string, hash: string): boolean {
+    return this.scriptApprovals()[folderPath]?.[normRel(rel)]?.includes(hash) ?? false;
+  }
+
+  private async addScriptApprovals(list: { folderPath: string; file: string; hash: string }[]): Promise<void> {
+    if (!list.length) return;
+    const all = this.scriptApprovals();
+    for (const { folderPath, file, hash } of list) {
+      const files = (all[folderPath] ??= {});
+      const rel = normRel(file);
+      const hashes = (files[rel] ?? []).filter((h) => h !== hash);
+      hashes.push(hash);
+      files[rel] = hashes.slice(-MAX_SCRIPT_APPROVALS_PER_FILE);
+    }
+    await this.deps.memento.update(SCRIPT_APPROVALS_KEY, all);
+  }
+
+  /** Reads a script file for its approval hash and review text (never throws). */
+  private async readScript(folderPath: string, file: string): Promise<ScriptRead> {
+    try {
+      const text = await this.readWorkspaceFile(file, folderPath, SCRIPT_FILE_SPEC);
+      return { hash: scriptContentHash({ text }), text };
+    } catch (e) {
+      const error = (e as Error).message;
+      return { hash: scriptContentHash({ error }), error };
+    }
+  }
+
+  /** Every script file reference: the shared rules' (in their folders) and the personal rules' (primary folder). */
+  private scriptRefs(states: FolderState[] = this.folderStates): { folderPath: string; file: string }[] {
+    const out: { folderPath: string; file: string }[] = [];
+    for (const st of states) {
+      for (const e of st.good?.entries ?? []) {
+        const file = e.rule ? scriptFileOf(e.rule) : undefined;
+        if (file !== undefined) out.push({ folderPath: st.folder.info.path, file });
+      }
+    }
+    const primary = states[0]?.folder.info.path ?? this.deps.folders()[0]?.path;
+    if (primary) {
+      for (const r of this.personalRules) {
+        const file = scriptFileOf(r);
+        if (file !== undefined && r.enabled !== false) out.push({ folderPath: primary, file });
+      }
+      for (const file of this.unknownPersonal.values()) out.push({ folderPath: primary, file });
+    }
+    return out;
+  }
+
+  /** Re-reads every referenced script file (hash + text) and their locations (watched as a side effect). */
+  private async refreshScripts(states: FolderState[] = this.folderStates): Promise<void> {
+    const reads = new Map<string, ScriptRead>();
+    const paths = new Set<string>();
+    for (const { folderPath, file } of this.scriptRefs(states)) {
+      const key = scriptKey(folderPath, file);
+      if (!bodyFileSyntaxError(file)) paths.add(bodyFileLocation(file, folderPath));
+      if (!reads.has(key)) reads.set(key, await this.readScript(folderPath, file));
+    }
+    this.scriptReads = reads;
+    this.scriptPaths = paths;
+  }
+
+  /**
+   * REVIEW-7 #1: the user's personal rules (call whenever they change). Those with `script.file` are held in
+   * `pendingApproval` while the file's contents aren't approved. Resolves to whether the state changed.
+   */
+  setPersonalRules(rules: Rule[]): Promise<boolean> {
+    return this.serial(async () => {
+      this.personalRules = rules.filter((r) => !r.shared && !isSharedRuleId(r.id));
+      this.unknownPersonal = new Map();
+      await this.refreshScripts();
+      return this.recompute();
+    });
+  }
+
+  /**
+   * Approves the current contents of a script file (the host calls it right after creating the file through the
+   * panel). `ruleId` picks the folder (a shared rule's own folder; else the primary). Throws (readable) when the file
+   * can't be used. Resolves to whether the state changed.
+   */
+  approveScriptFile(rel: string, ruleId?: string): Promise<boolean> {
+    return this.serial(async () => {
+      const folderPath = this.folderPathFor(ruleId);
+      if (!folderPath) throw new ScriptFileError('Open the Flutter project folder to use script files');
+      const text = await this.readWorkspaceFile(rel, folderPath, SCRIPT_FILE_SPEC);
+      await this.addScriptApprovals([{ folderPath, file: rel, hash: scriptContentHash({ text }) }]);
+      await this.refreshScripts();
+      return this.recompute();
+    });
+  }
+
+  /**
+   * The user saved `absPath` in VS Code (onDidSaveTextDocument): when it is a script file a rule refers to, or one
+   * already approved here (e.g. created by Flutter Intercept, not yet in a rule), its saved contents are approved.
+   * Resolves to whether anything was approved.
+   */
+  noteScriptFileSaved(absPath: string): Promise<boolean> {
+    return this.serial(async () => {
+      const abs = path.resolve(absPath);
+      const refs = new Map<string, { folderPath: string; file: string }>();
+      const add = (folderPath: string, file: string) => {
+        if (!bodyFileSyntaxError(file) && !scriptFileSyntaxError(file) && bodyFileLocation(file, folderPath) === abs) refs.set(scriptKey(folderPath, file), { folderPath, file });
+      };
+      for (const ref of this.scriptRefs()) add(ref.folderPath, ref.file);
+      for (const [folderPath, files] of Object.entries(this.scriptApprovals())) for (const file of Object.keys(files)) add(folderPath, file);
+      const approve: { folderPath: string; file: string; hash: string }[] = [];
+      for (const { folderPath, file } of refs.values()) {
+        const read = await this.readScript(folderPath, file);
+        if (read.text !== undefined) approve.push({ folderPath, file, hash: read.hash });
+      }
+      await this.addScriptApprovals(approve);
+      if (approve.length) {
+        await this.refreshScripts();
+        this.recompute();
+      }
+      return approve.length > 0;
+    });
+  }
+
   /** Reads one folder's file. `missing` when it doesn't exist; throws a readable Error when unreadable/unsafe. */
   private async readFile(folder: Folder): Promise<{ missing: true } | { missing: false; text: string }> {
     const { fs } = this.deps;
@@ -332,7 +586,7 @@ export class SharedRulesCore {
             st.good = parsed;
             const approved = approvals[folder.info.path];
             if (approved) {
-              // rules that changed or left the file lose their approval
+              // rules that changed or left the file lose their approval (script contents are approved per file)
               const present = new Set(this.gatedHashes(folder, parsed).values());
               const kept = approved.filter((h) => present.has(h));
               if (kept.length !== approved.length) {
@@ -353,6 +607,7 @@ export class SharedRulesCore {
       next.push(st);
     }
     if (approvalsChanged) await this.deps.memento.update(APPROVALS_KEY, approvals);
+    await this.refreshScripts(next);
     this.folderStates = next;
     return this.recompute();
   }
@@ -361,6 +616,7 @@ export class SharedRulesCore {
     const s: SharedRulesState = emptyState();
     const labels: string[] = [];
     this.pendingInfo = new Map();
+    this.activeScripts = new Map();
     for (const fs of this.folderStates) {
       if (fs.exists) labels.push(fs.folder.label);
       if (fs.problem) s.problems.push(fs.problem);
@@ -369,13 +625,40 @@ export class SharedRulesCore {
       s.problems.push(...good.problems);
       const approved = this.approvedSet(fs.folder);
       const gated = this.gatedHashes(fs.folder, good);
+      const folderPath = fs.folder.info.path;
       for (const e of good.entries) {
         if (!e.rule) continue;
         const hash = e.fileId !== undefined ? gated.get(e.fileId) : undefined;
-        if (hash !== undefined && !approved.has(hash)) {
+        const file = scriptFileOf(e.rule);
+        // a script file that was never read (yet) has no approvable hash: held
+        const script = file === undefined ? undefined : { file, hash: this.scriptReads.get(scriptKey(folderPath, file))?.hash ?? 'unknown' };
+        const ruleOk = hash === undefined || approved.has(hash);
+        const scriptOk = !script || this.isScriptApproved(folderPath, script.file, script.hash);
+        if (!ruleOk || !scriptOk) {
           s.pendingApproval.push(e.rule);
-          this.pendingInfo.set(e.rule.id, { folder: fs.folder, hash });
-        } else s.rules.push(e.rule);
+          this.pendingInfo.set(e.rule.id, { label: fs.folder.label, folderPath, ruleHash: hash, script });
+        } else {
+          s.rules.push(e.rule);
+          if (file !== undefined) this.activeScripts.set(e.rule.id, normRel(file));
+        }
+      }
+    }
+    // REVIEW-7 #1: personal rules whose script file contents aren't approved (unreadable files aren't held: resolving
+    // them reports the real problem)
+    const primary = this.folderPathFor(undefined);
+    if (primary) {
+      const held = (rule: Rule, file: string) => {
+        const read = this.scriptReads.get(scriptKey(primary, file));
+        if (read?.text === undefined || this.isScriptApproved(primary, file, read.hash) || this.pendingInfo.has(rule.id)) return;
+        s.pendingApproval.push(rule);
+        this.pendingInfo.set(rule.id, { label: PERSONAL_LABEL, folderPath: primary, personal: true, script: { file, hash: read.hash } });
+      };
+      for (const r of this.personalRules) {
+        const file = scriptFileOf(r);
+        if (file !== undefined && r.enabled !== false) held(r, file);
+      }
+      for (const [id, file] of this.unknownPersonal) {
+        if (!this.personalRules.some((r) => r.id === id)) held({ id, enabled: true, match: { url: '*' }, action: { kind: 'script', code: '', file } }, file);
       }
     }
     if (labels.length) s.file = labels.join(', ');
@@ -397,12 +680,17 @@ export class SharedRulesCore {
         throw new Error('The shared rules changed while you were deciding. Nothing was approved; review them again.');
       }
       const approvals = this.approvals();
-      for (const { folder, hash } of this.pendingInfo.values()) {
-        const list = approvals[folder.info.path] ?? [];
-        if (!list.includes(hash)) list.push(hash);
-        approvals[folder.info.path] = list;
+      const scripts: { folderPath: string; file: string; hash: string }[] = [];
+      for (const info of this.pendingInfo.values()) {
+        if (info.ruleHash !== undefined) {
+          const list = approvals[info.folderPath] ?? [];
+          if (!list.includes(info.ruleHash)) list.push(info.ruleHash);
+          approvals[info.folderPath] = list;
+        }
+        if (info.script) scripts.push({ folderPath: info.folderPath, ...info.script });
       }
       await this.deps.memento.update(APPROVALS_KEY, approvals);
+      await this.addScriptApprovals(scripts);
       return this.recompute();
     });
   }
@@ -428,12 +716,14 @@ export class SharedRulesCore {
     return parsed;
   }
 
+  /** Contents of the body and script files the rules refer to (for the secret checks; unreadable ones left out). */
   private async bodyTexts(folder: Folder, rules: Rule[]): Promise<Map<string, string>> {
     const texts = new Map<string, string>();
     for (const r of rules) {
-      for (const a of bodyFileActions(r)) {
+      const refs: [string, WorkspaceFileSpec][] = [...bodyFileActions(r).map((a): [string, WorkspaceFileSpec] => [a.bodyFile, BODY_FILE_SPEC]), ...scriptFileActions(r).map((a): [string, WorkspaceFileSpec] => [a.file, SCRIPT_FILE_SPEC])];
+      for (const [rel, spec] of refs) {
         try {
-          texts.set(a.bodyFile, await this.readBodyFile(a.bodyFile, folder.info.path));
+          texts.set(rel, await this.readWorkspaceFile(rel, folder.info.path, spec));
         } catch {
           // unreadable: its content isn't committed by this save either way
         }
@@ -491,6 +781,7 @@ export class SharedRulesCore {
     const hash = contentHash(JSON.parse(text));
     // Only the user's own (personal) gated rules are approved by a write; edited shared rules get new hashes (pending)
     // and carried-over entries are never approved implicitly.
+    // (a script file's contents keep their own, per-file approval)
     const approve = rules.filter((r) => personal.has(r.id) && approvalReason(r)).map((r) => ruleApprovalHash(folder.info.path, this.fileIdOf(r.id), r));
     return { folder, text, hash, approve, unchanged: fresh?.hash === hash, hadComments: !!fresh?.hadComments };
   }
@@ -643,9 +934,50 @@ export class SharedRulesCore {
   /** Reads a body file (checks in bodyFile.ts); cached by size + mtime. Throws BodyFileError. */
   async readBodyFile(rel: string, folder: string | undefined = this.folderPathFor(undefined)): Promise<string> {
     if (!folder) throw new BodyFileError('Open the Flutter project folder to use body files');
+    return this.readWorkspaceFile(rel, folder, BODY_FILE_SPEC);
+  }
+
+  /**
+   * Resolves a script file for the proxy (checks in scriptFile.ts: `.js`, inside the workspace, ≤ 256 KB, UTF-8);
+   * watched like body files. Only returns code whose contents are approved (REVIEW-7 #1):
+   * - shared rule id: the rule must be active (approved) with this `file`, and the contents approved; a change since
+   *   asks for a reload (which re-holds the rule) and throws;
+   * - personal rule id (or none): the contents must be approved; otherwise the rule is listed in `pendingApproval`
+   *   (state changes: the service fires onDidChange) and this throws.
+   * Throws ScriptFileError.
+   */
+  async readScriptFile(rel: string, folder: string | undefined = this.folderPathFor(undefined), ruleId?: string): Promise<string> {
+    if (!folder) throw new ScriptFileError('Open the Flutter project folder to use script files');
+    const text = await this.readWorkspaceFile(rel, folder, SCRIPT_FILE_SPEC);
+    const hash = scriptContentHash({ text });
+    if (ruleId !== undefined && isSharedRuleId(ruleId)) {
+      if (this.activeScripts.get(ruleId) !== normRel(rel)) throw new ScriptFileError(`script file ${rel} is not approved for this shared rule`);
+      if (!this.isScriptApproved(folder, rel, hash)) {
+        this.deps.requestReload?.();
+        throw new ScriptFileError(`script file ${rel} changed since the shared rule was approved; approve the shared rules again`);
+      }
+      return text;
+    }
+    if (!this.isScriptApproved(folder, rel, hash)) {
+      if (ruleId !== undefined) {
+        this.scriptReads.set(scriptKey(folder, rel), { hash, text });
+        if (!this.personalRules.some((r) => r.id === ruleId)) this.unknownPersonal.set(ruleId, rel);
+        this.recompute();
+      }
+      throw new ScriptFileError(`script file ${rel} waits for your approval (not created or saved in VS Code here, or changed outside it)`);
+    }
+    return text;
+  }
+
+  /** True for the absolute location of a rule's script file (its change must reload before re-resolving). */
+  isScriptFile(absPath: string): boolean {
+    return this.scriptPaths.has(path.resolve(absPath));
+  }
+
+  private async readWorkspaceFile(rel: string, folder: string, spec: WorkspaceFileSpec): Promise<string> {
     const syntax = bodyFileSyntaxError(rel);
     if (!syntax && within(bodyFileLocation(rel, folder), folder)) this.deps.watchBodyFile?.(folder, rel.replace(/\\/g, '/'));
-    const { real, size, mtimeMs } = await checkBodyFile(rel, folder, this.workspaceRoots(), this.deps.fs);
+    const { real, size, mtimeMs } = await checkWorkspaceFile(rel, folder, this.workspaceRoots(), this.deps.fs, spec);
     const cached = this.bodyCache.get(real);
     if (cached && cached.size === size && cached.mtimeMs === mtimeMs) return cached.text;
     const bytes = await this.deps.fs.readFile(real);
@@ -656,8 +988,8 @@ export class SharedRulesCore {
     } catch {
       again = undefined;
     }
-    if (again !== real) throw new BodyFileError(`body file ${rel} changed while it was read; try again`);
-    const text = decodeBodyFile(bytes, rel);
+    if (again !== real) throw new (spec.error ?? BodyFileError)(`${spec.what} ${rel} changed while it was read; try again`);
+    const text = decodeWorkspaceFile(bytes, rel, spec);
     this.bodyCache.set(real, { size, mtimeMs, text });
     if (this.bodyCache.size > 256) this.bodyCache.delete(this.bodyCache.keys().next().value as string);
     return text;
@@ -669,21 +1001,23 @@ export class SharedRulesCore {
   }
 
   /**
-   * `rules` with every `mock.bodyFile` (also in sequence steps) read into `body`. A rule whose body file can't be
-   * used is left out, with a problem line. Call before `proxyHost.setRules`, and again on `onDidChangeBodyFile`.
+   * `rules` with every `mock.bodyFile` (also in sequence steps) read into `body` and every `script.file` into `code`
+   * (shared rules: checked against their approval, see `readScriptFile`). A rule whose file can't be used is left
+   * out, with a problem line (a script never runs with empty code). Call before `proxyHost.setRules`, and again on
+   * `onDidChangeBodyFile`.
    */
   async resolveBodies(rules: Rule[]): Promise<{ rules: Rule[]; problems: string[] }> {
     const out: Rule[] = [];
     const problems: string[] = [];
     for (const r of rules) {
-      const actions = bodyFileActions(r);
-      if (!actions.length) {
+      if (!bodyFileActions(r).length && !scriptFileActions(r).length) {
         out.push(r);
         continue;
       }
       const copy = structuredClone(r);
       try {
         for (const a of bodyFileActions(copy)) a.body = await this.readBodyFile(a.bodyFile, this.folderPathFor(r.id));
+        for (const a of scriptFileActions(copy)) a.code = await this.readScriptFile(a.file, this.folderPathFor(r.id), r.id);
         out.push(copy);
       } catch (e) {
         problems.push(`Rule ${ruleLabel(r)} is off: ${(e as Error).message}`);
@@ -716,6 +1050,40 @@ export class SharedRulesCore {
     const rel = `${MOCKS_DIR}/${name}`;
     this.deps.watchBodyFile?.(folderPath, rel);
     return rel;
+  }
+
+  /**
+   * "Edit script in a file": writes `code` (default: `scriptTemplate(rule)`) to
+   * `.vscode/flutter-intercept/scripts/<name>.js` in the rule's folder (never overwriting an existing file) and
+   * returns the folder-relative path to put in `script.file`. Refuses code that looks like it holds a credential.
+   */
+  async createScriptFile(rule: Rule, code?: string): Promise<string> {
+    const folderPath = this.folderPathFor(rule.id);
+    if (!folderPath) throw new Error('Open the Flutter project folder to keep scripts in files');
+    const text = code === undefined || !code.trim() ? scriptTemplate(rule) : code;
+    if (Buffer.byteLength(text, 'utf8') > MAX_SCRIPT_FILE_BYTES) throw new Error('The script is larger than 256 KB');
+    const secret = scriptFileSecretProblem(text); // files under .vscode/ get committed
+    if (secret) throw new Error(secret);
+    const folder: Folder = { info: { name: path.basename(folderPath), path: folderPath }, key: '', file: '', label: '' };
+    const dir = path.join(folderPath, SCRIPTS_DIR);
+    await this.ensureDirInside(dir, folderPath);
+    const stem = scriptFileStem(rule);
+    let name = `${stem}.js`;
+    for (let n = 2; await this.exists(path.join(dir, name)); n++) {
+      if (n > 1000) throw new Error('Too many script files with this name');
+      name = `${stem}-${n}.js`;
+    }
+    await this.atomicWrite(folder, text, path.join(dir, name));
+    const rel = `${SCRIPTS_DIR}/${name}`;
+    this.deps.watchBodyFile?.(folderPath, rel);
+    // the user's own new file: its contents are approved (REVIEW-7 #1)
+    await this.addScriptApprovals([{ folderPath, file: rel, hash: scriptContentHash({ text: text.charCodeAt(0) === 0xfeff ? text.slice(1) : text }) }]);
+    return rel;
+  }
+
+  /** Why `code` must not be written to a script file (looks like it holds a credential), or undefined. */
+  checkScriptFileContent(code: string): string | undefined {
+    return scriptFileSecretProblem(code);
   }
 
   private async exists(p: string): Promise<boolean> {

@@ -2,6 +2,7 @@ import * as http from 'http';
 import * as https from 'https';
 import * as tls from 'tls';
 import { createUpstreamAgents, retireAgents, type UpstreamAgents, type UpstreamProxySpec } from './upstream-proxy';
+import { timedAgent, type TimingSink } from './timing';
 
 /*
  * Upstream connection pooling across client connections.
@@ -63,6 +64,8 @@ interface Pool {
   lan?: LanUpstream;
   /** CONTRACTS §12.6: pass-through traffic goes via this HTTP proxy. */
   upstream?: UpstreamAgents;
+  /** CONTRACTS §13.2: where the phases of the request served for a downstream connection go (src/timing.ts). */
+  timings?: (connection: unknown) => TimingSink | undefined;
 }
 
 export interface LanUpstream {
@@ -85,6 +88,100 @@ interface GetAgentOptions {
   proxySettingSource?: unknown;
 }
 
+/** Agents handed out for our rules (pooled, LAN-guarded, upstream-proxy, timed views, one-off WebSocket agents). */
+const ownAgents = new WeakSet<object>();
+const BYPASS = Symbol.for('flutter-intercept.request-bypass');
+
+type RequestFn = (...args: unknown[]) => http.ClientRequest;
+
+type HttpModule = { request?: unknown; globalAgent?: unknown; __vscodeOriginal?: { request?: unknown } };
+
+/**
+ * VS Code's extension host patches `http` / `https` IN PLACE (`Object.assign` on Node's module objects, the
+ * originals saved as `module.__vscodeOriginal`), and hands each extension a shallow copy of the patched module for
+ * `require('http' | 'https')`. The patched `request()` swaps the caller's agent for its proxy-resolving agent
+ * (`http.proxySupport`, default "override"; only `localhost` / `127.0.0.1` / host-less targets keep the caller's
+ * agent). For mockttp's upstream requests that silently dropped every agent of ours: no shared pool, no LAN SSRF
+ * re-check at connect time, no upstream proxy, no emulator alias rewrite, no timings (found by the v0.7.0
+ * integration suite: real HTTPS requests had only `requestMs`). `node:http` is the same patched object, so it is
+ * no way back to the original.
+ *
+ * Requests carrying one of OUR agents therefore go to Node's own `request()`; everything else still goes through
+ * the patched one. Node's own: the editor's saved original (`__vscodeOriginal.request`), else `node:http(s)` when it
+ * differs, else (a `request` not named like Node's) a ClientRequest built the way Node's request() builds it.
+ * Installed once per module object; a no-op where `request` already is Node's (plain Node, the CLI, tests).
+ */
+export function bypassPatchedRequests(
+  mods: { http?: HttpModule; https?: HttpModule },
+  nodeMods: { http?: HttpModule; https?: HttpModule } = {},
+): boolean {
+  let changed = false;
+  for (const k of ['http', 'https'] as const) {
+    const mod = mods[k] as (HttpModule & { request?: RequestFn & { [BYPASS]?: true } }) | undefined;
+    const patched = mod?.request;
+    if (!mod || typeof patched !== 'function' || patched[BYPASS]) continue;
+    const real = nativeRequest(k, mod, nodeMods[k]);
+    if (!real || real === patched) continue;
+    const request = function (this: unknown, ...args: unknown[]) {
+      const opts = typeof args[0] === 'string' || args[0] instanceof URL ? args[1] : args[0];
+      const agent = opts && typeof opts === 'object' ? (opts as { agent?: unknown }).agent : undefined;
+      return agent && typeof agent === 'object' && ownAgents.has(agent) ? real.apply(this, args) : patched.apply(this, args);
+    } as RequestFn & { [BYPASS]?: true };
+    request[BYPASS] = true;
+    try {
+      mod.request = request;
+      changed = true;
+    } catch {
+      /* read-only module object: leave it */
+    }
+  }
+  return changed;
+}
+
+/** Node's own request() for `mod` (see bypassPatchedRequests), or undefined when `mod.request` already is it. */
+function nativeRequest(k: 'http' | 'https', mod: HttpModule, nodeMod: HttpModule | undefined): RequestFn | undefined {
+  const saved = mod.__vscodeOriginal?.request ?? nodeMod?.__vscodeOriginal?.request;
+  if (typeof saved === 'function' && saved !== mod.request) return saved as RequestFn;
+  if (typeof nodeMod?.request === 'function' && nodeMod.request !== mod.request) return nodeMod.request as RequestFn;
+  if (typeof mod.request === 'function' && (mod.request as RequestFn).name === 'request') return undefined;
+  // Patched, original unknown: what Node's request() does for an options object (url forms go to the patched one).
+  const defaultAgent = k === 'https' ? https.globalAgent : undefined;
+  const patched = mod.request as RequestFn;
+  return function (...args: unknown[]) {
+    const [o, cb] = args;
+    if (!o || typeof o !== 'object' || o instanceof URL) return patched(...args);
+    return new http.ClientRequest({ ...(o as object), ...(defaultAgent ? { _defaultAgent: defaultAgent } : {}) } as http.RequestOptions, cb as never);
+  } as RequestFn;
+}
+
+async function pickAgent(
+  self: unknown,
+  original: (o: GetAgentOptions) => Promise<unknown>,
+  pool: Pool | undefined,
+  o: GetAgentOptions,
+): Promise<unknown> {
+  // LAN sockets (keyed on the socket, not on "LAN mode is on") only ever get guarded agents,
+  // which check the address actually connected to (DNS rebinding).
+  const lanAgent = pool?.lan?.agentFor(o.connection, o.protocol);
+  if (lanAgent) return lanAgent;
+  // An upstream proxy (CONTRACTS §12.6): every pooled request and upgrade goes through it.
+  const up = pool?.upstream;
+  if (up) {
+    if (o.protocol === 'https:') return up.https;
+    if (o.protocol === 'http:' || o.protocol === undefined) return up.http;
+    if (o.protocol === 'ws:' || o.protocol === 'wss:') return up.ws(o.protocol === 'wss:');
+  }
+  if (pool && !o.tryHttp2 && !o.connection?.destroyed) {
+    if (o.protocol === 'https:') return pool.https;
+    if (o.protocol === 'http:' || o.protocol === undefined) return pool.http;
+  }
+  // Websocket upgrades to an emulator host alias: a fresh (unpooled) rewriting agent.
+  if (pool?.rewrite && (o.protocol === 'ws:' || o.protocol === 'wss:') && o.hostname && HOST_ALIASES[o.hostname]) {
+    return o.protocol === 'wss:' ? new RewritingHttpsAgent() : new RewritingHttpAgent();
+  }
+  return original.call(self, o); // ws/wss, dead connections, everything else
+}
+
 function installHook(): boolean {
   if (hookInstalled !== undefined) return hookInstalled;
   try {
@@ -97,27 +194,22 @@ function installHook(): boolean {
     mod.getAgent = async function patchedGetAgent(this: unknown, o: GetAgentOptions) {
       const src = o?.proxySettingSource;
       const pool = src && typeof src === 'function' ? pools.get(src) : undefined;
-      // LAN sockets (keyed on the socket, not on "LAN mode is on") only ever get guarded agents,
-      // which check the address actually connected to (DNS rebinding).
-      const lanAgent = pool?.lan?.agentFor(o.connection, o.protocol);
-      if (lanAgent) return lanAgent;
-      // An upstream proxy (CONTRACTS §12.6): every pooled request and upgrade goes through it.
-      const up = pool?.upstream;
-      if (up) {
-        if (o.protocol === 'https:') return up.https;
-        if (o.protocol === 'http:' || o.protocol === undefined) return up.http;
-        if (o.protocol === 'ws:' || o.protocol === 'wss:') return up.ws(o.protocol === 'wss:');
-      }
-      if (pool && !o.tryHttp2 && !o.connection?.destroyed) {
-        if (o.protocol === 'https:') return pool.https;
-        if (o.protocol === 'http:' || o.protocol === undefined) return pool.http;
-      }
-      // Websocket upgrades to an emulator host alias: a fresh (unpooled) rewriting agent.
-      if (pool?.rewrite && (o.protocol === 'ws:' || o.protocol === 'wss:') && o.hostname && HOST_ALIASES[o.hostname]) {
-        return o.protocol === 'wss:' ? new RewritingHttpsAgent() : new RewritingHttpAgent();
-      }
-      return original.call(this, o); // ws/wss, dead connections, everything else
+      let agent = await pickAgent(this, original, pool, o);
+      if (!pool) return agent;
+      // mockttp answers `false` (no agent) for direct WebSocket upgrades; Node then makes a one-off agent. Same here,
+      // so the upgrade carries an agent of ours (timed, and kept clear of the editor's request patch below).
+      if (agent === false && (o.protocol === 'ws:' || o.protocol === 'wss:')) agent = o.protocol === 'wss:' ? new https.Agent() : new http.Agent();
+      if (!agent || typeof agent !== 'object' || 'http2' in agent || !(agent instanceof http.Agent)) return agent;
+      // Our rules only: a per-request view of the agent that reports the upstream phases (CONTRACTS §13.2).
+      const sink = pool.timings?.(o?.connection);
+      const out = sink ? timedAgent(agent, sink) : agent;
+      ownAgents.add(out);
+      return out;
     };
+    // The editor's http / https patch (see bypassPatchedRequests). In plain Node nothing is patched: no-op.
+    /* eslint-disable @typescript-eslint/no-require-imports */
+    bypassPatchedRequests({ http: require('http'), https: require('https') }, { http: require('node:http'), https: require('node:https') });
+    /* eslint-enable @typescript-eslint/no-require-imports */
     return (hookInstalled = true);
   } catch {
     return (hookInstalled = false);
@@ -132,6 +224,8 @@ export interface UpstreamPool {
   /** Route pass-through traffic via an HTTP proxy (undefined = direct). Connections in use finish first. */
   setUpstream(spec: UpstreamProxySpec | undefined): void;
   readonly upstream: UpstreamProxySpec | undefined;
+  /** CONTRACTS §13.2: the timing sink for the request a downstream connection is serving (undefined = none). */
+  setTimings(lookup: ((connection: unknown) => TimingSink | undefined) | undefined): void;
   destroy(): void;
 }
 
@@ -157,6 +251,9 @@ export function createUpstreamPool(opts: { rewriteLocalhost?: boolean } = {}): U
     },
     get upstream() {
       return pool.upstream?.spec;
+    },
+    setTimings(lookup) {
+      pool.timings = lookup;
     },
     destroy() {
       pools.delete(proxyConfig);

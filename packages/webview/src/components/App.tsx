@@ -54,14 +54,14 @@ export function App({ host }: { host: Host }) {
     return () => { off(); if (timer !== undefined) clearTimeout(timer); };
   }, [host]);
 
-  const { filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId, composer, dismissedWarnings } = state;
+  const { filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId, composer, dismissedWarnings, showWaterfall } = state;
   // Debounced: drafts can hold multi-MB bodies and change on every keystroke.
   useEffect(() => {
     const t = setTimeout(() => {
       try { host.setState(toPersisted(state)); } catch { /* state too large etc. — non-critical */ }
     }, PERSIST_MS);
     return () => clearTimeout(t);
-  }, [filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId, composer, dismissedWarnings]);
+  }, [filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId, composer, dismissedWarnings, showWaterfall]);
 
   const ctx = useMemo(() => ({ state, dispatch, post: host.post }), [state, host]);
 
@@ -303,8 +303,9 @@ export function ReplayBar() {
 }
 
 /**
- * CONTRACTS §12.1 approval gate: shared rules that map traffic to another host or set request headers are held
- * back until the user approves this file content. Approving asks once more, naming the file.
+ * CONTRACTS §12.1 / §13.4 approval gate: shared rules that map traffic to another host, set request headers or run
+ * scripts — and (REVIEW-7 #1) personal script rules whose file content wasn't approved — are held back until the user
+ * approves that content. Approving asks once more in VS Code, naming the rules.
  */
 export function SharedRulesBanner() {
   const { state, post } = useApp();
@@ -312,14 +313,14 @@ export function SharedRulesBanner() {
   if (!sr || sr.pendingApproval <= 0) return null;
   const file = sr.file ?? SHARED_FILE;
   return (
-    <div class="approval-banner" role="alert" aria-label="Shared rules awaiting approval">
+    <div class="approval-banner" role="alert" aria-label="Rules awaiting approval">
       <div class="approval-line">
         <span class="warning-icon" aria-hidden="true">⚠</span>
         <span class="approval-text">{pendingApprovalText(sr)}</span>
         <span class="spacer" />
         <Button onClick={() => post({ type: 'openSharedRules' })} title={`Open ${file} in the editor`}>Review file</Button>
         <Button kind="primary" onClick={() => post({ type: 'approveSharedRules' })}
-          title={`Run the held-back rules for this content of ${file} (VS Code asks to confirm; a later change to the file asks again)`}>
+          title="Run the held-back rules with their current content (VS Code asks to confirm, naming each rule; a later change asks again)">
           Approve…
         </Button>
       </div>

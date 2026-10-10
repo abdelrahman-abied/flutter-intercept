@@ -17,6 +17,11 @@
  * - CONTRACTS §12: forwards `setReplay` (state kept for `Status.replay`), `resetSequences` and the upstream proxy
  *   (all re-applied after a restart); resolves `mock.bodyFile` (also inside sequence steps) through an injected
  *   resolver before rules reach the proxy — a rule whose file can't be read is skipped and reported as a warning.
+ * - CONTRACTS §13.4: resolves `script.file` into `code` the same way (injected `setScriptFileResolver`, i.e.
+ *   SharedRulesService.resolveScriptFile); `refreshBodyFiles(path)` re-reads script files too. A script rule whose
+ *   file can't be read (or, for a shared rule, isn't approved with these contents) never reaches the proxy (fail
+ *   closed). Both resolvers get the rule id: a shared rule's files resolve in its own workspace folder.
+ *   Timings (§13.2) need nothing here.
  */
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
@@ -121,6 +126,20 @@ export function bodyFilesOf(rule: Rule): string[] {
   return out;
 }
 
+/** Reads a workspace-relative file for one rule (`ruleId`: a shared rule's file resolves in its own folder). */
+export type FileResolver = (path: string, ruleId: string) => Promise<string>;
+
+/** CONTRACTS §13.4: the script file of a `script` rule, if it has one. */
+export function scriptFilesOf(rule: Rule): string[] {
+  const a = rule.action as RuleAction | undefined;
+  return a?.kind === 'script' && typeof a.file === 'string' && a.file ? [a.file] : [];
+}
+
+/** Every workspace file a rule reads (mock body files and script files). */
+export function filesOf(rule: Rule): string[] {
+  return [...bodyFilesOf(rule), ...scriptFilesOf(rule)];
+}
+
 /** CONTRACTS §11.4: bounds for what the VM layer may put into Status.warnings. */
 export const MAX_WARNINGS_PER_SESSION = 50;
 const MAX_WARNING_TEXT = 500;
@@ -208,7 +227,8 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private proxyRules: Rule[] = [];
   private rulesGen = 0;
   private rulesApplied: Promise<void> = Promise.resolve();
-  private bodyResolver?: (path: string) => Promise<string>;
+  private bodyResolver?: FileResolver;
+  private scriptResolver?: FileResolver;
   private bodyWarnings: SessionWarning[] = [];
   private replayState?: ReplayState & { list: ReplayEntry[]; opts: ReplayOptions };
   private upstream?: UpstreamProxy;
@@ -400,21 +420,27 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     return this.rulesApplied;
   }
 
-  /** CONTRACTS §12.2: reads a workspace-relative body file (SharedRulesService.resolveBodyFile). */
-  setBodyFileResolver(resolve: ((path: string) => Promise<string>) | undefined): void {
+  /** CONTRACTS §12.2: reads a workspace-relative body file (SharedRulesService.resolveBodyFile(path, ruleId)). */
+  setBodyFileResolver(resolve: FileResolver | undefined): void {
     this.bodyResolver = resolve;
     if (this.rules.some((r) => bodyFilesOf(r).length)) this.applyRules();
   }
 
-  /** A body file changed (or every one, without `path`): re-reads the rules that use it. */
+  /** CONTRACTS §13.4: reads a workspace-relative script file (SharedRulesService.resolveScriptFile(path, ruleId)). */
+  setScriptFileResolver(resolve: FileResolver | undefined): void {
+    this.scriptResolver = resolve;
+    if (this.rules.some((r) => scriptFilesOf(r).length)) this.applyRules();
+  }
+
+  /** A body or script file changed (or every one, without `path`): re-reads the rules that use it. */
   refreshBodyFiles(path?: string): void {
-    if (this.rules.some((r) => (path === undefined ? bodyFilesOf(r).length > 0 : bodyFilesOf(r).includes(path)))) this.applyRules();
+    if (this.rules.some((r) => (path === undefined ? filesOf(r).length > 0 : filesOf(r).includes(path)))) this.applyRules();
   }
 
   private applyRules(): void {
     const gen = ++this.rulesGen;
     const rules = this.rules;
-    if (!rules.some((r) => bodyFilesOf(r).length)) {
+    if (!rules.some((r) => filesOf(r).length)) {
       this.proxyRules = rules;
       this.proxy?.setRules(rules);
       this.setBodyWarnings([]);
@@ -433,22 +459,31 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   }
 
   private async resolveBodies(rules: Rule[]): Promise<{ resolved: Rule[]; problems: SessionWarning[] }> {
+    // Cached per rule + path: the same path may resolve differently per rule (a shared rule's own folder, approval).
     const cache = new Map<string, Promise<string>>();
-    const read = (p: string): Promise<string> => {
+    const read = (p: string, ruleId: string): Promise<string> => {
       if (!this.bodyResolver) return Promise.reject(new Error('file-backed mock bodies are not available'));
-      let r = cache.get(p);
-      if (!r) cache.set(p, (r = this.bodyResolver(p)));
+      const key = `${ruleId}\0${p}`;
+      let r = cache.get(key);
+      if (!r) cache.set(key, (r = this.bodyResolver(p, ruleId)));
       return r;
     };
-    const resolveAction = async (a: RuleAction): Promise<RuleAction> => {
+    const readScript = (p: string, ruleId: string): Promise<string> =>
+      this.scriptResolver ? this.scriptResolver(p, ruleId) : Promise.reject(new Error('script files are not available'));
+    const resolveAction = async (a: RuleAction, ruleId: string): Promise<RuleAction> => {
+      if (a.kind === 'script' && a.file) {
+        const code = await readScript(a.file, ruleId);
+        if (typeof code !== 'string') throw new Error(`script file ${a.file} is not text`);
+        return { ...a, code };
+      }
       if (a.kind === 'mock' && a.bodyFile) {
         const { bodyFile, ...rest } = a;
-        const text = await read(bodyFile);
+        const text = await read(bodyFile, ruleId);
         if (typeof text !== 'string') throw new Error(`body file ${bodyFile} is not text`);
         return { ...rest, body: text };
       }
       if (a.kind === 'sequence') {
-        const steps = await Promise.all(a.steps.map(async (s) => (s.action.kind === 'mock' && s.action.bodyFile ? { ...s, action: (await resolveAction(s.action)) as typeof s.action } : s)));
+        const steps = await Promise.all(a.steps.map(async (s) => (s.action.kind === 'mock' && s.action.bodyFile ? { ...s, action: (await resolveAction(s.action, ruleId)) as typeof s.action } : s)));
         return { ...a, steps };
       }
       return a;
@@ -456,17 +491,22 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     const resolved: Rule[] = [];
     const problems: SessionWarning[] = [];
     for (const rule of rules) {
-      if (!bodyFilesOf(rule).length) {
+      if (!filesOf(rule).length) {
         resolved.push(rule);
         continue;
       }
       try {
-        resolved.push({ ...rule, action: await resolveAction(rule.action) });
+        resolved.push({ ...rule, action: await resolveAction(rule.action, rule.id) });
       } catch (e) {
         const label = rule.name?.trim() || rule.id;
         const why = e instanceof Error ? e.message : String(e);
-        problems.push({ id: `bodyFile:${rule.id}`, kind: 'other', text: `Rule "${label}" is skipped: its mock body file can't be used (${why}).`.replace(/[\r\n]+/g, ' ').slice(0, MAX_WARNING_TEXT) });
-        this.opts.log?.(`rule ${rule.id} skipped: body file: ${why}`);
+        const script = scriptFilesOf(rule).length > 0;
+        problems.push({
+          id: `${script ? 'scriptFile' : 'bodyFile'}:${rule.id}`,
+          kind: 'other',
+          text: `Rule "${label}" is skipped: its ${script ? 'script' : 'mock body'} file can't be used (${why}).`.replace(/[\r\n]+/g, ' ').slice(0, MAX_WARNING_TEXT),
+        });
+        this.opts.log?.(`rule ${rule.id} skipped: ${script ? 'script' : 'body'} file: ${why}`);
       }
     }
     return { resolved, problems };

@@ -9,6 +9,7 @@ import { bodyByteLength, formatBytes, formatDuration, isPaused, shortFrameLocati
 import { useExchangeActions } from './actions';
 import { AgentBadge, CoverageBadges, MenuList, PauseTimer, StateBadge, StatusText } from './bits';
 import { frameTotal, hasFrames } from '../frames';
+import { barGeometry, phaseClass, timeRange, timingTooltip, type TimeRange } from '../timing';
 
 export const ROW_HEIGHT = 22;
 const OVERSCAN = 8;
@@ -43,7 +44,7 @@ export function TrafficList({ list, onOpen }: { list: Exchange[]; onOpen: () => 
     if (followTail.current && el.scrollHeight > el.clientHeight) el.scrollTop = el.scrollHeight;
   }, [list.length]);
 
-  // Keyboard selection scrolls the row into view.
+  // Keyboard selection (and the host's `select`, via revealSeq) scrolls the row into view.
   useLayoutEffect(() => {
     const el = ref.current!;
     const i = state.selectedId ? list.findIndex((e) => e.id === state.selectedId) : -1;
@@ -51,7 +52,7 @@ export function TrafficList({ list, onOpen }: { list: Exchange[]; onOpen: () => 
     const top = i * ROW_HEIGHT;
     if (top < el.scrollTop) el.scrollTop = top;
     else if (top + ROW_HEIGHT > el.scrollTop + el.clientHeight) el.scrollTop = top + ROW_HEIGHT - el.clientHeight;
-  }, [state.selectedId]);
+  }, [state.selectedId, state.revealSeq]);
 
   const onScroll = () => {
     const el = ref.current!;
@@ -102,17 +103,23 @@ export function TrafficList({ list, onOpen }: { list: Exchange[]; onOpen: () => 
   // Matched-rule chips: only agent rules are marked in the row (the detail pane names every rule).
   const agentRules = new Map<string, Rule>();
   for (const r of state.rules) if (isAgentRule(r)) agentRules.set(r.id, r);
+  // Waterfall (CONTRACTS §13.2): bars are placed on the time span of the rows in view, in % (no DOM measuring).
+  const wf = state.showWaterfall;
+  const now = Date.now();
+  const range = wf
+    ? timeRange(list.slice(Math.floor(scrollTop / ROW_HEIGHT), Math.min(list.length, Math.ceil((scrollTop + vh) / ROW_HEIGHT))), now)
+    : undefined;
   const rows: JSX.Element[] = [];
   for (let i = start; i < end; i++) {
     const ex = list[i];
-    rows.push(<Row key={ex.id} ex={ex} selected={ex.id === state.selectedId} gaveUp={clientGaveUp(state, ex)}
+    rows.push(<Row key={ex.id} ex={ex} selected={ex.id === state.selectedId} gaveUp={clientGaveUp(state, ex)} range={range} now={now}
       agentRule={ex.matchedRuleId ? agentRules.get(ex.matchedRuleId) : undefined} contract={state.contracts[ex.id]}
       onSelect={() => dispatch({ type: 'select', id: ex.id })} onOpen={onOpen}
       onMenu={(x, y) => { dispatch({ type: 'select', id: ex.id }); setMenu({ id: ex.id, x, y }); }} />);
   }
 
   return (
-    <div class="list">
+    <div class={`list${wf ? ' wf' : ''}`}>
       <div class="list-head cols" aria-hidden="true">
         <span class="c-method">Method</span>
         <span class="c-status">Status</span>
@@ -121,6 +128,7 @@ export function TrafficList({ list, onOpen }: { list: Exchange[]; onOpen: () => 
         <span class="c-dur">Time</span>
         <span class="c-size">Size</span>
         <span class="c-state">State</span>
+        {wf && <span class="c-wf">Waterfall{range && <span class="wf-span"> · {formatDuration(range.end - range.start)}</span>}</span>}
       </div>
       <div
         ref={ref}
@@ -151,9 +159,21 @@ function RowMenu({ ex, at, onClose }: { ex: Exchange; at: { x: number; y: number
   return <MenuList label={`Actions for ${ex.method} ${ex.url}`} items={actions.menuItems} at={at} onClose={onClose} />;
 }
 
-function Row({ ex, selected, gaveUp, agentRule, contract, onSelect, onOpen, onMenu }: {
-  ex: Exchange; selected: boolean; gaveUp: boolean; agentRule?: Rule; contract?: ContractSummary; onSelect: () => void; onOpen: () => void;
-  onMenu: (x: number, y: number) => void;
+/** One waterfall bar: offset + width on the range, split into phase segments (CSSOM styles: CSP-safe). */
+export function WaterfallBar({ ex, range, now }: { ex: Exchange; range: TimeRange; now: number }) {
+  const g = barGeometry(ex, range, now);
+  return (
+    <span class="wf-track">
+      <span class={`wf-bar${g.running ? ' running' : ''}`} style={{ left: `${g.left}%`, width: `${g.width}%` }}>
+        {g.segments.map((s, i) => <span key={i} class={`wf-seg ${phaseClass(s.phase)}`} style={{ width: `${s.pct}%` }} />)}
+      </span>
+    </span>
+  );
+}
+
+function Row({ ex, selected, gaveUp, agentRule, contract, range, now, onSelect, onOpen, onMenu }: {
+  ex: Exchange; selected: boolean; gaveUp: boolean; agentRule?: Rule; contract?: ContractSummary; range?: TimeRange; now: number;
+  onSelect: () => void; onOpen: () => void; onMenu: (x: number, y: number) => void;
 }) {
   const sentBy = initiatorLabel(ex);
   const app = ex.source?.appFrame !== undefined ? ex.source.frames[ex.source.appFrame] : undefined;
@@ -189,6 +209,7 @@ function Row({ ex, selected, gaveUp, agentRule, contract, onSelect, onOpen, onMe
           <span class={`badge mini contract-badge cb-${cs}`} title={contractBadgeTitle(contract!)}>model</span>
         )}
       </span>
+      {range && <span class="c-wf" title={timingTooltip(ex)}><WaterfallBar ex={ex} range={range} now={now} /></span>}
     </div>
   );
 }

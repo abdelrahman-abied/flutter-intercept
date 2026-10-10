@@ -1125,3 +1125,109 @@ body.vscode-high-contrast .row:hover { outline: 1px dotted var(--fi-hc-active); 
   background: var(--vscode-inputValidation-errorBackground, transparent);
 }
 .upstream-status .insecure { color: var(--vscode-errorForeground); }
+
+/* ------------------------------------------------------------------ v0.7.0 (CONTRACTS §13) */
+
+/* §13.2 timing waterfall: a last list column; bars are % of the rows-in-view time span (set through CSSOM). */
+body {
+  --fi-ph-request: var(--vscode-charts-lines, var(--fi-muted));
+  --fi-ph-paused: var(--vscode-charts-yellow);
+  --fi-ph-delay: var(--vscode-charts-orange);
+  --fi-ph-dns: var(--vscode-charts-purple);
+  --fi-ph-connect: var(--vscode-charts-red, var(--vscode-errorForeground));
+  --fi-ph-tls: var(--vscode-charts-purple);
+  --fi-ph-send: var(--vscode-charts-green);
+  --fi-ph-wait: var(--vscode-charts-green);
+  --fi-ph-receive: var(--vscode-charts-blue);
+  --fi-ph-total: var(--vscode-charts-blue);
+}
+.list.wf .cols { grid-template-columns: 62px 46px minmax(60px, 1fr) minmax(80px, 2.4fr) 62px 62px 112px minmax(90px, 1.4fr); }
+@container (max-width: 560px) {
+  .list.wf .cols { grid-template-columns: 54px 40px minmax(80px, 1fr) 56px 104px; }
+  .list.wf .c-wf { display: none; }
+}
+.list-head .c-wf { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-span { text-transform: none; letter-spacing: 0; font-variant-numeric: tabular-nums; }
+.row .c-wf { min-width: 0; height: 100%; display: flex; align-items: center; }
+.wf-track { position: relative; flex: 1; height: 10px; }
+.wf-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  min-width: 2px;
+  overflow: hidden;
+  border-radius: 1px;
+  background: var(--fi-ph-total);
+}
+.wf-seg { height: 100%; flex: none; }
+.wf-bar.running { opacity: 0.6; }
+.ph-request { background: var(--fi-ph-request); }
+.ph-paused { background: var(--fi-ph-paused); }
+.ph-delay { background: var(--fi-ph-delay); }
+.ph-dns { background: var(--fi-ph-dns); }
+.ph-connect { background: var(--fi-ph-connect); }
+.ph-tls { background: var(--fi-ph-tls); opacity: 0.65; }
+.ph-send { background: var(--fi-ph-send); opacity: 0.65; }
+.ph-wait { background: var(--fi-ph-wait); }
+.ph-receive { background: var(--fi-ph-receive); }
+.ph-total { background: var(--fi-ph-total); opacity: 0.75; }
+.ph-other { background: var(--fi-ph-request); opacity: 0.4; }
+/* Time the tool added (breakpoints, mock delay / throttle) is hatched: never mistaken for network time. */
+.ph-paused, .ph-delay { background-image: repeating-linear-gradient(135deg, transparent 0 3px, var(--fi-bg) 3px 5px); }
+body.vscode-high-contrast .wf-bar, body.vscode-high-contrast .timing-bar { outline: 1px solid var(--fi-hc-border); }
+.wf-toggle { display: inline-flex; align-items: center; gap: 4px; }
+.wf-toggle .icon { width: 14px; height: 14px; }
+
+/* Timing tab */
+.timing { padding: 6px 0; }
+.timing-facts { font-size: 12px; margin-bottom: 6px; }
+.timing-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.timing-table th { width: 40%; text-align: left; font-weight: normal; padding: 2px 8px 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.timing-table td { padding: 2px 0; }
+.timing-ms { width: 80px; text-align: right; font-variant-numeric: tabular-nums; }
+.timing-track { position: relative; height: 18px; }
+.timing-bar { position: absolute; top: 5px; height: 8px; min-width: 1px; border-radius: 1px; }
+.timing-row.added th { font-style: italic; }
+.added-note { color: var(--fi-muted); }
+.timing-row.reused .timing-track { font-size: 12px; padding-left: 0; }
+.timing-total th, .timing-total td { border-top: 1px solid var(--fi-border); font-weight: 600; padding-top: 4px; }
+.swatch { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; border-radius: 2px; }
+.reused-badge { color: var(--vscode-charts-green); border: 1px solid var(--vscode-charts-green); background: transparent; }
+.timing-none { display: flex; flex-direction: column; gap: 2px; }
+
+/* §13.4 script rules */
+.kind-script { background: var(--vscode-charts-yellow); color: var(--vscode-editor-background); }
+textarea.script-code { width: 100%; min-height: 160px; tab-size: 2; white-space: pre; }
+.script-editor .link { margin: 2px 0; }
+.script-file-error { margin-top: 4px; }
+.script-log { margin-top: 4px; }
+.script-log summary { cursor: pointer; font-size: 12px; }
+.script-lines {
+  margin: 2px 0 0;
+  padding: 2px 0 2px 2.5em;
+  max-height: 160px;
+  overflow: auto;
+  border: 1px solid var(--fi-border);
+  border-radius: 3px;
+  background: var(--vscode-textCodeBlock-background, transparent);
+}
+.script-lines li { white-space: pre-wrap; word-break: break-word; padding: 0 6px 0 0; }
+.script-lines li.script-error {
+  color: var(--vscode-errorForeground);
+  background: var(--vscode-inputValidation-errorBackground, transparent);
+  outline: 1px solid var(--vscode-inputValidation-errorBorder, transparent);
+  outline-offset: -1px;
+  font-weight: 600;
+}
+
+/* §13.5 export menu: anchored at the right end of the toolbar, so it opens leftwards. */
+.export-menu .menu { left: auto; right: 0; }
+.export-menu .btn { display: inline-flex; align-items: center; gap: 4px; }
+
+/* §13.1 editor tab / own window (no `fi-panel` class): full height, list and details side by side on wide screens. */
+@media (min-width: 1100px) {
+  body:not(.fi-panel):not(.fi-sidebar) .detail-head { padding: 6px 12px; }
+  body:not(.fi-panel):not(.fi-sidebar) .tab-body { padding: 0 12px 12px; }
+  body:not(.fi-panel):not(.fi-sidebar) .rules-view.has-editor .rules-list { flex-basis: 40%; }
+}

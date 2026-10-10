@@ -8,8 +8,9 @@ import * as crypto from 'crypto';
 export const ENTRY_DIR_SEGMENTS = ['.dart_tool', 'flutter_intercept'] as const;
 
 /**
- * Template v4 = CONTRACTS §1 (v3) + §9.1 request → source, verbatim (source of truth:
- * scripts/e2e/templates/entry_v4.dart.tmpl, docs/spikes/template-v4.md). Placeholders: TARGET_IMPORT,
+ * Template v5 = v4 (CONTRACTS §1 v3 + §9.1 request → source, docs/spikes/template-v4.md) + §13.3
+ * `flutterInterceptInstall()` for background isolates (docs/spikes/background-isolates.md), verbatim (source of
+ * truth: scripts/e2e/templates/entry_v5.dart.tmpl). Placeholders: TARGET_IMPORT,
  * PROXY_PORT (default for plain-Dart sessions; Flutter sessions pass
  * `--dart-define=FLUTTER_INTERCEPT_PROXY=<host:port>`), CA_CERT_PEM (this install's CA certificate,
  * trusted by the app; never the key). `--dart-define=FLUTTER_INTERCEPT_TRACE=0` turns tracing off.
@@ -404,10 +405,28 @@ class _InterceptedHttpClient implements HttpClient {
   }
 }
 
-Future<void> main(List<String> args) async {
+// Statics, and so HttpOverrides.global, are per isolate. In debug sessions Flutter Intercept calls
+// flutterInterceptInstall through the VM service in every new isolate of the app (compute,
+// Isolate.run, Isolate.spawn) while it is paused at start, before any of its code runs (CONTRACTS
+// §13.3). The main isolate installs from main below; a second call is a no-op.
+_FlutterInterceptOverrides? _installed;
+
+_FlutterInterceptOverrides _install() {
+  final existing = _installed;
+  if (existing != null) return existing;
   _trustCa(SecurityContext.defaultContext);
   final overrides = _FlutterInterceptOverrides(HttpOverrides.current);
   HttpOverrides.global = overrides;
+  return _installed = overrides;
+}
+
+@pragma('vm:entry-point')
+void flutterInterceptInstall() {
+  _install();
+}
+
+Future<void> main(List<String> args) async {
+  final overrides = _install();
   // Zone value wins over a later \`HttpOverrides.global = ...\` inside the app.
   await HttpOverrides.runWithHttpOverrides(() {
     if (!_traceChains) return _runTarget(args);

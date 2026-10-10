@@ -1,0 +1,3 @@
+[
+  { "name": "posts are never requested (fails on purpose)", "url": "https://jsonplaceholder.typicode.com/posts/*", "expect": { "count": { "min": 1 } } }
+]

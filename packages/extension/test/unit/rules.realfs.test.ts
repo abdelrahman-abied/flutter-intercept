@@ -43,6 +43,22 @@ describe('real file system', () => {
     await expect(core.readBodyFile('../outside/secret.json', ws)).rejects.toThrow('must be inside the workspace');
   });
 
+  it('reads a script file through a symlink inside the workspace, refuses one escaping it (CONTRACTS §13.4)', async () => {
+    fs.writeFileSync(path.join(ws, 'real.js'), 'function onRequest() {}');
+    fs.writeFileSync(path.join(outside, 'evil.js'), 'function onRequest() {}');
+    fs.symlinkSync(path.join(ws, 'real.js'), path.join(ws, 'inside.js'));
+    fs.symlinkSync(path.join(outside, 'evil.js'), path.join(ws, 'escape.js'));
+    fs.symlinkSync(outside, path.join(ws, 'scripts'));
+    await core.approveScriptFile('inside.js');
+    expect(await core.readScriptFile('inside.js', ws)).toBe('function onRequest() {}');
+    await expect(core.approveScriptFile('escape.js')).rejects.toThrow('script file escape.js must be inside the workspace');
+    await expect(core.readScriptFile('escape.js', ws)).rejects.toThrow('script file escape.js must be inside the workspace');
+    await expect(core.readScriptFile('scripts/evil.js', ws)).rejects.toThrow('script file scripts/evil.js must be inside the workspace');
+    await expect(core.readScriptFile('../outside/evil.js', ws)).rejects.toThrow('must be inside the workspace');
+    fs.writeFileSync(path.join(ws, 'big.js'), Buffer.alloc(256 * 1024 + 1, 0x20));
+    await expect(core.readScriptFile('big.js', ws)).rejects.toThrow('script file big.js is larger than 256 KB');
+  });
+
   it('refuses a shared file that is a symlink to outside the folder', async () => {
     fs.mkdirSync(path.join(ws, '.vscode'));
     fs.writeFileSync(path.join(outside, 'rules.json'), fileJson([mock('a')]));

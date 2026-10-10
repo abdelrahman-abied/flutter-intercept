@@ -52,6 +52,9 @@ The root `npm run build` builds them in the right order.
 | | `npm run build` | esbuild → `dist/extension.js`, copies the webview dist. Needs proxy and webview built first. |
 | | `npm run test:bundle` | Smoke-tests the bundled extension (the mockttp patches survive bundling). |
 | | `npm run package` | `vsce` → `flutter-intercept.vsix`. |
+| | `npm run publish:ovsx` | Publishes the packaged `.vsix` to Open VSX (owner only, see [Publishing](#publishing)). |
+| `packages/cli` | `npm run build` | esbuild → `dist/cli.js`, the headless CI runner (`flutter-intercept test`). |
+| | `npm test` | vitest. |
 
 The webview dev harness takes URL params (documented at the top of `packages/webview/dev/fake-host.ts`):
 
@@ -111,6 +114,16 @@ What the script needs:
 - Internet access: the demo calls jsonplaceholder.typicode.com and httpbin.org.
 
 It uses port 8899 by default, and exit code 0 means every check passed.
+
+## Publishing
+
+Releases are made by the owner, one version at a time.
+
+- **VS Code Marketplace:** `npx vsce publish --packagePath flutter-intercept.vsix` with the publisher's token.
+- **Open VSX** (Cursor, Windsurf, VSCodium, Gitpod): once, create an account at open-vsx.org, sign the publisher
+  agreement and claim the namespace (`npx ovsx create-namespace abdulrahman-obaid -p <token>`). Then, for each
+  release, from `packages/extension`: `npm run package && OVSX_PAT=<token> npm run publish:ovsx`. Open VSX
+  resolves the `Dart-Code.dart-code` dependency from its own registry, where Dart-Code is published.
 
 ## Docs
 

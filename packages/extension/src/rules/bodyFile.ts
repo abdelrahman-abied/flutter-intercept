@@ -43,44 +43,74 @@ export function bodyFileLocation(rel: string, folder: string): string {
   return path.resolve(folder, rel.replace(/\\/g, '/'));
 }
 
+/** What a workspace file reference is checked against (body files here, script files in scriptFile.ts). */
+export interface WorkspaceFileSpec {
+  /** "body file", "script file": starts every message. */
+  what: string;
+  maxBytes: number;
+  /** "5 MB", "256 KB". */
+  maxLabel: string;
+  /** Extra syntax check of the value (e.g. the extension). */
+  syntax?: (rel: string) => string | undefined;
+  /** The error class thrown (default BodyFileError). */
+  error?: new (message: string) => BodyFileError;
+}
+
+export const BODY_FILE_SPEC: WorkspaceFileSpec = { what: 'body file', maxBytes: MAX_BODY_FILE_BYTES, maxLabel: '5 MB' };
+
 /**
- * The real path of the body file, after the safety checks: inside one of `workspaceRoots` (realpath), a regular
- * file, ≤ 5 MB. Throws BodyFileError with a readable message.
+ * The real path of a workspace file reference, after the safety checks: inside one of `workspaceRoots` (realpath),
+ * a regular file, at most `spec.maxBytes`. Throws `spec.error` (BodyFileError) with a readable message.
  */
-export async function checkBodyFile(rel: string, folder: string, workspaceRoots: string[], fs: RulesFs): Promise<{ real: string; size: number; mtimeMs: number }> {
-  const syntax = bodyFileSyntaxError(rel);
-  if (syntax) throw new BodyFileError(`body file ${JSON.stringify(String(rel).slice(0, 200))} ${syntax}`);
+export async function checkWorkspaceFile(rel: string, folder: string, workspaceRoots: string[], fs: RulesFs, spec: WorkspaceFileSpec): Promise<{ real: string; size: number; mtimeMs: number }> {
+  const Err = spec.error ?? BodyFileError;
+  const syntax = bodyFileSyntaxError(rel) ?? spec.syntax?.(rel);
+  if (syntax) throw new Err(`${spec.what} ${JSON.stringify(String(rel).slice(0, 200))} ${syntax}`);
   let real: string;
   try {
     real = checkSourcePath(bodyFileLocation(rel, folder), workspaceRoots, (p) => fs.realpathSync(p));
   } catch (e) {
-    throw new BodyFileError(/not found/i.test((e as Error).message) ? `body file ${rel} not found` : `body file ${rel} must be inside the workspace`);
+    throw new Err(/not found/i.test((e as Error).message) ? `${spec.what} ${rel} not found` : `${spec.what} ${rel} must be inside the workspace`);
   }
   let st: Awaited<ReturnType<RulesFs['stat']>>;
   try {
     st = await fs.stat(real);
   } catch {
-    throw new BodyFileError(`body file ${rel} not found`);
+    throw new Err(`${spec.what} ${rel} not found`);
   }
-  if (!st.isFile()) throw new BodyFileError(`body file ${rel} is not a regular file`);
-  if (st.size > MAX_BODY_FILE_BYTES) throw new BodyFileError(`body file ${rel} is larger than 5 MB`);
+  if (!st.isFile()) throw new Err(`${spec.what} ${rel} is not a regular file`);
+  if (st.size > spec.maxBytes) throw new Err(`${spec.what} ${rel} is larger than ${spec.maxLabel}`);
   return { real, size: st.size, mtimeMs: st.mtimeMs };
 }
 
-/** Decodes UTF-8 (BOM dropped); throws BodyFileError for anything else. */
-export function decodeBodyFile(bytes: Uint8Array, rel: string): string {
-  if (bytes.byteLength > MAX_BODY_FILE_BYTES) throw new BodyFileError(`body file ${rel} is larger than 5 MB`);
+/** Decodes UTF-8 (BOM dropped); throws `spec.error` (BodyFileError) for anything else. */
+export function decodeWorkspaceFile(bytes: Uint8Array, rel: string, spec: WorkspaceFileSpec): string {
+  const Err = spec.error ?? BodyFileError;
+  if (bytes.byteLength > spec.maxBytes) throw new Err(`${spec.what} ${rel} is larger than ${spec.maxLabel}`);
   let text: string;
   try {
     text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
   } catch {
-    throw new BodyFileError(`body file ${rel} is not UTF-8 text`);
+    throw new Err(`${spec.what} ${rel} is not UTF-8 text`);
   }
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
-/** A file-name stem for a rule's body file: its name, else the last path segment of its URL pattern. */
-export function bodyFileStem(rule: Pick<Rule, 'name' | 'match'>): string {
+/**
+ * The real path of the body file, after the safety checks: inside one of `workspaceRoots` (realpath), a regular
+ * file, ≤ 5 MB. Throws BodyFileError with a readable message.
+ */
+export function checkBodyFile(rel: string, folder: string, workspaceRoots: string[], fs: RulesFs): Promise<{ real: string; size: number; mtimeMs: number }> {
+  return checkWorkspaceFile(rel, folder, workspaceRoots, fs, BODY_FILE_SPEC);
+}
+
+/** Decodes UTF-8 (BOM dropped); throws BodyFileError for anything else. */
+export function decodeBodyFile(bytes: Uint8Array, rel: string): string {
+  return decodeWorkspaceFile(bytes, rel, BODY_FILE_SPEC);
+}
+
+/** A file-name stem for a rule's body (or script) file: its name, else the last path segment of its URL pattern. */
+export function bodyFileStem(rule: Pick<Rule, 'name' | 'match'>, fallback = 'mock'): string {
   let base = rule.name?.trim() ?? '';
   if (!base) {
     const url = rule.match.url.replace(/^\/.*\/[a-z]*$/, '').replace(/[?#].*$/, '');
@@ -93,7 +123,7 @@ export function bodyFileStem(rule: Pick<Rule, 'name' | 'match'>): string {
     .replace(/^[-.]+|[-.]+$/g, '')
     .slice(0, 60)
     .replace(/[-.]+$/, '');
-  return slug || 'mock';
+  return slug || fallback;
 }
 
 /** `.json` when the text is JSON (or empty), else `.txt`. */

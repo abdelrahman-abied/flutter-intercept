@@ -103,6 +103,28 @@ Future<Outcome> isolateTodo() => Isolate.run(() => _todoInIsolate(2), debugName:
 /// HTTP from Flutter's `compute` (isolate named after `debugLabel`).
 Future<Outcome> computeTodo() => compute(_todoInIsolate, 3, debugLabel: 'demo_compute');
 
+// Entry point of the `Isolate.spawn` isolate: runs the request and sends the outcome back.
+Future<void> _spawnEntry(SendPort reply) async {
+  try {
+    final (status, body) = await _todoInIsolate(4);
+    reply.send([status, body]);
+  } catch (e) {
+    reply.send([-1, '$e']);
+  }
+}
+
+/// HTTP from `Isolate.spawn` (named isolate "demo_spawn"), a longer-lived worker with its own entry point.
+Future<Outcome> spawnTodo() async {
+  final port = ReceivePort();
+  try {
+    await Isolate.spawn(_spawnEntry, port.sendPort, debugName: 'demo_spawn');
+    final result = await port.first.timeout(const Duration(seconds: 30)) as List<Object?>;
+    return (result[0] as int, result[1]);
+  } finally {
+    port.close();
+  }
+}
+
 /// --dart-define=NATIVE_HTTP=true : also request through the platform's HTTP stack (cupertino_http /
 /// ok_http). Off by default: these never go through the proxy (read-only in Flutter Intercept).
 const nativeHttp = bool.fromEnvironment('NATIVE_HTTP');

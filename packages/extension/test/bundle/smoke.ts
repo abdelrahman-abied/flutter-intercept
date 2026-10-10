@@ -53,6 +53,15 @@ async function viaTunnel(proxyPort: number, target: string, path: string): Promi
   }
   if (upstreamConns !== 1) fail(`expected 1 pooled upstream connection for 5 tunnels, got ${upstreamConns}`);
 
+  // CONTRACTS §13.2: upstream phases survive bundling (the pool's per-request timing view).
+  await new Promise((r) => setTimeout(r, 50));
+  const passed = proxy.getExchanges().filter((e) => e.url.includes('/n'));
+  const first = passed.find((e) => e.url.endsWith('/n0'));
+  if (!first?.timings || typeof first.timings.waitMs !== 'number' || typeof first.timings.tlsMs !== 'number') {
+    fail(`timings lost in the bundle: ${JSON.stringify(passed.map((e) => e.timings))}`);
+  }
+  if (!passed.some((e) => e.timings?.reused)) fail(`no reused-connection timings: ${JSON.stringify(passed.map((e) => e.timings))}`);
+
   // Mock and upstream failure (502) through the bundle.
   proxy.setRules([{ id: 'm', enabled: true, match: { url: '*/mocked' }, action: { kind: 'mock', status: 201, body: 'M' } }]);
   const get = (url: string) =>

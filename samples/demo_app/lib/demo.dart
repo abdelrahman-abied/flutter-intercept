@@ -237,6 +237,7 @@ Future<void> sseStream() => _timed('sse_events', sseEvents);
 Future<void> gqlCountry() => _timed('gql_country', () => graphqlCountry(_httpClient));
 Future<void> isolateGet() => _timed('isolate_todo', isolateTodo);
 Future<void> computeGet() => _timed('compute_todo', computeTodo);
+Future<void> spawnGet() => _timed('spawn_todo', spawnTodo);
 Future<void> nativeGetReq() => _timed('native_get', nativeGet);
 Future<void> nativePostReq() => _timed('native_post', nativePost);
 
@@ -248,6 +249,7 @@ Future<void> runCoverage() async {
     gqlCountry(),
     isolateGet(),
     computeGet(),
+    spawnGet(),
     if (nativeHttp) nativeGetReq(),
     if (nativeHttp) nativePostReq(),
   ]);
@@ -332,6 +334,7 @@ class DemoApp extends StatelessWidget {
               ('GraphQL POST CountryByCode', gqlCountry),
               ('GET from Isolate.run (demo_worker)', isolateGet),
               ('GET from compute (demo_compute)', computeGet),
+              ('GET from Isolate.spawn (demo_spawn)', spawnGet),
               if (nativeHttp) ('Native client GET', nativeGetReq),
               if (nativeHttp) ('Native client POST', nativePostReq),
             ])

@@ -50,12 +50,13 @@
  */
 import type {
   AuthFlowSummary, Body, ContractSummary, CorsInfo, Frame, GraphqlInfo, Exchange, HostMsg, NetworkProfile, RecordingSummary, RequestEdit, ResponseEdit,
-  Rule, RuleAction, SendDraft, Status, ViewMsg,
+  Rule, RuleAction, SendDraft, Status, Timings, ViewMsg,
 } from '../src/protocol';
 import type { MutateOp, SourceInfo, StackFrame } from '@flutter-intercept/proxy/types';
 import { applyOps } from '@flutter-intercept/proxy/jsonpath';
 import { parsePath, formatPath } from '../src/jsonpath';
 import { describeMutateOps } from '../src/state';
+import { SCRIPT_TEMPLATE } from '../src/scripts';
 import { bodySecretHint, isRecordable, needsApproval, SHARED_FILE, type StepAction } from '../src/scenarios';
 import { matches, ruleFromExchange } from '@flutter-intercept/proxy/rules';
 import { describeProfile, presetProfile, type NetworkPresetId } from '@flutter-intercept/proxy/network';
@@ -409,6 +410,22 @@ function onViewMsg(msg: ViewMsg) {
       if (!(msg.path in FAKE_FILES)) send({ type: 'error', message: `${msg.path} does not exist — use “Create file”.` });
       else console.info(`[fake-host] would open ${msg.path}`);
       break;
+    case 'openScriptFile':
+      // REVIEW-7 #1: "Create file" never reuses an existing file. Empty content = the host's starter template.
+      if (msg.create && msg.path in FAKE_FILES) { send({ type: 'error', message: `${msg.path} already exists — not reused. Pick another name.` }); break; }
+      if (msg.create) FAKE_FILES[msg.path] = msg.create.content.trim() ? msg.create.content : SCRIPT_TEMPLATE;
+      if (!(msg.path in FAKE_FILES)) send({ type: 'error', message: `${msg.path} does not exist — use “Create file”.` });
+      else console.info(`[fake-host] would open ${msg.path}`);
+      break;
+    case 'export': {
+      const ext = msg.format === 'openapi' ? 'openapi.json' : msg.format === 'postman' ? 'postman_collection.json' : 'har';
+      console.info(`[fake-host] would ask "Redact secrets?", then save ${msg.ids ? `${msg.ids.length} exchanges` : 'all HTTP exchanges'}`);
+      send({ type: 'exported', format: msg.format, path: `/workspace/demo_app/demo_app.${ext}` });
+      break;
+    }
+    case 'openInNewWindow':
+      console.info('[fake-host] would open the panel as an editor and move it to a new window');
+      break;
     case 'saveRecording': {
       const count = msg.ids?.length ?? exchanges.filter(isRecordable).length;
       const id = `rec_${Date.now().toString(36)}`;
@@ -607,6 +624,22 @@ function fakeSource(src: NonNullable<Template['src']>): SourceInfo {
 
 const json = (v: unknown): Body => ({ text: JSON.stringify(v), encoding: 'utf8' });
 const rnd = (a: number, b: number) => Math.round(a + random() * (b - a));
+
+/** CONTRACTS §13.2: plausible phases for `network` ms to the server + `receiveMs` download; pooled connections reuse. */
+function fakeTimings(network: number, receiveMs: number): Timings {
+  const t: Timings = { requestMs: rnd(0, 3) };
+  let left = network - t.requestMs!;
+  if (random() < 0.6) t.reused = true;
+  else {
+    t.dnsMs = Math.min(left, rnd(1, 15)); left -= t.dnsMs;
+    t.connectMs = Math.min(left, rnd(5, 30)); left -= t.connectMs;
+    t.tlsMs = Math.min(left, rnd(10, 40)); left -= t.tlsMs;
+  }
+  t.sendMs = left > 1 ? 1 : 0;
+  t.waitMs = Math.max(0, left - t.sendMs);
+  t.receiveMs = receiveMs;
+  return t;
+}
 const pick = <T,>(xs: T[]) => xs[Math.floor(random() * xs.length)];
 const UA = { 'user-agent': 'Dart/3.5 (dart:io)', 'accept-encoding': 'gzip', 'host': 'api.shop.example.com' };
 const AUTH = { authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiJ9.c2lnbmF0dXJl' };
@@ -752,7 +785,7 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
 
   // Network profile (global) + throttle rule: what would reach the network is slowed or failed.
   const reachesNetwork = !replay && (!a || a.kind === 'breakpoint' || a.kind === 'throttle' || a.kind === 'mutate' || a.kind === 'cors'
-    || a.kind === 'mapRemote' || a.kind === 'rewrite');
+    || a.kind === 'mapRemote' || a.kind === 'rewrite' || a.kind === 'script');
   if (t.cors) {
     // A `cors` rule answers the preflight / adds the headers; a mock answers the preflight itself (CONTRACTS §11.3).
     ex.cors = a?.kind === 'cors' || (a?.kind === 'mock' && t.cors.preflight)
@@ -832,7 +865,8 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
       });
       return;
     }
-    later(transfer, () => update(find(id) ?? cur, { ...resp, state: 'completed', durationMs: latency + transfer }));
+    if (a?.kind === 'script') resp.scriptLog = ['[fake host] scripts are not run here', `status ${resp.status}`];
+    later(transfer, () => update(find(id) ?? cur, { ...resp, state: 'completed', durationMs: latency + transfer, timings: fakeTimings(latency, transfer) }));
   };
 
   record(ex, !opts.instant);
@@ -855,6 +889,7 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
     const text = m.bodyFile !== undefined ? FAKE_FILES[m.bodyFile] ?? m.body : m.body;
     later(m.delayMs ?? 5, () => update(ex, {
       state: 'mocked', status: m.status, responseHeaders: m.headers ?? {}, responseBody: { text, encoding: 'utf8' }, durationMs: m.delayMs ?? 5,
+      timings: m.delayMs ? { requestMs: 1, delayMs: m.delayMs - 1 } : { requestMs: 1 },
       ...(ex.simulated ? { simulated: ex.simulated } : {}),
     }));
   } else if (a?.kind === 'block') {

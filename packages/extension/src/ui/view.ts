@@ -48,6 +48,11 @@ export class TrafficViewProvider implements vscode.WebviewViewProvider {
     return !!this.view;
   }
 
+  /** The panel view is on screen (CONTRACTS §13.6: no error notifications then). */
+  get visible(): boolean {
+    return !!this.view?.visible;
+  }
+
   resolveWebviewView(view: vscode.WebviewView): void {
     this.resolveCount++;
     this.detach?.();

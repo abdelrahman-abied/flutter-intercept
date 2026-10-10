@@ -239,7 +239,7 @@ describe('frames viewer', () => {
     await click($$('.row')[0]);
     await type($('.frames-filter')!, 'zzz');
     await click($$('.row')[1]);
-    expect($$('.tab').map((t) => t.textContent)).toEqual(['Request', 'Response']);
+    expect($$('.tab').map((t) => t.textContent)).toEqual(['Request', 'Response', 'Timing']);
     expect($('.tab[aria-selected="true"]')!.textContent).toBe('Response');
     await click($$('.row')[0]);
     expect($<HTMLInputElement>('.frames-filter')!.value).toBe('');

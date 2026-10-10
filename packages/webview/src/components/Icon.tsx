@@ -13,6 +13,9 @@ const PATHS = {
   edit: 'M10.5 2.5l3 3L6 13H3v-3z',
   copy: 'M5.5 5.5h7v8h-7zM3.5 10.5v-8h7',
   grip: 'M6 4h.01M10 4h.01M6 8h.01M10 8h.01M6 12h.01M10 12h.01',
+  export: 'M8 2.5v8M5 5.5l3-3 3 3M3 10.5v3h10v-3',
+  window: 'M7 3.5H3.5v9h9V9M9.5 2.5h4v4M13.5 2.5 8 8',
+  timing: 'M2.5 4h5M4.5 8h7M7.5 12h6',
 } as const;
 
 export type IconName = keyof typeof PATHS;

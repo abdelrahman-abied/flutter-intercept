@@ -3,7 +3,7 @@
  *
  * File format: `{ "version": 1, "rules": [ <Rule without `shared`/`used`>, … ], …other keys kept }`. Comments and
  * trailing commas are accepted (as in every `.vscode/*.json`) but are not written back. Hand-written rules may omit
- * `enabled` (default true), and a mock with `bodyFile` may omit `body`. Every rule needs an `id` (unique in the file).
+ * `enabled` (default true), a mock with `bodyFile` may omit `body`, and a script with `file` may omit `code`. Every rule needs an `id` (unique in the file).
  *
  * Ids in memory are namespaced so they can't collide with personal rules: `shared:<id>` for the primary folder's
  * file, `shared@<folder name>:<id>` for the files of further workspace folders (multi-root).
@@ -112,6 +112,8 @@ function prepare(raw: Record<string, unknown>, id: string): Record<string, unkno
     if (isObj(a) && a.kind === 'mock' && typeof a.bodyFile === 'string' && a.body === undefined) a.body = '';
   };
   fillBody(r.action);
+  // CONTRACTS §13.4: a script with `file` may omit `code` (the host reads the file into it)
+  if (isObj(r.action) && r.action.kind === 'script' && typeof r.action.file === 'string' && r.action.code === undefined) r.action.code = '';
   if (isObj(r.action) && r.action.kind === 'sequence' && Array.isArray(r.action.steps)) {
     for (const s of r.action.steps) if (isObj(s)) fillBody(s.action);
   }
@@ -205,6 +207,7 @@ function fileAction(a: unknown): unknown {
   for (const [k, v] of Object.entries(a)) {
     if (k === 'kind' || v === undefined) continue;
     if (k === 'body' && a.kind === 'mock' && typeof a.bodyFile === 'string') continue; // the file is the body
+    if (k === 'code' && a.kind === 'script' && typeof a.file === 'string') continue; // the file is the code
     out[k] = v;
   }
   if (a.kind === 'sequence' && Array.isArray(a.steps)) {
@@ -216,7 +219,7 @@ function fileAction(a: unknown): unknown {
 /**
  * The rule as it is written to the file: the file id, stable key order, and none of the personal-only fields
  * (`shared`, `used`, `expiresAt` — a wall-clock expiry would be dead for everyone else). A mock with `bodyFile`
- * is written without its resolved `body`.
+ * is written without its resolved `body`, a script with `file` without its resolved `code`.
  */
 export function toFileRule(rule: Rule, fileId: string): Record<string, unknown> {
   const src = rule as unknown as Record<string, unknown>;

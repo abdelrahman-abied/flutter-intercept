@@ -89,7 +89,7 @@ export class FakeMemento implements MementoLike {
   }
 }
 
-const KINDS = new Set(['mock', 'block', 'breakpoint', 'throttle', 'fault', 'mutate', 'cors', 'sequence', 'mapRemote', 'rewrite']);
+const KINDS = new Set(['mock', 'block', 'breakpoint', 'throttle', 'fault', 'mutate', 'cors', 'sequence', 'mapRemote', 'rewrite', 'script']);
 
 /** A small stand-in for the host's validateRule (same message shape: "<where>: <what>"). */
 export function fakeValidateRule(raw: unknown, where = 'rule'): Rule {
@@ -104,6 +104,7 @@ export function fakeValidateRule(raw: unknown, where = 'rule'): Rule {
   if (!r.match || typeof r.match.url !== 'string' || !r.match.url) fail('match is required (a rule without match would match everything)');
   if (!r.action || !KINDS.has(r.action.kind)) fail(`action: unknown kind ${JSON.stringify(r.action?.kind)}`);
   if (r.action.kind === 'mock' && (typeof r.action.status !== 'number' || typeof r.action.body !== 'string')) fail('action: status and body are required');
+  if (r.action.kind === 'script' && typeof r.action.code !== 'string') fail('action: code is required');
   return r as Rule;
 }
 
@@ -117,6 +118,17 @@ export function mock(id: string, extra: Partial<Rule> & { body?: string; bodyFil
     enabled: true,
     match: { url: `https://api.example.com/${id}` },
     action: { kind: 'mock', status: 200, body, ...(bodyFile ? { bodyFile } : {}), ...(headers ? { headers } : {}) },
+    ...rest,
+  } as Rule;
+}
+
+export function script(id: string, extra: Partial<Rule> & { code?: string; file?: string } = {}): Rule {
+  const { code = '', file, ...rest } = extra;
+  return {
+    id,
+    enabled: true,
+    match: { url: `https://api.example.com/${id}` },
+    action: { kind: 'script', code, ...(file ? { file } : {}) },
     ...rest,
   } as Rule;
 }

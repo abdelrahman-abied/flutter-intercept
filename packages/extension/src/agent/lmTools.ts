@@ -6,7 +6,7 @@
  * (`vscode.lm.registerTool`) and typed with the minimal shim below.
  */
 import { corsPolicyText } from './corsPolicy';
-import { AgentToolError, AgentTools, isWriteTool, READ_TOOLS, ToolName, ToolResult, WRITE_TOOLS } from './types';
+import { AgentToolError, AgentTools, isWriteTool, needsConfirmation, READ_TOOLS, toolImages, ToolName, ToolResult, WRITE_TOOLS } from './types';
 
 export const LM_TOOL_PREFIX = 'flutter_intercept_';
 export const ALL_TOOLS: readonly ToolName[] = [...READ_TOOLS, ...WRITE_TOOLS];
@@ -32,6 +32,8 @@ export interface LmVscode {
   lm?: { registerTool?: (name: string, tool: LmTool) => { dispose(): unknown } };
   LanguageModelToolResult?: new (content: unknown[]) => unknown;
   LanguageModelTextPart?: new (value: string) => unknown;
+  /** VS Code ≥ 1.104 (feature-detected): image parts in tool results. */
+  LanguageModelDataPart?: { image?(data: Uint8Array, mimeType: string): unknown };
   MarkdownString: new (value?: string) => unknown;
 }
 
@@ -160,6 +162,13 @@ export function invocationMessage(tool: ToolName, input: unknown): string {
       return `Mapping ${m}${plain(i.url)} to ${plain(i.to)}`;
     case 'add_rewrite':
       return `Adding a rewrite rule for ${m}${plain(i.url)}`;
+    // CONTRACTS §13.8
+    case 'export_openapi':
+      return `Exporting captured traffic as OpenAPI${i.url ? ` (${m}${plain(i.url)})` : ''}`;
+    case 'export_postman':
+      return `Exporting captured traffic as a Postman collection${i.url ? ` (${m}${plain(i.url)})` : ''}`;
+    case 'take_screenshot':
+      return `Taking a screenshot of ${i.sessionId ? `session ${plain(i.sessionId)}` : 'the running app'}`;
   }
 }
 
@@ -261,7 +270,13 @@ function bodySummary(body: unknown): string {
 }
 
 /** Exactly what a write tool will change, for the confirmation dialog (markdown). */
-export function confirmationText(tool: ToolName, input: unknown, ruleName?: string, request?: { method: string; url: string }): { title: string; message: string } {
+export function confirmationText(
+  tool: ToolName,
+  input: unknown,
+  ruleName?: string,
+  request?: { method: string; url: string },
+  device?: string,
+): { title: string; message: string } {
   const i = obj(input);
   const named = str(i.name) ? ` named ${code('[agent] ' + String(i.name))}` : '';
   switch (tool) {
@@ -402,20 +417,48 @@ export function confirmationText(tool: ToolName, input: unknown, ruleName?: stri
         message: `For ${target(i)}: forward to the real server, but change ${parts.length ? parts.join('. ') : 'nothing'}${named}${spendText(i)}.\n\nInserted as the first rule.`,
       };
     }
+    // CONTRACTS §13.8: names the device.
+    case 'take_screenshot':
+      return {
+        title: 'Take a screenshot',
+        message:
+          `Take a screenshot of ${device ? code(device) : i.sessionId ? `session ${code(i.sessionId)}` : 'the running app'}? ` +
+          "The agent sees the image (whatever is on the app's screen) and the requests of the last 5 s; the PNG is saved under `.dart_tool/flutter_intercept/screenshots/`.",
+      };
     default:
       return { title: 'Flutter Intercept', message: invocationMessage(tool, input) };
+  }
+}
+
+/** "emulator-5554" for take_screenshot's confirmation: the session's device (from get_status), if known. */
+async function screenshotDevice(tools: AgentTools, sessionId: unknown): Promise<string | undefined> {
+  try {
+    const st = (await tools.call('get_status', {})) as { sessions?: { id?: unknown; deviceId?: unknown }[] };
+    const sessions = Array.isArray(st.sessions) ? st.sessions : [];
+    const s = typeof sessionId === 'string' ? sessions.find((x) => x.id === sessionId) : sessions.length === 1 ? sessions[0] : undefined;
+    return typeof s?.deviceId === 'string' && s.deviceId ? s.deviceId : undefined;
+  } catch {
+    return undefined;
   }
 }
 
 /** Builds the LM tool object for one Agent API tool. */
 export function makeLmTool(tool: ToolName, deps: LmToolsDeps & { vscode: LmVscode }): LmTool {
   const vs = deps.vscode;
-  const textResult = (text: string) =>
-    vs.LanguageModelToolResult && vs.LanguageModelTextPart ? new vs.LanguageModelToolResult([new vs.LanguageModelTextPart(text)]) : { content: [{ value: text }] };
+  const textResult = (text: string, images: { data: string; mimeType: string }[] = []) => {
+    if (!vs.LanguageModelToolResult || !vs.LanguageModelTextPart) return { content: [{ value: text }] };
+    const parts: unknown[] = [];
+    const image = vs.LanguageModelDataPart?.image;
+    if (typeof image === 'function') for (const img of images) parts.push(image.call(vs.LanguageModelDataPart, Buffer.from(img.data, 'base64'), img.mimeType));
+    parts.push(new vs.LanguageModelTextPart(text));
+    return new vs.LanguageModelToolResult(parts);
+  };
   return {
     async prepareInvocation(options) {
       const prepared: PreparedInvocation = { invocationMessage: invocationMessage(tool, options?.input) };
-      if (isWriteTool(tool) && deps.tools.access === 'readWrite') {
+      const access = deps.tools.access;
+      // Write tools under readWrite; confirmed read tools (take_screenshot) whenever agents have access at all.
+      if (needsConfirmation(tool) && (isWriteTool(tool) ? access === 'readWrite' : access !== 'off')) {
         let ruleName: string | undefined;
         if (tool === 'remove_rule') {
           try {
@@ -434,7 +477,9 @@ export function makeLmTool(tool: ToolName, deps: LmToolsDeps & { vscode: LmVscod
             // describe by id only
           }
         }
-        const { title, message } = confirmationText(tool, options?.input, ruleName, request);
+        let device: string | undefined;
+        if (tool === 'take_screenshot') device = await screenshotDevice(deps.tools, obj(options?.input).sessionId);
+        const { title, message } = confirmationText(tool, options?.input, ruleName, request, device);
         prepared.confirmationMessages = { title, message: new vs.MarkdownString(message) };
       }
       return prepared;
@@ -444,7 +489,7 @@ export function makeLmTool(tool: ToolName, deps: LmToolsDeps & { vscode: LmVscod
       try {
         if (deps.tools.access === 'off') throw new AgentToolError('Flutter Intercept agent access is off (setting flutterIntercept.agent.access).', 'access');
         const result: ToolResult = await deps.tools.call(tool, obj(options?.input), abort.signal);
-        return textResult(formatResult(result));
+        return textResult(formatResult(result), toolImages(result));
       } catch (e) {
         // A thrown Error is how VS Code reports a failed tool call to the model; never let a non-Error escape.
         const err = e instanceof AgentToolError ? e : new AgentToolError((e as Error)?.message ?? String(e), 'internal');

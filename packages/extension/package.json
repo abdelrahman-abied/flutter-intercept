@@ -97,6 +97,35 @@
           "default": "profile",
           "description": "Requests made by native HTTP clients bypass the proxy, so they can't be mocked or paused. With \"profile\", they are still listed (read-only) from the app's HTTP profile in debug and profile mode."
         },
+        "flutterIntercept.backgroundIsolates": {
+          "type": "string",
+          "enum": [
+            "intercept",
+            "warn"
+          ],
+          "enumDescriptions": [
+            "Route requests from background isolates (compute, Isolate.run, Isolate.spawn) through Flutter Intercept too, in debug mode.",
+            "Only warn that requests from background isolates are not intercepted."
+          ],
+          "default": "intercept",
+          "description": "HttpOverrides applies per isolate, so requests from background isolates normally bypass the proxy. With \"intercept\", Flutter Intercept installs its overrides in each new isolate of an intercepted debug session before it runs."
+        },
+        "flutterIntercept.notifications": {
+          "type": "string",
+          "enum": [
+            "errors",
+            "all",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Notify when a request fails (network error or a 5xx response).",
+            "Also notify on 4xx responses.",
+            "Never notify."
+          ],
+          "default": "errors",
+          "description": "Show a notification when the app's requests fail while the traffic panel is not visible. At most one notification every 10 seconds; mocked, blocked and simulated failures are not reported.",
+          "scope": "application"
+        },
         "flutterIntercept.contractCheck": {
           "type": "boolean",
           "default": true,
@@ -129,6 +158,12 @@
           "description": "Hide Authorization, cookies, API keys, tokens and passwords from AI agents (tool results and HAR exports). The app always receives the real values.",
           "scope": "application"
         },
+        "flutterIntercept.agent.screenshots": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Let AI agents take screenshots of the running app (take_screenshot). Each screenshot asks for your confirmation first."
+        },
         "flutterIntercept.agent.mcpPort": {
           "type": "number",
           "default": 47823,
@@ -144,6 +179,18 @@
         "command": "flutterIntercept.openPanel",
         "title": "Open Traffic Panel",
         "category": "Flutter Intercept"
+      },
+      {
+        "command": "flutterIntercept.openInEditor",
+        "title": "Open Traffic in Editor",
+        "category": "Flutter Intercept",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "flutterIntercept.openInNewWindow",
+        "title": "Open Traffic in New Window",
+        "category": "Flutter Intercept",
+        "icon": "$(multiple-windows)"
       },
       {
         "command": "flutterIntercept.toggle",
@@ -168,6 +215,16 @@
       {
         "command": "flutterIntercept.addAgentInstructions",
         "title": "Add AI Agent Instructions",
+        "category": "Flutter Intercept"
+      },
+      {
+        "command": "flutterIntercept.exportOpenApi",
+        "title": "Export Traffic as OpenAPI",
+        "category": "Flutter Intercept"
+      },
+      {
+        "command": "flutterIntercept.exportPostman",
+        "title": "Export Traffic as Postman Collection",
         "category": "Flutter Intercept"
       }
     ],
@@ -216,7 +273,7 @@
         "toolReferenceName": "interceptListRequests",
         "canBeReferencedInPrompt": true,
         "userDescription": "List recorded HTTP requests.",
-        "modelDescription": "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state, start time, kind (\"websocket\", \"sse\", \"http\") or GraphQL operation name. Items show kind, the GraphQL operation and captured: \"vm-profile\" for read-only requests of native HTTP clients (no rules apply to them). Returns ids; call get_request for headers and bodies, get_frames for WebSocket messages / SSE events. Secrets are redacted.",
+        "modelDescription": "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state, start time, kind (\"websocket\", \"sse\", \"http\"), GraphQL operation name, or slowerThanMs (only requests that took longer). Items show kind, the GraphQL operation and captured: \"vm-profile\" for read-only requests of native HTTP clients (no rules apply to them). Returns ids; call get_request for headers and bodies, get_frames for WebSocket messages / SSE events. Secrets are redacted.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -292,6 +349,12 @@
               "description": "Flutter Web: also include the browser's own requests (Chrome updates, GCM, optimization guide), which are hidden by default.",
               "type": "boolean"
             },
+            "slowerThanMs": {
+              "description": "Only finished requests that took longer than this many milliseconds (durationMs > slowerThanMs). Read where the time went with get_request (timings).",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 600000
+            },
             "limit": {
               "default": 50,
               "description": "Max items (newest first), 1-200.",
@@ -315,7 +378,7 @@
         "toolReferenceName": "interceptGetRequest",
         "canBeReferencedInPrompt": true,
         "userDescription": "Show one request with headers and bodies.",
-        "modelDescription": "Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), timings and error. Use after list_requests or wait_for_request. Pass snippet (\"curl\", \"dart_http\" or \"dio\") to also get the request as runnable code (redacted values stay \"[redacted]\"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: \"vm-profile\" (read-only, from a native HTTP client).",
+        "modelDescription": "Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), error, and timings (ms per phase: requestMs = receiving the app's request, pausedMs = held at breakpoints, delayMs = added by a mock delay / throttle, dnsMs / connectMs / tlsMs on a new upstream connection or reused: true, sendMs, waitMs = time to first byte from the server, receiveMs = downloading the response; a missing phase did not happen or is unknown). scriptLog holds the lines a user's script rule logged (redacted). Use after list_requests or wait_for_request. Pass snippet (\"curl\", \"dart_http\" or \"dio\") to also get the request as runnable code (redacted values stay \"[redacted]\"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: \"vm-profile\" (read-only, from a native HTTP client).",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -468,7 +531,7 @@
         "toolReferenceName": "interceptListRules",
         "canBeReferencedInPrompt": true,
         "userDescription": "List mock, block and breakpoint rules.",
-        "modelDescription": "List the active intercept rules (mocks, blocks, breakpoints) in priority order: the first enabled matching rule wins. Rules created by agents are named \"[agent] ...\".",
+        "modelDescription": "List the active intercept rules (mocks, blocks, breakpoints, …) in priority order: the first enabled matching rule wins. Rules created by agents are named \"[agent] ...\". Script rules (the user's own JavaScript hooks) are shown as {kind: \"script\", file?} without their code; agents cannot read, add or change scripts.",
         "inputSchema": {
           "type": "object",
           "properties": {},
@@ -1038,6 +1101,128 @@
               "minimum": 0,
               "maximum": 9007199254740991,
               "description": "Only exchanges that started at or after this time (epoch milliseconds)."
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_export_openapi",
+        "displayName": "Flutter Intercept: Export OpenAPI from traffic",
+        "toolReferenceName": "interceptExportOpenapi",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Export recorded traffic as an OpenAPI document.",
+        "modelDescription": "Write an OpenAPI 3.1 document (JSON) inferred from the app's recorded HTTP traffic (optionally filtered by url glob, method, start time) under the project's .dart_tool/flutter_intercept/exports/ and return its path: servers per origin, paths with {id} parameters for id-like segments, query parameters, request and response bodies per status with JSON schemas inferred from every sample (required = present in all samples, nullable when seen null) and one example each. Returns {path, exchanges, routes, notes}. Use it to document an undocumented backend or to compare the app's real usage with a spec. Secrets are redacted according to the user's setting. Make the app call each endpoint a few times first for better schemas.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "description": "Only exchanges whose URL matches this glob (e.g. \"https://api.example.com/v1/*\"). Omit for every finished HTTP request.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "sinceMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Only exchanges that started at or after this time (epoch milliseconds)."
+            },
+            "title": {
+              "description": "Document / collection title. Default: the Flutter project's name.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "includeBrowserInternal": {
+              "description": "Flutter Web: also include the browser's own requests (Chrome updates, GCM, optimization guide), which are hidden by default.",
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_export_postman",
+        "displayName": "Flutter Intercept: Export Postman collection from traffic",
+        "toolReferenceName": "interceptExportPostman",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Export recorded traffic as a Postman collection.",
+        "modelDescription": "Write a Postman Collection v2.1 (JSON) from the app's recorded HTTP traffic (optionally filtered by url glob, method, start time) under the project's .dart_tool/flutter_intercept/exports/ and return its path: a folder per host, one request per route (the latest sample) with saved example responses, {{baseUrl}} variables per origin, and credential headers as empty {{variables}}. Returns {path, exchanges, routes, notes}. Secrets are redacted according to the user's setting.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "description": "Only exchanges whose URL matches this glob (e.g. \"https://api.example.com/v1/*\"). Omit for every finished HTTP request.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^[A-Za-z]+$",
+              "description": "HTTP method (case-insensitive). Omit to match any method."
+            },
+            "sinceMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Only exchanges that started at or after this time (epoch milliseconds)."
+            },
+            "title": {
+              "description": "Document / collection title. Default: the Flutter project's name.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "includeBrowserInternal": {
+              "description": "Flutter Web: also include the browser's own requests (Chrome updates, GCM, optimization guide), which are hidden by default.",
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_take_screenshot",
+        "displayName": "Flutter Intercept: Take a screenshot of the app",
+        "toolReferenceName": "interceptTakeScreenshot",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Take a screenshot of the running app (asks first).",
+        "modelDescription": "Take a screenshot of the running Flutter app (the debug session's device; pass sessionId when several apps run) to see what the UI shows after a change or a mocked response. Returns the PNG image plus {path, width, height, takenAt, method, recentRequests}: recentRequests are the (at most 10) requests that started in the 5 s before the screenshot (redacted summaries; read them with get_request). The user confirms every screenshot and can turn the tool off (setting flutterIntercept.agent.screenshots). Supported on Android devices/emulators and iOS simulators (and wherever the Flutter VM service can render one); other devices answer \"not supported\".",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "sessionId": {
+              "description": "Debug session to capture (see get_status). Omit when exactly one app is running.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
             }
           },
           "additionalProperties": false
@@ -2444,7 +2629,21 @@
         "id": "flutterIntercept.mcp",
         "label": "Flutter Intercept"
       }
-    ]
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "flutterIntercept.openInNewWindow",
+          "when": "view == flutterIntercept.traffic",
+          "group": "navigation@1"
+        },
+        {
+          "command": "flutterIntercept.openInEditor",
+          "when": "view == flutterIntercept.traffic",
+          "group": "navigation@2"
+        }
+      ]
+    }
   },
   "scripts": {
     "build": "node build.mjs",
@@ -2453,7 +2652,8 @@
     "test:integration": "node build.mjs --tests && node dist-test/runTest.js",
     "package": "vsce package --no-dependencies --baseContentUrl https://github.com/abdelrahman-abied/flutter-intercept/blob/HEAD/packages/extension --baseImagesUrl https://github.com/abdelrahman-abied/flutter-intercept/raw/HEAD/packages/extension -o flutter-intercept.vsix",
     "test:vsix": "npm run build && npm run package && node build.mjs --tests && FI_VSIX=flutter-intercept.vsix node dist-test/runTest.js",
-    "test:bundle": "node build.mjs --smoke && node dist-test/bundle-smoke.js"
+    "test:bundle": "node build.mjs --smoke && node dist-test/bundle-smoke.js",
+    "publish:ovsx": "npx --yes ovsx publish flutter-intercept.vsix"
   },
   "dependencies": {
     "@flutter-intercept/proxy": "*",

@@ -10,6 +10,7 @@ import {
 } from '../state';
 import { formatTime } from '../util';
 import { ActionEditor, SequenceEditor } from './ActionEditor';
+import { suggestScriptFile } from '../scripts';
 import { AgentBadge, Button, useNow } from './bits';
 import { Icon } from './Icon';
 
@@ -201,6 +202,7 @@ function ordinal(n: number): string {
 const KIND_RADIOS: readonly [RuleForm['kind'], string][] = [
   ['mock', 'Mock response'], ['block', 'Block'], ['breakpoint', 'Breakpoint'], ['throttle', 'Throttle'], ['fault', 'Fault'],
   ['mutate', 'Mutate JSON'], ['cors', 'CORS (dev only)'], ['sequence', 'Sequence'], ['mapRemote', 'Map remote'], ['rewrite', 'Rewrite'],
+  ['script', 'Script (JS)'],
 ];
 
 export function RuleEditor({ rule, sharedFile, onSave, onCancel }: {
@@ -234,20 +236,30 @@ export function RuleEditor({ rule, sharedFile, onSave, onCancel }: {
   const showGql = !!form.graphqlOperation || knownOps.length > 0 || /graphql/i.test(form.url);
   // mockBody is the file's content (resolved by the host) only while the path is the one the rule was saved with.
   const savedFile = rule?.action.kind === 'mock' ? rule.action.bodyFile : undefined;
+  const savedScript = rule?.action.kind === 'script' ? rule.action.file : undefined;
 
   // The host answers a refused / failed openBodyFile with an `error` message: show the next one in the editor too.
-  const [fileError, setFileError] = useState<{ after: number; message?: string }>();
+  // `create`: the failed request was "Create file" (REVIEW-7 #1: the host refuses an existing file — offer another name).
+  const [fileError, setFileError] = useState<{ after: number; message?: string; create?: boolean }>();
   const lastErrorId = state.hostErrors.at(-1)?.id ?? 0;
   useEffect(() => {
     if (!fileError || fileError.message) return;
     const e = state.hostErrors.find((x) => x.id > fileError.after);
     if (e) setFileError({ ...fileError, message: e.message });
   }, [state.hostErrors]);
-  useEffect(() => setFileError(undefined), [form.mockBodyFile, form.mockUseFile]);
-  const openBodyFile = (path: string, createWith?: string) => {
-    setFileError({ after: lastErrorId });
-    post(createWith === undefined ? { type: 'openBodyFile', path } : { type: 'openBodyFile', path, create: { content: createWith } });
+  useEffect(() => setFileError(undefined), [form.mockBodyFile, form.mockUseFile, form.scriptFile, form.scriptUseFile, form.kind]);
+  // REVIEW-7 #6: a saved rule's id goes along, so the host resolves the path in that rule's workspace folder.
+  const ruleId = form.isNew ? undefined : form.id;
+  const openFile = (type: 'openBodyFile' | 'openScriptFile', path: string, createWith?: string) => {
+    setFileError({ after: lastErrorId, create: createWith !== undefined });
+    post({
+      type, path,
+      ...(createWith !== undefined ? { create: { content: createWith } } : {}),
+      ...(ruleId ? { ruleId } : {}),
+    });
   };
+  const openBodyFile = (path: string, createWith?: string) => openFile('openBodyFile', path, createWith);
+  const openScriptFile = (path: string, createWith?: string) => openFile('openScriptFile', path, createWith);
 
   const save = (force = false) => {
     if (hasErrors || readOnly) return;
@@ -333,6 +345,9 @@ export function RuleEditor({ rule, sharedFile, onSave, onCancel }: {
             <ActionEditor kind={form.kind} f={form} v={v} uid="rule" set={set}
               bodyFile={{ suggest: () => suggestBodyFile(form.name, form.url), knownContent: !!savedFile && savedFile === form.mockBodyFile.trim(),
                 open: openBodyFile, error: fileError?.message,
+              }}
+              scriptFile={{ suggest: () => suggestScriptFile(form.name, form.url), knownContent: !!savedScript && savedScript === form.scriptFile.trim(),
+                open: openScriptFile, error: fileError?.message, errorOnCreate: !!fileError?.create,
               }} />
           )}
         </fieldset>

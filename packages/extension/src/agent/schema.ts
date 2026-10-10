@@ -192,6 +192,15 @@ const rewriteResponse = z
   })
   .describe("Changes to the real server's response before the app gets it.");
 
+// ---- CONTRACTS §13.8
+const exportSpecInput = z.strictObject({
+  url: url.optional().describe('Only exchanges whose URL matches this glob (e.g. "https://api.example.com/v1/*"). Omit for every finished HTTP request.'),
+  method: method.optional(),
+  sinceMs: sinceMs.optional(),
+  title: z.string().trim().min(1).max(200).optional().describe("Document / collection title. Default: the Flutter project's name."),
+  includeBrowserInternal,
+});
+
 export const toolSchemas = {
   get_status: z.strictObject({}),
   list_requests: z.strictObject({
@@ -203,6 +212,14 @@ export const toolSchemas = {
     kind: z.enum(EXCHANGE_KINDS).optional().describe('"websocket", "sse" (server-sent events) or "http" (everything else).'),
     graphqlOperation: graphqlOperation.optional().describe('Only GraphQL requests with this operation name (exact, case-sensitive).'),
     includeBrowserInternal,
+    // CONTRACTS §13.2
+    slowerThanMs: z
+      .number()
+      .int()
+      .min(0)
+      .max(600_000)
+      .optional()
+      .describe('Only finished requests that took longer than this many milliseconds (durationMs > slowerThanMs). Read where the time went with get_request (timings).'),
     limit: z.number().int().min(1).max(200).default(50).describe('Max items (newest first), 1-200.'),
   }),
   get_request: z.strictObject({
@@ -455,6 +472,12 @@ export const toolSchemas = {
     ttlMs: ttlMs.optional(),
     name: ruleName.optional(),
   }),
+  // CONTRACTS §13.8
+  export_openapi: exportSpecInput,
+  export_postman: exportSpecInput,
+  take_screenshot: z.strictObject({
+    sessionId: z.string().min(1).max(200).optional().describe('Debug session to capture (see get_status). Omit when exactly one app is running.'),
+  }),
 } satisfies Record<ToolName, z.ZodType>;
 
 export type ToolInput<T extends ToolName> = z.output<(typeof toolSchemas)[T]>;
@@ -495,12 +518,12 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   list_requests: {
     title: 'List HTTP requests',
-    model: "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state, start time, kind (\"websocket\", \"sse\", \"http\") or GraphQL operation name. Items show kind, the GraphQL operation and captured: \"vm-profile\" for read-only requests of native HTTP clients (no rules apply to them). Returns ids; call get_request for headers and bodies, get_frames for WebSocket messages / SSE events. Secrets are redacted.",
+    model: "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state, start time, kind (\"websocket\", \"sse\", \"http\"), GraphQL operation name, or slowerThanMs (only requests that took longer). Items show kind, the GraphQL operation and captured: \"vm-profile\" for read-only requests of native HTTP clients (no rules apply to them). Returns ids; call get_request for headers and bodies, get_frames for WebSocket messages / SSE events. Secrets are redacted.",
     user: 'List recorded HTTP requests.',
   },
   get_request: {
     title: 'Get HTTP request details',
-    model: 'Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), timings and error. Use after list_requests or wait_for_request. Pass snippet ("curl", "dart_http" or "dio") to also get the request as runnable code (redacted values stay "[redacted]"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: "vm-profile" (read-only, from a native HTTP client).',
+    model: 'Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), error, and timings (ms per phase: requestMs = receiving the app\'s request, pausedMs = held at breakpoints, delayMs = added by a mock delay / throttle, dnsMs / connectMs / tlsMs on a new upstream connection or reused: true, sendMs, waitMs = time to first byte from the server, receiveMs = downloading the response; a missing phase did not happen or is unknown). scriptLog holds the lines a user\'s script rule logged (redacted). Use after list_requests or wait_for_request. Pass snippet ("curl", "dart_http" or "dio") to also get the request as runnable code (redacted values stay "[redacted]"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: "vm-profile" (read-only, from a native HTTP client).',
     user: 'Show one request with headers and bodies.',
   },
   wait_for_request: {
@@ -515,7 +538,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   list_rules: {
     title: 'List intercept rules',
-    model: 'List the active intercept rules (mocks, blocks, breakpoints) in priority order: the first enabled matching rule wins. Rules created by agents are named "[agent] ...".',
+    model: 'List the active intercept rules (mocks, blocks, breakpoints, …) in priority order: the first enabled matching rule wins. Rules created by agents are named "[agent] ...". Script rules (the user\'s own JavaScript hooks) are shown as {kind: "script", file?} without their code; agents cannot read, add or change scripts.',
     user: 'List mock, block and breakpoint rules.',
   },
   export_har: {
@@ -675,6 +698,22 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
     title: 'Map requests to a local server',
     model: 'Redirect matching requests to a local backend (http://localhost:<port>, 127.0.0.1 or [::1], optionally with a path prefix): the path and query after the matched URL are kept, the app still sees the original URL, and exchanges carry simulated: "Mapped to <origin>". Requests keep their headers (including credentials), so map only to your own local server. Agents can only map to loopback targets; the user can map elsewhere from the panel. The url must name a host. Inserted first; remove it with remove_rule when done.',
     user: 'Send matching requests to a local server instead.',
+  },
+  // CONTRACTS §13.8
+  export_openapi: {
+    title: 'Export OpenAPI from traffic',
+    model: "Write an OpenAPI 3.1 document (JSON) inferred from the app's recorded HTTP traffic (optionally filtered by url glob, method, start time) under the project's .dart_tool/flutter_intercept/exports/ and return its path: servers per origin, paths with {id} parameters for id-like segments, query parameters, request and response bodies per status with JSON schemas inferred from every sample (required = present in all samples, nullable when seen null) and one example each. Returns {path, exchanges, routes, notes}. Use it to document an undocumented backend or to compare the app's real usage with a spec. Secrets are redacted according to the user's setting. Make the app call each endpoint a few times first for better schemas.",
+    user: 'Export recorded traffic as an OpenAPI document.',
+  },
+  export_postman: {
+    title: 'Export Postman collection from traffic',
+    model: "Write a Postman Collection v2.1 (JSON) from the app's recorded HTTP traffic (optionally filtered by url glob, method, start time) under the project's .dart_tool/flutter_intercept/exports/ and return its path: a folder per host, one request per route (the latest sample) with saved example responses, {{baseUrl}} variables per origin, and credential headers as empty {{variables}}. Returns {path, exchanges, routes, notes}. Secrets are redacted according to the user's setting.",
+    user: 'Export recorded traffic as a Postman collection.',
+  },
+  take_screenshot: {
+    title: 'Take a screenshot of the app',
+    model: "Take a screenshot of the running Flutter app (the debug session's device; pass sessionId when several apps run) to see what the UI shows after a change or a mocked response. Returns the PNG image plus {path, width, height, takenAt, method, recentRequests}: recentRequests are the (at most 10) requests that started in the 5 s before the screenshot (redacted summaries; read them with get_request). The user confirms every screenshot and can turn the tool off (setting flutterIntercept.agent.screenshots). Supported on Android devices/emulators and iOS simulators (and wherever the Flutter VM service can render one); other devices answer \"not supported\".",
+    user: 'Take a screenshot of the running app (asks first).',
   },
   add_rewrite: {
     title: 'Add a rewrite rule',

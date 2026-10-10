@@ -5,6 +5,7 @@
  */
 import type { VmSessionInfo, VmWatcher } from './types';
 import { createVmSessionCore, type VmCoreDeps, type VmSessionCore } from './core';
+import { createIsolateInstaller, type IsolateInstaller } from './isolates';
 import {
   connectWsTransport,
   createDapTransport,
@@ -18,9 +19,14 @@ import {
 export type DapRequest = (command: string, args: unknown) => PromiseLike<unknown>;
 
 export interface VmWatcherDeps extends VmCoreDeps {
-  /** WebSocket constructor for the direct transport (profile mode); undefined = DAP only. */
+  /** WebSocket constructor for the direct transport (profile mode, background-isolate install); undefined = DAP only. */
   webSocket?: WebSocketCtor;
+  /** Per-isolate budget of the background-isolate installer, ms (tests). */
+  isolateBudgetMs?: number;
 }
+
+/** How long the core waits for the installer to have seen an isolate it learnt about from the DAP. */
+const INSTALL_STATUS_WAIT_MS = 500;
 
 export interface SessionFeed {
   /** A Dart debug session started (or any of its custom events arrived first). */
@@ -28,6 +34,12 @@ export interface SessionFeed {
   /** Every Dart-Code custom event of a session. */
   customEvent(sessionId: string, event: string, body: unknown, request?: DapRequest): void;
   sessionEnded(sessionId: string): void;
+  /**
+   * A VM service method / extension through the session's Dart-Code debug adapter (`callService`), e.g. for
+   * screenshots (src/screenshot). Rejects for an unknown session, or when the adapter answered without a body
+   * (profile mode: no VM connection in the DAP).
+   */
+  callService(sessionId: string, method: string, params?: Record<string, unknown>): Promise<unknown>;
 }
 
 interface Entry {
@@ -40,6 +52,8 @@ interface Entry {
   core?: VmSessionCore;
   transport?: VmTransport;
   dap?: DapTransport;
+  /** CONTRACTS §13.3: our own DDS client holding new isolates at start to install the entry's overrides. */
+  installer?: IsolateInstaller;
 }
 
 const PROBE_TIMEOUT_MS = 5000;
@@ -100,6 +114,52 @@ export function createSessionWatcher(deps: VmWatcherDeps): VmWatcher & SessionFe
     return undefined;
   }
 
+  /**
+   * CONTRACTS §13.3 (docs/spikes/background-isolates.md): started as soon as the VM service URI is known, in
+   * parallel with the transport probe, when `backgroundIsolates` is "intercept" at that point. Needs the direct
+   * WebSocket (DDS resume permissions are per client: the DAP's own connection can't be used). In profile mode
+   * isolates never pause at start, so it simply never installs (the warnings stay).
+   */
+  function maybeStartInstaller(sessionId: string): void {
+    const e = entries.get(sessionId);
+    if (!e || disposed || !e.attached || e.installer || !e.vmServiceUri || !deps.webSocket) return;
+    let mode: 'intercept' | 'warn' = 'intercept';
+    try {
+      mode = deps.backgroundIsolates?.() === 'warn' ? 'warn' : 'intercept';
+    } catch {
+      mode = 'warn';
+    }
+    if (mode !== 'intercept') return;
+    const uri = toWsUri(e.vmServiceUri);
+    if (!isLoopbackWsUri(uri)) return; // logged by the transport selection
+    const installer = createIsolateInstaller(sessionId, {
+      log: deps.log,
+      backgroundIsolates: deps.backgroundIsolates,
+      setTimeout: deps.setTimeout,
+      clearTimeout: deps.clearTimeout,
+      budgetMs: deps.isolateBudgetMs,
+    });
+    e.installer = installer;
+    const ws = deps.webSocket;
+    void (async () => {
+      let t: VmTransport;
+      try {
+        // The installer subscribes to the Debug stream itself (mandatory before it takes resume permissions).
+        t = await connectWsTransport(uri, ws, { timeoutMs: PROBE_TIMEOUT_MS, streams: [] });
+      } catch (err) {
+        deps.log(`vm[${sessionId.slice(0, 8)}]: background isolates can't be intercepted (VM service WebSocket: ${String((err as Error)?.message ?? err).slice(0, 160)})`);
+        if (e.installer === installer) e.installer = undefined;
+        installer.stop();
+        return;
+      }
+      if (e.installer !== installer || !e.attached || disposed) {
+        t.close();
+        return;
+      }
+      if (await installer.start(t)) deps.log(`vm[${sessionId.slice(0, 8)}]: background isolates: installing the entry's overrides at isolate start`);
+    })();
+  }
+
   async function maybeStart(sessionId: string): Promise<void> {
     const e = entries.get(sessionId);
     if (!e || disposed || !e.attached || e.core || e.starting) return;
@@ -116,7 +176,10 @@ export function createSessionWatcher(deps: VmWatcherDeps): VmWatcher & SessionFe
         return;
       }
       e.transport = transport;
-      e.core = createVmSessionCore(sessionId, deps);
+      e.core = createVmSessionCore(sessionId, {
+        ...deps,
+        installStatus: (isolateId) => (e.installer ? e.installer.status(isolateId, INSTALL_STATUS_WAIT_MS) : Promise.resolve(undefined)),
+      });
       deps.log(`vm[${sessionId.slice(0, 8)}]: watching via ${transport.kind === 'dap' ? "Dart-Code's debug adapter" : 'the VM service WebSocket'}`);
       await e.core.start(transport);
     } catch (err) {
@@ -134,9 +197,11 @@ export function createSessionWatcher(deps: VmWatcherDeps): VmWatcher & SessionFe
     if (e.core) e.core.stop();
     else if (wasAttached) deps.setWarnings(sessionId, []);
     e.transport?.close();
+    e.installer?.stop();
     e.core = undefined;
     e.transport = undefined;
     e.dap = undefined;
+    e.installer = undefined;
   }
 
   return {
@@ -145,6 +210,7 @@ export function createSessionWatcher(deps: VmWatcherDeps): VmWatcher & SessionFe
       const e = entry(info.sessionId);
       e.attached = true;
       if (info.vmServiceUri) e.vmServiceUri = info.vmServiceUri;
+      maybeStartInstaller(info.sessionId);
       await maybeStart(info.sessionId);
     },
     detach,
@@ -164,6 +230,7 @@ export function createSessionWatcher(deps: VmWatcherDeps): VmWatcher & SessionFe
       if (event === 'dart.debuggerUris') {
         const uri = (body as { vmServiceUri?: unknown } | undefined)?.vmServiceUri;
         if (typeof uri === 'string' && uri) e.vmServiceUri = uri;
+        maybeStartInstaller(sessionId);
         void maybeStart(sessionId);
       } else if (event === 'dart.serviceExtensionAdded') {
         e.dap?.handleCustomEvent(event, body);
@@ -176,6 +243,13 @@ export function createSessionWatcher(deps: VmWatcherDeps): VmWatcher & SessionFe
     sessionEnded(sessionId) {
       detach(sessionId);
       entries.delete(sessionId);
+    },
+    async callService(sessionId, method, params) {
+      const request = entries.get(sessionId)?.request;
+      if (!request) throw new Error('not a running Dart debug session');
+      const body = await request('callService', { method, params: params ?? {} });
+      if (body === undefined || body === null) throw new Error(`${method}: no answer from the debug adapter (profile mode?)`);
+      return body;
     },
   };
 }

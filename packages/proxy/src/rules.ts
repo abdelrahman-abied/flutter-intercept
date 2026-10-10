@@ -294,8 +294,9 @@ export const WEBSOCKET_ACTIONS: ReadonlySet<RuleAction['kind']> = new Set(['bloc
 /**
  * Why a rule can't do what it says, for rule editors and agent tools (undefined = fine). Today: a rule whose
  * URL only matches WebSockets (`ws://` / `wss://`) with an action that doesn't apply to them (mock, breakpoint,
- * mutate, throttle, cors, the truncate fault), or a `graphqlOperation` on such a rule (the operation of a
- * GraphQL subscription is inside the frames, not in the upgrade request).
+ * mutate, throttle, cors, script, the truncate fault), or a `graphqlOperation` on such a rule (the operation of a
+ * GraphQL subscription is inside the frames, not in the upgrade request); a sequence step that can't be one
+ * (breakpoint, sequence, script); a script without code or over MAX_SCRIPT_BYTES.
  */
 export function ruleProblem(rule: Pick<Rule, 'match' | 'action'>): string | undefined {
   const own = actionProblem(rule.action);
@@ -342,7 +343,8 @@ export class RuleFromExchangeError extends Error {
  *   Multi-value headers (e.g. several set-cookie) are joined with ', ' because RuleAction mock
  *   headers are Record<string, string> (contract question raised in docs/spikes/proxy.md).
  * block = status 403; mutate = no ops yet (the caller adds them); cors = `{kind:'cors'}` matching any
- * method (the preflight is OPTIONS); anything else = a response-phase breakpoint. A GraphQL exchange's rule
+ * method (the preflight is OPTIONS); script = SCRIPT_TEMPLATE (hooks that change nothing yet); anything else = a
+ * response-phase breakpoint. A GraphQL exchange's rule
  * also matches its `graphqlOperation` (except cors). The host inserts it FIRST.
  */
 export function ruleFromExchange(e: Exchange, kind: RuleAction['kind'], id: string): Rule {
@@ -395,6 +397,8 @@ export function ruleFromExchange(e: Exchange, kind: RuleAction['kind'], id: stri
     action = { kind: 'mutate', ops: [] }; // the caller fills in the ops (CONTRACTS §10.5 mutateField)
   } else if (kind === 'cors') {
     action = { kind: 'cors' }; // any method: the preflight (OPTIONS) and the request itself
+  } else if (kind === 'script') {
+    action = { kind: 'script', code: SCRIPT_TEMPLATE };
   } else {
     action = { kind: 'breakpoint', phase: 'response' };
   }
@@ -408,6 +412,23 @@ export function ruleFromExchange(e: Exchange, kind: RuleAction['kind'], id: stri
   return { id, enabled: true, name: `${kind} ${e.method} ${path}`, match, action };
 }
 
+/** A starting point for a script rule (CONTRACTS §13.4): both hooks, changing nothing until edited. */
+export const SCRIPT_TEMPLATE = `// Runs before the request goes to the server. Return the request (edited), { response: { status, headers, body } }
+// to answer it here, or nothing to leave it unchanged. Synchronous only; context.log(...) shows in the request's details.
+function onRequest(request, context) {
+  // request.headers['x-debug'] = '1';
+  // return request;
+}
+
+// Runs before the app gets the response. Return the response (edited) or nothing.
+function onResponse(response, request, context) {
+  // if (response.status === 200 && response.body) {
+  //   const data = JSON.parse(response.body);
+  //   context.log('items', data.items?.length);
+  // }
+}
+`;
+
 /** One recorded SSE event as event-stream text. */
 function sseEventText(f: { event?: string; id?: string; text?: string }): string {
   let out = '';
@@ -420,7 +441,7 @@ function sseEventText(f: { event?: string; id?: string; text?: string }): string
 // ---------------------------------------------------------------- v0.6.0 (CONTRACTS §12.3, §12.6)
 
 /** Actions a sequence step may not use. */
-const NOT_A_STEP: ReadonlySet<string> = new Set(['sequence', 'breakpoint']);
+const NOT_A_STEP: ReadonlySet<string> = new Set(['sequence', 'breakpoint', 'script']);
 /** At most this many literal body replacements per rewrite side (CONTRACTS §12.6). */
 export const MAX_BODY_REPLACEMENTS = 20;
 
@@ -528,9 +549,34 @@ export function mapRemoteUrl(original: string, matchUrl: string, to: string): st
   return base + rest;
 }
 
-/** Problems with an action's own settings (v0.6.0 actions), for rule editors and agent tools. */
+// ---------------------------------------------------------------- v0.7.0 (CONTRACTS §13.4)
+
+/** Largest script source (UTF-8 bytes) a `script` rule may carry. */
+export const MAX_SCRIPT_BYTES = 256 * 1024;
+
+/** UTF-8 length of a string without Buffer / TextEncoder (this module also runs in the webview). */
+function utf8Length(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+      n += 4;
+      i++;
+    } else n += 3;
+  }
+  return n;
+}
+
+/** Problems with an action's own settings (v0.6.0+ actions), for rule editors and agent tools. */
 function actionProblem(a: RuleAction | undefined): string | undefined {
   if (!a || typeof a !== 'object') return undefined;
+  if (a.kind === 'script') {
+    if (typeof a.code !== 'string' || a.code.trim() === '') return 'A script rule needs code (define onRequest and / or onResponse).';
+    if (utf8Length(a.code) > MAX_SCRIPT_BYTES) return `A script can be at most ${MAX_SCRIPT_BYTES / 1024} KB.`;
+    return undefined;
+  }
   if (a.kind === 'sequence') {
     if (!Array.isArray(a.steps) || a.steps.length === 0) return 'A sequence needs at least one step.';
     for (let i = 0; i < a.steps.length; i++) {

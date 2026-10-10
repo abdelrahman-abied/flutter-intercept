@@ -36,6 +36,7 @@ export async function runConnectAgent(
       client: 'cursor',
     },
     { label: 'Gemini CLI', description: 'copies a `gemini mcp add …` command (or a settings.json snippet)', client: 'gemini' },
+    { label: 'Windsurf', description: 'copies an mcp_config.json snippet (serverUrl + headers)', client: 'windsurf' },
     { label: 'Other MCP client', description: 'copies the URL and the Authorization header', client: 'other' },
   ]);
   if (!client) return;
@@ -60,5 +61,6 @@ export async function runConnectAgent(
     return;
   }
   const cursorNote = client === 'cursor' && opts.cursorAutoRegistered ? ' (Cursor already has Flutter Intercept registered automatically; you only need this for another setup.)' : '';
-  await ui.info(`Copied the ${snippet.label} configuration to the clipboard.${cursorNote} ${SECRET_NOTE} Nothing was written to any config file.`);
+  const windsurfNote = client === 'windsurf' ? " Paste it into Windsurf's mcp_config.json (Cascade → MCP servers → View raw config), merging it into an existing \"mcpServers\" object." : '';
+  await ui.info(`Copied the ${snippet.label} configuration to the clipboard.${cursorNote}${windsurfNote} ${SECRET_NOTE} Nothing was written to any config file.`);
 }

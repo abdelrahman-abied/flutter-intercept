@@ -26,6 +26,7 @@ import { createCodegenService } from './codegen/service';
 import type { GeneratedFile } from './codegen/types';
 import { createContractService, DONT_CHECK } from './contract/service';
 import { openFrame } from './source/open';
+import { takeScreenshot } from './screenshot';
 import { createVmWatcher } from './vm';
 import { checkSourcePath, packageRootsFor, resolveFrames } from './source/resolve';
 import { InterceptController, validateRule, validateRules } from './ui/controller';
@@ -34,6 +35,9 @@ import { createRecordingService } from './recordings/store';
 import { disposeRecordingDiffs, openRecordingDiff } from './recordings/vscodeDiff';
 import { createSharedRulesService } from './rules/service';
 import { checkUpstreamProxy } from './proxyHost';
+import { toOpenApi, toPostman } from './export';
+import { registerNotifications } from './notify';
+import { TrafficPanel } from './ui/panel';
 import { TrafficViewProvider, VIEW_ID } from './ui/view';
 
 export const RULES_KEY = 'flutterIntercept.rules';
@@ -203,7 +207,8 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   // CONTRACTS §12: shared rules in the repo, recordings, auth flows, upstream proxy.
   const shared = createSharedRulesService({ workspaceState: context.workspaceState, validateRule, log });
   context.subscriptions.push(shared);
-  proxyHost.setBodyFileResolver((p) => shared.resolveBodyFile(p));
+  proxyHost.setBodyFileResolver((p, id) => shared.resolveBodyFile(p, id));
+  proxyHost.setScriptFileResolver((p, id) => shared.resolveScriptFile(p, id));
   context.subscriptions.push(shared.onDidChangeBodyFile((p) => proxyHost.refreshBodyFiles(p)));
   const recordings = createRecordingService({ root: () => flutterProjectRoot() });
   context.subscriptions.push({ dispose: disposeRecordingDiffs });
@@ -231,27 +236,86 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       if (!snap.items.length) return;
       const shown = snap.items.slice(0, 20).map((i) => `• ${i.name} (${i.match}) in ${i.folder}: ${i.reason}`);
       if (snap.items.length > shown.length) shown.push(`…and ${snap.items.length - shown.length} more (open the file to review them).`);
+      const scripts = snap.items.filter((i) => i.script);
+      const REVIEW = 'Review scripts…';
+      const warning = scripts.length
+        ? "Only approve rules from people you trust: scripts run on every matching request and can read, change and redirect it, credentials included; other rules can send your app's requests to another server or change what it receives."
+        : "Only approve rules from people you trust: they can send your app's requests, with its credentials, to another server or change what it receives.";
       const ok = await vscode.window.showWarningMessage(
-        `Approve ${snap.items.length} shared Flutter Intercept rule${snap.items.length === 1 ? '' : 's'}?`,
-        { modal: true, detail: `${shown.join('\n')}\n\nOnly approve rules from people you trust: they can send your app's requests, with its credentials, to another server or change what it receives.` },
+        `Approve ${snap.items.length} Flutter Intercept rule${snap.items.length === 1 ? '' : 's'}?`,
+        { modal: true, detail: `${shown.join('\n')}\n\n${warning}` },
         'Approve',
+        ...(scripts.length ? [REVIEW] : []),
       );
       if (ok === 'Approve') await shared.approvePending(snap.hash);
+      // REVIEW-7 #5: show exactly the code that would be approved (the rule's own folder for files).
+      if (ok === REVIEW) {
+        for (const item of scripts) {
+          const sc = item.script!;
+          const header = `// ${item.name} — ${item.reason}${sc.truncated ? '\n// (shown cut at 64 KB)' : ''}${sc.error ? `\n// ${sc.error}` : ''}\n`;
+          if (sc.path && !sc.error) await vscode.window.showTextDocument(vscode.Uri.file(sc.path), { preview: false });
+          else {
+            const doc = await vscode.workspace.openTextDocument({ content: header + sc.code, language: 'javascript' });
+            await vscode.window.showTextDocument(doc, { preview: false });
+          }
+        }
+        void vscode.window.showInformationMessage('Flutter Intercept: approve the rules from the panel banner once you have reviewed the scripts.');
+      }
     },
   };
   // CONTRACTS §11.4: background-isolate warnings and read-only native-client traffic from the app's HTTP profile.
   const vm = createVmWatcher({
     ...proxyHost.vmHostDeps(log),
     nativeClients: () => (vscode.workspace.getConfiguration('flutterIntercept').get<string>('nativeClients', 'profile') === 'off' ? 'off' : 'profile'),
+    // CONTRACTS §13.3: install the entry's overrides in new isolates (debug), or only warn.
+    backgroundIsolates: () => (vscode.workspace.getConfiguration('flutterIntercept').get<string>('backgroundIsolates', 'intercept') === 'warn' ? 'warn' : 'intercept'),
     // dart:io entries whose proxyDetails name this proxy already are in the list.
     isOurProxy: (_host, port) => port === proxyHost.port || port === proxyHost.lan?.port,
   });
   context.subscriptions.push(vm);
   const contractCheckEnabled = () => vscode.workspace.getConfiguration('flutterIntercept').get<boolean>('contractCheck', true);
 
+  /** Opens a workspace file a rule refers to, creating it only if missing (REVIEW-6 #5/#7 guards). */
+  async function openWorkspaceFile(what: string, rel: string, create: { content: string } | undefined, secretProblem: (content: string) => string | undefined, ruleId?: string): Promise<boolean> {
+    const abs = shared.bodyFilePath(rel, ruleId); // REVIEW-7 #6: the rule's own workspace folder
+    if (!abs) throw new Error(`Not a valid ${what} path: ${rel}`);
+    const roots = (vscode.workspace.workspaceFolders ?? []).map((f) => fs.realpathSync(f.uri.fsPath));
+    const inside = (p: string) => roots.some((r) => p === r || p.startsWith(r + path.sep));
+    let created = false;
+    if (create && fs.existsSync(abs) && what === 'script file') {
+      // REVIEW-7 #1: never adopt a file that's already there (it may come from the repo) as the user's new script.
+      throw new Error(`A file already exists at ${rel}. "Create file" never reuses one: pick another name, or use "Open file" to review it first.`);
+    }
+    if (create && !fs.existsSync(abs)) {
+      // REVIEW-6 #5: never write what looks like live credentials into the repo.
+      const secret = secretProblem(create.content);
+      if (secret) throw new Error(secret);
+      // REVIEW-6 #7: never create anything outside the workspace or through a symlink, never overwrite.
+      const root = roots.find((r) => abs.startsWith(r + path.sep));
+      if (!root) throw new Error(`The ${what} must be inside the workspace.`);
+      let dir = root;
+      for (const seg of path.relative(root, path.dirname(abs)).split(path.sep).filter(Boolean)) {
+        dir = path.join(dir, seg);
+        if (fs.existsSync(dir)) {
+          if (fs.lstatSync(dir).isSymbolicLink() || !fs.statSync(dir).isDirectory()) throw new Error(`Refusing to create the ${what} through ${path.relative(root, dir)} (not a plain folder).`);
+        } else fs.mkdirSync(dir);
+      }
+      fs.writeFileSync(abs, create.content, { flag: 'wx' });
+      created = true;
+    }
+    const real = checkSourcePath(abs, roots); // resolves symlinks; throws outside the workspace
+    if (!inside(real)) throw new Error(`The ${what} must be inside the workspace.`);
+    await vscode.window.showTextDocument(vscode.Uri.file(real), { preview: false });
+    return created;
+  }
+  const exporters = { openapi: toOpenApi, postman: toPostman };
+  const version = String((context.extension?.packageJSON as { version?: string } | undefined)?.version ?? '');
   const controller = new InterceptController({
     host: proxyHost,
-    saveRules: (rules) => context.workspaceState.update(RULES_KEY, rules),
+    saveRules: (rules) => {
+      void shared.setPersonalRules(rules).catch((e: unknown) => log(`personal rules → shared service: ${String(e)}`)); // REVIEW-7 #1
+      return context.workspaceState.update(RULES_KEY, rules);
+    },
     getEnabled: () => readSettings().enabled,
     setEnabled,
     log,
@@ -291,38 +355,35 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       if (!fs.existsSync(file.path)) await shared.save(shared.fileRules()); // creates an empty shared file
       await vscode.window.showTextDocument(vscode.Uri.file(file.path), { preview: false });
     },
-    openBodyFile: async (bodyFile, create) => {
-      const abs = shared.bodyFilePath(bodyFile);
-      if (!abs) throw new Error(`Not a valid body file path: ${bodyFile}`);
-      const roots = (vscode.workspace.workspaceFolders ?? []).map((f) => fs.realpathSync(f.uri.fsPath));
-      const inside = (p: string) => roots.some((r) => p === r || p.startsWith(r + path.sep));
-      if (create && !fs.existsSync(abs)) {
-        // REVIEW-6 #5: never write what looks like live credentials into the repo.
-        const secret = shared.checkBodyFileContent(create.content);
-        if (secret) throw new Error(secret);
-        // REVIEW-6 #7: never create anything outside the workspace or through a symlink, never overwrite.
-        const root = roots.find((r) => abs.startsWith(r + path.sep));
-        if (!root) throw new Error('The body file must be inside the workspace.');
-        let dir = root;
-        for (const seg of path.relative(root, path.dirname(abs)).split(path.sep).filter(Boolean)) {
-          dir = path.join(dir, seg);
-          if (fs.existsSync(dir)) {
-            if (fs.lstatSync(dir).isSymbolicLink() || !fs.statSync(dir).isDirectory()) throw new Error(`Refusing to create the body file through ${path.relative(root, dir)} (not a plain folder).`);
-          } else fs.mkdirSync(dir);
-        }
-        fs.writeFileSync(abs, create.content, { flag: 'wx' });
-      }
-      const real = checkSourcePath(abs, roots); // resolves symlinks; throws outside the workspace
-      if (!inside(real)) throw new Error('The body file must be inside the workspace.');
-      await vscode.window.showTextDocument(vscode.Uri.file(real), { preview: false });
+    openBodyFile: (bodyFile, create, ruleId) => openWorkspaceFile('body file', bodyFile, create, (c) => shared.checkBodyFileContent(c), ruleId),
+    // CONTRACTS §13.4: same rules as body files; the controller already checked `.js` and swapped in the template.
+    // REVIEW-7 #1: a file the user creates here is approved; one merely opened is not.
+    openScriptFile: async (scriptFile, create, ruleId) => {
+      if (await openWorkspaceFile('script file', scriptFile, create, (c) => shared.checkScriptFileContent(c), ruleId)) await shared.approveScriptFile(scriptFile, ruleId);
     },
+    exporters,
+    pickOne: (items, placeHolder) => Promise.resolve(vscode.window.showQuickPick(items, { placeHolder })),
+    showSaveDialog: async (defaultPath) => (await vscode.window.showSaveDialog({ defaultUri: vscode.Uri.file(defaultPath) }))?.fsPath,
+    confirmWarning: async (message, button) => (await vscode.window.showWarningMessage(message, { modal: true }, button)) === button,
+    version,
+    openInNewWindow: (): Promise<void> => editorPanel.openInNewWindow(),
     recordings,
     openDiff: (a, b) => openRecordingDiff(a, b),
     analyzeAuth: (ex) => analyzeAuth(ex),
   });
-  void shared.ready.then(() => controller.setSharedRules(shared.state().rules));
+  void shared.ready.then(async () => {
+    await shared.setPersonalRules(controller.personalRules()); // REVIEW-7 #1: personal script files need approval too
+    controller.setSharedRules(shared.state().rules);
+  });
   context.subscriptions.push(
-    shared.onDidChange((st) => controller.setSharedRules(st.rules)),
+    shared.onDidChange((st) => {
+      controller.setSharedRules(st.rules);
+      proxyHost.refreshBodyFiles(); // an approved personal script reaches the proxy even when shared rules are unchanged
+    }),
+    // REVIEW-7 #1: saving a script file in VS Code approves that content.
+    vscode.workspace.onDidSaveTextDocument((d) => {
+      if (d.uri.scheme === 'file') void shared.noteScriptFileSaved(d.uri.fsPath).catch((e: unknown) => log(`script approval on save: ${String(e)}`));
+    }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('flutterIntercept.contractCheck')) controller.recheckContracts();
       if (e.affectsConfiguration('flutterIntercept.upstreamProxy') || e.affectsConfiguration('flutterIntercept.upstreamProxyIgnoreCertErrors')) applyUpstreamProxy();
@@ -352,18 +413,21 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     if (files.length) void vscode.window.showInformationMessage(`Flutter Intercept: generated ${files.map((f) => f.path).join(', ')} — save them where you want them.`);
   }
   const view = new TrafficViewProvider(context.extensionUri, controller);
+  // CONTRACTS §13.1: the same UI as an editor tab, optionally in its own window.
+  const editorPanel: TrafficPanel = new TrafficPanel(context.extensionUri, controller, log);
+  context.subscriptions.push({ dispose: () => editorPanel.dispose() });
 
   // AI agents (CONTRACTS §8): one AgentApi behind two front doors, Copilot tools and a local MCP server.
-  const agentSettings = (): { access: AgentAccess; redactSecrets: boolean; interceptEnabled: boolean } => {
+  const agentSettings = (): { access: AgentAccess; redactSecrets: boolean; interceptEnabled: boolean; screenshots: boolean } => {
     // User settings only (REVIEW-6 #1): a workspace must not widen agent access or turn redaction off.
     const access = userSetting<string>('agent.access') ?? 'readWrite';
     return {
       access: access === 'readOnly' || access === 'off' ? access : 'readWrite',
       redactSecrets: userSetting<boolean>('agent.redactSecrets') !== false,
       interceptEnabled: readSettings().enabled,
+      screenshots: userSetting<boolean>('agent.screenshots') !== false,
     };
   };
-  const version = String((context.extension?.packageJSON as { version?: string } | undefined)?.version ?? '');
   const launcher = createAppLauncher({});
   context.subscriptions.push({ dispose: () => launcher.dispose() });
   const agentApi = createAgentApi({
@@ -382,6 +446,19 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     codegen,
     appPackageName: () => appPackageNames(flutterProjectRoots())[0],
     version,
+    exporters,
+    // CONTRACTS §13.8: VM-service screenshot first, adb / simctl as fallbacks (argument arrays, no shell).
+    takeScreenshot: (target) =>
+      takeScreenshot(target, {
+        callService: (sessionId, method, params) => vm.callService(sessionId, method, params),
+        exec: (cmd, args, opts) =>
+          new Promise((resolve, reject) =>
+            execFile(cmd, args, { encoding: 'buffer', timeout: opts?.timeoutMs ?? 15_000, maxBuffer: opts?.maxBuffer ?? 32 * 1024 * 1024 }, (err, stdout, stderr) =>
+              err ? reject(err) : resolve({ stdout, stderr: stderr.toString('utf8') }),
+            ),
+          ),
+        log,
+      }),
   });
   // CONTRACTS §9.2: the app's own packages decide which stack frame is the call site.
   const refreshAppPackages = () => proxyHost.setAppPackages(appPackageNames(flutterProjectRoots()));
@@ -468,12 +545,45 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   );
 
   const openPanel = () => view.reveal(false);
+  const exportCommand = async (format: 'openapi' | 'postman') => {
+    try {
+      const written = await controller.exportTraffic(format);
+      if (written) void vscode.window.showInformationMessage(`Flutter Intercept: exported ${format === 'openapi' ? 'OpenAPI' : 'Postman collection'} to ${written}`);
+    } catch (e) {
+      void vscode.window.showErrorMessage(`Flutter Intercept: ${(e as Error).message}`);
+    }
+  };
+
+  // CONTRACTS §13.6: failed requests while no traffic view is on screen.
+  const notifications = registerNotifications({
+    showMessage: (text, ...buttons) => vscode.window.showWarningMessage(`Flutter Intercept: ${text}`, ...buttons),
+    reveal: async (id) => {
+      if (!editorPanel.visible) await view.reveal(false);
+      controller.select(id);
+    },
+    turnOff: () => vscode.workspace.getConfiguration('flutterIntercept').update('notifications', 'off', vscode.ConfigurationTarget.Global),
+    // REVIEW-7 #7: user settings only, so a repository can't override "Turn off".
+    getLevel: () => userSetting<string>('notifications'),
+    isPanelVisible: () => (view.visible || editorPanel.visible) && vscode.window.state.focused,
+    onError: (e) => log(`notification failed: ${String(e)}`),
+  });
+  proxyHost.on('exchange', (e: Exchange) => notifications.onExchange(e));
+  context.subscriptions.push(
+    notifications,
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('flutterIntercept.notifications')) notifications.refreshLevel();
+    }),
+  );
   context.subscriptions.push(
     vscode.commands.registerCommand('flutterIntercept.toggle', async () => {
       await setEnabled(!readSettings().enabled);
       refreshStatus();
     }),
     vscode.commands.registerCommand('flutterIntercept.openPanel', openPanel),
+    vscode.commands.registerCommand('flutterIntercept.openInEditor', () => void editorPanel.open()),
+    vscode.commands.registerCommand('flutterIntercept.openInNewWindow', () => editorPanel.openInNewWindow()),
+    vscode.commands.registerCommand('flutterIntercept.exportOpenApi', () => exportCommand('openapi')),
+    vscode.commands.registerCommand('flutterIntercept.exportPostman', () => exportCommand('postman')),
     vscode.commands.registerCommand('flutterIntercept.clear', () => controller.clear()),
     vscode.commands.registerCommand('flutterIntercept.debugWithIntercept', () => debugWithIntercept(deps)),
   );

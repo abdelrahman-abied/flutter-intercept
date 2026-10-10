@@ -25,6 +25,10 @@ export const READ_TOOLS = [
   'list_recordings',
   'diff_recordings',
   'get_auth_flows',
+  // CONTRACTS §13.8
+  'export_openapi',
+  'export_postman',
+  'take_screenshot',
 ] as const;
 
 export const WRITE_TOOLS = [
@@ -90,4 +94,23 @@ export interface AppLauncher {
   sessions(): { id: string; deviceId?: string; program: string; mode: string; lan?: boolean }[];
 }
 
+/**
+ * CONTRACTS §13.8: read tools that still need the user's confirmation every time (LM `prepareInvocation`
+ * confirmation; MCP `readOnlyHint: false` so clients ask). Allowed under read-only access.
+ */
+export const CONFIRMED_READ_TOOLS: readonly ReadToolName[] = ['take_screenshot'];
+
+/** Image parts a tool result carries besides its JSON (MCP image content, LM data parts). Never serialised: a symbol key. */
+export const TOOL_IMAGES = Symbol.for('flutter-intercept.toolImages');
+export interface ToolImage {
+  /** Base64 of the image bytes. */
+  data: string;
+  mimeType: 'image/png';
+}
+export function toolImages(result: unknown): ToolImage[] {
+  const v = result && typeof result === 'object' ? (result as { [TOOL_IMAGES]?: unknown })[TOOL_IMAGES] : undefined;
+  return Array.isArray(v) ? (v as ToolImage[]) : [];
+}
+
 export const isWriteTool = (t: ToolName): t is WriteToolName => (WRITE_TOOLS as readonly string[]).includes(t);
+export const needsConfirmation = (t: ToolName): boolean => isWriteTool(t) || (CONFIRMED_READ_TOOLS as readonly string[]).includes(t);

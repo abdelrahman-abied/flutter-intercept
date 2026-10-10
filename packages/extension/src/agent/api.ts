@@ -13,12 +13,14 @@ import type { CodegenService } from '../codegen/types';
 import type { ContractResult, ContractService } from '../contract/types';
 import type { AuthAnalysis } from '../analysis/types';
 import type { RecordingService } from '../recordings/types';
+import type { ExportResult, ToOpenApi, ToPostman } from '../export/types';
+import type { Screenshot, ScreenshotTarget } from '../screenshot/types';
 import { checkMapTarget, expireTokenRule, fixtureApi, isRecordable, readOnlyReason, sanitizeSendHeaders, validateEdit, validateRule } from '../ui/controller';
 import type { SessionWarning } from '../ui/protocol';
-import { buildHar, writeHar } from './har';
+import { buildHar, writeExportFile, writeHar } from './har';
 import { pathError, select } from './paths';
 import { corsPolicyShort, urlGlobHasHost } from './corsPolicy';
-import { isSensitiveField, isSensitiveHeader, REDACTED, redactBodyText, redactFrameText, redactHeaders, redactQueryString, redactSecretValues, redactText, redactUrl } from './redact';
+import { isSensitiveField, isSensitiveHeader, REDACTED, redactBodyText, redactLogLine, redactFrameText, redactHeaders, redactQueryString, redactSecretValues, redactText, redactUrl } from './redact';
 import { parsePath, type PathSegment } from '@flutter-intercept/proxy/jsonpath';
 import {
   contractForAgent,
@@ -37,7 +39,7 @@ import {
 } from './samples';
 import { MAX_DIFF_ENTRIES, parseToolInput, ToolInput, TRIGGER_WINDOW_MS } from './schema';
 import { bodyShape } from './shape';
-import { AgentAccess, AgentTools, AgentToolError, AppLauncher, isWriteTool, ToolName, ToolResult } from './types';
+import { AgentAccess, AgentTools, AgentToolError, AppLauncher, isWriteTool, TOOL_IMAGES, ToolImage, ToolName, ToolResult } from './types';
 
 export const AGENT_RULE_PREFIX = '[agent] ';
 export { FINAL_STATES };
@@ -99,8 +101,11 @@ export interface AgentApiDeps {
   applyRules(rules: Rule[]): void;
   /** Controller-level clear (broadcasts `cleared` + snapshot): `controller.clear`. */
   clear(): void;
-  /** Live settings: `flutterIntercept.agent.access`, `...agent.redactSecrets`, `flutterIntercept.enabled`. */
-  getSettings(): { access: AgentAccess; redactSecrets: boolean; interceptEnabled: boolean };
+  /**
+   * Live settings: `flutterIntercept.agent.access`, `...agent.redactSecrets`, `flutterIntercept.enabled`, and
+   * (CONTRACTS §13.8) `...agent.screenshots` (absent = true).
+   */
+  getSettings(): { access: AgentAccess; redactSecrets: boolean; interceptEnabled: boolean; screenshots?: boolean };
   /** launch_app / stop_app / hot_restart and the session list for get_status (launch.ts). */
   launcher: AppLauncher;
   /** Project root for export_har (the workspace folder of the Flutter app); undefined = none open. */
@@ -125,7 +130,18 @@ export interface AgentApiDeps {
   recordingsChanged?(): void;
   /** Auth-flow analysis (src/analysis/auth.ts `analyzeAuth`). */
   analyzeAuth?(exchanges: Exchange[]): AuthAnalysis;
+  // ---- CONTRACTS §13.8 (v0.7.0). Optional: without them the tools answer with a clear "not available" error.
+  /** OpenAPI / Postman builders (src/export/**, pure). */
+  exporters?: { openapi?: ToOpenApi; postman?: ToPostman };
+  /** Takes a screenshot of a session's device (src/screenshot/** `takeScreenshot` bound to its deps). */
+  takeScreenshot?(target: ScreenshotTarget): Promise<Screenshot>;
 }
+
+/** take_screenshot: requests that started this long before the screenshot are listed with it. */
+export const SCREENSHOT_RECENT_MS = 5000;
+export const SCREENSHOT_RECENT_MAX = 10;
+/** take_screenshot: larger images are saved but not sent inline. */
+export const MAX_SCREENSHOT_BYTES = 16 * 1024 * 1024;
 
 /** Loopback targets agents may map to (CONTRACTS §12.7). */
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
@@ -374,6 +390,13 @@ export class AgentApi implements AgentTools {
         return this.addMapRemote(input as ToolInput<'add_map_remote'>);
       case 'add_rewrite':
         return this.addRewrite(input as ToolInput<'add_rewrite'>);
+      // CONTRACTS §13.8
+      case 'export_openapi':
+        return this.exportSpec('openapi', input as ToolInput<'export_openapi'>);
+      case 'export_postman':
+        return this.exportSpec('postman', input as ToolInput<'export_postman'>);
+      case 'take_screenshot':
+        return this.takeScreenshot(input as ToolInput<'take_screenshot'>);
       default:
         throw new AgentToolError(`unknown tool ${String(tool)}`, 'invalid');
     }
@@ -474,6 +497,9 @@ export class AgentApi implements AgentTools {
       ...(e.graphql ? { graphql: { ...e.graphql } } : {}),
       ...(e.cors ? { cors: { ...e.cors, ...(e.cors.problem ? { problem: this.text(e.cors.problem) } : {}) } } : {}),
       ...(e.captured ? { captured: e.captured, readOnly: readOnlyReason(e) } : {}),
+      // CONTRACTS §13.2 / §13.4: scriptLog is free text from the user's script: redacted like bodies.
+      ...(e.timings ? { timings: { ...e.timings } } : {}),
+      ...(e.scriptLog?.length ? { scriptLog: e.scriptLog.map((l) => (this.redact ? redactLogLine(String(l)) : String(l))) } : {}),
     };
   }
 
@@ -514,6 +540,11 @@ export class AgentApi implements AgentTools {
    * setHeaders read "[redacted]" and a map target is shown like a redacted URL (shared rules may carry them).
    */
   private ruleView(rule: Rule): Rule {
+    // CONTRACTS §13.4: agents never see a script's code (whatever the redaction setting).
+    if (rule.action?.kind === 'script') {
+      const { file } = rule.action;
+      rule = { ...rule, action: { kind: 'script', ...(file !== undefined ? { file } : {}) } as RuleAction };
+    }
     if (!this.redact) return rule;
     const headers = (h: Record<string, string> | undefined) =>
       h ? Object.fromEntries(Object.entries(h).map(([k, v]) => [k, isSensitiveHeader(k) ? REDACTED : redactSecretValues(v, true)])) : h;
@@ -546,7 +577,7 @@ export class AgentApi implements AgentTools {
     const keep = this.filter(i as ExchangeFilter);
     const matched = this.deps.host
       .getExchanges()
-      .filter((e) => keep(e) && (i.state === undefined || e.state === i.state))
+      .filter((e) => keep(e) && (i.state === undefined || e.state === i.state) && (i.slowerThanMs === undefined || (e.durationMs !== undefined && e.durationMs > i.slowerThanMs)))
       .sort((a, b) => b.startedAt - a.startedAt);
     return { items: matched.slice(0, i.limit).map((e) => this.summary(e)), total: matched.length };
   }
@@ -656,6 +687,8 @@ export class AgentApi implements AgentTools {
 
   /** Validates with the host's rule validation and inserts the rule FIRST (it wins). */
   private insertRule(rule: Rule): ToolResult {
+    // CONTRACTS §13.4: agents can't create scripts (no tool builds one; refused here as well).
+    if (hasScript(rule)) throw new AgentToolError('agents cannot add or change script rules; the user writes scripts in the Flutter Intercept panel', 'access');
     const probed = sensitiveQueryProbe(rule.match.url);
     if (probed) {
       throw new AgentToolError(
@@ -1660,6 +1693,100 @@ export class AgentApi implements AgentTools {
       ...this.spending(i),
     });
   }
+
+  // ------------------------------------------------------------------ v0.7.0 (CONTRACTS §13.8)
+
+  /** The document title / file name base: the given title, else the app's pubspec name, else the folder name. */
+  private projectTitle(root: string): string {
+    return this.deps.appPackageName?.() || path.basename(root) || 'Flutter app';
+  }
+
+  /** export_openapi / export_postman: redacted per setting, written under .dart_tool/flutter_intercept/exports/. */
+  private async exportSpec(format: 'openapi' | 'postman', i: ToolInput<'export_openapi'>): Promise<ToolResult> {
+    const build = format === 'openapi' ? this.deps.exporters?.openapi : this.deps.exporters?.postman;
+    if (!build) throw new AgentToolError(`${format === 'openapi' ? 'OpenAPI' : 'Postman'} export is not available in this build of Flutter Intercept`, 'state');
+    const root = this.deps.projectRoot();
+    if (!root) throw new AgentToolError('no workspace folder is open to export into', 'state');
+    const keep = this.filter({ url: i.url, method: i.method, sinceMs: i.sinceMs, includeBrowserInternal: i.includeBrowserInternal });
+    const list = this.deps.host.getExchanges().filter(keep);
+    let r: ExportResult;
+    try {
+      r = build(list, { title: i.title ?? this.projectTitle(root), redact: this.redact });
+    } catch (e) {
+      throw new AgentToolError(`the ${format} export failed: ${(e as Error)?.message ?? String(e)}`, 'internal');
+    }
+    if (!r.exchanges) {
+      throw new AgentToolError(`no finished HTTP request${i.url ? ` matches ${i.url}` : ' is recorded'}${i.sinceMs !== undefined ? ' since sinceMs' : ''}; make the app call the API first (WebSocket, SSE and browser-internal traffic is not exported)`, 'not_found');
+    }
+    const file = await writeExportFile(root, r.text, format === 'openapi' ? '.openapi.json' : '.postman_collection.json', new Date(this.now()));
+    return { path: file, exchanges: r.exchanges, routes: r.routes, notes: r.notes.slice(0, 50).map((n) => this.text(String(n))), redacted: this.redact };
+  }
+
+  /**
+   * take_screenshot (CONTRACTS §13.8): allowed under read-only access (the front doors confirm every call), refused
+   * when `flutterIntercept.agent.screenshots` is off. The PNG travels as an image part (TOOL_IMAGES), the JSON
+   * names the file and the requests that started in the SCREENSHOT_RECENT_MS before it (redacted summaries).
+   */
+  private async takeScreenshot(i: ToolInput<'take_screenshot'>): Promise<ToolResult> {
+    if (this.deps.getSettings().screenshots === false) {
+      throw new AgentToolError('screenshots are turned off for agents (setting flutterIntercept.agent.screenshots)', 'access');
+    }
+    if (!this.deps.takeScreenshot) throw new AgentToolError('screenshots are not available in this build of Flutter Intercept', 'state');
+    const sessions = this.deps.launcher.sessions();
+    let session: (typeof sessions)[number] | undefined;
+    if (i.sessionId !== undefined) {
+      session = sessions.find((s) => s.id === i.sessionId);
+      if (!session) throw new AgentToolError(`no intercepted debug session "${i.sessionId}" (get_status lists them)`, 'not_found');
+    } else if (sessions.length === 1) {
+      session = sessions[0];
+    } else if (!sessions.length) {
+      throw new AgentToolError('no app is running: start it with launch_app first', 'state');
+    } else {
+      throw new AgentToolError(`${sessions.length} apps are running; pass sessionId (one of ${sessions.map((s) => s.id).slice(0, 10).join(', ')})`, 'invalid');
+    }
+    const root = this.deps.projectRoot();
+    if (!root) throw new AgentToolError('no workspace folder is open to save the screenshot into', 'state');
+    let shot: Screenshot;
+    try {
+      shot = await this.deps.takeScreenshot({ sessionId: session.id, ...(session.deviceId ? { deviceId: session.deviceId } : {}), projectRoot: root });
+    } catch (e) {
+      throw new AgentToolError(`take_screenshot: ${this.text((e as Error)?.message ?? String(e))}`, 'state');
+    }
+    const at = Number.isFinite(shot.takenAt) ? shot.takenAt : this.now();
+    const recent = this.deps.host
+      .getExchanges()
+      .filter((e) => !e.browserInternal && e.startedAt >= at - SCREENSHOT_RECENT_MS && e.startedAt <= at)
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .slice(0, SCREENSHOT_RECENT_MAX)
+      .map((e) => this.summary(e));
+    const bytes = shot.png?.length ?? 0;
+    const inline = bytes > 0 && bytes <= MAX_SCREENSHOT_BYTES;
+    const result: ToolResult = {
+      path: shot.path,
+      ...(shot.width !== undefined ? { width: shot.width } : {}),
+      ...(shot.height !== undefined ? { height: shot.height } : {}),
+      takenAt: at,
+      method: shot.method,
+      bytes,
+      sessionId: session.id,
+      ...(session.deviceId ? { deviceId: session.deviceId } : {}),
+      recentRequests: recent,
+      ...(inline ? {} : { note: bytes ? 'the image is too large to send inline; open the file at path' : 'the screenshot is empty' }),
+    };
+    if (inline) {
+      const images: ToolImage[] = [{ data: shot.png.toString('base64'), mimeType: 'image/png' }];
+      Object.defineProperty(result, TOOL_IMAGES, { value: images, enumerable: false });
+    }
+    return result;
+  }
+}
+
+/** Does this rule (or a sequence step) run a script? */
+function hasScript(rule: Rule): boolean {
+  const a = rule.action as RuleAction | undefined;
+  if (!a) return false;
+  if (a.kind === 'script') return true;
+  return a.kind === 'sequence' && (a.steps ?? []).some((s) => (s.action as { kind?: string })?.kind === 'script');
 }
 
 /** " (GraphQL GetUser)" for rule names. */

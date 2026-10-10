@@ -79,11 +79,11 @@ export type ViewMsg =
   | { type: 'deleteRecording'; id: string }
   | { type: 'expireToken'; url: string; count: number }                // preset: sequence [401 × count, passthrough]
   | { type: 'openSharedRules' }                                        // opens .vscode/flutter-intercept.json
-  | { type: 'openBodyFile'; path: string; create?: { content: string } } // opens a mock body file (creates it, never overwrites)
+  | { type: 'openBodyFile'; path: string; create?: { content: string }; ruleId?: string } // opens a mock body file (creates it, never overwrites); ruleId = resolve in that rule's folder (REVIEW-7 #6)
   // CONTRACTS §13.7
   | { type: 'export'; format: ExportFormat; ids?: string[] }           // host asks redact or not, then a save dialog; ids default = all shown HTTP
   | { type: 'openInNewWindow' }                                        // opens the panel as an editor in its own window
-  | { type: 'openScriptFile'; path: string; create?: { content: string } }; // like openBodyFile, for script rules (.js)
+  | { type: 'openScriptFile'; path: string; create?: { content: string }; ruleId?: string }; // like openBodyFile, for script rules (.js); create never reuses an existing file (REVIEW-7 #1)
 
 /** CONTRACTS §13.5 */
 export type ExportFormat = 'openapi' | 'postman' | 'har';

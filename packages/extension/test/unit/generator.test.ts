@@ -110,15 +110,27 @@ describe('paths and imports', () => {
   const repo = path.join(__dirname, '..', '..', '..', '..');
   const contractsV1 = /## 1\.[\s\S]*?```dart\n([\s\S]*?)```/.exec(fs.readFileSync(path.join(repo, 'docs', 'CONTRACTS.md'), 'utf8'))![1];
 
-  it('ENTRY_TEMPLATE is template v4 verbatim (scripts/e2e template + docs/spikes/template-v4.md contract text)', () => {
-    expect(ENTRY_TEMPLATE).toBe(fs.readFileSync(path.join(repo, 'scripts', 'e2e', 'templates', 'entry_v4.dart.tmpl'), 'utf8'));
-    const spike = fs.readFileSync(path.join(repo, 'docs', 'spikes', 'template-v4.md'), 'utf8');
-    const block = /## Contract text for §1[\s\S]*?```dart\n([\s\S]*?)```/.exec(spike)![1];
-    expect(ENTRY_TEMPLATE).toBe(block);
+  it('ENTRY_TEMPLATE is template v5 verbatim (scripts/e2e/templates/entry_v5.dart.tmpl)', () => {
+    expect(ENTRY_TEMPLATE).toBe(fs.readFileSync(path.join(repo, 'scripts', 'e2e', 'templates', 'entry_v5.dart.tmpl'), 'utf8'));
   });
 
-  // Until the lead pastes v4 into CONTRACTS §1 the contract still shows v3; afterwards they must match.
-  it.skipIf(!contractsV1.includes(TRACE_HEADER))('ENTRY_TEMPLATE is the CONTRACTS.md §1 template verbatim', () => {
+  // CONTRACTS §13.3: v5 = v4 (docs/spikes/template-v4.md contract text) + the install function, nothing else.
+  it('template v5 is template v4 plus flutterInterceptInstall (docs/spikes/background-isolates.md)', () => {
+    const v4 = fs.readFileSync(path.join(repo, 'scripts', 'e2e', 'templates', 'entry_v4.dart.tmpl'), 'utf8');
+    const spike = fs.readFileSync(path.join(repo, 'docs', 'spikes', 'template-v4.md'), 'utf8');
+    expect(/## Contract text for §1[\s\S]*?```dart\n([\s\S]*?)```/.exec(spike)![1]).toBe(v4);
+    const v4Main = 'Future<void> main(List<String> args) async {\n  _trustCa(SecurityContext.defaultContext);\n  final overrides = _FlutterInterceptOverrides(HttpOverrides.current);\n  HttpOverrides.global = overrides;\n';
+    const added = /\n\/\/ Statics, and so HttpOverrides.global, are per isolate\.[\s\S]*?\nFuture<void> main\(List<String> args\) async \{\n  final overrides = _install\(\);\n/.exec(ENTRY_TEMPLATE);
+    expect(added).not.toBeNull();
+    expect(ENTRY_TEMPLATE.replace(added![0], '\n' + v4Main)).toBe(v4);
+    // The install function: top-level, kept for the VM (`invoke` by name), idempotent, same overrides as main.
+    expect(ENTRY_TEMPLATE).toContain("@pragma('vm:entry-point')\nvoid flutterInterceptInstall() {\n  _install();\n}");
+    expect(ENTRY_TEMPLATE).toContain('  final existing = _installed;\n  if (existing != null) return existing;\n');
+    expect(ENTRY_TEMPLATE).toContain('  HttpOverrides.global = overrides;\n  return _installed = overrides;\n');
+  });
+
+  // Until the lead pastes v5 into CONTRACTS §1 the contract still shows v4; afterwards they must match.
+  it.skipIf(!contractsV1.includes('flutterInterceptInstall'))('ENTRY_TEMPLATE is the CONTRACTS.md §1 template verbatim', () => {
     expect(ENTRY_TEMPLATE).toBe(contractsV1);
   });
 

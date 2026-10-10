@@ -52,6 +52,33 @@ function isoTime(ms: number): string {
 
 const finiteOr = (v: number | undefined, fallback: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
 
+const ms = (v: number | undefined): number | undefined => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined);
+
+/**
+ * CONTRACTS §13.2: `Exchange.timings` → HAR `timings`. `blocked` = requestMs + pausedMs + delayMs, `dns`, `connect`
+ * (TCP + TLS, as HAR defines it), `ssl`, `send`, `wait`, `receive`. The optional phases are -1 when unknown or not
+ * applicable (a reused connection); `send` / `wait` / `receive` are required non-negative by HAR 1.2, so unknown is 0
+ * there. Without timings (older recordings) the whole duration counts as `wait`.
+ */
+export function harTimings(e: Pick<Exchange, 'timings' | 'durationMs'>): Record<string, number> {
+  const t = e.timings;
+  if (!t) return { send: 0, wait: Math.max(0, finiteOr(e.durationMs, 0)), receive: 0 };
+  const sum = (...vs: (number | undefined)[]): number => {
+    const known = vs.map(ms).filter((v): v is number => v !== undefined);
+    return known.length ? known.reduce((a, b) => a + b, 0) : -1;
+  };
+  const tls = t.reused ? undefined : ms(t.tlsMs);
+  return {
+    blocked: sum(t.requestMs, t.pausedMs, t.delayMs),
+    dns: t.reused ? -1 : (ms(t.dnsMs) ?? -1),
+    connect: t.reused ? -1 : sum(t.connectMs, tls),
+    ssl: tls ?? -1,
+    send: ms(t.sendMs) ?? 0,
+    wait: ms(t.waitMs) ?? 0,
+    receive: ms(t.receiveMs) ?? 0,
+  };
+}
+
 const OPCODES: Record<string, number> = { text: 1, binary: 2, close: 8, ping: 9, pong: 10 };
 
 /**
@@ -134,7 +161,8 @@ export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string
           bodySize: e.responseBody ? bodyBytes(e.responseBody) : -1,
         },
         cache: {},
-        timings: { send: 0, wait: time, receive: 0 },
+        timings: harTimings(e),
+        ...(e.timings?.reused ? { _reusedConnection: true } : {}),
         _state: e.state,
         ...(e.matchedRuleId ? { _matchedRuleId: e.matchedRuleId } : {}),
         ...(e.error ? { _error: r ? redactText(e.error) : e.error } : {}),
@@ -158,7 +186,6 @@ export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string
 
 export const EXPORT_DIR = path.join('.dart_tool', 'flutter_intercept', 'exports');
 
-/** Writes `har` to `<projectRoot>/.dart_tool/flutter_intercept/exports/<timestamp>.har`; returns the path. */
 /**
  * REVIEW-6 #9: `<root>/<rel>` as a real directory INSIDE the project: every existing component is `lstat`ed (a
  * symlink or a non-directory is refused, so a repo can't point `.dart_tool/…` at a tracked or synced folder) and
@@ -192,12 +219,21 @@ export async function ensureDirInside(root: string, rel: string): Promise<string
   return cur;
 }
 
+/** Writes `har` to `<projectRoot>/.dart_tool/flutter_intercept/exports/<timestamp>.har`; returns the path. */
 export async function writeHar(projectRoot: string, har: Record<string, unknown>, now: Date = new Date()): Promise<string> {
+  return writeExportFile(projectRoot, JSON.stringify(har, null, 2), '.har', now);
+}
+
+/**
+ * CONTRACTS §13.8: writes `text` to `<projectRoot>/.dart_tool/flutter_intercept/exports/<timestamp><ext>` (e.g.
+ * `.openapi.json`) with the same safe-directory checks as `writeHar`; never replaces an existing file. Returns the path.
+ */
+export async function writeExportFile(projectRoot: string, text: string, ext: string, now: Date = new Date()): Promise<string> {
+  if (!/^(\.[a-z0-9_]+)+$/i.test(ext)) throw new Error(`unexpected export file extension ${JSON.stringify(ext)}`);
   const dir = await ensureDirInside(projectRoot, EXPORT_DIR);
   const stamp = now.toISOString().replace(/[:.]/g, '-');
-  const text = JSON.stringify(har, null, 2);
   for (let n = 1; ; n++) {
-    const name = n === 1 ? `${stamp}.har` : `${stamp}-${n}.har`;
+    const name = n === 1 ? `${stamp}${ext}` : `${stamp}-${n}${ext}`;
     try {
       // `wx`: never follows or replaces an existing entry (file or symlink planted in the folder).
       await fs.promises.writeFile(path.join(dir, name), text, { encoding: 'utf8', flag: 'wx' });

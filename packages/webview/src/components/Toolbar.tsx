@@ -1,14 +1,15 @@
-import { useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import { FILTER_HINT, parseFilter } from '../filter';
 import type { NetworkProfile } from '../protocol';
 import {
-  checkThrottle, customProfile, hasActiveFilters, hiddenBrowserCount, isProfileActive, pausedCount, PROFILE_CHOICES, profileChoice,
+  checkThrottle, customProfile, filterExchanges, hasActiveFilters, hiddenBrowserCount, isProfileActive, pausedCount, PROFILE_CHOICES, profileChoice,
   profileForChoice, profileLabel, throttleFieldsOf, type ProfileChoice, type ThrottleFields,
 } from '../state';
 import { STATUS_CLASSES } from '../util';
 import { authAlerts, INSECURE_TITLE, UPSTREAM_TITLE } from '../scenarios';
-import { Button } from './bits';
+import { EXPORT_FORMATS, EXPORT_LABEL, EXPORT_TITLE, exportScope } from '../exporting';
+import { Button, MenuButton, type MenuItem } from './bits';
 import { Icon } from './Icon';
 
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
@@ -116,6 +117,11 @@ export function Toolbar() {
               <Icon name="close" />
             </Button>
           )}
+          <button type="button" class="toggle wf-toggle" aria-pressed={state.showWaterfall}
+            title={state.showWaterfall ? 'Hide the timing waterfall column' : 'Show the timing waterfall column (DNS, connect, TLS, wait, download)'}
+            onClick={() => dispatch({ type: 'toggleWaterfall' })}>
+            <Icon name="timing" /> Waterfall
+          </button>
         </>
       )}
 
@@ -130,6 +136,13 @@ export function Toolbar() {
         </span>
       )}
       <span class="spacer" />
+      <ExportMenu />
+      <Button kind="icon" title={inEditor()
+        ? 'Move Flutter Intercept to its own window'
+        : 'Open Flutter Intercept in its own window (an editor tab you can move to another screen)'}
+        onClick={() => post({ type: 'openInNewWindow' })}>
+        <Icon name="window" />
+      </Button>
       {paused > 0 && (
         <button type="button" class="paused-alert" onClick={() => dispatch({ type: 'showPaused' })}
           title="Exchanges are waiting at a breakpoint. The app is blocked until you resume or abort them. Click to jump to the next one.">
@@ -138,6 +151,40 @@ export function Toolbar() {
         </button>
       )}
     </div>
+  );
+}
+
+/** The view is an editor tab / its own window (CONTRACTS §13.1): the host adds `fi-panel` only in the panel. */
+export function inEditor(): boolean {
+  return typeof document !== 'undefined' && !document.body.classList.contains('fi-panel') && !document.body.classList.contains('fi-sidebar');
+}
+
+/**
+ * CONTRACTS §13.5 "Export…": OpenAPI / Postman / HAR. While the list is filtered, only the HTTP exchanges it shows are
+ * exported (their ids go along); otherwise the host exports every HTTP exchange shown. The host asks about redaction
+ * and where to save, then answers `exported` (a notice).
+ */
+export function ExportMenu() {
+  const { state, post } = useApp();
+  const scope = useMemo(
+    () => exportScope(filterExchanges(state.exchanges, state.filters, state.contracts), hasActiveFilters(state.filters)),
+    [state.exchanges, state.filters, state.contracts],
+  );
+  const none = scope.count === 0;
+  const what = scope.filtered
+    ? `the ${scope.count} HTTP exchange${scope.count === 1 ? '' : 's'} the filter shows`
+    : `all ${scope.count} HTTP exchange${scope.count === 1 ? '' : 's'}`;
+  const items: MenuItem[] = EXPORT_FORMATS.map((format) => ({
+    label: `${EXPORT_LABEL[format]}…`,
+    title: none ? 'No HTTP exchanges to export' : `${EXPORT_TITLE[format]}. Exports ${what}.`,
+    disabled: none,
+    onSelect: () => post(scope.ids ? { type: 'export', format, ids: scope.ids } : { type: 'export', format }),
+  }));
+  return (
+    <MenuButton label="Export" class="export-menu" items={items}
+      title={none ? 'Export traffic as OpenAPI, Postman or HAR — no HTTP exchanges yet' : `Export ${what} as OpenAPI, Postman or HAR`}>
+      <Icon name="export" /> Export{scope.filtered ? ` (${scope.count})` : ''}… <Icon name="chevronDown" />
+    </MenuButton>
   );
 }
 

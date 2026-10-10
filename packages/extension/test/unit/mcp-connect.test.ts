@@ -236,11 +236,21 @@ describe('Connect AI Agent flow', () => {
     return ui;
   }
 
-  it('offers Claude Code, Cursor, Gemini CLI, Other', async () => {
+  it('offers Claude Code, Cursor, Gemini CLI, Windsurf, Other', async () => {
     const ui = fakeUi(undefined);
     await runConnectAgent(ui as ConnectUi, { url, token: tok });
-    expect(ui.items).toEqual(['Claude Code', 'Cursor', 'Gemini CLI', 'Other MCP client']);
+    expect(ui.items).toEqual(['Claude Code', 'Cursor', 'Gemini CLI', 'Windsurf', 'Other MCP client']);
     expect(ui.copied).toEqual([]);
+  });
+
+  it('Windsurf (CONTRACTS §13.8): copies an mcp_config.json snippet with serverUrl + headers, writes nothing', async () => {
+    const ui = fakeUi('windsurf');
+    await runConnectAgent(ui as ConnectUi, { url, token: tok });
+    expect(JSON.parse(ui.copied[0])).toEqual({ mcpServers: { 'flutter-intercept': { serverUrl: url, headers: { Authorization: `Bearer ${tok}` } } } });
+    expect(ui.copied).toHaveLength(1);
+    expect(ui.infos.at(-1)).toMatch(/mcp_config\.json/);
+    expect(ui.infos.at(-1)).toMatch(/Nothing was written/);
+    expect(() => connectSnippet('windsurf', 'http://evil.example/mcp', tok)).toThrow(/URL/);
   });
 
   it('Claude Code: copies; runs claude ONLY after the click', async () => {

@@ -78,6 +78,19 @@ and the traffic shows up.
   URLs. **Rewrite** changes headers, status or body text of real requests and responses.
 - `flutterIntercept.upstreamProxy` chains Flutter Intercept to Charles, Burp or a corporate proxy.
 
+**Timing, scripts and exports**
+- A **Waterfall** column shows where each request's time went: DNS, connect, TLS, sending, waiting for the server
+  and downloading, plus time held at a breakpoint or added by a simulated network. The **Timing** tab has the numbers
+  and says when a connection was reused.
+- **Script (JS)** rules run your own JavaScript on matching traffic: change a request before it leaves, change a
+  response before the app gets it, or answer locally. Scripts run isolated, with a time limit, and log to the request.
+- **Export…** turns recorded traffic into an **OpenAPI 3.1** document, a **Postman collection** or a HAR file, with
+  secrets redacted unless you choose otherwise.
+- A notification tells you when a request fails while the panel is hidden (`flutterIntercept.notifications`).
+- **Open in new window** moves the traffic view into a window of its own, for a second screen.
+- `flutter-intercept test` runs your integration tests through the proxy in CI, with shared rules, replay and
+  traffic assertions ([CI mode](#run-integration-tests-through-flutter-intercept-in-ci)).
+
 **Copy and resend**
 - **Copy as cURL**, **Copy as Dart (http)** or **Copy as Dio** from the detail pane or a row's right-click menu.
 - **Resend** a request unchanged, or **Edit and resend** it. The new request is listed with a link to the original.
@@ -205,13 +218,13 @@ Flutter Intercept reminds you of steps 3 and 4 once.
 
 AI coding agents can use Flutter Intercept the way you do. They can run the app, watch its requests, check what was
 sent, and fake server responses to test error states. This works with GitHub Copilot (agent mode), Claude Code,
-Cursor, and any client that speaks MCP (Model Context Protocol).
+Cursor, Windsurf, and any client that speaks MCP (Model Context Protocol).
 
 | What the agent can do | Tool |
 | --- | --- |
 | See whether the proxy and app sessions are running | `get_status` |
 | List recent requests (filter by URL, method, status, state) | `list_requests` |
-| Read one request in full (headers, bodies, timings, error) | `get_request` |
+| Read one request in full (headers, bodies, timing phases, script log, error) | `get_request` |
 | Wait until the app makes a matching request (with a timeout) | `wait_for_request` |
 | See requests paused at a breakpoint | `list_paused` |
 | List the rules in priority order | `list_rules` |
@@ -238,6 +251,8 @@ Cursor, and any client that speaks MCP (Model Context Protocol).
 | Make the next requests get 401, and read the token refresh flows | `expire_token`, `get_auth_flows` |
 | Send matching requests to a local server (agents: local targets only) | `add_map_remote` |
 | Change headers, status or body text of real requests and responses | `add_rewrite` |
+| Write the traffic as an OpenAPI 3.1 file or a Postman collection | `export_openapi`, `export_postman` |
+| Take a screenshot of the running app, with the requests just before it (asks you first) | `take_screenshot` |
 
 Over MCP there are also resources (`intercept://exchange/{id}`, `intercept://paused`, `intercept://rules`,
 `intercept://contract/{id}`) and prompts (`debug-failing-request`, `test-error-states`, `verify-change`,
@@ -252,10 +267,11 @@ In VS Code the tools are named `flutter_intercept_<tool>`; over MCP they use the
 
 - **GitHub Copilot (agent mode in VS Code):** nothing to set up. The tools are available as soon as the extension
   is installed.
-- **Claude Code, Cursor and other MCP clients:**
+- **Claude Code, Cursor, Windsurf and other MCP clients:**
   1. Run **Flutter Intercept: Connect AI Agent** and pick your client.
   2. The command copies the setup to the clipboard: the `claude mcp add …` command for Claude Code, an
-     `mcp.json` snippet for Cursor, or the URL and header for other clients.
+     `mcp.json` snippet for Cursor, an `mcp_config.json` snippet for Windsurf, or the URL and header for other
+     clients.
   3. Paste it into your client. The command never writes config files itself.
 - **The MCP server** runs at `http://127.0.0.1:<port>/mcp` (default port 47823) and accepts only local
   connections that carry its secret token.
@@ -374,27 +390,38 @@ endpoints.
 31. [Change headers, status or body text](#change-headers-status-or-body-text)
 32. [Chain to Charles, Burp or a corporate proxy](#chain-to-charles-burp-or-a-corporate-proxy)
 
+**Timing, scripts, exports and CI**
+
+33. [Open the traffic view in its own window](#open-the-traffic-view-in-its-own-window)
+34. [See where a request's time went](#see-where-a-requests-time-went)
+35. [Change requests and responses with a script](#change-requests-and-responses-with-a-script)
+36. [Export traffic as OpenAPI or Postman](#export-traffic-as-openapi-or-postman)
+37. [Get notified when requests fail](#get-notified-when-requests-fail)
+38. [Run integration tests through Flutter Intercept in CI](#run-integration-tests-through-flutter-intercept-in-ci)
+
 **Devices**
 
-33. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
-34. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
-35. [Run on a physical iPhone](#run-on-a-physical-iphone)
-36. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
+39. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
+40. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
+41. [Run on a physical iPhone](#run-on-a-physical-iphone)
+42. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
 
 **AI agents**
 
-37. [Connect an AI agent](#connect-an-ai-agent)
-38. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
-39. [Control what agents can see and do](#control-what-agents-can-see-and-do)
-40. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
-41. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
-42. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
+43. [Connect an AI agent](#connect-an-ai-agent)
+44. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
+45. [Control what agents can see and do](#control-what-agents-can-see-and-do)
+46. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
+47. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
+48. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
+49. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
 
 ### Run your app with interception
 
 You'll install the extension and see your app's requests in VS Code.
 
-1. Install **Flutter Intercept** from the Marketplace. VS Code also installs the Dart extension it needs.
+1. Install **Flutter Intercept** from the Marketplace (in Cursor, Windsurf or VSCodium: from Open VSX). The Dart
+   extension it needs is installed with it.
 2. Open your Flutter project, pick a device in the status bar, and press **F5**, as you always do.
 3. The **Traffic** panel opens at the bottom of VS Code on the first intercepted session.
 
@@ -720,19 +747,21 @@ far. Names are exact and case-sensitive; leave it empty for any operation.
 
 ### See requests from native clients and background isolates
 
-You'll find the requests Flutter Intercept can't intercept, instead of missing them.
+You'll see requests made outside your app's main isolate, and find the ones Flutter Intercept can't intercept.
 
-1. Run an app that uses `cupertino_http`, `cronet_http` or another native client, or makes requests in
-   `compute` / `Isolate.run`.
-2. Native requests appear marked **native**, read from the app's HTTP profile in debug and profile mode.
-3. A banner at the top of the panel names the native client or the background isolate; close it with
-   **Dismiss this warning**.
+1. Run an app in a debug session that makes requests in `compute`, `Isolate.run` or `Isolate.spawn`.
+2. Those requests appear in the list like any other; rules, breakpoints and mocks apply to them.
+3. Run an app that uses `cupertino_http`, `cronet_http` or another native client: its requests appear marked
+   **native**, read from the app's HTTP profile in debug and profile mode.
+4. A banner names what isn't intercepted (a native client, or a background isolate in profile mode or one started
+   with `Isolate.spawnUri`); close it with **Dismiss this warning**.
 
-**You should see:** native requests with what the HTTP profile recorded, but **Mock this**, **Block this**,
-**Break on this** and resend disabled: they never went through the proxy.
+**You should see:** background-isolate requests in the list. Native requests show what the HTTP profile recorded,
+with **Mock this**, **Block this**, **Break on this** and resend disabled: they never went through the proxy.
 
-**Tip:** filter with `captured:native`. Requests from a background isolate go direct, so rules don't apply to
-them. Turn native listing off with `flutterIntercept.nativeClients`.
+**Tip:** Flutter Intercept sets up each new isolate as it starts, in debug sessions only. Set
+`flutterIntercept.backgroundIsolates` to `warn` to leave isolates alone and only be told about them. Filter native
+requests with `captured:native`; turn that listing off with `flutterIntercept.nativeClients`.
 
 ### Share rules with your team
 
@@ -883,8 +912,120 @@ You'll send Flutter Intercept's outgoing traffic through another proxy.
 **You should see:** "via upstream proxy 127.0.0.1:8888" in the panel. With certificate checks off, it adds
 "certificate checks OFF".
 
-**Tip:** only the user setting counts, so a cloned repo can't reroute your traffic. Requests to `localhost` and the
+**Tip:** VS Code's own `http.proxy` setting doesn't apply to your app's traffic; use this setting instead. Only the
+user setting counts, so a cloned repo can't reroute your traffic. Requests to `localhost` and the
 emulator aliases go direct. Turn certificate checks off only for a proxy you run yourself.
+
+### Open the traffic view in its own window
+
+You'll move the traffic view to a second screen while the code stays in the main window.
+
+1. In the panel's title bar, click **Open Traffic in New Window** (or run it from the Command Palette).
+2. Drag the new window to another screen.
+
+**You should see:** the same traffic, rules and recordings in a window of its own, with the request list and the
+details side by side when it's wide enough.
+
+**Tip:** **Open Traffic in Editor** opens it as an editor tab instead. Both copies stay in sync with the bottom
+panel. Moving editors to a new window needs VS Code 1.85 or newer; older versions keep the tab.
+
+### See where a request's time went
+
+You'll find out whether a slow request waits on the network, the server or the download.
+
+1. Make sure **Waterfall** is on in the panel toolbar.
+2. Look at the **Waterfall** column: each bar sits where the request started and is split into phases. Hover it for
+   the numbers.
+3. Select a request and open the **Timing** tab.
+
+**You should see:** rows for DNS, connect, TLS, sending, waiting (time to first byte) and downloading, plus time held
+at a breakpoint or added by a simulated network, and the total. A reused connection is marked, with no DNS, connect
+or TLS.
+
+**Tip:** a long **waiting** phase is the server; long DNS, connect or TLS on every request means connections aren't
+reused. Mocked requests only show the delay you set. HAR exports carry the same timings.
+
+### Change requests and responses with a script
+
+You'll write a few lines of JavaScript that change traffic in ways a rule can't.
+
+1. **Add rule**, set the URL (for example `https://jsonplaceholder.typicode.com/todos/*`) and pick **Script (JS)**.
+2. Click **Start from the template**, or write your own:
+
+   ```js
+   function onRequest(request, context) {
+     request.headers['x-debug'] = '1';
+     return request;
+   }
+
+   function onResponse(response, request, context) {
+     const body = JSON.parse(response.body);
+     body.title = body.title.toUpperCase();
+     context.log('changed', request.url);
+     return { ...response, body: JSON.stringify(body) };
+   }
+   ```
+
+3. Click **Add rule** and use the app.
+
+**You should see:** the changed traffic, and the script's log lines in the request's **Script log**.
+
+**Tip:** `onRequest` can also return `{ response: { status, headers, body } }` to answer without contacting the
+server. Hooks must finish quickly (200 ms) and can't use timers, the network, files or `require`. If a script
+throws, the app gets a 502 and the log shows why. To share a script, pick **Edit script in a file**: shared
+scripts wait for your approval, like other rules that change traffic. AI agents can't add, change or read scripts.
+
+### Export traffic as OpenAPI or Postman
+
+You'll turn what your app actually sent and received into an API description or a collection.
+
+1. Use the app so the requests you want are in the list. Filter the list to export only some of them.
+2. Click **Export…** in the toolbar and pick **OpenAPI 3.1**, **Postman collection** or **HAR**.
+3. Choose **Redact secrets (recommended)** or **Keep values**, then where to save the file.
+
+**You should see:** a file with one path per route (`/users/{id}`), its query parameters, and request and response
+schemas inferred from every sample, with examples.
+
+**Tip:** the commands **Export Traffic as OpenAPI** and **Export Traffic as Postman Collection** do the same from
+the Command Palette. Keep values only for files that stay on your machine.
+
+### Get notified when requests fail
+
+You'll hear about failing requests even when the traffic panel is closed.
+
+1. Close or hide the panel and use the app.
+2. When a request fails (a network error or a 5xx), a notification names it.
+3. Click **Show** to open the panel at that request, or **Turn off** to stop the notifications.
+
+**You should see:** at most one notification every 10 seconds; failures in between are grouped
+("3 requests failed — latest: …").
+
+**Tip:** set `flutterIntercept.notifications` to `all` to include 4xx responses, or `off`. Failures you caused
+yourself (mocks, blocks, faults, offline) are never reported.
+
+### Run integration tests through Flutter Intercept in CI
+
+You'll run `integration_test` on a device or CI runner with your shared rules and check the traffic.
+
+1. Build the runner from this repository: `npm ci && npm run build`, then use
+   `node packages/cli/dist/cli.js`.
+2. From your Flutter project, run:
+
+   ```bash
+   node <repo>/packages/cli/dist/cli.js test integration_test/app_test.dart -d macos \
+     --har build/traffic.har --assert test/traffic.expect.json --junit build/traffic.xml
+   ```
+
+3. Optional: `--replay <recording>` answers from a recording, `--network-profile slow-3g` slows the network,
+   `--no-rules` ignores `.vscode/flutter-intercept.json`.
+
+**You should see:** the normal `flutter test` output, then a summary of the traffic and the assertions. The exit
+code is non-zero if a test or an assertion failed.
+
+**Tip:** shared rules that need approval in the editor are skipped unless you pass `--approve-shared-rules`.
+The expectations file is a list of `assert_traffic` checks, for example
+`[{"url": "*/todos/*", "expect": {"status": 200}}]`. Works on macOS, Android emulators and phones, and
+iOS simulators; not on physical iPhones or the web. See `packages/cli/README.md`.
 
 ### Run on an Android emulator or phone
 
@@ -948,8 +1089,9 @@ You'll let an AI coding agent see and drive your app's traffic.
 1. **GitHub Copilot (agent mode in VS Code):** nothing to set up. Open Chat in agent mode; the
    Flutter Intercept tools are listed in its tools picker. You can name one in a prompt, for example
    `#interceptListRequests`.
-2. **Claude Code, Cursor, Gemini CLI or another MCP client:** run **Flutter Intercept: Connect AI Agent** and pick
-   the client. The setup is copied to the clipboard; paste it into the client.
+2. **Claude Code, Cursor, Windsurf, Gemini CLI or another MCP client:** run **Flutter Intercept: Connect AI
+   Agent** and pick the client. The setup is copied to the clipboard; paste it into the client (for Windsurf, into
+   `mcp_config.json`).
 3. For Claude Code you can click **Add to Claude Code now** instead of pasting.
 
 **You should see:** the panel's status line show the agent as connected, and its last tool call.
@@ -1054,6 +1196,26 @@ You'll have an agent set up test scenarios and compare traffic for you.
 **Tip:** agents save recordings redacted unless they ask otherwise, may only map to local servers, and can't set
 request headers that carry credentials. Ask them to stop replaying and remove their rules when done.
 
+### Let agents export, time and take screenshots
+
+You'll have an agent document your API, chase slow requests and look at the screen.
+
+1. [Connect your agent](#connect-an-ai-agent), then run **Flutter Intercept: Add AI Agent Instructions** again
+   to pick up the new tools.
+2. Ask, for example:
+   - "Write an OpenAPI file for the requests the app made." (`export_openapi`)
+   - "Give me a Postman collection of the checkout flow." (`export_postman`)
+   - "Which requests took longer than a second, and where did the time go?" (`list_requests` with
+     `slowerThanMs`, `get_request` timings)
+   - "Open the profile screen and show me what it looks like." (`take_screenshot`)
+3. Approve each screenshot when the client asks.
+
+**You should see:** export files under `.dart_tool/flutter_intercept/exports/`, and screenshots under
+`.dart_tool/flutter_intercept/screenshots/` with the requests made just before each one.
+
+**Tip:** screenshots can show personal data on screen; turn them off with `flutterIntercept.agent.screenshots`.
+Exports follow `flutterIntercept.agent.redactSecrets`.
+
 ## Settings and commands
 
 | Setting | Default | Description |
@@ -1062,9 +1224,12 @@ request headers that carry credentials. Ask them to stop replaying and remove th
 | `flutterIntercept.port` | `8899` | Port of the local proxy. If it's busy, the next free port up to 8999 is used. A change applies at the next launch when no intercepted session is running. |
 | `flutterIntercept.agent.access` | `readWrite` | What AI agents may do: `readWrite`, `readOnly` or `off`. See [Use with AI agents](#use-with-ai-agents). |
 | `flutterIntercept.agent.redactSecrets` | `true` | Show secrets (auth headers, cookies, tokens, passwords) to agents as `[redacted]`. |
+| `flutterIntercept.agent.screenshots` | `true` | Let agents take screenshots of the running app (`take_screenshot`); each one asks for your confirmation. |
 | `flutterIntercept.captureSource` | `true` | Record which line of your code made each request (see [Where a request came from](#features)). Applies at the next launch. Flutter sessions only: plain Dart programs can't take the setting (the Dart VM rejects `--dart-define`) and always record. |
 | `flutterIntercept.web.enabled` | `true` | Intercept Flutter Web apps launched in Chrome from VS Code. |
 | `flutterIntercept.nativeClients` | `profile` | List requests of native HTTP clients (cupertino_http, cronet_http) read-only from the app's HTTP profile, or `off`. |
+| `flutterIntercept.backgroundIsolates` | `intercept` | Requests from background isolates (`compute`, `Isolate.run`, `Isolate.spawn`) go through Flutter Intercept too, in debug sessions. `warn` only tells you about them. |
+| `flutterIntercept.notifications` | `errors` | Notify when the app's requests fail while the panel is hidden: `errors` (network errors, 5xx), `all` (also 4xx) or `off`. |
 | `flutterIntercept.contractCheck` | `true` | Check JSON responses against your json_serializable / freezed models and show fields that would make `fromJson` throw. |
 | `flutterIntercept.rewriteLocalhost` | `true` | Requests to `10.0.2.2` / `10.0.3.2` (the emulator's names for your Mac) go to your Mac's `localhost`. Never applies to iPhones. |
 | `flutterIntercept.agent.mcpPort` | `47823` | Port of the local MCP server for agents. If it's busy, the next free port is used. |
@@ -1078,10 +1243,13 @@ cloned project can't reroute your traffic or widen agent access.
 | Command | What it does |
 |---|---|
 | **Flutter Intercept: Open Traffic Panel** | Shows the Traffic panel. It also opens by itself on the first intercepted session. |
+| **Flutter Intercept: Open Traffic in Editor** | Opens the traffic view as an editor tab. |
+| **Flutter Intercept: Open Traffic in New Window** | Opens the traffic view in a window of its own (VS Code 1.85+). |
+| **Flutter Intercept: Export Traffic as OpenAPI** / **as Postman Collection** | Writes the recorded traffic to an OpenAPI 3.1 file or a Postman collection. |
 | **Flutter Intercept: Toggle Interception** | Same as clicking `Intercept: on/off` in the status bar. |
 | **Flutter Intercept: Clear Traffic** | Clears the list. Requests still in flight stay. |
 | **Flutter Intercept: Debug with Intercept** | Starts an intercepted debug session directly. A fallback if F5 isn't picked up. |
-| **Flutter Intercept: Connect AI Agent** | Copies the setup for Claude Code, Cursor or another MCP client to the clipboard. |
+| **Flutter Intercept: Connect AI Agent** | Copies the setup for Claude Code, Cursor, Windsurf, Gemini CLI or another MCP client to the clipboard. |
 | **Flutter Intercept: Add AI Agent Instructions** | Adds or updates the Flutter Intercept section in `AGENTS.md`, `CLAUDE.md` or `.github/copilot-instructions.md`. |
 
 ## Limitations
@@ -1092,8 +1260,9 @@ What isn't intercepted, or behaves differently while intercepting:
   fallback: if the proxy stops, the page loses network until you restart the session.
 - **Native HTTP stacks**: `cronet_http`, `cupertino_http`, `native_dio_adapter` bypass `dart:io`. Their requests
   are listed read-only (from the app's HTTP profile) but can't be mocked, paused or blocked.
-- **Background isolates** (`compute`, `Isolate.run`, `Isolate.spawn`): `HttpOverrides` apply per isolate, so
-  clients created there go direct. A banner tells you when the app starts one.
+- **Background isolates**: intercepted in debug sessions only. In profile mode, and for isolates started with
+  `Isolate.spawnUri`, their requests go direct and a banner tells you. Requests from very short-lived isolates may
+  have no source line.
 - **Apps that install their own `HttpOverrides` zone** (`HttpOverrides.runWithHttpOverrides` or `runZoned`
   around their code): the inner zone wins.
   - Setting `HttpOverrides.global` is fine: your overrides still apply underneath.
@@ -1109,7 +1278,12 @@ What isn't intercepted, or behaves differently while intercepting:
 - **Recordings** hold finished HTTP exchanges only: WebSocket, SSE and native-client traffic isn't saved or
   replayed.
 - **Rewrite** body replacements are plain text (no regexes, up to 20 per body); binary bodies are left untouched.
-- **Shared rules** that could redirect or alter your traffic don't run on a machine until they're approved there.
+- **Shared rules** that could redirect or alter your traffic, and every shared script, don't run on a machine until
+  they're approved there.
+- **Scripts** are synchronous, get 200 ms per call and no timers, network, files or modules. Bodies over 1 MB or
+  binary bodies reach them as omitted. They don't apply to WebSockets.
+- **Screenshots** capture Flutter's own content (not the status bar or native dialogs) when taken through the debug
+  connection; on macOS desktop, web and physical iPhones they need that connection.
 - **What the panel keeps**: bodies are shown up to 5 MB, after which they're marked truncated. Recorded traffic
   is cleared when the window reloads; rules are kept.
 

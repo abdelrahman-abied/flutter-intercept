@@ -13,7 +13,8 @@ the target is outside the project root, `_<first 8 hex of sha1(path)>` is append
 The **content is device independent** (same bytes for an emulator and a simulator session).
 Uses **dart:io, dart:async and dart:convert only** — never adds a dependency to the app.
 
-Template v4 (placeholders in `{{ }}`) — v3 plus request → source (§9.1), validated on Android emulator + iOS
+Template v5 (placeholders in `{{ }}`) — v4 plus `flutterInterceptInstall()` for background isolates (§13.3,
+docs/spikes/background-isolates.md); v4 = v3 plus request → source (§9.1), validated on Android emulator + iOS
 simulator and Dart SDKs 3.0–3.13 (docs/spikes/template-v4.md; v3: docs/spikes/template-v3.md). It **trusts** this
 install's CA (below) instead of accepting any certificate:
 proxy leaf certificates pass normal chain + hostname verification; the `; DIRECT` fallback is verified exactly
@@ -411,10 +412,28 @@ class _InterceptedHttpClient implements HttpClient {
   }
 }
 
-Future<void> main(List<String> args) async {
+// Statics, and so HttpOverrides.global, are per isolate. In debug sessions Flutter Intercept calls
+// flutterInterceptInstall through the VM service in every new isolate of the app (compute,
+// Isolate.run, Isolate.spawn) while it is paused at start, before any of its code runs (CONTRACTS
+// §13.3). The main isolate installs from main below; a second call is a no-op.
+_FlutterInterceptOverrides? _installed;
+
+_FlutterInterceptOverrides _install() {
+  final existing = _installed;
+  if (existing != null) return existing;
   _trustCa(SecurityContext.defaultContext);
   final overrides = _FlutterInterceptOverrides(HttpOverrides.current);
   HttpOverrides.global = overrides;
+  return _installed = overrides;
+}
+
+@pragma('vm:entry-point')
+void flutterInterceptInstall() {
+  _install();
+}
+
+Future<void> main(List<String> args) async {
+  final overrides = _install();
   // Zone value wins over a later `HttpOverrides.global = ...` inside the app.
   await HttpOverrides.runWithHttpOverrides(() {
     if (!_traceChains) return _runTarget(args);
@@ -1304,3 +1323,45 @@ screenshot}/types.ts`, `rules/types.ts` (`resolveScriptFile`), `vm/types.ts` (`b
 - `package.json` script `publish:ovsx` (`npx ovsx publish flutter-intercept.vsix`, token from `OVSX_PAT`, run by the
   owner only). Metadata checked for Open VSX (license file, repository, icon, no proposed APIs); `Dart-Code.dart-code`
   exists there. README "Install" mentions Open VSX (Cursor, Windsurf, VSCodium).
+
+### 13.11 As built (v0.7.0)
+- **Timings** (docs/spikes/proxy-0.7.md): upstream phases come from a per-request view of whichever agent the rule
+  uses (pool, LAN-guarded, upstream proxy, one-off agent for WebSocket upgrades); `connectMs` starts at the first
+  `connectionAttempt` (Node ≥ 20.12) else the lookup; a TLS socket inside an upstream proxy's tunnel has no
+  `connectMs`/`tlsMs`; kbps pacing shows in `receiveMs`, not `delayMs`. Phases ride on the next 'exchange' event.
+  HAR: unknown `send`/`wait`/`receive` are 0 (HAR requires ≥ 0), optional phases -1; a reused connection gets
+  `_reusedConnection: true`.
+- **Scripts**: hooks are top-level `function` / `let` / `const` named `onRequest` / `onResponse`; a returned field
+  that is absent means unchanged (return `body: ''` to empty it), partial objects and `null` (= unchanged) accepted;
+  a Promise result is an error. Response buffering is decided from the source text mentioning `onResponse`. The
+  offline profile wins over a script; throttle latency is added before forwarding. The vm sandbox is a
+  null-prototype context (`this.constructor.constructor` is the blocked context `Function`). `ruleFromExchange(e,
+  'script')` returns `SCRIPT_TEMPLATE`; exports `MAX_SCRIPT_BYTES`, `SCRIPT_TEMPLATE`. The host reads `script.file`
+  into `code` (the file wins), passing the rule id so shared rules resolve in their folder and are re-checked
+  against the approved hash; unreadable / unapproved → skipped with a `scriptFile:<id>` warning. Shared script
+  rules: reason "runs JavaScript from the repository (<file>)"; inline code is secret-checked when shared. Agents
+  may `remove_rule` a script rule (removal only).
+- **Export**: only `completed` / `mocked` exchanges with a status; methods OpenAPI can't express are skipped (kept
+  in Postman). Path segments that look like credentials become path params (never examples). Postman: one request
+  per GraphQL operation. With no `ids` the panel exports every finished app exchange except browser-internal ones;
+  the panel's HAR keeps WebSocket/SSE frames.
+- **Notifications**: excluded by state (`mocked`/`blocked`), `initiator`, `browserInternal` and proxy-caused
+  `simulated` labels (faults, offline, replay misses, rewritten status); a script that throws still counts.
+  Failures while the panel is visible are dropped, not queued. Text: path without host/query, credentials redacted.
+- **Agent tools**: `take_screenshot` is MCP `readOnlyHint: false` so clients confirm; several running sessions and no
+  `sessionId` → error listing them; PNGs > 16 MB are not sent inline. `export_*` with nothing matching →
+  `not_found`.
+- **CLI** (docs/spikes/ci.md): `flutter test` only runs a file as an on-device integration test when its path starts
+  with `<project>/integration_test`, and calls a zero-argument `main`; the CLI writes
+  `integration_test/.flutter_intercept/<entry>_fi.dart` (imports the generated entry, `main() => entry.main(const
+  [])`; not `*_test.dart`; folder gitignored and deleted after the run). Exit codes: 2 usage/setup error, 128+signal
+  when interrupted. `run` prints the `flutter run -t <entry> --dart-define=…` command and waits for a signal.
+  Breakpoint rules are turned off headless. Only `emulator-*` gets `10.0.2.2`; web devices and physical iOS are
+  refused. `--no-redact` writes the HAR 0600; `--record` is never redacted. One run per project at a time.
+- **REVIEW-7** (docs/REVIEW-7.md): personal script files need content approval too (per file, workspaceState
+  `flutterIntercept.approvedScriptFiles`); `openBodyFile` / `openScriptFile` carry `ruleId`; `notifications` is
+  user-only; script contexts lack `FinalizationRegistry` / `WeakRef` / `SharedArrayBuffer` / `Atomics` /
+  `WebAssembly`, > 64 MB external memory restarts the worker, queue ≤ 100 with a 2 s wait; CLI exit 129 on SIGHUP,
+  world-writable / foreign-owned rules files refused (exit 2). The proxy sends requests carrying its own agents to
+  `node:http(s)` so VS Code's `http.proxySupport` patch can't replace them (REVIEW-7 #14): pass-through traffic
+  ignores VS Code's `http.proxy`; use `flutterIntercept.upstreamProxy`.

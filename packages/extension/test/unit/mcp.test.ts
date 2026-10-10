@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { AgentToolError, READ_TOOLS, WRITE_TOOLS, type AgentTools, type ToolName, type ToolResult } from '../../src/agent/types';
+import { AgentToolError, READ_TOOLS, TOOL_IMAGES, WRITE_TOOLS, type AgentTools, type ToolName, type ToolResult } from '../../src/agent/types';
 import { bearerOk, generateToken, mcpTesting, startMcpServer, type RunningMcpServer } from '../../src/agent/mcp/server';
 import { connectSnippet } from '../../src/agent/mcp/connect';
 
@@ -22,6 +22,7 @@ const schemas: Partial<Record<ToolName, object>> = {
   list_rules: z.object({}),
   add_mock: z.object({ url: z.string(), status: z.number().int().optional(), body: z.union([z.string(), z.record(z.string(), z.unknown())]) }),
   remove_rule: z.object({ ruleId: z.string() }),
+  take_screenshot: z.object({ sessionId: z.string().optional() }),
 };
 
 class FakeTools implements AgentTools {
@@ -35,6 +36,11 @@ class FakeTools implements AgentTools {
         return { proxyRunning: true, port: 8899, pausedCount: 0 };
       case 'add_mock':
         return { ruleId: 'rule-1', echo: input };
+      case 'take_screenshot': {
+        const r: ToolResult = { path: '/p/s.png', method: 'adb', width: 2 };
+        Object.defineProperty(r, TOOL_IMAGES, { value: [{ data: Buffer.from('PNG').toString('base64'), mimeType: 'image/png' }], enumerable: false });
+        return r;
+      }
       case 'get_request':
         throw new AgentToolError(`No request with id ${String(input.id)}.`, 'not_found');
       case 'list_rules':
@@ -206,9 +212,10 @@ describe('MCP server: tools', () => {
     const idempotentWrites = new Set(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'replay_recording']); // §12.7: same input, same replay state
     for (const t of listed) {
       const write = (WRITE_TOOLS as readonly string[]).includes(t.name);
-      expect(t.annotations?.readOnlyHint, t.name).toBe(!write);
+      const confirmed = t.name === 'take_screenshot'; // CONTRACTS §13.8: a read the client must confirm
+      expect(t.annotations?.readOnlyHint, t.name).toBe(!write && !confirmed);
       expect(t.annotations?.destructiveHint, t.name).toBe(write && destructive.has(t.name));
-      expect(t.annotations?.idempotentHint, t.name).toBe(!write || idempotentWrites.has(t.name)); // CONTRACTS §9.5
+      expect(t.annotations?.idempotentHint, t.name).toBe((!write && !confirmed) || idempotentWrites.has(t.name)); // CONTRACTS §9.5
       expect(t.annotations?.openWorldHint, t.name).toBe(t.name === 'resend_request' || t.name === 'add_map_remote'); // REVIEW-6 #12
       expect(t.description, t.name).toBeTruthy();
       expect(t.inputSchema.type).toBe('object');
@@ -227,6 +234,16 @@ describe('MCP server: tools', () => {
     const mock = await c.callTool({ name: 'add_mock', arguments: { url: 'https://api.example.com/users*', status: 500, body: { error: 'x' } } });
     expect(mock.structuredContent).toMatchObject({ ruleId: 'rule-1', echo: { url: 'https://api.example.com/users*', status: 500, body: { error: 'x' } } });
     expect(tools.calls.map((x) => x.tool)).toEqual(['get_status', 'add_mock']);
+  });
+
+  it('take_screenshot (CONTRACTS §13.8): image content first, then the JSON text; the image is not in structuredContent', async () => {
+    const c = await connect();
+    const r = await c.callTool({ name: 'take_screenshot', arguments: {} });
+    const content = r.content as Array<{ type: string; data?: string; mimeType?: string; text?: string }>;
+    expect(content[0]).toEqual({ type: 'image', data: Buffer.from('PNG').toString('base64'), mimeType: 'image/png' });
+    expect(content[1].type).toBe('text');
+    expect(JSON.parse(content[1].text!)).toEqual({ path: '/p/s.png', method: 'adb', width: 2 });
+    expect(r.structuredContent).toEqual({ path: '/p/s.png', method: 'adb', width: 2 });
   });
 
   it('invalid input never reaches AgentTools', async () => {

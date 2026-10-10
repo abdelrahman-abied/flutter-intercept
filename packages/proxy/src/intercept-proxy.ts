@@ -86,6 +86,20 @@ import { describeProfile, NO_PROFILE, type NetworkProfile } from './network';
 import { mutateBody } from './mutate';
 import { isTraceHost, isTraceUrl, parseTraceBody, TraceJoin, TRACE_BODY_MAX, TRACE_HEADER, TRACE_ID_RE, TRACE_PATH } from './trace';
 import type { Shaping } from './shaper';
+import { elapsed, type TimingPatch, type TimingSink } from './timing';
+import {
+  mentionsOnResponse,
+  readRequestResult,
+  readResponseResult,
+  sameHeaders,
+  scriptRequestOf,
+  scriptResponseOf,
+  ScriptRunner,
+  SCRIPT_LOG_MAX_CHARS,
+  SCRIPT_LOG_MAX_LINES,
+  type RequestOutcome,
+  type ScriptOutcome,
+} from './script';
 import type {
   Body,
   Exchange,
@@ -106,6 +120,7 @@ import type {
 /** The action a request gets: the rule's, or the current sequence step's (undefined = pass through). */
 type Applied = Exclude<RuleAction, { kind: 'sequence' }> | undefined;
 type RewriteAction = Extract<RuleAction, { kind: 'rewrite' }>;
+type ScriptAction = Extract<RuleAction, { kind: 'script' }>;
 
 interface RewriteFlow {
   request?: RewriteSpec;
@@ -196,6 +211,14 @@ interface Flow {
   localError?: string;
   /** Hooked routes: the Host header to send when it isn't the URL's (preserveHost, a rewritten Host). */
   wantHost?: string;
+  /** mockttp's timing events of the request (CONTRACTS §13.2 `requestMs`). */
+  te?: RequestTimingEvents;
+}
+
+/** The part of mockttp's TimingEvents we read (high-resolution `performance.now()` timestamps). */
+interface RequestTimingEvents {
+  startTimestamp?: number;
+  bodyReceivedTimestamp?: number;
 }
 
 /** Recording state of a WebSocket / event stream. */
@@ -418,6 +441,10 @@ export class InterceptProxy extends EventEmitter {
   private upstreamSpec?: UpstreamProxySpec;
   /** Upstream-proxy agents for LAN sockets, per gate (they check the final target). */
   private readonly lanUpstream = new WeakMap<LanGate, UpstreamAgents>();
+  /** CONTRACTS §13.2: the request each downstream connection is serving (for the upstream phase timings). */
+  private readonly connRequest = new WeakMap<object, string>();
+  /** CONTRACTS §13.4: the worker that runs script rules (started on the first hook call). */
+  private readonly scripts = new ScriptRunner();
 
   constructor(private readonly opts: InterceptProxyOptions) {
     super();
@@ -454,6 +481,7 @@ export class InterceptProxy extends EventEmitter {
       maxBodySize: BODY_CAP_BYTES,
     });
     const pool = createUpstreamPool({ rewriteLocalhost: this.opts.rewriteLocalhost ?? true });
+    pool.setTimings((connection) => this.timingSink(connection));
     const connection = {
       proxyConfig: pool.proxyConfig, // marks our rules for the shared upstream pool
       ignoreHostHttpsErrors: this.opts.ignoreUpstreamCertErrors ?? false,
@@ -685,6 +713,7 @@ export class InterceptProxy extends EventEmitter {
     for (const settle of [...this.holds.values()]) settle(false);
     for (const c of this.sendClients) c.destroy();
     this.sendClients.clear();
+    this.scripts.stop();
     await server.stop();
     this.pool?.destroy();
     this.pool = undefined;
@@ -824,6 +853,17 @@ export class InterceptProxy extends EventEmitter {
       else this.markSpent(rule.id, reason); // e.g. times lowered below the hits, or already expired
     }
     this.armExpiryTimers();
+    // CONTRACTS §13.4: the worker runs while an enabled script rule exists.
+    this.scripts.setScripts(
+      this.compiled
+        .filter(({ rule }) => rule.enabled && rule.action?.kind === 'script')
+        .map(({ rule }) => ({ ruleId: rule.id, code: (rule.action as ScriptAction).code })),
+    );
+  }
+
+  /** CONTRACTS §13.4: the script worker thread is running (status / tests). */
+  get scriptWorkerRunning(): boolean {
+    return this.scripts.running;
   }
 
   /**
@@ -1279,6 +1319,40 @@ export class InterceptProxy extends EventEmitter {
     else delete ex.graphql;
   }
 
+  // ---------------------------------------------------------------- timings (CONTRACTS §13.2)
+
+  /**
+   * Upstream phases from the pooled agents (src/timing.ts). A live exchange carries them with its next 'exchange'
+   * event (no event per phase); one that already finished gets an event of its own.
+   */
+  private addTimings(id: string, patch: TimingPatch): void {
+    const live = this.live.get(id);
+    const ex = live?.ex ?? this.store.get(id);
+    if (!ex || ex.captured || !Object.keys(patch).length) return;
+    ex.timings = { ...ex.timings, ...patch };
+    if (!live) this.emitChange(ex);
+  }
+
+  /** Add to an accumulated phase (breakpoint holds, delays). Integer ms ≥ 0. */
+  private addPhase(ex: Exchange, key: 'pausedMs' | 'delayMs', ms: number): void {
+    const add = Math.max(0, Math.round(ms));
+    ex.timings = { ...ex.timings, [key]: (ex.timings?.[key] ?? 0) + add };
+  }
+
+  /** `requestMs` (start → the whole request received), once known; never overwritten. */
+  private setRequestMs(ex: Exchange, te: RequestTimingEvents | undefined, end?: number): void {
+    if (ex.timings?.requestMs !== undefined || te?.startTimestamp === undefined) return;
+    const at = end ?? te.bodyReceivedTimestamp;
+    if (at === undefined) return;
+    ex.timings = { ...ex.timings, requestMs: elapsed(te.startTimestamp, at) };
+  }
+
+  /** The timing sink for the request a downstream connection is serving (upstream-pool.ts). */
+  private timingSink(connection: unknown): TimingSink | undefined {
+    const id = connection && typeof connection === 'object' ? this.connRequest.get(connection) : undefined;
+    return id ? (p) => this.addTimings(id, p) : undefined;
+  }
+
   // ---------------------------------------------------------------- request → source
 
   /** Preprocessing: take x-fi-id / x-fi-send off the request (headers and raw headers) and remember them. */
@@ -1450,6 +1524,8 @@ export class InterceptProxy extends EventEmitter {
   }
 
   private finish(ex: Exchange, state: Exchange['state']): void {
+    const live = this.live.get(ex.id);
+    if (live?.ex === ex) this.setRequestMs(ex, live.flow.te);
     ex.state = state;
     ex.durationMs = Date.now() - ex.startedAt;
     delete ex.pausedAt;
@@ -1482,9 +1558,11 @@ export class InterceptProxy extends EventEmitter {
       };
       this.paused.set(id, { phase, settle });
     });
+    const since = ex.pausedAt;
     return decision.then((d) => {
       delete ex.pausedAt;
       delete ex.pauseDeadline;
+      this.addPhase(ex, 'pausedMs', Date.now() - since);
       return d;
     });
   }
@@ -1530,11 +1608,19 @@ export class InterceptProxy extends EventEmitter {
     if (meta?.traceId) flow.traceId = meta.traceId;
     if (send) flow.send = send;
     // Keyed on the socket, like every LAN guard (also for requests inside a LAN CONNECT tunnel).
-    if (lanGateOf((req as unknown as { socket?: unknown }).socket)) flow.viaLan = true;
+    const socket = (req as unknown as { socket?: unknown }).socket;
+    if (lanGateOf(socket)) flow.viaLan = true;
+    if (socket && typeof socket === 'object') this.connRequest.set(socket, req.id);
+    flow.te = (req as unknown as { timingEvents?: RequestTimingEvents }).timingEvents;
     const latency = flow.throttle?.latencyMs;
     if (flow.route === 'plain' && latency && latency > 0) {
       // Before forwarding, without reading the body: the route matcher waits on this.
-      flow.delay = sleep(latency).then(() => this.live.has(req.id));
+      const from = performance.now();
+      flow.delay = sleep(latency).then(() => {
+        const live = this.live.get(req.id);
+        if (live) this.addPhase(live.ex, 'delayMs', performance.now() - from);
+        return !!live;
+      });
     }
 
     this.flows.set(req.id, flow);
@@ -1581,6 +1667,13 @@ export class InterceptProxy extends EventEmitter {
         note ??= `Rewrite rule: body replacement skipped: ${why} (headers and status were still rewritten).`;
       }
       flow = { route, rule, action, rewrite: rw, simulated: rewriteLabel(rw) };
+    } else if (action.kind === 'script') {
+      // CONTRACTS §13.4: hooked like a request breakpoint (onRequest gets the body), and buffered like a response
+      // breakpoint when the script may define onResponse. A body that can't be held skips the script.
+      const why = bodyLimitReason(headers);
+      flow = why
+        ? { route: 'plain', rule, note: `Script skipped: ${why}, so it was passed through unchanged.` }
+        : { route: mentionsOnResponse(action.code) ? 'h2' : 'h1', rule, action };
     } else if (action.kind !== 'breakpoint' && action.kind !== 'mutate') {
       flow = { route: 'h1', rule, action };
     } else {
@@ -1599,7 +1692,7 @@ export class InterceptProxy extends EventEmitter {
     // rewrite and throttle rules — whose own settings win over a throttle profile). Mock / block / fault answer as set.
     const k = action?.kind;
     const reachesNetwork =
-      !action || k === 'breakpoint' || k === 'mutate' || k === 'throttle' || k === 'cors' || k === 'mapRemote' || k === 'rewrite';
+      !action || k === 'breakpoint' || k === 'mutate' || k === 'throttle' || k === 'cors' || k === 'mapRemote' || k === 'rewrite' || k === 'script';
     const p = this.profile;
     if (reachesNetwork && !flow.localError && p.kind === 'offline') {
       flow = { route: 'h1', rule, fault: 'dns', simulated: describeProfile(p) };
@@ -1689,6 +1782,7 @@ export class InterceptProxy extends EventEmitter {
     this.applyShaping(tap, flow);
     tap.onRequestEnd = () => {
       const live = this.live.get(req.id);
+      if (live) this.setRequestMs(live.ex, live.flow.te, performance.now());
       if (live && live.ex.state === 'pending' && live.flow.route === 'plain') {
         void this.requestBodyFromTap(tap, live.ex).then((b) => {
           if (!this.live.has(req.id)) return;
@@ -1943,6 +2037,8 @@ export class InterceptProxy extends EventEmitter {
     }
     const ex = this.newExchange(req, flow);
     this.setRequestBody(ex, body);
+    flow.te ??= req.timingEvents;
+    this.setRequestMs(ex, flow.te, flow.te?.bodyReceivedTimestamp ?? performance.now());
     const action = flow.action;
 
     if (flow.preflight) return this.answerPreflight(req, ex, flow);
@@ -1951,14 +2047,7 @@ export class InterceptProxy extends EventEmitter {
 
     if (flow.localError) {
       this.track(ex, flow);
-      const text = `Flutter Intercept: ${flow.localError}`;
-      const headers: HeaderBag = { 'content-type': 'text/plain; charset=utf-8' };
-      const rawBody = frameBody(Buffer.from(text, 'utf8'), headers);
-      ex.status = 502;
-      ex.responseHeaders = cleanHeaders(headers);
-      ex.responseBody = { text, encoding: 'utf8' };
-      this.fail(ex, flow.localError);
-      return { response: { statusCode: 502, statusMessage: STATUS_CODES[502], headers, rawBody } };
+      return { response: this.localFailure(ex, flow.localError) };
     }
 
     if (flow.replay && flow.replay !== 'deferred') return this.answerReplay(ex, flow, flow.replay);
@@ -1966,7 +2055,9 @@ export class InterceptProxy extends EventEmitter {
     if (action?.kind === 'mock') {
       this.track(ex, flow);
       if (action.delayMs && action.delayMs > 0) {
+        const from = performance.now();
         await sleep(action.delayMs);
+        this.addPhase(ex, 'delayMs', performance.now() - from);
         if (ex.state !== 'pending') return { response: 'close' }; // client left during the delay
       }
       const headers: HeaderBag = { ...(action.headers ?? {}) };
@@ -2001,6 +2092,8 @@ export class InterceptProxy extends EventEmitter {
       return { response: { statusCode: status, statusMessage: STATUS_CODES[status], headers, rawBody } };
     }
 
+    if (action?.kind === 'script') return this.scriptRequest(req, ex, flow, action, body);
+
     if (action?.kind === 'breakpoint' && action.phase !== 'response') {
       const decision = this.pause(ex, 'request');
       this.track(ex, flow);
@@ -2021,6 +2114,114 @@ export class InterceptProxy extends EventEmitter {
     if (!(await this.latency(ex, flow))) return { response: 'close' };
     if (flow.map || flow.rewrite?.request || flow.wantHost) return this.forwardChanges(req, ex, flow, body);
     return undefined;
+  }
+
+  /** A 502 answered by the proxy (`Flutter Intercept: <error>`); the exchange ends 'error' with `error`. */
+  private localFailure(ex: Exchange, error: string): CallbackResponseMessageResult & { statusCode: number } {
+    const text = `Flutter Intercept: ${error}`;
+    const headers: HeaderBag = { 'content-type': 'text/plain; charset=utf-8' };
+    const rawBody = frameBody(Buffer.from(text, 'utf8'), headers);
+    ex.status = 502;
+    ex.responseHeaders = cleanHeaders(headers);
+    ex.responseBody = { text, encoding: 'utf8' };
+    this.fail(ex, error);
+    return { statusCode: 502, statusMessage: STATUS_CODES[502], headers, rawBody };
+  }
+
+  // ---------------------------------------------------------------- script rules (CONTRACTS §13.4)
+
+  /** Run a hook of the flow's script rule; its log lines go to `scriptLog`. */
+  private async runScript(ex: Exchange, flow: Flow, action: ScriptAction, hook: 'onRequest' | 'onResponse', args: unknown[]): Promise<ScriptOutcome> {
+    const rule = flow.rule;
+    const id = rule?.id ?? '';
+    const out = await this.scripts.run(id, rule?.name || id, action.code, hook, args, { ruleId: id, exchangeId: ex.id });
+    if (out.lines.length) ex.scriptLog = [...(ex.scriptLog ?? []), ...out.lines].slice(0, SCRIPT_LOG_MAX_LINES);
+    return out;
+  }
+
+  /** "Script <rule name>: <message>", also added as the last scriptLog line (room is made for it). */
+  private scriptError(ex: Exchange, flow: Flow, message: string): string {
+    const text = `Script ${flow.rule?.name || flow.rule?.id || ''}: ${message}`.slice(0, 2 * SCRIPT_LOG_MAX_CHARS);
+    ex.scriptLog = [...(ex.scriptLog ?? []).slice(0, SCRIPT_LOG_MAX_LINES - 1), text.slice(0, SCRIPT_LOG_MAX_CHARS)];
+    return text;
+  }
+
+  /**
+   * onRequest: forward unchanged (undefined), forward the edited request (re-framed like a request edit), or answer
+   * locally (`{response}`, like a mock: state 'mocked'). A throw, timeout or invalid result → 502, state 'error'.
+   */
+  private async scriptRequest(
+    req: CompletedRequest,
+    ex: Exchange,
+    flow: Flow,
+    action: ScriptAction,
+    body: Body | undefined,
+  ): Promise<CallbackRequestResult | undefined> {
+    this.track(ex, flow);
+    const input = scriptRequestOf(ex.method, ex.url, ex.requestHeaders, body);
+    const out = await this.runScript(ex, flow, action, 'onRequest', [input]);
+    if (this.live.get(ex.id)?.ex !== ex || ex.state !== 'pending') return { response: 'close' }; // the app left
+    let plan: RequestOutcome | undefined;
+    let error = out.error;
+    if (error === undefined && out.value !== undefined) {
+      try {
+        plan = readRequestResult(out.value);
+      } catch (e) {
+        error = (e as Error).message;
+      }
+    }
+    if (error !== undefined) return { response: this.localFailure(ex, this.scriptError(ex, flow, error)) };
+    if (plan?.kind === 'respond') {
+      const headers: HeaderBag = { ...plan.headers };
+      this.addCorsToLocalResponse(ex, headers);
+      const decoded = Buffer.from(plan.body, 'utf8');
+      const rawBody = frameBody(decoded, headers);
+      ex.status = plan.status;
+      ex.responseHeaders = cleanHeaders(headers);
+      ex.responseBody = await decodeForDisplay(decoded, undefined, true);
+      if (isEventStream(getHeader(headers, 'content-type'))) this.setSseFrames(ex, decoded);
+      this.finish(ex, 'mocked');
+      return { response: { statusCode: plan.status, statusMessage: STATUS_CODES[plan.status] ?? 'Unknown', headers, rawBody } };
+    }
+    let result: CallbackRequestResult | undefined;
+    if (plan) {
+      const edit: RequestEdit = {};
+      if (plan.method !== undefined && plan.method !== ex.method) edit.method = plan.method;
+      if (plan.url !== undefined && plan.url !== ex.url) edit.url = plan.url;
+      if (plan.headers && !sameHeaders(plan.headers, input.headers)) edit.headers = plan.headers;
+      if (plan.body !== undefined && plan.body !== input.body) edit.body = plan.body;
+      result = await this.applyRequestEdit(req, ex, edit);
+    }
+    if (!(await this.latency(ex, flow))) return { response: 'close' };
+    return result;
+  }
+
+  /** onResponse: the response unchanged or edited (re-framed like a response edit); failures → 502. */
+  private async scriptResponse(
+    res: PassThroughResponse,
+    ex: Exchange,
+    flow: Flow,
+    action: ScriptAction,
+  ): Promise<CallbackResponseResult | undefined> {
+    const input = scriptResponseOf(res.statusCode, ex.responseHeaders ?? {}, ex.responseBody);
+    const request = scriptRequestOf(ex.method, ex.url, ex.requestHeaders, ex.requestBody);
+    const out = await this.runScript(ex, flow, action, 'onResponse', [input, request]);
+    if (this.live.get(ex.id)?.ex !== ex || ex.state !== 'pending') return 'close';
+    let edit: ResponseEdit | undefined;
+    let error = out.error;
+    if (error === undefined && out.value !== undefined) {
+      try {
+        const r = readResponseResult(out.value);
+        edit = {};
+        if (r.status !== undefined && r.status !== res.statusCode) edit.status = r.status;
+        if (r.headers && !sameHeaders(r.headers, input.headers)) edit.headers = r.headers;
+        if (r.body !== undefined && r.body !== input.body) edit.body = r.body;
+      } catch (e) {
+        error = (e as Error).message;
+      }
+    }
+    if (error !== undefined) return this.localFailure(ex, this.scriptError(ex, flow, error));
+    return this.applyResponseEdit(res, ex, edit);
   }
 
   /**
@@ -2171,7 +2372,11 @@ export class InterceptProxy extends EventEmitter {
   /** Throttle latency before forwarding on a hooked route. false = the exchange ended meanwhile. */
   private async latency(ex: Exchange, flow: Flow): Promise<boolean> {
     const ms = flow.throttle?.latencyMs;
-    if (ms && ms > 0) await sleep(ms);
+    if (ms && ms > 0) {
+      const from = performance.now();
+      await sleep(ms);
+      if (this.live.get(ex.id)?.ex === ex) this.addPhase(ex, 'delayMs', performance.now() - from);
+    }
     return this.live.has(ex.id);
   }
 
@@ -2228,6 +2433,11 @@ export class InterceptProxy extends EventEmitter {
       }
       if (d.kind === 'gone') return 'close';
       result = await this.applyResponseEdit(res, ex, d.edit as ResponseEdit | undefined);
+    } else if (action?.kind === 'script') {
+      const r = await this.scriptResponse(res, ex, flow, action);
+      if (r === 'close' || r === 'reset') return r;
+      if (!this.live.has(ex.id)) return r; // failed: the 502 replaces the response
+      result = r;
     } else if (action?.kind === 'mutate') {
       result = await this.applyMutation(res, ex, action.ops);
       if (!this.live.has(ex.id) || ex.state !== 'pending') return 'close'; // the app left meanwhile
@@ -2424,12 +2634,17 @@ export class InterceptProxy extends EventEmitter {
     } else if (m.rule) flow.rule = m.rule;
     if (m.note) flow.note = m.note;
     if (meta?.traceId) flow.traceId = meta.traceId;
-    if (lanGateOf((req as unknown as { socket?: unknown }).socket)) flow.viaLan = true;
+    const socket = (req as unknown as { socket?: unknown }).socket;
+    if (lanGateOf(socket)) flow.viaLan = true;
+    if (socket && typeof socket === 'object') this.connRequest.set(socket, req.id);
     this.flows.set(req.id, flow);
     const ex = this.newExchange({ id: req.id, method: req.method, url, headers: req.headers as HeaderBag, timingEvents: req.timingEvents }, flow);
     delete ex.graphql;
     ex.kind = 'websocket';
     ex.frames = [];
+    // An upgrade request is its head: complete now (CONTRACTS §13.2, phases up to the 101).
+    flow.te = req.timingEvents;
+    this.setRequestMs(ex, flow.te, performance.now());
     this.track(ex, flow);
     if (flow.route === 'ws-pass') {
       markProxySocket((req as unknown as { socket?: object }).socket); // app side gets the message size limit
@@ -2647,6 +2862,8 @@ export { RESPONSE_PAUSE_LIMIT_BYTES };
 function snapshot(ex: Exchange): Exchange {
   const copy = { ...ex };
   if (ex.frames) copy.frames = ex.frames.slice();
+  if (ex.timings) copy.timings = { ...ex.timings };
+  if (ex.scriptLog) copy.scriptLog = ex.scriptLog.slice();
   return copy;
 }
 
@@ -2701,6 +2918,12 @@ function sanitizeRecord(input: Partial<Exchange>, maxFrames: number): Partial<Ex
   if ('responseHeaders' in input) out.responseHeaders = input.responseHeaders ? cleanHeaders(input.responseHeaders as HeaderBag) : undefined;
   if ('requestBody' in input) out.requestBody = capBody(input.requestBody);
   if ('responseBody' in input) out.responseBody = capBody(input.responseBody);
+  if ('timings' in input) out.timings = cleanTimings(input.timings);
+  if ('scriptLog' in input) {
+    out.scriptLog = Array.isArray(input.scriptLog)
+      ? input.scriptLog.slice(0, SCRIPT_LOG_MAX_LINES).map((l) => String(l).slice(0, SCRIPT_LOG_MAX_CHARS))
+      : undefined;
+  }
   if ('frames' in input) {
     const frames = Array.isArray(input.frames) ? input.frames.map((f) => ({ ...f })) : undefined;
     if (frames) {
@@ -2717,6 +2940,21 @@ function sanitizeRecord(input: Partial<Exchange>, maxFrames: number): Partial<Ex
     out.frames = frames;
   }
   return out as Partial<Exchange>;
+}
+
+const TIMING_FIELDS = ['requestMs', 'pausedMs', 'delayMs', 'dnsMs', 'connectMs', 'tlsMs', 'sendMs', 'waitMs', 'receiveMs'] as const;
+
+/** A record()'s timings (e.g. from the VM HTTP profile): known phases only, integer ms ≥ 0; undefined when none. */
+function cleanTimings(t: unknown): Exchange['timings'] {
+  if (!t || typeof t !== 'object') return undefined;
+  const src = t as Record<string, unknown>;
+  const out: NonNullable<Exchange['timings']> = {};
+  for (const k of TIMING_FIELDS) {
+    const v = src[k];
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) out[k] = Math.round(v);
+  }
+  if (src.reused === true) out.reused = true;
+  return Object.keys(out).length ? out : undefined;
 }
 
 function copyHeaders(h: Record<string, string | string[]>): HeaderBag {
@@ -2794,6 +3032,7 @@ function needsResponseHook(a: RuleAction | undefined): boolean {
   if (!a) return false;
   if (a.kind === 'mutate' || (a.kind === 'breakpoint' && a.phase !== 'request')) return true;
   if (a.kind === 'rewrite') return !!a.response?.replaceBody?.length;
+  if (a.kind === 'script') return mentionsOnResponse(a.code);
   if (a.kind === 'sequence') return (a.steps ?? []).some((s) => s?.action?.kind !== 'passthrough' && needsResponseHook(s?.action as RuleAction));
   return false;
 }

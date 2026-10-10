@@ -15,8 +15,9 @@ export interface SharedRulesState {
   rules: Rule[];                 // validated, each with `shared: true`
   /** Readable problems with the file (parse errors, invalid rules skipped). */
   problems: string[];
-  /** Rules held back until the user approves them (mapRemote / rewrite to other hosts, CONTRACTS §12.1; every
-   * `script` rule, CONTRACTS §13.4 — the approved hash covers the script file contents too). */
+  /** Rules held back until the user approves them (mapRemote / rewrite to other hosts, CONTRACTS §12.1; every shared
+   * `script` rule, CONTRACTS §13.4; and personal script rules whose file contents aren't approved, REVIEW-7 #1 — ids
+   * without the `shared:` prefix). Script file contents are approved per file. */
   pendingApproval: Rule[];
 }
 

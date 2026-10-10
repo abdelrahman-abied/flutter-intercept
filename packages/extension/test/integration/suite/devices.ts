@@ -14,6 +14,9 @@
  *  F. Android only: flutterMode=profile → intercepted.
  *  G. Android only: flutterMode=release → NOT intercepted (program untouched, app works, nothing recorded).
  *  H. flutterIntercept.captureSource=false → FLUTTER_INTERCEPT_TRACE=0 define, no exchange gets a source.
+ *  I. (in A's session) CONTRACTS §13.3: the coverage batch's requests from Isolate.run / compute / Isolate.spawn
+ *     isolates go through the proxy (template v5 installed at isolate start), no background-isolate warning for
+ *     them; §13.8: src/screenshot through Dart-Code's callService (VM service) and through the device tool.
  *
  * Request → source (CONTRACTS §9, template v4), in A and after the hot restart in B: a Dio request made
  * through interceptors (CatalogApi.fetchAlbum) and a package:http request (OrdersApi.createOrder) carry
@@ -26,7 +29,7 @@
  *    define (token only there), `flutterInterceptLan`, the LAN listener open and shown in Status;
  *  C asserts the LAN listener closes after the last iPhone session; F/G (profile/release) run too.
  */
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -36,6 +39,8 @@ import type { HostMsg } from '../../../src/ui/protocol';
 import { kindFromId } from '../../../src/iosDevices';
 import { defaultRouteIPv4 } from '../../../src/lanAddress';
 import { resolveFrames } from '../../../src/source/resolve';
+import { takeScreenshot, type ScreenshotDeps } from '../../../src/screenshot';
+import { vmCallService } from '../../../src/vm';
 import { activateBoth, freePort, outputOf, registerOutputTracker, RunOutcome, sleep, startSession, stopSession, waitFor } from './helpers';
 
 const JP = 'https://jsonplaceholder.typicode.com';
@@ -297,6 +302,51 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
       check(`DEV ${tag} A launch (F5, deviceId only)`, failures, t0, { output: evidence(text), mode: `host=${c.flutterInterceptProxyHost} port=${c.flutterInterceptPort} exchanges=${recorded.length} ${sources}` });
     } catch (e) {
       check(`DEV ${tag} A launch (F5, deviceId only)`, [...failures, `exception: ${(e as Error).message}`], t0);
+    }
+
+    // ---- I. background isolates intercepted (§13.3) + screenshots (§13.8) ----
+    if (session && !physicalIos) {
+      t0 = Date.now();
+      failures = [];
+      const s = session;
+      const notes: string[] = [];
+      try {
+        await waitFor(() => (/DEMO_COVERAGE done/.test(outputOf(s)) ? true : undefined), 180_000, 250);
+        await sleep(500);
+        const res = demoResults(outputOf(s));
+        const isoUrls: Record<string, string> = { isolate_todo: `${JP}/todos/2`, compute_todo: `${JP}/todos/3`, spawn_todo: `${JP}/todos/4` };
+        for (const [label, url] of Object.entries(isoUrls)) {
+          const r = res[label];
+          if (!r || r.status !== '200' || !r.body.includes('"overridesInIsolate":true')) failures.push(`${label}: ${r ? `${r.status} ${r.body.slice(0, 120)}` : 'no DEMO_RESULT'}`);
+          const ex = api.getExchanges().filter((e) => e.startedAt >= since && sameUrl(e, 'GET', url));
+          if (!ex.some((e) => e.captured !== 'vm-profile' && e.state === 'completed')) failures.push(`${label}: not recorded by the proxy (${ex.map((e) => `${e.state}/${e.captured ?? 'proxy'}`).join(', ') || 'nothing'})`);
+          if (ex.some((e) => e.captured === 'vm-profile')) failures.push(`${label}: also imported from the HTTP profile (duplicate)`);
+        }
+        const warned = (api.controller.status().warnings ?? []).filter((w) => w.kind === 'background-isolate' && /demo_(worker|compute|spawn)/.test(w.text));
+        if (warned.length) failures.push(`background-isolate warnings although intercepted: ${warned.map((w) => w.text).join(' | ')}`);
+        // Screenshots: VM service through Dart-Code, then the device tool alone.
+        const exec: ScreenshotDeps['exec'] = (cmd, args, opts) =>
+          new Promise((resolve, reject) =>
+            execFile(cmd, args, { encoding: 'buffer', timeout: opts?.timeoutMs ?? 20_000, maxBuffer: opts?.maxBuffer ?? 32 * 1024 * 1024 }, (err, stdout, stderr) =>
+              err ? reject(err) : resolve({ stdout, stderr: String(stderr) }),
+            ),
+          );
+        const log = (m: string) => notes.push(m);
+        const vmShot = await takeScreenshot({ sessionId: s.id, deviceId: dev, projectRoot: root }, { callService: (_id, m, p) => vmCallService(s, m, p), exec, log });
+        if (vmShot.method !== 'vm-service' || !vmShot.width || !vmShot.height || !fs.existsSync(vmShot.path)) failures.push(`VM screenshot: ${vmShot.method} ${vmShot.width}x${vmShot.height}`);
+        if (!vmShot.path.startsWith(path.join(root, '.dart_tool', 'flutter_intercept', 'screenshots') + path.sep)) failures.push(`screenshot saved at ${vmShot.path}`);
+        notes.push(`vm ${vmShot.width}x${vmShot.height} ${vmShot.png.length}B`);
+        fs.rmSync(vmShot.path, { force: true });
+        if (isAndroid || kindFromId(dev) === 'ios-simulator') {
+          const toolShot = await takeScreenshot({ sessionId: s.id, deviceId: dev, projectRoot: root }, { exec, log });
+          if (toolShot.method !== (isAndroid ? 'adb' : 'simctl') || !toolShot.width) failures.push(`tool screenshot: ${toolShot.method} ${toolShot.width}x${toolShot.height}`);
+          notes.push(`${toolShot.method} ${toolShot.width}x${toolShot.height} ${toolShot.png.length}B`);
+          fs.rmSync(toolShot.path, { force: true });
+        }
+        check(`DEV ${tag} I background isolates intercepted + screenshots`, failures, t0, { output: evidence(outputOf(s)).split('\n').filter((l) => /_todo/.test(l)).join('\n'), mode: notes.filter((n) => !/^screenshot:/.test(n)).join(' ') });
+      } catch (e) {
+        check(`DEV ${tag} I background isolates intercepted + screenshots`, [...failures, `exception: ${(e as Error).message}`], t0);
+      }
     }
 
     // ---- B. rules + hot restart ----

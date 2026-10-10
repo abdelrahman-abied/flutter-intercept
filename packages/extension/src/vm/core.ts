@@ -1,6 +1,7 @@
 /**
  * One debug session's VM-service watcher, transport-agnostic and vscode-free (CONTRACTS §11.4):
- * - background isolates → `SessionWarning {kind:'background-isolate'}` once per isolate name (≤ 10, then a summary);
+ * - background isolates → `SessionWarning {kind:'background-isolate'}` once per isolate name (≤ 10, then a summary),
+ *   unless the entry's overrides were installed in it at start (CONTRACTS §13.3, `installStatus`);
  * - native clients (setting `flutterIntercept.nativeClients` = "profile") → HTTP timeline logging enabled where it
  *   is needed (background isolates; the main isolate only when it loaded package:http_profile), turned off again
  *   on stop, the HTTP profile polled (≤ 1/s, backing off when idle or failing, one call in flight per isolate),
@@ -12,6 +13,7 @@ import type { Exchange } from '@flutter-intercept/proxy';
 import type { SessionWarning } from '../ui/protocol';
 import type { VmHostDeps } from './types';
 import type { VmTransport, VmTransportEvent } from './transport';
+import type { InstallStatus } from './isolates';
 import {
   asHttpProfile,
   bodiesPatch,
@@ -41,6 +43,11 @@ export interface VmCoreDeps extends VmHostDeps {
   callTimeoutMs?: number;
   /** Whether a dart:io `proxyDetails` host:port is OUR proxy (REVIEW-5 #14). Absent = never (import). */
   isOurProxy?: IsOurProxy;
+  /**
+   * CONTRACTS §13.3: whether the entry's overrides were installed in this isolate at its start (src/vm/isolates.ts).
+   * `installed` → no background-isolate warning, and its dart:io traffic is treated like the main isolate's.
+   */
+  installStatus?(isolateId: string): Promise<InstallStatus | undefined>;
 }
 
 export const POLL_MS = 1000;
@@ -59,6 +66,8 @@ interface IsolateState {
   main: boolean;
   /** The isolate loaded package:http_profile (undefined = unknown). */
   httpProfile?: boolean;
+  /** The entry's overrides were installed in this background isolate (its dart:io traffic went through the proxy). */
+  installed?: boolean;
   /** dart:io registered its extensions (we can enable logging / poll). */
   hasIo: boolean;
   logging: 'off' | 'enabling' | 'on';
@@ -167,7 +176,7 @@ export function createVmSessionCore(sessionId: string, deps: VmCoreDeps): VmSess
   }
 
   function warnIsolate(iso: IsolateState): void {
-    if (iso.main) return;
+    if (iso.main || iso.installed) return;
     const key = iso.name ?? '?';
     if (seenNames.has(key)) return;
     if (seenNames.size < MAX_SEEN_NAMES) seenNames.add(key);
@@ -198,7 +207,7 @@ export function createVmSessionCore(sessionId: string, deps: VmCoreDeps): VmSess
 
   /** Timeline logging costs app memory (every dart:io request + body is kept): only where it can find something. */
   function needsLogging(iso: IsolateState): boolean {
-    return !iso.main || iso.httpProfile !== false;
+    return !(iso.main || iso.installed) || iso.httpProfile !== false;
   }
 
   async function enableLogging(iso: IsolateState): Promise<void> {
@@ -284,6 +293,16 @@ export function createVmSessionCore(sessionId: string, deps: VmCoreDeps): VmSess
       mainId = id;
     }
     if (opts.hasIo) iso.hasIo = true;
+    if (!iso.main && deps.installStatus) {
+      // The DAP's serviceExtensionAdded can arrive before the installer saw the isolate's PauseStart: wait a little.
+      let st: InstallStatus | undefined;
+      try {
+        st = await deps.installStatus(id);
+      } catch {
+        st = undefined;
+      }
+      if (st === 'installed') iso.installed = true;
+    }
     warnIsolate(iso);
     emptyPolls = 0;
     return iso;
@@ -406,7 +425,7 @@ export function createVmSessionCore(sessionId: string, deps: VmCoreDeps): VmSess
     }
     if (t && (t.done || !t.exchangeId)) return false;
     if (!t) {
-      const verdict = classifyEntry(entry, iso, deps.isOurProxy);
+      const verdict = classifyEntry(entry, { main: iso.main || Boolean(iso.installed) }, deps.isOurProxy);
       if (verdict === 'wait') return false;
       if (verdict === 'skip') {
         remember(key, { done: true });

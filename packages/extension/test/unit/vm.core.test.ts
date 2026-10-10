@@ -198,6 +198,37 @@ describe('background isolates', () => {
     expect(h.warnings.at(-1)).toEqual([]);
   });
 
+  it('CONTRACTS §13.3: no warning for an isolate the installer intercepted; its dart:io traffic is never imported', async () => {
+    const h = host('profile');
+    const names: Record<string, string> = { 'isolates/5': 'demo_worker', 'isolates/7': 'demo_spawnuri', 'isolates/8': 'unseen' };
+    const status: Record<string, 'installed' | 'not-entry' | undefined> = { 'isolates/5': 'installed', 'isolates/7': 'not-entry' };
+    const asked: string[] = [];
+    const plainHttp = { id: '-1', isolateId: 'isolates/5', method: 'GET', uri: 'http://httpbin.org/get', events: [], startTime: 1, endTime: 2, request: { headers: {} }, response: { statusCode: 200, headers: {}, startTime: 1, endTime: 2 } };
+    const t = new FakeTransport()
+      .on('getVM', () => vmWithMain)
+      .on('getIsolate', (p) => (p.isolateId === MAIN ? mainIsolate : { type: 'Isolate', id: p.isolateId, name: names[String(p.isolateId)], extensionRPCs: ['ext.dart.io.httpEnableTimelineLogging'], libraries: [] }))
+      .on('ext.dart.io.httpEnableTimelineLogging', () => ({ type: 'Success' }))
+      .on('ext.dart.io.getHttpProfile', (p) => ({ type: 'HttpProfile', timestamp: 5, requests: p.isolateId === 'isolates/5' ? [plainHttp] : [] }));
+    const core = createVmSessionCore('s', {
+      ...h.deps,
+      installStatus: async (id: string) => {
+        asked.push(id);
+        return status[id];
+      },
+    });
+    await core.start(t);
+    expect(asked).toEqual([]); // never asked for main
+    for (const id of Object.keys(names)) t.emit({ kind: 'extension-added', isolateId: id, rpc: 'ext.dart.io.httpEnableTimelineLogging' });
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(asked.sort()).toEqual(['isolates/5', 'isolates/7', 'isolates/8']);
+    expect(h.warnings.at(-1)?.map((w) => w.id).sort()).toEqual(['isolate:s:demo_spawnuri', 'isolate:s:unseen']);
+    // The installed isolate's plain-http request went through the proxy (no proxyDetails for http): not imported.
+    expect(h.recorded).toEqual([]);
+    // Like the main isolate without package:http_profile: no HTTP timeline logging there.
+    expect(t.calls.filter((c) => c.method === 'ext.dart.io.httpEnableTimelineLogging').map((c) => c.params.isolateId)).not.toContain('isolates/5');
+    core.stop();
+  });
+
   it('WebSocket transport: names come with IsolateStart (recorded events)', async () => {
     const h = host('off');
     const t = new FakeTransport().on('getVM', () => ({ isolates: [] }));

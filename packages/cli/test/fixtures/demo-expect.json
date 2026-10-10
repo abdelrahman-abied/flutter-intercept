@@ -1,0 +1,18 @@
+[
+  {
+    "name": "todo loads from the real server",
+    "url": "https://jsonplaceholder.typicode.com/todos/1",
+    "method": "GET",
+    "expect": { "status": 200, "count": { "exact": 1 }, "json": [{ "path": "$.id", "equals": 1 }] }
+  },
+  {
+    "name": "user 1 is mocked by the shared rule",
+    "url": "https://jsonplaceholder.typicode.com/users/1",
+    "expect": { "status": 200, "json": [{ "path": "$.name", "equals": "Mocked User" }] }
+  },
+  {
+    "name": "todo before user",
+    "url": "https://jsonplaceholder.typicode.com/*",
+    "expect": { "order": ["*/todos/1", "*/users/1"] }
+  }
+]

@@ -1,6 +1,6 @@
 /** Ready-to-paste client configurations for `flutterIntercept.connectAgent` (pure, unit-tested). */
 
-export type AgentClient = 'claude' | 'cursor' | 'gemini' | 'other';
+export type AgentClient = 'claude' | 'cursor' | 'gemini' | 'windsurf' | 'other';
 
 export interface ConnectSnippet {
   client: AgentClient;
@@ -46,6 +46,14 @@ export function connectSnippet(client: AgentClient, url: string, token: string):
           label: 'settings.json snippet',
           text: JSON.stringify({ mcpServers: { [MCP_SERVER_NAME]: { httpUrl: url, headers: { Authorization: `Bearer ${token}` } } } }, null, 2),
         },
+      };
+    case 'windsurf':
+      // CONTRACTS §13.8. Windsurf's mcp_config.json (Cascade → MCP → "View raw config"): a remote HTTP server takes
+      // `serverUrl` (or `url`) plus `headers` (docs.windsurf.com/windsurf/cascade/mcp, now docs.devin.ai/desktop/cascade/mcp, 2026-10).
+      return {
+        client,
+        label: 'Windsurf',
+        text: JSON.stringify({ mcpServers: { [MCP_SERVER_NAME]: { serverUrl: url, headers: { Authorization: `Bearer ${token}` } } } }, null, 2),
       };
     default:
       return { client: 'other', label: 'Other MCP client', text: `URL: ${url}\nHeader: ${header}\nTransport: Streamable HTTP` };

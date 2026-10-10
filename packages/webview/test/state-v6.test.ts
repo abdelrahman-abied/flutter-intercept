@@ -292,8 +292,10 @@ describe('scenarios helpers', () => {
     expect(needsApproval({ kind: 'sequence', steps: [{ action: { kind: 'passthrough' } }, { action: { kind: 'mapRemote', to: 'https://x.io' } }] })).toMatch(/x\.io/);
     expect(needsApproval({ kind: 'sequence', steps: [{ action: { kind: 'passthrough' } }] })).toBeUndefined();
     expect(needsApproval({ kind: 'mock', status: 200, body: '' })).toBeUndefined();
-    expect(pendingApprovalText({ count: 0, problems: [], pendingApproval: 1 })).toMatch(/^1 shared rule from \.vscode\/flutter-intercept\.json is held back: it maps/);
-    expect(pendingApprovalText({ file: 'a/b.json', count: 0, problems: [], pendingApproval: 2 })).toMatch(/^2 shared rules from a\/b\.json are held back: they map/);
+    expect(pendingApprovalText({ count: 0, problems: [], pendingApproval: 1 })).toMatch(/^1 rule waits for your approval and doesn't run yet: shared rules from \.vscode\/flutter-intercept\.json/);
+    expect(pendingApprovalText({ file: 'a/b.json', count: 0, problems: [], pendingApproval: 2 })).toMatch(/^2 rules wait for your approval and don't run yet: shared rules from a\/b\.json/);
+    // REVIEW-7 #1: personal script rules are held too — the text doesn't say "shared" only.
+    expect(pendingApprovalText({ count: 0, problems: [], pendingApproval: 2 })).toMatch(/script rules whose file content you haven't approved/);
   });
 
   it('recordings: recordable exchanges, sorting, names, picks, diff pair, replay match', () => {

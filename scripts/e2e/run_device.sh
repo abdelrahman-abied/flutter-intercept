@@ -13,8 +13,9 @@
 #   --app <dir>              Flutter project (default samples/demo_app)
 #   --entry-dir <dir>        where to generate the entry (default .dart_tool/flutter_intercept;
 #                            use distinct dirs when running two devices in parallel)
-#   --template v1|v2|v3|v4   entry template from scripts/e2e/templates (default v4: + request -> source
-#                            traces, checked against the demo's call sites; v3 = no traces)
+#   --template v1|v2|v3|v4|v5  entry template from scripts/e2e/templates (default v5 = v4 + the
+#                            background-isolate install hook; v4: + request -> source traces, checked
+#                            against the demo's call sites; v3 = no traces)
 #   --attack                 REVIEW-1 #1: run scripts/e2e/evil_server.dart (self-signed CN=evil.example)
 #                            on :8443 and make the app GET it (EVIL_URL); it must never be accepted —
 #                            proxy up (proxy refuses upstream) or down (DIRECT must fail verification)
@@ -43,7 +44,7 @@ DEVICE=${1:-}
 [ -z "$DEVICE" ] && { sed -n '2,20p' "$0"; exit 64; }
 shift
 TARGET=lib/main.dart PORT=8899 MODE=debug EMU_HOST=0 DO_RESTART=1 DO_FALLBACK=1 APP_MODE="" ENTRY_DIR=.dart_tool/flutter_intercept ATTACK=0 EVIL_PORT=8443 LAN="" TOKEN=""
-export FI_TEMPLATE=${FI_TEMPLATE:-v4}
+export FI_TEMPLATE=${FI_TEMPLATE:-v5}
 APP="$REPO/samples/demo_app"
 DEFINES=()
 while [ $# -gt 0 ]; do
@@ -228,7 +229,7 @@ expect_trace() { # method url-regex frame-regex description
   if echo "$f" | grep -Eq "$3"; then pass "source of $4: $f"; else fail "source of $4 — got: $f"; fi
 }
 assert_traces() {
-  [ "$FI_TEMPLATE" = v4 ] || return 0
+  [ "$FI_TEMPLATE" = v4 ] || [ "$FI_TEMPLATE" = v5 ] || return 0
   # package:http opens the connection synchronously from the app's call: always found (AOT/profile
   # stacks have no column).
   expect_trace POST 'jsonplaceholder\.typicode\.com/todos$' '^OrdersApi\.createOrder \(package:demo_app/api/orders_api\.dart:1[0-9][:)]' "http POST (OrdersApi.createOrder)"
@@ -293,7 +294,7 @@ if [ "$DO_RESTART" = 1 ]; then
   assert_attack $RUN proxy-up
   sleep 1
   assert_traces
-  if [ "$FI_TEMPLATE" = v4 ]; then
+  if [ "$FI_TEMPLATE" = v4 ] || [ "$FI_TEMPLATE" = v5 ]; then
     p=$(grep -o 'fi=[0-9a-f]*-' "$PLOG" | sort -u | wc -l | tr -d ' ')
     [ "$p" -ge 2 ] && pass "trace ids get a new prefix after hot restart ($p prefixes)" || fail "trace id prefix not renewed by hot restart ($p)"
   fi

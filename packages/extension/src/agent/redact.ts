@@ -524,3 +524,39 @@ export function redactFrameText(text: string): string {
     : text;
   return lines.includes('"') ? redactJsonLikeText(lines) : redactSecretValues(lines);
 }
+
+const LOG_PAIR = /([A-Za-z0-9_.-]+)(["']?\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;&)]+)/g;
+/** REVIEW-7 #8: `context.log('token', value)` → `token <value>`: a sensitive name, whitespace, the value (optionally after "to" / "is" …). */
+const LOG_WS_PAIR = /(^|[\s,;(\[{])([A-Za-z0-9_.-]+)(\s+)(?:(to|is|was|as|for|of|=)(\s+))?([^\s,;)}]+)/gi;
+/** REVIEW-7 #8: well-known credential prefixes (GitHub, Stripe, Slack, AWS access keys, Google API keys). */
+const TOKEN_PREFIX = /^(gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,}|[sr]k_(live|test)_[A-Za-z0-9]{6,}|xox[abprs]-[A-Za-z0-9-]{6,}|AKIA[0-9A-Z]{12,}|AIza[0-9A-Za-z_-]{20,})/;
+const WORD_EDGE = /^([("'`\[{<]*)(.*?)([)"'`\]}>,;:.!?]*)$/s;
+
+/**
+ * CONTRACTS §13.4: one `scriptLog` line (free text a user's script logged) as agents see it: URLs and JSON like
+ * `redactText` / `redactFrameText`; `name=value` / `name: value` pairs and (REVIEW-7 #8) `name value` with a sensitive
+ * name anywhere in the line; every `Bearer <credential>`; and any word that is an opaque token or carries a known
+ * credential prefix. Errs on redacting too much (prose like "password is wrong" loses a word).
+ */
+export function redactLogLine(line: string): string {
+  const base = redactFrameText(redactText(line));
+  const sensitive = (name: string) => isSensitiveField(name) || isSensitiveHeader(name);
+  return base
+    .replace(LOG_PAIR, (whole, name: string, sep: string, value: string) => {
+      const q = /^["']/.test(value) ? value[0] : '';
+      if (value.slice(q.length, value.length - q.length) === REDACTED || !sensitive(name)) return whole;
+      return `${name}${sep}${q}${REDACTED}${q}`;
+    })
+    .replace(/\b(Bearer|Basic)\s+(?!\[redacted\])[A-Za-z0-9._~+/=-]+/gi, `$1 ${REDACTED}`)
+    .replace(LOG_WS_PAIR, (whole, lead: string, name: string, sp: string, link: string | undefined, sp2: string | undefined, value: string) => {
+      if (!sensitive(name) || value.includes(REDACTED)) return whole;
+      return `${lead}${name}${sp}${link ? `${link}${sp2}` : ''}${REDACTED}${/[\]"'.]+$/.exec(value)?.[0] ?? ''}`;
+    })
+    .split(/(\s+)/)
+    .map((word) => {
+      const m = WORD_EDGE.exec(word);
+      if (!m || !m[2] || m[2] === REDACTED) return word;
+      return isOpaqueToken(m[2]) || TOKEN_PREFIX.test(m[2]) ? `${m[1]}${REDACTED}${m[3]}` : word;
+    })
+    .join('');
+}

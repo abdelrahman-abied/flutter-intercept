@@ -9,7 +9,7 @@ import {
   lmToolName,
   registerLmTools,
 } from '../../src/agent/lmTools';
-import { AgentAccess, AgentToolError, AgentTools, READ_TOOLS, ToolName, WRITE_TOOLS } from '../../src/agent/types';
+import { AgentAccess, AgentToolError, AgentTools, READ_TOOLS, TOOL_IMAGES, ToolName, WRITE_TOOLS } from '../../src/agent/types';
 
 class TextPart {
   constructor(readonly value: string) {}
@@ -246,5 +246,70 @@ describe('texts', () => {
     expect(formatResult({ a: 1 })).toBe('{\n  "a": 1\n}');
     const big = { items: Array.from({ length: 300 }, (_, i) => ({ id: i, url: 'https://example.com/' + i })) };
     expect(formatResult(big)).not.toContain('\n');
+  });
+});
+
+describe('take_screenshot (CONTRACTS §13.8): a read tool confirmed every time', () => {
+  const statusAndShot = (sessions: unknown[]) => async (t: ToolName): Promise<Record<string, unknown>> => {
+    if (t === 'get_status') return { sessions };
+    if (t === 'take_screenshot') {
+      const r: Record<string | symbol, unknown> = { path: '/p/s.png', method: 'adb' };
+      Object.defineProperty(r, TOOL_IMAGES, { value: [{ data: Buffer.from('PNGDATA').toString('base64'), mimeType: 'image/png' }], enumerable: false });
+      return r as Record<string, unknown>;
+    }
+    return {};
+  };
+
+  it.each<AgentAccess>(['readWrite', 'readOnly'])('asks "Take a screenshot of <device>?" under %s access', async (access) => {
+    const { vs, tools } = fakeVscode();
+    registerLmTools({ subscriptions: [] }, { tools: fakeTools(access, statusAndShot([{ id: 's1', deviceId: 'emulator-5554' }])).tools, vscode: vs });
+    const p = await tools.get('flutter_intercept_take_screenshot')!.prepareInvocation({ input: {} }, token());
+    expect(p?.confirmationMessages?.title).toBe('Take a screenshot');
+    expect((p!.confirmationMessages!.message as Markdown).value).toMatch(/^Take a screenshot of `emulator-5554`\?/);
+    expect(p?.invocationMessage).toBe('Taking a screenshot of the running app');
+  });
+
+  it('names the chosen session, or falls back when the device is unknown; no confirmation when access is off', async () => {
+    const { vs, tools } = fakeVscode();
+    const sessions = [{ id: 's1', deviceId: 'emulator-5554' }, { id: 's2', deviceId: 'iPhone `15`' }];
+    registerLmTools({ subscriptions: [] }, { tools: fakeTools('readOnly', statusAndShot(sessions)).tools, vscode: vs });
+    const p = await tools.get('flutter_intercept_take_screenshot')!.prepareInvocation({ input: { sessionId: 's2' } }, token());
+    expect((p!.confirmationMessages!.message as Markdown).value).toMatch(/^Take a screenshot of `iPhone  15 `\?/); // backticks can't break out
+    const q = await tools.get('flutter_intercept_take_screenshot')!.prepareInvocation({ input: {} }, token());
+    expect((q!.confirmationMessages!.message as Markdown).value).toMatch(/^Take a screenshot of the running app\?/);
+    const off = fakeVscode();
+    registerLmTools({ subscriptions: [] }, { tools: fakeTools('off').tools, vscode: off.vs });
+    expect(await off.tools.get('flutter_intercept_take_screenshot')!.prepareInvocation({ input: {} }, token())).toEqual({ invocationMessage: 'Taking a screenshot of the running app' });
+  });
+
+  it('invoke returns the image as a data part when the host supports it, then the JSON', async () => {
+    class DataPart {
+      constructor(readonly data: Uint8Array, readonly mimeType: string) {}
+      static image(data: Uint8Array, mime: string) {
+        return new DataPart(data, mime);
+      }
+    }
+    const { vs, tools } = fakeVscode();
+    vs.LanguageModelDataPart = DataPart as unknown as LmVscode['LanguageModelDataPart'];
+    registerLmTools({ subscriptions: [] }, { tools: fakeTools('readOnly', statusAndShot([])).tools, vscode: vs });
+    const res = (await tools.get('flutter_intercept_take_screenshot')!.invoke({ input: {} }, token())) as ToolResult;
+    expect(res.content[0]).toBeInstanceOf(DataPart);
+    expect(Buffer.from((res.content[0] as DataPart).data).toString()).toBe('PNGDATA');
+    expect((res.content[0] as DataPart).mimeType).toBe('image/png');
+    expect(JSON.parse((res.content[1] as TextPart).value)).toEqual({ path: '/p/s.png', method: 'adb' });
+    // Older hosts: text only.
+    const old = fakeVscode();
+    registerLmTools({ subscriptions: [] }, { tools: fakeTools('readOnly', statusAndShot([])).tools, vscode: old.vs });
+    const r2 = (await old.tools.get('flutter_intercept_take_screenshot')!.invoke({ input: {} }, token())) as ToolResult;
+    expect(r2.content).toHaveLength(1);
+    expect(r2.content[0]).toBeInstanceOf(TextPart);
+  });
+
+  it('export tools have messages and no confirmation', async () => {
+    expect(invocationMessage('export_openapi', { url: '*/v1/*' })).toBe('Exporting captured traffic as OpenAPI (*/v1/*)');
+    expect(invocationMessage('export_postman', {})).toBe('Exporting captured traffic as a Postman collection');
+    const { vs, tools } = fakeVscode();
+    registerLmTools({ subscriptions: [] }, { tools: fakeTools().tools, vscode: vs });
+    expect((await tools.get('flutter_intercept_export_openapi')!.prepareInvocation({ input: {} }, token()))?.confirmationMessages).toBeUndefined();
   });
 });

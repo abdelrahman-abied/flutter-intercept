@@ -25,6 +25,7 @@
  *              on top of a small AgentTools adapter over the real AppLauncher (src/agent/launch.ts) and
  *              the extension's public API (rules, exchanges). Only VS Code's registration is skipped.
  */
+import * as fs from 'fs';
 import * as http from 'http';
 import type { AddressInfo } from 'net';
 import * as vscode from 'vscode';
@@ -652,7 +653,8 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
     // events) — both against the suite's local servers via --dart-define=WS_URL / SSE_URL (set through
     // `dart.flutterRunAdditionalArgs` for this case) — gql_country (POST GraphQL CountryByCode to the public API; its
     // status doesn't matter: detection and the mock rule don't need the network), isolate_todo / compute_todo (HTTP
-    // from background isolates "demo_worker" / "demo_compute": not intercepted → a session warning).
+    // from background isolates "demo_worker" / "demo_compute": with flutterIntercept.backgroundIsolates "warn" they
+    // are not intercepted → a session warning; the default "intercept" is covered by the devices suite, check I).
     for (const dev of devices) {
       const out: RunOutcome = { name: `AGENT ${dev} v0.5.0 over MCP: get_frames (WS + SSE), graphqlOperation filter + rule, isolate warnings`, output: '', proxyHits: [], failures: [], ms: 0 };
       const f = out.failures;
@@ -675,8 +677,10 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
       const final = (i: any) => !['pending', 'paused-request', 'paused-response'].includes(i.state);
       const dartCfg = vscode.workspace.getConfiguration('dart');
       const runArgsBefore = dartCfg.inspect<string[]>('flutterRunAdditionalArgs')?.globalValue;
+      const fiCfg = vscode.workspace.getConfiguration('flutterIntercept');
       let servers: Awaited<ReturnType<typeof startCoverageServers>> | undefined;
       try {
+        await fiCfg.update('backgroundIsolates', 'warn', vscode.ConfigurationTarget.Global);
         servers = await startCoverageServers();
         await dartCfg.update(
           'flutterRunAdditionalArgs',
@@ -800,6 +804,7 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
         await client?.close().catch(() => undefined);
         client = undefined;
         await dartCfg.update('flutterRunAdditionalArgs', runArgsBefore, vscode.ConfigurationTarget.Global).then(undefined, () => undefined);
+        await fiCfg.update('backgroundIsolates', undefined, vscode.ConfigurationTarget.Global).then(undefined, () => undefined);
         await servers?.close().catch(() => undefined);
       }
       out.ms = Date.now() - t0;
@@ -934,6 +939,107 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
         client = undefined;
         local.closeAllConnections?.();
         await new Promise<void>((resolve) => local.close(() => resolve()));
+      }
+      out.ms = Date.now() - t0;
+      results.push(out);
+      console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+    }
+
+    // v0.7.0 (CONTRACTS §13.2 / §13.4 / §13.8) over MCP: timings, slowerThanMs, export_openapi / export_postman,
+    // script rules hidden and refused, take_screenshot (skipped where the device can't take one).
+    for (const dev of devices) {
+      const out: RunOutcome = { name: `AGENT ${dev} v0.7.0 over MCP: timings, export_openapi/postman, script refusal, take_screenshot`, output: '', proxyHits: [], failures: [], ms: 0 };
+      const f = out.failures;
+      const t0 = Date.now();
+      let sessionId: string | undefined;
+      const notes: string[] = [];
+      const SCRIPT_ID = 'fi-suite-v070-script';
+      const SCRIPT_MARK = 'SUITE_SCRIPT_CODE_MARK';
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+      const leaks = (text: string) => SECRETS.filter((s) => text.includes(s));
+      try {
+        client = await connect();
+        const since = Date.now();
+        const l = await mcpCall('launch_app', { deviceId: dev });
+        sessionId = l.result.sessionId;
+        if (l.isError || !sessionId) throw new Error(`launch_app: ${l.text.slice(0, 200)}`);
+        const w = await mcpCall('wait_for_request', { url: USERS1, method: 'GET', sinceMs: since, timeoutMs: 120_000 });
+        if (w.isError || w.result.timedOut || w.result.status !== 200) throw new Error(`wait_for_request: ${w.text.slice(0, 200)}`);
+
+        // Timings (§13.2): a real request through the proxy has phases; slowerThanMs filters.
+        const g = await mcpCall('get_request', { id: w.result.id, includeBodies: false });
+        const tm = g.result.timings ?? {};
+        if (g.isError || typeof tm.waitMs !== 'number' || typeof tm.requestMs !== 'number') f.push(`get_request timings: ${JSON.stringify(g.result.timings)}`);
+        if (!tm.reused && typeof tm.connectMs !== 'number') f.push(`new connection without connectMs: ${JSON.stringify(tm)}`);
+        notes.push(`timings ${JSON.stringify(tm)}`);
+        const slow0 = await mcpCall('list_requests', { url: USERS1, slowerThanMs: 0, sinceMs: since });
+        if (slow0.isError || !(slow0.result.items ?? []).some((i: any) => i.id === w.result.id)) f.push(`slowerThanMs 0: ${slow0.text.slice(0, 200)}`);
+        const slowMax = await mcpCall('list_requests', { url: USERS1, slowerThanMs: 600_000, sinceMs: since });
+        if (slowMax.isError || slowMax.result.total !== 0) f.push(`slowerThanMs 600000: ${slowMax.text.slice(0, 200)}`);
+
+        // Exports (§13.8): files under .dart_tool/flutter_intercept/exports, redacted.
+        for (const [toolName, suffix, check] of [
+          ['export_openapi', '.openapi.json', (doc: any) => typeof doc.openapi === 'string' && doc.openapi.startsWith('3.1') && !!doc.paths],
+          ['export_postman', '.postman_collection.json', (doc: any) => /v2\.1/.test(doc.info?.schema ?? '') && Array.isArray(doc.item)],
+        ] as const) {
+          const r = await mcpCall(toolName, { url: 'https://jsonplaceholder.typicode.com/*', sinceMs: since });
+          const p: string = r.result.path ?? '';
+          if (r.isError || !p.endsWith(suffix) || !p.includes('.dart_tool/flutter_intercept/exports/') || (root && !p.startsWith(root))) {
+            f.push(`${toolName}: ${r.text.slice(0, 300)}`);
+            continue;
+          }
+          const text = fs.readFileSync(p, 'utf8');
+          let doc: any;
+          try {
+            doc = JSON.parse(text);
+          } catch {
+            doc = undefined;
+          }
+          if (!doc || !check(doc)) f.push(`${toolName}: unexpected document ${text.slice(0, 200)}`);
+          if (leaks(text).length) f.push(`${toolName} leaks ${leaks(text).join(', ')}`);
+          if (!(r.result.exchanges >= 1) || !(r.result.routes >= 1)) f.push(`${toolName} counts: ${r.text.slice(0, 200)}`);
+          notes.push(`${toolName}: ${r.result.routes} routes from ${r.result.exchanges} exchanges`);
+          fs.rmSync(p, { force: true });
+        }
+
+        // Scripts (§13.4): a user's script rule is listed without its code; agents can't add one.
+        api.setRules([{ id: SCRIPT_ID, enabled: true, name: 'suite script', match: { url: 'https://example.invalid/*' }, action: { kind: 'script', code: `function onRequest(r) { /* ${SCRIPT_MARK} */ return r }` } } as Rule, ...api.getRules()]);
+        const lr = await mcpCall('list_rules');
+        const listed = (lr.result.rules ?? []).find((r: any) => r.id === SCRIPT_ID);
+        if (lr.isError || !listed || JSON.stringify(listed.action) !== '{"kind":"script"}' || lr.text.includes(SCRIPT_MARK)) f.push(`list_rules script view: ${lr.text.slice(0, 300)}`);
+        const sq = await client!.callTool({ name: 'add_sequence', arguments: { url: 'https://example.invalid/*', steps: [{ kind: 'script', code: 'x' }] } }).catch((e: unknown) => ({ isError: true, content: [{ type: 'text', text: String(e) }] }));
+        if (!(sq as any).isError) f.push('add_sequence accepted a script step');
+        if (api.getRules().some((r) => r.id !== SCRIPT_ID && r.action.kind === 'script')) f.push('an agent call added a script rule');
+        api.setRules(api.getRules().filter((r) => r.id !== SCRIPT_ID));
+
+        // Screenshot (§13.8): image content + JSON; "not supported" devices are skipped.
+        const shot: any = await client!.callTool({ name: 'take_screenshot', arguments: { sessionId } });
+        const shotText = (shot.content ?? []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('');
+        if (shot.isError) {
+          if (/not supported|cannot take|unsupported/i.test(shotText)) notes.push(`take_screenshot skipped: ${shotText.slice(0, 120)}`);
+          else f.push(`take_screenshot: ${shotText.slice(0, 300)}`);
+        } else {
+          const img = (shot.content ?? []).find((c: any) => c.type === 'image');
+          const png = img ? Buffer.from(img.data, 'base64') : Buffer.alloc(0);
+          if (!img || img.mimeType !== 'image/png' || png.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') f.push(`take_screenshot image: ${JSON.stringify(img ?? null).slice(0, 120)}`);
+          const meta = JSON.parse(shotText);
+          if (!meta.path || !fs.existsSync(meta.path) || !String(meta.path).includes('/flutter_intercept/screenshots/') || !Array.isArray(meta.recentRequests)) f.push(`take_screenshot meta: ${shotText.slice(0, 300)}`);
+          if (meta.recentRequests?.length > 10) f.push(`take_screenshot recentRequests: ${meta.recentRequests.length}`);
+          if (leaks(shotText).length) f.push(`take_screenshot leaks ${leaks(shotText).join(', ')}`);
+          notes.push(`screenshot ${meta.method} ${meta.width}x${meta.height}, ${meta.recentRequests?.length ?? 0} recent requests`);
+        }
+        const s2 = await mcpCall('stop_app', { sessionId });
+        if (s2.isError || s2.result.stopped !== 1) f.push(`stop_app: ${s2.text.slice(0, 200)}`);
+        else sessionId = undefined;
+        out.output = notes.join('; ');
+      } catch (e) {
+        f.push(`exception: ${(e as Error).message}`);
+        out.output = notes.join('; ');
+      } finally {
+        api.setRules(api.getRules().filter((r) => r.id !== SCRIPT_ID));
+        if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
+        await client?.close().catch(() => undefined);
+        client = undefined;
       }
       out.ms = Date.now() - t0;
       results.push(out);

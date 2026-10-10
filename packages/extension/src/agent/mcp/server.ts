@@ -23,7 +23,7 @@ import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mc
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ErrorCode, McpError, type CallToolResult, type GetPromptResult, type ReadResourceResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { AgentToolError, READ_TOOLS, WRITE_TOOLS, type AgentTools, type ToolName } from '../types';
+import { AgentToolError, CONFIRMED_READ_TOOLS, READ_TOOLS, toolImages, WRITE_TOOLS, type AgentTools, type ToolName } from '../types';
 
 export const MCP_PATH = '/mcp';
 export const DEFAULT_MCP_PORT = 47823;
@@ -106,12 +106,14 @@ export function bearerOk(header: string | string[] | undefined, token: string): 
 
 export function toolAnnotations(tool: ToolName) {
   const write = (WRITE_TOOLS as readonly string[]).includes(tool);
+  // CONTRACTS §13.8: take_screenshot reads, but is not marked read-only so clients ask before every call.
+  const confirmed = (CONFIRMED_READ_TOOLS as readonly string[]).includes(tool);
   return {
     title: tool.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()),
-    readOnlyHint: !write,
+    readOnlyHint: !write && !confirmed,
     // The MCP default for destructiveHint is TRUE when readOnlyHint is false: say it explicitly.
     destructiveHint: write ? DESTRUCTIVE_TOOLS.has(tool) : false,
-    idempotentHint: !write || IDEMPOTENT_WRITE_TOOLS.has(tool),
+    idempotentHint: (!write && !confirmed) || IDEMPOTENT_WRITE_TOOLS.has(tool),
     openWorldHint: OPEN_WORLD_TOOLS.has(tool),
   };
 }
@@ -150,7 +152,9 @@ function buildServer(o: McpServerOptions, life: Lifecycle): McpServer {
         const run = (async (): Promise<CallToolResult> => {
           try {
             const result = await o.tools.call(tool, input, signal);
-            return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], structuredContent: result };
+            // CONTRACTS §13.8: images (take_screenshot) go first as image content; the JSON stays the text part.
+            const images = toolImages(result).map((img) => ({ type: 'image' as const, data: img.data, mimeType: img.mimeType }));
+            return { content: [...images, { type: 'text', text: JSON.stringify(result, null, 2) }], structuredContent: result };
           } catch (e) {
             const text = life.shutdown.aborted ? 'Flutter Intercept stopped (VS Code closed or agent access turned off).' : errorText(e);
             return { content: [{ type: 'text', text }], isError: true };

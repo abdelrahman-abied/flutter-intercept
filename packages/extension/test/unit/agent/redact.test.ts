@@ -3,6 +3,7 @@ import {
   isSensitiveField,
   isSensitiveHeader,
   REDACTED,
+  redactLogLine,
   redactBodyText,
   redactHeaders,
   redactJsonLikeText,
@@ -144,5 +145,33 @@ describe('REVIEW-4 #9: credential-looking values, whatever the key', () => {
     expect(redactJsonValue({ refresh: JWT, list: [OPAQUE, 'ok'] })).toEqual({ refresh: REDACTED, list: [REDACTED, 'ok'] });
     const r = redactExchange({ id: 'e', startedAt: 1, method: 'POST', url: 'https://a/login', requestHeaders: {}, state: 'completed', status: 200, responseHeaders: { 'content-type': 'application/json' }, responseBody: { text: `{"access":"${JWT}","bearer":"${OPAQUE}"}`, encoding: 'utf8' } });
     expect(r.responseBody!.text).toBe(`{"access":"${REDACTED}","bearer":"${REDACTED}"}`);
+  });
+});
+
+describe('redactLogLine (CONTRACTS §13.4, REVIEW-7 #8)', () => {
+  // Provider-format fakes are assembled at run time so the source never holds a token-shaped literal (push protection).
+  const SK = ['sk', 'live', '51abcDEF'].join('_');
+  const GHP = ['ghp', '1234567890abcdefABCDEF1234567890abcd'].join('_');
+  const AKIA = 'AK' + 'IA' + 'ABCDEFGHIJKLMNOP';
+  const XOXB = ['xo' + 'xb', '1234567890', 'abcdef'].join('-');
+  it.each<[string, string]>([
+    ['token abc123def456', 'token [redacted]'],
+    [`apiKey ${SK}`, 'apiKey [redacted]'],
+    ['x-api-key k-12345-abcde', 'x-api-key [redacted]'],
+    [`set token to ${GHP}`, 'set token to [redacted]'],
+    ['password hunter2', 'password [redacted]'],
+    ['[token abc123]', '[token [redacted]]'],
+    ['password=hunter2&user=bob', 'password=[redacted]&user=bob'],
+    ['cookie session=s3cr3t', 'cookie session=[redacted]'],
+    ['user password: hunter2, ok', 'user password: [redacted], ok'],
+    ['sent with Bearer abc.def.ghi', 'sent with Bearer [redacted]'],
+    ['{"session":"s3cr3t","n":1}', '{"session":"[redacted]","n":1}'],
+    [`${AKIA} leaked`, '[redacted] leaked'],
+    [`got ${XOXB} here`, 'got [redacted] here'],
+    ['id 7f3c9e2aB1d4E6f8a0b2C4d6e8f0a1b3 done', 'id [redacted] done'],
+    ['loaded 3 users in 40 ms', 'loaded 3 users in 40 ms'],
+    ['status 200 for GET /users/1', 'status 200 for GET /users/1'],
+  ])('%s → %s', (line, want) => {
+    expect(redactLogLine(line)).toBe(want);
   });
 });
