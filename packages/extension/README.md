@@ -299,18 +299,26 @@ endpoints.
 12. [Simulate a slow, flaky or offline network](#simulate-a-slow-flaky-or-offline-network)
 13. [Slow down or break a single endpoint](#slow-down-or-break-a-single-endpoint)
 
+**Your models vs the real API**
+
+14. [Check responses against your models](#check-responses-against-your-models)
+15. [Break a field on purpose](#break-a-field-on-purpose)
+16. [Generate a Dart model from traffic](#generate-a-dart-model-from-traffic)
+17. [Generate a fixture test](#generate-a-fixture-test)
+
 **Devices**
 
-14. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
-15. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
-16. [Run on a physical iPhone](#run-on-a-physical-iphone)
-17. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
+18. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
+19. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
+20. [Run on a physical iPhone](#run-on-a-physical-iphone)
+21. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
 
 **AI agents**
 
-18. [Connect an AI agent](#connect-an-ai-agent)
-19. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
-20. [Control what agents can see and do](#control-what-agents-can-see-and-do)
+22. [Connect an AI agent](#connect-an-ai-agent)
+23. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
+24. [Control what agents can see and do](#control-what-agents-can-see-and-do)
+25. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
 
 ### Run your app with interception
 
@@ -350,7 +358,8 @@ You'll narrow a busy list down to the requests you care about.
    - `m:POST` (method), `s:404`, `s:4xx` or `s:error` (status);
    - `t:json` (also `html`, `image`, `text`, `xml`, `binary`, `other`);
    - `body:token` or `body:"a phrase"`, `h:authorization` or `h:name=value`;
-   - `state:paused` (also `mocked`, `blocked`, `error`, `simulated`, `resent`), `src:login_page.dart`.
+   - `state:paused` (also `mocked`, `blocked`, `error`, `simulated`, `resent`), `src:login_page.dart`;
+   - `contract:error` (also `warning`, `ok`, `unchecked`): the [model check](#check-responses-against-your-models).
 3. Put `-` in front of any word or filter to exclude it, for example `-s:2xx`.
 4. Or use the toolbar: **All methods**, the **2xx** to **5xx** and **err** toggles, and **paused only**.
 
@@ -501,6 +510,74 @@ You'll make one endpoint slow or failing while the rest of the app stays normal.
 **Tip:** **Timeout** holds the request until your app gives up, so it tests your client timeout. Throttling
 doesn't slow uploads or WebSockets.
 
+### Check responses against your models
+
+You'll find the field of a real response that would make your `fromJson` throw.
+
+1. Use json_serializable or freezed models with their generated `*.g.dart` files. Nothing else to set up.
+2. Run the app, select a JSON response such as `GET https://jsonplaceholder.typicode.com/users/3`, and open
+   **Response**.
+3. **Model check** names the model and how it was found (a Retrofit or Chopper declaration, or the call site),
+   then says **matches the model** or lists the errors and warnings.
+4. Click a problem to open that field in your model file.
+5. Wrong model, or none? Click **Check against a model…** (or **Check against a different model…**) and pick a
+   class, a `List<…>`, **Don't check this route** or **Forget my choice (map automatically)**.
+
+**You should see:** a **model** badge on rows with problems, the field marked in the JSON tree, and the error on
+the field in your model file, for example
+`email is null in GET /users/1 → type 'Null' is not a subtype of type 'String' in type cast`.
+
+**Tip:** filter with `contract:error` (or `warning`, `ok`, `unchecked`). Turn it off with
+`flutterIntercept.contractCheck`.
+
+### Break a field on purpose
+
+You'll let the real response through with one field changed, to reproduce a crash and test your fix.
+
+1. Select a JSON response and open **Response**.
+2. Right-click a field in the JSON tree (or move to it with the arrow keys and press **Shift+F10**).
+3. Pick **Make null in next responses** or **Remove from next responses**.
+4. Or pick **Change value…**, type a JSON value such as `"42"`, `1.0` or `[]`, and click
+   **Apply to next responses**.
+5. Inside a list, **Make null in every item** and **Remove from every item** change that field in all items.
+6. Trigger the request again.
+
+**You should see:** a "Rule added: …" notice with **Undo**, and your app receiving the changed field.
+
+**Tip:** the change applies until you disable or delete the rule in **Rules**. There it's a **Mutate JSON** rule:
+add more paths with **+ Add change**. Numbers keep their exact form (`1.0` stays a double). **Copy JSON path**
+copies a field's path. A mocked response can't be changed this way; edit the mock instead.
+
+### Generate a Dart model from traffic
+
+You'll turn real responses into model classes.
+
+1. Make the app call the endpoint a few times, ideally with different data.
+2. Select one of the responses and click **Generate…** → **Generate Dart model** (also in the row's right-click
+   menu).
+3. The model opens in a new, unsaved editor. Save it in your project; for freezed or json_serializable, run
+   `dart run build_runner build`.
+
+**You should see:** every recorded response of that route merged into one model, in your project's style
+(freezed, json_serializable or plain). Fields seen only sometimes are optional; fields seen as `null` are
+nullable; nested objects get their own classes.
+
+**Tip:** the more varied the samples, the better the nullability. The item is disabled for non-JSON responses.
+
+### Generate a fixture test
+
+You'll turn a recorded request into a test that doesn't need the server.
+
+1. Select a finished request and click **Generate…** → **Generate test fixture**.
+2. The JSON fixture and a test open in new editors. Save them under `test/`.
+3. Adjust the test to call your repository or service and check what matters.
+
+**You should see:** a test that uses http_mock_adapter (Dio), `package:http`'s `MockClient` or mocktail for a
+Retrofit interface, depending on your project's dev dependencies.
+
+**Tip:** secrets in the recorded traffic are always redacted in fixtures. Check the rest of the data before you
+commit them.
+
 ### Run on an Android emulator or phone
 
 You'll intercept an Android build.
@@ -604,6 +681,29 @@ agents read, including HAR exports and code snippets.
 
 **Tip:** redaction only affects what agents read; your app always gets the real values. Agents never see the CA
 key, the iPhone LAN token or the MCP token.
+
+### Let agents check models and verify changes
+
+You'll have an agent debug a parsing error, break fields, write models and tests, and check its own work.
+
+1. [Connect your agent](#connect-an-ai-agent), then run **Flutter Intercept: Add AI Agent Instructions** again
+   to pick up the new tools.
+2. Ask, for example:
+   - "The profile screen fails with `type 'Null' is not a subtype of type 'String'`. Which field and model?"
+     (`check_contract`)
+   - "Make `email` null in the next `/users/*` response and check the app shows a fallback." (`add_mutation`)
+   - "Generate a model for `GET /users/{id}` and a fixture test for it." (`generate_model`,
+     `generate_fixture_test`)
+   - "After my change, check that the app requests `/users/3` with a 200 and a string `$.email`."
+     (`assert_traffic`)
+3. MCP clients that support prompts also get ready-made ones: `debug-failing-request`, `test-error-states`,
+   `verify-change` and `build-api-layer-from-traffic`. In Claude Code they're slash commands, such as
+   `/mcp__flutter-intercept__verify-change`.
+
+**You should see:** a pass/fail answer from `assert_traffic`, and generated files that the agent writes into your
+project itself (the tools only return them).
+
+**Tip:** agents match URLs with globs only (`*/users/*`), never regexes.
 
 ## Settings and commands
 
