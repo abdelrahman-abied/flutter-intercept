@@ -224,3 +224,14 @@ Android emulator: with the offline profile the h2c calls got `14 UNAVAILABLE`, a
 15 s deadline with no connection reaching the server. Device runs on the busy machine showed the known
 `stop_app: Canceled` flake once; reruns alone passed. Not verified: a physical iPhone, connectrpc against a real app,
 mTLS on gRPC upstreams, IPv6 targets, Edge.
+
+
+## v0.11.0 — gRPC parity (started 2026-10-11, branch `feature/0.11.0`)
+Contract: CONTRACTS §17. Owner instruction: take every decision in the project's interest.
+| Agent | Owns |
+|---|---|
+| P proxy | message transform, gRPC breakpoints + edits, mutate via the injected codec, gRPC replay, `setGrpcCodec` — `packages/proxy/**` except `types.ts` |
+| S schema | `.proto` parser + linking into the shared schema, `source` — `packages/extension/src/grpc/**` except `types.ts`, `service.ts`, `discovery.ts` |
+| H host + agents + recordings | codec injection, `resume` with `GrpcEdit`, `decodeGrpc.paused`, `.proto` discovery, recordings v3 / replay / diff, agent tools — `src/agent/**`, `src/ui/controller.ts`, `src/proxyHost.ts`, `src/recordings/**`, `src/grpc/service.ts` + `discovery.ts`, `test/integration/suite/agent.ts` |
+| W webview | gRPC pause editor, breakpoint / mutate on gRPC, recordings counts — `packages/webview/**` except `protocol.ts` |
+| lead | contract, types, `extension.ts`, sidecar, CLI, docs, E2E, review |

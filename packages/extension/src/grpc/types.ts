@@ -42,6 +42,8 @@ export interface ProtoMessage {
   fields: ProtoField[];
   file: string;
   line?: number;
+  /** CONTRACTS §17.5: read from generated Dart (default) or a `.proto` file. */
+  source?: 'pb.dart' | 'proto';
 }
 
 export interface ProtoEnum {
@@ -60,6 +62,8 @@ export interface GrpcMethod {
   serverStreaming: boolean;
   file: string;
   line?: number;
+  /** CONTRACTS §17.5: read from generated Dart (default) or a `.proto` file. */
+  source?: 'pb.dart' | 'proto';
 }
 
 export interface GrpcSchema {

@@ -1878,3 +1878,95 @@ tokenizer) bounded; redaction of decoded messages and metadata for agents; `grpc
   `messages` as `get_request` would (schema decode → redacted JSON, else raw decode redacted by value, else
   `[binary N bytes]`) and HTTP `mock.body` through `redactBodyText`; confirmations show only validated values; tool
   descriptions say that without the app's generated code redaction is by value only.
+
+
+## 17. v0.11.0 — gRPC parity (2026-10-11)
+
+Goal: the HTTP tools that 0.10 left out for gRPC — **breakpoints**, **mutate**, **recordings / replay / diff** — plus
+**`.proto` files** as a schema source. Owner: "take every decision in the project's interest". Plan and owners:
+docs/PLAN.md "v0.11.0". Hook map (as of 0.10): the relay pipes bytes (`grpcRelay`, `Observer` links), so 0.11 replaces
+the observer links with a **message-reframing transform** that can hold or rewrite whole messages without breaking
+backpressure or HTTP/2 flow control. Types already in code: `packages/proxy/src/types.ts` (`GrpcPause`, `GrpcEdit`,
+`GrpcProxyCodec`, `ReplayEntry.kind 'grpc'` + `grpc`, `Exchange.grpcPause`), `packages/webview/src/protocol.ts`
+(`GrpcDecoded.paused`, `RecordingSummary.grpc`), `packages/extension/src/grpc/types.ts` (`ProtoMessage.source`,
+`GrpcMethod.source`).
+
+### 17.1 Proxy: message transform (replaces the observer links)
+- Request and response directions of a relayed call run through a `GrpcMessageTransform` that parses whole messages
+  (5-byte header + payload), records them as today (frame cap 64 KB, counts, §16.8 decompression), and for each
+  message either forwards it unchanged (default, zero-copy when no hook applies), **holds** it (breakpoint), or
+  **replaces** it (mutate / breakpoint edit), re-framed with `frameMessage`. Replaced messages are sent **uncompressed**
+  (flag 0 is legal per message whatever `grpc-encoding` says). Holding = not calling the transform callback, so
+  HTTP/2 flow control pushes back on the sender.
+- Whole-message cap for hooks: 4 MB (decompressed for compressed messages, bounded as §16.8). A larger message is
+  forwarded unchanged and the exchange gets a note ("message over 4 MB: not paused / not mutated").
+- The fast path (no breakpoint / mutate rule for the call) must stay as cheap as 0.10 (no per-message copies).
+
+### 17.2 Breakpoints on gRPC
+- A `breakpoint` rule now applies to gRPC calls (`grpcApplicable` += breakpoint, mutate). Phase `request` holds each
+  message the app sends; `response` holds each message the server sends **and** the end of the call (the trailers);
+  `both` = both.
+- While held: `Exchange.state` `paused-request` / `paused-response`, `pausedAt`, `pauseDeadline`, and
+  `grpcPause` = `{kind: 'message', dir, index, base64, size}` (the full held message, ≤ 4 MB) or `{kind: 'status',
+  code, message?, trailers}` (the trailers the server sent; a trailers-only response is held as status too).
+- `resume(id, edit?: GrpcEdit)`: for a message pause `{message: base64}` replaces it, `{drop: true}` drops it (the
+  index of later messages is unchanged in the record; dropped messages are recorded with `dropped: true`); for a status
+  pause `{status: {code 0–16, message?}, trailers?}` replaces the final status / custom trailers (pseudo,
+  `content-type`, `grpc-status`, `grpc-message` refused inside `trailers`). `messageJson` is host-only (encoded with the
+  schema before `resume` reaches the proxy, like `grpcMock.messagesJson`). `abort(id)` → `RST_STREAM CANCEL` both ways.
+  Auto-resume unedited after `breakpointTimeoutMs`. Messages behind a held one wait (order is kept); the other
+  direction keeps flowing.
+- Pausing never holds a whole streaming call open forever: each pause has its own deadline.
+
+### 17.3 Mutate on gRPC
+- `mutate` rules apply to **response messages** of matching gRPC calls: decode with the codec the host injects
+  (`setGrpcCodec`), `applyOps` (same JSON path subset), encode, forward. No codec / unknown method / decode failure →
+  the message is forwarded unchanged and the exchange gets a note ("mutate: no schema for /pkg.Svc/Method"). Proto3 JSON
+  rules apply (`valueJson` "42" for int64 strings etc.); an encode error (e.g. a string into an int32) forwards the
+  original and notes the JSON path.
+- `InterceptProxy.setGrpcCodec(codec?: GrpcProxyCodec)`: `decode(path, dir, bytes) → json | undefined` and
+  `encode(path, dir, json) → Uint8Array` (throws with a JSON-path message), synchronous, called only for messages a
+  hook needs. The host passes one backed by its schema service (VS Code and the sidecar; the CLI passes none).
+
+### 17.4 Recordings, replay and diff with gRPC
+- Recording format **version 3** when a recording contains gRPC calls (2 with WS/SSE only, 1 otherwise). A gRPC entry:
+  `kind: 'grpc'`, method POST, URL, request / response headers, `frames` (message frames both ways, as recorded:
+  ≤ 64 KB each), `grpc: {code, message?, trailers?, requestHash?}` (`requestHash` = sha256 of the first request
+  message, to tell unary calls apart). Calls with a truncated or `sizeUnknown` response message are saved with
+  `incomplete: true` and are not replayed (fallback applies). Redacted recordings: with a schema, messages are decoded,
+  redacted like agents see them, re-encoded; without one, binary messages become zero bytes of the recorded size.
+- Replay: a gRPC entry answers like a `grpcMock` (recorded response headers minus pseudo / content-type, the recorded
+  response messages with their recorded gaps capped at 5 s, then the recorded status and trailers). Matching: path,
+  then `requestHash` when several entries share a path, else the next unused entry for that path in order, then the
+  last one. Unmatched gRPC calls follow `fallback` (passthrough / `14 Not in the recording`, as 0.10).
+- Diff: route key `gRPC /pkg.Service/Method`; status code changes, message count changes per direction, and, when the
+  schema decodes both sides, JSON shape changes of the first response message (same shape diff as HTTP bodies).
+- Agents: `save_recording` / `replay_recording` / `diff_recordings` include gRPC; `RecordingSummary.grpc` counts them.
+
+### 17.5 `.proto` files as a schema source (`src/grpc/**`, pure)
+- `loadGrpcSchema` also accepts `*.proto` files (proto2 / proto3 / editions syntax subset: package, import, message,
+  nested message / enum, fields with labels, maps, oneofs, options ignored, services with rpc + `stream`, `json_name`,
+  `reserved`, `extensions` skipped with a problem; groups → problem). JSON names follow protoc (lowerCamelCase unless
+  `json_name`). Imports resolve by path suffix among the loaded `.proto` files; `google/protobuf/*` uses the built-in
+  well-known types.
+- When a message or method is defined by both generated Dart and a `.proto`, the generated Dart wins (it is what the
+  app runs); `source` tells which one was used. Same budget and caps as §16.8.
+- Discovery (host): `**/*.proto` in the workspace folders too (skip `node_modules`, `build`, `.dart_tool`, `Pods`,
+  `.git`; caps shared with the Dart files).
+
+### 17.6 Host, agents, webview
+- Host: `setGrpcCodec` wired in VS Code and the sidecar; `resume` with `GrpcEdit.messageJson` encoded with the call's
+  request / response type (errors back to the caller, the call stays paused); `decodeGrpc` also returns `paused` (the
+  held message decoded in full, ≤ 4 MB) for a paused call.
+- Agents: `add_breakpoint` / `add_mutation` describe gRPC; `list_paused` / `get_request` show `grpcPause` (decoded,
+  redacted); `resume_request` takes `grpc: {messageJson? | message? | drop? | status? + trailers?}`; recordings tools
+  per §17.4.
+- Webview: a gRPC pause editor (JSON editor of the held message with Resume / Drop / Abort; a status editor for the end
+  of the call), breakpoints and mutate offered on gRPC rows and in the rule editor (the 0.10 "doesn't apply to gRPC"
+  notes removed for them), recordings show gRPC counts.
+
+### 17.7 Security review items
+The transform's caps (4 MB hold, decompression bound), held-message memory per call and in total (≤ 64 MB of held
+messages across calls, beyond that new pauses are skipped with a note), codec calls bounded (no recursion bombs:
+§16.3 limits), recordings never write unredacted messages when `redact` is set, `.proto` parser bounded and linear,
+`resume` edits validated (base64, size, status range, trailer names).

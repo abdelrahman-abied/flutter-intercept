@@ -80,6 +80,36 @@ export interface Exchange {
   responseTrailers?: Record<string, string | string[]>;
   /** kind `tunnel`: a gRPC connection over TLS passed through undecrypted (host not in `grpcDecryptHosts`). */
   grpcTunnel?: true;
+  // CONTRACTS §17 (v0.11.0)
+  /** kind `grpc`, while `paused-*`: what is held (a message, or the end of the call). */
+  grpcPause?: GrpcPause;
+}
+
+/** CONTRACTS §17.2: what a gRPC breakpoint holds. */
+export type GrpcPause =
+  | { kind: 'message'; dir: 'send' | 'receive'; index: number; base64: string; size: number }
+  | { kind: 'status'; code: number; message?: string; trailers: Record<string, string | string[]> };
+
+/** CONTRACTS §17.2: `resume(id, edit)` for a paused gRPC call. One of message / drop (message pause) or status (end). */
+export interface GrpcEdit {
+  /** Replacement message (protobuf bytes, base64). */
+  message?: string;
+  /** Host-only: JSON encoded with the schema into `message` before the proxy sees it. */
+  messageJson?: unknown;
+  /** Drop the held message. */
+  drop?: true;
+  /** Status pause: the final gRPC status (0–16) and message. */
+  status?: { code: number; message?: string };
+  /** Status pause: custom trailers replacing the server's (reserved names refused). */
+  trailers?: Record<string, string>;
+}
+
+/** CONTRACTS §17.3: protobuf decode / encode the host injects (`setGrpcCodec`); synchronous, bounded. */
+export interface GrpcProxyCodec {
+  /** `path` = `/pkg.Service/Method`; dir `send` = request type, `receive` = response type. undefined = unknown. */
+  decode(path: string, dir: 'send' | 'receive', bytes: Uint8Array): unknown | undefined;
+  /** Throws an Error whose message names the JSON path. */
+  encode(path: string, dir: 'send' | 'receive', json: unknown): Uint8Array;
 }
 
 /** CONTRACTS §16.2: one gRPC call. */
@@ -139,6 +169,8 @@ export interface Frame {
   closeCode?: number;              // close frames
   compressed?: true;               // gRPC message sent compressed (base64/size are the decompressed bytes)
   sizeUnknown?: true;              // CONTRACTS §16.8: decompression stopped at the frame cap; size = compressed (wire) size
+  dropped?: true;                  // CONTRACTS §17.2: a gRPC message dropped at a breakpoint (never delivered)
+  edited?: true;                   // CONTRACTS §17.2 / §17.3: a gRPC message replaced by a breakpoint edit or a mutate rule
 }
 
 export interface GraphqlInfo {
@@ -362,9 +394,12 @@ export interface ReplayEntry {
   headers: Record<string, string | string[]>;
   body?: Body;
   requestBodyHash?: string;        // sha256 of the decoded request body, to tell POSTs apart
-  /** CONTRACTS §14.5: a recorded WebSocket / SSE exchange, replayed as a scripted server from `frames`. */
-  kind?: 'websocket' | 'sse';
+  /** CONTRACTS §14.5: a recorded WebSocket / SSE exchange, replayed as a scripted server from `frames`.
+   * CONTRACTS §17.4: `grpc` = a recorded gRPC call (frames = its messages), replayed like a grpcMock. */
+  kind?: 'websocket' | 'sse' | 'grpc';
   frames?: Frame[];
+  /** kind `grpc`: the recorded status, custom trailers and the sha256 (hex) of the first request message. */
+  grpc?: { code: number; message?: string; trailers?: Record<string, string | string[]>; requestHash?: string };
 }
 
 export interface ReplayOptions {

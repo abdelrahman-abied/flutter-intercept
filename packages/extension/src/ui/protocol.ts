@@ -1,5 +1,5 @@
 /** CONTRACTS §4, verbatim. */
-import type { Exchange, RequestEdit, ResponseEdit, Rule, RuleAction } from '@flutter-intercept/proxy';
+import type { Exchange, GrpcEdit, RequestEdit, ResponseEdit, Rule, RuleAction } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 
 export interface Status {
@@ -63,7 +63,7 @@ export type HostMsg =
 // webview → host
 export type ViewMsg =
   | { type: 'ready' }
-  | { type: 'resume'; id: string; edit?: RequestEdit | ResponseEdit }
+  | { type: 'resume'; id: string; edit?: RequestEdit | ResponseEdit | GrpcEdit } // GrpcEdit: CONTRACTS §17.2
   | { type: 'abort'; id: string }
   | { type: 'setRules'; rules: Rule[] }
   | { type: 'clear' }
@@ -122,7 +122,7 @@ export interface SessionWarning {
 }
 
 /** CONTRACTS §12.7 */
-export interface RecordingSummary { id: string; name: string; createdAt: number; exchanges: number; redacted: boolean; streams?: number; frames?: number } // streams/frames: CONTRACTS §14.5 (WebSocket / SSE)
+export interface RecordingSummary { id: string; name: string; createdAt: number; exchanges: number; redacted: boolean; streams?: number; frames?: number; grpc?: number } // streams/frames: CONTRACTS §14.5 (WebSocket / SSE)
 export interface AuthFlowSummary {
   steps: { exchangeId: string; role: 'unauthorized' | 'refresh' | 'retry' | 'other' }[];
   stampede?: { refreshCalls: number; windowMs: number };
@@ -147,6 +147,8 @@ export interface GrpcDecoded {
   messages: GrpcDecodedMessage[];
   /** `exchange.framesDropped` when decoded (0 = none), so the panel lines messages up with frames exactly. */
   framesDropped: number;
+  /** CONTRACTS §17.6: the message a breakpoint holds, decoded in full (≤ 4 MB), while the call is paused on a message. */
+  paused?: GrpcDecodedMessage & { index: number };
   /** Example JSON for each type (rule editor "skeleton" button). */
   skeletons?: { request?: string; response?: string };
   problem?: string;

@@ -68,6 +68,9 @@ export type {
   ScriptResponse,
   ClientCertificate,
   GrpcInfo,
+  GrpcPause,
+  GrpcEdit,
+  GrpcProxyCodec,
 } from './types';
 // v0.10.0 (CONTRACTS §16.2)
 export {
