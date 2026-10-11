@@ -157,7 +157,7 @@ and `mock` (gRPC has `grpcMock`). As built: docs/spikes/grpc.md "As built — pr
 | **Rewrite** | Request metadata, response headers, new `response.setTrailers` / `removeTrailers` (trailers-only answers too). Pseudo headers, `content-type`, `te`, `grpc-encoding` / `-accept-encoding` / `-status` / `-message` / `-timeout` refused; CR/LF refused; `-bin` values base64. `replaceBody` / `status` → note, metadata still applied. |
 | **Scripts** | `onGrpcMessage` (`{path, dir, index, json?, base64, size}` → `{json}` / `{base64}` / `{drop}`) and `onGrpcStatus` (`{code?, message?, trailers?}`) on the 0.11 message transform, only when the script defines them. 200 ms per hook, ≤ 1 MB per message, ≤ 1000 messages per call; errors send the original and go to the script log. |
 | **Map remote** | Upstream session to the mapped origin (h2c for `http`, TLS + ALPN h2 for `https`), `:authority` = new host unless `preserveHost`; LAN deny and client-certificate Origin checks on the mapped URL; "Mapped to <origin>". |
-| **Resend / edit & resend** | `send()` with `grpc.messages`: own HTTP/2 call, uncompressed messages then half-close; ≤ 100 messages, 4 MB each, 16 MB total; `grpc-timeout: 60S` default. Rules and the network profile don't apply. Host encodes `messagesJson`; refused when a recorded request message was cut. LAN-recorded calls only with LAN mode on and through `lanTargetDenial`. |
+| **Resend / edit & resend** | `send()` with `grpc.messages`: own HTTP/2 call, uncompressed messages then half-close; ≤ 100 messages, 4 MB each, 16 MB total; `grpc-timeout: 60S` default. Rules, the network profile and replay apply, like HTTP resend (REVIEW-12). Host encodes `messagesJson`; refused when a recorded request message was cut. LAN-recorded calls only with LAN mode on and through `lanTargetDenial`. |
 | **Agents** | `resend_request` with `grpc.messagesJson` or `grpc.messages` (redacted values restored), `add_rewrite` trailers and gRPC validation, `add_map_remote` on gRPC (loopback only). |
 | **Webview** | **More rules…** (rewrite / script / map remote for a route), trailers fields in the rewrite editor, gRPC notes per action, gRPC edit & resend composer, script templates with gRPC hooks. |
 
@@ -168,7 +168,6 @@ and `mock` (gRPC has `grpcMock`). As built: docs/spikes/grpc.md "As built — pr
   view with default credentials: untested, touches the simulator's trust store, needs its own spike and security
   review (docs/spikes/grpc.md "Open decision"). Android needs a writable-system emulator: document only.
 - A `grpcurl` snippet for gRPC calls in **Copy as…** and `get_request` (snippets are HTTP-only today).
-- Rules (and the network profile) on resent gRPC calls; today a resent call goes straight to the server.
 
 ## 5. Spikes and decisions before building
 - Dio's async stack depth for request → source (0.3).

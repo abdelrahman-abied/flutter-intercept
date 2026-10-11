@@ -1490,7 +1490,7 @@ status and the trailers.
 half-closes. Unary and server-streaming calls behave as from the app; client-streaming and bidi calls send all their
 messages first, then half-close. Up to 100 messages, 4 MB each and 16 MB in total. The deadline is 60 s unless you add a
 `grpc-timeout` header; after it the call is cancelled. `content-type`, `te`, `grpc-encoding` and pseudo headers are
-set by the proxy. Rules and the network profile don't apply to a resent gRPC call (it isn't the app's traffic).
+set by the proxy. Rules, the network profile and replay apply to a resent gRPC call, as they do to the app's calls.
 **Resend** is disabled when a request message was too large to record in full (64 KB); use **Edit and resend**. A
 call recorded from a physical iPhone is resent only while that session's LAN mode is on, and only to servers it
 allows.
@@ -1806,7 +1806,7 @@ What isn't intercepted, or behaves differently while intercepting:
     Rewrites change metadata and trailers only, not the body or the status. HAR exports and recordings include
     gRPC calls; OpenAPI, Postman, the cURL / Dart / Dio snippets and the model and fixture generators skip them.
   - Script hooks see messages up to 1 MB, at most 1000 per call; the rest go through unchanged.
-  - Resent gRPC calls skip rules and the network profile. Client-streaming and bidi calls are resent with all their
+  - Client-streaming and bidi calls are resent with all their
     messages first, then a half-close; up to 100 messages (16 MB) and a 60 s deadline by default.
   - Breakpoints and Mutate JSON work on whole messages up to 4 MB, with 64 MB of gRPC data held at most across
     calls; Mutate JSON changes response messages up to 1 MB and needs the app's schema. Larger messages go through

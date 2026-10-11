@@ -20,7 +20,7 @@
 - **Resend and Edit and resend for gRPC calls.** **Resend** sends the recorded request messages and metadata again;
   **Edit and resend** edits the method, metadata and messages (JSON encoded with the schema, or base64). The proxy
   opens its own HTTP/2 call: up to 100 messages (4 MB each, 16 MB in total), a 60 s deadline unless `grpc-timeout`
-  is given, all messages sent then a half-close. Rules and the network profile don't apply to resent gRPC calls.
+  is given, all messages sent then a half-close. Rules, the network profile and replay apply to resent gRPC calls, as for HTTP.
 - **More rules…** on a request or gRPC call opens a new **Rewrite**, **Script** or **Map remote** rule for its route
   in the rule editor.
 - Only CORS and HTTP **Mock response** rules don't apply to gRPC calls now.
