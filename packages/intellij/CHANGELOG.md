@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.2 (preview)
+
+- Fixed an empty Flutter Intercept tool window ("Nothing to show") when it was opened after an app had already been
+  run with interception.
+
 ## 0.9.1 (preview)
 
 - Fixed the plugin icon on the JetBrains Marketplace and in the Plugins settings (it showed as a small square).

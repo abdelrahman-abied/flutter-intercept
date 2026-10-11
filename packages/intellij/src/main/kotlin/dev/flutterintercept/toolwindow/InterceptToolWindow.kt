@@ -59,6 +59,13 @@ class InterceptToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     private var browser: EmbeddedView? = null
     private var browserDisposable: Disposable? = null
     private val jcef = JcefBridge.isSupported()
+    // Declared before `init`: it may call showUi() right away when the sidecar is already running.
+    private val flutterBrowser = FlutterEmbeddedBrowser()
+    private var embedding = false
+    /** Why the embedded browser isn't used (shown on the fallback panel), once known. */
+    private var embeddedProblem: String? = null
+    /** Set when the panel is disposed (tool window closed / project closing): late callbacks then do nothing. */
+    @Volatile private var disposed = false
 
     init {
         background = UIUtil.getPanelBackground()
@@ -81,13 +88,8 @@ class InterceptToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     }
 
     private fun onEdt(block: () -> Unit) {
-        ApplicationManager.getApplication().invokeLater({ if (!project.isDisposed) block() }, ModalityState.any())
+        ApplicationManager.getApplication().invokeLater({ if (!disposed && !project.isDisposed) block() }, ModalityState.any())
     }
-
-    private val flutterBrowser = FlutterEmbeddedBrowser()
-    private var embedding = false
-    /** Why the embedded browser isn't used (shown on the fallback panel), once known. */
-    private var embeddedProblem: String? = null
 
     private fun showUi(init: InitResult) {
         val existing = browser
@@ -245,6 +247,7 @@ class InterceptToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     private fun escape(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
 
     override fun dispose() {
+        disposed = true
         browser = null
         browserDisposable = null
     }

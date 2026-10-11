@@ -118,6 +118,10 @@ class PluginPlatformTest : BasePlatformTestCase() {
             service.sessionEnded("s1")
             sidecar.pushTheme()
             sidecar.setUiVisible(true)
+            // Regression (0.9.1): opening the tool window while the sidecar already runs called showUi() from
+            // `init` before the panel's later properties existed (NPE, empty "Nothing to show" tool window).
+            val panel = dev.flutterintercept.toolwindow.InterceptToolWindowPanel(project)
+            com.intellij.openapi.util.Disposer.dispose(panel)
             app.deleteRecursively()
         } finally {
             sidecar.dispose()
