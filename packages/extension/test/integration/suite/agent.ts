@@ -1206,9 +1206,10 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
           const batchIdle = async () => {
             if (!session) return;
             await waitFor(() => {
+              // The latest batch: a hot restart may cut an earlier one short (its `start` never gets a `done`).
               const o = outputOf(session);
-              const started = (o.match(/DEMO_GRPC start/g) ?? []).length;
-              return started > 0 && started === (o.match(/DEMO_GRPC done/g) ?? []).length ? true : undefined;
+              const lastStart = o.lastIndexOf('DEMO_GRPC start');
+              return lastStart >= 0 && o.indexOf('DEMO_GRPC done', lastStart) > lastStart ? true : undefined;
             }, 120_000, 250).catch(() => f.push('the previous gRPC batch never finished'));
           };
           // 1. A response breakpoint (once): edit the held Order's id through resume_request grpc.messageJson.
