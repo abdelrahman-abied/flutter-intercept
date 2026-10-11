@@ -2,11 +2,11 @@
 // finds the files and passes their contents.
 
 import { decodeMessage, decodeRaw, encodeMessage, skeleton } from './codec';
-import { isGrpcGeneratedFile, loadGrpcSchema } from './schema';
+import { isGrpcGeneratedFile, isProtoFile, loadGrpcSchema } from './schema';
 import type { GrpcCodec } from './types';
 
 export * from './types';
-export { decodeMessage, decodeRaw, encodeMessage, isGrpcGeneratedFile, loadGrpcSchema, skeleton };
+export { decodeMessage, decodeRaw, encodeMessage, isGrpcGeneratedFile, isProtoFile, loadGrpcSchema, skeleton };
 
 /** The same functions as one object (the `GrpcCodec` interface). */
 export const grpcCodec: GrpcCodec = { loadGrpcSchema, decodeMessage, decodeRaw, encodeMessage, skeleton };

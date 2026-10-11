@@ -12,7 +12,10 @@ import type {
   ProtoScalar,
 } from './types';
 import { ParsedEnum, ParsedField, ParsedFile, ParsedMessage, parseGeneratedFile, TypeRef } from './parse';
+import { isProtoFile, ParsedProto, parseProtoFile, ProtoTypeRef } from './proto';
 import { builtinWellKnownTypes, WKT_FILES } from './wkt';
+
+export { isProtoFile };
 
 export const MAX_FILES = 5000;
 export const MAX_FILE_BYTES = 2 * 1024 * 1024;
@@ -171,13 +174,15 @@ export function loadGrpcSchema(files: GrpcSourceFile[]): GrpcSchema {
 }
 
 function link(schema: Schema, input: GrpcSourceFile[]): void {
-  // 1. parse, within the caps
+  // 1. parse, within the caps (generated Dart and .proto files share them)
   const parsed: ParsedFile[] = [];
+  const protos: ParsedProto[] = [];
   let total = 0;
   let count = 0;
   for (const f of input) {
     if (!f || typeof f.path !== 'string' || typeof f.text !== 'string') continue;
-    if (!isGrpcGeneratedFile(f.path)) continue;
+    const isProto = isProtoFile(f.path);
+    if (!isProto && !isGrpcGeneratedFile(f.path)) continue;
     if (++count > MAX_FILES) {
       schema.addProblem(`more than ${MAX_FILES} generated files; the rest were skipped`);
       break;
@@ -192,9 +197,26 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
       break;
     }
     const path = norm(f.path);
+    if (isProto) {
+      const pp = parseProtoFile(path, f.text, labelOf(f, path));
+      pp.problems.forEach((x) => schema.addProblem(x));
+      protos.push(pp);
+      continue;
+    }
     const p = parseGeneratedFile(path, f.text, labelOf(f, path));
     p.problems.forEach((x) => schema.addProblem(x));
     parsed.push(p);
+  }
+
+  // .proto declarations (first file wins for a name), by fully-qualified name and by Dart class.
+  const protoKinds = new Map<string, 'message' | 'enum'>();
+  const protoByDartClass = new Map<string, string | null>();
+  for (const pp of protos) {
+    for (const d of [...pp.messages, ...pp.enums]) {
+      if (protoKinds.has(d.fq)) continue;
+      protoKinds.set(d.fq, 'fields' in d ? 'message' : 'enum');
+      protoByDartClass.set(d.dartClass, protoByDartClass.has(d.dartClass) ? null : d.fq);
+    }
   }
 
   const byPath = new Map<string, ParsedFile>();
@@ -336,6 +358,9 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
       const sameDir = all.find((d) => dirname(d.file.path) === dirname(from.path));
       return { decl: sameDir ?? all[0] };
     }
+    // A type only a .proto file defines (its generated Dart wasn't loaded).
+    const fromProto = protoByDartClass.get(ref.cls);
+    if (fromProto) return { fq: fromProto };
     const key = `${from.path}|${ref.prefix ?? ''}.${ref.cls}`;
     if (!unresolved.has(key)) {
       unresolved.add(key);
@@ -374,7 +399,7 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
         if (field) fields.push(field);
         else schema.addProblem(`${f.label}: ${m.dartClass} field ${pf.number} (${pf.name}) has a type this version can't read`);
       }
-      schema.addMessage({ name: d.fq, dartClass: m.dartClass, fields, file: f.path, line: m.line });
+      schema.addMessage({ name: d.fq, dartClass: m.dartClass, fields, file: f.path, line: m.line, source: 'pb.dart' });
     }
   }
 
@@ -387,7 +412,7 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
     const req = typeOf(f, { label: 'O', kind: 'message' }, m.req, `method ${m.path}`);
     const res = typeOf(f, { label: 'O', kind: 'message' }, m.res, `method ${m.path}`);
     if (req?.kind !== 'message' || res?.kind !== 'message') return undefined;
-    return { path: m.path, requestType: req.type, responseType: res.type, clientStreaming: cs, serverStreaming: ss, file: f.path, line: m.line };
+    return { path: m.path, requestType: req.type, responseType: res.type, clientStreaming: cs, serverStreaming: ss, file: f.path, line: m.line, source: 'pb.dart' };
   };
   const service = new Map<string, { f: ParsedFile; cs: boolean; ss: boolean }>();
   for (const f of parsed) for (const s of f.serviceMethods) if (!service.has(s.path)) service.set(s.path, { f, cs: s.clientStreaming, ss: s.serverStreaming });
@@ -410,7 +435,99 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
     }
   }
 
-  // 6. well-known types referenced but not loaded
+  // 6. .proto files: whatever the generated Dart didn't define (the Dart is what the app runs)
+  const dartKinds = new Map<string, 'message' | 'enum'>();
+  for (const m of declsByFile.values()) for (const d of m.values()) if (!dartKinds.has(d.fq)) dartKinds.set(d.fq, d.kind);
+  const wktKinds = new Map<string, { kind: 'message' | 'enum'; file: string }>();
+  for (const [file, classes] of Object.entries(WKT_FILES)) {
+    for (const cls of classes) wktKinds.set(`google.protobuf.${cls}`, { kind: cls === 'NullValue' ? 'enum' : 'message', file });
+  }
+  const kindOf = (fq: string): 'message' | 'enum' | undefined => {
+    const k = dartKinds.get(fq) ?? protoKinds.get(fq);
+    if (k) return k;
+    const w = wktKinds.get(fq);
+    if (w) usedWkt.add(w.file);
+    return w?.kind;
+  };
+  const unresolvedProto = new Set<string>();
+  /** protoc's scoping: the innermost enclosing scope that has the name wins; `.a.B` is absolute. */
+  const resolveProto = (pp: ParsedProto, name: string, scope: string, where: string): ProtoFieldType => {
+    const candidates: string[] = [];
+    if (name.startsWith('.')) candidates.push(name.slice(1));
+    else {
+      for (let sc = scope; ; ) {
+        candidates.push(sc ? `${sc}.${name}` : name);
+        if (!sc) break;
+        const dot = sc.lastIndexOf('.');
+        sc = dot < 0 ? '' : sc.slice(0, dot);
+      }
+    }
+    for (const c of candidates) {
+      const k = kindOf(c);
+      if (k) return k === 'enum' ? { kind: 'enum', type: c } : { kind: 'message', type: c };
+    }
+    const bare = name.replace(/^\./, '');
+    const key = `${pp.path}|${bare}`;
+    if (!unresolvedProto.has(key)) {
+      unresolvedProto.add(key);
+      schema.addProblem(`${pp.label}: ${where} uses ${bare}, which isn't among the loaded files; its contents are shown raw`);
+    }
+    return { kind: 'message', type: bare };
+  };
+  const protoType = (pp: ParsedProto, t: ProtoTypeRef, scope: string, where: string): ProtoFieldType =>
+    t.scalar ? { kind: 'scalar', scalar: t.scalar } : resolveProto(pp, t.name ?? '', scope, where);
+  const packable = (t: ProtoFieldType) => t.kind === 'enum' || (t.kind === 'scalar' && t.scalar !== 'string' && t.scalar !== 'bytes');
+  for (const pp of protos) {
+    for (const e of pp.enums) {
+      if (!dartKinds.has(e.fq)) schema.addEnum({ name: e.fq, dartClass: e.dartClass, values: e.values, file: pp.path });
+    }
+  }
+  for (const pp of protos) {
+    for (const m of pp.messages) {
+      if (dartKinds.has(m.fq) || schema.message(m.fq)) continue;
+      const fields: ProtoField[] = [];
+      for (const fd of m.fields) {
+        const where = `${m.fq.slice(m.fq.lastIndexOf('.') + 1)}.${fd.name}`;
+        let type: ProtoFieldType;
+        if (fd.map) {
+          const value = protoType(pp, fd.map.value, m.fq, where);
+          type = { kind: 'map', key: fd.map.key, value };
+        } else type = protoType(pp, fd.type, m.fq, where);
+        const field: ProtoField = { number: fd.number, name: fd.name, type };
+        if (fd.repeated) field.repeated = true;
+        if (fd.repeated && packable(type) && (fd.packed ?? pp.packedByDefault)) field.packed = true;
+        if (fd.oneof) field.oneof = fd.oneof;
+        if (fd.required) field.required = true;
+        fields.push(field);
+      }
+      schema.addMessage({ name: m.fq, dartClass: m.dartClass, fields, file: pp.path, line: m.line, source: 'proto' });
+    }
+  }
+  for (const pp of protos) {
+    for (const r of pp.methods) {
+      if (schema.method(r.path)) continue;
+      const scope = pp.pkg;
+      const where = `method ${r.path}`;
+      const req = resolveProto(pp, r.req, scope, where);
+      const res = resolveProto(pp, r.res, scope, where);
+      if (req.kind !== 'message' || res.kind !== 'message') {
+        schema.addProblem(`${pp.label}: ${where} uses an enum as its request or response`);
+        continue;
+      }
+      schema.addMethod({
+        path: r.path,
+        requestType: req.type,
+        responseType: res.type,
+        clientStreaming: r.clientStreaming,
+        serverStreaming: r.serverStreaming,
+        file: pp.path,
+        line: r.line,
+        source: 'proto',
+      });
+    }
+  }
+
+  // 7. well-known types referenced but not loaded
   // (an Any can carry any of them, so it brings them all)
   for (const wkt of builtinWellKnownTypes(usedWkt.has('any') ? undefined : usedWkt)) {
     if ('fields' in wkt) schema.addMessage(wkt);
