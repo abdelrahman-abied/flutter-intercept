@@ -231,7 +231,22 @@ describe('paused gRPC calls', () => {
     expect(button(/Resume with edit/).disabled).toBe(true);
     await type(names()[0], 'x-debug');
     await click(button(/Resume with edit/));
-    expect(lastOf('resume')).toEqual({ type: 'resume', id: 'p1', edit: { status: { code: 0 }, trailers: { 'x-debug': 't-1' } } });
+    // REVIEW-11: a trailers-only edit sends just the trailers.
+    expect(lastOf('resume')).toEqual({ type: 'resume', id: 'p1', edit: { trailers: { 'x-debug': 't-1' } } });
+  });
+
+  it('a held code outside 0–16 is read-only; trailers can still be edited', async () => {
+    await openPaused(paused({ grpcPause: { kind: 'status', code: 42, message: 'odd', trailers: { 'grpc-status': '42', 'x-trace': 't-1' } } }));
+    const code = $<HTMLInputElement>('input[aria-label="gRPC status"]')!;
+    expect(code.value).toBe('42 CODE 42');
+    expect(code.readOnly).toBe(true);
+    expect($('select[aria-label="gRPC status"]')).toBeNull();
+    expect(($$('.grpc-pause-editor label.field input')[1] as HTMLInputElement).disabled).toBe(true);
+    expect($('.grpc-status-fixed-note')!.textContent).toContain('status code 42, outside the standard 0–16');
+    const names = $$('.grpc-pause-editor .he-name') as HTMLInputElement[];
+    await type(names[0], 'x-debug');
+    await click(button(/Resume with edit/));
+    expect(lastOf('resume')).toEqual({ type: 'resume', id: 'p1', edit: { trailers: { 'x-debug': 't-1' } } });
   });
 });
 

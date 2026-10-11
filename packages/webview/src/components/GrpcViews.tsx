@@ -318,11 +318,14 @@ function GrpcStatusPause({ ex, p }: { ex: Exchange; p: Extract<GrpcPause, { kind
   const changed = statusChanged || trailersChanged;
   const error = grpcHeaderError(rows, 'Trailer');
   const canEdit = !busy && changed && !error;
+  // REVIEW-11: `status` goes along only when the code or message changed — a trailers-only edit must not resend a
+  // server code the proxy would refuse (above 16).
   const edit = (): GrpcEdit => ({
-    status: { code: Number(code), ...(message.trim() ? { message: message.trim() } : {}) },
+    ...(statusChanged ? { status: { code: Number(code), ...(message.trim() ? { message: message.trim() } : {}) } } : {}),
     ...(trailersChanged ? { trailers: rowsToFlatRecord(rows) } : {}),
   });
-  const known = Number(code) < GRPC_CODES.length;
+  /** The server sent a code outside 0–16: it can't be resent, so the status is read-only (trailers stay editable). */
+  const fixed = !(Number.isInteger(p.code) && p.code >= 0 && p.code < GRPC_CODES.length);
   return (
     <form class="pause-editor grpc-pause-editor" aria-label="Edit the end of the gRPC call" onSubmit={(e) => e.preventDefault()}
       onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); if (canEdit) resume(edit()); else if (!changed && !busy) resume(); } }}>
@@ -330,18 +333,27 @@ function GrpcStatusPause({ ex, p }: { ex: Exchange; p: Extract<GrpcPause, { kind
       <div class="field-row">
         <label class="field">
           <span>Status</span>
-          <select aria-label="gRPC status" value={code} disabled={busy} class={code !== String(p.code) ? 'modified' : undefined}
-            onChange={(e) => setCode((e.target as HTMLSelectElement).value)}>
-            {GRPC_CODES.map((_, c) => <option key={c} value={String(c)}>{grpcCodeLabel(c)}</option>)}
-            {!known && <option value={code}>{code}</option>}
-          </select>
+          {fixed ? (
+            <input class="grpc-status-fixed" aria-label="gRPC status" value={grpcCodeLabel(p.code)} readOnly disabled />
+          ) : (
+            <select aria-label="gRPC status" value={code} disabled={busy} class={code !== String(p.code) ? 'modified' : undefined}
+              onChange={(e) => setCode((e.target as HTMLSelectElement).value)}>
+              {GRPC_CODES.map((_, c) => <option key={c} value={String(c)}>{grpcCodeLabel(c)}</option>)}
+            </select>
+          )}
         </label>
         <label class="field grow">
           <span>Message <span class="muted">(grpc-message)</span></span>
-          <input value={message} disabled={busy} spellcheck={false} class={message !== (p.message ?? '') ? 'modified' : undefined}
+          <input value={message} disabled={busy || fixed} spellcheck={false} class={message !== (p.message ?? '') ? 'modified' : undefined}
             onInput={(e) => setMessage((e.target as HTMLInputElement).value)} />
         </label>
       </div>
+      {fixed && (
+        <div class="msg info grpc-status-fixed-note" role="note">
+          The server sent status code {p.code}, outside the standard 0–16: it is forwarded as is and can't be changed here.
+          The trailers can still be edited.
+        </div>
+      )}
       <h4 class={`section-title${trailersChanged ? ' modified' : ''}`}>Trailers</h4>
       <HeadersEditor rows={rows} disabled={busy} onChange={setRows} />
       <div class="hint">grpc-status and grpc-message come from the fields above; :pseudo headers and content-type can't be set.</div>
