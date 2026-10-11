@@ -567,7 +567,28 @@ const WORD_EDGE = /^([("'`\[{<]*)(.*?)([)"'`\]}>,;:.!?]*)$/s;
  * name anywhere in the line; every `Bearer <credential>`; and any word that is an opaque token or carries a known
  * credential prefix. Errs on redacting too much (prose like "password is wrong" loses a word).
  */
+/**
+ * REVIEW-12 #3: base64 runs (≥ 16 characters of the standard alphabet, padded, or mixing letters with digits / `+`)
+ * become `[base64 N bytes]` — a script may log a gRPC message's `base64`, whose protobuf strings would otherwise pass.
+ * Paths (`/a/b`) and plain words are kept.
+ */
+export function redactBase64Runs(text: string): string {
+  return text.replace(/(^|[^A-Za-z0-9+/=_-])([A-Za-z0-9+/]{16,}={0,2})(?=$|[^A-Za-z0-9+/=_-])/g, (whole, lead: string, run: string) => {
+    if (run === REDACTED) return whole;
+    const padded = run.endsWith('=');
+    const mixed = /[0-9+]/.test(run) && /[A-Za-z]/.test(run);
+    if (!padded && !mixed) return whole;
+    if (!padded && run.startsWith('/')) return whole; // a path
+    const bytes = Math.floor((run.length * 3) / 4) - (run.endsWith('==') ? 2 : run.endsWith('=') ? 1 : 0);
+    return `${lead}[base64 ${bytes} bytes]`;
+  });
+}
+
 export function redactLogLine(line: string): string {
+  return redactBase64Runs(redactLogLineText(line));
+}
+
+function redactLogLineText(line: string): string {
   const base = redactFrameText(redactText(line));
   const sensitive = (name: string) => isSensitiveField(name) || isSensitiveHeader(name);
   return base

@@ -19,6 +19,7 @@ import type { Screenshot, ScreenshotTarget } from '../screenshot/types';
 import { checkMapTarget, expireTokenRule, fixtureApi, grpcResendMessages, isRecordable, readOnlyReason, resolveGrpcEdit, resolveSendGrpc, sanitizeGrpcSendHeaders, sanitizeSendHeaders, validateSendDraft, tunnelReason, validateEdit, validateRule } from '../ui/controller';
 import type { SessionWarning } from '../ui/protocol';
 import { buildHar, writeExportFile, writeHar } from './har';
+import { mapRemoteSelfProblem } from '../proxyHost';
 import { pathError, select } from './paths';
 import { corsPolicyShort, urlGlobHasHost } from './corsPolicy';
 import { isSensitiveField, isSensitiveHeader, REDACTED, redactBody, redactBodyText, redactGrpcMetadata, redactLogLine, redactFrameText, redactHeaders, redactQueryString, redactSecretValues, redactText, redactUrl } from './redact';
@@ -125,6 +126,8 @@ export interface AgentApiDeps {
     // CONTRACTS §16.4 (InterceptProxyHost). Optional on older builds.
     readonly grpcDecryptHosts?: string[];
     readonly grpcProblem?: string;
+    /** REVIEW-12 #1 (InterceptProxyHost.ownListeners). */
+    readonly ownListeners?: { ports: number[]; hosts: string[] };
   };
   /**
    * CONTRACTS §9.4: resolves `package:` / `file:` frames to files (src/source/resolve.ts `resolveFrames` bound
@@ -1410,12 +1413,14 @@ export class AgentApi implements AgentTools {
     let grpcIn: { messages?: string[]; messagesJson?: unknown[] };
     if (g?.messagesJson !== undefined && g.messages !== undefined) throw bad('pass grpc.messagesJson or grpc.messages, not both');
     if (g?.messagesJson !== undefined) {
-      const originals = decodeGrpcMessages(e, this.deps.grpc, { filter: (f) => f.kind === 'message' && f.dir === 'send' && !f.dropped }).messages;
+      // REVIEW-12 #4: "[redacted]" values are restored only from the same method's recorded messages
+      const sameMethod = grpcMethodPath(url) === grpcMethodPath(e.url);
+      const originals = sameMethod ? decodeGrpcMessages(e, this.deps.grpc, { filter: (f) => f.kind === 'message' && f.dir === 'send' && !f.dropped }).messages : [];
       grpcIn = {
         messagesJson: g.messagesJson.map((m, n) => {
           const o = originals[n];
           if (o?.via === 'schema' && o.json !== undefined && !o.truncated) return restoreRedactedJson(m, o.json);
-          if (JSON.stringify(m)?.includes(REDACTED)) throw bad(`grpc.messagesJson[${n}] contains "[redacted]", but the original message ${n + 1} can't be decoded to restore it; pass the full message`);
+          if (JSON.stringify(m)?.includes(REDACTED)) throw bad(`grpc.messagesJson[${n}] contains "[redacted]", but there is no decodable original message ${n + 1} of the same method to restore it from; pass the full message`);
           return m;
         }),
       };
@@ -2062,6 +2067,10 @@ export class AgentApi implements AgentTools {
     } catch (e) {
       throw new AgentToolError((e as Error).message, 'invalid');
     }
+    // CONTRACTS §18.6 / REVIEW-12 #1: never the proxy itself (a relay loop)
+    const own = this.deps.host.ownListeners ?? { ports: this.deps.host.port !== undefined ? [this.deps.host.port] : [], hosts: [] };
+    const self = mapRemoteSelfProblem(i.to, own);
+    if (self) throw new AgentToolError(`add_map_remote refused: ${self}`, 'invalid');
     if (!LOOPBACK_HOSTS.has(to.hostname.toLowerCase())) {
       throw new AgentToolError(
         `agents can only map requests to a local server (localhost, 127.0.0.1 or [::1]); got ${JSON.stringify(to.hostname.slice(0, 100))}. Mapping to another host can be set up by the user in the Flutter Intercept panel.`,

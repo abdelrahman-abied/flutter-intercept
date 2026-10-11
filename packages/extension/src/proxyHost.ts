@@ -40,6 +40,7 @@ import { EventEmitter } from 'events';
 import { parseHostPattern, type ClientCertificate, type Exchange, type GrpcProxyCodec, type InterceptProxyOptions, type ReplayEntry, type ReplayOptions, type Rule, type RuleAction, type SendRequest } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 import type { GrpcMessageEncoder } from './grpc/service';
+import { isLoopbackTarget } from './rules/policy';
 import type { SessionWarning } from './ui/protocol';
 import type { VmHostDeps } from './vm/types';
 
@@ -345,6 +346,37 @@ export function filesOf(rule: Rule): string[] {
   return [...bodyFilesOf(rule), ...scriptFilesOf(rule)];
 }
 
+/** Host names that reach this machine from the app: loopback, the emulators' aliases, any-address. */
+const SELF_ALIASES = new Set(['10.0.2.2', '10.0.3.2', '0.0.0.0', '[::]', '::']);
+
+/**
+ * CONTRACTS §18.6 / REVIEW-12 #1: why a Map Remote target would send traffic back into the proxy itself (a relay loop),
+ * or undefined. `ports` = the proxy's listening ports (loopback listener, configured port, LAN listener); `hosts` = extra
+ * host names of its listeners (the LAN address).
+ */
+export function mapRemoteSelfProblem(to: string, own: { ports: readonly (number | undefined)[]; hosts?: readonly (string | undefined)[] }): string | undefined {
+  let u: URL;
+  try {
+    u = new URL(to);
+  } catch {
+    return undefined;
+  }
+  const host = u.hostname.toLowerCase();
+  const self = isLoopbackTarget(to) || SELF_ALIASES.has(host) || own.hosts?.some((h) => !!h && h.toLowerCase() === host.replace(/^\[|\]$/g, ''));
+  if (!self) return undefined;
+  const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+  if (!own.ports.some((p) => p === port)) return undefined;
+  return `its target ${u.protocol}//${u.host} is Flutter Intercept's own proxy port: the requests would loop back into the proxy`;
+}
+
+/** The Map Remote targets of a rule (sequence steps included). */
+function mapTargets(rule: Rule): string[] {
+  const a = rule.action as RuleAction | undefined;
+  if (a?.kind === 'mapRemote') return [a.to];
+  if (a?.kind === 'sequence') return (a.steps ?? []).flatMap((s) => ((s.action as RuleAction).kind === 'mapRemote' ? [(s.action as { to: string }).to] : []));
+  return [];
+}
+
 /** CONTRACTS §16.2: does this rule (or a sequence step) carry `grpcMock.messagesJson` the host must encode? */
 export function hasGrpcJson(rule: Rule): boolean {
   const visit = (a: RuleAction | { kind: 'passthrough' } | undefined): boolean => {
@@ -567,6 +599,8 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       this.grpcCheck = this.readGrpcSupport(proxy);
       if (this.grpcCodec) this.applyGrpcCodec(proxy);
       if (this.clientCerts.length) this.applyClientCertificates(proxy);
+      // REVIEW-12 #1: the port is known now — re-check Map Remote targets against it
+      const recheck = this.rules.some((r) => mapTargets(r).length > 0);
       this.applyReplay(proxy);
       if (this.profile.kind !== 'none') this.applyProfile(proxy); // a new proxy starts with none
       if (this.appPackages.length) proxy.setAppPackages?.(this.appPackages);
@@ -583,6 +617,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       }
       if (grpcLater !== undefined) this.setConfigWarning('grpcDecryptHosts', grpcLater || undefined);
       this.emit('grpc', this.grpcInfo);
+      if (recheck) this.applyRules();
       this.opts.log?.(`proxy listening on ${this.opts.host ?? '127.0.0.1'}:${proxy.port}${port !== first ? ` (port ${first} busy)` : ''}`);
       this.emit('state', true);
       return proxy.port;
@@ -657,6 +692,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       this.lanTokenForgotten = false;
       const bound = await proxy.openLan({ host, token });
       this.lanState = { host: bound.host, port: bound.port, token };
+      if (this.rules.some((r) => mapTargets(r).length > 0)) this.applyRules(); // REVIEW-12 #1: the LAN listener is ours too
       this.opts.log?.(`LAN listener open on ${bound.host}:${bound.port} (token-protected)`);
       this.emit('lan', this.lan);
       return this.lanState;
@@ -761,13 +797,40 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     }
   }
 
+  /** The proxy's own listening ports and LAN address (Map Remote loop check). */
+  get ownListeners(): { ports: number[]; hosts: string[] } {
+    const ports = [this.proxy?.port, this.opts.getPort(), this.lanState?.port, this.proxy?.lan?.port].filter((p): p is number => typeof p === 'number' && p > 0);
+    const hosts = [this.lanState?.host, this.proxy?.lan?.host].filter((h): h is string => typeof h === 'string' && !!h);
+    return { ports: [...new Set(ports)], hosts: [...new Set(hosts)] };
+  }
+
+  /** REVIEW-12 #1: rules whose Map Remote target is this proxy are never applied (whatever their source). */
+  private dropSelfMaps(rules: Rule[]): { kept: Rule[]; problems: SessionWarning[] } {
+    if (!rules.some((r) => mapTargets(r).length)) return { kept: rules, problems: [] };
+    const own = this.ownListeners;
+    const kept: Rule[] = [];
+    const problems: SessionWarning[] = [];
+    for (const r of rules) {
+      const why = mapTargets(r)
+        .map((to) => mapRemoteSelfProblem(to, own))
+        .find(Boolean);
+      if (!why) {
+        kept.push(r);
+        continue;
+      }
+      problems.push({ id: `selfMap:${r.id}`, kind: 'other', text: `Rule "${(r.name?.trim() || r.id).slice(0, 200)}" is skipped: ${why}.`.replace(/[\r\n]+/g, ' ').slice(0, MAX_WARNING_TEXT) });
+      this.opts.log?.(`rule ${r.id} skipped: ${why}`);
+    }
+    return { kept, problems };
+  }
+
   private applyRules(): void {
     const gen = ++this.rulesGen;
-    const rules = this.rules;
+    const { kept: rules, problems: selfProblems } = this.dropSelfMaps(this.rules);
     if (!rules.some(needsResolve)) {
       this.proxyRules = rules;
       this.proxy?.setRules(rules);
-      this.setBodyWarnings([]);
+      this.setBodyWarnings(selfProblems);
       this.rulesApplied = Promise.resolve();
       return;
     }
@@ -776,7 +839,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         if (gen !== this.rulesGen) return;
         this.proxyRules = resolved;
         this.proxy?.setRules(resolved);
-        this.setBodyWarnings(problems);
+        this.setBodyWarnings([...selfProblems, ...problems]);
       },
       (e: unknown) => this.opts.log?.(`applying rules failed: ${e instanceof Error ? e.message : String(e)}`),
     );

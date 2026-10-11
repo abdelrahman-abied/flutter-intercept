@@ -394,6 +394,8 @@ describe('v0.3.0 rule fields (CONTRACTS §9.3)', () => {
 describe('send (CONTRACTS §9.3)', () => {
   it('validates, strips framing/proxy headers, sends as the editor and replies sent', async () => {
     const { host, c, replies, reply } = setup();
+    // REVIEW-12 #4: a resend needs its original record
+    host.exchanges = [{ id: 'e1', startedAt: 1, method: 'POST', url: 'https://api.example.com/a', requestHeaders: {}, state: 'completed', status: 200 }];
     await c.handle(
       {
         type: 'send',

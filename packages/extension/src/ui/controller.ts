@@ -65,6 +65,7 @@ import { scriptFileOf, scriptFileSyntaxError, scriptTemplate } from '../rules/sc
 import { buildHar, ensureDirInside, EXPORT_DIR, type HarGrpcDecoder } from '../agent/har';
 import { decodeGrpcMessages, decodeHeldMessage, grpcMethodFromGlob, grpcMethodPath, grpcProxyCodec, hexOf, MAX_CODEC_BYTES, type GrpcDeps } from '../grpc/service';
 import { gitIgnoreStatus, type GitignoreFs } from '../recordings/gitignore';
+import { mapRemoteSelfProblem } from '../proxyHost';
 import type { AgentStatus, AuthFlowSummary, ContractSummary, ExportFormat, GrpcDecoded, GrpcStatus, HostMsg, RecordingSummary, SendDraft, SessionWarning, SnippetFormat, Status, ViewMsg } from './protocol';
 
 export type { GrpcDecoded, GrpcDecodedMessage, GrpcStatus } from './protocol';
@@ -129,6 +130,8 @@ export interface ControllerHost {
   on(event: 'grpc', l: (info: unknown) => void): unknown;
   /** CONTRACTS §16.8: drop the gRPC breaker warnings (called when the last debug session ends). */
   clearGrpcBreakerWarnings?(): void;
+  /** REVIEW-12 #1 (InterceptProxyHost.ownListeners): the proxy's own ports / LAN address — Map Remote may not target them. */
+  readonly ownListeners?: { ports: number[]; hosts: string[] };
 }
 
 /**
@@ -1221,10 +1224,15 @@ function checkSendGrpc(raw: Record<string, unknown>, where: string): { messages?
     return { messages: [...(g.messages as string[])] };
   }
   if (!Array.isArray(g.messagesJson) || g.messagesJson.length > MAX_SEND_GRPC_MESSAGES) fail(`${where}.grpc`, `messagesJson must be a list of at most ${MAX_SEND_GRPC_MESSAGES} JSON messages`);
+  let jsonTotal = 0;
   g.messagesJson.forEach((m, i) => {
     if (!isJsonValue(m)) fail(`${where}.grpc`, `messagesJson[${i}] must be a JSON value`);
-    if (JSON.stringify(m).length > MAX_CODEC_BYTES) fail(`${where}.grpc`, `messagesJson[${i}] must be at most 4 MB as JSON`);
+    const n = JSON.stringify(m).length;
+    if (n > MAX_CODEC_BYTES) fail(`${where}.grpc`, `messagesJson[${i}] must be at most 4 MB as JSON`);
+    jsonTotal += n;
   });
+  // REVIEW-12 #4: bound the encoding work too (the encoded total is capped in resolveSendGrpc)
+  if (jsonTotal > MAX_SEND_GRPC_TOTAL_BYTES * 2) fail(`${where}.grpc`, 'messagesJson must total at most 32 MB as JSON');
   return { messagesJson: [...(g.messagesJson as unknown[])] };
 }
 
@@ -1259,13 +1267,19 @@ export function resolveSendGrpc(url: string, grpcIn: { messages?: string[]; mess
   if (!path) throw new Error('the URL of a gRPC call ends in /<package.Service>/<Method>');
   if (!grpc) throw new Error('gRPC decoding is not available: pass messages (base64) instead of messagesJson.');
   const codec = grpcProxyCodec(grpc);
+  let total = 0;
   return {
     messages: (grpcIn.messagesJson ?? []).map((json, i) => {
+      let bytes: Uint8Array;
       try {
-        return Buffer.from(codec.encode(path, 'send', json)).toString('base64');
+        bytes = codec.encode(path, 'send', json);
       } catch (e) {
         throw new Error(`messagesJson[${i}] can't be encoded as the request of ${path}: ${(e as Error)?.message ?? String(e)}`);
       }
+      total += bytes.length;
+      // REVIEW-12 #4: a total cap on the encoded messages (as the proxy's send cap)
+      if (total > MAX_SEND_GRPC_TOTAL_BYTES) throw new Error('the encoded messages must total at most 16 MB');
+      return Buffer.from(bytes).toString('base64');
     }),
   };
 }
@@ -1688,6 +1702,8 @@ export class InterceptController {
           if (msg.resentFrom !== undefined) {
             const fromId = checkId(msg.resentFrom, 'send');
             const from = this.deps.host.getExchanges().find((e) => e.id === fromId);
+            // REVIEW-12 #4: without its record the LAN check can't be made: refuse
+            if (!from) throw new Error("Can't resend this request: its recorded exchange is no longer available (cleared or evicted).");
             const ro = from && readOnlyReason(from);
             if (ro) throw new Error(`Can't resend this request: ${ro}.`);
             if (from?.kind === 'tunnel') throw new Error("Can't resend a passed-through TLS connection: its request was never decrypted.");
@@ -1950,6 +1966,18 @@ export class InterceptController {
    */
   applyRules(input: Rule[]): void {
     const rules = validateRules(input); // drops `used`
+    // CONTRACTS §18.6 / REVIEW-12 #1: a Map Remote to the proxy's own port would loop (shared rules are filtered by the host)
+    const own = this.deps.host.ownListeners;
+    if (own) {
+      for (const [i, r] of rules.entries()) {
+        if (r.shared) continue;
+        const targets = r.action.kind === 'mapRemote' ? [r.action.to] : r.action.kind === 'sequence' ? r.action.steps.flatMap((st) => (st.action.kind === 'mapRemote' ? [st.action.to] : [])) : [];
+        for (const to of targets) {
+          const why = mapRemoteSelfProblem(to, own);
+          if (why) fail(`rule ${i + 1}`, why);
+        }
+      }
+    }
     const personal = rules.filter((r) => !r.shared);
     const sharedIn = rules.filter((r) => r.shared);
     const current = this.sharedRules();
