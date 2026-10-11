@@ -185,11 +185,12 @@ describe('gRPC detail pane', () => {
     expect(all('decodeGrpc')).toHaveLength(1);
     // Snippets, resend, breakpoints, generators and the token preset don't apply.
     const bar = $('.detail-actions')!;
-    for (const label of ['Expire token…', 'Resend']) expect(button(label, bar).disabled, label).toBe(true);
+    expect(button('Expire token…', bar).disabled).toBe(true);
+    expect(button('Resend', bar).disabled).toBe(false); // CONTRACTS §18.4
     expect(button('Break on this', bar).disabled).toBe(false); // CONTRACTS §17.2
     expect(button(/Copy as/, bar).disabled).toBe(true);
     expect(button(/Copy as/, bar).title).toMatch(/not gRPC calls/);
-    expect(button(/Edit and resend/, bar).disabled).toBe(true);
+    expect(button(/Edit and resend/, bar).disabled).toBe(false);
     expect(button(/Generate/, bar).disabled).toBe(true);
     expect(button('Block this', bar).disabled).toBe(false);
   });

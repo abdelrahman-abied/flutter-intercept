@@ -13,11 +13,14 @@ import { matchesFilter, parseFilter } from './filter';
 import { checkPath } from './jsonpath';
 import { corsActionError } from './coverage';
 import { hasMessagesTab } from './frames';
-import { appliesToGrpc, describeGrpcMock, grpcPauseKey, isBase64, isGrpc, reservedGrpcHeader, type GrpcDecodeEntry } from './grpc';
+import {
+  appliesToGrpc, decodedMessages, describeGrpcMock, grpcPauseKey, isBase64, isGrpc, looksLikeGrpcUrl, reservedGrpcHeader,
+  type GrpcDecodeEntry,
+} from './grpc';
 import { EXPORT_LABEL } from './exporting';
 import { describeScript, scriptCodeError, scriptFileError, scriptMatchError } from './scripts';
 import {
-  bodyFileError, checkMapTarget, describeRewrite, emptyRewriteForm, MAX_STEPS, rewriteError, rewriteFromForm, rewriteToForm, sequencePreview,
+  bodyFileError, checkMapTarget, describeRewrite, emptyRewriteForm, grpcRewriteError, MAX_STEPS, rewriteError, rewriteFromForm, rewriteToForm, sequencePreview,
   sortRecordings, stepCountError, togglePick, type PreviewStep, type RewriteForm, type SequenceThen, type StepAction, type StepKind,
 } from './scenarios';
 import {
@@ -65,6 +68,18 @@ export interface Composer {
   originalBody?: string;
   open: boolean;
   sending: boolean;
+  /** CONTRACTS §18.4: resending a gRPC call — its request messages instead of a body. */
+  grpc?: GrpcComposer;
+}
+
+/** The request messages of a gRPC "Edit and resend": JSON per message when the schema decodes them, else base64. */
+export interface GrpcComposer {
+  mode: 'json' | 'base64';
+  /** One JSON text per message (from the host's decode); absent when the schema doesn't decode every message. */
+  json?: string[];
+  base64: string[];
+  /** Why some recorded messages can't be copied as they were (cut at 64 KB, not kept). */
+  note?: string;
 }
 export interface HostError { id: number; message: string }
 
@@ -104,6 +119,8 @@ export interface State {
   revealSeq: number;
   /** CONTRACTS §16.4: `decodeGrpc` requests and the host's `grpcDecoded` answers, by exchange id. */
   grpcDecoded: Record<string, GrpcDecodeEntry>;
+  /** A new rule prefilled from an exchange ("Rewrite / Script / Map remote for this…"), opened unsaved in the editor. */
+  ruleTemplate?: Rule;
 }
 
 export const NEW_RULE = '__new__';
@@ -176,7 +193,11 @@ export type Action =
   | { type: 'clearRecordingPicks' }
   | { type: 'toggleWaterfall' }
   /** CONTRACTS §16.4: the panel posted `decodeGrpc` for this version of the exchange. */
-  | { type: 'grpcRequested'; id: string; key: string; base: number; at: number };
+  | { type: 'grpcRequested'; id: string; key: string; base: number; at: number }
+  /** Open the rule editor on a new, unsaved rule prefilled from an exchange (CONTRACTS §18). */
+  | { type: 'newRuleFrom'; rule: Rule }
+  /** CONTRACTS §18.4: the gRPC part of "Edit and resend". */
+  | { type: 'patchGrpcComposer'; patch: Partial<GrpcComposer> };
 
 let noticeSeq = 0;
 let errorSeq = 0;
@@ -290,7 +311,14 @@ export function reducer(state: State, action: Action): State {
     }
 
     case 'editRule':
-      return { ...state, editingRuleId: action.id, view: action.id ? 'rules' : state.view };
+      return { ...state, editingRuleId: action.id, view: action.id ? 'rules' : state.view, ruleTemplate: undefined };
+
+    case 'newRuleFrom':
+      return { ...state, editingRuleId: NEW_RULE, view: 'rules', ruleTemplate: action.rule };
+
+    case 'patchGrpcComposer':
+      if (!state.composer?.grpc) return state;
+      return { ...state, composer: { ...state.composer, grpc: { ...state.composer.grpc, ...action.patch } } };
 
     case 'awaitRule':
       return { ...state, awaitingRule: { kind: action.kind, knownIds: state.rules.map((r) => r.id), label: action.label } };
@@ -312,7 +340,7 @@ export function reducer(state: State, action: Action): State {
       }
       const ex = action.id ? findExchange(state, action.id) : undefined;
       if (action.id && !ex) return state;
-      return { ...state, view: 'traffic', composer: ex ? composerFromExchange(ex) : blankComposer() };
+      return { ...state, view: 'traffic', composer: ex ? composerFromExchange(ex, state.grpcDecoded[ex.id]) : blankComposer() };
     }
 
     case 'patchComposer':
@@ -839,7 +867,39 @@ export function unsendableBody(ex: Pick<Exchange, 'requestBody'>): string | unde
   return undefined;
 }
 
-export function composerFromExchange(ex: Exchange): Composer {
+/** Headers the proxy sets itself on a gRPC send (CONTRACTS §18.4): not copied into the editor. */
+const GRPC_SEND_DROP = new Set(['content-type', 'te', 'grpc-encoding', 'grpc-accept-encoding', 'content-length', 'host', 'connection']);
+const grpcSendHeaders = (h: Headers | undefined): HeaderRow[] =>
+  headersToRows(h).filter((r) => !r.name.startsWith(':') && !GRPC_SEND_DROP.has(r.name.toLowerCase()));
+
+/** The request messages of a recorded gRPC call (base64), and why they aren't complete, if they aren't. */
+export function grpcRequestMessages(ex: Exchange): { messages: string[]; problem?: string } {
+  const frames = (ex.frames ?? []).filter((f) => f.kind === 'message' && f.dir === 'send');
+  const messages = frames.map((f) => f.base64 ?? '');
+  const cut = frames.findIndex((f) => f.truncated || f.sizeUnknown || f.base64 === undefined);
+  if (cut >= 0) return { messages, problem: `Request message ${cut + 1} was cut at 64 KB — it can't be resent as recorded.` };
+  if ((ex.grpc?.messagesSent ?? frames.length) > frames.length) {
+    return { messages, problem: `Only ${frames.length} of the ${ex.grpc!.messagesSent} request messages were kept — they can't be resent as recorded.` };
+  }
+  return { messages };
+}
+
+export function composerFromExchange(ex: Exchange, decode?: GrpcDecodeEntry): Composer {
+  if (isGrpc(ex)) {
+    const { messages, problem } = grpcRequestMessages(ex);
+    // JSON editing when the schema decoded every request message in full.
+    const frames = ex.frames ?? [];
+    const decoded = decodedMessages(decode, frames, ex.framesDropped ?? 0).filter((_, i) => frames[i].kind === 'message' && frames[i].dir === 'send');
+    const json = decoded.length === messages.length && decoded.every((m) => m?.via === 'schema' && m.json !== undefined && !m.truncated)
+      ? decoded.map((m) => m!.json!) : undefined;
+    return {
+      resentFrom: ex.id,
+      draft: { kind: 'request', method: 'POST', url: ex.url, headers: grpcSendHeaders(ex.requestHeaders), body: '' },
+      open: true,
+      sending: false,
+      grpc: { mode: json ? 'json' : 'base64', ...(json ? { json } : {}), base64: messages, ...(problem ? { note: problem } : {}) },
+    };
+  }
   const bodyNote = unsendableBody(ex);
   const text = !bodyNote && ex.requestBody ? ex.requestBody.text : '';
   return {
@@ -861,8 +921,15 @@ export function blankComposer(): Composer {
  * original (or the original body is unknown) so a stale length never reaches the server; a Host header that
  * doesn't match the URL is dropped too.
  */
-export function composeSend(c: Pick<Composer, 'draft' | 'originalBody'>): SendDraft {
+export function composeSend(c: Pick<Composer, 'draft' | 'originalBody'> & Partial<Pick<Composer, 'grpc'>>): SendDraft {
   const d = c.draft;
+  if (c.grpc) {
+    // CONTRACTS §18.4: always POST; the proxy sets content-type / te itself.
+    const req: SendDraft = { method: 'POST', url: d.url.trim(), grpc: grpcSendMessages(c.grpc) };
+    const rows = d.headers.filter((r) => r.name.trim() && !GRPC_SEND_DROP.has(r.name.trim().toLowerCase()) && !r.name.trim().startsWith(':'));
+    if (rows.length) req.headers = rowsToRecord(rows);
+    return req;
+  }
   const req: SendDraft = { method: d.method.trim().toUpperCase(), url: d.url.trim() };
   let rows = d.headers.filter((r) => r.name.trim());
   const bodyChanged = c.originalBody === undefined || d.body !== c.originalBody;
@@ -876,8 +943,49 @@ export function composeSend(c: Pick<Composer, 'draft' | 'originalBody'>): SendDr
   return req;
 }
 
+/** CONTRACTS §18.4 caps: ≤ 100 messages, ≤ 4 MB each, ≤ 16 MB in all. */
+export const MAX_GRPC_SEND_MESSAGES = 100;
+
+/** The `grpc` part of a send: JSON entries (encoded by the host) or base64 (an empty entry = an empty message). */
+export function grpcSendMessages(g: GrpcComposer): NonNullable<SendDraft['grpc']> {
+  if (g.mode === 'json') return { messagesJson: (g.json ?? []).map((m) => JSON.parse(m) as unknown) };
+  return { messages: g.base64.map((m) => m.replace(/\s+/g, '')) };
+}
+
+/** Problems with a gRPC composer, one line each (empty = it can be sent). */
+export function grpcComposerErrors(c: Pick<Composer, 'draft' | 'grpc'>): string[] {
+  const g = c.grpc;
+  if (!g) return [];
+  const errors: string[] = [];
+  if (!isAbsoluteUrl(c.draft.url.trim())) errors.push('URL must be absolute (http:// or https://)');
+  else if (!/^\/[^/]+\/[^/]+$/.test(new URL(c.draft.url.trim()).pathname)) errors.push('URL path must be /package.Service/Method');
+  const list = g.mode === 'json' ? g.json ?? [] : g.base64;
+  if (list.length > MAX_GRPC_SEND_MESSAGES) errors.push(`At most ${MAX_GRPC_SEND_MESSAGES} messages`);
+  list.forEach((m, i) => {
+    if (g.mode === 'json' && !m.trim()) { errors.push(`Message ${i + 1}: enter a JSON object, e.g. {}`); return; }
+    const e = grpcMessageError(m, g.mode);
+    if (e) errors.push(`Message ${i + 1}: ${e}`);
+  });
+  for (const r of c.draft.headers) {
+    if (r.name.trim() && !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(r.name.trim())) errors.push(`Invalid header name “${r.name}”`);
+  }
+  return errors;
+}
+
+/** Why a gRPC call can't be resent as recorded, if it can't (Edit and resend still works). */
+export function grpcUnsendable(ex: Exchange): string | undefined {
+  return isGrpc(ex) ? grpcRequestMessages(ex).problem : undefined;
+}
+
 /** One-click "Resend": the recorded request as is. undefined when its body can't be reproduced. */
 export function resendRequest(ex: Exchange): SendDraft | undefined {
+  if (isGrpc(ex)) {
+    if (!canResend(ex)) return undefined;
+    const { messages, problem } = grpcRequestMessages(ex);
+    if (problem) return undefined;
+    const rows = grpcSendHeaders(ex.requestHeaders);
+    return { method: 'POST', url: ex.url, ...(rows.length ? { headers: rowsToRecord(rows) } : {}), grpc: { messages } };
+  }
   if (!canResend(ex) || unsendableBody(ex)) return undefined;
   const req: SendDraft = { method: ex.method, url: ex.url };
   if (Object.keys(ex.requestHeaders).length) req.headers = ex.requestHeaders;
@@ -1516,12 +1624,19 @@ export function validateRuleForm(f: RuleForm): RuleFormValidation {
   const op = f.graphqlOperation.trim();
   if (op && !/^[_A-Za-z][_0-9A-Za-z]*$/.test(op)) head.graphqlOperation = 'A GraphQL operation name: letters, digits and _, e.g. getUser';
 
-  const action = f.kind === 'sequence' ? { errors: {} } as ActionValidation : validateActionFields(f.kind, f);
+  // CONTRACTS §18.1: a rewrite on a gRPC URL can't touch the reserved metadata in its headers either.
+  const grpcUrl = looksLikeGrpcUrl(url);
+  const withGrpcRewrite = (kind: string, af: ActionFields, v: ActionValidation): ActionValidation => {
+    if (kind !== 'rewrite' || !grpcUrl || v.errors.rewrite) return v;
+    const e = grpcRewriteError(af.rewrite);
+    return e ? { ...v, errors: { ...v.errors, rewrite: e } } : v;
+  };
+  const action = f.kind === 'sequence' ? { errors: {} } as ActionValidation : withGrpcRewrite(f.kind, f, validateActionFields(f.kind, f));
   const errors: RuleFormValidation['errors'] = { ...head, ...action.errors };
   let stepChecks: ActionValidation[] | undefined;
   if (f.kind === 'sequence') {
     stepChecks = f.steps.map((s) => {
-      const v = validateActionFields(s.kind, s);
+      const v = withGrpcRewrite(s.kind, s, validateActionFields(s.kind, s));
       const c = stepCountError(s.count);
       return c ? { ...v, errors: { ...v.errors, count: c } } : v;
     });

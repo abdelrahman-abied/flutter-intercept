@@ -85,6 +85,10 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             title={actions.off.breakpoint ?? (grpc
               ? 'Create a breakpoint rule for this method: each message pauses, and the end of the call (status and trailers)'
               : 'Create a breakpoint rule that pauses requests like this one')}>Break on this</Button>
+          <MenuButton label="More rules" title={actions.off.rules ?? 'Rewrite, script or map remote rule for this route (opens in the rule editor)'}
+            items={actions.ruleItems} disabled={!!actions.off.rules}>
+            More rules… <Icon name="chevronDown" />
+          </MenuButton>
           <Button onClick={() => setExpiring(!expiring)} pressed={expiring} disabled={!!actions.off.expire}
             title={actions.off.expire ?? 'Make the next request(s) like this one get 401 token_expired — test how the app refreshes its token'}>
             Expire token…

@@ -254,7 +254,8 @@ export function ActionEditor({ kind, f, v, set, uid, compact, bodyFile, scriptFi
             : (
               <div class="hint">
                 An origin, or a URL prefix that replaces the matched prefix (the rest of the path and the query are kept).
-                The app still sees the original URL; the server's certificate is verified as usual.
+                The app still sees the original URL; the server's certificate is verified as usual. gRPC calls go to the
+                new server over HTTP/2 (h2c for http://, TLS for https://).
               </div>
             )}
           {warning && <div class="msg warn map-warning" role="note">{warning}</div>}
@@ -338,6 +339,8 @@ export function ScriptEditor({ uid, f, v, set, file }: {
       <div class="hint">
         JavaScript hooks run in the proxy on every matching request: <code>onRequest(request, context)</code> can edit
         the request or answer it locally; <code>onResponse(response, request, context)</code> can edit the response.
+        For gRPC calls, <code>onGrpcMessage(message, context)</code> sees each message (decoded JSON when the app's schema
+        knows it) and may change or drop it, and <code>onGrpcStatus(status, context)</code> can change the end of the call.
         Synchronous plain JavaScript only (no <code>require</code>, timers or <code>fetch</code>), 200 ms per call. A script
         that throws or times out gives the app a 502 and shows its error in the exchange's script log. Scripts are your
         own trusted code — not a sandbox. AI agents can't read or change them.
@@ -541,7 +544,8 @@ export function RewriteEditor({ uid, value, error, onChange }: {
     <div class="rewrite-editor">
       <div class="hint">
         Passes through to the real server and changes what goes there or comes back. Body replacements are literal
-        text (no regex), up to {MAX_REPLACEMENTS} per body; binary bodies are left untouched.
+        text (no regex), up to {MAX_REPLACEMENTS} per body; binary bodies are left untouched. On gRPC calls the headers
+        are the call's metadata; body replacements and the status don't apply there.
       </div>
       <div class="rw-side" role="group" aria-label="Request changes">
         <div class="field-label rw-title">Request <span class="muted">— before it reaches the server</span></div>
@@ -555,6 +559,17 @@ export function RewriteEditor({ uid, value, error, onChange }: {
             onInput={(e) => onChange({ ...value, status: (e.target as HTMLInputElement).value })} />
         </label>
         <RewriteSide uid={`${uid}-res`} label="response" value={value.response} onChange={side('response')} />
+        <div class="field-label">Set trailers <span class="badge mini grpc-only-badge">gRPC only</span></div>
+        <HeadersEditor rows={value.setTrailers ?? []} onChange={(setTrailers) => onChange({ ...value, setTrailers })} />
+        <label class="field">
+          <span>Remove trailers <span class="muted">(names, comma separated)</span></span>
+          <input class="mono" value={value.removeTrailers ?? ''} spellcheck={false} aria-label="Remove response trailers"
+            placeholder="e.g. x-debug-info" onInput={(e) => onChange({ ...value, removeTrailers: (e.target as HTMLInputElement).value })} />
+        </label>
+        <div class="hint">
+          Trailers end a gRPC call: custom metadata only — grpc-status, grpc-message and the other reserved names can't be
+          changed here (use a breakpoint, Mutate JSON or a script). Ignored for HTTP.
+        </div>
       </div>
       {error && <div class="msg error">{error}</div>}
     </div>

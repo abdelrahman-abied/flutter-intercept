@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Exchange } from '../protocol';
 import {
-  composeSend, computeEdit, currentDraft, findExchange, isBodyEditable, validateDraft,
+  composeSend, computeEdit, currentDraft, findExchange, grpcComposerErrors, isBodyEditable, MAX_GRPC_SEND_MESSAGES, validateDraft,
   type DraftValidation, type HeaderRow, type RequestDraft, type ResponseDraft,
 } from '../state';
 import { formatJson } from '../json';
@@ -237,6 +237,7 @@ export function Composer() {
   const [confirming, setConfirming] = useState(false);
   useEffect(() => setConfirming(false), [c?.draft.body]);
   if (!c) return null;
+  if (c.grpc) return <GrpcComposerView />;
   const draft = c.draft;
   const original = c.resentFrom ? findExchange(state, c.resentFrom) : undefined;
   const validation = validateDraft(draft);
@@ -297,6 +298,96 @@ export function Composer() {
           </Button>
           <Button onClick={close} disabled={busy}>Cancel</Button>
           <span class="pe-summary">{busy ? 'Sending…' : 'The new exchange is selected once the proxy records it.'}</span>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------- gRPC edit & resend (CONTRACTS §18.4)
+
+/** "Edit and resend" of a gRPC call: URL (/pkg.Service/Method), metadata, and the request messages (JSON or base64). */
+function GrpcComposerView() {
+  const { state, dispatch, post } = useApp();
+  const c = state.composer!;
+  const g = c.grpc!;
+  const draft = c.draft;
+  const original = c.resentFrom ? findExchange(state, c.resentFrom) : undefined;
+  const busy = c.sending;
+  const errors = grpcComposerErrors(c);
+  const canSend = !busy && errors.length === 0;
+  const list = g.mode === 'json' ? g.json ?? [] : g.base64;
+  const setList = (next: string[]) => dispatch({ type: 'patchGrpcComposer', patch: g.mode === 'json' ? { json: next } : { base64: next } });
+  const set = (patch: Partial<RequestDraft>) => dispatch({ type: 'patchComposer', patch });
+  const close = () => dispatch({ type: 'closeComposer', discard: true });
+  const send = () => {
+    if (!canSend) return;
+    post({ type: 'send', request: composeSend(c), ...(c.resentFrom ? { resentFrom: c.resentFrom } : {}) });
+    dispatch({ type: 'composerSending' });
+  };
+  return (
+    <section class="detail composer grpc-composer" aria-label="Edit and resend" tabIndex={-1}>
+      <form class="pause-editor composer-form" onSubmit={(e) => { e.preventDefault(); send(); }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
+          if (e.key === 'Escape' && !busy) { e.preventDefault(); close(); }
+        }}>
+        <div class="detail-title composer-head">
+          <h3>Edit and resend <span class="badge mini kind-badge kb-grpc">gRPC</span></h3>
+          {original
+            ? <button type="button" class="link" onClick={() => dispatch({ type: 'select', id: original.id })}
+                title="Show the original call (closes the editor; reopen it with “Edit and resend”)">from {original.url}</button>
+            : <span class="muted">from a call that is no longer listed</span>}
+          <span class="spacer" />
+          <Button kind="icon" title="Close (Esc)" onClick={close}><Icon name="close" /></Button>
+        </div>
+        <p class="hint">
+          The proxy opens its own HTTP/2 call (POST, content-type application/grpc), sends these messages, half-closes and
+          lists the call with every response message — rules and the network profile apply. Deadline 60 s unless a
+          grpc-timeout header says otherwise.
+        </p>
+        <div class="pe-line">
+          <input class="pe-url" aria-label="URL" spellcheck={false} value={draft.url} disabled={busy}
+            onInput={(e) => set({ url: (e.target as HTMLInputElement).value })} />
+        </div>
+        <h4 class="section-title">Headers <span class="muted">(metadata)</span></h4>
+        <HeadersEditor rows={draft.headers} disabled={busy} onChange={(headers) => set({ headers })} />
+        <h4 class="section-title">Request messages</h4>
+        {g.note && <div class="msg info" role="note">{g.note}</div>}
+        <div class="radios" role="radiogroup" aria-label="Message format">
+          <label class="radio" title={g.json ? undefined : 'The app\'s schema didn\'t decode these messages — edit them as base64'}>
+            <input type="radio" name="grpc-send-mode" checked={g.mode === 'json'} disabled={!g.json || busy}
+              onChange={() => dispatch({ type: 'patchGrpcComposer', patch: { mode: 'json' } })} />
+            JSON (encoded with the app's schema)
+          </label>
+          <label class="radio">
+            <input type="radio" name="grpc-send-mode" checked={g.mode === 'base64'} disabled={busy}
+              onChange={() => dispatch({ type: 'patchGrpcComposer', patch: { mode: 'base64' } })} />
+            Base64 protobuf
+          </label>
+        </div>
+        <ol class="grpc-messages" aria-label="Request messages">
+          {list.map((m, i) => (
+            <li key={i} class="grpc-msg-row">
+              <textarea class="code-input" rows={g.mode === 'json' ? 6 : 3} spellcheck={false} value={m} disabled={busy}
+                aria-label={`Request message ${i + 1}`} onInput={(e) => setList(list.map((x, k) => (k === i ? (e.target as HTMLTextAreaElement).value : x)))} />
+              <Button kind="icon" title={`Remove message ${i + 1}`} disabled={busy} onClick={() => setList(list.filter((_, k) => k !== i))}>
+                <Icon name="close" />
+              </Button>
+            </li>
+          ))}
+        </ol>
+        <button type="button" class="link" disabled={busy || list.length >= MAX_GRPC_SEND_MESSAGES}
+          onClick={() => setList([...list, g.mode === 'json' ? '{}' : ''])}>+ Add message</button>
+        {errors.length > 0 && (
+          <ul class="msg error errors" role="alert">{errors.map((e) => <li key={e}>{e}</li>)}</ul>
+        )}
+        <div class="pe-actions">
+          <Button kind="primary" type="submit" disabled={!canSend} title="Send this call through the proxy (Ctrl/Cmd+Enter)">
+            <Icon name="play" /> Send
+          </Button>
+          <Button onClick={close} disabled={busy}>Cancel</Button>
+          <span class="pe-summary">{busy ? 'Sending…' : 'The new call is selected once the proxy records it.'}</span>
         </div>
       </form>
     </section>

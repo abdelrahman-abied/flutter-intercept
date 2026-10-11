@@ -262,7 +262,10 @@ export function methodTypesText(m: NonNullable<GrpcDecoded['method']>): string {
 // ---------------------------------------------------------------- rules (CONTRACTS §16.2)
 
 /** Actions the proxy applies to gRPC calls; a rule with any other action never matches one. */
-const GRPC_KINDS = new Set<string>(['grpcMock', 'block', 'fault', 'throttle', 'passthrough', 'breakpoint', 'mutate']);
+/** CONTRACTS §18: every action except `mock` (HTTP bodies — gRPC has grpcMock) and `cors` (browser-only). */
+const GRPC_KINDS = new Set<string>([
+  'grpcMock', 'block', 'fault', 'throttle', 'passthrough', 'breakpoint', 'mutate', 'rewrite', 'script', 'mapRemote',
+]);
 
 export function appliesToGrpc(a: RuleAction | SequenceStep['action']): boolean {
   if (a.kind === 'sequence') return a.steps.every((s) => appliesToGrpc(s.action));
@@ -273,10 +276,43 @@ export function appliesToGrpc(a: RuleAction | SequenceStep['action']): boolean {
 export function grpcActionNote(kind: string, stepKinds?: readonly string[]): string | undefined {
   if (kind === 'sequence') {
     const bad = (stepKinds ?? []).find((k) => !GRPC_KINDS.has(k));
-    return bad ? 'gRPC calls skip this rule: a sequence applies to them only when every step is a gRPC mock, Block, Fault, Throttle, Mutate JSON or Real server.' : undefined;
+    if (!bad) return undefined;
+    return `gRPC calls skip this rule: its ${bad === 'cors' ? 'CORS' : '“Mock response”'} step doesn't apply to them${bad === 'mock' ? ' — use a gRPC mock step' : ''}.`;
   }
   if (GRPC_KINDS.has(kind)) return undefined;
-  return 'gRPC calls skip this rule: only gRPC mock, Block, Fault, Throttle, Breakpoint, Mutate JSON and Sequence (of those) apply to them.';
+  if (kind === 'cors') return 'gRPC calls skip this rule: CORS is for browser requests (Flutter Web) only.';
+  return 'gRPC calls skip this rule: “Mock response” answers HTTP requests — use a gRPC mock for gRPC calls.';
+}
+
+/** CONTRACTS §18.1: metadata a rewrite may not set or remove on gRPC calls (status changes: breakpoint / mutate / script). */
+const RESERVED_GRPC_METADATA = new Set([
+  'content-type', 'te', 'grpc-encoding', 'grpc-accept-encoding', 'grpc-status', 'grpc-message', 'grpc-timeout',
+]);
+export function reservedGrpcMetadata(name: string): boolean {
+  const n = name.trim().toLowerCase();
+  return n.startsWith(':') || RESERVED_GRPC_METADATA.has(n);
+}
+
+/** Why a metadata name / value can't be used in a gRPC rewrite, if it can't (`-bin` values are base64). */
+export function grpcMetadataError(name: string, value: string | undefined, what: string): string | undefined {
+  const n = name.trim();
+  if (!n) return undefined;
+  if (reservedGrpcMetadata(n)) {
+    return `${what} “${n}” can't be changed on gRPC calls (pseudo headers, content-type, te, grpc-encoding, grpc-accept-encoding, ` +
+      'grpc-status, grpc-message and grpc-timeout are reserved — change the status with a breakpoint, Mutate JSON or a script)';
+  }
+  if (value !== undefined && /-bin$/i.test(n) && !isBase64(value.trim())) return `${what} “${n}”: a -bin value must be base64`;
+  return undefined;
+}
+
+/** CONTRACTS §18.1: what of a rewrite doesn't apply to gRPC calls (body replacements, the status). */
+export function grpcRewriteNote(a: { request?: { replaceBody?: unknown[] }; response?: { replaceBody?: unknown[]; status?: number } } | undefined): string | undefined {
+  const body = !!(a?.request?.replaceBody?.length || a?.response?.replaceBody?.length);
+  const status = a?.response?.status !== undefined;
+  if (!body && !status) return undefined;
+  const what = body && status ? 'Body replacements and the status change' : body ? 'Body replacements' : 'The status change';
+  return `On gRPC calls only the metadata parts apply: ${what} ${status && !body ? 'is' : 'are'} skipped ` +
+    '(protobuf bodies — use Mutate JSON or a script; for the status, a breakpoint or a script).';
 }
 
 /** `/pkg.Service/Method` (or `/pkg.Service/*`) somewhere in a URL pattern. */

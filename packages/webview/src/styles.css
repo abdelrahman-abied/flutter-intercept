@@ -1340,3 +1340,6 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
 .grpc-pause-editor textarea { width: 100%; box-sizing: border-box; }
 .grpc-pause-editor textarea.modified { border-color: var(--fi-info); }
 .grpc-pause-what { margin-bottom: 6px; }
+
+/* v0.12.0 (CONTRACTS §18) */
+.grpc-only-badge { background: transparent; color: var(--vscode-charts-purple); border: 1px solid var(--vscode-charts-purple); font-weight: normal; text-transform: none; }

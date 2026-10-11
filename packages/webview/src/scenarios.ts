@@ -5,7 +5,7 @@
 import type { AuthFlowSummary, Exchange, RecordingSummary, Rule, RuleAction, Status } from './protocol';
 import type { RewriteSpec, SequenceStep } from '@flutter-intercept/proxy/types';
 import { splitUrl } from './util';
-import { grpcCodeName } from './grpc';
+import { grpcCodeName, grpcMetadataError } from './grpc';
 
 const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -121,13 +121,19 @@ export interface RewriteSideForm {
   removeHeaders: string;
   replaceBody: ReplaceRow[];
 }
-export interface RewriteForm { request: RewriteSideForm; response: RewriteSideForm; status: string }
+export interface RewriteForm {
+  request: RewriteSideForm; response: RewriteSideForm; status: string;
+  /** CONTRACTS §18.1: gRPC response trailers (custom metadata only; ignored for HTTP). Optional: drafts from before 0.12. */
+  setTrailers?: NameValue[];
+  /** Trailer names to remove, comma or space separated. */
+  removeTrailers?: string;
+}
 
 export const MAX_REPLACEMENTS = 20;
 
 const emptySide = (): RewriteSideForm => ({ setHeaders: [], removeHeaders: '', replaceBody: [] });
 export function emptyRewriteForm(): RewriteForm {
-  return { request: emptySide(), response: emptySide(), status: '' };
+  return { request: emptySide(), response: emptySide(), status: '', setTrailers: [], removeTrailers: '' };
 }
 
 function sideToForm(s: RewriteSpec | undefined): RewriteSideForm {
@@ -143,6 +149,8 @@ export function rewriteToForm(a: Extract<RuleAction, { kind: 'rewrite' }>): Rewr
     request: sideToForm(a.request),
     response: sideToForm(a.response),
     status: a.response?.status !== undefined ? String(a.response.status) : '',
+    setTrailers: Object.entries(a.response?.setTrailers ?? {}).map(([name, value]) => ({ name, value })),
+    removeTrailers: (a.response?.removeTrailers ?? []).join(', '),
   };
 }
 
@@ -165,10 +173,16 @@ export function rewriteFromForm(f: RewriteForm): Extract<RuleAction, { kind: 're
   const a: Extract<RuleAction, { kind: 'rewrite' }> = { kind: 'rewrite' };
   const req = sideFromForm(f.request);
   if (req) a.request = req;
-  const res: (RewriteSpec & { status?: number }) | undefined = sideFromForm(f.response);
+  type ResponseSpec = NonNullable<Extract<RuleAction, { kind: 'rewrite' }>['response']>;
+  let res: ResponseSpec | undefined = sideFromForm(f.response);
   const status = f.status.trim();
-  if (status) a.response = { ...(res ?? {}), status: Number(status) };
-  else if (res) a.response = res;
+  if (status) res = { ...(res ?? {}), status: Number(status) };
+  const setTrailers: Record<string, string> = {};
+  for (const r of f.setTrailers ?? []) if (r.name.trim()) setTrailers[r.name.trim()] = r.value;
+  if (Object.keys(setTrailers).length) res = { ...(res ?? {}), setTrailers };
+  const removeTrailers = removeList(f.removeTrailers ?? '');
+  if (removeTrailers.length) res = { ...(res ?? {}), removeTrailers };
+  if (res) a.response = res;
   return a;
 }
 
@@ -190,8 +204,35 @@ export function rewriteError(f: RewriteForm): string | undefined {
   if (e) return e;
   const s = f.status.trim();
   if (s && (!/^\d{3}$/.test(s) || +s < 100 || +s > 599)) return 'Response status: 100–599 (empty = keep the server\'s)';
+  // Trailers are gRPC-only: the reserved metadata rules always apply to them (CONTRACTS §18.1).
+  for (const r of f.setTrailers ?? []) {
+    if (!r.name.trim()) { if (r.value.trim()) return 'Trailer: a value needs a name'; continue; }
+    const e = grpcMetadataError(r.name, r.value, 'Trailer');
+    if (e) return e;
+    if (!TOKEN.test(r.name.trim())) return `Trailer name “${r.name.trim()}” is not valid`;
+  }
+  for (const n of removeList(f.removeTrailers ?? '')) {
+    const e = grpcMetadataError(n, undefined, 'Trailer');
+    if (e) return e;
+    if (!TOKEN.test(n)) return `Trailer to remove “${n}” is not valid`;
+  }
   const a = rewriteFromForm(f);
-  if (!a.request && !a.response) return 'Set or remove a header, change the status, or add a body replacement.';
+  if (!a.request && !a.response) return 'Set or remove a header or trailer, change the status, or add a body replacement.';
+  return undefined;
+}
+
+/** CONTRACTS §18.1: on a gRPC URL the reserved metadata can't be set or removed in headers either. */
+export function grpcRewriteError(f: RewriteForm): string | undefined {
+  for (const [side, label] of [[f.request, 'Request header'], [f.response, 'Response header']] as const) {
+    for (const r of side.setHeaders) {
+      const e = grpcMetadataError(r.name, r.value, label);
+      if (e) return e;
+    }
+    for (const n of removeList(side.removeHeaders)) {
+      const e = grpcMetadataError(n, undefined, `${label} to remove`);
+      if (e) return e;
+    }
+  }
   return undefined;
 }
 
@@ -213,6 +254,8 @@ export function describeRewrite(a: Extract<RuleAction, { kind: 'rewrite' }>): st
   side(a.request, 'request');
   if (a.response?.status !== undefined) parts.push(`status → ${a.response.status}`);
   side(a.response, 'response');
+  const t = Object.keys(a.response?.setTrailers ?? {}).length + (a.response?.removeTrailers?.length ?? 0);
+  if (t) parts.push(`response trailers (${t})`);
   return `Rewrite: ${parts.length ? parts.join(', ') : 'no changes'}`;
 }
 

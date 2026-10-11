@@ -11,7 +11,8 @@ export const MAX_SCRIPT_BYTES = 256 * 1024;
  * content: the host writes its own template, naming the rule.) Hooks are synchronous plain JavaScript: no require,
  * timers, fetch or import().
  */
-export const SCRIPT_TEMPLATE = `// Flutter Intercept script rule. Define onRequest and/or onResponse (synchronous, plain JavaScript).
+export const SCRIPT_TEMPLATE = `// Flutter Intercept script rule. Define onRequest / onResponse (HTTP) and/or onGrpcMessage / onGrpcStatus (gRPC);
+// synchronous, plain JavaScript.
 // Return an edited object, or undefined to leave it unchanged. context.log(...) writes to the exchange's script log.
 
 function onRequest(request, context) {
@@ -24,6 +25,19 @@ function onRequest(request, context) {
 function onResponse(response, request, context) {
   // response: { status, headers, body? }
   // context.log('status', response.status);
+  return undefined;
+}
+
+// gRPC calls (onRequest / onResponse are not called for them):
+function onGrpcMessage(message, context) {
+  // message: { path, dir: 'send' | 'receive', index, json?, base64, size } — json decoded with the app's schema
+  // return { json: { ...message.json, name: 'Test' } };   or { base64: '...' }   or { drop: true }
+  return undefined;
+}
+
+function onGrpcStatus(status, context) {
+  // status: { path, code, message?, trailers } — before the app gets the end of the call
+  // return { code: 14, message: 'backend down' };
   return undefined;
 }
 `;
@@ -59,9 +73,12 @@ export function scriptFileError(path: string): string | undefined {
 
 /** Why an inline script can't be saved, if it can't. */
 export function scriptCodeError(code: string): string | undefined {
-  if (!code.trim()) return 'Write the script (onRequest and/or onResponse), or edit it in a file.';
+  if (!code.trim()) return 'Write the script (onRequest / onResponse, or onGrpcMessage / onGrpcStatus), or edit it in a file.';
   if (new TextEncoder().encode(code).length > MAX_SCRIPT_BYTES) return 'At most 256 KB — move it to a file and keep it smaller.';
-  if (!/\bon(Request|Response)\b/.test(code)) return 'Define function onRequest(request, context) and/or onResponse(response, request, context).';
+  if (!/\bon(Request|Response|GrpcMessage|GrpcStatus)\b/.test(code)) {
+    return 'Define function onRequest(request, context) and/or onResponse(response, request, context) — or, for gRPC, ' +
+      'onGrpcMessage(message, context) / onGrpcStatus(status, context).';
+  }
   return undefined;
 }
 

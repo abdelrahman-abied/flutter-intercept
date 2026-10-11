@@ -253,13 +253,14 @@ describe('rules on gRPC calls (CONTRACTS §16.2)', () => {
   const g = grpcCall();
   it('only grpcMock, block, fault, throttle, breakpoint, mutate (0.11) and sequences of those (+ real server) apply', () => {
     const yes: RuleAction[] = [
-      { kind: 'breakpoint', phase: 'both' }, { kind: 'mutate', ops: [] },
+      { kind: 'breakpoint', phase: 'both' }, { kind: 'mutate', ops: [] }, { kind: 'rewrite' }, { kind: 'script', code: '' }, { kind: 'mapRemote', to: 'http://localhost' },
       { kind: 'grpcMock' }, { kind: 'block', mode: 'reset' }, { kind: 'fault', fault: 'timeout' }, { kind: 'throttle', latencyMs: 100 },
       { kind: 'sequence', steps: [{ action: { kind: 'grpcMock', code: 14 } }, { action: { kind: 'passthrough' } }] },
     ];
     const no: RuleAction[] = [
-      { kind: 'mock', status: 200, body: '' }, { kind: 'script', code: '' }, { kind: 'cors' }, { kind: 'rewrite' },
-      { kind: 'mapRemote', to: 'http://localhost' }, { kind: 'sequence', steps: [{ action: { kind: 'mock', status: 500, body: '' } }] },
+      // CONTRACTS §18: only mock (HTTP bodies) and cors (browser-only) are left out.
+      { kind: 'mock', status: 200, body: '' }, { kind: 'cors' },
+      { kind: 'sequence', steps: [{ action: { kind: 'mock', status: 500, body: '' } }] },
     ];
     for (const a of yes) expect(appliesToGrpc(a)).toBe(true);
     for (const a of no) expect(appliesToGrpc(a)).toBe(false);
@@ -280,7 +281,7 @@ describe('rules on gRPC calls (CONTRACTS §16.2)', () => {
     expect(grpcActionNote('mock')).toMatch(/gRPC calls skip this rule/);
     expect(grpcActionNote('grpcMock')).toBeUndefined();
     expect(grpcActionNote('sequence', ['grpcMock', 'passthrough'])).toBeUndefined();
-    expect(grpcActionNote('sequence', ['grpcMock', 'mock'])).toMatch(/every step/);
+    expect(grpcActionNote('sequence', ['grpcMock', 'mock'])).toMatch(/“Mock response” step doesn't apply to them — use a gRPC mock step/);
     expect(looksLikeGrpcUrl('http://*/demo.Users/GetUser')).toBe(true);
     expect(looksLikeGrpcUrl('*/demo.v1.Users/*')).toBe(true);
     expect(looksLikeGrpcUrl('https://api.example.com/users/*')).toBe(false);

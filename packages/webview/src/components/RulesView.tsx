@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Rule } from '../protocol';
 import {
-  canMoveRule, isShared, needsApproval, SHARED_FILE, suggestBodyFile,
+  canMoveRule, isShared, needsApproval, rewriteFromForm, SHARED_FILE, suggestBodyFile,
 } from '../scenarios';
 import {
   compileExchangeMatcher, countMatches, deleteRule, describeAction, formToRule, isAgentRule, moveRule, NEW_RULE, ruleBudget, ruleDisplayName,
@@ -10,7 +10,7 @@ import {
 } from '../state';
 import { formatTime } from '../util';
 import { ActionEditor, SequenceEditor, type GrpcHooks } from './ActionEditor';
-import { DECODE_TIMEOUT_MS, grpcActionNote, isGrpc, looksLikeGrpcUrl } from '../grpc';
+import { DECODE_TIMEOUT_MS, grpcActionNote, grpcRewriteNote, isGrpc, looksLikeGrpcUrl } from '../grpc';
 import { suggestScriptFile } from '../scripts';
 import { AgentBadge, Button, useNow } from './bits';
 import { Icon } from './Icon';
@@ -179,8 +179,9 @@ export function RulesView() {
       </div>
       {state.editingRuleId && (state.editingRuleId === NEW_RULE || rules.some((r) => r.id === state.editingRuleId)) && (
         <RuleEditor
-          key={state.editingRuleId}
+          key={`${state.editingRuleId}:${state.ruleTemplate?.id ?? ''}`}
           rule={state.editingRuleId === NEW_RULE ? undefined : rules.find((r) => r.id === state.editingRuleId)}
+          template={state.editingRuleId === NEW_RULE ? state.ruleTemplate : undefined}
           sharedFile={sr?.file}
           onSave={(rule, isNew) => {
             commit(upsertRule(rules, rule), isNew ? `Added rule “${ruleLabel(rule)}” at position ${rules.length + 1}.` : undefined);
@@ -206,11 +207,14 @@ const KIND_RADIOS: readonly [RuleForm['kind'], string][] = [
   ['script', 'Script (JS)'], ['grpcMock', 'gRPC mock'],
 ];
 
-export function RuleEditor({ rule, sharedFile, onSave, onCancel }: {
-  rule?: Rule; sharedFile?: string; onSave: (r: Rule, isNew: boolean) => void; onCancel: () => void;
+export function RuleEditor({ rule, template, sharedFile, onSave, onCancel }: {
+  rule?: Rule;
+  /** A new rule prefilled from an exchange (CONTRACTS §18 "Rewrite / Script / Map remote for this…"): unsaved until Add. */
+  template?: Rule;
+  sharedFile?: string; onSave: (r: Rule, isNew: boolean) => void; onCancel: () => void;
 }) {
   const { state, dispatch, post } = useApp();
-  const [form, setForm] = useState<RuleForm>(() => ruleToForm(rule));
+  const [form, setForm] = useState<RuleForm>(() => (template && !rule ? { ...ruleToForm(template), isNew: true } : ruleToForm(rule)));
   const [confirmJson, setConfirmJson] = useState(false);
   const readOnly = !!rule && isShared(rule);
   const set = (patch: Partial<RuleForm>) => {
@@ -234,7 +238,10 @@ export function RuleEditor({ rule, sharedFile, onSave, onCancel }: {
     const test = compileExchangeMatcher({ url: form.url.trim(), method: form.method.trim() || undefined });
     return state.exchanges.filter((e) => isGrpc(e) && test(e)).reverse();
   }, [form.url, form.method, state.exchanges, v.errors.url]);
-  const showGrpcNote = !!grpcNote && (grpcMatches.length > 0 || looksLikeGrpcUrl(form.url));
+  const grpcRoute = grpcMatches.length > 0 || looksLikeGrpcUrl(form.url);
+  const showGrpcNote = !!grpcNote && grpcRoute;
+  // CONTRACTS §18.1: body replacements / the status of a rewrite don't apply to gRPC calls.
+  const rewriteNote = grpcRoute && form.kind === 'rewrite' && !v.errors.rewrite ? grpcRewriteNote(rewriteFromForm(form.rewrite)) : undefined;
   const usesGrpcMock = form.kind === 'grpcMock' || (form.kind === 'sequence' && form.steps.some((s) => s.kind === 'grpcMock'));
   const [skeletonFor, setSkeletonFor] = useState<{ id: string; at: number } | undefined>();
   const grpcHooks = useMemo<GrpcHooks | undefined>(() => {
@@ -383,6 +390,7 @@ export function RuleEditor({ rule, sharedFile, onSave, onCancel }: {
             ))}
           </div>
           {showGrpcNote && <div class="msg info grpc-rule-note" role="note">{grpcNote}</div>}
+          {rewriteNote && <div class="msg info grpc-rule-note grpc-rewrite-note" role="note">{rewriteNote}</div>}
           {form.kind === 'sequence' ? (
             <div class="hint">Different answers for successive requests — set the steps below.</div>
           ) : (
