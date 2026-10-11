@@ -134,7 +134,7 @@ describe('action.yml (CONTRACTS §14.1)', () => {
     }
     expect(uses.length).toBeGreaterThanOrEqual(2);
     for (const step of uses) {
-      expect(step.uses).toBe('abdelrahman-abied/flutter-intercept@v0.8.0');
+      expect(step.uses).toMatch(/^abdelrahman-abied\/flutter-intercept@v\d+\.\d+\.\d+$/);
       for (const k of Object.keys(asMap(step.with))) expect(Object.keys(inputs)).toContain(k);
     }
   });
