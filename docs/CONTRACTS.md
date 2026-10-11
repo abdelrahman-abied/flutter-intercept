@@ -1483,3 +1483,61 @@ counts per route and message-type changes. Agents: `save_recording` includes the
   client-certificate paths absolute / `~/` only; `nativeClients: "proxy"` user settings only; emulator routing records
   with owner + heartbeat; action input `upload-recording` (default false, redacted copy).
 
+
+## 15. v0.9.0 — Android Studio / IntelliJ plugin (2026-10-11)
+
+Goal: the same Flutter Intercept in Android Studio (and IntelliJ IDEA with the Flutter plugin), reusing the proxy, the
+host logic and the webview. Plan and owners: docs/PLAN.md "v0.9.0". Types already in code:
+`packages/sidecar/src/types.ts` (stdio protocol, settings), `packages/intellij/src/main/kotlin/dev/flutterintercept/api/SidecarApi.kt`
+(what the run integration needs from the core). Target: Android Studio 2026.2 (build 262, JBR 25) and IntelliJ IDEA
+2026.2 with the `io.flutter` and `Dart` plugins; build against the local Android Studio install and its bundled
+Flutter/Dart plugins (no SDK download needed for development).
+
+### 15.1 Architecture
+```
+Android Studio ── plugin (Kotlin) ──stdio JSON──▶ node sidecar.js ──▶ InterceptProxy (mockttp), controller, agent API (MCP)
+      │ JCEF tool window ◀── http://127.0.0.1:<ui>/?t=<token>  (webview bundle + WebSocket for HostMsg/ViewMsg)
+      └ Flutter run configs ── prepareLaunch → generated entry (-t) + --dart-define (FLUTTER_INTERCEPT_PROXY, …)
+```
+- **Sidecar** (`packages/sidecar`, TypeScript, one esbuild bundle `dist/sidecar.js`): composes the vscode-free extension
+  modules (proxyHost, ui/controller, agent api + mcp server, rules core, recordings, contract, codegen, export, notify
+  policy, vm core, entry generator, CA store, adb reverse) exactly like the VS Code host does, with the vscode-only
+  pieces replaced by `SidecarRequest`s to the plugin. A test asserts the bundle never requires `vscode`.
+- **UI server** (sidecar): binds 127.0.0.1 on a random port; one random token per sidecar run (32 bytes, base64url);
+  `GET /?t=<token>` returns the webview HTML (same CSP as §4 with `connect-src ws://127.0.0.1:<port>`), the bundle
+  and an IDE theme stylesheet (`--vscode-*` variables for light / dark / high contrast); `GET /ws?t=` upgrades to a
+  WebSocket carrying `HostMsg` / `ViewMsg` JSON. Requests without the token, with a foreign `Host`, or with an `Origin`
+  other than the UI origin are refused (403). Several JCEF clients may attach (one per project window).
+- **Webview standalone mode** (`packages/webview`): when `acquireVsCodeApi` is absent, `host.ts` talks over that
+  WebSocket (URL + token from the page), reconnects with backoff, and state persistence uses `sessionStorage`; the
+  UI is otherwise identical. `body.fi-ide` selects IDE layout tweaks; theme variables come from the stylesheet.
+- **Plugin** (`packages/intellij`, Kotlin, Gradle with the IntelliJ Platform Gradle Plugin 2.x): starts the sidecar
+  lazily with the user's Node (setting `nodePath`, default `node` on PATH; Node ≥ 18 checked, clear notification
+  otherwise), one sidecar per IDE process (application service) shared by project windows; restarts it on crash
+  (backoff, ≤ 3 times / 5 min); kills it on exit. Tool window "Flutter Intercept" (bottom) with a JCEF browser on
+  `uiUrl` (fallback message when JCEF is unavailable). Status bar widget (on/off, paused count). Settings page
+  (Tools → Flutter Intercept) storing `SidecarSettings` application-level; passphrases in `PasswordSafe`. Actions:
+  Toggle Interception, Open Traffic, Clear, Connect AI Agent (copies `connectAgent` text), Export OpenAPI / Postman,
+  Save CA Certificate. Implements every `ui.*` request with IDE APIs (FileEditorManager, CopyPasteManager, popups,
+  FileChooser/FileSaverDialog, Messages, notifications, DiffManager, LightVirtualFile).
+- **Run integration** (plugin `run/**`): before a Flutter run configuration (`io.flutter.run.SdkRunConfig` and
+  related) launches in debug or profile mode, call `prepareLaunch`; on `Rewrite`, launch with the generated entry and
+  the extra args **without permanently changing the user's run configuration** (a copy or a transient patch that is
+  always restored); `Skip` → unchanged + the reason logged once. Device id/kind from the Flutter plugin's device
+  service; VM service URI from the running Flutter app when available → `sessionStarted`; process end →
+  `sessionEnded`. Release mode is never intercepted. **Spike first** (docs/spikes/intellij-run.md): the least
+  invasive supported hook (an execution listener / `RunConfigurationExtension`-style patch / own executor or action
+  "Run with Flutter Intercept"), measured in a real Android Studio sandbox (`runIde`) on the Android emulator and
+  macOS. If no automatic hook is reliable, ship the action + a run-configuration-level toggle.
+
+### 15.2 Security
+- Same guarantees as the VS Code host (§7, §8, §12.1, REVIEW-1…8): loopback-only proxy except the iPhone LAN mode,
+  user-level settings only (the plugin has no workspace-level overrides for routing/agent settings), shared-rule
+  approval with the same modal content (via `ui.confirm`), redaction for agents, CA key in `dataDir` (0600).
+- The UI token and MCP token never appear in logs or stderr. The sidecar exits when stdin closes (the IDE died).
+- Node path from settings only (never from the project); the sidecar bundle ships inside the plugin.
+
+### 15.3 Packaging
+`./gradlew buildPlugin` produces `flutter-intercept-intellij-<version>.zip` containing the plugin jar and
+`sidecar/sidecar.js` + `sidecar/webview/*` (built by `npm run build -w @flutter-intercept/sidecar` first). Publishing to
+the JetBrains Marketplace is the owner's step (token); `verifyPlugin` must pass for 262.

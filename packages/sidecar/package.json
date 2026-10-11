@@ -1,0 +1,16 @@
+{
+  "name": "@flutter-intercept/sidecar",
+  "version": "0.9.0",
+  "private": true,
+  "description": "Flutter Intercept host for IDEs other than VS Code (Android Studio / IntelliJ): proxy, traffic UI server and agent API over stdio JSON.",
+  "license": "MIT",
+  "type": "commonjs",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@flutter-intercept/proxy": "*"
+  }
+}

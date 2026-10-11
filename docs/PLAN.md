@@ -177,3 +177,13 @@ packaged VSIX — default 42/42, agent 19/19 (macOS + Android emulator), devices
 macOS), web 8/8. Independent review: docs/REVIEW-8.md, all findings fixed or documented. Not verified on hardware: a
 physical iPhone in CI mode and iPhone screenshots via `devicectl` (no device connected), Edge.
 
+
+## v0.9.0 — Android Studio / IntelliJ plugin (started 2026-10-11, branch `feature/0.9.0`)
+Contract: CONTRACTS §15. Same rules as before.
+| Agent | Owns |
+|---|---|
+| S sidecar | `packages/sidecar/**` except `src/types.ts` |
+| K plugin core | `packages/intellij/**` except `src/main/kotlin/dev/flutterintercept/run/**` and `api/SidecarApi.kt` |
+| R run integration | `packages/intellij/src/main/kotlin/dev/flutterintercept/run/**`, docs/spikes/intellij-run.md |
+| W webview | `packages/webview/**` except `protocol.ts` (standalone WebSocket host, IDE theme) |
+| lead | contract, types, `api/SidecarApi.kt`, docs, integration, review |
