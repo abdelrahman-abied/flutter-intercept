@@ -190,7 +190,7 @@ describe('list_requests / get_request (v0.5.0 fields)', () => {
     expect(await ids({ graphqlOperation: 'GetUser' })).toEqual([b.id]);
     expect(await ids({ graphqlOperation: 'GetUser', url: '*/rest*' })).toEqual([]);
     await rejects(api.call('list_requests', { graphqlOperation: 'Get User' }), 'invalid');
-    await rejects(api.call('list_requests', { kind: 'grpc' }), 'invalid');
+    await rejects(api.call('list_requests', { kind: 'mqtt' }), 'invalid');
     const items = ((await api.call('list_requests', {})) as any).items;
     expect(items.find((i: any) => i.id === b.id)).toMatchObject({ graphqlOperation: 'GetUser' });
     expect(items.find((i: any) => i.id === a.id)).toMatchObject({ kind: 'websocket' });

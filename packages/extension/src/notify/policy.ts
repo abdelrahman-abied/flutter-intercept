@@ -4,7 +4,8 @@
  * - Counted: the app's own traffic only. Not editor / agent sends, browser-internal requests, answers the user
  *   arranged (mocked, blocked, replayed or scripted local answers — all end `mocked` / `blocked`), simulated
  *   faults (fault rules, throttle drops, offline profile, "not in the recording"), or a status a rewrite rule set.
- * - A failure: state `error`, or status ≥ 500; level "all" adds 4xx.
+ * - A failure: state `error`, or status ≥ 500; level "all" adds 4xx. CONTRACTS §16.4: a gRPC call (HTTP status 200)
+ *   fails when its gRPC status is not 0 (OK) or 1 (CANCELLED, the app's own cancel); text "gRPC 14 UNAVAILABLE: …".
  * - Each exchange is looked at once, when it first reaches a final state (later updates are ignored).
  * - While the panel is visible nothing is shown or queued (the user can see the traffic).
  * - At most one notice per window (default 10 s): failures inside it are grouped into the next notice, which
@@ -19,6 +20,7 @@
 import type { Exchange } from '@flutter-intercept/proxy';
 import { STATUS_CODES } from 'http';
 import { redactSecretValues, redactText } from '../agent/redact';
+import { grpcCodeName } from '../grpc/service';
 import type { Notice, NotifyLevel, NotifyPolicy, NotifyPolicyOptions } from './types';
 
 export const DEFAULT_WINDOW_MS = 10_000;
@@ -68,6 +70,10 @@ export function isExcluded(e: Exchange): boolean {
 export function isFailure(e: Exchange, level: NotifyLevel): boolean {
   if (level === 'off') return false;
   if (e.state === 'error') return true;
+  if (e.kind === 'grpc') {
+    const code = e.grpc?.statusCode;
+    if (typeof code === 'number') return code !== 0 && code !== 1;
+  }
   const st = e.status;
   if (typeof st !== 'number') return false;
   return st >= 500 || (level === 'all' && st >= 400);
@@ -99,6 +105,14 @@ export function describeRequest(e: Exchange): string {
 
 /** `500 Internal Server Error`, or a short error message (URLs reduced to origin + path). */
 export function describeOutcome(e: Exchange): string {
+  const code = e.kind === 'grpc' ? e.grpc?.statusCode : undefined;
+  if (typeof code === 'number') {
+    const name = grpcCodeName(code);
+    const head = `gRPC ${code}${name && name !== String(code) ? ` ${name}` : ''}`;
+    const msg = e.grpc?.statusMessage ? redactText(neutralizeText(e.grpc.statusMessage)).replace(/\s+/g, ' ').trim() : '';
+    const text = msg ? `${head}: ${msg}` : head;
+    return text.length > MAX_ERROR_CHARS ? `${text.slice(0, MAX_ERROR_CHARS - 1)}…` : text;
+  }
   if (typeof e.status === 'number' && e.status > 0) {
     const reason = STATUS_CODES[e.status];
     return reason ? `${e.status} ${reason}` : String(e.status);

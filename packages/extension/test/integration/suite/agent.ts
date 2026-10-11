@@ -17,6 +17,10 @@
  * (status changes), replay_recording with fallback "fail" (users/1 answered from the recording without any rule, an
  * unrecorded endpoint fails), get_auth_flows, and add_map_remote of users/1 to a local server started by the suite.
  *
+ * v0.10.0 (MCP door, CONTRACTS §16.4; opt-in FI_AGENT_GRPC=1 with scripts/e2e/grpc_server running): the demo's gRPC
+ * GetOrder call listed (kind "grpc"), decoded (get_request / get_frames), get_grpc_schema, add_grpc_mock (JSON messages,
+ * times 1; an error status) after hot restarts, assert_traffic expect.grpcStatus, get_status grpc.
+ *
  * Two paths, chosen automatically:
  *  - "lm":     the extension registered `flutter_intercept_*` (lead wiring + package.json
  *              languageModelTools present) → every step goes through `vscode.lm.invokeTool`.
@@ -1109,6 +1113,95 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
       out.ms = Date.now() - t0;
       results.push(out);
       console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+    }
+
+    // v0.10.0 (CONTRACTS §16.4) over MCP: the demo's gRPC calls (samples/demo_app/lib/grpc_demo.dart against
+    // scripts/e2e/grpc_server, h2c). Opt-in: FI_AGENT_GRPC=1 once that server runs (run_device.sh --grpc starts it).
+    // list_requests kind "grpc", get_request (gRPC info, trailers, schema-decoded messages), get_frames,
+    // get_grpc_schema (method + skeleton), add_grpc_mock with JSON messages (times 1) and with an error status,
+    // assert_traffic expect.grpcStatus, both after hot restarts; get_status grpc.
+    if (process.env.FI_AGENT_GRPC === '1') {
+      const GET_ORDER = '/demo.orders.v1.OrderService/GetOrder';
+      for (const dev of devices) {
+        const out: RunOutcome = { name: `AGENT ${dev} v0.10.0 over MCP: gRPC list/get/frames, get_grpc_schema, add_grpc_mock, assert grpcStatus`, output: '', proxyHits: [], failures: [], ms: 0 };
+        const f = out.failures;
+        const t0 = Date.now();
+        let sessionId: string | undefined;
+        const notes: string[] = [];
+        const ruleIds: string[] = [];
+        try {
+          client = await connect();
+          const st = await mcpCall('get_status', {});
+          if (st.isError || st.result.grpc?.enabled !== true) f.push(`get_status grpc: ${JSON.stringify(st.result.grpc)}`);
+          const since = Date.now();
+          const l = await mcpCall('launch_app', { deviceId: dev });
+          sessionId = l.result.sessionId;
+          if (l.isError || !sessionId) throw new Error(`launch_app: ${l.text.slice(0, 200)}`);
+          const w = await mcpCall('wait_for_request', { url: `*${GET_ORDER}`, kind: 'grpc', sinceMs: since, timeoutMs: 120_000 });
+          if (w.isError || w.result.timedOut) throw new Error(`no gRPC GetOrder call (is the e2e gRPC server running?): ${w.text.slice(0, 200)}`);
+          const list = await mcpCall('list_requests', { kind: 'grpc', sinceMs: since });
+          if (list.isError || !(list.result.total > 0) || (list.result.items ?? []).some((i: any) => i.kind !== 'grpc')) f.push(`list_requests kind grpc: ${list.text.slice(0, 300)}`);
+          const g = await mcpCall('get_request', { id: w.result.id });
+          if (g.isError || typeof g.result.grpc?.code !== 'number' || g.result.grpc?.method !== 'GetOrder') f.push(`get_request grpc: ${g.text.slice(0, 300)}`);
+          const msgs: any[] = g.result.messages ?? [];
+          if (!msgs.some((m) => m.dir === 'receive' && m.via === 'schema' && m.json && typeof m.json === 'object')) f.push(`get_request messages not schema-decoded: ${JSON.stringify(msgs).slice(0, 300)}`);
+          if (g.result.grpc?.code === 0 && g.result.responseTrailers?.['x-demo-trailer'] !== 'done') f.push(`trailers: ${JSON.stringify(g.result.responseTrailers)}`);
+          const fr = await mcpCall('get_frames', { id: w.result.id });
+          if (fr.isError || !(fr.result.frames ?? []).every((x: any) => x.kind === 'message')) f.push(`get_frames: ${fr.text.slice(0, 300)}`);
+          notes.push(`GetOrder → ${g.result.grpc?.status}, ${msgs.length} message(s) decoded via ${[...new Set(msgs.map((m) => m.via))].join('/')}`);
+
+          const sch = await mcpCall('get_grpc_schema', { method: GET_ORDER });
+          if (sch.isError || sch.result.available !== true || sch.result.responseType !== 'demo.orders.v1.Order' || typeof sch.result.responseSkeleton !== 'object') f.push(`get_grpc_schema: ${sch.text.slice(0, 300)}`);
+          const all = await mcpCall('get_grpc_schema', {});
+          if (all.isError || !(all.result.methods ?? []).some((m: any) => m.path === GET_ORDER)) f.push(`get_grpc_schema list: ${all.text.slice(0, 300)}`);
+
+          // A JSON mock for the next call only.
+          const mk = await mcpCall('add_grpc_mock', { url: `*${GET_ORDER}`, messages: [{ ...(sch.result.responseSkeleton ?? {}), id: 'fi-mocked-order' }], times: 1, name: 'order mock' });
+          if (mk.isError || !mk.result.ruleId) throw new Error(`add_grpc_mock: ${mk.text.slice(0, 300)}`);
+          ruleIds.push(mk.result.ruleId);
+          const bad = await mcpCall('add_grpc_mock', { url: `*${GET_ORDER}`, messages: [{ noSuchField: 1 }] });
+          if (!bad.isError || !/noSuchField/.test(bad.text)) f.push(`add_grpc_mock with a bad field was not refused: ${bad.text.slice(0, 200)}`);
+          let restartAt = Date.now();
+          let h = await mcpCall('hot_restart', { sessionId });
+          if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+          const wm = await mcpCall('wait_for_request', { url: `*${GET_ORDER}`, kind: 'grpc', sinceMs: restartAt, timeoutMs: 90_000 });
+          if (wm.isError || wm.result.timedOut || wm.result.matchedRuleId !== mk.result.ruleId || wm.result.state !== 'mocked') f.push(`grpc mock did not answer: ${wm.text.slice(0, 300)}`);
+          else {
+            const gm = await mcpCall('get_request', { id: wm.result.id });
+            if (!JSON.stringify(gm.result.messages ?? []).includes('fi-mocked-order')) f.push(`mocked message not seen: ${gm.text.slice(0, 300)}`);
+          }
+
+          // An error status for every call, asserted by name.
+          const err = await mcpCall('add_grpc_mock', { service: 'demo.orders.v1.OrderService', method: 'GetOrder', code: 'UNAVAILABLE', message: 'fi-suite down' });
+          if (err.isError || !err.result.ruleId) throw new Error(`add_grpc_mock (error): ${err.text.slice(0, 300)}`);
+          ruleIds.push(err.result.ruleId);
+          restartAt = Date.now();
+          h = await mcpCall('hot_restart', { sessionId });
+          if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+          const as = await mcpCall('assert_traffic', { url: `*${GET_ORDER}`, kind: 'grpc', sinceMs: restartAt, withinMs: 90_000, expect: { grpcStatus: 'UNAVAILABLE' } });
+          if (as.isError || as.result.pass !== true) f.push(`assert_traffic grpcStatus: ${as.text.slice(0, 300)}`);
+          const asBad = await mcpCall('assert_traffic', { url: `*${GET_ORDER}`, kind: 'grpc', sinceMs: restartAt, expect: { grpcStatus: 0 } });
+          if (asBad.isError || asBad.result.pass !== false) f.push(`assert_traffic grpcStatus 0 should fail: ${asBad.text.slice(0, 300)}`);
+          notes.push(`mock → ${wm.result.state}; error mock asserted ${as.result.pass ? 'UNAVAILABLE' : 'FAILED'}`);
+
+          for (const id of ruleIds.splice(0)) await mcpCall('remove_rule', { ruleId: id });
+          const s2 = await mcpCall('stop_app', { sessionId });
+          if (s2.isError || s2.result.stopped !== 1) f.push(`stop_app: ${s2.text.slice(0, 200)}`);
+          else sessionId = undefined;
+          out.output = notes.join('; ');
+        } catch (e) {
+          f.push(`exception: ${(e as Error).message}`);
+          out.output = notes.join('; ');
+        } finally {
+          for (const id of ruleIds) await mcpCall('remove_rule', { ruleId: id }).catch(() => undefined);
+          if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
+          await client?.close().catch(() => undefined);
+          client = undefined;
+        }
+        out.ms = Date.now() - t0;
+        results.push(out);
+        console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+      }
     }
 
     // Access: readOnly blocks writes on both doors; off stops the MCP server.

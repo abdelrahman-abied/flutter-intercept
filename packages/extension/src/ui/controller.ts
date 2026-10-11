@@ -39,6 +39,13 @@
  * CONTRACTS §14 (v0.8.0): `Status.upstreamProxySource` / `tlsPassthrough` / `clientCertificates` come from the host
  * (re-broadcast on its 'tlsPassthrough' / 'clientCertificates' events); tunnel exchanges (`kind: 'tunnel'`, TLS passed
  * through undecrypted) only get block rules and can't be resent; finished WebSocket / SSE exchanges are recordable.
+ *
+ * CONTRACTS §16.4 (v0.10.0): `decodeGrpc {id}` → `grpcDecoded` (schema decode of each message frame the panel holds,
+ * else raw, hex ≤ 4 KB, skeletons of the method's types); `createRuleFromExchange` with `grpcMock` → a rule answering
+ * with the call's response messages (`messagesJson` when the schema decodes them all, else base64 `messages`) and its
+ * status; gRPC calls only get `grpcMock` and `block` rules from an exchange, are never resent nor recorded; HAR exports
+ * include them (`_grpc`). `Status.grpc` from the host (decrypt hosts, self-check) and the injected schema service,
+ * re-broadcast on the host's 'grpc' event and on schema changes. Types from src/ui/protocol.ts.
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -55,9 +62,17 @@ import type { Recording, RecordingMeta, RecordingService } from '../recordings/t
 import type { SharedRulesService, SharedRulesState } from '../rules/types';
 import type { ToOpenApi, ToPostman } from '../export/types';
 import { scriptFileOf, scriptFileSyntaxError, scriptTemplate } from '../rules/scriptFile';
-import { buildHar, ensureDirInside, EXPORT_DIR } from '../agent/har';
+import { buildHar, ensureDirInside, EXPORT_DIR, type HarGrpcDecoder } from '../agent/har';
+import { decodeGrpcMessages, grpcMethodPath, hexOf, type GrpcDeps } from '../grpc/service';
 import { gitIgnoreStatus, type GitignoreFs } from '../recordings/gitignore';
-import type { AgentStatus, AuthFlowSummary, ContractSummary, ExportFormat, HostMsg, RecordingSummary, SendDraft, SessionWarning, SnippetFormat, Status, ViewMsg } from './protocol';
+import type { AgentStatus, AuthFlowSummary, ContractSummary, ExportFormat, GrpcDecoded, GrpcStatus, HostMsg, RecordingSummary, SendDraft, SessionWarning, SnippetFormat, Status, ViewMsg } from './protocol';
+
+export type { GrpcDecoded, GrpcDecodedMessage, GrpcStatus } from './protocol';
+/** The §16.4 answer to `decodeGrpc`. */
+export type GrpcDecodedMsg = Extract<HostMsg, { type: 'grpcDecoded' }>;
+/** Kept for callers: `Status` already carries §16.4 `grpc`. */
+export type ControllerStatus = Status;
+type AnyViewMsg = ViewMsg | { type: 'decodeGrpc'; id: string };
 
 export type Sink = (msg: HostMsg) => void;
 
@@ -105,6 +120,13 @@ export interface ControllerHost {
   readonly clientCertificateStatus?: { host: string; problem?: string }[];
   /** Fire after the passthrough hosts / client certificates changed. */
   on(event: 'tlsPassthrough' | 'clientCertificates', l: (info: unknown) => void): unknown;
+  // CONTRACTS §16.4 (InterceptProxyHost). Optional on older hosts.
+  /** Hosts whose TLS gRPC is decrypted. */
+  readonly grpcDecryptHosts?: string[];
+  /** The proxy's gRPC self-check failed (or the build has no gRPC support). */
+  readonly grpcProblem?: string;
+  /** Fires after the decrypt hosts or the self-check result changed. */
+  on(event: 'grpc', l: (info: unknown) => void): unknown;
 }
 
 /**
@@ -218,6 +240,10 @@ export interface ControllerDeps {
   openScriptFile?: (path: string, create?: { content: string }, ruleId?: string) => Promise<unknown>;
   /** Opens the panel as an editor in its own window (src/ui/panel.ts `openInNewWindow`). */
   openInNewWindow?: () => unknown;
+
+  // ---- CONTRACTS §16.4 (v0.10.0). Optional: without it gRPC messages are shown raw only where possible.
+  /** The gRPC schema service (src/grpc/service.ts `createGrpcSchemaService`); its `onDidChange` re-broadcasts status. */
+  grpc?: GrpcDeps & { onDidChange?(listener: () => void): { dispose(): void } };
 }
 
 /** CONTRACTS §13.5: the redaction choice offered on every export from the panel / commands. */
@@ -267,7 +293,8 @@ function checkRuleId(v: unknown, where: string): string | undefined {
 /** CONTRACTS §12.4 / §14.5: finished HTTP, WebSocket and SSE exchanges (not tunnels, native-client or browser traffic). */
 export function isRecordable(e: Exchange): boolean {
   if (e.kind === 'websocket' && e.status !== 101) return false; // an upgrade that never opened (the store agrees)
-  return FINAL_STATES.has(e.state) && e.kind !== 'tunnel' && e.captured !== 'vm-profile' && !e.browserInternal;
+  // CONTRACTS §16.4: recordings skip gRPC (later)
+  return FINAL_STATES.has(e.state) && e.kind !== 'tunnel' && e.kind !== 'grpc' && e.captured !== 'vm-profile' && !e.browserInternal;
 }
 
 export function recordingSummary(m: RecordingMeta): RecordingSummary {
@@ -352,8 +379,10 @@ export async function fixtureApi(
   }
 }
 
-/** Kinds `createRuleFromExchange` can build (throttle/fault rules come from the rule editor). */
-const RULE_KINDS = new Set<RuleAction['kind']>(['mock', 'block', 'breakpoint']);
+/** Kinds `createRuleFromExchange` can build (throttle/fault rules come from the rule editor); grpcMock: CONTRACTS §16.4. */
+const RULE_KINDS = new Set<RuleAction['kind']>(['mock', 'block', 'breakpoint', 'grpcMock']);
+/** CONTRACTS §16.4: JSON text of one decoded message shown in the panel (longer is cut, `truncated`). */
+export const UI_MAX_GRPC_JSON_CHARS = 256 * 1024;
 const FAULTS = new Set(['reset', 'timeout', 'truncate', 'dns']);
 const PRESET_IDS = new Set(['slow-3g', 'fast-3g', 'flaky']);
 
@@ -429,6 +458,10 @@ export function tunnelReason(e: Exchange): string | undefined {
     host = new URL(e.url).hostname;
   } catch {
     // keep generic
+  }
+  // CONTRACTS §16.5: a gRPC connection over TLS with the app's default credentials.
+  if (e.grpcTunnel) {
+    return `gRPC over TLS${host ? ` to ${host}` : ''}, not decrypted: the app trusts only its own certificate roots, so only the bytes each way and the timing are known. Add the host to flutterIntercept.grpc.decryptHosts if the app trusts the Flutter Intercept CA in debug (pinned to it, or onBadCertificate). Only block rules (and faults) apply to it.`;
   }
   return `the TLS connection${host ? ` to ${host}` : ''} was passed through without decryption because the host matches flutterIntercept.tlsPassthrough (for apps that pin certificates); only the bytes each way and the timing are known, no request, headers or bodies. Only block rules (and faults) apply to it.`;
 }
@@ -707,6 +740,9 @@ function validateAction(a: unknown, aw: string, inStep: boolean): RuleAction {
       if (text > MAX_REWRITE_TEXT_TOTAL) fail(aw, 'the find and replace texts of one rewrite must total at most 256 KB');
       break;
     }
+    case 'grpcMock':
+      checkGrpcMock(a, aw);
+      return { ...a } as unknown as RuleAction;
     case 'script': {
       // CONTRACTS §13.4: never inside a sequence; `code` may be empty when `file` supplies it (read by the host).
       if (inStep) fail(aw, 'a sequence step cannot be a script');
@@ -722,6 +758,97 @@ function validateAction(a: unknown, aw: string, inStep: boolean): RuleAction {
       fail(aw, `unknown kind ${JSON.stringify(a.kind)}`);
   }
   return { ...a } as unknown as RuleAction;
+}
+
+/** CONTRACTS §16.2: grpcMock limits. */
+export const MAX_GRPC_MOCK_MESSAGES = 1000;
+export const MAX_GRPC_MOCK_BYTES = 4 * 1024 * 1024;
+export const MAX_GRPC_MESSAGE_TEXT = 4096;
+/** Headers / trailers a grpcMock may not set: the proxy owns them (and HTTP/2 forbids the connection-specific ones). */
+const GRPC_MOCK_FORBIDDEN = new Set(['content-type', 'grpc-status', 'grpc-message', 'content-length', 'transfer-encoding', 'connection', 'keep-alive', 'proxy-connection', 'upgrade', 'te', 'trailer', 'host']);
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/**
+ * CONTRACTS §16.2: `grpcMock` — code an integer 0–999 (canonical 0–16), message ≤ 4 KB, `messages` (base64 protobuf
+ * payloads) or `messagesJson` (JSON values the host encodes with the app's schema), not both, ≤ 1000 and ≤ 4 MB together;
+ * headers / trailers without pseudo headers, content-type, grpc-status / grpc-message or connection headers; delayMs /
+ * gapMs 0–600000.
+ */
+function checkGrpcMock(a: Record<string, unknown>, aw: string): void {
+  onlyKeys(a, ['kind', 'code', 'message', 'messages', 'messagesJson', 'headers', 'trailers', 'delayMs', 'gapMs'], aw);
+  if (a.code !== undefined && !isInt(a.code, 0, 999)) fail(aw, 'code must be a gRPC status code (an integer 0–16, e.g. 14 = UNAVAILABLE)');
+  if (a.message !== undefined && (typeof a.message !== 'string' || a.message.length > MAX_GRPC_MESSAGE_TEXT)) fail(aw, `message must be text of at most ${MAX_GRPC_MESSAGE_TEXT} characters`);
+  if (a.messages !== undefined && a.messagesJson !== undefined) fail(aw, 'pass messages (base64) or messagesJson (JSON), not both');
+  let bytes = 0;
+  if (a.messages !== undefined) {
+    if (!Array.isArray(a.messages) || a.messages.length > MAX_GRPC_MOCK_MESSAGES) fail(aw, `messages must be a list of at most ${MAX_GRPC_MOCK_MESSAGES} base64 protobuf payloads`);
+    a.messages.forEach((m, i) => {
+      if (typeof m !== 'string' || !BASE64.test(m)) fail(aw, `messages[${i}] must be base64 (a serialized protobuf message)`);
+      bytes += m.length;
+    });
+  }
+  if (a.messagesJson !== undefined) {
+    if (!Array.isArray(a.messagesJson) || a.messagesJson.length > MAX_GRPC_MOCK_MESSAGES) fail(aw, `messagesJson must be a list of at most ${MAX_GRPC_MOCK_MESSAGES} JSON messages`);
+    a.messagesJson.forEach((m, i) => {
+      if (!isJsonValue(m)) fail(aw, `messagesJson[${i}] must be a JSON value`);
+      bytes += JSON.stringify(m).length;
+    });
+  }
+  if (bytes > MAX_GRPC_MOCK_BYTES) fail(aw, 'the messages must total at most 4 MB');
+  for (const side of ['headers', 'trailers'] as const) {
+    if (a[side] === undefined) continue;
+    checkHeaders(a[side], `${aw}.${side}`, false);
+    for (const name of Object.keys(a[side] as object)) {
+      const n = name.toLowerCase();
+      if (n.startsWith(':') || GRPC_MOCK_FORBIDDEN.has(n)) fail(`${aw}.${side}`, `"${name}" can't be set by a gRPC mock (the proxy sets it; use code / message for the status)`);
+    }
+  }
+  for (const k of ['delayMs', 'gapMs'] as const) if (a[k] !== undefined && !isInt(a[k], 0, 600_000)) fail(aw, `${k} must be an integer 0–600000`);
+}
+
+/** The response messages of a finished gRPC exchange as a grpcMock (JSON when the schema decodes every one). */
+export function grpcMockRuleFromExchange(e: Exchange, id: string, grpc: Pick<GrpcDeps, 'codec' | 'schema'> | undefined): Rule {
+  if (e.kind !== 'grpc') throw new Error('a gRPC mock needs a gRPC call; use a mock rule for HTTP requests');
+  const path = grpcMethodPath(e.url);
+  let origin = '';
+  try {
+    origin = new URL(e.url).origin;
+  } catch {
+    // reported below
+  }
+  if (!path || !origin || origin === 'null') throw new Error("its URL isn't a gRPC method (…/package.Service/Method)");
+  if (e.state === 'pending' || e.state === 'paused-request' || e.state === 'paused-response') throw new Error('the call has not finished yet; mock it once it has its status');
+  if (e.framesDropped) throw new Error('some of its messages were not kept (too many), so the mock would be incomplete');
+  const received = (e.frames ?? []).filter((f) => f.kind === 'message' && f.dir === 'receive');
+  if (received.some((f) => f.truncated || typeof f.base64 !== 'string')) throw new Error('some of its response messages were too large to record in full');
+  const decoded = decodeGrpcMessages(e, grpc, { filter: (f) => f.dir === 'receive' });
+  const allJson = decoded.messages.length > 0 && decoded.messages.every((m) => m.via === 'schema');
+  const info = e.grpc;
+  const code = info?.statusCode ?? 0;
+  const custom = (h: Record<string, string | string[]> | undefined): Record<string, string> | undefined => {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(h ?? {})) {
+      const n = k.toLowerCase();
+      if (n.startsWith(':') || GRPC_MOCK_FORBIDDEN.has(n) || n === 'date' || n === 'server' || n.startsWith('grpc-') || n === 'content-encoding') continue;
+      if (!TOKEN.test(k)) continue;
+      const value = Array.isArray(v) ? v.join(', ') : v;
+      if (typeof value !== 'string' || /[\r\n\0]/.test(value)) continue;
+      out[n] = value;
+    }
+    return Object.keys(out).length ? out : undefined;
+  };
+  const headers = custom(e.responseHeaders);
+  const trailers = custom(e.responseTrailers);
+  const action: RuleAction = {
+    kind: 'grpcMock',
+    ...(code !== 0 ? { code } : {}),
+    ...(info?.statusMessage ? { message: info.statusMessage.slice(0, MAX_GRPC_MESSAGE_TEXT) } : {}),
+    ...(received.length ? (allJson ? { messagesJson: decoded.messages.map((m) => m.json) } : { messages: received.map((f) => f.base64 as string) }) : {}),
+    ...(headers ? { headers } : {}),
+    ...(trailers ? { trailers } : {}),
+  };
+  const name = `gRPC mock ${path} → ${info?.statusCode !== undefined ? `${code}` : 'OK'}${received.length ? ` (${received.length} message${received.length === 1 ? '' : 's'})` : ''}`;
+  return { id, enabled: true, name: name.slice(0, 500), match: { method: 'POST', url: `${origin}${path}` }, action };
 }
 
 /** CONTRACTS §12.2: a workspace-relative path: no absolute path, drive, `..` segment or control characters; ≤ 300. */
@@ -992,6 +1119,8 @@ export class InterceptController {
     deps.host.on('upstream', () => this.broadcastStatus());
     deps.host.on('tlsPassthrough', () => this.broadcastStatus());
     deps.host.on('clientCertificates', () => this.broadcastStatus());
+    deps.host.on('grpc', () => this.broadcastStatus());
+    this.grpcSub = deps.grpc?.onDidChange?.(() => this.broadcastStatus());
     this.modelsSub = deps.contract?.onDidChangeModels(() => this.recheckContracts());
   }
 
@@ -1008,7 +1137,7 @@ export class InterceptController {
     this.pausedListeners.push(l);
   }
 
-  status(): Status {
+  status(): ControllerStatus {
     return {
       proxyRunning: this.deps.host.running,
       port: this.deps.host.port,
@@ -1024,7 +1153,97 @@ export class InterceptController {
       ...this.sharedStatus(),
       ...this.upstreamStatus(),
       ...this.tlsStatus(),
+      ...this.grpcStatus(),
     };
+  }
+
+  /** CONTRACTS §16.4: `Status.grpc` (only with the gRPC schema service wired). */
+  private grpcStatus(): { grpc?: GrpcStatus } {
+    const g = this.deps.grpc;
+    if (!g) return {};
+    let enabled = true;
+    let schema: GrpcStatus['schema'];
+    try {
+      enabled = g.enabled();
+      const st = g.status();
+      if (st) schema = { methods: st.methods, messages: st.messages, problems: st.problems.slice(0, 50) };
+    } catch (e) {
+      this.deps.log?.(`gRPC status failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const problem = this.deps.host.grpcProblem;
+    return {
+      grpc: {
+        enabled,
+        decryptHosts: [...(this.deps.host.grpcDecryptHosts ?? [])],
+        ...(problem ? { problem } : {}),
+        ...(schema ? { schema } : {}),
+      },
+    };
+  }
+
+  /** CONTRACTS §16.4: the panel's `decodeGrpc`: the messages it holds (uiExchange's frames), decoded. */
+  decodeGrpc(id: string): GrpcDecoded {
+    const ex = this.exchangeOrThrow(id);
+    if (ex.kind !== 'grpc') throw new Error(ex.kind === 'tunnel' && ex.grpcTunnel ? (tunnelReason(ex) ?? 'This gRPC connection is not decrypted.') : 'This exchange is not a gRPC call.');
+    const g = this.deps.grpc;
+    const shown = uiExchange(ex);
+    const frames = shown.frames ?? [];
+    const call = decodeGrpcMessages(ex, g, { frames });
+    const m = call.method;
+    const skeleton = (type: string): string | undefined => {
+      try {
+        const schema = g?.schema();
+        if (!schema || !g) return undefined;
+        const v = g.codec.skeleton(schema, type);
+        return v === undefined ? undefined : JSON.stringify(v, null, 2);
+      } catch {
+        return undefined;
+      }
+    };
+    const pretty = (v: unknown): { json?: string; truncated?: true } => {
+      let t: string | undefined;
+      try {
+        t = JSON.stringify(v, null, 2);
+      } catch {
+        t = undefined;
+      }
+      if (t === undefined) return {};
+      return t.length > UI_MAX_GRPC_JSON_CHARS ? { json: t.slice(0, UI_MAX_GRPC_JSON_CHARS), truncated: true } : { json: t };
+    };
+    let problem: string | undefined;
+    if (!g) problem = 'gRPC decoding is not available in this build.';
+    else if (!g.enabled()) problem = 'gRPC support is off (setting flutterIntercept.grpc.enabled): messages are shown as hex only.';
+    else if (!g.schema()) problem = "No protobuf schema was found (the app's generated *.pb.dart / *.pbgrpc.dart files): messages are decoded without field names.";
+    else if (!m) problem = `The app's generated code has no method ${call.path ?? ex.url}: messages are decoded without field names.`;
+    const sk = m ? { request: skeleton(m.requestType), response: skeleton(m.responseType) } : undefined;
+    return {
+      ...(m ? { method: { requestType: m.requestType, responseType: m.responseType, clientStreaming: m.clientStreaming, serverStreaming: m.serverStreaming, ...(m.file ? { file: this.fileLabel(m.file) } : {}) } } : {}),
+      messages: call.messages.map((d) => {
+        const p = d.json !== undefined && d.via !== 'none' ? pretty(d.json) : {};
+        return {
+          dir: d.dir,
+          via: p.json !== undefined ? d.via : 'none',
+          hex: d.bytes ? hexOf(d.bytes) : '',
+          size: d.size,
+          ...(p.json !== undefined ? { json: p.json } : {}),
+          ...(d.truncated || p.truncated ? { truncated: true as const } : {}),
+          ...(d.error ? { error: d.error } : {}),
+        };
+      }),
+      framesDropped: shown.framesDropped ?? 0,
+      ...(sk && (sk.request || sk.response) ? { skeletons: { ...(sk.request ? { request: sk.request } : {}), ...(sk.response ? { response: sk.response } : {}) } } : {}),
+      ...(problem ? { problem } : {}),
+    };
+  }
+
+  /** A schema source file for the panel: project-relative when inside the project, else its name. */
+  private fileLabel(file: string): string {
+    const root = this.deps.projectRoot?.();
+    if (root) {
+      const rel = path.relative(root, file);
+      if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return rel.split(path.sep).join('/');
+    }
+    return path.basename(file);
   }
 
   /** REVIEW-6 #1: the upstream proxy (`host:port`) and whether its certificate checks are off; §14.6 its source. */
@@ -1098,12 +1317,14 @@ export class InterceptController {
     this.broadcast({ type: 'status', status: this.status() });
   }
 
+  private grpcSub?: { dispose(): void };
+
   snapshot(): HostMsg {
     return { type: 'snapshot', exchanges: this.deps.host.getExchanges().map(uiExchange), rules: this.rulesView(), status: this.status() };
   }
 
   async handle(raw: unknown, reply: Sink): Promise<void> {
-    const msg = raw as ViewMsg;
+    const msg = raw as AnyViewMsg;
     if (!msg || typeof msg !== 'object' || typeof (msg as { type?: unknown }).type !== 'string') return;
     try {
       switch (msg.type) {
@@ -1160,13 +1381,28 @@ export class InterceptController {
             throw new Error(`Can't create ${msg.action === 'mock' ? 'a mock' : 'a breakpoint'} rule from a WebSocket: WebSocket connections can only be blocked (or failed with a fault rule).`);
           }
           if (ex.kind === 'tunnel' && msg.action !== 'block') {
-            throw new Error(`Can't create ${msg.action === 'mock' ? 'a mock' : 'a breakpoint'} rule from a passed-through TLS connection: it isn't decrypted, so it can only be blocked (or failed with a fault rule). Remove the host from flutterIntercept.tlsPassthrough to mock it.`);
+            throw new Error(
+              ex.grpcTunnel
+                ? "Can't mock or pause this gRPC connection: it is TLS that isn't decrypted, so it can only be blocked (or failed with a fault rule). Add the host to flutterIntercept.grpc.decryptHosts if the app trusts the Flutter Intercept CA in debug."
+                : `Can't create ${msg.action === 'mock' ? 'a mock' : msg.action === 'grpcMock' ? 'a gRPC mock' : 'a breakpoint'} rule from a passed-through TLS connection: it isn't decrypted, so it can only be blocked (or failed with a fault rule). Remove the host from flutterIntercept.tlsPassthrough to mock it.`,
+            );
           }
+          // CONTRACTS §16.2: gRPC calls get gRPC mocks and blocks; breakpoints and HTTP mocks don't apply to them.
+          if (ex.kind === 'grpc' && msg.action !== 'grpcMock' && msg.action !== 'block') {
+            throw new Error(`Can't create ${msg.action === 'mock' ? 'an HTTP mock' : 'a breakpoint'} rule from a gRPC call: use a gRPC mock (or a block rule) instead.`);
+          }
+          if (msg.action === 'grpcMock' && ex.kind !== 'grpc') throw new Error("Can't create a gRPC mock from this request: it isn't a gRPC call.");
           let rule: Rule;
           try {
-            rule = validateRule(ex.kind === 'tunnel' ? tunnelBlockRule(ex, this.newRuleId()) : ruleFromExchange(ex, msg.action, this.newRuleId()));
+            rule = validateRule(
+              ex.kind === 'tunnel'
+                ? tunnelBlockRule(ex, this.newRuleId())
+                : msg.action === 'grpcMock'
+                  ? grpcMockRuleFromExchange(ex, this.newRuleId(), this.deps.grpc)
+                  : ruleFromExchange(ex, msg.action, this.newRuleId()),
+            );
           } catch (e) {
-            throw new Error(ruleFromExchangeErrorMessage(e, msg.action));
+            throw new Error(ruleFromExchangeErrorMessage(e, msg.action === 'grpcMock' ? 'gRPC mock' : msg.action));
           }
           this.applyRules([rule, ...this.deps.host.getRules()]);
           return;
@@ -1179,6 +1415,7 @@ export class InterceptController {
             const ro = from && readOnlyReason(from);
             if (ro) throw new Error(`Can't resend this request: ${ro}.`);
             if (from?.kind === 'tunnel') throw new Error("Can't resend a passed-through TLS connection: its request was never decrypted.");
+            if (from?.kind === 'grpc') throw new Error("Can't resend a gRPC call from here: it is HTTP/2 with binary messages.");
           }
           if (!this.deps.host.send) throw new Error('This proxy build cannot send requests.');
           const { id } = await this.deps.host.send({ ...request, initiator: 'editor', ...(msg.resentFrom ? { resentFrom: msg.resentFrom } : {}) });
@@ -1314,6 +1551,13 @@ export class InterceptController {
           if (!this.deps.openInNewWindow) throw new Error('Opening the traffic view in a new window is not available in this editor.');
           await this.deps.openInNewWindow();
           return;
+        // ---- CONTRACTS §16.4
+        case 'decodeGrpc': {
+          const id = checkId(msg.id, 'decodeGrpc');
+          const answer: GrpcDecodedMsg = { type: 'grpcDecoded', id, decoded: this.decodeGrpc(id) };
+          this.send(reply, answer as unknown as HostMsg);
+          return;
+        }
         default:
           return;
       }
@@ -1365,7 +1609,7 @@ export class InterceptController {
     const title = this.deps.appPackageName?.() || (root ? path.basename(root) : '') || 'Flutter app';
     let text: string;
     if (fmt === 'har') {
-      text = JSON.stringify(buildHar(list, { redact, creatorVersion: this.deps.version }), null, 2);
+      text = JSON.stringify(buildHar(list, { redact, creatorVersion: this.deps.version, grpcDecode: this.harGrpcDecoder() }), null, 2);
     } else {
       const r = builder!(list, { title, redact });
       if (!r.exchanges) throw new Error(`Nothing to export as ${fmt === 'openapi' ? 'OpenAPI' : 'Postman'}: no finished HTTP request (WebSocket and SSE traffic is skipped).`);
@@ -1389,6 +1633,12 @@ export class InterceptController {
     }
     await (this.deps.writeFile ?? writeExport)(file, text, { private: !redact });
     return file;
+  }
+
+  /** CONTRACTS §16.4: decoded gRPC messages for HAR exports (redacted exports carry JSON, never raw bytes). */
+  harGrpcDecoder(): HarGrpcDecoder | undefined {
+    const g = this.deps.grpc;
+    return g ? (e) => decodeGrpcMessages(e, g).messages.map((m) => (m.via === 'schema' ? m.json : undefined)) : undefined;
   }
 
   /** Also used by the `flutterIntercept.clear` command. */
@@ -1649,6 +1899,7 @@ export class InterceptController {
     this.contractQueue.clear();
     this.contractGen++;
     this.modelsSub?.dispose();
+    this.grpcSub?.dispose();
     if (this.authTimer) clearTimeout(this.authTimer);
     this.authTimer = undefined;
     this.sinks.clear();
@@ -1767,6 +2018,7 @@ export class InterceptController {
     const ro = readOnlyReason(ex);
     if (ro) throw new Error(`Can't change the next responses of this request: ${ro}.`);
     if (ex.kind === 'websocket' || ex.kind === 'sse') throw new Error(`Can't change fields of a ${ex.kind === 'sse' ? 'server-sent event stream' : 'WebSocket'}: mutation rules apply to JSON responses.`);
+    if (ex.kind === 'grpc' || ex.kind === 'tunnel') throw new Error(`Can't change fields of a ${ex.kind === 'grpc' ? 'gRPC call' : 'passed-through TLS connection'}: mutation rules apply to JSON responses (use a gRPC mock).`);
     if (typeof msg.op !== 'string' || !['null', 'delete', 'set'].includes(msg.op)) fail('mutateField', 'op must be "null", "delete" or "set"');
     const bad = pathError(msg.path);
     if (bad) fail('mutateField', bad);

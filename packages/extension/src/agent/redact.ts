@@ -104,6 +104,26 @@ export function redactHeaders(headers: Headers | undefined): Headers | undefined
   return out;
 }
 
+/** gRPC metadata the redaction never blanks: the protocol's own fields (status, encodings, timeouts, rich error details). */
+const GRPC_PROTOCOL_METADATA = /^(grpc-(status|message|encoding|accept-encoding|timeout|status-details-bin|previous-rpc-attempts|retry-pushback-ms)|content-type|te|user-agent)$/i;
+
+/**
+ * CONTRACTS §16.4: gRPC request / response headers and trailers for agents and redacted exports — `redactHeaders`
+ * (authorization, cookies, token-ish names, credential-looking values), and every custom binary (`*-bin`) entry is
+ * "[redacted]": its bytes are opaque (serialized tokens, session blobs) and can't be redacted by name inside.
+ */
+export function redactGrpcMetadata(headers: Headers | undefined): Headers | undefined {
+  const out = redactHeaders(headers);
+  if (!out) return out;
+  for (const k of Object.keys(out)) {
+    if (/-bin$/i.test(k) && !GRPC_PROTOCOL_METADATA.test(k)) {
+      const v = out[k];
+      out[k] = Array.isArray(v) ? v.map(() => REDACTED) : REDACTED;
+    }
+  }
+  return out;
+}
+
 /** Redacts `a=1&token=x` style text (query strings, urlencoded bodies), keeping order and raw keys. */
 export function redactQueryString(qs: string): string {
   if (!qs) return qs;

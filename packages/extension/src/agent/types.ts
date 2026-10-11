@@ -29,6 +29,8 @@ export const READ_TOOLS = [
   'export_openapi',
   'export_postman',
   'take_screenshot',
+  // CONTRACTS §16.4
+  'get_grpc_schema',
 ] as const;
 
 export const WRITE_TOOLS = [
@@ -56,6 +58,8 @@ export const WRITE_TOOLS = [
   'expire_token',
   'add_map_remote',
   'add_rewrite',
+  // CONTRACTS §16.4
+  'add_grpc_mock',
 ] as const;
 
 export type ReadToolName = (typeof READ_TOOLS)[number];

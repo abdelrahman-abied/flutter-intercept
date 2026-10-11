@@ -1,15 +1,26 @@
 /**
  * HAR 1.2 export of recorded exchanges (CONTRACTS §8 `export_har`), redacted per setting, written
  * under `<project>/.dart_tool/flutter_intercept/exports/<timestamp>.har`. Pure except `writeHar`.
+ *
+ * CONTRACTS §16.4: gRPC calls are entries too (`httpVersion` HTTP/2) with `_grpc`: the call info, trailers and one item
+ * per message `{type, time, size, compressed?, truncated?, data (base64), json?}`. Redacted, a message never carries
+ * its bytes: `json` (schema-decoded, secret-named fields "[redacted]") when the injected decoder can decode it, else
+ * `data: "[binary N bytes]"`; metadata is redacted like headers, and custom `-bin` metadata is always "[redacted]".
  */
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Body, Exchange } from '@flutter-intercept/proxy';
-import { Headers, redactBody, redactFrameText, redactHeaders, redactSecretValues, redactText, redactUrl } from './redact';
+import { Headers, redactBody, redactFrameText, redactGrpcMetadata, redactHeaders, redactSecretValues, redactText, redactUrl } from './redact';
+import { redactJsonValue } from './samples';
+
+/** Decoded JSON per `message` frame of a gRPC exchange (frame order; undefined = not decodable). */
+export type HarGrpcDecoder = (e: Exchange) => (unknown | undefined)[];
 
 export interface HarOptions {
   redact: boolean;
   creatorVersion?: string;
+  /** CONTRACTS §16.4: schema decoding for gRPC messages (src/grpc/service.ts). */
+  grpcDecode?: HarGrpcDecoder;
 }
 
 type NV = { name: string; value: string };
@@ -89,7 +100,7 @@ const OPCODES: Record<string, number> = { text: 1, binary: 2, close: 8, ping: 9,
  * (time in seconds, redacted like get_frames).
  */
 function frameFields(e: Exchange, redact: boolean): Record<string, unknown> {
-  if (!e.kind || !e.frames?.length) return {};
+  if (!e.kind || !e.frames?.length || e.kind === 'grpc') return {};
   const text = (t: string | undefined) => (t === undefined ? '' : redact ? redactFrameText(t) : t);
   if (e.kind === 'websocket') {
     return {
@@ -112,14 +123,75 @@ function frameFields(e: Exchange, redact: boolean): Record<string, unknown> {
   };
 }
 
+/** CONTRACTS §16.4: the `_grpc` field of a gRPC entry. */
+function grpcFields(e: Exchange, opts: HarOptions): Record<string, unknown> {
+  if (e.kind !== 'grpc') return {};
+  const r = opts.redact;
+  let decoded: (unknown | undefined)[] = [];
+  if (opts.grpcDecode) {
+    try {
+      decoded = opts.grpcDecode(e);
+    } catch {
+      decoded = [];
+    }
+  }
+  const info = e.grpc;
+  const messages: Record<string, unknown>[] = [];
+  let n = 0;
+  for (const f of e.frames ?? []) {
+    if (f.kind !== 'message') continue;
+    const json = decoded[n++];
+    const item: Record<string, unknown> = {
+      type: f.dir,
+      time: finiteOr(f.at, 0) / 1000,
+      size: f.size,
+      ...(f.compressed ? { compressed: true } : {}),
+      ...(f.truncated ? { truncated: true } : {}),
+    };
+    if (r) {
+      if (json !== undefined) item.json = redactJsonValue(json);
+      else item.data = `[binary ${f.size} bytes]`;
+    } else {
+      if (f.base64 !== undefined) item.data = f.base64;
+      if (json !== undefined) item.json = json;
+    }
+    messages.push(item);
+  }
+  const trailers = r ? redactGrpcMetadata(e.responseTrailers) : e.responseTrailers;
+  return {
+    _grpc: {
+      ...(info
+        ? {
+            service: info.service,
+            method: info.method,
+            ...(info.statusCode !== undefined ? { statusCode: info.statusCode } : {}),
+            ...(info.statusMessage !== undefined ? { statusMessage: r ? redactText(info.statusMessage) : info.statusMessage } : {}),
+            ...(info.trailersOnly ? { trailersOnly: true } : {}),
+            ...(info.requestEncoding ? { requestEncoding: info.requestEncoding } : {}),
+            ...(info.responseEncoding ? { responseEncoding: info.responseEncoding } : {}),
+            messagesSent: info.messagesSent,
+            messagesReceived: info.messagesReceived,
+            ...(info.deadlineMs !== undefined ? { deadlineMs: info.deadlineMs } : {}),
+          }
+        : {}),
+      trailers: headerList(trailers),
+      messages,
+      ...(e.framesDropped ? { messagesDropped: e.framesDropped } : {}),
+    },
+  };
+}
+
 export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string, unknown> {
   const r = opts.redact;
   const entries = [...exchanges]
     .sort((a, b) => finiteOr(a.startedAt, 0) - finiteOr(b.startedAt, 0))
     .map((e) => {
       const url = r ? redactUrl(e.url) : e.url;
-      const reqHeaders = r ? redactHeaders(e.requestHeaders) : e.requestHeaders;
-      const resHeaders = r ? redactHeaders(e.responseHeaders) : e.responseHeaders;
+      const grpc = e.kind === 'grpc';
+      const redactH = grpc ? redactGrpcMetadata : redactHeaders;
+      const reqHeaders = r ? redactH(e.requestHeaders) : e.requestHeaders;
+      const resHeaders = r ? redactH(e.responseHeaders) : e.responseHeaders;
+      const httpVersion = grpc ? 'HTTP/2' : 'HTTP/1.1';
       const reqMime = headerValue(e.requestHeaders, 'content-type') ?? 'application/octet-stream';
       const resMime = headerValue(e.responseHeaders, 'content-type') ?? '';
       const time = Math.max(0, finiteOr(e.durationMs, 0));
@@ -129,7 +201,7 @@ export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string
         request: {
           method: e.method,
           url,
-          httpVersion: 'HTTP/1.1',
+          httpVersion,
           cookies: [],
           headers: headerList(reqHeaders),
           queryString: queryList(url),
@@ -147,7 +219,7 @@ export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string
         response: {
           status: e.status ?? 0,
           statusText: '',
-          httpVersion: 'HTTP/1.1',
+          httpVersion,
           cookies: [],
           headers: headerList(resHeaders),
           content: {
@@ -172,6 +244,7 @@ export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string
         ...(e.graphql ? { _graphql: { ...e.graphql } } : {}),
         ...(e.captured ? { _captured: e.captured } : {}),
         ...frameFields(e, r),
+        ...grpcFields(e, opts),
       };
       return entry;
     });

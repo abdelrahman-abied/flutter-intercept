@@ -27,11 +27,17 @@
  *   both also as constructor options so they apply from the first connection; `applyUpstreamSettings` (§14.6) uses
  *   VS Code's `http.proxy` (user settings, injected `vscodeHttpProxy`) when `flutterIntercept.upstreamProxy` is empty,
  *   with `http.noProxy` hosts going direct (`noProxy` on the upstream config) and `upstreamProxySource` for Status.
+ * - CONTRACTS §16 (v0.10.0): forwards the gRPC decrypt hosts (`flutterIntercept.grpc.decryptHosts`, normalised like the
+ *   TLS passthrough list, also a constructor option) and reports the proxy's gRPC self-check (`grpcProblem`); event
+ *   'grpc' after either changes. `grpcMock.messagesJson` (also in sequence steps) is encoded into `messages` through an
+ *   injected encoder (`setGrpcMessageEncoder`, src/grpc/service.ts `grpcMockEncoder`) before rules reach the proxy, like
+ *   `mock.bodyFile`: a rule whose messages can't be encoded is skipped and reported as a warning.
  */
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { parseHostPattern, type ClientCertificate, type Exchange, type InterceptProxyOptions, type ReplayEntry, type ReplayOptions, type Rule, type RuleAction, type SendRequest } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
+import type { GrpcMessageEncoder } from './grpc/service';
 import type { SessionWarning } from './ui/protocol';
 import type { VmHostDeps } from './vm/types';
 
@@ -84,6 +90,10 @@ export interface ProxyLike {
   /** The passthrough patterns in effect. */
   readonly tlsPassthrough?: string[];
   setClientCertificates?(certs: ClientCertificate[]): void;
+  // CONTRACTS §16.2. Optional: older proxy builds lack them (the host then reports a problem).
+  setGrpcDecryptHosts?(hosts: string[]): void | { hosts: string[]; problems: string[] };
+  /** The gRPC self-check of the mockttp internals the silent tunnels use. */
+  grpcSupport?(): { ok: boolean; problem?: string };
 }
 
 /** REVIEW-6 #1: `host:port` of an upstream proxy URL — never user info, path or query. */
@@ -132,13 +142,22 @@ const HOST_PORT = /^(?<host>[^:]+)(?::(?<port>\d{1,5}))?$/;
  * in `problems` and dropped on its own; the rest still apply.
  */
 export function normalizeTlsPassthrough(input: unknown): { hosts: string[]; problems: string[] } {
+  return normalizeHostPatterns(input, 'flutterIntercept.tlsPassthrough');
+}
+
+/** CONTRACTS §16.4: `flutterIntercept.grpc.decryptHosts`, normalised exactly like the TLS passthrough list. */
+export function normalizeGrpcDecryptHosts(input: unknown): { hosts: string[]; problems: string[] } {
+  return normalizeHostPatterns(input, 'flutterIntercept.grpc.decryptHosts');
+}
+
+function normalizeHostPatterns(input: unknown, setting: string): { hosts: string[]; problems: string[] } {
   const hosts: string[] = [];
   const problems: string[] = [];
   if (input === undefined || input === null) return { hosts, problems };
-  if (!Array.isArray(input)) return { hosts, problems: ['flutterIntercept.tlsPassthrough must be a list of host names'] };
+  if (!Array.isArray(input)) return { hosts, problems: [`${setting} must be a list of host names`] };
   for (const raw of input) {
     if (typeof raw !== 'string') {
-      problems.push('flutterIntercept.tlsPassthrough: entries must be strings');
+      problems.push(`${setting}: entries must be strings`);
       continue;
     }
     const h = raw.trim().toLowerCase().replace(/\.+$/, '');
@@ -152,12 +171,12 @@ export function normalizeTlsPassthrough(input: unknown): { hosts: string[]; prob
       }
     }
     if (why) {
-      problems.push(`flutterIntercept.tlsPassthrough: ${why}`);
+      problems.push(`${setting}: ${why}`);
       continue;
     }
     if (!hosts.includes(h)) hosts.push(h);
     if (hosts.length >= MAX_HOST_PATTERNS) {
-      problems.push(`flutterIntercept.tlsPassthrough: only the first ${MAX_HOST_PATTERNS} hosts are used`);
+      problems.push(`${setting}: only the first ${MAX_HOST_PATTERNS} hosts are used`);
       break;
     }
   }
@@ -320,6 +339,25 @@ export function filesOf(rule: Rule): string[] {
   return [...bodyFilesOf(rule), ...scriptFilesOf(rule)];
 }
 
+/** CONTRACTS §16.2: does this rule (or a sequence step) carry `grpcMock.messagesJson` the host must encode? */
+export function hasGrpcJson(rule: Rule): boolean {
+  const visit = (a: RuleAction | { kind: 'passthrough' } | undefined): boolean => {
+    if (!a) return false;
+    if (a.kind === 'grpcMock') return Array.isArray(a.messagesJson);
+    if (a.kind === 'sequence') return (a.steps ?? []).some((s) => visit(s.action as RuleAction));
+    return false;
+  };
+  return visit(rule.action);
+}
+
+/** The host has to resolve something before the proxy gets this rule (files, gRPC JSON messages). */
+function needsResolve(rule: Rule): boolean {
+  return filesOf(rule).length > 0 || hasGrpcJson(rule);
+}
+
+/** A `grpcMock.messagesJson` list that couldn't be encoded (reported as a gRPC problem, not a file problem). */
+class GrpcEncodeError extends Error {}
+
 /** CONTRACTS §11.4: bounds for what the VM layer may put into Status.warnings. */
 export const MAX_WARNINGS_PER_SESSION = 50;
 const MAX_WARNING_TEXT = 500;
@@ -385,7 +423,7 @@ export interface InterceptProxyHostOptions {
  * 'lan' ({host, port} | undefined — never the token), 'rule-spent' (ruleId, reason), 'rule-hit' (ruleId, used),
  * 'warnings' (SessionWarning[], the full current list — after every change), 'replay' (ReplayState | undefined),
  * 'upstream' ({display, ignoreCertErrors} | undefined), 'tlsPassthrough' (string[]), 'clientCertificates'
- * (ClientCertificateStatus[] — never key material).
+ * (ClientCertificateStatus[] — never key material), 'grpc' ({decryptHosts, problem?} — CONTRACTS §16).
  * Rules, the network profile and the app package names are kept here so they survive restarts and
  * apply from the first request.
  */
@@ -430,6 +468,12 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   /** REVIEW-8 #4 / #12: setting problems shown in Status.warnings (`upstream`, `tlsPassthrough`). */
   private configWarnings = new Map<string, SessionWarning>();
   private certsUnsupportedLogged = false;
+  // CONTRACTS §16
+  private grpcHosts: string[] = [];
+  private grpcSettingProblems: string[] = [];
+  private grpcHostsUnsupportedLogged = false;
+  private grpcCheck?: { ok: boolean; problem?: string };
+  private grpcEncoder?: GrpcMessageEncoder;
 
   constructor(private readonly opts: InterceptProxyHostOptions) {
     super();
@@ -478,6 +522,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         ...(this.upstream ? { upstreamProxy: this.upstream } : {}),
         ...(this.tlsHosts.length ? { tlsPassthrough: [...this.tlsHosts] } : {}),
         ...(this.clientCerts.length ? { clientCertificates: [...this.clientCerts] } : {}),
+        ...(this.grpcHosts.length ? { grpcDecryptHosts: [...this.grpcHosts] } : {}),
       });
       try {
         await proxy.start();
@@ -504,6 +549,12 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         const problems = this.applyTlsPassthrough(proxy);
         if (problems.length || this.tlsSettingProblems.length) this.setConfigWarningLater = [...this.tlsSettingProblems, ...problems].join(' ');
       }
+      let grpcLater: string | undefined;
+      if (this.grpcHosts.length) {
+        const problems = this.applyGrpcDecryptHosts(proxy);
+        if (problems.length || this.grpcSettingProblems.length) grpcLater = [...this.grpcSettingProblems, ...problems].join(' ');
+      }
+      this.grpcCheck = this.readGrpcSupport(proxy);
       if (this.clientCerts.length) this.applyClientCertificates(proxy);
       this.applyReplay(proxy);
       if (this.profile.kind !== 'none') this.applyProfile(proxy); // a new proxy starts with none
@@ -518,6 +569,8 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         this.setConfigWarning('tlsPassthrough', this.setConfigWarningLater || undefined);
         this.setConfigWarningLater = undefined;
       }
+      if (grpcLater !== undefined) this.setConfigWarning('grpcDecryptHosts', grpcLater || undefined);
+      this.emit('grpc', this.grpcInfo);
       this.opts.log?.(`proxy listening on ${this.opts.host ?? '127.0.0.1'}:${proxy.port}${port !== first ? ` (port ${first} busy)` : ''}`);
       this.emit('state', true);
       return proxy.port;
@@ -658,10 +711,24 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     if (this.rules.some((r) => (path === undefined ? filesOf(r).length > 0 : filesOf(r).includes(path)))) this.applyRules();
   }
 
+  /**
+   * CONTRACTS §16.2: encodes `grpcMock.messagesJson` into `messages` (src/grpc/service.ts `grpcMockEncoder`). Undefined =
+   * gRPC JSON messages can't be encoded (those rules are skipped and reported). Re-applies the rules that use it.
+   */
+  setGrpcMessageEncoder(encode: GrpcMessageEncoder | undefined): void {
+    this.grpcEncoder = encode;
+    this.refreshGrpcMocks();
+  }
+
+  /** The gRPC schema changed: re-encodes the rules with `grpcMock.messagesJson`. */
+  refreshGrpcMocks(): void {
+    if (this.rules.some(hasGrpcJson)) this.applyRules();
+  }
+
   private applyRules(): void {
     const gen = ++this.rulesGen;
     const rules = this.rules;
-    if (!rules.some((r) => filesOf(r).length)) {
+    if (!rules.some(needsResolve)) {
       this.proxyRules = rules;
       this.proxy?.setRules(rules);
       this.setBodyWarnings([]);
@@ -691,7 +758,18 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     };
     const readScript = (p: string, ruleId: string): Promise<string> =>
       this.scriptResolver ? this.scriptResolver(p, ruleId) : Promise.reject(new Error('script files are not available'));
-    const resolveAction = async (a: RuleAction, ruleId: string): Promise<RuleAction> => {
+    const resolveAction = async (a: RuleAction, ruleId: string, matchUrl: string): Promise<RuleAction> => {
+      if (a.kind === 'grpcMock' && Array.isArray(a.messagesJson)) {
+        const { messagesJson, ...rest } = a;
+        if (!this.grpcEncoder) throw new GrpcEncodeError('gRPC JSON messages need the protobuf schema, which is not available');
+        let messages: string[];
+        try {
+          messages = this.grpcEncoder(matchUrl, messagesJson);
+        } catch (e) {
+          throw new GrpcEncodeError(e instanceof Error ? e.message : String(e));
+        }
+        return { ...rest, messages };
+      }
       if (a.kind === 'script' && a.file) {
         const code = await readScript(a.file, ruleId);
         if (typeof code !== 'string') throw new Error(`script file ${a.file} is not text`);
@@ -704,7 +782,13 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         return { ...rest, body: text };
       }
       if (a.kind === 'sequence') {
-        const steps = await Promise.all(a.steps.map(async (s) => (s.action.kind === 'mock' && s.action.bodyFile ? { ...s, action: (await resolveAction(s.action, ruleId)) as typeof s.action } : s)));
+        const steps = await Promise.all(
+          a.steps.map(async (s) =>
+            (s.action.kind === 'mock' && s.action.bodyFile) || (s.action.kind === 'grpcMock' && Array.isArray(s.action.messagesJson))
+              ? { ...s, action: (await resolveAction(s.action, ruleId, matchUrl)) as typeof s.action }
+              : s,
+          ),
+        );
         return { ...a, steps };
       }
       return a;
@@ -712,15 +796,24 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     const resolved: Rule[] = [];
     const problems: SessionWarning[] = [];
     for (const rule of rules) {
-      if (!filesOf(rule).length) {
+      if (!needsResolve(rule)) {
         resolved.push(rule);
         continue;
       }
       try {
-        resolved.push({ ...rule, action: await resolveAction(rule.action, rule.id) });
+        resolved.push({ ...rule, action: await resolveAction(rule.action, rule.id, rule.match?.url ?? '') });
       } catch (e) {
         const label = rule.name?.trim() || rule.id;
         const why = e instanceof Error ? e.message : String(e);
+        if (e instanceof GrpcEncodeError) {
+          problems.push({
+            id: `grpcMock:${rule.id}`,
+            kind: 'other',
+            text: `Rule "${label}" is skipped: its gRPC messages can't be encoded (${why}).`.replace(/[\r\n]+/g, ' ').slice(0, MAX_WARNING_TEXT),
+          });
+          this.opts.log?.(`rule ${rule.id} skipped: gRPC messages: ${why}`);
+          continue;
+        }
         const script = scriptFilesOf(rule).length > 0;
         problems.push({
           id: `${script ? 'scriptFile' : 'bodyFile'}:${rule.id}`,
@@ -893,8 +986,82 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     return [];
   }
 
+  // ------------------------------------------------------------------ CONTRACTS §16 (gRPC)
+
+  /**
+   * CONTRACTS §16.4: TLS hosts whose gRPC silent tunnels are decrypted (`flutterIntercept.grpc.decryptHosts`, normalised
+   * like the passthrough list; problems returned, logged and shown as a warning). Kept across restarts. Emits 'grpc'.
+   */
+  setGrpcDecryptHosts(input: unknown): { hosts: string[]; problems: string[] } {
+    const r = normalizeGrpcDecryptHosts(input);
+    for (const p of r.problems) this.opts.log?.(p);
+    this.grpcSettingProblems = r.problems;
+    const before = JSON.stringify(this.grpcDecryptHosts);
+    this.grpcHosts = r.hosts;
+    const proxyProblems = this.proxy ? this.applyGrpcDecryptHosts(this.proxy) : [];
+    const problems = [...r.problems, ...proxyProblems];
+    this.setConfigWarning('grpcDecryptHosts', problems.length ? problems.join(' ') : undefined);
+    if (JSON.stringify(this.grpcDecryptHosts) !== before) this.emit('grpc', this.grpcInfo);
+    return { hosts: this.grpcDecryptHosts, problems };
+  }
+
+  /** `Status.grpc.decryptHosts`: the hosts in effect (a copy). */
+  get grpcDecryptHosts(): string[] {
+    return [...this.grpcHosts];
+  }
+
+  /**
+   * `Status.grpc.problem`: the running proxy's gRPC self-check failed (calls are then only seen as undecrypted tunnels),
+   * or the proxy build has no gRPC support. Undefined while stopped or when fine.
+   */
+  get grpcProblem(): string | undefined {
+    const c = this.proxy ? this.grpcCheck : undefined;
+    return c && !c.ok ? (c.problem ?? 'the proxy cannot handle gRPC') : undefined;
+  }
+
+  /** What 'grpc' events carry. */
+  get grpcInfo(): { decryptHosts: string[]; problem?: string } {
+    const problem = this.grpcProblem;
+    return { decryptHosts: this.grpcDecryptHosts, ...(problem ? { problem } : {}) };
+  }
+
+  private readGrpcSupport(proxy: ProxyLike): { ok: boolean; problem?: string } {
+    if (!proxy.grpcSupport) return { ok: false, problem: 'this proxy build cannot intercept gRPC: gRPC calls are not shown' };
+    try {
+      const r = proxy.grpcSupport();
+      if (r && r.ok === true) return { ok: true };
+      const problem = r && typeof r.problem === 'string' && r.problem ? r.problem.replace(/[\r\n]+/g, ' ').slice(0, MAX_WARNING_TEXT) : 'the gRPC self-check failed';
+      this.opts.log?.(`gRPC: ${problem}`);
+      return { ok: false, problem };
+    } catch (e) {
+      const problem = `the gRPC self-check failed: ${e instanceof Error ? e.message : String(e)}`.replace(/[\r\n]+/g, ' ').slice(0, MAX_WARNING_TEXT);
+      this.opts.log?.(problem);
+      return { ok: false, problem };
+    }
+  }
+
+  /** Applies the decrypt list; returns the proxy's problems (patterns it dropped or refused). */
+  private applyGrpcDecryptHosts(proxy: ProxyLike): string[] {
+    if (proxy.setGrpcDecryptHosts) {
+      try {
+        const r = proxy.setGrpcDecryptHosts([...this.grpcHosts]);
+        const problems = r && Array.isArray(r.problems) ? r.problems.map((p) => `flutterIntercept.grpc.decryptHosts: ${String(p).slice(0, 300)}`) : [];
+        for (const p of problems) this.opts.log?.(p);
+        return problems;
+      } catch (e) {
+        const msg = `gRPC decrypt hosts not applied (the previous list stays in effect): ${e instanceof Error ? e.message : String(e)}`;
+        this.opts.log?.(msg);
+        return [msg];
+      }
+    } else if (this.grpcHosts.length && !this.grpcHostsUnsupportedLogged) {
+      this.grpcHostsUnsupportedLogged = true;
+      this.opts.log?.('this proxy build cannot decrypt gRPC: flutterIntercept.grpc.decryptHosts is ignored');
+    }
+    return [];
+  }
+
   /** REVIEW-8 #4 / #12: one Status warning per setting with problems (undefined text = clear it). */
-  private setConfigWarning(key: 'upstream' | 'tlsPassthrough', text: string | undefined): void {
+  private setConfigWarning(key: 'upstream' | 'tlsPassthrough' | 'grpcDecryptHosts', text: string | undefined): void {
     const before = JSON.stringify(this.warnings);
     if (text) this.configWarnings.set(key, { id: `settings:${key}`, kind: 'other', text: text.replace(/[\r\n]+/g, ' ').slice(0, MAX_WARNING_TEXT) });
     else this.configWarnings.delete(key);

@@ -20,7 +20,9 @@ import type { SessionWarning } from '../ui/protocol';
 import { buildHar, writeExportFile, writeHar } from './har';
 import { pathError, select } from './paths';
 import { corsPolicyShort, urlGlobHasHost } from './corsPolicy';
-import { isSensitiveField, isSensitiveHeader, REDACTED, redactBody, redactBodyText, redactLogLine, redactFrameText, redactHeaders, redactQueryString, redactSecretValues, redactText, redactUrl } from './redact';
+import { isSensitiveField, isSensitiveHeader, REDACTED, redactBody, redactBodyText, redactGrpcMetadata, redactLogLine, redactFrameText, redactHeaders, redactQueryString, redactSecretValues, redactText, redactUrl } from './redact';
+import { decodeGrpcMessages, GRPC_CODE_NAMES, grpcCodeName, grpcMethodFromGlob, grpcMethodPath, normalizeMethodName, type DecodedMessage, type GrpcDeps } from '../grpc/service';
+import type { GrpcMethod, GrpcSchema, ProtoFieldType, ProtoMessage } from '../grpc/types';
 import { parsePath, type PathSegment } from '@flutter-intercept/proxy/jsonpath';
 import {
   contractForAgent,
@@ -48,6 +50,9 @@ export const MAX_ASSERT_FAILURES = 50;
 export const MAX_JSON_FAILURES_PER_EXCHANGE = 10;
 /** get_frames: total characters of frame text in one result (further frames → `more`, page with `next`). */
 export const MAX_FRAME_RESULT_CHARS = 200_000;
+/** CONTRACTS §16.4: get_request on a gRPC call — the first this many messages each way, at most this much JSON. */
+export const GRPC_MESSAGES_PER_DIR = 20;
+export const MAX_GRPC_MESSAGES_JSON = 64 * 1024;
 
 type Frame = NonNullable<Exchange['frames']>[number];
 
@@ -115,6 +120,9 @@ export interface AgentApiDeps {
     readonly tlsPassthrough?: string[];
     /** §14.3: host pattern + problem per configured client certificate (never paths or key material). */
     readonly clientCertificateStatus?: { host: string; problem?: string }[];
+    // CONTRACTS §16.4 (InterceptProxyHost). Optional on older builds.
+    readonly grpcDecryptHosts?: string[];
+    readonly grpcProblem?: string;
   };
   /**
    * CONTRACTS §9.4: resolves `package:` / `file:` frames to files (src/source/resolve.ts `resolveFrames` bound
@@ -160,6 +168,9 @@ export interface AgentApiDeps {
   exporters?: { openapi?: ToOpenApi; postman?: ToPostman };
   /** Takes a screenshot of a session's device (src/screenshot/** `takeScreenshot` bound to its deps). */
   takeScreenshot?(target: ScreenshotTarget): Promise<Screenshot>;
+  // ---- CONTRACTS §16.4 (v0.10.0). Optional: without it gRPC messages are shown raw and the gRPC tools say why.
+  /** The gRPC schema service (src/grpc/service.ts). */
+  grpc?: GrpcDeps;
 }
 
 /** take_screenshot: requests that started this long before the screenshot are listed with it. */
@@ -256,7 +267,7 @@ type ExchangeFilter = {
   method?: string;
   status?: StatusFilter;
   sinceMs?: number;
-  kind?: 'http' | 'websocket' | 'sse' | 'tunnel';
+  kind?: 'http' | 'websocket' | 'sse' | 'tunnel' | 'grpc';
   graphqlOperation?: string;
   /** CONTRACTS §11.3: the web browser's own traffic is excluded unless true. */
   includeBrowserInternal?: boolean;
@@ -422,6 +433,11 @@ export class AgentApi implements AgentTools {
         return this.exportSpec('postman', input as ToolInput<'export_postman'>);
       case 'take_screenshot':
         return this.takeScreenshot(input as ToolInput<'take_screenshot'>);
+      // CONTRACTS §16.4
+      case 'add_grpc_mock':
+        return this.addGrpcMock(input as ToolInput<'add_grpc_mock'>);
+      case 'get_grpc_schema':
+        return this.getGrpcSchema(input as ToolInput<'get_grpc_schema'>);
       default:
         throw new AgentToolError(`unknown tool ${String(tool)}`, 'invalid');
     }
@@ -509,13 +525,25 @@ export class AgentApi implements AgentTools {
       ...(e.browserInternal ? { browserInternal: true } : {}),
       // CONTRACTS §14.2 / §14.3
       ...(e.kind === 'tunnel' ? { notDecrypted: true, ...(e.tunnelBytes ? { bytesSent: e.tunnelBytes.sent, bytesReceived: e.tunnelBytes.received } : {}) } : {}),
+      ...(e.grpcTunnel ? { grpcTunnel: true } : {}),
       ...(e.clientCertificate ? { clientCertificate: e.clientCertificate } : {}),
+      // CONTRACTS §16.4
+      ...(e.kind === 'grpc' && e.grpc
+        ? {
+            grpc: {
+              ...(e.grpc.statusCode !== undefined ? { code: e.grpc.statusCode, status: grpcCodeName(e.grpc.statusCode) } : {}),
+              messagesSent: e.grpc.messagesSent,
+              messagesReceived: e.grpc.messagesReceived,
+            },
+          }
+        : {}),
     };
   }
 
   private detail(e: Exchange, includeBodies: boolean, maxBodyChars: number): Record<string, unknown> {
-    const reqH = this.redact ? redactHeaders(e.requestHeaders) : e.requestHeaders;
-    const resH = this.redact ? redactHeaders(e.responseHeaders) : e.responseHeaders;
+    const redactH = e.kind === 'grpc' ? redactGrpcMetadata : redactHeaders;
+    const reqH = this.redact ? redactH(e.requestHeaders) : e.requestHeaders;
+    const resH = this.redact ? redactH(e.responseHeaders) : e.responseHeaders;
     return {
       ...this.summary(e),
       requestHeaders: reqH ?? {},
@@ -538,6 +566,122 @@ export class AgentApi implements AgentTools {
       // CONTRACTS §13.2 / §13.4: scriptLog is free text from the user's script: redacted like bodies.
       ...(e.timings ? { timings: { ...e.timings } } : {}),
       ...(e.scriptLog?.length ? { scriptLog: e.scriptLog.map((l) => (this.redact ? redactLogLine(String(l)) : String(l))) } : {}),
+      ...(e.kind === 'grpc' ? this.grpcDetail(e, includeBodies) : {}),
+    };
+  }
+
+  // ------------------------------------------------------------------ CONTRACTS §16.4 (gRPC)
+
+  /** The schema service's current schema, if gRPC support is on and a schema was found. */
+  private grpcSchema(): GrpcSchema | undefined {
+    const g = this.deps.grpc;
+    try {
+      return g && g.enabled() ? g.schema() : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** A decoded message's JSON as agents see it (secret-named fields and credential-looking values redacted). */
+  private grpcJson(v: unknown): unknown {
+    return this.redact ? redactJsonValue(v) : v;
+  }
+
+  /** One decoded message for get_request. */
+  private grpcMessageView(m: DecodedMessage, index: number): Record<string, unknown> {
+    return {
+      index,
+      dir: m.dir,
+      at: m.at,
+      size: m.size,
+      via: m.via,
+      ...(m.compressed ? { compressed: true } : {}),
+      ...(m.truncated ? { truncated: true } : {}),
+      ...(m.json !== undefined ? { json: this.grpcJson(m.json) } : {}),
+      ...(m.error ? { error: this.text(m.error) } : {}),
+    };
+  }
+
+  /** get_request's gRPC part: call info, trailers, and the first messages each way decoded (≤ 64 KB of JSON). */
+  private grpcDetail(e: Exchange, includeMessages: boolean): Record<string, unknown> {
+    const info = e.grpc;
+    const path = grpcMethodPath(e.url);
+    const schemaMethod = path ? this.grpcSchema()?.method(path) : undefined;
+    const trailers = this.redact ? redactGrpcMetadata(e.responseTrailers) : e.responseTrailers;
+    const out: Record<string, unknown> = {
+      grpc: {
+        ...(info ? { service: info.service, method: info.method } : {}),
+        ...(path ? { path } : {}),
+        ...(info?.statusCode !== undefined ? { code: info.statusCode, status: grpcCodeName(info.statusCode) } : {}),
+        ...(info?.statusMessage !== undefined ? { statusMessage: this.text(info.statusMessage) } : {}),
+        ...(info?.trailersOnly ? { trailersOnly: true } : {}),
+        ...(info?.requestEncoding ? { requestEncoding: info.requestEncoding } : {}),
+        ...(info?.responseEncoding ? { responseEncoding: info.responseEncoding } : {}),
+        ...(info?.deadlineMs !== undefined ? { deadlineMs: info.deadlineMs } : {}),
+        ...(info ? { messagesSent: info.messagesSent, messagesReceived: info.messagesReceived } : {}),
+        ...(schemaMethod
+          ? { requestType: schemaMethod.requestType, responseType: schemaMethod.responseType, streaming: streamingLabel(schemaMethod) }
+          : {}),
+      },
+      ...(trailers ? { responseTrailers: trailers } : {}),
+    };
+    if (!includeMessages) return out;
+    const seen = { send: 0, receive: 0 };
+    const decoded = decodeGrpcMessages(e, this.deps.grpc, {
+      filter: (f) => {
+        if (f.kind !== 'message') return false;
+        return seen[f.dir]++ < GRPC_MESSAGES_PER_DIR;
+      },
+    });
+    const dropped = e.framesDropped ?? 0;
+    let budget = MAX_GRPC_MESSAGES_JSON;
+    let omitted = 0;
+    const messages = decoded.messages.map((m) => {
+      const view = this.grpcMessageView(m, dropped + m.frame);
+      const size = JSON.stringify(view).length;
+      if (size <= budget) {
+        budget -= size;
+        return view;
+      }
+      omitted++;
+      const { json: _j, ...rest } = view;
+      return { ...rest, jsonOmitted: true };
+    });
+    const total = (e.frames ?? []).filter((f) => f.kind === 'message').length;
+    const notes: string[] = [];
+    if (total > messages.length || dropped) notes.push(`showing the first ${GRPC_MESSAGES_PER_DIR} messages each way of those kept${dropped ? ` (${dropped} older frames were dropped)` : ''}; read every message with get_frames`);
+    if (omitted) notes.push(`${omitted} message(s) shown without json (over ${MAX_GRPC_MESSAGES_JSON / 1024} KB in all); read them with get_frames`);
+    if (decoded.messages.some((m) => m.via === 'raw') && !schemaMethod) {
+      notes.push(this.grpcSchema() ? `the app's generated code has no method ${path ?? '(unknown path)'}: messages are decoded raw (field numbers)` : 'no protobuf schema (gRPC support off or no generated *.pb.dart found): messages are decoded raw (field numbers)');
+    }
+    return { ...out, messages, ...(notes.length ? { messagesNote: notes.join('; ') } : {}) };
+  }
+
+  /** get_frames on a gRPC call: one decoded message (JSON text, redacted) as the frame's text. */
+  private grpcFrameView(e: Exchange, n: number, index: number, maxChars: number): Record<string, unknown> {
+    const f = (e.frames ?? [])[n];
+    const d = decodeGrpcMessages(e, this.deps.grpc, { filter: (_f, i) => i === n }).messages[0];
+    let text: string | undefined;
+    if (d?.json !== undefined) {
+      try {
+        text = JSON.stringify(this.grpcJson(d.json));
+      } catch {
+        text = undefined;
+      }
+    }
+    const cut = text !== undefined && text.length > maxChars;
+    return {
+      index,
+      dir: f.dir,
+      at: f.at,
+      kind: f.kind,
+      size: f.size,
+      ...(d ? { via: d.via } : {}),
+      ...(f.compressed ? { compressed: true } : {}),
+      ...(text !== undefined ? { text: cut ? text.slice(0, maxChars) : text } : f.kind === 'message' ? { text: `[binary ${f.size} bytes]`, binary: true } : {}),
+      ...(cut || f.truncated ? { truncated: true } : {}),
+      ...(cut ? { textChars: text!.length } : {}),
+      ...(d?.error ? { error: this.text(d.error) } : {}),
     };
   }
 
@@ -570,7 +714,26 @@ export class AgentApi implements AgentTools {
           }
         : {}),
       ...this.tlsView(),
+      ...this.grpcStatusView(),
     };
+  }
+
+  /** CONTRACTS §16.4: gRPC interception state and the schema's counts. */
+  private grpcStatusView(): Record<string, unknown> {
+    const g = this.deps.grpc;
+    const hosts = this.deps.host.grpcDecryptHosts ?? [];
+    const problem = this.deps.host.grpcProblem;
+    if (!g && !hosts.length && !problem) return {};
+    let enabled = true;
+    let schema: Record<string, unknown> | undefined;
+    try {
+      enabled = g ? g.enabled() : true;
+      const st = g?.status();
+      if (st) schema = { methods: st.methods, messages: st.messages, ...(st.problems.length ? { problems: st.problems.slice(0, 10).map((p) => this.text(p)) } : {}) };
+    } catch {
+      // reported as unknown
+    }
+    return { grpc: { enabled, decryptHosts: [...hosts], ...(problem ? { problem } : {}), ...(schema ? { schema } : {}) } };
   }
 
   /** CONTRACTS §14.2 / §14.3: passthrough hosts and client certificates — host patterns and problems only. */
@@ -623,6 +786,13 @@ export class AgentApi implements AgentTools {
           return a.headers ? { ...a, headers: headers(a.headers) } : a;
         case 'mapRemote':
           return { ...a, to: redactUrl(a.to) };
+        case 'grpcMock':
+          return {
+            ...a,
+            ...(a.headers ? { headers: headers(a.headers) } : {}),
+            ...(a.trailers ? { trailers: headers(a.trailers) } : {}),
+            ...(a.messagesJson ? { messagesJson: a.messagesJson.map((m) => redactJsonValue(m)) } : {}),
+          };
         case 'rewrite':
           return { ...a, ...(a.request ? { request: spec(a.request) } : {}), ...(a.response ? { response: spec(a.response) } : {}) };
         case 'sequence':
@@ -688,7 +858,7 @@ export class AgentApi implements AgentTools {
    */
   private waitForRequest(i: ToolInput<'wait_for_request'>, signal?: AbortSignal): Promise<ToolResult> {
     const since = i.sinceMs === undefined ? this.defaultSince() : i.sinceMs === 'now' ? this.now() : i.sinceMs;
-    const f = { url: i.url, method: i.method, status: i.status as StatusFilter, sinceMs: since, includeBrowserInternal: i.includeBrowserInternal };
+    const f = { url: i.url, method: i.method, status: i.status as StatusFilter, sinceMs: since, includeBrowserInternal: i.includeBrowserInternal, kind: i.kind };
     const keep = this.filter(f);
     const hit = (e: Exchange) => FINAL_STATES.has(e.state) && keep(e);
     const view = (e: Exchange) => ({ timedOut: false, sinceMs: since, ...this.detail(e, i.includeBodies, 20_000) });
@@ -725,7 +895,9 @@ export class AgentApi implements AgentTools {
     const root = this.deps.projectRoot();
     if (!root) throw new AgentToolError('no workspace folder is open to export into', 'state');
     const list = this.deps.host.getExchanges().filter(this.filter({ url: i.url, method: i.method, sinceMs: i.sinceMs, includeBrowserInternal: i.includeBrowserInternal }));
-    const har = buildHar(list, { redact: this.redact, creatorVersion: this.deps.version });
+    const g = this.deps.grpc;
+    const grpcDecode = g ? (e: Exchange) => decodeGrpcMessages(e, g).messages.map((m) => (m.via === 'schema' ? m.json : undefined)) : undefined;
+    const har = buildHar(list, { redact: this.redact, creatorVersion: this.deps.version, ...(grpcDecode ? { grpcDecode } : {}) });
     const file = await writeHar(root, har, new Date(this.now()));
     return { path: file, entries: list.length, redacted: this.redact };
   }
@@ -768,6 +940,10 @@ export class AgentApi implements AgentTools {
   }
 
   private addMock(i: ToolInput<'add_mock'>): ToolResult {
+    const grpcPath = grpcMethodFromGlob(i.url);
+    if (grpcPath && this.grpcSchema()?.method(grpcPath)) {
+      throw new AgentToolError(`add_mock refused: ${grpcPath} is a gRPC method, and HTTP mocks never match gRPC calls; use add_grpc_mock`, 'invalid');
+    }
     const isJson = typeof i.body !== 'string';
     const headers: Record<string, string> = { ...(i.headers ?? {}) };
     if (isJson && !Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')) headers['content-type'] = 'application/json';
@@ -1021,6 +1197,7 @@ export class AgentApi implements AgentTools {
     if (e.kind === 'websocket') return `exchange "${e.id}" is a WebSocket connection; only plain HTTP requests can be resent`;
     if (e.kind === 'sse') return `exchange "${e.id}" is a server-sent event stream; resending it would hold a stream open, so only plain HTTP requests can be resent`;
     if (e.kind === 'tunnel') return `exchange "${e.id}" is a TLS connection passed through without decryption (flutterIntercept.tlsPassthrough); its request was never seen, so it can't be resent`;
+    if (e.kind === 'grpc') return `exchange "${e.id}" is a gRPC call (HTTP/2 with binary messages); only plain HTTP requests can be resent`;
     if (e.initiator) return `exchange "${e.id}" was itself sent by ${e.initiator === 'agent' ? 'an agent' : 'the editor'}; resend the app's original request instead`;
     if (/^(lan|tls)-/.test(e.id)) return `exchange "${e.id}" is a connection-level record (refused LAN or TLS connection), not a request that reached a server`;
     if (e.viaLan) return `exchange "${e.id}" came from a physical device over the LAN; resending it from this computer would bypass the LAN safeguards`;
@@ -1232,7 +1409,7 @@ export class AgentApi implements AgentTools {
     });
     const since = i.sinceMs ?? this.assertSince();
     // Compiled once per call (REVIEW-4 #11), matched against the agent's view of the URL (#1).
-    const keep = this.filter({ url: i.url, method: i.method, sinceMs: since, includeBrowserInternal: i.includeBrowserInternal });
+    const keep = this.filter({ url: i.url, method: i.method, sinceMs: since, includeBrowserInternal: i.includeBrowserInternal, kind: i.kind });
     const order = x.order?.map((glob) => ({ glob, test: compileMatcher({ url: glob }) }));
     const internal = i.includeBrowserInternal === true;
     const upper = c?.exact ?? c?.max;
@@ -1333,6 +1510,15 @@ export class AgentApi implements AgentTools {
         failures.push(`${label(e)}: ${e.durationMs !== undefined ? `took ${e.durationMs} ms` : 'duration unknown'}, expected at most ${x.maxDurationMs} ms`);
       }
       if (x.json?.length) this.jsonFailures(e, x.json, label(e), failures);
+      if (x.grpcStatus !== undefined) {
+        const want = typeof x.grpcStatus === 'string' ? GRPC_CODE_NAMES.indexOf(x.grpcStatus as (typeof GRPC_CODE_NAMES)[number]) : x.grpcStatus;
+        const wantText = `${want} (${grpcCodeName(want)})`;
+        if (e.kind !== 'grpc') failures.push(`${label(e)}: not a gRPC call (kind ${e.kind ?? 'http'}), expected gRPC status ${wantText}`);
+        else if (e.grpc?.statusCode !== want) {
+          const got = e.grpc?.statusCode;
+          failures.push(`${label(e)}: ${got !== undefined ? `gRPC status ${got} (${grpcCodeName(got)})` : `no gRPC status (state ${e.state})`}, expected ${wantText}`);
+        }
+      }
       if (failures.length > MAX_ASSERT_FAILURES) break;
     }
     const extra = failures.length - MAX_ASSERT_FAILURES;
@@ -1451,7 +1637,7 @@ export class AgentApi implements AgentTools {
   private getFrames(i: ToolInput<'get_frames'>): ToolResult {
     const e = this.find(i.id);
     if (!e.kind) {
-      throw new AgentToolError(`exchange "${e.id}" is a plain HTTP request, not a WebSocket or SSE stream; read it with get_request`, 'invalid');
+      throw new AgentToolError(`exchange "${e.id}" is a plain HTTP request, not a WebSocket, SSE stream or gRPC call; read it with get_request`, 'invalid');
     }
     if (e.kind === 'tunnel') {
       throw new AgentToolError(`exchange "${e.id}" is a TLS connection passed through without decryption (flutterIntercept.tlsPassthrough): it has no messages to read; get_request shows its byte counts`, 'invalid');
@@ -1464,7 +1650,7 @@ export class AgentApi implements AgentTools {
     let chars = 0;
     let next = from;
     for (let n = from - dropped; n < frames.length && out.length < i.limit; n++) {
-      const view = this.wsFrameView(frames[n], dropped + n, i.maxChars);
+      const view = e.kind === 'grpc' ? this.grpcFrameView(e, n, dropped + n, i.maxChars) : this.wsFrameView(frames[n], dropped + n, i.maxChars);
       const len = typeof view.text === 'string' ? view.text.length : 0;
       if (out.length && chars + len > MAX_FRAME_RESULT_CHARS) break;
       chars += len;
@@ -1787,6 +1973,198 @@ export class AgentApi implements AgentTools {
     return { path: file, exchanges: r.exchanges, routes: r.routes, notes: r.notes.slice(0, 50).map((n) => this.text(String(n))), redacted: this.redact };
   }
 
+  // ------------------------------------------------------------------ v0.10.0 (CONTRACTS §16.4)
+
+  /** gRPC deps, or a readable tool error when gRPC support is missing or off. */
+  private grpcOrThrow(): GrpcDeps {
+    const g = this.deps.grpc;
+    if (!g) throw new AgentToolError('gRPC support is not available in this build of Flutter Intercept', 'state');
+    if (!g.enabled()) throw new AgentToolError('gRPC support is off (setting flutterIntercept.grpc.enabled)', 'state');
+    return g;
+  }
+
+  /** Up to 10 method paths that look like `wanted` (same method or service name, case-insensitive). */
+  private similarMethods(schema: GrpcSchema, wanted: string): string[] {
+    const parts = wanted.toLowerCase().split(/[/.]/).filter(Boolean);
+    const last = parts[parts.length - 1] ?? '';
+    return schema.methods
+      .map((m) => m.path)
+      .filter((p) => (last && p.toLowerCase().includes(last)) || parts.some((x) => x.length > 2 && p.toLowerCase().includes(x)))
+      .slice(0, 10);
+  }
+
+  /**
+   * add_grpc_mock: a `grpcMock` rule for one method. JSON messages are encoded now (so a wrong field fails this call,
+   * naming the JSON path) and kept as `messagesJson` (the host re-encodes them when the schema changes); base64
+   * messages are kept as they are.
+   */
+  private addGrpcMock(i: ToolInput<'add_grpc_mock'>): ToolResult {
+    const bad = (m: string) => new AgentToolError(m, 'invalid');
+    const named = i.service !== undefined || i.method !== undefined;
+    if (i.url !== undefined && named) throw bad('pass url, or service and method (not both)');
+    if (i.url === undefined && !(i.service !== undefined && i.method !== undefined)) throw bad('pass url (e.g. "*/shop.v1.CartService/AddItem"), or both service and method');
+    const glob = i.url ?? `*/${i.service}/${i.method}`;
+    const path = grpcMethodFromGlob(glob);
+    const code = i.code === undefined ? 0 : typeof i.code === 'string' ? GRPC_CODE_NAMES.indexOf(i.code as (typeof GRPC_CODE_NAMES)[number]) : i.code;
+    const list = i.messages ?? [];
+    const strings = list.filter((m) => typeof m === 'string') as string[];
+    if (strings.length && strings.length !== list.length) throw bad('messages: pass JSON objects (encoded with the schema) or base64 strings, not both');
+    let encoded: 'json' | 'base64' | undefined;
+    if (list.length && !strings.length) {
+      const g = this.grpcOrThrow();
+      if (!path) throw bad(`url ${JSON.stringify(glob.slice(0, 200))} doesn't name one gRPC method (…/package.Service/Method), so the message type is unknown; pass base64 messages, or a url / service + method without wildcards`);
+      const schema = g.schema();
+      if (!schema) throw new AgentToolError("no protobuf schema was found in the app's generated *.pb.dart files; pass the messages as base64 strings", 'state');
+      const method = schema.method(path);
+      if (!method) {
+        const near = this.similarMethods(schema, path);
+        throw new AgentToolError(`the app's generated code has no gRPC method ${path}${near.length ? ` (did you mean ${near.join(', ')}?)` : ''}; get_grpc_schema lists the methods`, 'not_found');
+      }
+      list.forEach((json, n) => {
+        try {
+          g.codec.encodeMessage(schema, method.responseType, json);
+        } catch (e) {
+          throw bad(`messages[${n}] is not a valid ${method.responseType}: ${(e as Error)?.message ?? String(e)}`);
+        }
+      });
+      encoded = 'json';
+    } else if (strings.length) {
+      strings.forEach((b, n) => {
+        if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(b)) throw bad(`messages[${n}] is not base64 (a serialized protobuf message)`);
+      });
+      encoded = 'base64';
+    }
+    const codeText = code === 0 ? 'OK' : `${code} ${grpcCodeName(code)}`;
+    const result = this.insertRule({
+      id: this.newId(),
+      enabled: true,
+      name: this.label(i.name, `gRPC mock ${path ?? glob} → ${codeText}${list.length ? ` (${list.length} message${list.length === 1 ? '' : 's'})` : ''}`),
+      match: { method: 'POST', url: glob },
+      action: {
+        kind: 'grpcMock',
+        ...(code !== 0 ? { code } : {}),
+        ...(i.message !== undefined ? { message: i.message } : {}),
+        ...(encoded === 'json' ? { messagesJson: list } : encoded === 'base64' ? { messages: strings } : {}),
+        ...(i.delayMs !== undefined ? { delayMs: i.delayMs } : {}),
+        ...(i.gapMs !== undefined ? { gapMs: i.gapMs } : {}),
+      },
+      ...this.spending(i),
+    });
+    return { ...result, ...(path ? { method: path } : { match: glob }), code, status: grpcCodeName(code), messages: list.length };
+  }
+
+  /** A schema source file for agents: project-relative, else its file name (never an absolute path). */
+  private schemaFile(file: string | undefined): string | undefined {
+    if (!file) return undefined;
+    return this.projectPath(file) ?? path.basename(file);
+  }
+
+  /** One message type for get_grpc_schema: fields, the enums they use, its file. */
+  private messageView(schema: GrpcSchema, msg: ProtoMessage): Record<string, unknown> {
+    const enums: Record<string, string[]> = {};
+    const collect = (t: ProtoFieldType) => {
+      if (t.kind === 'enum' && Object.keys(enums).length < 30 && !enums[t.type]) {
+        const en = schema.enumType(t.type);
+        if (en) enums[t.type] = en.values.slice(0, 100).map((v) => v.name);
+      }
+      if (t.kind === 'map') collect(t.value);
+    };
+    const fields = msg.fields.slice(0, 500).map((f) => {
+      collect(f.type);
+      return {
+        number: f.number,
+        name: f.name,
+        type: protoTypeLabel(f.type),
+        ...(f.repeated ? { repeated: true } : {}),
+        ...(f.oneof ? { oneof: f.oneof } : {}),
+        ...(f.required ? { required: true } : {}),
+      };
+    });
+    const file = this.schemaFile(msg.file);
+    return { name: msg.name, fields, ...(Object.keys(enums).length ? { enums } : {}), ...(file ? { file } : {}), ...(msg.line !== undefined ? { line: msg.line } : {}) };
+  }
+
+  private skeletonOf(g: GrpcDeps, schema: GrpcSchema, type: string): unknown {
+    try {
+      return g.codec.skeleton(schema, type);
+    } catch (e) {
+      return { error: `no skeleton: ${(e as Error)?.message ?? String(e)}` };
+    }
+  }
+
+  /** Finds a message by full name, `.name`, short name or Dart class name. */
+  private findMessage(schema: GrpcSchema, name: string): ProtoMessage | undefined {
+    const n = name.trim().replace(/^\./, '');
+    const exact = schema.message(n);
+    if (exact) return exact;
+    const hits = schema.messages.filter((m) => m.name.endsWith(`.${n}`) || m.dartClass === n || m.name === n);
+    return hits.length === 1 ? hits[0] : undefined;
+  }
+
+  private getGrpcSchema(i: ToolInput<'get_grpc_schema'>): ToolResult {
+    const g = this.deps.grpc;
+    if (!g) return { available: false, reason: 'gRPC support is not available in this build of Flutter Intercept' };
+    if (!g.enabled()) return { available: false, reason: 'gRPC support is off (setting flutterIntercept.grpc.enabled)' };
+    if (i.method !== undefined && i.message !== undefined) throw new AgentToolError('pass method or message, not both', 'invalid');
+    const schema = g.schema();
+    const st = g.status();
+    const problems = (st?.problems ?? []).slice(0, 10).map((p) => this.text(p));
+    if (!schema) {
+      return {
+        available: false,
+        reason: st
+          ? "no protobuf schema: no protoc-generated Dart (*.pbgrpc.dart / *.pb.dart) was found in the workspace or in packages with services (run protoc with the Dart plugin, or open the app's folder)"
+          : 'the protobuf schema is still loading; retry in a moment',
+        ...(problems.length ? { problems } : {}),
+      };
+    }
+    if (i.method !== undefined) {
+      const p = normalizeMethodName(i.method);
+      if (!p) throw new AgentToolError(`method must look like "/package.Service/Method" (got ${JSON.stringify(i.method.slice(0, 100))})`, 'invalid');
+      const m = schema.method(p);
+      if (!m) {
+        const near = this.similarMethods(schema, p);
+        throw new AgentToolError(`no gRPC method ${p} in the app's generated code${near.length ? ` (similar: ${near.join(', ')})` : ''}`, 'not_found');
+      }
+      const req = schema.message(m.requestType);
+      const res = schema.message(m.responseType);
+      const file = this.schemaFile(m.file);
+      return {
+        available: true,
+        method: m.path,
+        requestType: m.requestType,
+        responseType: m.responseType,
+        clientStreaming: m.clientStreaming,
+        serverStreaming: m.serverStreaming,
+        streaming: streamingLabel(m),
+        ...(file ? { file } : {}),
+        ...(m.line !== undefined ? { line: m.line } : {}),
+        ...(req ? { request: this.messageView(schema, req) } : {}),
+        ...(res ? { response: this.messageView(schema, res) } : {}),
+        requestSkeleton: this.skeletonOf(g, schema, m.requestType),
+        responseSkeleton: this.skeletonOf(g, schema, m.responseType),
+      };
+    }
+    if (i.message !== undefined) {
+      const msg = this.findMessage(schema, i.message);
+      if (msg) return { available: true, message: this.messageView(schema, msg), skeleton: this.skeletonOf(g, schema, msg.name) };
+      const en = schema.enumType(i.message.trim().replace(/^\./, ''));
+      if (en) return { available: true, enum: { name: en.name, values: en.values.slice(0, 500) } };
+      const n = i.message.toLowerCase();
+      const near = schema.messages.filter((m) => m.name.toLowerCase().includes(n)).slice(0, 10).map((m) => m.name);
+      throw new AgentToolError(`no message or enum ${JSON.stringify(i.message.slice(0, 200))} in the app's generated code${near.length ? ` (similar: ${near.join(', ')})` : ''}`, 'not_found');
+    }
+    const methods = schema.methods.slice(0, i.limit).map((m) => ({ path: m.path, requestType: m.requestType, responseType: m.responseType, streaming: streamingLabel(m) }));
+    return {
+      available: true,
+      methods,
+      totalMethods: schema.methods.length,
+      messages: schema.messages.length,
+      ...(schema.methods.length > methods.length ? { more: schema.methods.length - methods.length } : {}),
+      ...(problems.length ? { problems } : {}),
+    };
+  }
+
   /**
    * take_screenshot (CONTRACTS §13.8): allowed under read-only access (the front doors confirm every call), refused
    * when `flutterIntercept.agent.screenshots` is off. The PNG travels as an image part (TOOL_IMAGES), the JSON
@@ -1843,6 +2221,27 @@ export class AgentApi implements AgentTools {
       Object.defineProperty(result, TOOL_IMAGES, { value: images, enumerable: false });
     }
     return result;
+  }
+}
+
+/** "unary", "server streaming", "client streaming" or "bidi streaming". */
+function streamingLabel(m: Pick<GrpcMethod, 'clientStreaming' | 'serverStreaming'>): string {
+  return m.clientStreaming && m.serverStreaming ? 'bidi streaming' : m.serverStreaming ? 'server streaming' : m.clientStreaming ? 'client streaming' : 'unary';
+}
+
+/** A protobuf field type as text: `string`, `shop.v1.Item`, `enum shop.v1.Color`, `map<string, shop.v1.Item>`. */
+export function protoTypeLabel(t: ProtoFieldType): string {
+  switch (t.kind) {
+    case 'scalar':
+      return t.scalar;
+    case 'enum':
+      return `enum ${t.type}`;
+    case 'message':
+      return t.type;
+    case 'map':
+      return `map<${t.key}, ${protoTypeLabel(t.value)}>`;
+    default:
+      return 'unknown';
   }
 }
 

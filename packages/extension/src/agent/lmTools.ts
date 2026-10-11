@@ -7,6 +7,7 @@
  */
 import { corsPolicyText } from './corsPolicy';
 import { AgentToolError, AgentTools, isWriteTool, needsConfirmation, READ_TOOLS, toolImages, ToolName, ToolResult, WRITE_TOOLS } from './types';
+import { GRPC_CODE_NAMES } from '../grpc/service';
 
 export const LM_TOOL_PREFIX = 'flutter_intercept_';
 export const ALL_TOOLS: readonly ToolName[] = [...READ_TOOLS, ...WRITE_TOOLS];
@@ -169,7 +170,24 @@ export function invocationMessage(tool: ToolName, input: unknown): string {
       return `Exporting captured traffic as a Postman collection${i.url ? ` (${m}${plain(i.url)})` : ''}`;
     case 'take_screenshot':
       return `Taking a screenshot of ${i.sessionId ? `session ${plain(i.sessionId)}` : 'the running app'}`;
+    // CONTRACTS §16.4
+    case 'add_grpc_mock':
+      return `Adding gRPC mock for ${grpcTarget(i, plain)} → ${grpcCodeText(i.code)}`;
+    case 'get_grpc_schema':
+      return i.method ? `Reading the gRPC schema of ${plain(i.method)}` : i.message ? `Reading the protobuf type ${plain(i.message)}` : "Listing the app's gRPC methods";
   }
+}
+
+/** `*\/shop.v1.Cart/AddItem` or `shop.v1.Cart/AddItem` for gRPC tool texts. */
+function grpcTarget(i: Record<string, unknown>, fmt: (v: unknown) => string): string {
+  return i.url !== undefined ? fmt(i.url) : fmt(`${String(i.service ?? '?')}/${String(i.method ?? '?')}`);
+}
+
+/** `14 (UNAVAILABLE)` / `OK` for a gRPC code given as number or name. */
+function grpcCodeText(code: unknown): string {
+  if (code === undefined || code === 0 || code === 'OK') return 'OK';
+  const name = typeof code === 'number' ? GRPC_CODE_NAMES[code] : undefined;
+  return name ? `${code} (${name})` : String(code).replace(/[\r\n]/g, ' ').slice(0, 40);
 }
 
 /** "500 ×2, then the real server" for add_sequence's steps. */
@@ -415,6 +433,18 @@ export function confirmationText(
       return {
         title: 'Add a rewrite rule',
         message: `For ${target(i)}: forward to the real server, but change ${parts.length ? parts.join('. ') : 'nothing'}${named}${spendText(i)}.\n\nInserted as the first rule.`,
+      };
+    }
+    // CONTRACTS §16.4
+    case 'add_grpc_mock': {
+      const n = Array.isArray(i.messages) ? i.messages.length : 0;
+      const msg = str(i.message) ? ` with message ${code(i.message)}` : '';
+      return {
+        title: 'Add a gRPC mock rule',
+        message:
+          `Answer gRPC calls to ${code(i.url ?? `${String(i.service ?? '?')}/${String(i.method ?? '?')}`)} with ${n ? `**${n}** message${n === 1 ? '' : 's'}` : 'no messages'}, then status **${grpcCodeText(i.code)}**${msg}` +
+          `${typeof i.delayMs === 'number' && i.delayMs ? `, after ${i.delayMs} ms` : ''}${named}${spendText(i)}.\n\n` +
+          'Inserted as the first rule: matching calls from the app get this answer and never reach the server.',
       };
     }
     // CONTRACTS §13.8: names the device.

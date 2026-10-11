@@ -3,6 +3,7 @@
  * VS Code language model tools) and for package.json `languageModelTools` (unit-tested equal).
  */
 import { z } from 'zod';
+import { GRPC_CODE_NAMES } from '../grpc/service';
 import { READ_TOOLS, ToolName, WRITE_TOOLS } from './types';
 
 /** REVIEW-4 #2: agents pass globs only (a `/regex/` could freeze the extension host); at most MAX_GLOB_STARS `*`. */
@@ -50,13 +51,37 @@ export const FIXTURE_STYLES = ['http_mock_adapter', 'mock_client', 'mocktail'] a
 export const JSON_TYPES = ['string', 'number', 'integer', 'boolean', 'null', 'object', 'array'] as const;
 export const MAX_MUTATE_OPS = 20;
 // CONTRACTS §11.5
-export const EXCHANGE_KINDS = ['http', 'websocket', 'sse', 'tunnel'] as const; // tunnel: CONTRACTS §14.2
+export const EXCHANGE_KINDS = ['http', 'websocket', 'sse', 'tunnel', 'grpc'] as const; // tunnel: CONTRACTS §14.2; grpc: §16.4
 export const MAX_FRAMES_PER_CALL = 500;
 // CONTRACTS §12.7
 export const MAX_SEQUENCE_STEPS = 50;
 export const MAX_REWRITE_HEADERS = 50;
 export const MAX_REWRITE_REPLACEMENTS = 20;
 export const MAX_DIFF_ENTRIES = 200;
+// CONTRACTS §16.4
+export const MAX_AGENT_GRPC_MESSAGES = 100;
+export { GRPC_CODE_NAMES };
+
+const exchangeKind = z
+  .enum(EXCHANGE_KINDS)
+  .describe(
+    '"http" (plain requests), "websocket", "sse" (server-sent events), "grpc" (gRPC calls: one per call, messages read with get_frames) or "tunnel" (a TLS connection passed through undecrypted: a flutterIntercept.tlsPassthrough host, or gRPC over TLS that is not decrypted).',
+  );
+const grpcStatus = z
+  .union([z.number().int().min(0).max(999), z.enum(GRPC_CODE_NAMES)])
+  .describe('A gRPC status: the code (0 = OK, 5 = NOT_FOUND, 14 = UNAVAILABLE, 16 = UNAUTHENTICATED, …) or its name ("OK", "NOT_FOUND", "UNAVAILABLE", …).');
+const grpcServiceName = z
+  .string()
+  .min(1)
+  .max(300)
+  .regex(/^[A-Za-z_][A-Za-z0-9_.]*$/, 'a fully-qualified service name such as shop.v1.CartService')
+  .describe('Fully-qualified gRPC service, e.g. "shop.v1.CartService" (get_grpc_schema lists them).');
+const grpcMethodName = z
+  .string()
+  .min(1)
+  .max(200)
+  .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'a gRPC method name such as AddItem')
+  .describe('gRPC method of that service, e.g. "AddItem".');
 
 const includeBrowserInternal = z
   .boolean()
@@ -210,10 +235,7 @@ export const toolSchemas = {
     status: statusFilter.optional(),
     state: z.enum(EXCHANGE_STATES).optional(),
     sinceMs: sinceMs.optional(),
-    kind: z
-      .enum(EXCHANGE_KINDS)
-      .optional()
-      .describe('"websocket", "sse" (server-sent events), "tunnel" (a TLS connection passed through undecrypted for a flutterIntercept.tlsPassthrough host) or "http" (everything else).'),
+    kind: exchangeKind.optional(),
     graphqlOperation: graphqlOperation.optional().describe('Only GraphQL requests with this operation name (exact, case-sensitive).'),
     includeBrowserInternal,
     // CONTRACTS §13.2
@@ -248,6 +270,7 @@ export const toolSchemas = {
     timeoutMs: z.number().int().min(0).max(120_000).default(30_000).describe('Give up after this long (max 120000) and return {timedOut: true}.'),
     includeBodies: z.boolean().default(false),
     includeBrowserInternal,
+    kind: exchangeKind.optional().describe('Only exchanges of this kind, e.g. "grpc" for gRPC calls (url then globs the method path: "*/shop.v1.CartService/AddItem").'),
   }),
   list_paused: z.strictObject({}),
   list_rules: z.strictObject({}),
@@ -384,9 +407,11 @@ export const toolSchemas = {
           .describe('URL globs that must have been requested in this order (each one starting after the previous one), among all requests since sinceMs.'),
         json: z.array(jsonAssertion).min(1).max(20).optional(),
         maxDurationMs: z.number().int().min(0).max(600_000).optional().describe('Every matched request finished within this many ms.'),
+        grpcStatus: grpcStatus.optional().describe('Every matched exchange is a gRPC call that ended with this gRPC status (code or name, e.g. 0 / "OK", 14 / "UNAVAILABLE"). gRPC errors arrive with HTTP status 200, so use this rather than status.'),
       })
       .describe('What must hold. Every given expectation is checked.'),
     includeBrowserInternal,
+    kind: exchangeKind.optional().describe('Only exchanges of this kind, e.g. "grpc".'),
   }),
   add_mutation: z.strictObject({
     url,
@@ -483,6 +508,38 @@ export const toolSchemas = {
   take_screenshot: z.strictObject({
     sessionId: z.string().min(1).max(200).optional().describe('Debug session to capture (see get_status). Omit when exactly one app is running.'),
   }),
+  // CONTRACTS §16.4
+  add_grpc_mock: z.strictObject({
+    url: url
+      .optional()
+      .describe('URL glob naming one gRPC method: "<scheme>://<host:port>/<package.Service>/<Method>", e.g. "*/shop.v1.CartService/AddItem" (the URL of a gRPC call in list_requests). Or pass service and method instead.'),
+    service: grpcServiceName.optional(),
+    method: grpcMethodName.optional(),
+    code: grpcStatus.optional().describe('gRPC status to answer with (default 0 = OK), e.g. 14 / "UNAVAILABLE", 5 / "NOT_FOUND", 16 / "UNAUTHENTICATED". With a non-zero code and no messages the call fails at once (trailers-only).'),
+    message: z.string().max(1000).optional().describe('grpc-message text sent with the status (the error text the app sees).'),
+    messages: z
+      .array(z.union([z.record(z.string(), z.unknown()), z.string().max(4 * 1024 * 1024)]))
+      .max(MAX_AGENT_GRPC_MESSAGES)
+      .optional()
+      .describe(
+        "Response messages, in order (streaming methods get several). JSON objects in proto3 JSON form (field names as in get_grpc_schema's skeleton; int64 as strings, enums by name, bytes base64), encoded with the app's generated schema; or base64 strings of serialized protobuf (when there is no schema). Not both kinds. Omit for none.",
+      ),
+    delayMs: z.number().int().min(0).max(600_000).optional().describe('Wait this long before answering.'),
+    gapMs: z.number().int().min(0).max(600_000).optional().describe('Pause between messages (streaming).'),
+    times: times.optional(),
+    ttlMs: ttlMs.optional(),
+    name: ruleName.optional(),
+  }),
+  get_grpc_schema: z.strictObject({
+    method: z
+      .string()
+      .min(1)
+      .max(500)
+      .optional()
+      .describe('A gRPC method: "/shop.v1.CartService/AddItem", "shop.v1.CartService/AddItem" or "shop.v1.CartService.AddItem". Returns its request / response types, fields, streaming and skeleton JSON.'),
+    message: z.string().min(1).max(500).optional().describe('A message or enum type: fully qualified ("shop.v1.Item", "shop.v1.Cart.Line") or its short / Dart name ("Item", "Cart_Line").'),
+    limit: z.number().int().min(1).max(500).default(200).describe('Without method / message: max methods listed (1-500).'),
+  }),
 } satisfies Record<ToolName, z.ZodType>;
 
 export type ToolInput<T extends ToolName> = z.output<(typeof toolSchemas)[T]>;
@@ -518,17 +575,17 @@ interface ToolDoc {
 export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   get_status: {
     title: 'Intercept status',
-    model: 'Get Flutter Intercept status: whether the intercepting proxy runs, the running debug sessions (device, program), how many requests are recorded and paused, the agent access level, and warnings about traffic that is NOT intercepted (e.g. requests from a background isolate, native HTTP clients that are only listed read-only, requests that bypass the proxy). Also: upstreamProxy (host:port the traffic is chained through; upstreamProxySource "http.proxy" = VS Code\'s proxy setting), tlsPassthrough (host globs whose HTTPS is passed through undecrypted, listed as kind "tunnel") and clientCertificates ([{host, loaded, problem?}] — mutual-TLS certificates the proxy presents; a problem means it did not load and the server will likely reject the connection). Call this first to see whether an app is running before using the other tools.',
+    model: 'Get Flutter Intercept status: whether the intercepting proxy runs, the running debug sessions (device, program), how many requests are recorded and paused, the agent access level, and warnings about traffic that is NOT intercepted (e.g. requests from a background isolate, native HTTP clients that are only listed read-only, requests that bypass the proxy). Also: grpc ({enabled, decryptHosts, problem?, schema: {methods, messages, problems}} — gRPC interception and the protobuf schema read from the app\'s generated code), upstreamProxy (host:port the traffic is chained through; upstreamProxySource "http.proxy" = VS Code\'s proxy setting), tlsPassthrough (host globs whose HTTPS is passed through undecrypted, listed as kind "tunnel") and clientCertificates ([{host, loaded, problem?}] — mutual-TLS certificates the proxy presents; a problem means it did not load and the server will likely reject the connection). Call this first to see whether an app is running before using the other tools.',
     user: 'Show proxy, session and traffic status.',
   },
   list_requests: {
     title: 'List HTTP requests',
-    model: "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state, start time, kind (\"websocket\", \"sse\", \"http\"), GraphQL operation name, or slowerThanMs (only requests that took longer). Items show kind, the GraphQL operation and captured: \"vm-profile\" for read-only requests of native HTTP clients (no rules apply to them); kind \"tunnel\" items are TLS connections to a flutterIntercept.tlsPassthrough host, passed through undecrypted (notDecrypted: true, bytesSent / bytesReceived, no status, headers or bodies). Returns ids; call get_request for headers and bodies, get_frames for WebSocket messages / SSE events. Secrets are redacted.",
+    model: "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state, start time, kind (\"websocket\", \"sse\", \"grpc\", \"tunnel\", \"http\"), GraphQL operation name, or slowerThanMs (only requests that took longer). Items show kind, the GraphQL operation and captured: \"vm-profile\" for read-only requests of native HTTP clients (no rules apply to them); kind \"tunnel\" items are TLS connections to a flutterIntercept.tlsPassthrough host, passed through undecrypted (notDecrypted: true, bytesSent / bytesReceived, no status, headers or bodies; grpcTunnel: true = gRPC over TLS that is not decrypted). kind \"grpc\" items are gRPC calls: url ends in /<package.Service>/<Method>, status is the HTTP status (200 even for gRPC errors) and grpc {status, code, messagesSent, messagesReceived} holds the gRPC result. Returns ids; call get_request for headers and bodies, get_frames for WebSocket messages / SSE events. Secrets are redacted.",
     user: 'List recorded HTTP requests.',
   },
   get_request: {
     title: 'Get HTTP request details',
-    model: 'Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), error, and timings (ms per phase: requestMs = receiving the app\'s request, pausedMs = held at breakpoints, delayMs = added by a mock delay / throttle, dnsMs / connectMs / tlsMs on a new upstream connection or reused: true, sendMs, waitMs = time to first byte from the server, receiveMs = downloading the response; a missing phase did not happen or is unknown). scriptLog holds the lines a user\'s script rule logged (redacted). Use after list_requests or wait_for_request. Pass snippet ("curl", "dart_http" or "dio") to also get the request as runnable code (redacted values stay "[redacted]"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: "vm-profile" (read-only, from a native HTTP client). A tunnel (kind "tunnel") has no headers or bodies: tunnel {notDecrypted: why, bytesSent, bytesReceived} explains that the host is passed through without decryption (usually because the app pins its certificate) — remove it from flutterIntercept.tlsPassthrough to inspect it. clientCertificate is the host pattern of the mutual-TLS client certificate the proxy presented upstream. multipart/form-data bodies are shown parsed: secret fields "[redacted]", file parts "[file <name>, N bytes]".',
+    model: 'Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), error, and timings (ms per phase: requestMs = receiving the app\'s request, pausedMs = held at breakpoints, delayMs = added by a mock delay / throttle, dnsMs / connectMs / tlsMs on a new upstream connection or reused: true, sendMs, waitMs = time to first byte from the server, receiveMs = downloading the response; a missing phase did not happen or is unknown). scriptLog holds the lines a user\'s script rule logged (redacted). Use after list_requests or wait_for_request. Pass snippet ("curl", "dart_http" or "dio") to also get the request as runnable code (redacted values stay "[redacted]"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: "vm-profile" (read-only, from a native HTTP client). A tunnel (kind "tunnel") has no headers or bodies: tunnel {notDecrypted: why, bytesSent, bytesReceived} explains that the host is passed through without decryption (usually because the app pins its certificate) — remove it from flutterIntercept.tlsPassthrough to inspect it. clientCertificate is the host pattern of the mutual-TLS client certificate the proxy presented upstream. multipart/form-data bodies are shown parsed: secret fields "[redacted]", file parts "[file <name>, N bytes]". A gRPC call (kind "grpc") shows grpc {service, method, code, status, statusMessage, streaming, requestType, responseType, encodings, deadlineMs, messagesSent, messagesReceived}, responseTrailers, and messages: the first 20 each way decoded to JSON with the app\'s generated protobuf code (via "schema"), or as raw field numbers (via "raw"), at most 64 KB in all (read every message with get_frames); secret-named fields and credential metadata (authorization, cookies, custom -bin metadata) read "[redacted]".',
     user: 'Show one request with headers and bodies.',
   },
   wait_for_request: {
@@ -642,7 +699,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   assert_traffic: {
     title: 'Assert on recorded traffic',
     model:
-      'Check in one call that the app made the expected requests: matching url (glob; * matches any characters) and method since sinceMs (default: the latest launch_app/hot_restart, else all recorded traffic), with expect: status (code, "2xx".., "error"), count {min, max, exact} (default: at least one), order (URL globs requested in that order), json assertions on every matched response ({path: "$.items[0].id", exists | equals | type}), maxDurationMs. withinMs waits (event-driven, max 120 s) for the requests to arrive; it never hangs. Returns {pass, matched, ids, failures: [readable reasons]}. Failure texts name the request, path and expectation but never echo response values; equals compares with the redacted view (a secret only equals "[redacted]"). Use it as the final check of a change instead of reading bodies by hand.',
+      'Check in one call that the app made the expected requests: matching url (glob; * matches any characters) and method since sinceMs (default: the latest launch_app/hot_restart, else all recorded traffic), with expect: status (code, "2xx".., "error"), count {min, max, exact} (default: at least one), order (URL globs requested in that order), json assertions on every matched response ({path: "$.items[0].id", exists | equals | type}), maxDurationMs, grpcStatus (gRPC calls: the gRPC status code or name; gRPC errors have HTTP status 200). kind narrows to one exchange kind (e.g. "grpc"). withinMs waits (event-driven, max 120 s) for the requests to arrive; it never hangs. Returns {pass, matched, ids, failures: [readable reasons]}. Failure texts name the request, path and expectation but never echo response values; equals compares with the redacted view (a secret only equals "[redacted]"). Use it as the final check of a change instead of reading bodies by hand.',
     user: 'Check that expected requests and responses happened.',
   },
   add_mutation: {
@@ -654,7 +711,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   get_frames: {
     title: 'Get WebSocket / SSE frames',
     model:
-      'Read the messages of a recorded WebSocket connection or the events of a server-sent events (SSE) stream (list_requests kind "websocket" / "sse"): oldest first, each with index, dir ("send" = app → server, "receive"), at (epoch ms), kind (text, binary, ping, pong, close, event), size and text (SSE: event name and id). Binary payloads are summarised as "[binary N bytes]"; JSON messages are redacted structurally, other text by pattern (secrets read "[redacted]"). Page with since = the returned next; while the connection is open (state "pending") new frames keep arriving. Only the newest 500 frames per connection are kept (dropped counts the older ones).',
+      'Read the messages of a recorded WebSocket connection or the events of a server-sent events (SSE) stream (list_requests kind "websocket" / "sse"): oldest first, each with index, dir ("send" = app → server, "receive"), at (epoch ms), kind (text, binary, ping, pong, close, event), size and text (SSE: event name and id). Binary payloads are summarised as "[binary N bytes]"; JSON messages are redacted structurally, other text by pattern (secrets read "[redacted]"). Page with since = the returned next; while the connection is open (state "pending") new frames keep arriving. Only the newest 500 frames per connection are kept (dropped counts the older ones). For a gRPC call (kind "grpc") the frames are its messages (kind "message", compressed when sent gzip): text is the message decoded to JSON with the app\'s generated protobuf code (via "schema") or as raw field numbers (via "raw"), redacted structurally.',
     user: 'Show the messages of a WebSocket or SSE stream.',
   },
   add_cors_rule: {
@@ -719,6 +776,19 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
     title: 'Take a screenshot of the app',
     model: "Take a screenshot of the running Flutter app (the debug session's device; pass sessionId when several apps run) to see what the UI shows after a change or a mocked response. Returns the PNG image plus {path, width, height, takenAt, method, recentRequests}: recentRequests are the (at most 10) requests that started in the 5 s before the screenshot (redacted summaries; read them with get_request). The user confirms every screenshot and can turn the tool off (setting flutterIntercept.agent.screenshots). Supported on Android devices/emulators, iOS simulators, macOS and Flutter Web in Chrome (and wherever the Flutter VM service can render one); other devices answer \"not supported\".",
     user: 'Take a screenshot of the running app (asks first).',
+  },
+  // CONTRACTS §16.4
+  add_grpc_mock: {
+    title: 'Add gRPC mock rule',
+    model:
+      'Make the app\'s gRPC calls to one method get a fake answer (the real server is not contacted): response messages (JSON objects encoded with the app\'s own generated protobuf code — get the field names from get_grpc_schema\'s responseSkeleton — or base64 protobuf), then a gRPC status (code, default 0 = OK) and optional message. Use it to test error handling ({code: "UNAVAILABLE"}, {code: 16, message: "token expired"}), empty or edge-case responses, and streaming (several messages, gapMs between them). Pass url (a glob ending in "/<package.Service>/<Method>", e.g. "*/shop.v1.CartService/AddItem") or service + method. The rule is inserted first; times (e.g. 1) or ttlMs remove it automatically, otherwise use remove_rule. HTTP mocks (add_mock) never match gRPC calls; add_block, add_sequence (mock steps are HTTP-only) and simulate_network apply to gRPC too. Only decrypted gRPC calls (kind "grpc" in list_requests) can be mocked, not "tunnel" ones.',
+    user: 'Add a rule that answers a gRPC method with fake messages and status.',
+  },
+  get_grpc_schema: {
+    title: 'Get gRPC schema',
+    model:
+      "Read the app's gRPC contract from its protoc-generated Dart code (*.pbgrpc.dart, *.pb.dart, *.pbenum.dart in the workspace and in packages that ship services). With method (\"/pkg.Service/Method\"): request and response types, streaming (unary, server, client or bidi), each type's fields (number, JSON name, type, repeated / map / oneof), the enums they use, and skeleton JSON with every field set — the starting point for add_grpc_mock messages. With message: one message or enum type. Without either: the list of methods. Returns {available: false, reason} when gRPC support is off or no generated code was found. Source files are project-relative.",
+    user: "Show the app's gRPC methods and message types.",
   },
   add_rewrite: {
     title: 'Add a rewrite rule',

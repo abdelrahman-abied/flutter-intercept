@@ -2,7 +2,7 @@
  * Shared pieces of the OpenAPI / Postman exports (CONTRACTS §13.5). Pure: no vscode, no fs.
  *
  * - Which exchanges are exported: finished HTTP exchanges with a response (`completed` / `mocked` with a status),
- *   vm-profile captures included; WebSocket, SSE, browser-internal, unfinished (pending / paused) and
+ *   vm-profile captures included; WebSocket, SSE, gRPC (CONTRACTS §16.4), TLS tunnels, browser-internal, unfinished (pending / paused) and
  *   response-less (error / aborted / blocked) ones are skipped, each kind counted in a note.
  * - Path templates: `routeTemplate`'s id segments (`{id}`, `{id2}`, …), plus segments that are credentials
  *   (JWTs, opaque tokens: `/reset/eyJ…`), so a secret never becomes part of a path name.
@@ -68,7 +68,7 @@ const FINISHED = new Set(['completed', 'mocked']);
 
 /** The exchanges an export uses, with notes for the ones it skips. */
 export function selectExchanges(exchanges: readonly Exchange[]): Selection {
-  const skipped = { websocket: 0, sse: 0, browser: 0, unfinished: 0, noResponse: 0, badUrl: 0 };
+  const skipped = { websocket: 0, sse: 0, grpc: 0, tunnel: 0, browser: 0, unfinished: 0, noResponse: 0, badUrl: 0 };
   const samples: Sample[] = [];
   const sorted = exchanges
     .map((e, i) => ({ e, i }))
@@ -77,6 +77,8 @@ export function selectExchanges(exchanges: readonly Exchange[]): Selection {
   for (const e of sorted) {
     if (e.kind === 'websocket') skipped.websocket++;
     else if (e.kind === 'sse') skipped.sse++;
+    else if (e.kind === 'grpc') skipped.grpc++;
+    else if (e.kind === 'tunnel') skipped.tunnel++;
     else if (e.browserInternal) skipped.browser++;
     else if (e.state === 'pending' || e.state === 'paused-request' || e.state === 'paused-response') skipped.unfinished++;
     else if (!FINISHED.has(e.state) || typeof e.status !== 'number') skipped.noResponse++;
@@ -100,6 +102,8 @@ export function selectExchanges(exchanges: readonly Exchange[]): Selection {
   const notes: string[] = [];
   if (skipped.websocket) notes.push(`${plural(skipped.websocket, 'WebSocket exchange')} skipped`);
   if (skipped.sse) notes.push(`${plural(skipped.sse, 'SSE exchange')} skipped`);
+  if (skipped.grpc) notes.push(`${plural(skipped.grpc, 'gRPC call')} skipped (export them as HAR)`);
+  if (skipped.tunnel) notes.push(`${plural(skipped.tunnel, 'undecrypted TLS connection')} skipped`);
   if (skipped.browser) notes.push(`${plural(skipped.browser, 'browser-internal exchange')} skipped`);
   if (skipped.unfinished) notes.push(`${plural(skipped.unfinished, 'unfinished exchange')} (pending or paused) skipped`);
   if (skipped.noResponse) notes.push(`${plural(skipped.noResponse, 'exchange')} without a response (failed, aborted or blocked) skipped`);

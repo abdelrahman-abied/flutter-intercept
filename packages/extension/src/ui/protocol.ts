@@ -28,6 +28,8 @@ export interface Status {
   tlsPassthrough?: string[];
   /** CONTRACTS §14.3: configured client certificates (host pattern + whether it loaded; never paths' contents or passphrases). */
   clientCertificates?: { host: string; problem?: string }[];
+  /** CONTRACTS §16.4: gRPC interception and the schema read from the app's generated `*.pb*.dart`. */
+  grpc?: GrpcStatus;
 }
 
 export interface AgentStatus {
@@ -54,7 +56,9 @@ export type HostMsg =
   | { type: 'authFlows'; flows: AuthFlowSummary[] }
   // CONTRACTS §13.7
   | { type: 'select'; id: string }                                     // focus this exchange (from a notification's "Show")
-  | { type: 'exported'; format: ExportFormat; path: string };          // after a successful 'export'
+  | { type: 'exported'; format: ExportFormat; path: string }           // after a successful 'export'
+  // CONTRACTS §16.4
+  | { type: 'grpcDecoded'; id: string; decoded: GrpcDecoded };         // answer to 'decodeGrpc'
 
 // webview → host
 export type ViewMsg =
@@ -89,7 +93,9 @@ export type ViewMsg =
   // CONTRACTS §13.7
   | { type: 'export'; format: ExportFormat; ids?: string[] }           // host asks redact or not, then a save dialog; ids default = all shown HTTP
   | { type: 'openInNewWindow' }                                        // opens the panel as an editor in its own window
-  | { type: 'openScriptFile'; path: string; create?: { content: string }; ruleId?: string }; // like openBodyFile, for script rules (.js); create never reuses an existing file (REVIEW-7 #1)
+  | { type: 'openScriptFile'; path: string; create?: { content: string }; ruleId?: string } // like openBodyFile, for script rules (.js); create never reuses an existing file (REVIEW-7 #1)
+  // CONTRACTS §16.4
+  | { type: 'decodeGrpc'; id: string };                                // host answers 'grpcDecoded'
 
 /** CONTRACTS §13.5 */
 export type ExportFormat = 'openapi' | 'postman' | 'har';
@@ -121,4 +127,38 @@ export interface AuthFlowSummary {
   steps: { exchangeId: string; role: 'unauthorized' | 'refresh' | 'retry' | 'other' }[];
   stampede?: { refreshCalls: number; windowMs: number };
   problem?: string;
+}
+
+/** CONTRACTS §16.4 */
+export interface GrpcStatus {
+  enabled: boolean;
+  decryptHosts: string[];
+  /** The proxy's self-check failed: gRPC calls are only seen as undecrypted tunnels. */
+  problem?: string;
+  /** From the app's generated `*.pb*.dart`. */
+  schema?: { methods: number; messages: number; problems: string[] };
+}
+
+/** CONTRACTS §16.4: a gRPC call's messages decoded by the host (schema from the app's `*.pb*.dart`, else raw). */
+export interface GrpcDecoded {
+  /** e.g. `/pkg.Service/Method` → types; absent when the schema doesn't know the method. */
+  method?: { requestType: string; responseType: string; clientStreaming: boolean; serverStreaming: boolean; file?: string };
+  /** One per `message` frame, same order as `exchange.frames` (other frame kinds skipped). */
+  messages: GrpcDecodedMessage[];
+  /** `exchange.framesDropped` when decoded (0 = none), so the panel lines messages up with frames exactly. */
+  framesDropped: number;
+  /** Example JSON for each type (rule editor "skeleton" button). */
+  skeletons?: { request?: string; response?: string };
+  problem?: string;
+}
+export interface GrpcDecodedMessage {
+  dir: 'send' | 'receive';
+  /** Pretty JSON (schema decode) or raw field tree (`protoc --decode_raw` style). */
+  json?: string;
+  via: 'schema' | 'raw' | 'none';
+  /** First 4 KB as hex. */
+  hex: string;
+  size: number;
+  truncated?: true;
+  error?: string;
 }
