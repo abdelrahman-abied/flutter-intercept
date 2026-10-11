@@ -39,8 +39,21 @@ const val PLUGIN_ID = "dev.flutterintercept"
 /** The plugin's folder name in the plugins directory (= the distribution zip's top folder, rootProject.name). */
 const val PLUGIN_FOLDER = "flutter-intercept-intellij"
 
-/** System property naming a sidecar.js to use instead of the bundled one (development: `./gradlew runIde`). */
+/**
+ * System property naming a sidecar.js to use instead of the bundled one (development: `./gradlew runIde`). Honoured
+ * only with [DEV_MODE_PROPERTY]=true in a sandbox IDE (REVIEW-9 #7).
+ */
 const val SIDECAR_PATH_PROPERTY = "flutter.intercept.sidecar"
+const val DEV_MODE_PROPERTY = "flutter.intercept.dev"
+
+/**
+ * The development override is allowed in an internal-mode IDE, or when the dev flag is set in a sandbox IDE (the
+ * Gradle plugin's runIde / tests always pass `idea.plugins.path` to a sandbox plugins folder).
+ */
+fun devOverrideAllowed(property: (String) -> String?, isInternal: Boolean): Boolean {
+    if (property(DEV_MODE_PROPERTY) != "true") return false
+    return isInternal || property("idea.plugins.path")?.contains("sandbox") == true
+}
 
 @Service(Service.Level.APP)
 class SidecarProcess : Disposable {
@@ -210,15 +223,16 @@ class SidecarProcess : Disposable {
 
     private fun doStart(): Connection {
         val settings = InterceptSettings.getInstance().state
-        val node = when (val r = NodeLocator().locate(settings.nodePath, listOf(shellPath(), System.getenv("PATH")))) {
+        val dataDir = dataDir()
+        val node = when (val r = NodeLocator(runVersion = { nodeVersionOutput(it, dataDir) }).locate(settings.nodePath, listOf(shellPath(), System.getenv("PATH")))) {
             is NodeLookup.Found -> r
             is NodeLookup.Problem -> throw StartProblem(r.message, openSettings = true)
         }
         val script = sidecarScript() ?: throw StartProblem(
             "The Flutter Intercept sidecar is missing from the plugin. Reinstall the plugin.", openSettings = false,
         )
-        val dataDir = dataDir()
-        val pb = ProcessBuilder(node.path, script.absolutePath).directory(script.parentFile)
+        // A neutral working directory (never a project), like the Node probe.
+        val pb = ProcessBuilder(node.path, script.absolutePath).directory(dataDir)
         val env = pb.environment()
         // A Dock-launched IDE has a minimal PATH; the sidecar runs adb / flutter / xcrun, so give it the shell's.
         try { env.putAll(EnvironmentUtil.getEnvironmentMap()) } catch (_: Exception) {}
@@ -397,7 +411,10 @@ class SidecarProcess : Disposable {
 
         /** The bundled `<plugin>/sidecar/sidecar.js`, or the development override (system property) when it exists. */
         fun sidecarScript(): File? {
-            System.getProperty(SIDECAR_PATH_PROPERTY)?.takeIf { it.isNotBlank() }?.let { File(it) }?.takeIf { it.isFile }?.let { return it }
+            val app = ApplicationManager.getApplication()
+            if (devOverrideAllowed(System::getProperty, app?.isInternal == true)) {
+                System.getProperty(SIDECAR_PATH_PROPERTY)?.takeIf { it.isNotBlank() }?.let { File(it) }?.takeIf { it.isFile }?.let { return it }
+            }
             val candidates = sidecarCandidates(pluginJar(), PathManager.getPluginsDir().toFile())
             candidates.firstOrNull { it.isFile }?.let { return it }
             LOG.warn("Flutter Intercept sidecar not found; looked at ${candidates.joinToString()}")
@@ -440,15 +457,47 @@ class SidecarProcess : Disposable {
         }
 
         /** `<system>/flutter-intercept`, private to the user (holds the CA key). */
+        /**
+         * `<config>/flutter-intercept`, private to the user. Durable (the CA key, MCP token, approvals live here): the
+         * system path is a cache users and tools clear. 0.9.0 pre-releases used `<system>/flutter-intercept`: moved once.
+         */
+        @Synchronized
         fun dataDir(): File {
-            val dir = File(PathManager.getSystemPath(), "flutter-intercept")
+            val dir = File(PathManager.getConfigPath(), "flutter-intercept")
+            migrateDataDir(File(PathManager.getSystemPath(), "flutter-intercept"), dir)
             dir.mkdirs()
+            makePrivate(dir)
+            return dir
+        }
+
+        /** Moves [old] to [new] when [new] doesn't exist yet (or is empty); never overwrites. Best effort. */
+        fun migrateDataDir(old: File, new: File): Boolean {
+            if (!old.isDirectory) return false
+            if (new.exists() && (new.list()?.isNotEmpty() != false)) return false
+            return try {
+                new.parentFile?.mkdirs()
+                if (new.exists()) new.delete()
+                try {
+                    Files.move(old.toPath(), new.toPath())
+                } catch (_: Exception) {
+                    old.copyRecursively(new, overwrite = false)
+                    old.deleteRecursively()
+                }
+                makePrivate(new)
+                LOG.info("Moved the Flutter Intercept data folder to the IDE config folder")
+                true
+            } catch (e: Exception) {
+                LOG.warn("Couldn't move the Flutter Intercept data folder: ${e.javaClass.simpleName}")
+                false
+            }
+        }
+
+        fun makePrivate(dir: File) {
             try {
                 Files.setPosixFilePermissions(dir.toPath(), PosixFilePermissions.fromString("rwx------"))
             } catch (_: Exception) {
-                // not POSIX (Windows): the system dir is already per-user
+                // not POSIX (Windows): the config dir is already per-user
             }
-            return dir
         }
 
         private fun shellPath(): String? = try { EnvironmentUtil.getValue("PATH") } catch (_: Exception) { null }

@@ -58,6 +58,31 @@ class NodeLocatorTest {
     }
 
     @Test
+    fun relativePathEntriesAreSkipped() {
+        val dirs = locator(emptySet(), emptyMap()).searchDirs(listOf(".:bin:node_modules/.bin:/abs/bin"))
+        assertEquals("/abs/bin", dirs.first())
+        assertTrue(dirs.none { !File(it).isAbsolute })
+    }
+
+    @Test
+    fun versionProbeRunsInTheGivenDirectory() {
+        if (System.getProperty("os.name").startsWith("Windows")) return
+        val tmp = java.nio.file.Files.createTempDirectory("fi-node").toFile()
+        try {
+            val neutral = File(tmp, "neutral").apply { mkdirs() }
+            val fake = File(tmp, "node").apply {
+                writeText("#!/bin/sh\necho \"v20.0.0 cwd=${'$'}(pwd -P)\"\n")
+                setExecutable(true)
+            }
+            val out = dev.flutterintercept.sidecar.nodeVersionOutput(fake.path, neutral)!!
+            assertTrue(out, out.contains("cwd=${neutral.canonicalPath}"))
+            assertEquals(20, NodeLocator.parseMajor(out))
+        } finally {
+            tmp.deleteRecursively()
+        }
+    }
+
+    @Test
     fun findsHomebrewNodeWhenPathIsMinimal() {
         val l = locator(setOf("/opt/homebrew/bin/node"), mapOf("/opt/homebrew/bin/node" to "v26.4.0"))
         assertEquals(NodeLookup.Found("/opt/homebrew/bin/node", "v26.4.0"), l.locate("", listOf("/usr/bin:/bin")))

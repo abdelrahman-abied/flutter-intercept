@@ -37,7 +37,7 @@ exports[`SidecarHost > prepareLaunch rewrites per device kind like the VS Code p
       "--flavor",
       "dev",
       "--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=<sha>",
-      "--dart-define=FLUTTER_INTERCEPT_PROXY=flutter-intercept:<token>@192.168.77.7:50123",
+      "--dart-define-from-file=<dataDir>/lan-defines/flutter-intercept-lan-<id>.json",
     ],
     "kind": "rewrite",
     "note": "Physical iPhone: the app reaches the proxy over Wi-Fi (LAN mode, token-protected)",

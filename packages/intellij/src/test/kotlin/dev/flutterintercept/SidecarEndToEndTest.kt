@@ -13,6 +13,7 @@ import dev.flutterintercept.sidecar.RpcException
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Before
@@ -139,9 +140,24 @@ class SidecarEndToEndTest {
         assertTrue(release is LaunchPlan.Skip)
     }
 
-    /** CONTRACTS §15.4: one-time UI URLs exchanged for an HttpOnly session cookie. */
+    private fun body(url: String, method: String = "GET"): Pair<Int, String> {
+        val c = URI(url).toURL().openConnection() as HttpURLConnection
+        c.requestMethod = method
+        c.instanceFollowRedirects = false
+        c.connectTimeout = 5_000
+        c.readTimeout = 5_000
+        return try {
+            val code = c.responseCode
+            assertNull("no session cookie (REVIEW-9 #1)", c.getHeaderField("Set-Cookie"))
+            code to (if (code == 200 && method == "GET") c.inputStream.bufferedReader().readText() else "")
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    /** CONTRACTS §15.4 / REVIEW-9 #1, #6: one-time page URLs, no cookie, per-page WebSocket secrets. */
     @Test
-    fun oneTimeUiUrlBecomesACookieSession() {
+    fun oneTimeUiUrlServesThePageOnce() {
         val init = init()
         val url = (rpc.call("uiUrl", null, 10_000) as JsonObject).get("url").asString
         assertTrue(url.startsWith(init.uiOrigin + "/"))
@@ -149,20 +165,20 @@ class SidecarEndToEndTest {
         val other = (rpc.call("uiUrl", null, 10_000) as JsonObject).get("url").asString
         assertFalse("each call gives a new URL", url == other)
 
-        val first = fetch(url)
-        assertTrue("exchange redirects: ${first.code}", first.code in 300..399)
-        val setCookie = first.setCookie!!
-        assertTrue(setCookie, setCookie.contains("HttpOnly", ignoreCase = true))
-        assertTrue(setCookie, setCookie.contains("SameSite=Strict", ignoreCase = true))
-        assertFalse("the redirect drops the token", first.location.orEmpty().contains("t="))
-        val cookie = setCookie.substringBefore(';')
+        body(url, "HEAD") // must not redeem the token (REVIEW-9 #6): the GET below still gets the page
+        val (code, page) = body(url)
+        assertEquals(200, code)
+        assertTrue(page.contains("__FI_WS__"))
+        assertEquals("a used one-time URL is refused", 403, body(url).first)
+        assertEquals("no token", 403, body(init.uiOrigin + "/").first)
 
-        assertEquals("a used one-time URL is refused", 403, fetch(url).code)
-        assertEquals("the cookie session serves the UI", 200, fetch(init.uiOrigin + "/", cookie).code)
-        assertEquals(403, fetch(init.uiOrigin + "/").code)
-        assertEquals(403, fetch(init.uiOrigin + "/", "fi_session=forged").code)
-        // An unused second URL still works once.
-        assertTrue(fetch(other).code in 300..399)
+        val (code2, page2) = body(other)
+        assertEquals(200, code2)
+        val ws = Regex("""__FI_WS__\s*=\s*"([^"]+)"""")
+        val s1 = ws.find(page)?.groupValues?.get(1)
+        val s2 = ws.find(page2)?.groupValues?.get(1)
+        assertTrue("$s1 / $s2", s1 != null && s2 != null && s1 != s2)
+        assertFalse("the WebSocket secret isn't the page token", s1!!.contains(url.substringAfter("t=")))
     }
 
     @Test

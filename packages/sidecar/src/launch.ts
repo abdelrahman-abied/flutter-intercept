@@ -13,7 +13,7 @@ import * as path from 'path';
 import { withSoftTimeout, type ReverseTracker } from '../../extension/src/adb';
 import { isGeneratedEntry, writeEntry } from '../../extension/src/entry/generator';
 import type { LanOpening } from '../../extension/src/proxyHost';
-import { prepareLan, type LanDeps } from '../../extension/src/debug/lanPrepare';
+import { newLanDefinesPath, prepareLan, writeLanDefines, type LanDeps } from '../../extension/src/debug/lanPrepare';
 import type { WebPacSource } from '../../extension/src/debug/pacServer';
 import {
   HOST_KEY,
@@ -42,6 +42,8 @@ export interface LaunchRecord {
   web: boolean;
   /** Browser flags we added (web screenshots find the debug browser by them). */
   webFlags?: string[];
+  /** REVIEW-9: the 0600 `--dart-define-from-file` holding the LAN token (delete when the session ends). */
+  lanDefinesFile?: string;
 }
 
 export interface LaunchDeps {
@@ -53,6 +55,8 @@ export interface LaunchDeps {
   /** LAN mode for physical iPhones: address + listener + notices. `classify` is supplied here from `deviceKind`. */
   lan?: Omit<LanDeps, 'classify'>;
   webPac?: WebPacSource;
+  /** REVIEW-9: private folder (the sidecar's dataDir) for LAN define files; the token never goes on the command line. */
+  lanDefinesDir?: string;
   /** The web-server device / own browser profile was not intercepted: shown once by the host. */
   webSkipped?(message: string): void;
   log(msg: string): void;
@@ -131,7 +135,8 @@ async function prepare(deps: LaunchDeps, p: PrepareLaunchParams): Promise<{ resu
       }
       if (!webPacUrl) deps.log('Flutter Web: no PAC URL, using --proxy-server (no DIRECT fallback)');
     }
-    result = rewriteDebugConfig(config, { ...ctxBase, proxyPort: port, caCertPem, physicalIos: lanInfo.physicalIos, lan: lanInfo.lan, webPacUrl });
+    const lanDefinesFile = lanInfo.lan && deps.lanDefinesDir ? newLanDefinesPath(deps.lanDefinesDir) : undefined;
+    result = rewriteDebugConfig(config, { ...ctxBase, proxyPort: port, caCertPem, physicalIos: lanInfo.physicalIos, lan: lanInfo.lan, lanDefinesFile, webPacUrl });
     if (result.kind === 'skip' && result.noLan) {
       const message = `Flutter Intercept: ${lanInfo.problem ?? result.reason}, so this iPhone session runs without interception.`;
       deps.log(message);
@@ -156,6 +161,7 @@ async function prepare(deps: LaunchDeps, p: PrepareLaunchParams): Promise<{ resu
   }
   if (result.kind !== 'rewrite') return { result: skip('unexpected rewrite result') };
   await writeEntry(result.plan);
+  if (result.lanDefines) await writeLanDefines(result.lanDefines.path, result.lanDefines.content);
   const port = result.config[MARKER_KEY] as number;
   deps.log(
     `[prepareLaunch] ${p.deviceKind} device=${p.deviceId ?? '(unknown)'} program ${path.basename(result.plan.program)} -> ${path.relative(p.projectRoot, result.plan.entryPath)} ` +
@@ -173,6 +179,14 @@ async function prepare(deps: LaunchDeps, p: PrepareLaunchParams): Promise<{ resu
       additionalArgs: (result.config.toolArgs as string[]) ?? [],
       ...(result.lan ? { note: 'Physical iPhone: the app reaches the proxy over Wi-Fi (LAN mode, token-protected)' } : {}),
     },
-    record: { ...base, program: result.plan.program, port, host: result.config[HOST_KEY], lan: result.config[LAN_KEY] === true, web: false },
+    record: {
+      ...base,
+      program: result.plan.program,
+      port,
+      host: result.config[HOST_KEY],
+      lan: result.config[LAN_KEY] === true,
+      web: false,
+      ...(result.lanDefines ? { lanDefinesFile: result.lanDefines.path } : {}),
+    },
   };
 }

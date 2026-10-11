@@ -29,6 +29,7 @@ describe('dist/sidecar.js', () => {
   let child: ChildProcessWithoutNullStreams;
   let tmp: string;
   const lines: any[] = [];
+  const secrets = new Map<string, string>();
   let stderr = '';
   const waiters: { pred: (m: any) => boolean; resolve: (m: any) => void }[] = [];
   const next = (pred: (m: any) => boolean, ms = 20_000) =>
@@ -52,6 +53,14 @@ describe('dist/sidecar.js', () => {
         const msg = JSON.parse(buf.slice(0, nl)); // every stdout line must be protocol JSON
         buf = buf.slice(nl + 1);
         lines.push(msg);
+        // answer the sidecar's requests like a plugin with a password store
+        if (typeof msg.id === 'number' && msg.id < 0 && typeof msg.method === 'string') {
+          if (msg.method === 'secrets.get') send({ id: msg.id, result: secrets.get(msg.params.key) ?? null });
+          else if (msg.method === 'secrets.set') {
+            secrets.set(msg.params.key, msg.params.value);
+            send({ id: msg.id, result: null });
+          } else send({ id: msg.id, error: { message: 'unknown method', code: 'unknown_method' } });
+        }
         for (const w of [...waiters]) if (w.pred(msg)) {
           waiters.splice(waiters.indexOf(w), 1);
           w.resolve(msg);
@@ -90,24 +99,22 @@ describe('dist/sidecar.js', () => {
     const { uiUrl, mcpUrl, version } = r.result;
     expect(version).toBe(JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version);
     expect(mcpUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
+    expect(secrets.get('flutterIntercept.mcpToken')).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(fs.existsSync(path.join(tmp, 'data', 'mcp-token'))).toBe(false);
     const token = new URL(uiUrl).searchParams.get('t')!;
     expect(lines.some((m) => m.event === 'ready')).toBe(true);
 
-    // CONTRACTS §15.4: one-time URL → cookie + redirect; the URL is dead afterwards
-    const first = await get(uiUrl);
-    expect(first.status).toBe(302);
-    expect(first.headers.location).toBe('/');
-    const cookie = (first.headers['set-cookie'] as string[])[0].split(';')[0];
+    // CONTRACTS §15.4 / REVIEW-9 #1: the one-time URL serves the page itself, once; no cookie
+    const page = await get(uiUrl);
+    expect(page.status).toBe(200);
+    expect(page.headers['set-cookie']).toBeUndefined();
     expect((await get(uiUrl)).status).toBe(403);
     const origin = new URL(uiUrl).origin;
-    const page = await get(`${origin}/`, cookie);
-    expect(page.status).toBe(200);
     expect(page.body).toContain('class="fi-ide ide-dark vscode-dark"');
     const wsUrl = /window\.__FI_WS__ = "([^"]+)"/.exec(page.body)![1];
-    const js = await get(`${origin}/webview.js`, cookie);
+    const js = await get(`${origin}/webview.js`);
     expect(js.status).toBe(200);
     expect(js.body.length).toBeGreaterThan(10_000);
-    expect((await get(`${origin}/webview.js`)).status).toBe(403);
 
     const ws = new WebSocket(wsUrl, { origin });
     const snapshot = await new Promise<any>((resolve, reject) => {

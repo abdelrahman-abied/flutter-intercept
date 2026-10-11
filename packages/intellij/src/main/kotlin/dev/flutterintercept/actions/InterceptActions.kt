@@ -158,9 +158,7 @@ class SetPassphraseAction : InterceptAction() {
             fun ask(host: String) {
                 val pass = Messages.showPasswordDialog(project, "Passphrase for the client certificate of $host (empty clears it):", "Flutter Intercept", null) ?: return
                 ApplicationManager.getApplication().executeOnPooledThread {
-                    ClientCertificates.setPassphrase(host, pass)
-                    // The sidecar reloads the certificates (and asks for passphrases again) with the settings.
-                    SidecarProcess.getInstance().pushSettings()
+                    ClientCertificates.applyPassphrase(host, pass)
                 }
             }
             if (hosts.size == 1) ask(hosts[0])

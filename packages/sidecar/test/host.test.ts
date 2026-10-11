@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { SidecarHost, usableFolder, type PluginLink } from '../src/host';
+import { loadMcpToken, MCP_TOKEN_KEY, SidecarHost, usableFolder, type PluginLink } from '../src/host';
 import { RpcFailure } from '../src/rpc';
 import type { DeviceKind, InitResult, PrepareLaunchResult } from '../src/types';
 
@@ -93,11 +93,10 @@ describe('SidecarHost', () => {
     expect(link.events.find((e) => e.event === 'status')?.data).toEqual({ proxyRunning: false, enabled: true, sessions: 0, paused: 0 });
     const oneTime = new URL(init.uiUrl).searchParams.get('t')!;
     expect(logs.join('\n')).not.toContain(oneTime);
-    const wsToken = (host as unknown as { ui: { token: string } }).ui.token;
-    host.log(`leak? ${wsToken}`);
-    expect(logs.join('\n')).not.toContain(wsToken);
+    // the fake plugin has no password store (unknown_method) → private file fallback
     const mcpToken = fs.readFileSync(path.join(tmp, 'data', 'mcp-token'), 'utf8');
     expect(mcpToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    host.log(`leak? ${mcpToken}`);
     if (process.platform !== 'win32') expect(fs.statSync(path.join(tmp, 'data', 'mcp-token')).mode & 0o777).toBe(0o600);
     expect(logs.join('\n')).not.toContain(mcpToken);
     await expect(host.handle('init', {})).rejects.toThrow('already initialized');
@@ -165,6 +164,9 @@ describe('SidecarHost', () => {
       JSON.stringify(r)
         .split(project)
         .join('<project>')
+        .split(path.join(tmp, 'data'))
+        .join('<dataDir>')
+        .replace(/flutter-intercept-lan-[0-9a-f]{32}\.json/g, 'flutter-intercept-lan-<id>.json')
         .replace(/ENTRY_SHA=[0-9a-f]+/g, 'ENTRY_SHA=<sha>')
         .replace(/flutter-intercept:[A-Za-z0-9_-]{43}@/g, 'flutter-intercept:<token>@')
         .replace(/spki-list=[A-Za-z0-9+/]{43}=/g, 'spki-list=<pin>')
@@ -196,6 +198,25 @@ describe('SidecarHost', () => {
     const entry = (out['macos macos'] as { program: string }).program.replace('<project>', project);
     expect(fs.readFileSync(entry, 'utf8')).toContain('-----BEGIN CERTIFICATE-----');
   }, 60_000);
+
+  it('physical iPhone: the LAN token goes in a 0600 define file in dataDir, removed when the session ends', async () => {
+    const ph = (host as unknown as { proxyHost: { openLan(h: string): Promise<unknown> } }).proxyHost;
+    const realOpenLan = ph.openLan;
+    ph.openLan = async (h: string) => ({ host: h, port: 50123, token: 'T'.repeat(43) });
+    const r = (await host.handle('prepareLaunch', { ...launch('ios-device', '00008110-001234567890801E'), launchId: 'phone-1' })) as { additionalArgs: string[] };
+    ph.openLan = realOpenLan;
+    expect(JSON.stringify(r)).not.toContain('T'.repeat(43));
+    const flag = r.additionalArgs.find((a) => a.startsWith('--dart-define-from-file='))!;
+    const file = flag.slice('--dart-define-from-file='.length);
+    expect(file.startsWith(path.join(tmp, 'data', 'lan-defines') + path.sep)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ FLUTTER_INTERCEPT_PROXY: `flutter-intercept:${'T'.repeat(43)}@192.168.77.7:50123` });
+    if (process.platform !== 'win32') expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    await host.handle('sessionStarted', { launchId: 'phone-1', sessionId: 'p1' });
+    expect(fs.existsSync(file)).toBe(true);
+    await host.handle('sessionEnded', { sessionId: 'p1' });
+    await new Promise((res) => setTimeout(res, 20));
+    expect(fs.existsSync(file)).toBe(false);
+  });
 
   it('prepareLaunch skips release, web-server, tests, and strips our old defines', async () => {
     expect(await host.handle('prepareLaunch', launch('android-emulator', 'emulator-5554', 'release'))).toEqual({ kind: 'skip', reason: 'release build: never intercepted' });
@@ -239,10 +260,97 @@ describe('SidecarHost', () => {
     expect((host as unknown as { folders: string[] }).folders).toEqual([project]);
   });
 
+  const viewMsg = async (msg: unknown) => {
+    const replies: any[] = [];
+    const ctl = (host as unknown as { controller: { handle(m: unknown, reply: (r: unknown) => void): Promise<void> } }).controller;
+    await ctl.handle(msg, (r) => replies.push(r));
+    return replies;
+  };
+
+  it('creates body files silently only under .vscode/flutter-intercept/, asks elsewhere, refuses build config', async () => {
+    link.answers['ui.openFile'] = () => null;
+    expect(await viewMsg({ type: 'openBodyFile', path: '.vscode/flutter-intercept/mocks/u.json', create: { content: '{}' } })).toEqual([]);
+    expect(fs.existsSync(path.join(project, '.vscode/flutter-intercept/mocks/u.json'))).toBe(true);
+    expect(link.requests.some((q) => q.method === 'ui.confirm')).toBe(false);
+
+    for (const bad of ['android/buildSrc/build.gradle', 'android/app/build.gradle.kts', 'pubspec_overrides.yaml', '.vscode/tasks.json', 'hook/build.dart', 'tool/run.sh']) {
+      const r = await viewMsg({ type: 'openBodyFile', path: bad, create: { content: 'x' } });
+      expect(r[0]?.type, bad).toBe('error');
+      expect(r[0].message).toContain('Refusing to create');
+      expect(fs.existsSync(path.join(project, bad))).toBe(false);
+    }
+    expect(link.requests.some((q) => q.method === 'ui.confirm')).toBe(false);
+
+    link.answers['ui.confirm'] = () => null; // Cancel
+    const cancelled = await viewMsg({ type: 'openBodyFile', path: 'assets/mock.json', create: { content: '{}' } });
+    expect(cancelled[0]?.type).toBe('error');
+    expect(fs.existsSync(path.join(project, 'assets/mock.json'))).toBe(false);
+    const ask = link.requests.filter((q) => q.method === 'ui.confirm').at(-1)!.params as { message: string; buttons: string[]; modal: boolean };
+    expect(ask).toMatchObject({ message: `Create ${path.join(project, 'assets', 'mock.json')}?`, buttons: ['Create'], modal: true });
+    link.answers['ui.confirm'] = () => 'Create';
+    expect(await viewMsg({ type: 'openBodyFile', path: 'assets/mock.json', create: { content: '{}' } })).toEqual([]);
+    expect(fs.readFileSync(path.join(project, 'assets/mock.json'), 'utf8')).toBe('{}');
+  });
+
+  it('passes webLaunchUrl from sessionStarted to the session (web screenshots)', async () => {
+    await host.handle('prepareLaunch', launch('web', 'chrome'));
+    await host.handle('sessionStarted', { launchId: 'l-web-chrome', sessionId: 'w1', deviceId: 'chrome', webLaunchUrl: 'http://localhost:51234/' });
+    const s = (host as unknown as { sessions: Map<string, { webLaunchUrl?: string }> }).sessions.get('w1');
+    expect(s?.webLaunchUrl).toBe('http://localhost:51234/');
+    await host.handle('sessionEnded', { sessionId: 'w1' });
+  });
+
   it('accepts the optional additions (workspaceFolders, uiVisible, fileSaved)', async () => {
     await host.handle('workspaceFolders', { workspaceFolders: [project, 'relative/ignored'] });
     await host.handle('uiVisible', { visible: true });
     expect(await host.handle('fileSaved', { path: path.join(project, 'x.js') })).toEqual({ approved: false });
     await expect(host.handle('fileSaved', { path: 'rel.js' })).rejects.toMatchObject({ code: 'invalid' });
+  });
+});
+
+describe('MCP token storage', () => {
+  const tmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'fi-mcp-'));
+  const store = () => {
+    const link = fakeLink();
+    const saved = new Map<string, string>();
+    link.answers['secrets.get'] = (p: { key: string }) => saved.get(p.key) ?? null;
+    link.answers['secrets.set'] = (p: { key: string; value: string }) => void saved.set(p.key, p.value);
+    return { link, saved };
+  };
+
+  it('keeps the token in the IDE password store, migrating a legacy file once and deleting it', async () => {
+    const dir = tmpDir();
+    fs.writeFileSync(path.join(dir, 'mcp-token'), 'L'.repeat(43), { mode: 0o600 });
+    const { link, saved } = store();
+    expect(await loadMcpToken(dir, link)).toBe('L'.repeat(43));
+    expect(saved.get(MCP_TOKEN_KEY)).toBe('L'.repeat(43));
+    expect(fs.existsSync(path.join(dir, 'mcp-token'))).toBe(false);
+    expect(await loadMcpToken(dir, link)).toBe('L'.repeat(43));
+    expect(link.requests.map((r) => r.method)).toEqual(['secrets.get', 'secrets.set', 'secrets.get']);
+  });
+
+  it('generates a new token into the store when there is none', async () => {
+    const dir = tmpDir();
+    const { link, saved } = store();
+    const t = await loadMcpToken(dir, link);
+    expect(t).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(saved.get(MCP_TOKEN_KEY)).toBe(t);
+    expect(fs.existsSync(path.join(dir, 'mcp-token'))).toBe(false);
+  });
+
+  it('falls back to a 0600 file only when the plugin answers unavailable; other errors propagate', async () => {
+    const dir = tmpDir();
+    const link = fakeLink();
+    link.answers['secrets.get'] = () => {
+      throw new RpcFailure('no password store', 'unavailable');
+    };
+    const t = await loadMcpToken(dir, link);
+    expect(fs.readFileSync(path.join(dir, 'mcp-token'), 'utf8')).toBe(t);
+    if (process.platform !== 'win32') expect(fs.statSync(path.join(dir, 'mcp-token')).mode & 0o777).toBe(0o600);
+    const broken = fakeLink();
+    broken.answers['secrets.get'] = () => {
+      throw new RpcFailure('keychain locked', 'failed');
+    };
+    await expect(loadMcpToken(tmpDir(), broken)).rejects.toThrow('keychain locked');
   });
 });

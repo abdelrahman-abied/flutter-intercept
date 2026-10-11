@@ -70,7 +70,13 @@ object UiRequestHandler {
             "secrets.clientCertPassphrase" -> CompletableFuture.supplyAsync({
                 ClientCertificates.getPassphrase(p.requireString("host"))?.takeIf { it.isNotEmpty() }
             }, AppExecutorUtil.getAppExecutorService())
-            else -> CompletableFuture.failedFuture(RpcException("Unknown request $method", "unknown-method"))
+            // The sidecar's own secrets (e.g. `flutterIntercept.mcpToken`) in the IDE's password safe; values never logged.
+            "secrets.get" -> CompletableFuture.supplyAsync({ secretGet(p.requireString("key")) }, AppExecutorUtil.getAppExecutorService())
+            "secrets.set" -> CompletableFuture.supplyAsync({
+                secretSet(p.requireString("key"), p.optString("value"))
+                null
+            }, AppExecutorUtil.getAppExecutorService())
+            else -> CompletableFuture.failedFuture(RpcException("Unknown request ${method.take(60)}", "unknown_method"))
         }
     }
 
@@ -87,7 +93,7 @@ object UiRequestHandler {
         val real: Path = try {
             PathGuard.check(path, allowedRoots())
         } catch (e: PathRefusedException) {
-            return CompletableFuture.failedFuture(RpcException(e.message ?: "Refused", "outside-workspace"))
+            return CompletableFuture.failedFuture(RpcException(e.message ?: "Refused", "outside_workspace"))
         }
         val line = p.optInt("line")
         val column = p.optInt("column")
@@ -263,6 +269,23 @@ object UiRequestHandler {
 
     fun secretAttributes(key: String) = CredentialAttributes(generateServiceName("Flutter Intercept", key))
 
+    /** Keys the sidecar may read and write: its own namespace only. */
+    fun checkSecretKey(key: String): String {
+        if (!Regex("""flutterIntercept\.[A-Za-z0-9_.:*\-]{1,200}""").matches(key)) throw RpcException("Secret keys must start with flutterIntercept.", "invalid")
+        return key
+    }
+
+    private fun secretGet(key: String): String? =
+        com.intellij.ide.passwordSafe.PasswordSafe.instance.getPassword(secretAttributes(checkSecretKey(key)))?.takeIf { it.isNotEmpty() }
+
+    /** Empty or absent value deletes the secret. */
+    private fun secretSet(key: String, value: String?) {
+        val k = checkSecretKey(key)
+        com.intellij.ide.passwordSafe.PasswordSafe.instance.set(
+            secretAttributes(k), if (value.isNullOrEmpty()) null else com.intellij.credentialStore.Credentials(k, value),
+        )
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────────────────────
 
     /** The project of the focused window, else any open project. */
@@ -298,5 +321,5 @@ object UiRequestHandler {
     private fun JsonObject.optString(key: String): String? = get(key)?.takeIf { it.isJsonPrimitive }?.asString
     private fun JsonObject.optBoolean(key: String): Boolean? = get(key)?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }?.asBoolean
     private fun JsonObject.optInt(key: String): Int? = get(key)?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }?.asDouble?.toInt()
-    private fun JsonObject.requireString(key: String): String = optString(key) ?: throw RpcException("$key is required", "bad-params")
+    private fun JsonObject.requireString(key: String): String = optString(key) ?: throw RpcException("$key is required", "invalid")
 }

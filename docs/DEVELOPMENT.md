@@ -115,11 +115,20 @@ What the script needs:
 
 It uses port 8899 by default, and exit code 0 means every check passed.
 
+## Android Studio / IntelliJ plugin
+
+`packages/sidecar` (Node, `npm run build -w @flutter-intercept/sidecar` → `dist/sidecar.js` + `dist/webview/`) and
+`packages/intellij` (Kotlin, Gradle wrapper; Java 25 from Android Studio's JBR). See
+[packages/intellij/README.md](../packages/intellij/README.md#build-from-source). Platform tests share one sandbox:
+don't run two Gradle test runs at once.
+
 ## Publishing
 
 Releases are made by the owner, one version at a time.
 
 - **VS Code Marketplace:** `npx vsce publish --packagePath flutter-intercept.vsix` with the publisher's token.
+- **JetBrains Marketplace** (Android Studio / IntelliJ): `./gradlew publishPlugin` from `packages/intellij` with
+  `PUBLISH_TOKEN` set (owner only), after `verifyPlugin` passes.
 - **Open VSX** (Cursor, Windsurf, VSCodium, Gitpod): once, create an account at open-vsx.org, sign the publisher
   agreement and claim the namespace (`npx ovsx create-namespace abdulrahman-obaid -p <token>`). Then, for each
   release, from `packages/extension`: `npm run package && OVSX_PAT=<token> npm run publish:ovsx`. Open VSX

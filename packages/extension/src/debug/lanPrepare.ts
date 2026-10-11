@@ -1,5 +1,9 @@
 /** Physical-iOS launch preparation (CONTRACTS §7). No `vscode` import: unit-tested. */
+import { randomBytes } from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { withSoftTimeout } from '../adb';
+import { isOurDefinesFile, LAN_DEFINES_PREFIX } from './rewrite';
 import type { DeviceKind } from '../iosDevices';
 import type { LanOpening } from '../proxyHost';
 
@@ -50,3 +54,60 @@ export async function prepareLan(
   }
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// REVIEW-9: LAN define files. The token-bearing FLUTTER_INTERCEPT_PROXY of a physical-iPhone session is passed with
+// `--dart-define-from-file` (src/debug/rewrite.ts), never on the command line. The file lives in the host's private
+// storage (VS Code globalStorage / the sidecar's dataDir — never the project): `<storage>/lan-defines/` (0700),
+// `flutter-intercept-lan-<32 hex>.json` (0600, created exclusively). Delete it when the session ends or the LAN
+// listener closes, and sweep stale ones at startup. flutter_tools still copies defines (base64) into gitignored
+// generated build files (ios/Flutter/Generated.xcconfig, flutter_export_environment.sh): accepted residual, the
+// token is per LAN opening.
+// ---------------------------------------------------------------------------------------------------------------
+
+export const LAN_DEFINES_DIR = 'lan-defines';
+
+/** A fresh path for a LAN define file under `storageDir` (nothing is written). */
+export function newLanDefinesPath(storageDir: string): string {
+  return path.join(path.resolve(storageDir), LAN_DEFINES_DIR, `${LAN_DEFINES_PREFIX}${randomBytes(16).toString('hex')}.json`);
+}
+
+/** Writes a LAN define file: its folder 0700 (never through a symlink), the file 0600, never overwriting. */
+export async function writeLanDefines(file: string, content: string): Promise<void> {
+  if (!isOurDefinesFile(file)) throw new Error('not a Flutter Intercept LAN define file path');
+  const dir = path.dirname(file);
+  await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+  const st = await fs.promises.lstat(dir);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`refusing to write the LAN define file through ${dir} (not a plain folder)`);
+  if (process.platform !== 'win32' && (st.mode & 0o077) !== 0) await fs.promises.chmod(dir, 0o700);
+  await fs.promises.writeFile(file, content, { mode: 0o600, flag: 'wx' });
+}
+
+/** Deletes one of our LAN define files (anything else is left alone). Never throws. */
+export async function removeLanDefines(file: string | undefined): Promise<void> {
+  if (!isOurDefinesFile(file)) return;
+  await fs.promises.unlink(file).catch(() => undefined);
+}
+
+/** Deletes every LAN define file under `storageDir` (startup sweep, LAN listener closed). Never throws; returns the count. */
+export async function cleanupLanDefines(storageDir: string): Promise<number> {
+  const dir = path.join(path.resolve(storageDir), LAN_DEFINES_DIR);
+  let names: string[];
+  try {
+    names = await fs.promises.readdir(dir);
+  } catch {
+    return 0;
+  }
+  let n = 0;
+  for (const name of names) {
+    const file = path.join(dir, name);
+    if (!isOurDefinesFile(file)) continue;
+    try {
+      await fs.promises.unlink(file);
+      n++;
+    } catch {
+      // gone already
+    }
+  }
+  return n;
+}

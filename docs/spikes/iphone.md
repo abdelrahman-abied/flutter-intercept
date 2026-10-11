@@ -95,6 +95,30 @@ The v3 entry builds `const _proxy = 'PROXY $_proxyAddress; DIRECT';` from the de
 - A base64url token contains no `:`, `@` or `;`.
 - The `; DIRECT` fallback and CA trust are untouched.
 
+## Update (v0.9.0, REVIEW-9): the token is no longer on the command line
+
+The IntelliJ Flutter plugin logs the full `flutter run` command line, both to idea.log (INFO
+`io.flutter.run.daemon.FlutterApp`) and to the Run console. A `--dart-define=FLUTTER_INTERCEPT_PROXY=flutter-intercept:<token>@…`
+argument would therefore leak the LAN token.
+
+What happens now:
+- For physical-iPhone sessions, both hosts write `{"FLUTTER_INTERCEPT_PROXY": "flutter-intercept:<token>@<ip>:<port>"}`
+  to a file and pass `--dart-define-from-file=<that file>` instead. The rewrite is shared (`src/debug/rewrite.ts`
+  `lanDefinesFile`, `src/debug/lanPrepare.ts`), so the VS Code host and the sidecar behave the same.
+- The file:
+  - lives in the host's private storage (VS Code globalStorage, or the sidecar's `dataDir`), in `lan-defines/` (0700),
+    never in the project;
+  - has a random name `flutter-intercept-lan-<32 hex>.json`, mode 0600, and is created exclusively.
+- R verified on macOS that `String.fromEnvironment` reads the value the same way from the file.
+- The file is deleted when the session ends or the LAN listener closes. Stale files are swept at startup.
+- On re-resolve and restore, our own `--dart-define-from-file` is removed, matched by name. The user's own define files
+  are kept.
+- Non-LAN sessions keep the inline `localhost` / `10.0.2.2` define, which holds no secret.
+
+Accepted residual: flutter_tools still copies the defines, base64-encoded, into generated build files that are
+gitignored. These are `ios/Flutter/Generated.xcconfig` (`DART_DEFINES`) and `ios/Flutter/flutter_export_environment.sh`.
+The token is per LAN opening, so a copy left there stops working once the listener closes or the network changes.
+
 ## Results so far
 
 The test proxy runs in LAN mode: `scripts/e2e/mitm_proxy.dart --bind 192.168.1.20 --token <t>`.

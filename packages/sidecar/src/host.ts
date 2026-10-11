@@ -6,8 +6,8 @@
  * WebSocket (uiServer.ts) instead of a webview.
  *
  * Plugin → sidecar methods: those of types.ts `PluginRequest`, plus three optional additions (see EXTRA_METHODS).
- * Sidecar → plugin: types.ts `SidecarRequest`s, plus `secrets.clientCertPassphrase` (optional for the plugin: an
- * error answer means "no passphrase"); events `ready`, `status`, `log`, plus `settingsChanged`.
+ * Sidecar → plugin: types.ts `SidecarRequest`s, including `secrets.clientCertPassphrase` (an error answer means "no
+ * passphrase") and `secrets.get` / `secrets.set` for the MCP token (`unavailable` → private file in dataDir); events `ready`, `status`, `log`, plus `settingsChanged`.
  */
 import { execFile } from 'child_process';
 import * as crypto from 'crypto';
@@ -25,6 +25,7 @@ import { analyzeAuth } from '../../extension/src/analysis/auth';
 import { CaStore, type CaGenerator } from '../../extension/src/ca';
 import { createCodegenService } from '../../extension/src/codegen/service';
 import type { GeneratedFile } from '../../extension/src/codegen/types';
+import { cleanupLanDefines, removeLanDefines } from '../../extension/src/debug/lanPrepare';
 import { PacServer } from '../../extension/src/debug/pacServer';
 import { createWebServerNotice } from '../../extension/src/debug/webServerNotice';
 import { toOpenApi, toPostman } from '../../extension/src/export';
@@ -42,6 +43,7 @@ import { InterceptController, validateRule, validateRules } from '../../extensio
 import { matchesProxyExchange } from '../../extension/src/vm/profile';
 import type { WebSocketCtor } from '../../extension/src/vm/transport';
 import { webScreenshot } from '../../extension/src/web/screenshot';
+import { createPathDecision } from '../../extension/src/rules/createPolicy';
 import { createNodeContractService, DONT_CHECK, type NodeContractService } from './contract';
 import { prepareLaunch, type LaunchRecord } from './launch';
 import { RpcFailure } from './rpc';
@@ -91,7 +93,7 @@ export interface SidecarHostOptions {
   uiToken?: string;
 }
 
-type SessionInfo = { record: LaunchRecord; deviceId?: string; vmServiceUri?: string };
+type SessionInfo = { record: LaunchRecord; deviceId?: string; vmServiceUri?: string; webLaunchUrl?: string };
 
 const AGENT_CLIENTS: readonly AgentClient[] = ['claude', 'cursor', 'gemini', 'windsurf', 'other'];
 const MAX_LAUNCHES = 50;
@@ -146,23 +148,70 @@ function appPackageNames(roots: string[]): string[] {
   return [...names];
 }
 
-/** Loads (or creates, 0600) the MCP token in `dataDir`. */
-export async function loadMcpToken(dataDir: string): Promise<string> {
-  const file = path.join(dataDir, MCP_TOKEN_FILE);
+/** REVIEW-9 #7: the MCP token lives in the IDE's password store under this key (`secrets.get` / `secrets.set`). */
+export const MCP_TOKEN_KEY = 'flutterIntercept.mcpToken';
+const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+
+/** The legacy / fallback token file (0600) in `dataDir`, if it holds a valid token. */
+async function readTokenFile(file: string): Promise<string | undefined> {
   try {
     const t = (await fs.promises.readFile(file, 'utf8')).trim();
-    if (/^[A-Za-z0-9_-]{43}$/.test(t)) {
-      if (process.platform !== 'win32' && ((await fs.promises.stat(file)).mode & 0o077) !== 0) await fs.promises.chmod(file, 0o600);
-      return t;
-    }
+    return TOKEN_RE.test(t) ? t : undefined;
   } catch {
-    // create below
+    return undefined;
+  }
+}
+
+/** Fallback only (the plugin has no password store): loads or creates the 0600 token file. */
+export async function loadMcpTokenFile(dataDir: string): Promise<string> {
+  const file = path.join(dataDir, MCP_TOKEN_FILE);
+  const existing = await readTokenFile(file);
+  if (existing) {
+    if (process.platform !== 'win32' && ((await fs.promises.stat(file)).mode & 0o077) !== 0) await fs.promises.chmod(file, 0o600);
+    return existing;
   }
   const token = generateToken();
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   await fs.promises.mkdir(dataDir, { recursive: true, mode: 0o700 });
   await fs.promises.writeFile(tmp, token, { mode: 0o600, flag: 'wx' });
   await fs.promises.rename(tmp, file);
+  return token;
+}
+
+const isUnavailable = (e: unknown) => {
+  const code = (e as RpcFailure)?.code;
+  return code === 'unavailable' || code === 'unknown_method';
+};
+
+/**
+ * The MCP token: from the plugin's password store (`secrets.get`); else migrated once from the legacy file (then
+ * deleted) or newly generated, and stored with `secrets.set`. Only when the plugin answers `unavailable` (or doesn't
+ * know the methods) is the 0600 file in `dataDir` used. Other errors propagate (the MCP server doesn't start).
+ */
+export async function loadMcpToken(dataDir: string, link: Pick<PluginLink, 'request'>, log: (m: string) => void = () => undefined): Promise<string> {
+  const file = path.join(dataDir, MCP_TOKEN_FILE);
+  let stored: unknown;
+  try {
+    stored = await link.request('secrets.get', { key: MCP_TOKEN_KEY });
+  } catch (e) {
+    if (isUnavailable(e)) {
+      log('MCP: the IDE has no password store available; keeping the token in a private file');
+      return loadMcpTokenFile(dataDir);
+    }
+    throw e;
+  }
+  if (typeof stored === 'string' && TOKEN_RE.test(stored)) {
+    await fs.promises.unlink(file).catch(() => undefined); // a leftover legacy file
+    return stored;
+  }
+  const token = (await readTokenFile(file)) ?? generateToken();
+  try {
+    await link.request('secrets.set', { key: MCP_TOKEN_KEY, value: token });
+  } catch (e) {
+    if (isUnavailable(e)) return loadMcpTokenFile(dataDir);
+    throw e;
+  }
+  await fs.promises.unlink(file).catch(() => undefined);
   return token;
 }
 
@@ -305,7 +354,6 @@ export class SidecarHost {
     this.initialized = true;
     this.compose();
     const uiUrl = await this.ui.start();
-    this.secrets.add(this.ui.token);
     await this.reconcileMcp();
     const result: InitResult = { uiUrl, ...(this.mcp ? { mcpUrl: this.mcp.url } : {}), version: this.o.version };
     this.log(`Flutter Intercept sidecar ${this.o.version} for ${this.ide.name || 'IDE'} ${this.ide.version} (plugin ${this.ide.pluginVersion || '?'}), ${this.folders.length} project folder(s)`);
@@ -317,6 +365,8 @@ export class SidecarHost {
   private compose(): void {
     const log = this.log;
     this.state = new JsonStateStore(this.dataDir, log);
+    void cleanupLanDefines(this.dataDir).then((n) => n && log(`removed ${n} stale LAN define file(s)`));
+    this.disposers.push(() => cleanupLanDefines(this.dataDir));
     this.ca = new CaStore(this.dataDir, { log, ...(this.o.caGenerate ? { generate: this.o.caGenerate } : {}) });
     const adbOpts = { log, ...(this.o.adbExec ? { exec: this.o.adbExec } : {}), ...(this.o.adbPath !== undefined ? { adbPath: this.o.adbPath } : {}) };
     this.reverses = new ReverseTracker(adbOpts);
@@ -504,7 +554,7 @@ export class SidecarHost {
       takeScreenshot: (target) => {
         const s = this.sessions.get(target.sessionId);
         if (s?.record.web) {
-          return webScreenshot(target, { appUrl: () => undefined, webFlags: () => s.record.webFlags, exec: execTool, log });
+          return webScreenshot(target, { appUrl: () => s.webLaunchUrl, webFlags: () => s.record.webFlags, exec: execTool, log });
         }
         return takeScreenshot(target, { callService: (sid, method, params) => this.vm.callService(sid, method, params), exec: execTool, log });
       },
@@ -537,7 +587,10 @@ export class SidecarHost {
     // Status events for the plugin's status bar widget.
     this.proxyHost.on('state', () => this.emitStatus());
     this.proxyHost.on('lan', (l: unknown) => {
-      if (!l) this.lanWatcher.stop();
+      if (!l) {
+        this.lanWatcher.stop();
+        void cleanupLanDefines(this.dataDir); // REVIEW-9: no LAN token file outlives the listener
+      }
       this.emitStatus();
       this.controller.broadcastStatus();
     });
@@ -682,7 +735,8 @@ export class SidecarHost {
       this.applyUpstreamProxy();
     }
     if (changed('tlsPassthrough')) this.proxyHost.setTlsPassthrough(next.tlsPassthrough);
-    if (changed('clientCertificates')) await this.applyClientCertificates();
+    // Always re-load: a passphrase changed in the IDE's password store arrives as a `settings` call (REVIEW-9 #7).
+    await this.applyClientCertificates();
     if (changed('contractCheck')) this.controller.recheckContracts();
     if (changed('notifications')) this.notifications.refreshLevel();
     if (changed('agent')) await this.reconcileMcp();
@@ -702,7 +756,7 @@ export class SidecarHost {
       }
       if (want && !this.mcp) {
         try {
-          this.mcpToken ??= await loadMcpToken(this.dataDir);
+          this.mcpToken ??= await loadMcpToken(this.dataDir, { request: (m, p) => withTimeout(this.o.link.request(m, p), 10_000, m) }, this.log);
           this.secrets.add(this.mcpToken);
           this.mcp = await startMcpServer({
             port: Number.isInteger(port) ? port : DEFAULT_MCP_PORT,
@@ -849,6 +903,20 @@ export class SidecarHost {
       if (secret) throw new Error(secret);
       const root = roots.find((r) => abs.startsWith(r + path.sep));
       if (!root) throw new Error(`The ${what} must be inside the project.`);
+      // REVIEW-9 #2: silently only under .vscode/flutter-intercept/; never build / VCS / IDE / tool config; else ask.
+      const decisions = [createPathDecision(rel), createPathDecision(path.relative(root, abs))];
+      const refused = decisions.find((d) => d.kind === 'refuse');
+      if (refused && refused.kind === 'refuse') throw new Error(`Refusing to create ${rel}: ${refused.reason}.`);
+      if (decisions.some((d) => d.kind === 'confirm')) {
+        const CREATE = 'Create';
+        const ok = await this.ask<string | null>('ui.confirm', {
+          message: `Create ${abs}?`,
+          detail: `The Flutter Intercept traffic view wants to create this new ${what} in ${root}. Only continue if you started this yourself.`,
+          buttons: [CREATE],
+          modal: true,
+        });
+        if (ok !== CREATE) throw new Error(`Not created: ${rel}.`);
+      }
       let dir = root;
       for (const seg of path.relative(root, path.dirname(abs)).split(path.sep).filter(Boolean)) {
         dir = path.join(dir, seg);
@@ -891,6 +959,7 @@ export class SidecarHost {
           unavailable: (message) => void this.notify('warning', message),
         },
         webPac: this.webPac,
+        lanDefinesDir: this.dataDir,
         webSkipped: (m) => this.webSkipped(m),
         log: this.log,
       },
@@ -922,7 +991,9 @@ export class SidecarHost {
     this.launches.delete(record.launchId);
     const deviceId = typeof p.deviceId === 'string' && p.deviceId ? p.deviceId : record.deviceId;
     const vmServiceUri = typeof p.vmServiceUri === 'string' && p.vmServiceUri ? p.vmServiceUri : undefined;
-    this.sessions.set(p.sessionId, { record, deviceId, vmServiceUri });
+    const web = (p as { webLaunchUrl?: unknown }).webLaunchUrl;
+    const webLaunchUrl = typeof web === 'string' && /^https?:\/\//.test(web) && web.length <= 2048 ? web : undefined;
+    this.sessions.set(p.sessionId, { record, deviceId, vmServiceUri, ...(webLaunchUrl ? { webLaunchUrl } : {}) });
     this.refreshAppPackages();
     this.controller.setSessions(this.sessions.size);
     this.emitStatus();
@@ -960,6 +1031,7 @@ export class SidecarHost {
     if (typeof id !== 'string') return;
     void this.nativeRoutes.release(id).catch((e: unknown) => this.log(`emulator proxy release failed: ${String(e)}`));
     this.lanLife.ended(id);
+    void removeLanDefines(this.sessions.get(id)?.record.lanDefinesFile);
     if (this.webSessions.delete(id) && this.webSessions.size === 0) this.proxyHost.setWebSessionActive(false);
     this.vm.detach(id);
     this.proxyHost.setWarnings(id, []);
@@ -995,6 +1067,16 @@ export class SidecarHost {
     })();
     return this.shuttingDown;
   }
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new RpcFailure(`${what}: no answer from the IDE within ${ms} ms`, 'timeout')), ms);
+    p.then(
+      (v) => (clearTimeout(t), resolve(v)),
+      (e: unknown) => (clearTimeout(t), reject(e)),
+    );
+  });
 }
 
 /** Runs a tool with an argument array (no shell), stdout as bytes. */

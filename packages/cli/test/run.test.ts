@@ -282,15 +282,23 @@ describe('physical iPhone: LAN listener (CONTRACTS §7, §14.1)', () => {
     });
   }
 
-  it.skipIf(!lanIp)('no ::add-mask:: outside GitHub Actions, and the token is never printed', async () => {
+  it.skipIf(!lanIp)('no ::add-mask:: outside GitHub Actions, the token is never printed, the exit hook deletes the defines file', async () => {
     const token = crypto.randomBytes(32).toString('base64url');
-    const f = fake((_a, c) => c.exit(0), IPHONE);
+    let gone: boolean | undefined;
+    const f = fake((args, c) => {
+      const file = args.find((a) => a.startsWith('--dart-define-from-file='))!.slice('--dart-define-from-file='.length);
+      expect(fs.existsSync(file)).toBe(true);
+      f.exitHooks[0](); // what process.on('exit') runs if the process dies mid-run
+      gone = !fs.existsSync(file);
+      c.exit(0);
+    }, IPHONE);
     f.deps.lanAddress = async () => ({ address: lanIp!, iface: 'en0' });
     f.deps.newToken = () => token;
     expect((await runCli(base({ device: 'IPHONE' }), f.deps)).exitCode).toBe(0);
     const printed = [...f.logs, ...f.out];
     expect(printed.some((l) => l.startsWith('::add-mask::'))).toBe(false);
     expect(printed.join('\n')).not.toContain(token);
+    expect(gone).toBe(true);
   });
 
   it('refuses without a LAN address, before anything starts', async () => {
@@ -320,8 +328,17 @@ describe('physical iPhone: LAN listener (CONTRACTS §7, §14.1)', () => {
     const token = crypto.randomBytes(32).toString('base64url');
     let seen: { define: string; noAuth: number; wrong: number; ok: number } | undefined;
     let lanPort = 0;
+    let definesFile = '';
+    let fileModes: { file: number; dir: number } | undefined;
     const f = fake(async (args, child) => {
-      const define = args.find((a) => a.startsWith('--dart-define=FLUTTER_INTERCEPT_PROXY='))!.slice('--dart-define=FLUTTER_INTERCEPT_PROXY='.length);
+      // REVIEW-9: the token-bearing define comes in a 0600 JSON file in the run's 0700 temp dir, not in the argv
+      expect(args.some((a) => a.includes(token))).toBe(false);
+      expect(args.some((a) => a.includes('FLUTTER_INTERCEPT_PROXY'))).toBe(false);
+      definesFile = args.find((a) => a.startsWith('--dart-define-from-file='))!.slice('--dart-define-from-file='.length);
+      expect(path.isAbsolute(definesFile)).toBe(true);
+      expect(path.basename(path.dirname(path.dirname(definesFile)))).toMatch(/^flutter-intercept-run-/);
+      fileModes = { file: fs.statSync(definesFile).mode & 0o777, dir: fs.statSync(path.dirname(path.dirname(definesFile))).mode & 0o777 };
+      const define = (JSON.parse(fs.readFileSync(definesFile, 'utf8')) as Record<string, string>).FLUTTER_INTERCEPT_PROXY;
       const m = /^flutter-intercept:([^@]+)@([\d.]+):(\d+)$/.exec(define)!;
       lanPort = Number(m[3]);
       const basic = (t: string) => `Basic ${Buffer.from(`flutter-intercept:${t}`).toString('base64')}`;
@@ -339,6 +356,9 @@ describe('physical iPhone: LAN listener (CONTRACTS §7, §14.1)', () => {
     const r = await runCli(base({ device: 'IPHONE', har: 'out/run.har', noRedact: true, record: 'out/rec.json', flutterArgs: ['-v'] }), f.deps);
 
     expect(seen).toEqual({ define: `flutter-intercept:${token}@${lanIp}:${lanPort}`, noAuth: 407, wrong: 407, ok: 201 });
+    if (process.platform !== 'win32') expect(fileModes).toEqual({ file: 0o600, dir: 0o700 });
+    expect(fs.existsSync(definesFile)).toBe(false);
+    expect(fs.existsSync(path.dirname(path.dirname(definesFile)))).toBe(false);
     expect(r.exitCode).toBe(0);
     const b64 = Buffer.from(`flutter-intercept:${token}`).toString('base64');
     // REVIEW-8 #12: in GitHub Actions the runner is told to mask the token and the Basic credential; those two
@@ -346,7 +366,7 @@ describe('physical iPhone: LAN listener (CONTRACTS §7, §14.1)', () => {
     expect([...f.logs, ...f.out].filter((l) => l.includes(token) || l.includes(b64))).toEqual([`::add-mask::${token}`, `::add-mask::${b64}`]);
     const printed = [...f.logs, ...f.out].filter((l) => !l.startsWith('::add-mask::')).join('\n');
     expect(printed).not.toContain(token);
-    expect(printed).toContain(`--dart-define=FLUTTER_INTERCEPT_PROXY=flutter-intercept:***@${lanIp}:${lanPort}`);
+    expect(printed).toContain(`--dart-define-from-file=${definesFile}`);
     expect(f.logs.filter((l) => l.includes('Local Network'))).toHaveLength(1);
     expect(printed).toMatch(/flutter -v prints dart-define values/);
     for (const out of ['out/run.har', 'out/rec.json']) {
@@ -376,6 +396,9 @@ describe('helpers', () => {
   it('builds the flutter test command with our defines last', () => {
     expect(flutterTestArgs(['w.dart'], 'macos', 'localhost:1', 'abc', ['--flavor', 'x'])).toEqual([
       'test', 'w.dart', '-d', 'macos', '--flavor', 'x', '--dart-define=FLUTTER_INTERCEPT_PROXY=localhost:1', '--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=abc',
+    ]);
+    expect(flutterTestArgs(['w.dart'], 'IPHONE', { definesFile: '/tmp/x/lan-defines/f.json' }, 'abc', [])).toEqual([
+      'test', 'w.dart', '-d', 'IPHONE', '--dart-define-from-file=/tmp/x/lan-defines/f.json', '--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=abc',
     ]);
   });
 

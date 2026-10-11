@@ -47,18 +47,21 @@ class ConfirmDialog(
     }
 
     override fun createActions(): Array<Action> {
-        val choices = buttons.mapIndexed { i, label ->
+        // Cancel is the default button: Enter must never approve (e.g. a shared rule, REVIEW-9 #7).
+        cancelAction.putValue(DEFAULT_ACTION, true)
+        return (choiceActions(buttons) { label ->
+            chosen = label
+            close(OK_EXIT_CODE)
+        } + cancelAction).toTypedArray()
+    }
+
+    companion object {
+        /** One action per button; none of them is the default. */
+        fun choiceActions(buttons: List<String>, onChoose: (String) -> Unit): List<Action> = buttons.map { label ->
             object : AbstractAction(label) {
-                init {
-                    if (i == 0) putValue(DEFAULT_ACTION, true)
-                }
-                override fun actionPerformed(e: ActionEvent?) {
-                    chosen = label
-                    close(OK_EXIT_CODE)
-                }
+                override fun actionPerformed(e: ActionEvent?) = onChoose(label)
             }
         }
-        return (choices + cancelAction).toTypedArray()
     }
 
     /** Shows the dialog (EDT) and returns the chosen button, or null for Cancel / Escape. */

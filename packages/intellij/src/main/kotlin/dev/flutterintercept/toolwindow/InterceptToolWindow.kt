@@ -2,7 +2,6 @@
 // the sidecar restarts. Without JCEF (Android Studio 2026.2 ships none) it offers the UI in the system browser.
 package dev.flutterintercept.toolwindow
 
-import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
@@ -93,7 +92,9 @@ class InterceptToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             return
         }
         val parent = Disposer.newDisposable(this, "Flutter Intercept JCEF")
-        val created = JcefBridge.create("about:blank", init.uiOrigin, parent)
+        // The guard reads the sidecar's current origin, so a restart on a new port stays inside JCEF (REVIEW-9 #4).
+        val guard = NavigationGuard(currentOrigin = { sidecar.init?.uiOrigin }, loadFresh = { onEdt { loadFresh() } })
+        val created = JcefBridge.create("about:blank", guard, parent)
         if (created == null) {
             Disposer.dispose(parent)
             showExternal(init)
@@ -105,10 +106,15 @@ class InterceptToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         loadFresh()
     }
 
+    @Volatile private var fetching = false
+
     /** Every load uses a fresh one-time URL from the sidecar (CONTRACTS §15.4); URLs are never logged. */
     private fun loadFresh() {
+        if (fetching) return
+        fetching = true
         sidecar.freshUiUrl().whenComplete { url, e ->
             onEdt {
+                fetching = false
                 if (url != null) browser?.load(url)
                 else showMessage("Flutter Intercept couldn't open the traffic view: ${e?.cause?.message ?: e?.message}", true)
             }
@@ -119,7 +125,8 @@ class InterceptToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         val box = centered()
         val text = JBLabel(
             "<html><div style='text-align:center'>This IDE has no embedded browser (JCEF), so the traffic view opens " +
-                "in your web browser.<br>It stays private to this computer and works only while the IDE runs.</div></html>",
+                "in your web browser.<br>It stays private to this computer and works only while the IDE runs. Browser " +
+                "extensions allowed to read local (127.0.0.1) pages can see it too.</div></html>",
             SwingConstants.CENTER,
         )
         val open = JButton("Open Traffic in Browser").apply {
@@ -127,7 +134,8 @@ class InterceptToolWindowPanel(private val project: Project) : JPanel(BorderLayo
                 // A fresh one-time URL each time: a used one in the browser history is worthless (CONTRACTS §15.4).
                 sidecar.freshUiUrl().whenComplete { url, e ->
                     onEdt {
-                        if (url != null) BrowserUtil.browse(url)
+                        // Through a private redirect file: the one-time URL never appears on a command line (REVIEW-9 #3).
+                        if (url != null) BrowserLauncher.open(url, SidecarProcess.dataDir())
                         else Notifications.notify(project, NotificationType.ERROR, "Flutter Intercept couldn't open the traffic view: ${e?.cause?.message ?: e?.message}")
                     }
                 }

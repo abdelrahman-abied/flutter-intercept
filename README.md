@@ -76,6 +76,12 @@ code --install-extension abdulrahman-obaid.flutter-intercept
 It needs the [Dart extension](https://marketplace.visualstudio.com/items?itemName=Dart-Code.dart-code), which VS
 Code installs for you.
 
+### Android Studio and IntelliJ IDEA (preview)
+
+A plugin for Android Studio 2026.2+ and IntelliJ IDEA with the Flutter plugin brings the same traffic view, rules,
+recordings and agent tools. It needs **Node.js 18+** on your machine. Build it from this repository for now
+([packages/intellij](packages/intellij/README.md)); JetBrains Marketplace publishing comes with the first release.
+
 ## Quick start
 
 1. Open your Flutter project in VS Code.

@@ -61,14 +61,51 @@ export const TRACE_DEFINE = 'FLUTTER_INTERCEPT_TRACE';
 /** Every dart-define we own. */
 export const OUR_DEFINES = [SHA_DEFINE, PROXY_DEFINE, TRACE_DEFINE] as const;
 
-/** toolArgs without the given defines (both `--dart-define=K=V` and `--dart-define K=V`). */
+/**
+ * REVIEW-9: the LAN token must never be on a command line (the IntelliJ Flutter plugin logs the full `flutter run`
+ * command to idea.log and the Run console; Dart-Code's logs may too). For LAN sessions FLUTTER_INTERCEPT_PROXY goes
+ * into a 0600 JSON file passed with `--dart-define-from-file` (`String.fromEnvironment` reads it the same way).
+ * Our files are recognised by name only: `flutter-intercept-lan-<32 hex>.json` (written by src/debug/lanPrepare.ts
+ * in the host's private storage, never in the project).
+ */
+export const DEFINE_FROM_FILE = '--dart-define-from-file';
+export const LAN_DEFINES_PREFIX = 'flutter-intercept-lan-';
+const LAN_DEFINES_NAME = /^flutter-intercept-lan-[0-9a-f]{32}\.json$/;
+
+/** Whether `file` is one of our LAN define files (absolute, our name pattern). */
+export function isOurDefinesFile(file: unknown): file is string {
+  return typeof file === 'string' && path.isAbsolute(file) && LAN_DEFINES_NAME.test(path.basename(file));
+}
+
+/** Our LAN define file named in `toolArgs` (`--dart-define-from-file=<ours>` or the two-token form), if any. */
+export function lanDefinesFileIn(toolArgs: unknown): string | undefined {
+  const args = Array.isArray(toolArgs) ? (toolArgs as unknown[]).map(String) : [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === DEFINE_FROM_FILE && isOurDefinesFile(args[i + 1])) return args[i + 1];
+    if (args[i].startsWith(`${DEFINE_FROM_FILE}=`) && isOurDefinesFile(args[i].slice(DEFINE_FROM_FILE.length + 1))) return args[i].slice(DEFINE_FROM_FILE.length + 1);
+  }
+  return undefined;
+}
+
+/** The JSON a LAN define file holds. */
+export function lanDefinesContent(proxyAddress: string): string {
+  return `${JSON.stringify({ [PROXY_DEFINE]: proxyAddress })}\n`;
+}
+
+/**
+ * toolArgs without the given defines (both `--dart-define=K=V` and `--dart-define K=V`); when the proxy define is
+ * among them, also without our LAN `--dart-define-from-file` (never the user's own define files).
+ */
 export function stripDefines(toolArgs: unknown, names: readonly string[] = OUR_DEFINES): string[] {
   const args = Array.isArray(toolArgs) ? (toolArgs as unknown[]).map(String) : [];
   const isOurs = (a: string | undefined) => typeof a === 'string' && names.some((n) => a.startsWith(`${n}=`));
+  const files = names.includes(PROXY_DEFINE);
   const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--dart-define' && isOurs(args[i + 1])) { i++; continue; }
     if (args[i].startsWith('--dart-define=') && isOurs(args[i].slice('--dart-define='.length))) continue;
+    if (files && args[i] === DEFINE_FROM_FILE && isOurDefinesFile(args[i + 1])) { i++; continue; }
+    if (files && args[i].startsWith(`${DEFINE_FROM_FILE}=`) && isOurDefinesFile(args[i].slice(DEFINE_FROM_FILE.length + 1))) continue;
     out.push(args[i]);
   }
   return out;
@@ -84,12 +121,15 @@ export function withShaDefine(toolArgs: unknown, sha: string): string[] {
   return [...stripShaDefine(toolArgs), `--dart-define=${SHA_DEFINE}=${sha}`];
 }
 
-/** Replaces (never duplicates) both of our defines: the entry hash and the proxy address. */
-export function withInterceptDefines(toolArgs: unknown, sha: string, proxyAddress: string, captureSource = true): string[] {
+/**
+ * Replaces (never duplicates) both of our defines: the entry hash and the proxy address. With `definesFile` the proxy
+ * address is not on the command line: `--dart-define-from-file=<definesFile>` instead (the caller writes the file).
+ */
+export function withInterceptDefines(toolArgs: unknown, sha: string, proxyAddress: string, captureSource = true, definesFile?: string): string[] {
   return [
     ...stripDefines(toolArgs),
     `--dart-define=${SHA_DEFINE}=${sha}`,
-    `--dart-define=${PROXY_DEFINE}=${proxyAddress}`,
+    definesFile ? `${DEFINE_FROM_FILE}=${definesFile}` : `--dart-define=${PROXY_DEFINE}=${proxyAddress}`,
     ...(captureSource ? [] : [`--dart-define=${TRACE_DEFINE}=0`]),
   ];
 }
@@ -189,6 +229,12 @@ export interface RewriteContext {
   physicalIos?: boolean;
   /** The open LAN listener for a physical-iOS session; undefined = no LAN address (do not intercept). */
   lan?: { host: string; port: number; token: string };
+  /**
+   * REVIEW-9: absolute path (our name pattern, in the host's private storage) for the LAN define file. With it, a LAN
+   * session gets `--dart-define-from-file=<path>` instead of the token-bearing define, and the result's `lanDefines`
+   * says what to write there before launching. Without it (or a path that isn't ours) the define stays inline.
+   */
+  lanDefinesFile?: string;
   /** fsPath of the folder VS Code passed to the provider (may be undefined). */
   folder?: string;
   /** fsPaths of all workspace folders. */
@@ -252,6 +298,8 @@ export type RewriteResult =
       needsAdbReverse: boolean;
       /** Physical iOS: the session goes through the LAN listener. */
       lan: boolean;
+      /** LAN session with `lanDefinesFile`: write `content` to `path` (0600) before launching. Holds the token. */
+      lanDefines?: { path: string; content: string };
     };
 
 /** Normalizes Dart-Code's `debuggerType` (number or case-insensitive name) to a name. */
@@ -455,7 +503,9 @@ function rewriteOrSkip(input: DebugConfig, ctx: RewriteContext): RewriteResult {
   // flutter_tools keeps .dart_tool out of Gradle inputs: the SHA define forces a rebuild of a changed entry.
   // Flutter only: the Dart VM rejects --dart-define; plain Dart uses the entry's localhost:<port> default.
   // LAN (physical iOS): `flutter-intercept:<token>@<lanIp>:<port>`; the token lives only in this define.
-  if (flutter) config.toolArgs = withInterceptDefines(config.toolArgs, plan.sha, lan ? lanProxyAddress(lan) : `${proxyHost}:${proxyPort}`, ctx.captureSource !== false);
+  const definesFile = lan && isOurDefinesFile(ctx.lanDefinesFile) ? ctx.lanDefinesFile : undefined;
+  const proxyAddress = lan ? lanProxyAddress(lan) : `${proxyHost}:${proxyPort}`;
+  if (flutter) config.toolArgs = withInterceptDefines(config.toolArgs, plan.sha, proxyAddress, ctx.captureSource !== false, definesFile);
   if (mode === 'before' || mode === 'already') {
     if (!config.cwd && cwd) config.cwd = cwd;
     // Pin the debugger type; otherwise Dart-Code treats a program under .dart_tool/ as plain Dart.
@@ -471,6 +521,7 @@ function rewriteOrSkip(input: DebugConfig, ctx: RewriteContext): RewriteResult {
     deviceId,
     needsAdbReverse: flutter && !lan && proxyHost === 'localhost',
     lan: !!lan,
+    ...(flutter && definesFile ? { lanDefines: { path: definesFile, content: lanDefinesContent(proxyAddress) } } : {}),
   };
 }
 

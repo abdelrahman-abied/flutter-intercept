@@ -60,12 +60,31 @@ class PluginPlatformTest : BasePlatformTestCase() {
     fun testUnknownRequestIsAnError() {
         val e = try { handle("ui.nope", "{}"); null } catch (e: ExecutionException) { e.cause }
         assertTrue(e is RpcException)
+        assertEquals("unknown_method", (e as RpcException).code)
+    }
+
+    fun testSidecarSecretsRoundTrip() {
+        handle("secrets.set", """{"key":"flutterIntercept.testSecret","value":"s3cret"}""")
+        assertEquals("s3cret", handle("secrets.get", """{"key":"flutterIntercept.testSecret"}"""))
+        handle("secrets.set", """{"key":"flutterIntercept.testSecret"}""")
+        assertNull(handle("secrets.get", """{"key":"flutterIntercept.testSecret"}"""))
+        val e = try { handle("secrets.get", """{"key":"other.key"}"""); null } catch (e: ExecutionException) { e.cause }
+        assertTrue(e is RpcException)
+    }
+
+    fun testDataDirIsDurableAndPrivate() {
+        val dir = SidecarProcess.dataDir()
+        assertTrue(dir.path, dir.path.startsWith(com.intellij.openapi.application.PathManager.getConfigPath()))
+        if (!System.getProperty("os.name").startsWith("Windows")) {
+            assertEquals("rwx------", java.nio.file.attribute.PosixFilePermissions.toString(Files.getPosixFilePermissions(dir.toPath())))
+        }
     }
 
     fun testRealSidecarStartsAndPreparesALaunch() {
         val script = File("../sidecar/dist/sidecar.js").absoluteFile
         if (!script.isFile) return // bundle not built
         System.setProperty(SIDECAR_PATH_PROPERTY, script.path)
+        System.setProperty("flutter.intercept.dev", "true") // the override needs it (and a sandbox)
         val settings = InterceptSettings.getInstance()
         val before = settings.snapshot()
         settings.update(settings.snapshot().apply { port = 18_899; agentAccess = "off"; agentMcpPort = 18_823 })
@@ -94,6 +113,7 @@ class PluginPlatformTest : BasePlatformTestCase() {
             sidecar.dispose()
             settings.update(before)
             System.clearProperty(SIDECAR_PATH_PROPERTY)
+            System.clearProperty("flutter.intercept.dev")
         }
     }
 }

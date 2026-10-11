@@ -8,7 +8,8 @@ import dev.flutterintercept.sidecar.InitResult
 import dev.flutterintercept.sidecar.SidecarStatus
 import dev.flutterintercept.sidecar.redactSecrets
 import dev.flutterintercept.status.InterceptStatusBarWidget
-import dev.flutterintercept.toolwindow.JcefBridge
+import dev.flutterintercept.sidecar.devOverrideAllowed
+import dev.flutterintercept.ui.ConfirmDialog
 import dev.flutterintercept.ui.UiRequestHandler
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -76,13 +77,31 @@ class MiscTest {
     }
 
     @Test
-    fun jcefNavigationStaysOnTheUiOrigin() {
-        val o = "http://127.0.0.1:51234"
-        assertTrue(JcefBridge.isInternal("$o/?t=x", o))
-        assertTrue(JcefBridge.isInternal("$o/assets/app.js", o))
-        assertFalse(JcefBridge.isInternal("http://127.0.0.1:512345/", o))
-        assertFalse(JcefBridge.isInternal("https://pub.dev/packages/http", o))
-        assertTrue(JcefBridge.isInternal("about:blank", o))
+    fun confirmChoicesAreNeverTheDefaultButton() {
+        val chosen = mutableListOf<String>()
+        val actions = ConfirmDialog.choiceActions(listOf("Approve", "Approve All")) { chosen += it }
+        assertEquals(2, actions.size)
+        assertTrue(actions.none { it.getValue(com.intellij.openapi.ui.DialogWrapper.DEFAULT_ACTION) == true })
+        actions[0].actionPerformed(null)
+        assertEquals(listOf("Approve"), chosen)
+    }
+
+    @Test
+    fun devSidecarOverrideOnlyInASandbox() {
+        val sandbox = mapOf("flutter.intercept.dev" to "true", "idea.plugins.path" to "/repo/.intellijPlatform/sandbox/x/plugins")
+        assertTrue(devOverrideAllowed(sandbox::get, false))
+        assertFalse("flag missing", devOverrideAllowed(mapOf("idea.plugins.path" to "/x/sandbox/plugins")::get, true))
+        assertFalse("not a sandbox", devOverrideAllowed(mapOf("flutter.intercept.dev" to "true")::get, false))
+        assertTrue("internal mode", devOverrideAllowed(mapOf("flutter.intercept.dev" to "true")::get, true))
+    }
+
+    @Test
+    fun secretKeysStayInTheirNamespace() {
+        assertEquals("flutterIntercept.mcpToken", UiRequestHandler.checkSecretKey("flutterIntercept.mcpToken"))
+        assertEquals("flutterIntercept.clientCertificatePassphrase:*.corp.example", UiRequestHandler.checkSecretKey("flutterIntercept.clientCertificatePassphrase:*.corp.example"))
+        for (bad in listOf("other.key", "flutterIntercept.", "flutterIntercept.a b", "xflutterIntercept.mcpToken")) {
+            try { UiRequestHandler.checkSecretKey(bad); org.junit.Assert.fail(bad) } catch (e: dev.flutterintercept.sidecar.RpcException) { assertEquals("invalid", e.code) }
+        }
     }
 
     @Test

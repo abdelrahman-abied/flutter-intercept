@@ -92,6 +92,14 @@ class SettingsTest {
     }
 
     @Test
+    fun passphraseChangeIsStoredThenSettingsAreResent() {
+        val calls = mutableListOf<String>()
+        ClientCertificates.applyPassphrase("api.example", "pw", store = { h, p -> calls += "store $h ${p != null}" }, resend = { calls += "resend" })
+        ClientCertificates.applyPassphrase("api.example", "", store = { h, p -> calls += "store $h ${!p.isNullOrEmpty()}" }, resend = { calls += "resend" })
+        assertEquals(listOf("store api.example true", "resend", "store api.example false", "resend"), calls)
+    }
+
+    @Test
     fun clientCertificateLines() {
         val (entries, bad) = ClientCertificates.parse(
             """

@@ -132,7 +132,7 @@ class JsonLineRpcTest {
 
     @Test
     fun nullResultIsSentExplicitlyAndFailuresBecomeErrors() {
-        handler = { m, _ -> if (m == "ui.pick") CompletableFuture.completedFuture(null) else CompletableFuture.failedFuture(RpcException("outside", "outside-workspace")) }
+        handler = { m, _ -> if (m == "ui.pick") CompletableFuture.completedFuture(null) else CompletableFuture.failedFuture(RpcException("outside", "outside_workspace")) }
         sidecarSends("""{"id":-2,"method":"ui.pick","params":{"items":[]}}""")
         val r = sidecarReads()
         assertEquals(-2, r.get("id").asLong)
@@ -140,7 +140,7 @@ class JsonLineRpcTest {
         sidecarSends("""{"id":-3,"method":"ui.openFile","params":{"path":"/etc/passwd"}}""")
         val err = sidecarReads()
         assertEquals("outside", err.getAsJsonObject("error").get("message").asString)
-        assertEquals("outside-workspace", err.getAsJsonObject("error").get("code").asString)
+        assertEquals("outside_workspace", err.getAsJsonObject("error").get("code").asString)
         assertFalse(err.has("result"))
     }
 
@@ -175,6 +175,26 @@ class JsonLineRpcTest {
         assertTrue(rpc.isClosed)
         val after = rpc.request("x", null, 1_000)
         assertTrue(after.isCompletedExceptionally)
+    }
+
+    @Test
+    fun oversizeLinesAreDroppedAndReadingGoesOn() {
+        rpc.close()
+        val sidecarOut = PipedOutputStream()
+        val pluginIn = PipedInputStream(sidecarOut, 1 shl 16)
+        val w = OutputStreamWriter(sidecarOut, Charsets.UTF_8)
+        val logs = LinkedBlockingQueue<String>()
+        rpc = JsonLineRpc(pluginIn, java.io.ByteArrayOutputStream(), handler = { _, _ -> CompletableFuture.completedFuture(null) },
+            onEvent = { e, d -> events.add(e to d) }, onClose = {}, executor = executor, scheduler = scheduler,
+            log = { logs.add(it) }, maxLineChars = 100).start()
+        w.write("""{"event":"log","data":{"line":"${"x".repeat(500)}"}}""" + "\n")
+        w.write("""{"event":"status","data":{"enabled":true}}""" + "\r\n")
+        w.flush()
+        val (name, _) = events.poll(2, TimeUnit.SECONDS)!!
+        assertEquals("status", name)
+        assertTrue(logs.poll(2, TimeUnit.SECONDS)!!.contains("longer than 100"))
+        assertNull(events.poll(100, TimeUnit.MILLISECONDS))
+        assertEquals(16 * 1024 * 1024, JsonLineRpc.MAX_LINE_CHARS)
     }
 
     @Test

@@ -50,6 +50,8 @@ class JsonLineRpc(
     private val scheduler: ScheduledExecutorService,
     private val log: (String) -> Unit = {},
     threadName: String = "Flutter Intercept sidecar reader",
+    /** Longest accepted line (chars); longer ones are dropped whole, so a runaway sidecar can't exhaust the heap. */
+    private val maxLineChars: Int = MAX_LINE_CHARS,
 ) {
     private val reader = BufferedReader(InputStreamReader(input, StandardCharsets.UTF_8))
     private val writer: Writer = OutputStreamWriter(output, StandardCharsets.UTF_8)
@@ -129,7 +131,11 @@ class JsonLineRpc(
     private fun readLoop() {
         try {
             while (!closed.get()) {
-                val line = reader.readLine() ?: break
+                val line = readBoundedLine() ?: break
+                if (line === OVERSIZE) {
+                    log("Dropped a line from the sidecar longer than $maxLineChars chars")
+                    continue
+                }
                 if (line.isBlank()) continue
                 val obj = try {
                     JsonParser.parseString(line).takeIf { it.isJsonObject }?.asJsonObject
@@ -146,6 +152,31 @@ class JsonLineRpc(
             // stream closed
         } finally {
             close()
+        }
+    }
+
+    private val lineBuf = StringBuilder()
+
+    /** The next line without its terminator; [OVERSIZE] for a line over [maxLineChars]; null at end of stream. */
+    private fun readBoundedLine(): String? {
+        lineBuf.setLength(0)
+        var oversize = false
+        while (true) {
+            val c = reader.read()
+            if (c < 0) return if (lineBuf.isEmpty() && !oversize) null else if (oversize) OVERSIZE else lineBuf.toString()
+            if (c == '\n'.code) {
+                if (oversize) return OVERSIZE
+                if (lineBuf.isNotEmpty() && lineBuf[lineBuf.length - 1] == '\r') lineBuf.setLength(lineBuf.length - 1)
+                return lineBuf.toString()
+            }
+            if (oversize) continue
+            if (lineBuf.length >= maxLineChars) {
+                oversize = true
+                lineBuf.setLength(0)
+                lineBuf.trimToSize()
+                continue
+            }
+            lineBuf.append(c.toChar())
         }
     }
 
@@ -205,6 +236,9 @@ class JsonLineRpc(
     }
 
     companion object {
+        const val MAX_LINE_CHARS = 16 * 1024 * 1024
+        private val OVERSIZE = String(charArrayOf('\u0000'))
+
         /** For params and results: nulls are omitted (optional fields are absent, as in TypeScript). */
         val GSON: Gson = GsonBuilder().disableHtmlEscaping().create()
         /** For the envelope: keeps `"result": null`. */

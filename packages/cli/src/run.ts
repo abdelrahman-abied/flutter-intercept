@@ -24,6 +24,8 @@ import { isIntegrationTestPath, prepareEntries, resolveRunTargets, resolveTestTa
 import { toJunitXml } from './junit';
 import { loadReplay, writeHarFile, writeOutput, writeRecording } from './outputs';
 import { isVerboseFlutter, LAN_NOTES, lanAddressForIphone, lanProxyAddress, newRunToken, resolveLanHost, withoutProxyAuthorization, type LanAddress } from './lan';
+import { lanDefinesContent } from '../../extension/src/debug/rewrite';
+import { newLanDefinesPath, removeLanDefines, writeLanDefines } from '../../extension/src/debug/lanPrepare';
 import { loadRules } from './rules';
 import { assertionsTable, trafficTable } from './summary';
 import type { CliOptions, CliResult } from './types';
@@ -124,8 +126,13 @@ export function stripOwnDefines(args: string[]): { args: string[]; dropped: stri
   return { args: out, dropped };
 }
 
-export function flutterTestArgs(files: string[], deviceId: string, proxy: string, sha: string, extra: string[]): string[] {
-  return ['test', ...files, '-d', deviceId, ...extra, `--dart-define=${PROXY_DEFINE}=${proxy}`, `--dart-define=${ENTRY_SHA_DEFINE}=${sha}`];
+/**
+ * `proxy`: the define value, or `{definesFile}` — a physical iPhone's token-bearing value is passed in a 0600 JSON file
+ * (`--dart-define-from-file`, REVIEW-9), never on the command line.
+ */
+export function flutterTestArgs(files: string[], deviceId: string, proxy: string | { definesFile: string }, sha: string, extra: string[]): string[] {
+  const proxyArg = typeof proxy === 'string' ? `--dart-define=${PROXY_DEFINE}=${proxy}` : `--dart-define-from-file=${proxy.definesFile}`;
+  return ['test', ...files, '-d', deviceId, ...extra, proxyArg, `--dart-define=${ENTRY_SHA_DEFINE}=${sha}`];
 }
 
 
@@ -217,6 +224,7 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
   let interrupted: Signal | undefined;
   let reversedOn: string | undefined;
   let lanOpen = false;
+  let lanDefinesFile: string | undefined;
   let child: ChildLike | undefined;
   let stopWaiting: (() => void) | undefined;
   let forwardTimer: NodeJS.Timeout | undefined;
@@ -287,7 +295,10 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
         deps.out(`::add-mask::${token}`);
         deps.out(`::add-mask::${Buffer.from(`flutter-intercept:${token}`).toString('base64')}`);
       }
-      proxyAddr = lanProxyAddress({ ...bound, token });
+      // REVIEW-9: the token-bearing define goes into a 0600 file in the run's 0700 temp dir (deleted with it)
+      lanDefinesFile = newLanDefinesPath(tmp);
+      await writeLanDefines(lanDefinesFile, lanDefinesContent(lanProxyAddress({ ...bound, token })));
+      proxyAddr = `${bound.host}:${bound.port}`;
       proxy.on('lan-peer', (ip: string) => log(`iPhone connected from ${ip}; the LAN listener now accepts only that address`));
       log(`proxy on 127.0.0.1:${port}, device ${device.id} (${device.kind}) reaches it over the LAN at ${bound.host}:${bound.port} (token-protected, this run only)`);
       for (const n of LAN_NOTES) log(n);
@@ -338,7 +349,7 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
 
     if (o.command === 'test') {
       for (const f of entries.files) if (!isIntegrationTestPath(projectRoot, f)) throw new SetupError(`internal: ${f} would not run as an integration test`);
-      const args = flutterTestArgs(entries.files.map((f) => path.relative(projectRoot, f)), device!.id, proxyAddr, entries.sha, extra);
+      const args = flutterTestArgs(entries.files.map((f) => path.relative(projectRoot, f)), device!.id, lanDefinesFile ? { definesFile: lanDefinesFile } : proxyAddr, entries.sha, extra);
       log(displayCommand(path.basename(flutter), args));
       if (!interrupted) {
         flutterCode = await new Promise<number>((resolve, reject) => {
@@ -376,6 +387,7 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
     entries?.cleanup();
     await adb.removeAll().catch(() => undefined);
     reversedOn = undefined;
+    if (lanDefinesFile) await removeLanDefines(lanDefinesFile);
     if (lanOpen) await proxy?.closeLan().catch((e) => log(`closing the LAN listener: ${(e as Error).message}`));
     await proxy?.stop().catch((e) => log(`proxy stop: ${(e as Error).message}`));
     fs.rmSync(tmp, { recursive: true, force: true });

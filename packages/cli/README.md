@@ -238,9 +238,11 @@ reach the Mac's loopback address, so for the length of the run the proxy also li
 
 - only the IPv4 of the interface that carries the default route, and only a private (RFC 1918) one. Without one
   the run is refused (exit code 2);
-- every request must carry a token that is new for each run (32 random bytes). The token is passed to the app in
-  the `FLUTTER_INTERCEPT_PROXY` define and is never printed: the logged command shows
-  `flutter-intercept:***@<address>:<port>`. In GitHub Actions the CLI also registers the token with `::add-mask::`,
+- every request must carry a token that is new for each run (32 random bytes). The token reaches the app in the
+  `FLUTTER_INTERCEPT_PROXY` define through a private file (`--dart-define-from-file`, mode 0600, in the run's
+  temporary folder, deleted when the run ends), so it is never on the command line and never printed. Flutter
+  still copies defines into generated build files such as `ios/Flutter/Generated.xcconfig` (gitignored); the
+  token stops working when the run ends. In GitHub Actions the CLI also registers the token with `::add-mask::`,
   so the runner masks it in every log line, flutter's included. Still, don't pass `-v` to flutter, because verbose
   builds print define values;
 - the first device that connects with the token is the only one accepted, and LAN clients can't reach this Mac's

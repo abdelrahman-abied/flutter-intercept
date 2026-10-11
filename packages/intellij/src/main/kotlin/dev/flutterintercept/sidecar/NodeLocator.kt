@@ -17,7 +17,8 @@ class NodeLocator(
     private val isWindows: Boolean = System.getProperty("os.name").orEmpty().startsWith("Windows", ignoreCase = true),
     private val home: String = System.getProperty("user.home").orEmpty(),
     private val isExecutable: (File) -> Boolean = { it.isFile && it.canExecute() },
-    private val runVersion: (String) -> String? = ::nodeVersionOutput,
+    /** Runs `<node> --version`; production passes a neutral working directory (see [nodeVersionOutput]). */
+    private val runVersion: (String) -> String? = { nodeVersionOutput(it, File(System.getProperty("user.home"))) },
     private val listDir: (File) -> List<File> = { it.listFiles()?.toList().orEmpty() },
 ) {
     private val exe get() = if (isWindows) "node.exe" else "node"
@@ -29,7 +30,8 @@ class NodeLocator(
     fun searchDirs(pathEnvs: List<String?>): List<String> {
         val sep = if (isWindows) ";" else ":"
         val dirs = LinkedHashSet<String>()
-        for (env in pathEnvs) env?.split(sep)?.map { it.trim() }?.filter { it.isNotEmpty() }?.forEach { dirs += it }
+        // Relative entries (".", "bin", "node_modules/.bin") would resolve against a working directory: skipped.
+        for (env in pathEnvs) env?.split(sep)?.map { it.trim() }?.filter { it.isNotEmpty() && File(it).isAbsolute }?.forEach { dirs += it }
         if (isWindows) {
             System.getenv("ProgramFiles")?.let { dirs += "$it\\nodejs" }
             System.getenv("LOCALAPPDATA")?.let { dirs += "$it\\Programs\\nodejs" }
@@ -98,9 +100,16 @@ class NodeLocator(
     }
 }
 
-/** Runs `<node> --version` with a 5 s limit; stdout or null. */
-fun nodeVersionOutput(node: String): String? = try {
-    val p = ProcessBuilder(node, "--version").redirectErrorStream(true).start()
+/**
+ * Runs `<node> --version` with a 5 s limit; stdout or null. [workDir] is a neutral directory (the plugin's data dir),
+ * never a project: version-manager shims (asdf, mise, Volta, nvm's `.nvmrc`) then resolve the user's global Node,
+ * not one a cloned project's `.tool-versions` / `.nvmrc` / `package.json` would pick.
+ */
+fun nodeVersionOutput(node: String, workDir: File?): String? = try {
+    val pb = ProcessBuilder(node, "--version").redirectErrorStream(true)
+    workDir?.takeIf { it.isDirectory }?.let { pb.directory(it) }
+    pb.environment().remove("NODE_OPTIONS")
+    val p = pb.start()
     p.outputStream.close()
     if (!p.waitFor(5, TimeUnit.SECONDS)) {
         p.destroyForcibly()

@@ -2,7 +2,6 @@
 // classes and no CEF in its JBR), so the plugin can't link against it. Everything here degrades to "unsupported".
 package dev.flutterintercept.toolwindow
 
-import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.util.Disposer
@@ -29,27 +28,29 @@ object JcefBridge {
     }
 
     /**
-     * A browser on [url] that keeps navigation on [allowedOrigin]: other http(s) links and popups open in the system
-     * browser instead. Null when JCEF can't be used. Disposed with [parent].
+     * A browser on [url] whose navigation [guard] decides (current UI origin only; other http(s) links open in the
+     * system browser). Null when JCEF can't be used. Disposed with [parent].
      */
-    fun create(url: String, allowedOrigin: String, parent: Disposable): Browser? {
+    fun create(url: String, guard: NavigationGuard, parent: Disposable): Browser? {
         if (!isSupported()) return null
         return try {
             val browserClass = cls("com.intellij.ui.jcef.JBCefBrowser") ?: return null
             val browser = browserClass.getConstructor(String::class.java).newInstance(url)
             (browser as? Disposable)?.let { Disposer.register(parent, it) }
-            installNavigationGuard(browser, allowedOrigin)
-            Browser(browser)
+            installNavigationGuard(browser, guard)
+            Browser(browser, guard)
         } catch (e: Throwable) {
             LOG.warn("JCEF browser couldn't be created: ${e.javaClass.simpleName}")
             null
         }
     }
 
-    class Browser internal constructor(private val impl: Any) {
+    class Browser internal constructor(private val impl: Any, private val guard: NavigationGuard) {
         val component: JComponent get() = impl.javaClass.getMethod("getComponent").invoke(impl) as JComponent
 
+        /** Loads a fresh one-time URL (never the same one twice: it's spent once served). */
         fun load(url: String) {
+            guard.expect(url)
             impl.javaClass.getMethod("loadURL", String::class.java).invoke(impl, url)
         }
 
@@ -58,11 +59,7 @@ object JcefBridge {
         }
     }
 
-    /** Allowed in the UI browser: the UI origin itself and blank pages. */
-    fun isInternal(url: String, allowedOrigin: String): Boolean =
-        url == allowedOrigin || url.startsWith("$allowedOrigin/") || url.startsWith("$allowedOrigin?") || url == "about:blank" || url.startsWith("devtools://")
-
-    private fun installNavigationGuard(browser: Any, origin: String) {
+    private fun installNavigationGuard(browser: Any, guard: NavigationGuard) {
         try {
             val client = browser.javaClass.getMethod("getJBCefClient").invoke(browser)
             val cefBrowser = browser.javaClass.getMethod("getCefBrowser").invoke(browser)
@@ -73,10 +70,7 @@ object JcefBridge {
                 val handler = proxy(requestHandlerClass) { method, args ->
                     if (method.name == "onBeforeBrowse" && args != null && args.size >= 3) {
                         val target = args[2]?.let { req -> req.javaClass.getMethod("getURL").invoke(req) as? String }.orEmpty()
-                        if (target.isNotEmpty() && !isInternal(target, origin)) {
-                            openExternally(target)
-                            true
-                        } else false
+                        guard.onBeforeBrowse(target)
                     } else null
                 }
                 client.javaClass.getMethod("addRequestHandler", requestHandlerClass, cefBrowserClass).invoke(client, handler, cefBrowser)
@@ -84,7 +78,7 @@ object JcefBridge {
             if (lifeSpanHandlerClass != null) {
                 val handler = proxy(lifeSpanHandlerClass) { method, args ->
                     if (method.name == "onBeforePopup" && args != null && args.size >= 3) {
-                        (args[2] as? String)?.let(::openExternally)
+                        guard.onPopup(args[2] as? String)
                         true // never open a JCEF popup window
                     } else null
                 }
@@ -95,9 +89,6 @@ object JcefBridge {
         }
     }
 
-    private fun openExternally(url: String) {
-        if (url.startsWith("https://") || url.startsWith("http://")) BrowserUtil.browse(url)
-    }
 
     /** An interface implementation whose unhandled methods return false / null (like the CEF adapters). */
     private fun proxy(iface: Class<*>, handle: (Method, Array<out Any?>?) -> Any?): Any =

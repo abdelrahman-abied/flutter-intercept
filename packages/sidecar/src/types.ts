@@ -6,7 +6,7 @@
  *   response {id: number, result?: unknown, error?: {message: string; code?: string}}
  *   event    {event: string, data?: unknown}                   (sidecar → plugin only)
  * stderr carries human log lines only (never secrets). Plugin-originated ids are positive; sidecar-originated
- * ids are negative, so they never collide.
+ * ids are negative, so they never collide. An unknown method answers error code `unknown_method`.
  */
 
 /** User-level settings the plugin stores (application scope) and passes on `init` / `settings`. */
@@ -102,7 +102,10 @@ export type SidecarRequest =
   | { method: 'ui.notify'; params: { level: 'info' | 'warning' | 'error'; message: string; buttons?: string[] } }                           // → button | null
   | { method: 'ui.reveal'; params?: { exchangeId?: string } }                                                                               // focus the tool window
   /** A client-certificate passphrase from the IDE's password store, without prompting; error / null = none. */
-  | { method: 'secrets.clientCertPassphrase'; params: { host: string } };                                                                  // → string | null
+  | { method: 'secrets.clientCertPassphrase'; params: { host: string } }                                                                   // → string | null
+  /** REVIEW-9: the MCP token in the IDE's password store (key `flutterIntercept.mcpToken`); error code `unavailable` = no store. */
+  | { method: 'secrets.get'; params: { key: string } }                                                                                     // → string | null
+  | { method: 'secrets.set'; params: { key: string; value: string } };                                                                     // → null
 
 // ── sidecar → plugin events ──────────────────────────────────────────────────────────────────────────────
 export type SidecarEvent =

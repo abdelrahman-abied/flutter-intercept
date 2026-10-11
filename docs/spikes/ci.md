@@ -253,3 +253,19 @@ package). `npm pack --dry-run`: `LICENSE`, `README.md`, `dist/cli.js` (1.8 MB, 0
   path; the workflow author chooses it). `upload-artifact@v7` stays tag-pinned: first-party `actions/*`, and a SHA
   pin would need a bump process the repo doesn't have (no Dependabot by the owner's choice). README: credentials
   warning for `record`, artifact visibility, no fork PRs on the iPhone runner.
+
+### REVIEW-9 follow-up: LAN define in a file
+
+- A physical-iPhone run no longer passes `--dart-define=FLUTTER_INTERCEPT_PROXY=flutter-intercept:<token>@…` to
+  `flutter test`. Right after `openLan` the CLI writes `lanDefinesContent(value)` (debug/rewrite.ts) to
+  `newLanDefinesPath(<run temp dir>)` with `writeLanDefines` (debug/lanPrepare.ts): `<tmp>/lan-defines/` 0700,
+  `flutter-intercept-lan-<32 hex>.json` 0600, created exclusively, in the run's 0700 temp dir. flutter gets
+  `--dart-define-from-file=<abs path>` (supported by `flutter test`; a `--dart-define` with the same key would win, and
+  the user's own `FLUTTER_INTERCEPT_PROXY` defines are still dropped). `removeLanDefines` in `finally`; the temp dir is
+  removed there and by the exit hook too (signals go through `finally`, a dying process through the hook).
+- Masking unchanged (`::add-mask::` in Actions, `user:***@` in printed defines, the `-v` warning, Proxy-Authorization
+  scrub). Residual (accepted, as in the editor): flutter_tools writes the defines base64-encoded into gitignored
+  generated files (`ios/Flutter/Generated.xcconfig`, `flutter_export_environment.sh`); the token dies with the run.
+- Tests: the flutter argv carries neither the token nor `FLUTTER_INTERCEPT_PROXY`; the file holds the right value, is
+  0600 in a 0700 `flutter-intercept-run-*` dir, and is gone after the run and after the exit hook; no printed line has
+  the token (only the two `::add-mask::` commands in Actions).

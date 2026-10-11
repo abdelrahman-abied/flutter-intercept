@@ -1551,4 +1551,9 @@ exchanges it for an `HttpOnly; SameSite=Strict; Path=/` session cookie and redir
 — 60 s — is refused). The page's WebSocket authenticates with the cookie (same origin) or the page-embedded
 `__FI_WS__` token, which never appears in the address bar. The webview also strips any `?t=` with
 `history.replaceState`. JCEF clients use the same flow.
+- **REVIEW-9** (docs/REVIEW-9.md): §15.4 as built is **cookie-less** — a one-time `GET /?t=` serves the page with a
+  per-page WebSocket secret; reloads need a fresh `uiUrl`; the browser fallback opens a 0600 redirect file. New
+  sidecar → plugin requests `secrets.get` / `secrets.set` (MCP token). "Create file" follows
+  `rules/createPolicy.ts` in both hosts. A physical iPhone's proxy value is passed with `--dart-define-from-file`
+  (0600 file outside the project), not `--dart-define`, in both hosts.
 

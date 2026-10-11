@@ -16,6 +16,8 @@ import { languageModelToolsContribution, toolDescriptions, toolSchemas } from '.
 import type { AgentAccess } from './agent/types';
 import { CaStore } from './ca';
 import { InterceptDebugConfigurationProvider, InterceptEvent, prepareLaunch, PrepareDeps, readSettings } from './debug/provider';
+import { cleanupLanDefines, removeLanDefines } from './debug/lanPrepare';
+import { lanDefinesFileIn } from './debug/rewrite';
 import { DebugConfig, debuggerTypeName, HOST_KEY, LAN_KEY, MARKER_KEY, ORIGINAL_PROGRAM_KEY, proxyHostFor, WEB_FLAGS_KEY, WEB_KEY } from './debug/rewrite';
 import { IosDeviceClassifier } from './iosDevices';
 import { IosUsbToolingChecker, needsRosettaWarning, resolveFlutterSdk, ROSETTA_INSTALL_COMMAND, rosettaWarningText } from './iosUsbTooling';
@@ -42,6 +44,7 @@ import { createSharedRulesService } from './rules/service';
 import { toOpenApi, toPostman } from './export';
 import { registerNotifications } from './notify';
 import { clientCertHosts, loadClientCertificates, PASSPHRASE_SECRET_PREFIX, passphraseSecretKey } from './ui/clientCerts';
+import { createPathDecision } from './rules/createPolicy';
 import { TrafficPanel } from './ui/panel';
 import { TrafficViewProvider, VIEW_ID } from './ui/view';
 
@@ -191,6 +194,8 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     proxyHost,
     log,
     webPac,
+    // REVIEW-9: a physical iPhone's proxy value (with the LAN token) goes in a 0600 file, not on the command line.
+    lanDefinesDir: context.globalStorageUri.fsPath,
     // CONTRACTS §14.7: shown once; only a click starts the proxy and copies a Chrome command (never run by us).
     webServerSkipped: createWebServerNotice({
       show: (m, ...a) => vscode.window.showInformationMessage(m, ...a),
@@ -394,6 +399,13 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       // REVIEW-6 #5: never write what looks like live credentials into the repo.
       const secret = secretProblem(create.content);
       if (secret) throw new Error(secret);
+      // REVIEW-9 #2: only our own folder silently; never build / platform / VCS / IDE configuration; else ask.
+      const decision = createPathDecision(rel);
+      if (decision.kind === 'refuse') throw new Error(`Not creating ${rel}: ${decision.reason}`);
+      if (decision.kind === 'confirm') {
+        const ok = await vscode.window.showWarningMessage(`Create ${abs}?`, { modal: true, detail: `Flutter Intercept was asked to create this ${what}.` }, 'Create');
+        if (ok !== 'Create') return false;
+      }
       // REVIEW-6 #7: never create anything outside the workspace or through a symlink, never overwrite.
       const root = roots.find((r) => abs.startsWith(r + path.sep));
       if (!root) throw new Error(`The ${what} must be inside the workspace.`);
@@ -633,8 +645,12 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   refreshStatus();
   controller.onPausedCount(() => refreshStatus());
   proxyHost.on('state', () => refreshStatus());
+  void cleanupLanDefines(context.globalStorageUri.fsPath).catch(() => undefined);
   proxyHost.on('lan', (l: unknown) => {
-    if (!l) lanWatcher.stop();
+    if (!l) {
+      lanWatcher.stop();
+      void cleanupLanDefines(context.globalStorageUri.fsPath).catch(() => undefined);
+    }
     refreshStatus();
     controller.broadcastStatus();
   });
@@ -753,6 +769,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     }),
     vscode.debug.onDidTerminateDebugSession((session) => {
       debugSessions.delete(session.id);
+      void removeLanDefines(lanDefinesFileIn((session.configuration as DebugConfig).toolArgs)).catch(() => undefined);
       webLaunchUrls.delete(session.id);
       void nativeRoutes.release(session.id).catch((e: unknown) => log(`emulator proxy release failed: ${String(e)}`));
       lanLife.ended(session.id); // also on crash / app killed: closes the LAN listener after the last iPhone session

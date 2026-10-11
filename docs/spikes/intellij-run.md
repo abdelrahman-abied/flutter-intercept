@@ -232,3 +232,39 @@ again → hot restart", Android Profiler.
 4. Press Run again while the app runs: hot restart (Flutter's behaviour), no second instance. Stop: session ends.
 5. Turn interception off (Tools → Flutter Intercept → Toggle) and Run: `not intercepting main.dart: …`, plain launch.
 6. "Run in Flutter Release Mode" (Flutter menu): `not intercepting main.dart: release build: never intercepted`.
+
+## LAN token in the launch args (REVIEW-9 #7)
+
+The physical-iPhone define `FLUTTER_INTERCEPT_PROXY=flutter-intercept:<token>@<lanIp>:<port>` is visible in two places,
+because the Flutter plugin echoes the full `flutter run` command line:
+
+- **idea.log, INFO, logger `io.flutter.run.daemon.FlutterApp`.** `FlutterApp.start` calls
+  `LOG.info(project + " (" + mode + ")")` and then `LOG.info(command.toString())` unconditionally, with no settings
+  check (javap). Seen in the sandbox: `INFO - io.flutter.run.daemon.FlutterApp - …/flutter [--no-color, run, …,
+  --dart-define=FLUTTER_INTERCEPT_PROXY=localhost:8899, …]`. "Collect Logs and Diagnostic Data" attaches idea.log to
+  bug reports.
+- **The Run console, first line.** The handler is `MostlySilentColoredProcessHandler` (an `OSProcessHandler`).
+  `BaseOSProcessHandler.startNotify()` sends `getCommandLineForLog()` (the full command string) as `SYSTEM` text.
+  `DaemonConsoleView.print` passes every non-`NORMAL_OUTPUT` type straight through, and
+  `LaunchState.setUpConsoleAndActions` attaches the console before the platform calls `startNotify`. (Established from
+  the bytecode; there is no screenshot, because the Performance Testing script stops after `%runConfiguration` on a
+  `RunConfigurationCommand` NPE.)
+- **Verbose mode.** With the Flutter setting "verbose logging" on, `flutter run --verbose` also prints the build
+  invocations, defines included.
+
+Nothing on our side can filter the plugin's logger or console without hacks (for example raising the
+`io.flutter.run.daemon.FlutterApp` log level around a launch would not cover the console).
+
+**Fix that keeps the entry template unchanged (verified):** pass the LAN address through `--dart-define-from-file`.
+`String.fromEnvironment` reads those values exactly like `--dart-define`. On macOS:
+`flutter run … --dart-define-from-file=.dart_tool/fi_spike/defines.json --target=…` with
+`{"FLUTTER_INTERCEPT_PROXY":"flutter-intercept:TESTTOKEN@192.0.2.1:9"}` (file mode 0600). A VM-service `evaluate` of the
+entry's `const String.fromEnvironment('FLUTTER_INTERCEPT_PROXY')` returned
+`flutter-intercept:TESTTOKEN@192.0.2.1:9`. idea.log and the console then show only the file path.
+
+**Remaining exposure, whichever way the define is passed:** flutter_tools writes every define, base64-encoded, into
+`DART_DEFINES` in the app's generated build files. Measured: `macos/Flutter/ephemeral/Flutter-Generated.xcconfig`,
+`flutter_export_environment.sh` and `flutter_native_integration.env` held the test token. For iOS the files are
+`ios/Flutter/Generated.xcconfig` and `flutter_export_environment.sh`. Flutter's templates gitignore these files, and the
+next build overwrites them. The VS Code host has the same exposure today. The token is only valid while the LAN
+listener is open (it is new per opening), so a leaked copy is dead after the session.

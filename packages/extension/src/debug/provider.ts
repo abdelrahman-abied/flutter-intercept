@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { ReverseTracker, withSoftTimeout } from '../adb';
 import { writeEntry } from '../entry/generator';
 import type { LanOpening, ProxyHost } from '../proxyHost';
-import { LanDeps, prepareLan } from './lanPrepare';
+import { LanDeps, newLanDefinesPath, prepareLan, writeLanDefines } from './lanPrepare';
 import { PacServer, WebPacSource } from './pacServer';
 import { DebugConfig, isWebDevice, MARKER_KEY, ORIGINAL_PROGRAM_KEY, rewriteDebugConfig, RewriteResult } from './rewrite';
 
@@ -45,6 +45,13 @@ export interface PrepareDeps {
    * resolves undefined (or fails) falls back to `--proxy-server` (no fallback when the proxy stops).
    */
   webPac?: WebPacSource;
+  /**
+   * REVIEW-9: the host's private storage folder (VS Code globalStorage). Physical-iPhone sessions then get the
+   * token-bearing proxy define through a 0600 `--dart-define-from-file` there instead of on the command line. The host
+   * deletes the file when the session ends / the LAN listener closes (`removeLanDefines(lanDefinesFileIn(toolArgs))`,
+   * `cleanupLanDefines(dir)`) and sweeps it at startup.
+   */
+  lanDefinesDir?: string;
 }
 
 const defaultPac = new WeakMap<PrepareDeps, { pac: PacServer; port?: number }>();
@@ -110,7 +117,7 @@ function rewriteFor(
   port: number,
   selected: string | undefined,
   caCertPem: string,
-  lan: { physicalIos?: boolean; lan?: LanOpening } = {},
+  lan: { physicalIos?: boolean; lan?: LanOpening; definesFile?: string } = {},
   web: { webPacUrl?: string } = {},
 ): RewriteResult {
   const active = vscode.window.activeTextEditor?.document.uri;
@@ -122,6 +129,7 @@ function rewriteFor(
     selectedDeviceId: selected,
     physicalIos: lan.physicalIos,
     lan: lan.lan,
+    lanDefinesFile: lan.definesFile,
     webPacUrl: web.webPacUrl,
     settingsToolArgs: dartSettingsToolArgs(folder),
     captureSource: vscode.workspace.getConfiguration('flutterIntercept', folder?.uri).get<boolean>('captureSource', true),
@@ -161,7 +169,8 @@ export async function prepareLaunch(
       // Flutter Web (CONTRACTS §14.7): a PAC URL with DIRECT fallback.
       const webLaunch = (result.kind === 'skip' && result.needsCa) || isWebDevice(selected);
       const web = webLaunch ? await webExtras(deps, port) : {};
-      result = rewriteFor(folder, config, settings, port, selected, caCertPem, lanInfo, web);
+      const definesFile = lanInfo.lan && deps.lanDefinesDir ? newLanDefinesPath(deps.lanDefinesDir) : undefined;
+      result = rewriteFor(folder, config, settings, port, selected, caCertPem, { ...lanInfo, definesFile }, web);
       if ((result.kind === 'skip' && result.noLan) || (result.kind === 'restore' && lanInfo.physicalIos && !lanInfo.lan)) {
         const message = `Flutter Intercept: ${lanInfo.problem ?? result.reason}, so this iPhone session runs without interception.`;
         deps.log(message);
@@ -193,6 +202,7 @@ export async function prepareLaunch(
     }
     if (result.kind !== 'rewrite') return config;
     await writeEntry(result.plan);
+    if (result.lanDefines) await writeLanDefines(result.lanDefines.path, result.lanDefines.content);
     const port = result.config.flutterInterceptPort as number;
     deps.log(
       `[${hook}] mode=${result.mode} ${result.debuggerType} device=${result.deviceId ?? '(unknown)'} program ${result.plan.program} -> ${result.plan.entryPath} ` +

@@ -78,6 +78,10 @@ intellijPlatform {
             local(platformLocalPath)
         }
     }
+    // JetBrains Marketplace (owner only): PUBLISH_TOKEN=<token> ./gradlew publishPlugin
+    publishing {
+        token = providers.environmentVariable("PUBLISH_TOKEN")
+    }
 }
 
 val checkSidecar = tasks.register("checkSidecar") {
@@ -108,7 +112,10 @@ tasks {
     runIde {
         // Dev fallback: when the sandbox has no bundled sidecar, the plugin uses the repo's build.
         jvmArgumentProviders.add(CommandLineArgumentProvider {
-            listOf("-Dflutter.intercept.sidecar=${sidecarDist.file("sidecar.js").asFile.absolutePath}")
+            listOf(
+                "-Dflutter.intercept.dev=true",
+                "-Dflutter.intercept.sidecar=${sidecarDist.file("sidecar.js").asFile.absolutePath}",
+            )
         })
     }
 

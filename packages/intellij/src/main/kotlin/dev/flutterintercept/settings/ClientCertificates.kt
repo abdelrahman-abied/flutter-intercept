@@ -21,6 +21,20 @@ object ClientCertificates {
     }
 
     /**
+     * Stores (or clears) a passphrase, then re-sends the settings so the sidecar reloads the certificates right away
+     * (it asks for passphrases with `secrets.clientCertPassphrase` while loading them). Off the EDT.
+     */
+    fun applyPassphrase(
+        host: String,
+        passphrase: String?,
+        store: (String, String?) -> Unit = ::setPassphrase,
+        resend: () -> Unit = { dev.flutterintercept.sidecar.SidecarProcess.getInstance().pushSettings() },
+    ) {
+        store(host, passphrase)
+        resend()
+    }
+
+    /**
      * One certificate per line: `host = /path/client.p12` (PKCS#12) or `host = /path/cert.pem, /path/key.pem`.
      * Blank lines and `#` comments are skipped; returns the entries and the 1-based numbers of invalid lines.
      */
