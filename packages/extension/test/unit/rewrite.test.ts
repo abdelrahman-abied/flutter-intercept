@@ -581,3 +581,11 @@ describe('Flutter Web (CONTRACTS §11.3): browser flags, program untouched', () 
     expect(() => webInterceptFlags(9555, 'a,b')).toThrow();
   });
 });
+
+describe('grpc.enabled (CONTRACTS §16.1)', () => {
+  it('adds FLUTTER_INTERCEPT_GRPC=0 only when gRPC interception is off, and strips an earlier one', () => {
+    expect(withInterceptDefines([], 'abc', 'localhost:1')).not.toContain('--dart-define=FLUTTER_INTERCEPT_GRPC=0');
+    expect(withInterceptDefines([], 'abc', 'localhost:1', true, undefined, false)).toContain('--dart-define=FLUTTER_INTERCEPT_GRPC=0');
+    expect(withInterceptDefines(['--dart-define=FLUTTER_INTERCEPT_GRPC=0'], 'abc', 'localhost:1')).not.toContain('--dart-define=FLUTTER_INTERCEPT_GRPC=0');
+  });
+});

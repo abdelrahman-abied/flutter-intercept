@@ -46,6 +46,19 @@ cupertino_http compiles a small native-assets library on Apple builds, cronet_ht
 `android.uniquePackageNames=false` in `android/gradle.properties` (play-services-cronet's two artifacts share a
 namespace) and Google Play services on the device.
 
+gRPC (0.10.0, `lib/grpc_demo.dart`): grpc-dart against `demo.orders.v1.OrderService`
+(`protos/demo/orders/v1/orders.proto`; the protoc-generated Dart is committed in `lib/src/generated/` and is also a
+fixture for Flutter Intercept's schema reader; regenerate with `protos/generate.sh`, which needs `protoc` and
+`dart pub global activate protoc_plugin 25.1.0`). Start the test server on the host machine:
+`cd scripts/e2e/grpc_server && dart run bin/server.dart --port 50051 --tls-port 50052` (TLS with a self-signed
+certificate minted at start, `CN=fi-grpc-server`). With `GRPC_PORT` set, a gRPC batch runs after the first request
+batch and after every hot restart (`DEMO_GRPC start` … `DEMO_GRPC done <n>`; also the "gRPC calls…" screen):
+`grpc_unary` (GetOrder, metadata `authorization`, a `session_token` field, server header + trailer), `grpc_stream`
+(WatchOrders, three events 100 ms apart), `grpc_client_stream` (UploadItems), `grpc_bidi` (Chat, ping-pong),
+`grpc_missing` (GetOrder `missing` → `ERR … code: 5`), `grpc_isolate` (GetOrder from `Isolate.run`, named
+`demo_grpc_worker`) and, with `GRPC_TLS_PORT`, `grpc_tls` (GetOrder over TLS; the app accepts only the test server's
+self-signed certificate). Every answer carries `servedTo`, the client address:port the server saw.
+
 Targets: `lib/main.dart` (prod), `lib/main_dev.dart` (dev flavor entry).
 
 Dart defines:
@@ -61,6 +74,8 @@ Dart defines:
 - `LOCAL_PORT=n` (and optionally `LOCAL_HOST=host`) — also GET `/health` on a server on the host machine:
   `10.0.2.2` on the Android emulator, `localhost` elsewhere. Start one with
   `dart run scripts/e2e/host_server.dart --port 8787`, then run with `--dart-define=LOCAL_PORT=8787`.
+- `GRPC_PORT=n` / `GRPC_TLS_PORT=n` (and optionally `GRPC_HOST=host`) — the gRPC batch against the test server
+  (h2c / TLS port): `10.0.2.2` on the Android emulator, `localhost` elsewhere. 0 = no batch.
 - `APP_FINDPROXY=charles|env` — the app's own `HttpClient` (Dio `IOHttpClientAdapter` +
   package:http `IOClient`) sets `findProxy` after creation: `charles` = leftover debug
   snippet `'PROXY 127.0.0.1:8888'`, `env` = `HttpClient.findProxyFromEnvironment`.
@@ -70,5 +85,6 @@ Dart defines:
 - `EVIL_URL=https://host:port/` — also GET this URL with a plain package:http client (label `attack`);
   used with `scripts/e2e/evil_server.dart` (self-signed certificate) to check it is always rejected.
 
-Device check: `scripts/e2e/run_device.sh <deviceId> [--app-mode <mode>]` (see
+Device check: `scripts/e2e/run_device.sh <deviceId> [--app-mode <mode>] [--grpc [--grpc-off] [--isolates]]` (see
+`docs/spikes/template-v6.md` for gRPC,
 `docs/spikes/device.md`, `docs/spikes/template-v2.md`, `docs/spikes/template-v3.md`).

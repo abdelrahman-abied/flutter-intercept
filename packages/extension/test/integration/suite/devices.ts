@@ -23,6 +23,13 @@
  *     here so the check doesn't depend on the host wiring): cronet goes to the proxy, rejects its CA (the demo has
  *     no debug network_security_config), the core reports the trust failure, routing is released and
  *     `http_proxy` is back to its previous value. `FI_DEVICES_ONLY=J` runs only this check.
+ *  K. CONTRACTS §16 (template v6, gRPC): scripts/e2e/grpc_server on the host (h2c + TLS, self-signed) and the
+ *     demo's gRPC batch (GRPC_PORT / GRPC_TLS_PORT defines, lib/grpc_demo.dart). K1: unary, server / client /
+ *     bidi streaming and a NOT_FOUND call are recorded as `kind: "grpc"` with their status and message counts,
+ *     the Isolate.run call too (installed at isolate start), the TLS call as an undecrypted `grpcTunnel`; a
+ *     `grpcMock` rule (code 14) answers GetOrder after a hot restart. K2: `flutterIntercept.grpc.enabled: false`
+ *     → `FLUTTER_INTERCEPT_GRPC=0` define, the calls work direct and nothing gRPC is recorded.
+ *     `FI_DEVICES_ONLY=K` runs only this check; `FI_GRPC_PORT` picks the server port (default: a free one).
  *
  * Request → source (CONTRACTS §9, template v4), in A and after the hot restart in B: a Dio request made
  * through interceptors (CatalogApi.fetchAlbum) and a package:http request (OrdersApi.createOrder) carry
@@ -35,7 +42,7 @@
  *    define (token only there), `flutterInterceptLan`, the LAN listener open and shown in Status;
  *  C asserts the LAN listener closes after the last iPhone session; F/G (profile/release) run too.
  */
-import { execFile, execFileSync } from 'child_process';
+import { execFile, execFileSync, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -91,7 +98,7 @@ const hasHeader = (headers: Record<string, unknown> | undefined, name: string) =
 const evidence = (text: string) =>
   text
     .split(/\r?\n/)
-    .filter((l) => /DEMO_(START|RESULT|BATCH)|\[flutter_intercept\]|Restarted application|Launching|Built /.test(l))
+    .filter((l) => /DEMO_(START|RESULT|BATCH|GRPC)|\[flutter_intercept\]|Restarted application|Launching|Built /.test(l))
     .join('\n');
 
 /** DEMO_RESULT lines (last one per label) in `text`. */
@@ -266,8 +273,12 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
     await api.setRules([]);
 
     // ---- J. bypass detection + native clients through the proxy (§14.7) ----
-    if (isEmu) await checkJ(dev, tag);
+    if (isEmu && (!process.env.FI_DEVICES_ONLY || process.env.FI_DEVICES_ONLY === 'J')) await checkJ(dev, tag);
     if (process.env.FI_DEVICES_ONLY === 'J') continue;
+
+    // ---- K. gRPC (§16, template v6) ----
+    if (!physicalIos && (!process.env.FI_DEVICES_ONLY || process.env.FI_DEVICES_ONLY === 'K')) await checkK(dev, tag);
+    if (process.env.FI_DEVICES_ONLY === 'K') continue;
 
     // ---- A. launch like F5 (deviceId only) ----
     let session: vscode.DebugSession | undefined;
@@ -521,6 +532,130 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
       if (end !== before) failures.push(`http_proxy ${end} at the end (was ${before})`);
     }
     check(name, failures, t0, { mode: notes.filter((n) => !/^native proxy:/.test(n)).join(' ') });
+  }
+
+  /** scripts/e2e/grpc_server on 127.0.0.1 / ::1: h2c on `port`, TLS (self-signed, minted at start) on `port + 1`. */
+  async function startGrpcServer(grpcPort: number): Promise<{ stop: () => void; log: () => string }> {
+    const dir = path.resolve(root, '..', '..', 'scripts', 'e2e', 'grpc_server');
+    execFileSync('dart', ['pub', 'get'], { cwd: dir, stdio: 'pipe', timeout: 180_000 });
+    const p = spawn('dart', ['run', 'bin/server.dart', '--port', String(grpcPort), '--tls-port', String(grpcPort + 1)], { cwd: dir });
+    let out = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (out += d));
+    await waitFor(() => (/GRPC_SERVER_READY/.test(out) ? true : undefined), 120_000, 200).catch(() => {
+      p.kill();
+      throw new Error(`gRPC server did not start: ${out.slice(-400)}`);
+    });
+    return { stop: () => p.kill(), log: () => out };
+  }
+
+  async function checkK(dev: string, tag: string) {
+    const grpcPort = Number(process.env.FI_GRPC_PORT) || (await freePort());
+    const svc = '/demo.orders.v1.OrderService/';
+    const defines = [`--dart-define=GRPC_PORT=${grpcPort}`, `--dart-define=GRPC_TLS_PORT=${grpcPort + 1}`, '--dart-define=COVERAGE=false'];
+    const waitGrpc = async (s: vscode.DebugSession, from: number) => {
+      await waitFor(() => (/DEMO_GRPC done/.test(outputOf(s).slice(from)) ? true : undefined), 600_000, 250);
+      await sleep(500);
+      return outputOf(s).slice(from);
+    };
+    const grpcCalls = (since: number) => api.getExchanges().filter((e) => e.startedAt >= since && e.kind === 'grpc' && e.url.includes(`:${grpcPort}${svc}`));
+    let server: { stop: () => void; log: () => string } | undefined;
+    try {
+      server = await startGrpcServer(grpcPort);
+    } catch (e) {
+      check(`DEV ${tag} K gRPC`, [`exception: ${(e as Error).message}`], Date.now());
+      return;
+    }
+    try {
+      // ---- K1: intercepted ----
+      let t0 = Date.now();
+      let failures: string[] = [];
+      let session: vscode.DebugSession | undefined;
+      let since = Date.now();
+      try {
+        await api.setRules([]);
+        session = await launch(`FI-D K1 ${tag}`, dev, { toolArgs: defines });
+        const args = (session.configuration.toolArgs ?? []) as string[];
+        if (args.some((a) => a.startsWith('--dart-define=FLUTTER_INTERCEPT_GRPC='))) failures.push(`gRPC define although enabled: ${args.join(' ')}`);
+        const text = await waitGrpc(session, 0);
+        const res = demoResults(text);
+        const ok = (label: string, re: RegExp) => {
+          const r = res[label];
+          if (!r || !re.test(`${r.status} ${r.body}`)) failures.push(`${label}: ${r ? `${r.status} ${r.body.slice(0, 160)}` : 'no DEMO_RESULT'}`);
+        };
+        ok('grpc_unary', /^0 .*"status":"ORDER_STATUS_SHIPPED"/);
+        ok('grpc_stream', /^0 .*"events":\["1:ORDER_STATUS_PENDING","2:ORDER_STATUS_SHIPPED","3:ORDER_STATUS_DELIVERED"\]/);
+        ok('grpc_client_stream', /^0 .*"count":3,"quantity":6/);
+        ok('grpc_bidi', /^0 .*"replies":\["echo: hello 1","echo: hello 2","echo: hello 3"\]/);
+        ok('grpc_missing', /^ERR .*code: 5/);
+        ok('grpc_tls', /^0 .*"status":"ORDER_STATUS_SHIPPED"/);
+        ok('grpc_isolate', /^0 .*"overridesInIsolate":true/);
+        const calls = grpcCalls(since);
+        const byMethod = (m: string) => calls.filter((e) => e.url.endsWith(svc + m) && e.state === 'completed');
+        const getOrders = byMethod('GetOrder');
+        if (!getOrders.some((e) => e.grpc?.statusCode === 0 && e.grpc.messagesReceived === 1)) failures.push(`GetOrder OK not recorded (${calls.map((e) => `${e.url} ${e.state} ${e.grpc?.statusCode}`).join(', ') || 'no gRPC exchanges'})`);
+        if (!getOrders.some((e) => e.grpc?.statusCode === 5)) failures.push('GetOrder NOT_FOUND not recorded with grpc-status 5');
+        if (getOrders.filter((e) => e.grpc?.statusCode === 0).length < 2) failures.push('the Isolate.run GetOrder was not recorded');
+        if (!byMethod('WatchOrders').some((e) => e.grpc?.statusCode === 0 && e.grpc.messagesReceived === 3)) failures.push('WatchOrders: no completed call with 3 messages received');
+        if (!byMethod('UploadItems').some((e) => e.grpc?.statusCode === 0 && e.grpc.messagesSent === 3)) failures.push('UploadItems: no completed call with 3 messages sent');
+        if (!byMethod('Chat').some((e) => e.grpc?.statusCode === 0 && e.grpc.messagesSent === 3 && e.grpc.messagesReceived === 3)) failures.push('Chat: no completed call with 3 messages each way');
+        for (const e of calls) if (e.method !== 'POST') failures.push(`gRPC exchange method ${e.method}`);
+        const tunnels = api.getExchanges().filter((e) => e.startedAt >= since && e.kind === 'tunnel' && e.grpcTunnel && e.url.includes(`:${grpcPort + 1}`));
+        if (!tunnels.length) failures.push(`TLS call not recorded as a grpcTunnel (${api.getExchanges().filter((e) => e.startedAt >= since && e.url.includes(`:${grpcPort + 1}`)).map((e) => `${e.kind} ${e.url}`).join(', ') || 'nothing'})`);
+        check(`DEV ${tag} K1 gRPC recorded (h2c calls, streaming, status, isolate, TLS tunnel)`, failures, t0, { output: evidence(text), mode: `grpc=${calls.length} tunnels=${tunnels.length}` });
+
+        // grpcMock + hot restart
+        t0 = Date.now();
+        failures = [];
+        await api.setRules([{ id: 'grpc-mock', enabled: true, match: { method: 'POST', url: `*${svc}GetOrder` }, action: { kind: 'grpcMock', code: 14, message: 'mocked by suite' } }]);
+        const from = outputOf(session).length;
+        since = Date.now();
+        await session.customRequest('hotRestart');
+        const text2 = await waitGrpc(session, from);
+        const r = demoResults(text2).grpc_unary;
+        if (!r || r.status !== 'ERR' || !/code: 14/.test(r.body) || !/mocked by suite/.test(r.body)) failures.push(`grpc_unary after the mock: ${r ? `${r.status} ${r.body.slice(0, 160)}` : 'no DEMO_RESULT'}`);
+        const mocked = grpcCalls(since).filter((e) => e.url.endsWith(svc + 'GetOrder') && e.grpc?.statusCode === 14);
+        if (!mocked.length) failures.push('mocked GetOrder not recorded with grpc-status 14');
+        const stream = demoResults(text2).grpc_stream;
+        if (!stream || stream.status !== '0') failures.push(`grpc_stream (not mocked) after the restart: ${stream ? stream.status : 'none'}`);
+        check(`DEV ${tag} K1 grpcMock (code 14) after hot restart`, failures, t0, { output: evidence(text2), mode: `mocked=${mocked.length}` });
+      } catch (e) {
+        check(`DEV ${tag} K1 gRPC`, [...failures, `exception: ${(e as Error).message}`], t0);
+      } finally {
+        await api.setRules([]);
+        if (session) await stopSession(session).catch(() => false);
+        await sleep(1500);
+      }
+
+      // ---- K2: grpc.enabled=false ----
+      t0 = Date.now();
+      failures = [];
+      session = undefined;
+      await cfg.update('grpc.enabled', false, vscode.ConfigurationTarget.Global);
+      try {
+        since = Date.now();
+        session = await launch(`FI-D K2 ${tag}`, dev, { toolArgs: defines });
+        const args = (session.configuration.toolArgs ?? []) as string[];
+        const def = args.filter((a) => a.startsWith('--dart-define=FLUTTER_INTERCEPT_GRPC='));
+        if (def.length !== 1 || def[0] !== '--dart-define=FLUTTER_INTERCEPT_GRPC=0') failures.push(`gRPC define ${JSON.stringify(def)}`);
+        const text = await waitGrpc(session, 0);
+        const res = demoResults(text);
+        for (const l of ['grpc_unary', 'grpc_stream', 'grpc_client_stream', 'grpc_bidi', 'grpc_tls', 'grpc_isolate']) {
+          if (res[l]?.status !== '0') failures.push(`${l}: ${res[l] ? `${res[l].status} ${res[l].body.slice(0, 120)}` : 'no DEMO_RESULT'}`);
+        }
+        const recorded = api.getExchanges().filter((e) => e.startedAt >= since && (e.kind === 'grpc' || e.grpcTunnel || e.url.includes(`:${grpcPort}`) || e.url.includes(`:${grpcPort + 1}`)));
+        if (recorded.length) failures.push(`${recorded.length} gRPC exchange(s) recorded although gRPC is off: ${recorded.map((e) => e.url).join(', ')}`);
+        check(`DEV ${tag} K2 grpc.enabled=false: direct, nothing recorded`, failures, t0, { output: evidence(text) });
+      } catch (e) {
+        check(`DEV ${tag} K2 grpc.enabled=false`, [...failures, `exception: ${(e as Error).message}`], t0);
+      } finally {
+        await cfg.update('grpc.enabled', undefined, vscode.ConfigurationTarget.Global);
+        if (session) await stopSession(session).catch(() => false);
+        await sleep(1500);
+      }
+    } finally {
+      server.stop();
+    }
   }
 
   async function runSimple(

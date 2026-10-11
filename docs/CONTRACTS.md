@@ -13,7 +13,7 @@ the target is outside the project root, `_<first 8 hex of sha1(path)>` is append
 The **content is device independent** (same bytes for an emulator and a simulator session).
 Uses **dart:io, dart:async and dart:convert only** — never adds a dependency to the app.
 
-Template v5 (placeholders in `{{ }}`) — v4 plus `flutterInterceptInstall()` for background isolates (§13.3,
+Template v6 (placeholders in `{{ }}`) — v5 plus the gRPC `Socket.connect` hook (§16.1, docs/spikes/template-v6.md); v5 = v4 plus `flutterInterceptInstall()` for background isolates (§13.3,
 docs/spikes/background-isolates.md); v4 = v3 plus request → source (§9.1), validated on Android emulator + iOS
 simulator and Dart SDKs 3.0–3.13 (docs/spikes/template-v4.md; v3: docs/spikes/template-v3.md). It **trusts** this
 install's CA (below) instead of accepting any certificate:
@@ -412,6 +412,129 @@ class _InterceptedHttpClient implements HttpClient {
   }
 }
 
+// gRPC (CONTRACTS §16.1). grpc-dart, and connectrpc's HTTP/2 transport, open their connection with a plain
+// Socket.connect, which HttpOverrides never sees. Those connects (recognised by the library's frame on the
+// stack) go to the proxy instead, through a "silent" CONNECT: the proxy never answers it and relays or decodes
+// what follows. Every other connect goes direct, exactly as without Flutter Intercept. Off with
+// --dart-define=FLUTTER_INTERCEPT_GRPC=0 and in sessions without the proxy define (plain Dart).
+const _grpcEnabled =
+    String.fromEnvironment('FLUTTER_INTERCEPT_GRPC') != '0' && bool.hasEnvironment('FLUTTER_INTERCEPT_PROXY');
+const _grpcFrames = <String>[
+  'package:grpc/src/client/http2_connection.dart',
+  'package:connectrpc/src/http2/connection.dart',
+];
+// Connecting to the proxy takes at most 2 s (or the app's connectTimeout if shorter), then the call goes direct.
+const _grpcHopTimeout = Duration(seconds: 2);
+// grpc-dart reconnects at once when an accepted connection drops: after 3 tunnels to one authority within
+// 2 s, that authority goes direct for 30 s (per isolate).
+const _grpcBurstTunnels = 3;
+const _grpcBurstMs = 2000;
+const _grpcDirectMs = 30000;
+
+// IOOverrides.global before ours: direct connects go through it (null: the SDK's own).
+IOOverrides? _ioPrevious;
+// A scope that overrides nothing: the SDK's own behaviour, for the hop to the proxy.
+IOOverrides? _ioPlain;
+final Map<String, List<int>> _grpcTunnels = <String, List<int>>{};
+final Map<String, int> _grpcDirectUntil = <String, int>{};
+
+// Not a subclass (IOOverrides is `abstract base`, and a `base`/`final` subclass does not parse in apps on a
+// pre-3.0 language version): a scope from IOOverrides.runZoned is a ready-made IOOverrides. Installed as the
+// global only, never in a zone, so that an IOOverrides.global the app sets later still takes effect.
+void _installIO() {
+  if (!_grpcEnabled) return;
+  final previous = Zone.root.run(() => IOOverrides.current);
+  try {
+    IOOverrides.global = null;
+    _ioPlain = Zone.root.run(() => IOOverrides.runZoned(() => IOOverrides.current!));
+    IOOverrides.global = previous;
+    final ours = Zone.root.run(() => IOOverrides.runZoned(() => IOOverrides.current!, socketConnect: _grpcConnect));
+    _ioPrevious = previous;
+    IOOverrides.global = ours;
+  } catch (e) {
+    IOOverrides.global = previous;
+    _note('gRPC calls are not intercepted ($e)');
+  }
+}
+
+Future<Socket> _grpcConnect(dynamic host, int port, {dynamic sourceAddress, int sourcePort = 0, Duration? timeout}) {
+  final unix = host is InternetAddress && host.type == InternetAddressType.unix;
+  if (unix || !_grpcCaller()) return _grpcDirect(host, port, sourceAddress, sourcePort, timeout);
+  return _grpcTunnel(host, port, sourceAddress, sourcePort, timeout);
+}
+
+bool _grpcCaller() {
+  final stack = StackTrace.current.toString();
+  for (final frame in _grpcFrames) {
+    if (stack.contains(frame)) return true;
+  }
+  return false;
+}
+
+Future<Socket> _grpcDirect(dynamic host, int port, dynamic sourceAddress, int sourcePort, Duration? timeout) {
+  return IOOverrides.runWithIOOverrides(
+      () => Socket.connect(host, port, sourceAddress: sourceAddress, sourcePort: sourcePort, timeout: timeout),
+      _ioPrevious ?? _ioPlain!);
+}
+
+// FLUTTER_INTERCEPT_PROXY is [user:token@]host:port (the host may be an [IPv6] literal).
+String _grpcProxyHost() {
+  final hostPort = _proxyAddress.substring(_proxyAddress.indexOf('@') + 1);
+  final host = hostPort.substring(0, hostPort.lastIndexOf(':'));
+  return host.startsWith('[') && host.endsWith(']') ? host.substring(1, host.length - 1) : host;
+}
+
+int _grpcProxyPort() => int.parse(_proxyAddress.substring(_proxyAddress.lastIndexOf(':') + 1));
+
+String _grpcProxyAuthorization() {
+  final at = _proxyAddress.indexOf('@');
+  if (at < 0) return '';
+  return 'Proxy-Authorization: Basic ${base64Encode(utf8.encode(_proxyAddress.substring(0, at)))}\r\n';
+}
+
+Future<Socket> _grpcTunnel(dynamic host, int port, dynamic sourceAddress, int sourcePort, Duration? timeout) async {
+  final target = host is InternetAddress ? host.address : '$host';
+  final authority = target.contains(':') && !target.startsWith('[') ? '[$target]:$port' : '$target:$port';
+  final now = DateTime.now().millisecondsSinceEpoch;
+  if ((_grpcDirectUntil[authority] ?? 0) > now) return _grpcDirect(host, port, sourceAddress, sourcePort, timeout);
+  final recent = _grpcTunnels.putIfAbsent(authority, () => <int>[]);
+  recent.removeWhere((int t) => now - t >= _grpcBurstMs);
+  if (recent.length >= _grpcBurstTunnels) {
+    recent.clear();
+    _grpcDirectUntil[authority] = now + _grpcDirectMs;
+    _note('gRPC to $authority goes direct for 30 s ($_grpcBurstTunnels connections through the proxy within 2 s)');
+    return _grpcDirect(host, port, sourceAddress, sourcePort, timeout);
+  }
+  final hop = timeout != null && timeout < _grpcHopTimeout ? timeout : _grpcHopTimeout;
+  final watch = Stopwatch()..start();
+  Socket socket;
+  String head;
+  try {
+    final proxyHost = _grpcProxyHost();
+    final proxyPort = _grpcProxyPort();
+    final authorization = _grpcProxyAuthorization();
+    socket = await IOOverrides.runWithIOOverrides(
+        () => Socket.connect(proxyHost, proxyPort, timeout: hop), _ioPlain!);
+    final left = timeout == null ? null : timeout - watch.elapsed;
+    final ms = left == null ? null : (left.inMilliseconds < 1 ? 1 : left.inMilliseconds);
+    head = 'CONNECT $authority HTTP/1.1\r\n'
+        'Host: $authority\r\n'
+        'Flutter-Intercept-Tunnel: silent\r\n'
+        '${ms == null ? '' : 'Flutter-Intercept-Connect-Timeout: $ms\r\n'}'
+        '$authorization'
+        '\r\n';
+  } catch (_) {
+    // Proxy unreachable: connect direct with what is left of the app's timeout.
+    final left = timeout == null ? null : timeout - watch.elapsed;
+    if (left != null && left <= Duration.zero) rethrow;
+    return _grpcDirect(host, port, sourceAddress, sourcePort, left);
+  }
+  recent.add(now);
+  // No reply is ever read: the app's HTTP/2 (h2c or TLS) follows the head on the same connection.
+  socket.add(utf8.encode(head));
+  return socket;
+}
+
 // Statics, and so HttpOverrides.global, are per isolate. In debug sessions Flutter Intercept calls
 // flutterInterceptInstall through the VM service in every new isolate of the app (compute,
 // Isolate.run, Isolate.spawn) while it is paused at start, before any of its code runs (CONTRACTS
@@ -424,6 +547,7 @@ _FlutterInterceptOverrides _install() {
   _trustCa(SecurityContext.defaultContext);
   final overrides = _FlutterInterceptOverrides(HttpOverrides.current);
   HttpOverrides.global = overrides;
+  _installIO();
   return _installed = overrides;
 }
 

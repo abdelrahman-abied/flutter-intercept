@@ -2,6 +2,7 @@ import { execFileSync, spawn, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as https from 'https';
+import * as net from 'net';
 import type { AddressInfo } from 'net';
 import * as os from 'os';
 import * as path from 'path';
@@ -14,7 +15,10 @@ import {
   entryPathFor,
   entrySha,
   ENTRY_TEMPLATE,
+  ENTRY_TEMPLATE_VERSION,
   findPubspecRoot,
+  GRPC_DEFINE,
+  grpcDefines,
   isGeneratedEntry,
   parsePubspec,
   planEntry,
@@ -24,6 +28,8 @@ import {
   TRACE_URL,
   writeEntry,
 } from '../../src/entry/generator';
+
+const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const FAKE_CA = '-----BEGIN CERTIFICATE-----\nTUlJQ0FBQUE=\n-----END CERTIFICATE-----\n';
 
@@ -110,8 +116,20 @@ describe('paths and imports', () => {
   const repo = path.join(__dirname, '..', '..', '..', '..');
   const contractsV1 = /## 1\.[\s\S]*?```dart\n([\s\S]*?)```/.exec(fs.readFileSync(path.join(repo, 'docs', 'CONTRACTS.md'), 'utf8'))![1];
 
-  it('ENTRY_TEMPLATE is template v5 verbatim (scripts/e2e/templates/entry_v5.dart.tmpl)', () => {
-    expect(ENTRY_TEMPLATE).toBe(fs.readFileSync(path.join(repo, 'scripts', 'e2e', 'templates', 'entry_v5.dart.tmpl'), 'utf8'));
+  const v5 = fs.readFileSync(path.join(repo, 'scripts', 'e2e', 'templates', 'entry_v5.dart.tmpl'), 'utf8');
+
+  it('ENTRY_TEMPLATE is template v6 verbatim (scripts/e2e/templates/entry_v6.dart.tmpl)', () => {
+    expect(ENTRY_TEMPLATE_VERSION).toBe(6);
+    expect(ENTRY_TEMPLATE).toBe(fs.readFileSync(path.join(repo, 'scripts', 'e2e', 'templates', 'entry_v6.dart.tmpl'), 'utf8'));
+  });
+
+  // CONTRACTS §16.1: v6 = v5 + the gRPC block (before the install function) + `_installIO();` in `_install()`, nothing else.
+  it('template v6 is template v5 plus the gRPC Socket.connect hook (docs/spikes/template-v6.md)', () => {
+    const block = /\n\/\/ gRPC \(CONTRACTS §16\.1\)\.[\s\S]*?\n(?=\/\/ Statics, and so HttpOverrides\.global, are per isolate\.)/.exec(ENTRY_TEMPLATE);
+    expect(block).not.toBeNull();
+    const install = '  HttpOverrides.global = overrides;\n  _installIO();\n  return _installed = overrides;\n';
+    expect(ENTRY_TEMPLATE).toContain(install);
+    expect(ENTRY_TEMPLATE.replace(block![0], '\n').replace(install, '  HttpOverrides.global = overrides;\n  return _installed = overrides;\n')).toBe(v5);
   });
 
   // CONTRACTS §13.3: v5 = v4 (docs/spikes/template-v4.md contract text) + the install function, nothing else.
@@ -120,17 +138,16 @@ describe('paths and imports', () => {
     const spike = fs.readFileSync(path.join(repo, 'docs', 'spikes', 'template-v4.md'), 'utf8');
     expect(/## Contract text for §1[\s\S]*?```dart\n([\s\S]*?)```/.exec(spike)![1]).toBe(v4);
     const v4Main = 'Future<void> main(List<String> args) async {\n  _trustCa(SecurityContext.defaultContext);\n  final overrides = _FlutterInterceptOverrides(HttpOverrides.current);\n  HttpOverrides.global = overrides;\n';
-    const added = /\n\/\/ Statics, and so HttpOverrides.global, are per isolate\.[\s\S]*?\nFuture<void> main\(List<String> args\) async \{\n  final overrides = _install\(\);\n/.exec(ENTRY_TEMPLATE);
+    const added = /\n\/\/ Statics, and so HttpOverrides.global, are per isolate\.[\s\S]*?\nFuture<void> main\(List<String> args\) async \{\n  final overrides = _install\(\);\n/.exec(v5);
     expect(added).not.toBeNull();
-    expect(ENTRY_TEMPLATE.replace(added![0], '\n' + v4Main)).toBe(v4);
+    expect(v5.replace(added![0], '\n' + v4Main)).toBe(v4);
     // The install function: top-level, kept for the VM (`invoke` by name), idempotent, same overrides as main.
     expect(ENTRY_TEMPLATE).toContain("@pragma('vm:entry-point')\nvoid flutterInterceptInstall() {\n  _install();\n}");
     expect(ENTRY_TEMPLATE).toContain('  final existing = _installed;\n  if (existing != null) return existing;\n');
-    expect(ENTRY_TEMPLATE).toContain('  HttpOverrides.global = overrides;\n  return _installed = overrides;\n');
+    expect(ENTRY_TEMPLATE).toContain('  HttpOverrides.global = overrides;\n  _installIO();\n  return _installed = overrides;\n');
   });
 
-  // Until the lead pastes v5 into CONTRACTS §1 the contract still shows v4; afterwards they must match.
-  it.skipIf(!contractsV1.includes('flutterInterceptInstall'))('ENTRY_TEMPLATE is the CONTRACTS.md §1 template verbatim', () => {
+  it('ENTRY_TEMPLATE is the CONTRACTS.md §1 template verbatim', () => {
     expect(ENTRY_TEMPLATE).toBe(contractsV1);
   });
 
@@ -481,4 +498,288 @@ describe.skipIf(!hasDart)('request → source traces (real dart, template v4)', 
       proxy = getLocal({ https: { key: ca.key, cert: ca.cert } });
     }
   }, 60_000);
+});
+
+// CONTRACTS §16.1 (template v6): the gRPC Socket.connect hook, read as text.
+describe('template v6: gRPC hook (static)', () => {
+  it('installs a non-subclass IOOverrides scope as the global only, never in a zone', () => {
+    expect(ENTRY_TEMPLATE).not.toMatch(/extends IOOverrides|implements IOOverrides|\bbase class\b|\bfinal class\b|\bsealed class\b|\binterface class\b/);
+    expect(ENTRY_TEMPLATE).toContain('IOOverrides.runZoned(() => IOOverrides.current!, socketConnect: _grpcConnect)');
+    expect(ENTRY_TEMPLATE.match(/IOOverrides\.global = /g)).toHaveLength(4); // null, previous, ours; previous on failure
+    expect(ENTRY_TEMPLATE).toContain('    IOOverrides.global = ours;\n');
+    // The app's main runs in HttpOverrides' zone only: no IOOverrides zone around it.
+    const main = ENTRY_TEMPLATE.slice(ENTRY_TEMPLATE.indexOf('Future<void> main(List<String> args) async {'));
+    expect(main).not.toContain('IOOverrides');
+    // Direct connects go through the previous global (or the SDK's own), never back through ours.
+    expect(ENTRY_TEMPLATE).toContain('      _ioPrevious ?? _ioPlain!);');
+  });
+
+  it('redirects only grpc-dart / connectrpc h2 connects, off with FLUTTER_INTERCEPT_GRPC=0 or without the proxy define', () => {
+    expect(ENTRY_TEMPLATE).toContain("String.fromEnvironment('FLUTTER_INTERCEPT_GRPC') != '0' && bool.hasEnvironment('FLUTTER_INTERCEPT_PROXY')");
+    expect(ENTRY_TEMPLATE).toContain("'package:grpc/src/client/http2_connection.dart',\n  'package:connectrpc/src/http2/connection.dart',\n");
+    expect(ENTRY_TEMPLATE).toContain('host is InternetAddress && host.type == InternetAddressType.unix');
+    expect(ENTRY_TEMPLATE).toContain('  if (!_grpcEnabled) return;\n');
+  });
+
+  it('writes exactly the silent CONNECT head of §16.1 and never reads a reply', () => {
+    expect(ENTRY_TEMPLATE).toContain(
+      "    head = 'CONNECT $authority HTTP/1.1\\r\\n'\n" +
+        "        'Host: $authority\\r\\n'\n" +
+        "        'Flutter-Intercept-Tunnel: silent\\r\\n'\n" +
+        "        '${ms == null ? '' : 'Flutter-Intercept-Connect-Timeout: $ms\\r\\n'}'\n" +
+        "        '$authorization'\n" +
+        "        '\\r\\n';\n",
+    );
+    expect(ENTRY_TEMPLATE).toContain("return 'Proxy-Authorization: Basic ${base64Encode(utf8.encode(_proxyAddress.substring(0, at)))}\\r\\n';");
+    const tunnel = ENTRY_TEMPLATE.slice(ENTRY_TEMPLATE.indexOf('Future<Socket> _grpcTunnel('), ENTRY_TEMPLATE.indexOf('// Statics, and so'));
+    expect(tunnel).not.toMatch(/\.listen\(|\.first\b|\.transform\(|\.read/);
+    expect(ENTRY_TEMPLATE).toContain('const _grpcHopTimeout = Duration(seconds: 2);');
+    expect(ENTRY_TEMPLATE).toContain('const _grpcBurstTunnels = 3;\nconst _grpcBurstMs = 2000;\nconst _grpcDirectMs = 30000;\n');
+  });
+
+  it('grpcDefines: the define only when the setting is off', () => {
+    expect(GRPC_DEFINE).toBe('FLUTTER_INTERCEPT_GRPC');
+    expect(grpcDefines(undefined)).toEqual([]);
+    expect(grpcDefines(true)).toEqual([]);
+    expect(grpcDefines(false)).toEqual(['--dart-define=FLUTTER_INTERCEPT_GRPC=0']);
+  });
+});
+
+// Template v6 with the real Dart VM: a stand-in `package:grpc` (path dependency) whose
+// lib/src/client/http2_connection.dart opens the socket like grpc-dart's SocketTransportConnector, a TCP
+// listener as the proxy (records what it receives, never answers) and a TCP target.
+describe.skipIf(!hasDart)('template v6: gRPC connects (real dart)', () => {
+  let work: string;
+  let app: string;
+  let entryFile: string;
+  let ca: { key: string; cert: string };
+  let proxy: net.Server;
+  let proxyPort: number;
+  let target: net.Server;
+  let targetPort: number;
+  let unixPath: string;
+  let unixServer: net.Server;
+  const heads: { head: string; rest: Buffer }[] = [];
+  let targetConnections = 0;
+
+  const listen = (server: net.Server, at?: string) =>
+    new Promise<number>((resolve) => (at ? server.listen(at, () => resolve(0)) : server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port))));
+
+  const runApp = (defines: string[], ...args: string[]) =>
+    new Promise<{ out: string; ms: number }>((resolve) => {
+      const t0 = Date.now();
+      const p = spawn('dart', ['run', ...defines, entryFile, ...args], { cwd: app });
+      let out = '';
+      p.stdout.on('data', (d) => (out += d));
+      p.stderr.on('data', (d) => (out += d));
+      p.on('close', () => resolve({ out, ms: Date.now() - t0 }));
+    });
+  const proxyDefine = () => `-DFLUTTER_INTERCEPT_PROXY=127.0.0.1:${proxyPort}`;
+  /** `CONNECTED <remotePort>` lines printed by the app, as 'proxy' / 'target' / port. */
+  const routes = (out: string) =>
+    [...out.matchAll(/CONNECTED (\S+)/g)].map((m) => (m[1] === String(proxyPort) ? 'proxy' : m[1] === String(targetPort) ? 'target' : m[1]));
+
+  beforeAll(async () => {
+    ca = await mockttpCaGenerator('Flutter Intercept CA grpc-test');
+    proxy = net.createServer((s) => {
+      let buf = Buffer.alloc(0);
+      let entry: { head: string; rest: Buffer } | undefined;
+      s.on('data', (d) => {
+        if (entry) {
+          entry.rest = Buffer.concat([entry.rest, d]);
+          return;
+        }
+        buf = Buffer.concat([buf, d]);
+        const i = buf.indexOf('\r\n\r\n');
+        if (i >= 0) heads.push((entry = { head: buf.subarray(0, i + 4).toString('latin1'), rest: buf.subarray(i + 4) }));
+      });
+      s.on('error', () => undefined);
+    });
+    proxyPort = await listen(proxy);
+    target = net.createServer((s) => {
+      targetConnections++;
+      s.on('error', () => undefined);
+      s.resume();
+    });
+    targetPort = await listen(target);
+    work = tmpDir('fi-grpc-');
+    unixPath = path.join(work, 'g.sock');
+    unixServer = net.createServer((s) => {
+      s.on('error', () => undefined);
+      s.resume();
+    });
+    await listen(unixServer, unixPath);
+
+    write(path.join(work, 'grpc', 'pubspec.yaml'), 'name: grpc\nenvironment:\n  sdk: ^3.0.0\n');
+    write(
+      path.join(work, 'grpc', 'lib', 'src', 'client', 'http2_connection.dart'),
+      [
+        "import 'dart:io';",
+        '',
+        "// Like grpc-dart's SocketTransportConnector.initSocket: a plain Socket.connect.",
+        'Future<Socket> initSocket(Object host, int port, Duration? timeout) => Socket.connect(host, port, timeout: timeout);',
+        '',
+      ].join('\n'),
+    );
+    app = path.join(work, 'app');
+    write(path.join(app, 'pubspec.yaml'), 'name: grpc_app\nenvironment:\n  sdk: ^3.0.0\ndependencies:\n  grpc:\n    path: ../grpc\n');
+    write(
+      path.join(app, 'lib', 'main.dart'),
+      [
+        "import 'dart:io';",
+        "import 'package:grpc/src/client/http2_connection.dart' as grpc;",
+        '',
+        'Object hostOf(String h) => h == "v6" ? InternetAddress("::1") : h == "v4" ? InternetAddress("127.0.0.1") : h.startsWith("unix:") ? InternetAddress(h.substring(5), type: InternetAddressType.unix) : h;',
+        '',
+        'Future<void> connect(String how, Object host, int port, Duration? timeout) async {',
+        '  final sw = Stopwatch()..start();',
+        "  final s = how == 'plain' ? await Socket.connect(host, port, timeout: timeout) : await grpc.initSocket(host, port, timeout);",
+        "  s.add('PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n'.codeUnits);",
+        '  await s.flush();',
+        "  print('CONNECTED ${host is InternetAddress && host.type == InternetAddressType.unix ? 'unix' : s.remotePort} ms=${sw.elapsedMilliseconds}');",
+        '  s.destroy();',
+        '}',
+        '',
+        '// args: <grpc|plain|layered|replaced> <host> <port> [timeoutMs] [count]',
+        'Future<void> main(List<String> args) async {',
+        '  final how = args[0];',
+        '  final host = hostOf(args[1]);',
+        '  final port = int.parse(args[2]);',
+        "  final timeout = args.length > 3 && args[3] != '-' ? Duration(milliseconds: int.parse(args[3])) : null;",
+        '  final count = args.length > 4 ? int.parse(args[4]) : 1;',
+        '  var appConnects = 0;',
+        "  if (how == 'replaced') {",
+        '    // The app installs its own global later: it wins (gRPC goes through it, not the proxy).',
+        '    final saved = IOOverrides.current;',
+        '    IOOverrides.global = null;',
+        '    final plain = IOOverrides.runZoned(() => IOOverrides.current!);',
+        '    IOOverrides.global = saved;',
+        '    IOOverrides.global = IOOverrides.runZoned(() => IOOverrides.current!, socketConnect: (h, int p, {sourceAddress, int sourcePort = 0, Duration? timeout}) {',
+        '      appConnects++;',
+        '      return IOOverrides.runWithIOOverrides(() => Socket.connect(h, p, timeout: timeout), plain);',
+        '    });',
+        '  }',
+        '  for (var i = 0; i < count; i++) {',
+        "    if (how == 'layered') {",
+        '      // The app layers its own overrides in a zone: ours still applies underneath.',
+        "      await IOOverrides.runZoned(() => connect('grpc', host, port, timeout), createFile: (p) => File.fromUri(Uri.file(p)));",
+        '    } else {',
+        "      await connect(how == 'replaced' ? 'grpc' : how, host, port, timeout);",
+        '    }',
+        '  }',
+        "  if (how == 'replaced') print('APP_CONNECTS $appConnects');",
+        "  print('DONE');",
+        '}',
+        '',
+      ].join('\n'),
+    );
+    execFileSync('dart', ['pub', 'get', '--offline'], { cwd: app, stdio: 'pipe' });
+    const plan = planEntry({ program: path.join(app, 'lib', 'main.dart'), proxyPort, caCertPem: ca.cert })!;
+    await writeEntry(plan);
+    entryFile = plan.entryPath;
+  }, 120_000);
+
+  afterAll(async () => {
+    for (const s of [proxy, target, unixServer]) s?.close();
+    if (work) fs.rmSync(work, { recursive: true, force: true });
+  });
+
+  it('a grpc-dart connect goes through the proxy with the exact silent CONNECT head, then the h2c preface', async () => {
+    heads.length = 0;
+    const { out } = await runApp([proxyDefine()], 'grpc', 'localhost', String(targetPort));
+    expect(out).toContain('DONE');
+    expect(routes(out)).toEqual(['proxy']);
+    await sleepMs(100);
+    expect(heads.map((h) => h.head)).toEqual([`CONNECT localhost:${targetPort} HTTP/1.1\r\nHost: localhost:${targetPort}\r\nFlutter-Intercept-Tunnel: silent\r\n\r\n`]);
+    expect(heads[0].rest.toString('latin1')).toBe('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n');
+  }, 60_000);
+
+  it('authority: IPv4 / IPv6 InternetAddress (brackets); remaining connect timeout; Proxy-Authorization from user:token@', async () => {
+    heads.length = 0;
+    const tok = 'tok-123_ABC';
+    await runApp([proxyDefine()], 'grpc', 'v4', String(targetPort));
+    await runApp([proxyDefine()], 'grpc', 'v6', String(targetPort), '5000');
+    const { out } = await runApp([`-DFLUTTER_INTERCEPT_PROXY=flutter-intercept:${tok}@127.0.0.1:${proxyPort}`], 'grpc', 'api.example.test', '443');
+    expect(routes(out)).toEqual(['proxy']);
+    await sleepMs(100);
+    expect(heads).toHaveLength(3);
+    expect(heads[0].head).toBe(`CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nHost: 127.0.0.1:${targetPort}\r\nFlutter-Intercept-Tunnel: silent\r\n\r\n`);
+    const v6 = /^CONNECT \[::1\]:(\d+) HTTP\/1\.1\r\nHost: \[::1\]:\1\r\nFlutter-Intercept-Tunnel: silent\r\nFlutter-Intercept-Connect-Timeout: (\d+)\r\n\r\n$/.exec(heads[1].head);
+    expect(v6).not.toBeNull();
+    expect(Number(v6![2])).toBeGreaterThan(3000);
+    expect(Number(v6![2])).toBeLessThanOrEqual(5000);
+    const basic = Buffer.from(`flutter-intercept:${tok}`).toString('base64');
+    expect(heads[2].head).toBe(
+      `CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\nFlutter-Intercept-Tunnel: silent\r\nProxy-Authorization: Basic ${basic}\r\n\r\n`,
+    );
+  }, 60_000);
+
+  it('everything else goes direct: app sockets, Unix-domain sockets, FLUTTER_INTERCEPT_GRPC=0, no proxy define', async () => {
+    heads.length = 0;
+    const plain = await runApp([proxyDefine()], 'plain', 'localhost', String(targetPort));
+    expect(routes(plain.out)).toEqual(['target']);
+    const unix = await runApp([proxyDefine()], 'grpc', `unix:${unixPath}`, '0');
+    expect(unix.out).toContain('CONNECTED unix');
+    const off = await runApp([proxyDefine(), '-DFLUTTER_INTERCEPT_GRPC=0'], 'grpc', 'localhost', String(targetPort));
+    expect(routes(off.out)).toEqual(['target']);
+    const noDefine = await runApp([], 'grpc', 'localhost', String(targetPort));
+    expect(routes(noDefine.out)).toEqual(['target']);
+    await sleepMs(100);
+    expect(heads).toHaveLength(0);
+  }, 60_000);
+
+  it('an app that layers IOOverrides.runZoned keeps the hook; an app that replaces the global wins', async () => {
+    heads.length = 0;
+    const layered = await runApp([proxyDefine()], 'layered', 'localhost', String(targetPort));
+    expect(routes(layered.out)).toEqual(['proxy']);
+    const replaced = await runApp([proxyDefine()], 'replaced', 'localhost', String(targetPort));
+    expect(routes(replaced.out)).toEqual(['target']);
+    expect(replaced.out).toContain('APP_CONNECTS 1');
+    expect(replaced.out).not.toContain('[flutter_intercept]');
+  }, 60_000);
+
+  it('proxy down: direct at once (connection refused), with the app timeout honoured', async () => {
+    const closed = net.createServer();
+    const downPort = await listen(closed);
+    await new Promise<void>((r) => closed.close(() => r()));
+    const before = targetConnections;
+    const { out } = await runApp([`-DFLUTTER_INTERCEPT_PROXY=127.0.0.1:${downPort}`], 'grpc', 'localhost', String(targetPort), '3000');
+    expect(routes(out)).toEqual(['target']);
+    expect(Number(/CONNECTED \d+ ms=(\d+)/.exec(out)![1])).toBeLessThan(500);
+    expect(targetConnections).toBe(before + 1);
+    expect(out).not.toContain('[flutter_intercept]');
+  }, 60_000);
+
+  it('circuit breaker: after 3 tunnels to one authority within 2 s it goes direct (one note)', async () => {
+    heads.length = 0;
+    const { out } = await runApp([proxyDefine()], 'grpc', 'localhost', String(targetPort), '-', '6');
+    expect(routes(out)).toEqual(['proxy', 'proxy', 'proxy', 'target', 'target', 'target']);
+    expect(out.match(/\[flutter_intercept\] gRPC to localhost:\d+ goes direct for 30 s/g)).toHaveLength(1);
+    // Another authority is not affected.
+    heads.length = 0;
+    const other = await runApp([proxyDefine()], 'grpc', 'v4', String(targetPort), '-', '2');
+    expect(routes(other.out)).toEqual(['proxy', 'proxy']);
+  }, 60_000);
+});
+
+// The entry inherits the app's language version (§1): v6 must parse and compile in a 2.12 package.
+describe.skipIf(!hasDart)('template v6 under old language versions (real dart)', () => {
+  it('dart analyze: no errors with language version 2.12', async () => {
+    const app = tmpDir('fi-lang-');
+    try {
+      write(path.join(app, 'pubspec.yaml'), "name: old_app\nenvironment:\n  sdk: '>=2.12.0 <4.0.0'\n");
+      write(path.join(app, 'lib', 'main.dart'), "void main() { print('CALLED old'); }\n");
+      execFileSync('dart', ['pub', 'get', '--offline'], { cwd: app, stdio: 'pipe' });
+      const ca = await mockttpCaGenerator('Flutter Intercept CA lang-test');
+      const plan = planEntry({ program: path.join(app, 'lib', 'main.dart'), proxyPort: 9, caCertPem: ca.cert })!;
+      await writeEntry(plan);
+      const r = spawnSync('dart', ['analyze', '--no-fatal-warnings', plan.entryPath], { cwd: app, encoding: 'utf8' });
+      expect(r.stdout + r.stderr).not.toMatch(/\berror\b -/);
+      expect(r.status).toBe(0);
+      const run = spawnSync('dart', ['run', '-DFLUTTER_INTERCEPT_PROXY=127.0.0.1:9', plan.entryPath], { cwd: app, encoding: 'utf8' });
+      expect(run.stdout).toContain('CALLED old');
+    } finally {
+      fs.rmSync(app, { recursive: true, force: true });
+    }
+  }, 120_000);
 });

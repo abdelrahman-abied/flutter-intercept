@@ -30,8 +30,17 @@
 // locally (204, never forwarded); each trace is logged as `PROXY_TRACE <id> <stack as a JSON string>`.
 // The request header `x-fi-id` is logged (`fi=<id>` on PROXY_REQ) and stripped before upstream.
 //
+// Silent tunnels (CONTRACTS §16.1/§16.2, entry template v6's gRPC hook): a CONNECT carrying
+// `Flutter-Intercept-Tunnel: silent` gets no reply. The bytes after the head (h2c preface or a TLS
+// ClientHello, often in the same chunk) are relayed raw to the target, which is connected with
+// `Flutter-Intercept-Connect-Timeout` (default 30 s, max 60 s). 10.0.2.2 (the Android emulator's alias of
+// this machine) is connected as 127.0.0.1. Never decoded here (the real proxy decodes h2c). Refusals and
+// upstream failures close the connection. Logged: `PROXY_SILENT <authority> first=<h2c|tls|other>
+// via=<local port of the upstream connection> timeout=<ms|-> auth=<bool>`, `PROXY_SILENT_CLOSE <authority>
+// up=<bytes> down=<bytes>`, `PROXY_SILENT_ERR <authority> <error>`.
+//
 // Greppable log lines: PROXY_READY, PROXY_REQ, PROXY_EDIT, PROXY_PASS,
-// PROXY_MOCK, PROXY_BLOCK, PROXY_ERR, PROXY_TRACE.
+// PROXY_MOCK, PROXY_BLOCK, PROXY_ERR, PROXY_TRACE, PROXY_SILENT*.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -201,9 +210,14 @@ Future<void> _ensureCerts(String dir) async {
 void _accept(Socket client, int tlsPort, int plainPort) {
   final buf = <int>[];
   Socket? tunnel;
+  _Silent? silentTunnel;
   var connecting = false;
   late StreamSubscription<List<int>> sub;
   sub = client.listen((data) async {
+    if (silentTunnel != null) {
+      silentTunnel!.add(data);
+      return;
+    }
     if (tunnel != null) {
       tunnel!.add(data);
       return;
@@ -216,13 +230,25 @@ void _accept(Socket client, int tlsPort, int plainPort) {
     connecting = true;
     sub.pause();
     final isConnect = head.startsWith('CONNECT ');
+    final silent = isConnect && _header(head.substring(0, end), 'flutter-intercept-tunnel')?.toLowerCase() == 'silent';
     if (_token != null && !_authorized(head)) {
       final firstLine = head.substring(0, head.indexOf('\r\n'));
-      log('PROXY_407 ${firstLine.split(' ').take(2).join(' ')} from ${client.remoteAddress.address}');
+      log('PROXY_407 ${firstLine.split(' ').take(2).join(' ')} from ${client.remoteAddress.address}${silent ? ' (silent: closed)' : ''}');
+      if (silent) {
+        client.destroy();
+        return;
+      }
       client.add(latin1.encode('HTTP/1.1 407 Proxy Authentication Required\r\n'
           'Proxy-Authenticate: Basic realm="flutter-intercept"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'));
       await client.flush().catchError((_) {});
       client.destroy();
+      return;
+    }
+    if (silent) {
+      final rest = buf.sublist(end + 4);
+      buf.clear();
+      silentTunnel = await _silentTunnel(client, head.substring(0, end), rest);
+      if (silentTunnel != null) sub.resume();
       return;
     }
     try {
@@ -251,7 +277,83 @@ void _accept(Socket client, int tlsPort, int plainPort) {
       client.destroy();
     }
     sub.resume();
-  }, onDone: () => tunnel?.destroy(), onError: (_) => tunnel?.destroy());
+  }, onDone: () {
+    tunnel?.destroy();
+    silentTunnel?.up.destroy();
+  }, onError: (_) {
+    tunnel?.destroy();
+    silentTunnel?.up.destroy();
+  });
+}
+
+String? _header(String head, String name) {
+  for (final line in head.split('\r\n').skip(1)) {
+    final i = line.indexOf(':');
+    if (i > 0 && line.substring(0, i).trim().toLowerCase() == name) return line.substring(i + 1).trim();
+  }
+  return null;
+}
+
+String _kind(List<int> first) {
+  if (first.isEmpty) return 'none';
+  if (first[0] == 0x16) return 'tls';
+  if (first.length >= 14 && latin1.decode(first.sublist(0, 14)) == 'PRI * HTTP/2.0') return 'h2c';
+  return 'other';
+}
+
+/// An open silent tunnel: client bytes go to [up] (counted; the first chunk is classified and logged).
+class _Silent {
+  _Silent(this.up, this.authority, this.timeout);
+  final Socket up;
+  final String authority;
+  final String timeout;
+  int upBytes = 0, downBytes = 0;
+  bool logged = false;
+
+  void add(List<int> data) {
+    if (!logged) {
+      logged = true;
+      log('PROXY_SILENT $authority first=${_kind(data)} via=${up.port} timeout=$timeout auth=${_token != null}');
+    }
+    upBytes += data.length;
+    up.add(data);
+  }
+}
+
+/// Silent CONNECT: connects the target and relays raw bytes both ways; never writes a reply. Returns null
+/// after closing the client (refused target, upstream failure).
+Future<_Silent?> _silentTunnel(Socket client, String head, List<int> rest) async {
+  final authority = head.substring(8, head.indexOf(' ', 8));
+  final colon = authority.lastIndexOf(':');
+  var host = authority.substring(0, colon);
+  if (host.startsWith('[') && host.endsWith(']')) host = host.substring(1, host.length - 1);
+  final port = int.tryParse(authority.substring(colon + 1)) ?? 0;
+  final asked = int.tryParse(_header(head, 'flutter-intercept-connect-timeout') ?? '');
+  final timeoutMs = asked == null ? 30000 : asked.clamp(1, 60000);
+  final connectHost = host == '10.0.2.2' ? '127.0.0.1' : host;
+  try {
+    if (_token != null && await _forbiddenTarget(host)) {
+      log('PROXY_SILENT_ERR $authority refused (local target)');
+      client.destroy();
+      return null;
+    }
+    final up = await Socket.connect(connectHost, port, timeout: Duration(milliseconds: timeoutMs));
+    up.setOption(SocketOption.tcpNoDelay, true);
+    final t = _Silent(up, authority, asked == null ? '-' : '$asked');
+    up.listen((d) {
+      t.downBytes += d.length;
+      client.add(d);
+    }, onDone: () {
+      log('PROXY_SILENT_CLOSE $authority up=${t.upBytes} down=${t.downBytes}');
+      client.destroy();
+    }, onError: (Object e) => client.destroy());
+    if (rest.isNotEmpty) t.add(rest);
+    return t;
+  } catch (e) {
+    log('PROXY_SILENT_ERR $authority $e');
+    client.destroy();
+    return null;
+  }
 }
 
 bool _authorized(String head) {

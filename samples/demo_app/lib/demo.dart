@@ -16,6 +16,7 @@ import 'api/local_api.dart';
 import 'api/orders_api.dart';
 import 'api/users_api.dart';
 import 'coverage.dart';
+import 'grpc_demo.dart';
 import 'pinned_roots.dart';
 
 /// --dart-define=APP_SETS_OVERRIDES=true : the app installs its own
@@ -131,16 +132,19 @@ String _short(Object? body) {
   return s.length > 160 ? '${s.substring(0, 160)}...' : s;
 }
 
-Future<void> _timed(String label, Future<(int, Object?)> Function() fn) async {
+Future<void> _timed(String label, Future<(int, Object?)> Function() fn, {void Function(String line)? onLine}) async {
   final sw = Stopwatch()..start();
+  String line;
   try {
     final (status, body) = await fn();
-    log('DEMO_RESULT $label $status ms=${sw.elapsedMilliseconds} ${_short(body)}');
+    line = 'DEMO_RESULT $label $status ms=${sw.elapsedMilliseconds} ${_short(body)}';
   } catch (e) {
     final msg = e.toString().replaceAll(RegExp(r'\s+'), ' ');
-    log('DEMO_RESULT $label ERR ms=${sw.elapsedMilliseconds} '
-        '${msg.length > 200 ? msg.substring(0, 200) : msg}');
+    line = 'DEMO_RESULT $label ERR ms=${sw.elapsedMilliseconds} '
+        '${msg.length > 200 ? msg.substring(0, 200) : msg}';
   }
+  log(line);
+  onLine?.call(line);
 }
 
 Future<void> dioUser() => _timed('dio_user', () async {
@@ -256,6 +260,24 @@ Future<void> runCoverage() async {
   log('DEMO_COVERAGE done');
 }
 
+// gRPC calls (lib/grpc_demo.dart): once after the first batch and after every hot restart when GRPC_PORT is set.
+int _grpcBatch = 0;
+Future<void> runGrpcBatch() async {
+  _grpcBatch++;
+  log('DEMO_GRPC start $_grpcBatch host=$grpcHost port=$grpcPort tlsPort=$grpcTlsPort');
+  // One after the other: the first call opens the channel's connection, the others reuse it.
+  for (final e in grpcCalls.entries) {
+    await _timed(e.key, e.value);
+  }
+  log('DEMO_GRPC done $_grpcBatch');
+}
+
+Future<String> _grpcScreenCall(String label, Future<GrpcOutcome> Function() fn) async {
+  String? line;
+  await _timed(label, fn, onLine: (l) => line = l);
+  return line ?? label;
+}
+
 Future<void> runBatch() async {
   _batch++;
   log('DEMO_BATCH start $_batch');
@@ -281,13 +303,15 @@ void runDemo({required String flavor}) {
   log('DEMO_START flavor=$flavor appSetsOverrides=$appSetsOverrides '
       'appZoneOverrides=$appZoneOverrides findProxy=${appFindProxy.isEmpty ? '-' : appFindProxy} '
       'pinning=${appPinning.isEmpty ? '-' : appPinning} repeat=$repeatSeconds'
-      '${localPort > 0 ? ' local=$localHealthUrl' : ''}');
+      '${localPort > 0 ? ' local=$localHealthUrl' : ''}'
+      '${grpcPort > 0 ? ' grpc=$grpcHost:$grpcPort' : ''}');
   if (appSetsOverrides) HttpOverrides.global = AppHttpOverrides();
 
   void start() {
     WidgetsFlutterBinding.ensureInitialized();
     runApp(DemoApp(flavor: flavor));
     final first = runBatch();
+    if (grpcPort > 0) first.then((_) => runGrpcBatch());
     if (coverage) first.then((_) => runCoverage());
     if (coverage && coverageRepeatSeconds > 0) {
       Timer.periodic(Duration(seconds: coverageRepeatSeconds), (_) => runCoverage());
@@ -312,11 +336,19 @@ class DemoApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Demo ($flavor)',
-      home: Scaffold(
+      home: Builder(builder: (context) => Scaffold(
         appBar: AppBar(title: Text('Network demo — $flavor')),
         body: ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: FilledButton.tonal(
+                onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(builder: (_) => const GrpcScreen(run: _grpcScreenCall))),
+                child: const Text('gRPC calls…'),
+              ),
+            ),
             for (final (label, fn) in [
               ('Run all requests', runBatch),
               ('Run coverage scenarios', runCoverage),
@@ -344,7 +376,7 @@ class DemoApp extends StatelessWidget {
               ),
           ],
         ),
-      ),
+      )),
     );
   }
 }

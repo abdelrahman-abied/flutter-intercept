@@ -19,7 +19,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { spkiPin } from '../ca';
-import { EntryPlan, findPubspecRoot, FsLike, isGeneratedEntry, isWithin, planEntry, PROXY_DEFINE, readPubspec } from '../entry/generator';
+import { EntryPlan, findPubspecRoot, FsLike, GRPC_DEFINE, grpcDefines, isGeneratedEntry, isWithin, planEntry, PROXY_DEFINE, readPubspec } from '../entry/generator';
 
 export const ORIGINAL_PROGRAM_KEY = 'flutterInterceptOriginalProgram';
 export const MARKER_KEY = 'flutterInterceptPort';
@@ -59,7 +59,7 @@ export { PROXY_DEFINE };
 /** CONTRACTS §9.1: `FLUTTER_INTERCEPT_TRACE=0` turns the entry's request → source traces off. */
 export const TRACE_DEFINE = 'FLUTTER_INTERCEPT_TRACE';
 /** CONTRACTS §16.1: `FLUTTER_INTERCEPT_GRPC=0` turns the entry's gRPC (`Socket.connect`) redirect off. */
-export const GRPC_DEFINE = 'FLUTTER_INTERCEPT_GRPC';
+export { GRPC_DEFINE };
 /** Every dart-define we own. */
 export const OUR_DEFINES = [SHA_DEFINE, PROXY_DEFINE, TRACE_DEFINE, GRPC_DEFINE] as const;
 
@@ -133,7 +133,7 @@ export function withInterceptDefines(toolArgs: unknown, sha: string, proxyAddres
     `--dart-define=${SHA_DEFINE}=${sha}`,
     definesFile ? `${DEFINE_FROM_FILE}=${definesFile}` : `--dart-define=${PROXY_DEFINE}=${proxyAddress}`,
     ...(captureSource ? [] : [`--dart-define=${TRACE_DEFINE}=0`]),
-    ...(grpc ? [] : [`--dart-define=${GRPC_DEFINE}=0`]),
+    ...grpcDefines(grpc),
   ];
 }
 

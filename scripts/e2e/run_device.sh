@@ -13,9 +13,17 @@
 #   --app <dir>              Flutter project (default samples/demo_app)
 #   --entry-dir <dir>        where to generate the entry (default .dart_tool/flutter_intercept;
 #                            use distinct dirs when running two devices in parallel)
-#   --template v1|v2|v3|v4|v5  entry template from scripts/e2e/templates (default v5 = v4 + the
-#                            background-isolate install hook; v4: + request -> source traces, checked
-#                            against the demo's call sites; v3 = no traces)
+#   --template v1..v6        entry template from scripts/e2e/templates (default v6 = v5 + the gRPC
+#                            Socket.connect hook; v5 = v4 + the background-isolate install hook; v4: +
+#                            request -> source traces, checked against the demo's call sites; v3 = no traces)
+#   --grpc                   CONTRACTS §16.1 (template v6): start scripts/e2e/grpc_server (h2c on
+#                            --grpc-port, default 50051, TLS on the next port) and pass GRPC_PORT /
+#                            GRPC_TLS_PORT: the demo's gRPC batch (DEMO_GRPC) must go through silent
+#                            tunnels of the proxy (the server's `servedTo` port = the proxy's upstream port)
+#                            while the proxy is up, and direct once it is down
+#   --grpc-off               with --grpc: --dart-define=FLUTTER_INTERCEPT_GRPC=0, every gRPC call must go direct
+#   --isolates               flutter run --start-paused + scripts/e2e/isolate_installer.mjs (the extension's
+#                            background-isolate install, CONTRACTS §13.3): grpc_isolate must be tunnelled too
 #   --attack                 REVIEW-1 #1: run scripts/e2e/evil_server.dart (self-signed CN=evil.example)
 #                            on :8443 and make the app GET it (EVIL_URL); it must never be accepted —
 #                            proxy up (proxy refuses upstream) or down (DIRECT must fail verification)
@@ -44,7 +52,8 @@ DEVICE=${1:-}
 [ -z "$DEVICE" ] && { sed -n '2,20p' "$0"; exit 64; }
 shift
 TARGET=lib/main.dart PORT=8899 MODE=debug EMU_HOST=0 DO_RESTART=1 DO_FALLBACK=1 APP_MODE="" ENTRY_DIR=.dart_tool/flutter_intercept ATTACK=0 EVIL_PORT=8443 LAN="" TOKEN=""
-export FI_TEMPLATE=${FI_TEMPLATE:-v5}
+GRPC=0 GRPC_PORT=50051 GRPC_OFF=0 ISOLATES=0
+export FI_TEMPLATE=${FI_TEMPLATE:-v6}
 APP="$REPO/samples/demo_app"
 DEFINES=()
 while [ $# -gt 0 ]; do
@@ -62,6 +71,10 @@ while [ $# -gt 0 ]; do
     --attack) ATTACK=1 ;;
     --evil-port) EVIL_PORT=$2; shift ;;
     --lan) LAN=$2; shift ;;
+    --grpc) GRPC=1 ;;
+    --grpc-port) GRPC_PORT=$2; shift ;;
+    --grpc-off) GRPC_OFF=1 ;;
+    --isolates) ISOLATES=1 ;;
     --app-mode) APP_MODE=$2; shift
       case $APP_MODE in
         charles|env) DEFINES+=("--dart-define=APP_FINDPROXY=$APP_MODE") ;;
@@ -75,8 +88,9 @@ done
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/fi_e2e.XXXXXX")
 LOG="$WORK/flutter.log" PLOG="$WORK/proxy.log" FIFO="$WORK/stdin.fifo"
-PROXY_PID="" FLUTTER_PID="" HOLDER_PID="" EVIL_PID="" ANDROID=0 FAILS=0
-echo "[e2e] device=$DEVICE target=$TARGET mode=$MODE template=$FI_TEMPLATE app-mode=${APP_MODE:-default} port=$PORT logs=$WORK"
+PROXY_PID="" FLUTTER_PID="" HOLDER_PID="" EVIL_PID="" GRPC_PID="" INSTALLER_PID="" ANDROID=0 FAILS=0
+GLOG="$WORK/grpc_server.log" ILOG="$WORK/installer.log"
+echo "[e2e] device=$DEVICE target=$TARGET mode=$MODE template=$FI_TEMPLATE app-mode=${APP_MODE:-default} port=$PORT grpc=$GRPC$( [ "$GRPC_OFF" = 1 ] && echo ' (FLUTTER_INTERCEPT_GRPC=0)') isolates=$ISOLATES logs=$WORK"
 
 pass() { echo "[e2e] PASS $*"; }
 fail() { echo "[e2e] FAIL $*"; FAILS=$((FAILS + 1)); }
@@ -107,6 +121,8 @@ cleanup() {
   [ -n "$HOLDER_PID" ] && kill "$HOLDER_PID" 2>/dev/null
   stop_proxy
   [ -n "$EVIL_PID" ] && { kill "$EVIL_PID" 2>/dev/null; pkill -f "evil_server.dart --port $EVIL_PORT --dir" 2>/dev/null; }
+  [ -n "$GRPC_PID" ] && { kill "$GRPC_PID" 2>/dev/null; pkill -f "bin/server.dart --port $GRPC_PORT " 2>/dev/null; }
+  [ -n "$INSTALLER_PID" ] && kill "$INSTALLER_PID" 2>/dev/null
   [ "$ANDROID" = 1 ] && [ "$ATTACK" = 1 ] && adb -s "$DEVICE" reverse --remove "tcp:$EVIL_PORT" 2>/dev/null
   [ "$ANDROID" = 1 ] && [ "$EMU_HOST" = 0 ] && adb -s "$DEVICE" reverse --remove "tcp:$PORT" 2>/dev/null
   echo "[e2e] logs kept in $WORK"
@@ -145,6 +161,17 @@ if [ "$ATTACK" = 1 ]; then
   DEFINES+=("--dart-define=EVIL_URL=https://${LAN:-localhost}:$EVIL_PORT/attack")
 fi
 
+if [ "$GRPC" = 1 ]; then
+  (cd "$HERE/grpc_server" && dart pub get >/dev/null 2>&1)
+  (cd "$HERE/grpc_server" && exec dart run bin/server.dart --port "$GRPC_PORT" --tls-port $((GRPC_PORT + 1))) > "$GLOG" 2>&1 &
+  GRPC_PID=$!
+  for _ in $(seq 1 60); do grep -q GRPC_SERVER_READY "$GLOG" && break; sleep 0.5; done
+  grep -q GRPC_SERVER_READY "$GLOG" || { echo "[e2e] gRPC server did not start"; cat "$GLOG"; exit 2; }
+  # The demo reaches the host machine at 10.0.2.2 from the Android emulator, localhost elsewhere.
+  DEFINES+=("--dart-define=GRPC_PORT=$GRPC_PORT" "--dart-define=GRPC_TLS_PORT=$((GRPC_PORT + 1))")
+  [ "$GRPC_OFF" = 1 ] && DEFINES+=("--dart-define=FLUTTER_INTERCEPT_GRPC=0")
+fi
+
 # --- entry (v3: device independent; the proxy address is a dart-define)
 ENTRY_ABS=$("$HERE/gen_entry.sh" "$APP" "$TARGET" "$HOST" "$PORT" "$ENTRY_DIR") || exit 2
 ENTRY_REL="$ENTRY_DIR/$(basename "$ENTRY_ABS")"
@@ -161,10 +188,20 @@ mkfifo "$FIFO"
 : > "$LOG" # exists before flutter run's redirect (which waits for the fifo) so wait_batch can grep it
 sleep 100000 > "$FIFO" &
 HOLDER_PID=$!
-(cd "$APP" && exec flutter run -d "$DEVICE" -t "$ENTRY_REL" "--$MODE" \
+PAUSED=()
+[ "$ISOLATES" = 1 ] && PAUSED=(--start-paused)
+(cd "$APP" && exec flutter run -d "$DEVICE" -t "$ENTRY_REL" "--$MODE" ${PAUSED[@]+"${PAUSED[@]}"} \
   "--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=$SHA" ${DEFINES[@]+"${DEFINES[@]}"}) \
   < "$FIFO" > "$LOG" 2>&1 &
 FLUTTER_PID=$!
+if [ "$ISOLATES" = 1 ]; then
+  # The VM service URI flutter run prints once the app is up (paused at start).
+  for _ in $(seq 1 600); do grep -qE 'Dart VM Service on .* is available at: http' "$LOG" && break; kill -0 "$FLUTTER_PID" 2>/dev/null || break; sleep 1; done
+  VMS=$(grep -oE 'Dart VM Service on .* is available at: http://[^ ]+' "$LOG" | head -1 | sed 's/.* is available at: //')
+  [ -z "$VMS" ] && { echo "[e2e] no VM service URI"; tail -40 "$LOG"; exit 1; }
+  node "$HERE/isolate_installer.mjs" "$VMS" > "$ILOG" 2>&1 &
+  INSTALLER_PID=$!
+fi
 
 # Wait until the n-th "DEMO_BATCH done" appears (n counts across restarts).
 wait_batch() {
@@ -229,7 +266,7 @@ expect_trace() { # method url-regex frame-regex description
   if echo "$f" | grep -Eq "$3"; then pass "source of $4: $f"; else fail "source of $4 — got: $f"; fi
 }
 assert_traces() {
-  [ "$FI_TEMPLATE" = v4 ] || [ "$FI_TEMPLATE" = v5 ] || return 0
+  case $FI_TEMPLATE in v4|v5|v6) ;; *) return 0 ;; esac
   # package:http opens the connection synchronously from the app's call: always found (AOT/profile
   # stacks have no column).
   expect_trace POST 'jsonplaceholder\.typicode\.com/todos$' '^OrdersApi\.createOrder \(package:demo_app/api/orders_api\.dart:1[0-9][:)]' "http POST (OrdersApi.createOrder)"
@@ -267,11 +304,52 @@ assert_attack() { # run phase
   fi
 }
 
+# --- gRPC (template v6, CONTRACTS §16.1)
+wait_grpc() { # n timeout
+  [ "$GRPC" = 1 ] || return 0
+  local n=$1 timeout=$2 t=0
+  while [ "$(grep -c 'DEMO_GRPC done' "$LOG")" -lt "$n" ]; do
+    t=$((t + 1)); [ $t -gt "$timeout" ] && { echo "[e2e] timeout waiting for gRPC batch $n"; return 1; }
+    sleep 1
+  done
+}
+# Port of the connection the gRPC server saw for <label> in run n ("servedTo":"<addr>:<port>").
+served_port() { result "$1" "$2" | grep -oE '"servedTo":"[^"]*"' | head -1 | sed -E 's/.*:([0-9]+)"$/\1/'; }
+# Upstream ports of the proxy's silent tunnels whose first bytes were <kind> (h2c|tls).
+tunnel_ports() { grep -oE "PROXY_SILENT [^ ]+ first=$1 via=[0-9]+" "$PLOG" | sed -E 's/.*via=//'; }
+expect_route() { # run label kind(h2c|tls) want(tunnel|direct) description
+  local p; p=$(served_port "$1" "$2")
+  if [ -z "$p" ]; then fail "run$1 $2: no servedTo — got: $(result "$1" "$2")"; return; fi
+  if tunnel_ports "$3" | grep -qx "$p"; then
+    [ "$4" = tunnel ] && pass "run$1 $2: $5 (silent tunnel, $3, upstream port $p)" || fail "run$1 $2: went through the proxy (port $p), expected direct"
+  else
+    [ "$4" = direct ] && pass "run$1 $2: $5 (direct, port $p)" || fail "run$1 $2: not through the proxy (port $p not a $3 tunnel)"
+  fi
+}
+assert_grpc() { # run tunnel|direct [isolate-want]
+  [ "$GRPC" = 1 ] || return 0
+  local n=$1 want=$2 iso=${3:-$2}
+  expect "$n" grpc_unary '^grpc_unary 0 .*"status":"ORDER_STATUS_SHIPPED".*"server":"fi-grpc-server"' "gRPC unary"
+  expect "$n" grpc_stream '^grpc_stream 0 .*"events":\["1:ORDER_STATUS_PENDING","2:ORDER_STATUS_SHIPPED","3:ORDER_STATUS_DELIVERED"\]' "gRPC server streaming (3 events)"
+  expect "$n" grpc_client_stream '^grpc_client_stream 0 .*"count":3,"quantity":6' "gRPC client streaming"
+  expect "$n" grpc_bidi '^grpc_bidi 0 .*"replies":\["echo: hello 1","echo: hello 2","echo: hello 3"\]' "gRPC bidi streaming"
+  expect "$n" grpc_missing '^grpc_missing ERR .*code: 5' "gRPC error status NOT_FOUND (trailers) passes unchanged"
+  expect "$n" grpc_tls '^grpc_tls 0 .*"status":"ORDER_STATUS_SHIPPED"' "gRPC over TLS (app trusts the server's self-signed cert)"
+  for l in grpc_unary grpc_stream grpc_client_stream grpc_bidi; do expect_route "$n" $l h2c "$want" "$l"; done
+  expect_route "$n" grpc_tls tls "$want" "grpc_tls"
+  expect "$n" grpc_isolate '^grpc_isolate 0 ' "gRPC from Isolate.run"
+  expect_route "$n" grpc_isolate h2c "$iso" "grpc_isolate"
+}
+
 BUILD_TIMEOUT=600
+GRPC_WANT=tunnel ISO_WANT=direct
+[ "$GRPC_OFF" = 1 ] && GRPC_WANT=direct
+[ "$ISOLATES" = 1 ] && ISO_WANT=$GRPC_WANT
 wait_batch 1 $BUILD_TIMEOUT || exit 1
 if grep -q "Launching $ENTRY_DIR/" "$LOG"; then pass "flutter run accepted the .dart_tool/ target"; fi
 assert_intercepted 1
 assert_attack 1 proxy-up
+wait_grpc 1 120 && assert_grpc 1 "$GRPC_WANT" "$ISO_WANT"
 grep -q 'PROXY_EDIT 200 GET https://httpbin.org/gzip gzip=true' "$PLOG" \
   && pass "proxy saw gzip upstream body and re-gzipped it" || fail "proxy gzip edit line missing"
 sleep 1 # traces are flushed ~100 ms after the request
@@ -292,9 +370,10 @@ if [ "$DO_RESTART" = 1 ]; then
   grep -q 'Restarted application' "$LOG" && pass "hot restart" || fail "no 'Restarted application'"
   assert_intercepted $RUN
   assert_attack $RUN proxy-up
+  wait_grpc $RUN 120 && assert_grpc $RUN "$GRPC_WANT" "$ISO_WANT"
   sleep 1
   assert_traces
-  if [ "$FI_TEMPLATE" = v4 ] || [ "$FI_TEMPLATE" = v5 ]; then
+  if [ "$FI_TEMPLATE" = v4 ] || [ "$FI_TEMPLATE" = v5 ] || [ "$FI_TEMPLATE" = v6 ]; then
     p=$(grep -o 'fi=[0-9a-f]*-' "$PLOG" | sort -u | wc -l | tr -d ' ')
     [ "$p" -ge 2 ] && pass "trace ids get a new prefix after hot restart ($p prefixes)" || fail "trace id prefix not renewed by hot restart ($p)"
   fi
@@ -328,6 +407,9 @@ if [ "$DO_FALLBACK" = 1 ] && [ "$MODE" = debug ]; then
     echo "[e2e] -- proxy down, adb reverse kept (run$RUN)"
     assert_direct $RUN https-only
     assert_attack $RUN proxy-down
+    # adb reverse accepts the hop and drops it: grpc-dart sees connected-then-lost (reported, not asserted).
+    wait_grpc $RUN 120 && for l in grpc_unary grpc_stream grpc_client_stream grpc_bidi grpc_tls grpc_isolate; do echo "[e2e] INFO run$RUN $(result $RUN $l)"; done
+    grep '\[flutter_intercept\] gRPC' "$LOG" | sed 's/^/[e2e] INFO /'
     adb -s "$DEVICE" reverse --remove "tcp:$PORT" >/dev/null
   fi
   printf 'R' > "$FIFO"
@@ -335,6 +417,8 @@ if [ "$DO_FALLBACK" = 1 ] && [ "$MODE" = debug ]; then
   echo "[e2e] -- proxy down$( [ "$ANDROID" = 1 ] && [ "$EMU_HOST" = 0 ] && echo ', adb reverse removed') (run$RUN)"
   assert_direct $RUN
   assert_attack $RUN proxy-down
+  # The gRPC breaker may still hold an authority direct from the previous stage: either way, direct.
+  wait_grpc $RUN 120 && assert_grpc $RUN direct direct
 fi
 
 echo "[e2e] ---- $( [ $FAILS = 0 ] && echo ALL PASSED || echo "$FAILS FAILED" ) ($DEVICE, $TARGET, $MODE)"

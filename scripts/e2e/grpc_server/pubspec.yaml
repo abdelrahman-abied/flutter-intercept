@@ -1,0 +1,10 @@
+name: fi_grpc_server
+description: gRPC test server for Flutter Intercept's device checks (scripts/e2e). Not published.
+publish_to: none
+environment:
+  sdk: ^3.5.0
+dependencies:
+  grpc: ^5.1.0
+  protobuf: ^6.1.0
+  fixnum: ^1.1.1
+  http2: ^2.3.1

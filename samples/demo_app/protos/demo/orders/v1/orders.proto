@@ -1,0 +1,99 @@
+// The demo's gRPC API (lib/grpc_demo.dart; test server: scripts/e2e/grpc_server).
+// Regenerate the Dart code with samples/demo_app/protos/generate.sh.
+syntax = "proto3";
+
+package demo.orders.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// One RPC of each kind.
+service OrderService {
+  // Unary. `id: "missing"` answers NOT_FOUND.
+  rpc GetOrder(GetOrderRequest) returns (Order);
+  // Server streaming: `max_events` status changes, `interval_ms` apart.
+  rpc WatchOrders(WatchOrdersRequest) returns (stream OrderEvent);
+  // Client streaming: the server sums what it receives.
+  rpc UploadItems(stream LineItem) returns (UploadSummary);
+  // Bidirectional streaming: every message is answered at once.
+  rpc Chat(stream ChatMessage) returns (stream ChatMessage);
+}
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_PENDING = 1;
+  ORDER_STATUS_SHIPPED = 2;
+  ORDER_STATUS_DELIVERED = 3;
+  ORDER_STATUS_CANCELLED = 4;
+}
+
+message Money {
+  string currency_code = 1;
+  int64 units = 2;
+  int32 nanos = 3;
+}
+
+message LineItem {
+  string sku = 1;
+  int32 quantity = 2;
+  Money unit_price = 3;
+}
+
+message Order {
+  message Address {
+    string line1 = 1;
+    string city = 2;
+    string country_code = 3;
+  }
+
+  string id = 1;
+  string customer_email = 2;
+  OrderStatus status = 3;
+  repeated LineItem items = 4;
+  Money total = 5;
+  map<string, string> labels = 6;
+  bool gift = 7;
+  double weight_kg = 8;
+  bytes signature = 9;
+  oneof delivery {
+    string pickup_store = 10;
+    Address shipping_address = 11;
+  }
+  google.protobuf.Timestamp created_at = 12;
+  repeated string tags = 13;
+  uint32 priority = 14;
+  // Which connection the server saw (host:port of the peer), for the device checks.
+  string served_to = 15;
+}
+
+message GetOrderRequest {
+  string id = 1;
+  bool include_items = 2;
+  // A credential in a message body (agents must see it redacted).
+  string session_token = 3;
+}
+
+message WatchOrdersRequest {
+  string customer_email = 1;
+  int32 max_events = 2;
+  int32 interval_ms = 3;
+}
+
+message OrderEvent {
+  string order_id = 1;
+  OrderStatus status = 2;
+  int32 sequence = 3;
+  string served_to = 4;
+}
+
+message UploadSummary {
+  int32 count = 1;
+  int32 total_quantity = 2;
+  string served_to = 3;
+}
+
+message ChatMessage {
+  string from = 1;
+  string text = 2;
+  int32 sequence = 3;
+  string served_to = 4;
+}
