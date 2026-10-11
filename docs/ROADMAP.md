@@ -36,7 +36,7 @@ loop + zero-code on every device.
 | Flutter Web CORS / XMLHttpRequest errors | SO 130K + 101K + 74K views; [flutter#46904](https://github.com/flutter/flutter/issues/46904) +49; DevTools doesn't cover web | ❌ gap |
 | DevTools Network unreliable | [#368](https://github.com/flutter/devtools/issues/368) +125, [#1952](https://github.com/flutter/devtools/issues/1952) +54, regressions [#9203](https://github.com/flutter/devtools/issues/9203) (58 comments); open: body search [#7624](https://github.com/flutter/devtools/issues/7624), request origin [#7807](https://github.com/flutter/devtools/issues/7807) | 🟡 always-on capture beats it; no search / origin |
 | Auth token refresh debugging | [SO 56740793](https://stackoverflow.com/q/56740793) 112K views; [dio#50](https://github.com/cfug/dio/issues/50) +28, [dio#590](https://github.com/cfug/dio/issues/590) +28 | ❌ |
-| WebSocket / SSE / gRPC | [devtools#2044](https://github.com/flutter/devtools/issues/2044) gRPC +26 (most-voted open Network request); web_socket_channel 11.4M/mo | ❌ gap |
+| WebSocket / SSE / gRPC | [devtools#2044](https://github.com/flutter/devtools/issues/2044) gRPC +26 (most-voted open Network request); web_socket_channel 11.4M/mo | ✅ WebSocket / SSE (0.5); ✅ gRPC (0.10, grpc-dart): full view for h2c and decrypt hosts, TLS by default metadata only |
 | Emulator → localhost, macOS entitlement, cleartext | SO 263K, 63K, 19K views | ❌ easy win |
 | In-app inspectors that need code | pretty_dio_logger 320K/mo, talker_dio_logger 168K, alice 33K, chucker_flutter 21K… ≈575K/mo | the audience a zero-code tool converts |
 
@@ -117,6 +117,30 @@ below. Same way of working: contract first, parallel owners, independent securit
 | **VS Code `http.proxy` as the default upstream** | since REVIEW-7 #14 the app's traffic ignores it | S | Owner decision: use it when `flutterIntercept.upstreamProxy` is empty (user settings only). |
 | **Idle pooled connections** | keep-alive to real hosts is new inside VS Code (REVIEW-7 #14) | S | Watch item: idle timeout / retry on a stale socket if flaky failures appear. |
 | **Android Studio plugin** | users asked | L | **Built in 0.9.0** (CONTRACTS §15, docs/REVIEW-9.md): Node sidecar + Kotlin plugin; the traffic view inside Android Studio through the Flutter plugin's embedded browser (JCEF in IntelliJ IDEA). |
+
+### 0.10.0 — gRPC (built 2026-10-11, CONTRACTS §16, docs/REVIEW-10.md)
+The last ❌ row of §2 ([devtools#2044](https://github.com/flutter/devtools/issues/2044)). Spikes: docs/spikes/grpc.md,
+docs/spikes/template-v6.md. Owner decision: TLS gRPC with the app's default credentials is shown as metadata only (an
+undecrypted tunnel), with no trust-store changes on any device.
+
+| Item | Notes |
+|---|---|
+| **Zero-code capture** | Template v6: an `IOOverrides.global` `socketConnect` hook redirects only grpc-dart / connectrpc-h2c connects (stack frame filter) through a "silent" CONNECT; circuit breaker (3 tunnels in 2 s → direct 30 s, reported to the proxy and shown as a warning). |
+| **Proxy** | mockttp `http2: 'fallback'`, own `node:http2` relay with pooled upstream sessions, framing and bounded gzip / deflate, trailers, cancel and deadlines. |
+| **Schema from generated Dart** | `*.pbgrpc.dart` / `*.pb.dart` / `*.pbenum.dart` → methods, messages, enums; proto3 JSON decode, raw decode, encode, skeletons. No `.proto` files. |
+| **UI** | gRPC rows (status name, streaming, counts), Messages tab (JSON / raw / hex / base64), trailers, `t:grpc` / `grpc:` filters, gRPC mock form, status banner. |
+| **Rules** | `grpcMock`; block, fault, throttle, network profiles and sequences on gRPC; other actions never match gRPC calls. |
+| **Settings and hosts** | `flutterIntercept.grpc.enabled` / `grpc.decryptHosts` in VS Code, the sidecar / plugin settings page, CLI `--no-grpc` / `--grpc-decrypt-host`, action inputs `grpc` / `grpc-decrypt-hosts`. |
+| **Agents** | `add_grpc_mock`, `get_grpc_schema`, `kind: "grpc"`, `assert_traffic expect.grpcStatus`, decoded and redacted messages in `get_request` / `get_frames`; HAR `_grpc`. |
+
+**Next / considered (gRPC follow-ups)**
+- Breakpoints, mutate and replay (and recordings) for gRPC calls.
+- `.proto` files as a schema source, for apps whose generated code isn't in the workspace.
+- A gRPC-Web view (today plain HTTP rows without message decoding).
+- connectrpc over TLS (its HTTP/2 transport uses `SecureSocket.connect`, which the hook can't see).
+- Optional "trust the CA on the iOS simulator" (`simctl keychain add-root-cert`, removed at session end) for a full TLS
+  view with default credentials: untested, touches the simulator's trust store, needs its own spike and security
+  review (docs/spikes/grpc.md "Open decision"). Android needs a writable-system emulator: document only.
 
 ## 5. Spikes and decisions before building
 - Dio's async stack depth for request → source (0.3).

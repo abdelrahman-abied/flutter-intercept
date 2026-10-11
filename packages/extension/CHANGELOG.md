@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.10.0
+
+### gRPC
+
+- **gRPC calls are intercepted with no app code**: grpc-dart, and connectrpc's HTTP/2 transport over plain-text h2c.
+  The generated entry (template v6) sends only their connections to the proxy, through an `IOOverrides` hook; every
+  other socket goes direct.
+- Each call is one row with its method, gRPC status, trailers, streaming and message counts. A **Messages** tab
+  decodes every message to JSON with the app's own generated `*.pb.dart` code (no `.proto` files needed), or shows
+  raw field numbers. New filters: `kind:grpc`, `t:grpc`, `grpc:<status>`.
+- **gRPC mock** rules: status, `grpc-message`, messages as JSON (with a **Skeleton** of the response type) or base64,
+  a delay, a gap between stream messages, extra headers and trailers. **Mock this** on a call starts from its real
+  response.
+- Block, fault (reset, timeout, truncate, DNS), throttle, network profiles and sequences apply to gRPC calls. Rules
+  with other actions never match them.
+- gRPC over TLS is listed as an undecrypted tunnel by default. `flutterIntercept.grpc.decryptHosts` decrypts the
+  listed hosts for apps that trust the Flutter Intercept CA in debug builds; `flutterIntercept.grpc.enabled` turns
+  gRPC interception off.
+- When gRPC connections to a host keep closing, the app connects to it directly for 30 s, and a warning says so.
+- HAR exports include gRPC calls, and failed gRPC calls trigger notifications. Recordings, OpenAPI and Postman
+  skip them.
+- CLI: `--grpc-decrypt-host <glob>` and `--no-grpc`; GitHub Action inputs `grpc` and `grpc-decrypt-hosts`.
+
+### Agent API
+- New `add_grpc_mock` (messages as JSON encoded with the app's schema, or base64) and `get_grpc_schema` (methods,
+  fields, streaming, example JSON).
+- `list_requests`, `wait_for_request` and `assert_traffic` take `kind: "grpc"`; `assert_traffic` checks
+  `expect.grpcStatus`; `get_request` and `get_frames` return decoded messages with secret-named fields and credential
+  metadata redacted; `get_status` reports gRPC and the schema.
+
+### Security
+- Independent review: docs/REVIEW-10.md. Blocked or failed TLS gRPC tunnels are held instead of closed, so blocks and
+  the offline profile keep applying. Compressed messages are decompressed only as far as they are kept. The schema
+  parser runs in linear time with a per-file budget. Agents never see absolute paths in schema problems, and
+  `list_rules` redacts mock messages and bodies.
+
 ## 0.9.1
 
 - Same version number as the Android Studio / IntelliJ plugin 0.9.1 (which fixed its Marketplace icon). No changes in VS Code.

@@ -210,3 +210,17 @@ Contract: CONTRACTS §16. Spike: docs/spikes/grpc.md. Owner decision: TLS gRPC w
 | H host + agent | settings → proxy, schema service, controller `decodeGrpc` / grpcMock from exchange, agent tools + redaction, HAR export, notify policy — `src/agent/**`, `src/ui/controller.ts`, `src/proxyHost.ts`, `src/export/**`, `src/notify/**`, `test/integration/suite/agent.ts` |
 | W webview | gRPC rows, Messages tab, trailers, filter, grpcMock rule form, status banner — `packages/webview/**` except `protocol.ts` |
 | lead | contract, types, `extension.ts`, extension `package.json` (settings, languageModelTools), sidecar / plugin / CLI settings, docs, E2E, review |
+
+### v0.10.0 status (2026-10-11)
+gRPC in both editors and the CLI: VS Code extension 0.10.0, the Android Studio / IntelliJ plugin 0.10.0 (preview),
+CLI `--grpc-decrypt-host` / `--no-grpc` and the action inputs `grpc` / `grpc-decrypt-hosts`. Verified: unit tests
+(proxy 477, webview 490, extension 1966, cli 114, sidecar 38, plugin 95); VS Code integration suites on the packaged
+VSIX — default 42/42, agent 21/21 (macOS + Android emulator, incl. the gRPC case), devices: every check passed on the
+Android emulator, an iOS 26.5 simulator and macOS, incl. the new gRPC case K (K1: calls recorded, a `grpcMock` answers
+after a hot restart; K2: `grpc.enabled: false` → direct), web 8/8; `verifyPlugin` Compatible with Android Studio
+2026.2. Template v6 validated on Dart 3.0 / 3.3 / 3.13.5 and language versions 2.12 / 3.0 (docs/spikes/template-v6.md).
+Independent review: docs/REVIEW-10.md, all findings fixed (CONTRACTS §16.8). End-to-end check of REVIEW-10 #1 on the
+Android emulator: with the offline profile the h2c calls got `14 UNAVAILABLE`, and the TLS call was held until its
+15 s deadline with no connection reaching the server. Device runs on the busy machine showed the known
+`stop_app: Canceled` flake once; reruns alone passed. Not verified: a physical iPhone, connectrpc against a real app,
+mTLS on gRPC upstreams, IPv6 targets, Edge.

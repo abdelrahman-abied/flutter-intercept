@@ -3,7 +3,7 @@
 Runs your Flutter integration tests through the Flutter Intercept proxy without VS Code. It applies the
 shared rules from your repository, can replay a recording or simulate a slow network, and checks the traffic
 against expectations. Like the extension, it changes no app code: a generated entry point routes the app's
-`dart:io` traffic (Dio, package:http, `HttpClient`) through a proxy on 127.0.0.1.
+`dart:io` traffic (Dio, package:http, `HttpClient`) and its grpc-dart gRPC calls through a proxy on 127.0.0.1.
 
 Use it as a [GitHub Action](#github-action), or build it from this repository and run the bundle with Node 18
 or later (not published to npm yet):
@@ -56,6 +56,8 @@ node packages/cli/dist/cli.js test -d macos --network-profile slow-3g -- --flavo
 | `--assert <file>` | Check expectations (below). Any failure makes the exit code 1. |
 | `--junit <file>` | Write the assertion results as JUnit XML. |
 | `--no-redact` | Keep secrets in the HAR and in assertion messages. |
+| `--grpc-decrypt-host <glob>` | Decrypt gRPC over TLS to this host (repeatable). Only for apps that trust the Flutter Intercept CA in debug builds; other TLS gRPC is listed as an undecrypted tunnel. |
+| `--no-grpc` | Let the app's gRPC calls connect directly (not intercepted). Can't be combined with `--grpc-decrypt-host`. |
 | `--flutter <path>` | Flutter executable (default: `$FLUTTER_ROOT/bin/flutter`, else `flutter` on `PATH`). |
 
 **How each device reaches the proxy:** Android emulators (`emulator-*`) use `10.0.2.2`. Physical Android devices
@@ -106,7 +108,9 @@ Each item may also have a `name`:
 
 `expect` supports `status` (a code, `"2xx"`…`"5xx"` or `"error"`), `count` (`min` / `max` / `exact`; the default is
 at least one), `order` (URL globs that must have been requested in that order), `json` (`{path, exists | equals |
-type}` on every matched response) and `maxDurationMs`. The check runs after flutter exits, against everything
+type}` on every matched response), `maxDurationMs` and `grpcStatus` (gRPC calls: a code or name such as `0` /
+`"OK"`; gRPC errors arrive with HTTP status 200). An item's `kind: "grpc"` limits it to gRPC calls, whose `url` ends
+in `/<package.Service>/<Method>`. The check runs after flutter exits, against everything
 recorded during the run. The file is validated first, so a typo fails before the build starts.
 
 ## GitHub Action
@@ -129,7 +133,7 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
-      - uses: abdelrahman-abied/flutter-intercept@v0.8.0
+      - uses: abdelrahman-abied/flutter-intercept@v0.10.0
         with:
           device: macos
           har: build/traffic.har
@@ -158,7 +162,7 @@ jobs:
           echo no | "$sdk/avdmanager" create avd --name ci --package "$image"
           nohup "$ANDROID_HOME/emulator/emulator" -avd ci -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect > /dev/null 2>&1 &
           "$ANDROID_HOME/platform-tools/adb" wait-for-device shell 'while [ "$(getprop sys.boot_completed)" != 1 ]; do sleep 2; done'
-      - uses: abdelrahman-abied/flutter-intercept@v0.8.0
+      - uses: abdelrahman-abied/flutter-intercept@v0.10.0
         with:
           device: emulator-5554
           targets: integration_test/app_test.dart
@@ -192,7 +196,7 @@ jobs:
           channel: stable
       - name: Build flutter-intercept
         run: |
-          git clone --depth 1 --branch v0.8.0 https://github.com/abdelrahman-abied/flutter-intercept "$RUNNER_TEMP/fi"
+          git clone --depth 1 --branch v0.10.0 https://github.com/abdelrahman-abied/flutter-intercept "$RUNNER_TEMP/fi"
           cd "$RUNNER_TEMP/fi"
           npm ci --no-audit --no-fund --ignore-scripts
           npm run build --workspace packages/proxy
@@ -220,6 +224,8 @@ jobs:
 | `assert` | Expectations file. A failed expectation fails the step (exit code 1). |
 | `replay`, `replay-fallback` | Answer from a recording; `passthrough` (default) or `fail` for unmatched requests. |
 | `network-profile` | `offline`, `slow-3g`, `fast-3g` or `flaky`. |
+| `grpc` | `false` lets the app's gRPC calls connect directly (`--no-grpc`). Default `true`. |
+| `grpc-decrypt-hosts` | Hosts or globs whose gRPC over TLS is decrypted, one per line or space-separated (`--grpc-decrypt-host`). Only for apps that trust the Flutter Intercept CA in debug builds. |
 | `rules` | Shared rules file; empty = `.vscode/flutter-intercept.json` when present; `none` = no rules. |
 | `approve-shared-rules` | `true` applies rules that need approval in the editor. Only in pipelines you control. |
 | `flutter-args` | Extra `flutter test` arguments, one per line or space-separated (no shell quoting). |
@@ -270,6 +276,13 @@ npx flutter-intercept-cli test -d macos --har build/traffic.har
 - Flutter Web devices are not supported. Physical iPhones work with `test` only (see above).
 - Only `dart:io` traffic goes through the proxy. Native HTTP stacks (cupertino_http, cronet_http) and platform
   views are not seen: the editor's VM-service capture isn't available in a headless run.
+- gRPC calls from grpc-dart are intercepted, listed in the HAR and checked by expectations (`expect.grpcStatus`,
+  `kind: "grpc"`); recordings and replay skip them. gRPC over TLS is an undecrypted tunnel unless the host is passed
+  with `--grpc-decrypt-host` and the app trusts the run's CA in debug builds (`onBadCertificate`; the CA is new for
+  each run, so pinning it isn't practical here). The other gRPC limits of the extension apply (obfuscated builds,
+  connectrpc over TLS, apps that replace `IOOverrides.global`).
+- Background isolates (`compute`, `Isolate.run`) aren't set up in CLI runs (`test` or `run`): their HTTP and gRPC
+  calls go direct. The editor sets them up through the debug connection.
 - Run one CLI at a time per project: the generated files under `.dart_tool/flutter_intercept/` and
   `integration_test/.flutter_intercept/` are shared.
 - The run's certificate authority lives in a temporary directory, only the generated entry trusts it, and it is

@@ -28,7 +28,7 @@ Intercept skips all of that:
 - **HTTPS just works.** Nothing to install on the device, simulator or Mac.
 - **Your app stays untouched.** No package to add, no code to change. `flutter build` and CI never see it.
 - **Works with what you already use:** **Dio**, **package:http** and plain `HttpClient`, so anything built on
-  `dart:io`.
+  `dart:io`, plus **gRPC** calls from grpc-dart.
 - **Every target you debug on:** Android emulators and phones, the iOS simulator, physical iPhones, macOS desktop
   and plain Dart programs.
 
@@ -49,6 +49,7 @@ Intercept skips all of that:
 | **Model check** | Each JSON response is checked against your json_serializable / freezed models; fields that would crash `fromJson` are flagged in your model file. |
 | **Break a field** | Make a field null, remove it or change it in real responses to reproduce crashes. |
 | **Generate code** | Dart models and fixture tests from recorded traffic. |
+| **gRPC** | grpc-dart calls with their method, gRPC status, trailers and every message, decoded with your app's own generated `*.pb.dart` code (no `.proto` needed). Mock them, block them, fail them or slow them down. gRPC over TLS is listed undecrypted unless the app trusts the CA in debug builds. |
 | **Web, WebSockets, SSE, GraphQL** | Flutter Web on Chrome (with CORS help), WebSocket messages, SSE events, GraphQL operation names. |
 | **Native clients** | cupertino_http / cronet_http requests listed read-only; a banner for background isolates. |
 | **Team rules & scenarios** | Rules shared through the repo (with an approval gate), sequences like "500 then 200", expire-token tests, auth-flow timelines. |
@@ -124,15 +125,18 @@ See [Use with AI agents](packages/extension/README.md#use-with-ai-agents).
 | macOS desktop | None, if your app already has the network client entitlement. |
 | Plain Dart programs | None. |
 | Physical iPhone | One-time setup: signing team, same Wi-Fi as your Mac. See the [iPhone guide](packages/extension/README.md#iphone). |
-| Flutter web | Not supported. Web has no `dart:io`. |
+| Flutter web | None for Chrome started by the debug session. See [Flutter Web](packages/extension/README.md#flutter-web). |
 
 Hot reload, hot restart, flavors and profile mode keep working. Release launches are never intercepted.
+
+gRPC calls are intercepted on the same targets, except plain Dart programs (verified on the Android emulator, the
+iOS simulator and macOS).
 
 ## How it works
 
 When you start a debug session, Flutter Intercept launches your app through a small generated entry point
-instead of `lib/main.dart`. That entry routes `HttpClient` through a proxy running inside VS Code, makes the app
-trust that proxy's certificate, and then calls your real `main()`.
+instead of `lib/main.dart`. That entry routes `HttpClient` (and grpc-dart's connections) through a proxy running
+inside VS Code, makes the app trust that proxy's certificate, and then calls your real `main()`.
 
 ```text
 F5 ─► generated entry (.dart_tool/flutter_intercept/) ─► your main()
@@ -155,6 +159,8 @@ F5 ─► generated entry (.dart_tool/flutter_intercept/) ─► your main()
 - **No certificate is installed anywhere.** Your app trusts one certificate authority, created for your
   installation alone, and only during intercepted debug sessions.
 - **The real server's certificate is still checked.** A bad certificate upstream still fails.
+- **gRPC over TLS isn't decrypted by default.** It's listed as an encrypted connection; only hosts you list in
+  `flutterIntercept.grpc.decryptHosts`, for apps that already trust the CA in debug builds, are decrypted.
 
 Read the full [security notes](packages/extension/README.md#security). To report a vulnerability, see
 [SECURITY.md](SECURITY.md).
@@ -163,13 +169,21 @@ Read the full [security notes](packages/extension/README.md#security). To report
 
 These aren't intercepted:
 
-- Flutter web on the `web-server` device (Chrome from VS Code works).
-- Native HTTP stacks such as `cronet_http` and `cupertino_http` (listed read-only, not interceptable).
-- Clients created in background isolates (`compute`, `Isolate.spawn`) — a banner tells you.
-- Apps that wrap their code in their own `HttpOverrides` zone.
+- Flutter web on the `web-server` device (Chrome started by the debug session works).
+- Native HTTP stacks such as `cronet_http` and `cupertino_http`: listed read-only, and routed through the proxy only
+  on Android emulators with `flutterIntercept.nativeClients: "proxy"`.
+- Background isolates in profile mode and `Isolate.spawnUri` (debug-mode `compute` / `Isolate.run` /
+  `Isolate.spawn` are intercepted) — a banner tells you.
+- Apps that wrap their code in their own `HttpOverrides` zone or use a custom `connectionFactory` — a warning names
+  the host.
+- gRPC from obfuscated (`--obfuscate` / `--split-debug-info`) builds, apps that replace `IOOverrides.global`,
+  connectrpc over TLS and custom gRPC transport connectors. gRPC-Web is ordinary HTTP.
+- The contents of gRPC over TLS, unless the app trusts the CA in debug builds (listed as an encrypted connection).
+  Breakpoints, rewrites, scripts, replay and recordings don't apply to gRPC yet.
 
-Certificate pinning with Dio's `validateCertificate` and mTLS client certificates fail while intercepting. See
-the full [limitations](packages/extension/README.md#limitations).
+Hosts the app pins itself (Dio's `validateCertificate`) need `flutterIntercept.tlsPassthrough`; servers that
+require a client certificate need `flutterIntercept.clientCertificates`. See the full
+[limitations](packages/extension/README.md#limitations).
 
 ## Requirements
 

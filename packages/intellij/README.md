@@ -29,6 +29,29 @@ The status bar shows `Intercept: on · N paused`; click it to turn interception 
 (Tools → Flutter Intercept) include Connect AI Agent, Export OpenAPI / Postman, Save CA Certificate and Set Client
 Certificate Passphrase. Settings live in **Settings → Tools → Flutter Intercept** and apply to all projects.
 
+## gRPC
+
+grpc-dart calls are intercepted like HTTP requests, with each message decoded from your app's generated `*.pb.dart`
+code. Settings are in **Settings → Tools → Flutter Intercept → gRPC**:
+
+- **Intercept gRPC calls (grpc-dart, connectrpc)**: on by default. Off, the app's gRPC calls connect directly.
+  Applies to the next run.
+- **Decrypt TLS gRPC for hosts**: one host or glob per line (for example `*.staging.example`). Only for apps that
+  trust the Flutter Intercept CA in debug builds; other gRPC over TLS is listed as an undecrypted tunnel.
+
+To use it:
+
+1. Run the app. Each gRPC call shows as a row with a **gRPC** badge, its method, the gRPC status and the message
+   counts; **Messages** has every message, decoded.
+2. **Mock this** on a call creates a gRPC mock with its messages and status; Block, faults, throttling and the network
+   profiles apply too.
+3. For gRPC over TLS, make debug builds trust the CA (**Tools → Flutter Intercept → Save CA Certificate**, or an
+   `onBadCertificate` callback behind `kDebugMode`) and add the host above.
+
+The VS Code tutorials cover it step by step, starting at
+[See gRPC calls and their messages](../extension/README.md#see-grpc-calls-and-their-messages); the
+[limitations](../extension/README.md#limitations) apply here too.
+
 ## Differences from VS Code
 
 - Android Studio shows the traffic through the Flutter plugin's embedded browser (see above).
