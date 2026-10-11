@@ -1246,14 +1246,14 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
 
           // 2. A mutate rule on the response message (once).
           await batchIdle();
-          const mu = await mcpCall('add_mutation', { url: `*${GET_ORDER}`, ops: [{ path: '$.customerEmail', op: 'set', value: 'mutated@example.com' }], times: 1, name: 'grpc mutate' });
+          const mu = await mcpCall('add_mutation', { url: `*${GET_ORDER}`, ops: [{ path: '$.id', op: 'set', value: 'fi-mutated' }], times: 1, name: 'grpc mutate' });
           if (mu.isError || !mu.result.ruleId) throw new Error(`add_mutation (gRPC): ${mu.text.slice(0, 300)}`);
           ruleIds.push(mu.result.ruleId);
           from = session ? outputOf(session).length : 0;
           restartAt = Date.now();
           h = await mcpCall('hot_restart', { sessionId });
           if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
-          await unaryLine(from, /mutated@example\.com/, 'mutate rule');
+          await unaryLine(from, /fi-mutated/, 'mutate rule'); // the demo prints id, not customerEmail
           for (const id of ruleIds.splice(0)) await mcpCall('remove_rule', { ruleId: id }).catch(() => undefined);
 
           // 3. Record a clean run, replay it with fallback "fail": GetOrder is answered from the recording.
