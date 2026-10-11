@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.1
+
+- Same version number as the Android Studio / IntelliJ plugin 0.9.1 (which fixed its Marketplace icon). No changes in VS Code.
+
 ## 0.9.0
 
 - **Android Studio and IntelliJ IDEA**: a preview plugin with the same engine (packages/intellij). The traffic view's
