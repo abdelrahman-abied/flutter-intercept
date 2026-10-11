@@ -437,6 +437,32 @@ function rewriteMetadataProblem(a: Extract<RuleAction, { kind: 'rewrite' }>): st
   return undefined;
 }
 
+/**
+ * CONTRACTS §18.6: does a Map Remote target (or any URL) point at the proxy itself — a loopback / unspecified address,
+ * `localhost`, or an emulator alias for this machine, on one of the proxy's ports? Such a rule would relay calls to the
+ * proxy without end; hosts refuse it in validation. Pure (no DNS): names that merely resolve here are caught at run
+ * time by the hop marker.
+ */
+export function targetsProxy(url: string, proxyPorts: readonly number[]): boolean {
+  let u: URL;
+  try {
+    u = new URL(String(url ?? '').trim());
+  } catch {
+    return false;
+  }
+  const port = Number(u.port) || (u.protocol === 'https:' || u.protocol === 'wss:' ? 443 : 80);
+  if (!proxyPorts.includes(port)) return false;
+  const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  if (h === '10.0.2.2' || h === '10.0.3.2' || h === '0.0.0.0' || h === '::' || h === '::1') return true;
+  if (/^127\.\d+\.\d+\.\d+$/.test(h)) return true;
+  const mapped = /^(?:0{0,4}:){0,5}ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(h);
+  return !!mapped && (mapped[1].startsWith('127.') || mapped[1] === '0.0.0.0');
+}
+
+/** CONTRACTS §18.6: a status message a breakpoint edit or a script may set, at most this many UTF-8 bytes. */
+export const GRPC_STATUS_MESSAGE_MAX_BYTES = 1024;
+
 /** Largest gRPC message a breakpoint edit may carry (CONTRACTS §17.2, the hook cap). */
 export const GRPC_EDIT_MAX_BYTES = 4 * 1024 * 1024;
 
@@ -466,6 +492,7 @@ export function grpcEditProblem(pause: 'message' | 'status', edit: unknown): str
     if (!st || typeof st !== 'object') return 'status must be {code, message?}.';
     if (!Number.isInteger(st.code) || (st.code as number) < 0 || (st.code as number) > 16) return `gRPC status code must be 0–16, got ${String(st.code)}.`;
     if (st.message !== undefined && typeof st.message !== 'string') return 'The status message must be text.';
+    if (typeof st.message === 'string' && utf8Length(st.message) > GRPC_STATUS_MESSAGE_MAX_BYTES) return `The status message is over ${GRPC_STATUS_MESSAGE_MAX_BYTES / 1024} KB.`;
   }
   if (e.trailers !== undefined) return grpcMockProblem({ kind: 'grpcMock', trailers: e.trailers as Record<string, string> });
   return undefined;

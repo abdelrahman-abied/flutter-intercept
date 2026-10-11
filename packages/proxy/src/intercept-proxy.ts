@@ -3,8 +3,9 @@ import * as http from 'http';
 import { STATUS_CODES } from 'http';
 import * as http2 from 'http2';
 import type { Readable } from 'stream';
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import * as net from 'net';
+import * as os from 'os';
 import * as tls from 'tls';
 // Deep imports on purpose: mockttp's index also loads its admin server and remote client
 // (express, GraphQL, body-parser, …), ~2 MB of bundle and ~100 ms of module init we never use.
@@ -41,6 +42,7 @@ import {
   grpcMockProblem,
   GRPC_REWRITE_RESERVED,
   GRPC_TRAILER_RESERVED,
+  targetsProxy,
   isInvalidMatcher,
   mapRemoteUrl,
   MAX_BODY_REPLACEMENTS,
@@ -123,6 +125,7 @@ import type { RequestPlan } from './upstream-request';
 import { refreshRoutes } from './routes';
 import { captured, getTap, installTaps, isComplete, RESPONSE_PAUSE_LIMIT_BYTES, type HeadPatch, type Tap } from './taps';
 import {
+  adoptAsLanSocket,
   checkLanRequest,
   findOnSocketChain,
   tunnelMarker,
@@ -277,6 +280,8 @@ interface Flow {
   replay?: ReplayEntry | 'deferred';
   /** Answer 502 with this text (e.g. an unusable Map Remote target). */
   localError?: string;
+  /** CONTRACTS §18.6: a gRPC call that came back from our own relay: answered 14, never recorded. */
+  loop?: boolean;
   /** REVIEW-8 #1: answer 403 with this text — a web page's request to a client-certificate host. */
   refused?: string;
   /** Hooked routes: the Host header to send when it isn't the URL's (preserveHost, a rewritten Host). */
@@ -336,6 +341,8 @@ interface MatchResult {
 interface ReqMeta {
   traceId?: string;
   sendNonce?: string;
+  /** CONTRACTS §18.6: the hop marker a gRPC call arrived with (one of ours = a loop). */
+  hop?: string;
 }
 
 interface Live {
@@ -612,6 +619,8 @@ export class InterceptProxy extends EventEmitter {
   private grpcCodec?: GrpcProxyCodec;
   /** CONTRACTS §17.7: bytes of gRPC messages held at breakpoints right now, across calls. */
   private grpcHeld = 0;
+  /** CONTRACTS §18.6: this instance's hop marker (on every relayed / sent gRPC call; one arriving with it is a loop). */
+  private readonly hopNonce = randomBytes(18).toString('base64url');
   /** CONTRACTS §16.8: when each authority's breaker report was last emitted. */
   private readonly breakerSeen = new Map<string, number>();
 
@@ -1240,6 +1249,39 @@ export class InterceptProxy extends EventEmitter {
   }
 
   /**
+   * CONTRACTS §18.6: does this URL point at this proxy's own listener (loopback / unspecified / emulator alias / this
+   * machine's addresses, on the loopback or LAN listener port)? Hosts use it (or the pure `targetsProxy`) to refuse Map
+   * Remote rules that would relay to the proxy.
+   */
+  targetsProxy(url: string): boolean {
+    try {
+      const u = new URL(url);
+      return this.targetsSelf(u.hostname.replace(/^\[|\]$/g, ''), Number(u.port) || (u.protocol === 'https:' ? 443 : 80));
+    } catch {
+      return false;
+    }
+  }
+
+  /** CONTRACTS §18.6: the connected address is this machine (loopback / unspecified / an interface) on one of our ports. */
+  private addressIsSelf(ip: string, port: number): boolean {
+    const ports = [this._port, this.lanGate?.address?.port].filter((p): p is number => !!p);
+    if (!ports.includes(port)) return false;
+    const a = normalizeIp(ip);
+    if (isLoopbackHost(a) || a === '0.0.0.0' || a === '::') return true;
+    for (const list of Object.values(os.networkInterfaces())) for (const i of list ?? []) if (normalizeIp(i.address) === a) return true;
+    return false;
+  }
+
+  private targetsSelf(hostIn: string, port: number): boolean {
+    const ports = [this._port, this.lanGate?.address?.port].filter((p): p is number => !!p);
+    if (!ports.includes(port)) return false;
+    const h = normalizeIp(hostIn.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, ''));
+    if (isLoopbackHost(h) || HOST_ALIASES[h] || h === '0.0.0.0' || h === '::') return true;
+    if (h === normalizeIp(this.host) || h === this.lanGate?.address?.host) return true;
+    return lanIPv4Addresses().includes(h);
+  }
+
+  /**
    * CONTRACTS §17.3: the protobuf codec mutate rules use on gRPC response messages (undefined = none: mutate rules then
    * forward messages unchanged with a note). Synchronous; called only for messages a mutate rule changes.
    */
@@ -1398,21 +1440,22 @@ export class InterceptProxy extends EventEmitter {
   }
 
   /**
-   * CONTRACTS §18.4: send a gRPC call (resend / edit & resend): our own HTTP/2 call through the relay's upstream path
-   * (pooled sessions, upstream proxy, client certificates, emulator aliases), messages sent uncompressed, then a
-   * half-close; recorded as a gRPC exchange with `initiator` / `resentFrom` and every response message, the status and
-   * the trailers. Rules and the network profile don't apply (it isn't the app's traffic). A resend of a call a LAN
-   * client made only goes where the LAN guard lets LAN clients go. Resolves once recorded.
+   * CONTRACTS §18.4 / §18.6: send a gRPC call (resend / edit & resend) exactly like the app would: through a silent
+   * tunnel into this proxy's own listener (h2c, or TLS to our own MITM for https targets), so rules, breakpoints, the
+   * network profile, replay, Map Remote and the LAN guard all apply, and the call is recorded with `initiator` /
+   * `resentFrom`. Messages go uncompressed, then a half-close. A resend of a LAN client's call runs with that client's
+   * LAN guards (LAN mode must be on); one whose original record is gone is refused. Resolves once recorded.
    */
   private async sendGrpc(r: SendRequest, method: string, u: URL, headers: HeaderBag): Promise<{ id: string }> {
     const g = r.grpc as { messages?: unknown; messagesJson?: unknown };
     if (!g || typeof g !== 'object') throw new Error('grpc must be {messages}');
     if (g.messagesJson !== undefined) throw new Error('grpc.messagesJson must be encoded by the host (schema) into messages before send()');
     if (method !== 'POST') throw new Error('A gRPC call is sent with POST');
-    const { service, method: rpc } = parseGrpcPath(u.pathname);
+    const { method: rpc } = parseGrpcPath(u.pathname);
     if (!rpc || u.search) throw new Error(`Not a gRPC method URL (/package.Service/Method): ${u.pathname}`);
     if (!Array.isArray(g.messages)) throw new Error('grpc.messages must be a list of base64 messages');
     if (g.messages.length > GRPC_SEND_MAX_MESSAGES) throw new Error(`At most ${GRPC_SEND_MAX_MESSAGES} messages per call`);
+    if (!this.grpcCheck.ok || !this.rawServer) throw new Error(`gRPC calls can't be sent: ${this.grpcCheck.problem ?? 'the proxy is not running'}`);
     const messages: Buffer[] = [];
     let total = 0;
     for (const [i, m] of g.messages.entries()) {
@@ -1423,10 +1466,15 @@ export class InterceptProxy extends EventEmitter {
       if (total > GRPC_SEND_MAX_BYTES) throw new Error(`The messages are over ${GRPC_SEND_MAX_BYTES / 1024 / 1024} MB in total`);
       messages.push(b);
     }
-    // A resend of a LAN client's call: only targets the LAN guard allows (CONTRACTS §18.5).
-    const fromLan = r.resentFrom !== undefined && this.store.get(r.resentFrom)?.viaLan === true;
-    const gate = fromLan ? this.lanGate : undefined;
+    // A resend of a LAN client's call: only targets the LAN guard allows (CONTRACTS §18.5 / §18.6).
+    let fromLan = false;
+    if (r.resentFrom !== undefined) {
+      const orig = this.store.get(r.resentFrom);
+      if (!orig) throw new Error('The original call is no longer recorded, so it can\'t be resent (its LAN origin is unknown)');
+      fromLan = orig.viaLan === true;
+    }
     if (fromLan) {
+      const gate = this.lanGate;
       if (!gate || gate.closed) throw new Error('This call came from a LAN client and LAN mode is off: it can only be resent while LAN mode is on');
       const denial = await lanTargetDenial(u.href, gate.host);
       if (denial) throw new Error(denial);
@@ -1437,138 +1485,81 @@ export class InterceptProxy extends EventEmitter {
       if (v === undefined || lk.startsWith(':') || GRPC_SEND_DROPPED.has(lk)) continue;
       meta[lk] = v;
     }
-    const timeout = parseGrpcTimeout(meta['grpc-timeout']);
-    if (timeout === undefined) {
-      delete meta['grpc-timeout'];
-      meta['grpc-timeout'] = '60S';
-    }
-    const deadlineMs = timeout ?? GRPC_SEND_DEADLINE_MS;
-    const id = randomUUID();
-    const protocol = u.protocol === 'https:' ? 'https:' : 'http:';
-    const host = u.hostname.replace(/^\[|\]$/g, '');
-    const port = Number(u.port) || (protocol === 'https:' ? 443 : 80);
-    const requestHeaders: Record<string, string | string[]> = { ...meta, 'content-type': 'application/grpc', te: 'trailers' };
-    const info: GrpcInfo = { service, method: rpc, messagesSent: 0, messagesReceived: 0, deadlineMs };
-    const ex: Exchange = {
-      id,
-      startedAt: Date.now(),
-      method: 'POST',
-      url: `${protocol}//${u.host}${u.pathname}`,
-      requestHeaders,
-      state: 'pending',
-      kind: 'grpc',
-      frames: [],
-      grpc: info,
-      initiator: r.initiator,
-      ...(r.resentFrom !== undefined ? { resentFrom: r.resentFrom } : {}),
-      ...(fromLan ? { viaLan: true as const } : {}),
-    };
-    const flow: Flow = { route: 'grpc' };
-    this.track(ex, flow);
-    void this.runSendGrpc(ex, info, messages, requestHeaders, { protocol, host, port, gate, deadlineMs, authority: u.host });
-    return { id };
-  }
-
-  private async runSendGrpc(
-    ex: Exchange,
-    info: GrpcInfo,
-    messages: Buffer[],
-    requestHeaders: Record<string, string | string[]>,
-    t: { protocol: 'http:' | 'https:'; host: string; port: number; gate?: LanGate; deadlineMs: number; authority: string },
-  ): Promise<void> {
-    const isLive = () => this.live.get(ex.id)?.ex === ex;
-    const C = http2.constants;
-    const cert = t.protocol === 'https:' ? this.certFor(t.host, t.port) : undefined;
-    if (cert) ex.clientCertificate = cert.host;
-    let lease: Awaited<ReturnType<GrpcSessionPool['acquire']>>;
-    try {
-      if (!this.grpcPool) throw new Error('the proxy is stopping');
-      lease = await this.grpcPool.acquire(
-        {
-          protocol: t.protocol,
-          host: t.host,
-          port: t.port,
-          ...(t.gate ? { gate: t.gate } : {}),
-          upstream: this.upstreamSpec,
-          ...(!t.gate && (this.opts.rewriteLocalhost ?? true) ? { alias: (h: string) => HOST_ALIASES[h] } : {}),
-          rejectUnauthorized: !this.grpcInsecure(t.host, t.port, t.gate),
-          ...(cert ? { cert: { pattern: cert.host, options: cert.options } } : {}),
-          connectTimeoutMs: GRPC_CONNECT_TIMEOUT_MS,
+    const given = parseGrpcTimeout(meta['grpc-timeout']);
+    const deadlineMs = Math.min(given ?? GRPC_SEND_DEADLINE_MS, GRPC_SEND_MAX_DEADLINE_MS);
+    meta['grpc-timeout'] = given !== undefined && given <= GRPC_SEND_MAX_DEADLINE_MS ? String(meta['grpc-timeout']) : given === undefined ? '60S' : '1H';
+    const tlsTarget = u.protocol === 'https:';
+    const target = `${u.hostname.includes(':') ? `[${u.hostname.replace(/^\[|\]$/g, '')}]` : u.hostname}:${Number(u.port) || (tlsTarget ? 443 : 80)}`;
+    const nonce = randomUUID();
+    const ca = tlsTarget ? (this.opts.ca ?? (await defaultCa())).cert : undefined;
+    return new Promise<{ id: string }>((resolve, reject) => {
+      const sendMeta: SendMeta = {
+        initiator: r.initiator,
+        ...(r.resentFrom !== undefined ? { resentFrom: r.resentFrom } : {}),
+        done: false,
+        recorded: (id) => {
+          sendMeta.done = true;
+          this.sends.delete(nonce);
+          resolve({ id });
         },
-        (p) => this.addTimings(ex.id, p),
-      );
-    } catch (e) {
-      if (isLive()) this.fail(ex, `Could not connect to ${t.authority}: ${(e as Error).message}`);
-      return;
-    }
-    if (!isLive()) return lease.release();
-    let up: http2.ClientHttp2Stream;
-    const sentAt = performance.now();
-    try {
-      up = lease.session.request({ ...requestHeaders, ':method': 'POST', ':path': new URL(ex.url).pathname, ':authority': t.authority, ':scheme': t.protocol.slice(0, -1) });
-    } catch (e) {
-      lease.release();
-      if (isLive()) this.fail(ex, `Could not start the call: ${(e as Error).message}`);
-      return;
-    }
-    lease.track(up);
-    let upError: (Error & { code?: string }) | undefined;
-    up.on('error', (e: Error & { code?: string }) => (upError ??= e));
-    const deadline = setTimeout(() => {
-      if (!up.closed) up.close(C.NGHTTP2_CANCEL);
-      if (isLive()) this.fail(ex, `No answer within the deadline (${t.deadlineMs} ms); the call was cancelled.`);
-    }, t.deadlineMs);
-    deadline.unref?.();
-    const sendRec = new GrpcFrameRecorder('send', () => undefined, (f) => this.addFrame(ex, f, true));
-    for (const m of messages) {
-      up.write(frameMessage(m));
-      info.messagesSent++;
-      sendRec.push({ compressed: false, size: m.length, kept: m, complete: true });
-    }
-    up.end();
-    this.setRequestMs(ex, undefined);
-    const recvRec = new GrpcFrameRecorder('receive', () => info.responseEncoding, (f) => this.addFrame(ex, f, true));
-    const parser = new GrpcMessageParser((m) => {
-      if (!isLive()) return;
-      info.messagesReceived++;
-      recvRec.push(m);
-    });
-    let headAt: number | undefined;
-    let trailers: http2.IncomingHttpHeaders | undefined;
-    const status = (h: http2.IncomingHttpHeaders) => {
-      const code = parseGrpcStatus(h['grpc-status']);
-      if (code !== undefined) info.statusCode = code;
-      const msg = decodeGrpcMessage(h['grpc-message']);
-      if (msg !== undefined) info.statusMessage = msg;
-    };
-    up.on('response', (h, flags) => {
-      if (!isLive()) return;
-      headAt = performance.now();
-      this.addTimings(ex.id, { waitMs: elapsed(sentAt, headAt) });
-      ex.status = Number(h[':status']) || 0;
-      ex.responseHeaders = recordedHeaders(h as HeaderBag);
-      const enc = grpcEncodingOf(h['grpc-encoding']);
-      if (enc) info.responseEncoding = enc;
-      if (flags & C.NGHTTP2_FLAG_END_STREAM) {
-        info.trailersOnly = true;
-        status(h);
-      }
-      this.emitChange(ex);
-    });
-    up.on('data', (c: Buffer) => parser.push(c));
-    up.on('trailers', (h) => {
-      trailers = h;
-      if (!isLive()) return;
-      ex.responseTrailers = recordedHeaders(h as HeaderBag);
-      status(h);
-      if (headAt !== undefined) this.addTimings(ex.id, { receiveMs: elapsed(headAt) });
-    });
-    up.once('close', () => {
-      clearTimeout(deadline);
-      if (!isLive()) return;
-      if (trailers || info.trailersOnly) return this.finish(ex, 'completed');
-      const code = up.rstCode;
-      this.fail(ex, upError ? `The call failed: ${upError.message}` : code ? `The server reset the stream (${h2CodeName(code)}).` : 'The server ended the response without trailers (no gRPC status).');
+      };
+      let session: http2.ClientHttp2Session | undefined;
+      let sock: net.Socket | undefined;
+      const cleanup = () => {
+        clearTimeout(timer);
+        session?.destroy();
+        sock?.destroy();
+      };
+      const failed = (why: string) => {
+        if (!sendMeta.done) {
+          sendMeta.done = true;
+          this.sends.delete(nonce);
+          reject(new Error(`Flutter Intercept: send failed (${why})`));
+        }
+        cleanup();
+      };
+      // The app-side deadline: the call is cancelled then (the exchange records it), plus a margin for the answer.
+      const timer = setTimeout(() => failed('deadline'), deadlineMs + 5000);
+      timer.unref?.();
+      this.sends.set(nonce, sendMeta);
+      const host = this.host === '0.0.0.0' || this.host === '' ? '127.0.0.1' : this.host === '::' ? '::1' : this.host;
+      sock = net.connect(this._port, host);
+      sock.on('error', (e) => failed(e.message));
+      sock.once('connect', () => {
+        const flags = [this.hopNonce, ...(tlsTarget ? ['tls'] : []), ...(fromLan ? ['lan'] : [])].join('; ');
+        sock!.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nFlutter-Intercept-Tunnel: silent\r\n${INTERNAL_TUNNEL_HEADER}: ${flags}\r\n\r\n`);
+        let conn: net.Socket = sock!;
+        if (tlsTarget) {
+          // To our own MITM over loopback: the hop is authenticated by the nonce, the real server is verified upstream.
+          conn = tls.connect({ socket: sock!, ...(net.isIP(u.hostname.replace(/^\[|\]$/g, '')) ? {} : { servername: u.hostname }), ALPNProtocols: ['h2'], ca, rejectUnauthorized: false });
+          conn.on('error', (e) => failed(e.message));
+        }
+        const s = http2.connect(`${u.protocol}//${target}`, { createConnection: () => conn });
+        session = s;
+        s.on('error', (e) => failed(e.message));
+        const call = s.request({
+          ...meta,
+          ':method': 'POST',
+          ':path': u.pathname,
+          ':authority': u.host,
+          'content-type': 'application/grpc',
+          te: 'trailers',
+          [SEND_HEADER]: nonce,
+        });
+        call.on('error', () => undefined);
+        call.on('data', () => undefined); // the exchange records the answer
+        call.once('close', () => {
+          if (!sendMeta.done) failed('the call was not recorded');
+          else cleanup();
+        });
+        const cancel = setTimeout(() => {
+          if (!call.closed) call.close(http2.constants.NGHTTP2_CANCEL); // the deadline, like the app's own
+        }, deadlineMs);
+        cancel.unref?.();
+        call.once('close', () => clearTimeout(cancel));
+        for (const m of messages) call.write(frameMessage(m));
+        call.end();
+      });
     });
   }
 
@@ -1891,6 +1882,7 @@ export class InterceptProxy extends EventEmitter {
     if (!Array.isArray(raw)) return;
     let traceId: string | undefined;
     let sendNonce: string | undefined;
+    let hop: string | undefined;
     const kept = (raw as Array<[string, string]>).filter((pair) => {
       const name = String(pair?.[0] ?? '').toLowerCase();
       if (name === TRACE_HEADER) {
@@ -1902,7 +1894,11 @@ export class InterceptProxy extends EventEmitter {
         return false;
       }
       // CONTRACTS §16.2: the silent-tunnel headers mean something on a CONNECT only, and never go upstream.
-      if (name === SILENT_TUNNEL_HEADER || name === CONNECT_TIMEOUT_HEADER) return false;
+      if (name === SILENT_TUNNEL_HEADER || name === CONNECT_TIMEOUT_HEADER || name === INTERNAL_TUNNEL_HEADER) return false;
+      if (name === HOP_HEADER) {
+        hop ??= String(pair[1]).trim();
+        return false;
+      }
       return true;
     });
     if (kept.length === raw.length) return;
@@ -1911,9 +1907,12 @@ export class InterceptProxy extends EventEmitter {
     deleteHeader(req.headers as HeaderBag, SEND_HEADER);
     deleteHeader(req.headers as HeaderBag, SILENT_TUNNEL_HEADER);
     deleteHeader(req.headers as HeaderBag, CONNECT_TIMEOUT_HEADER);
+    deleteHeader(req.headers as HeaderBag, INTERNAL_TUNNEL_HEADER);
+    deleteHeader(req.headers as HeaderBag, HOP_HEADER);
     const meta: ReqMeta = {};
     if (traceId && TRACE_ID_RE.test(traceId)) meta.traceId = traceId;
     if (sendNonce) meta.sendNonce = sendNonce;
+    if (hop) meta.hop = hop;
     this.reqMeta.set(req, meta);
   }
 
@@ -3484,6 +3483,13 @@ export class InterceptProxy extends EventEmitter {
 
   /** A gRPC call's flow: the first applicable rule (or sequence step), the network profile. */
   private decideGrpc(req: OngoingRequest): Flow {
+    const meta0 = this.reqMeta.get(req);
+    if (meta0?.hop !== undefined && meta0.hop === this.hopNonce) {
+      // CONTRACTS §18.6: our own relayed call came back — refused, not recorded (the sending side records it).
+      const loop: Flow = { route: 'grpc', loop: true };
+      this.flows.set(req.id, loop);
+      return loop;
+    }
     const m = this.matchRule(req.method, req.url, { count: true, grpc: true });
     let flow = this.grpcFlowFor(req.url, m.rule, m.action, m.note, m.step);
     // REVIEW-10 #6 (REVIEW-8 #1): a web page's call to a client-certificate host is refused before any connection.
@@ -3494,6 +3500,9 @@ export class InterceptProxy extends EventEmitter {
     if (refused) flow = { route: 'grpc', ...(m.rule ? { rule: m.rule } : {}), refused };
     const meta = this.reqMeta.get(req);
     if (meta?.traceId) flow.traceId = meta.traceId;
+    // CONTRACTS §18.6: a call made by send() (its own silent tunnel into this listener): initiator / resentFrom.
+    const send = meta?.sendNonce ? this.sends.get(meta.sendNonce) : undefined;
+    if (send) flow.send = send;
     if (lanGateOf((req as unknown as { socket?: unknown }).socket)) flow.viaLan = true;
     flow.te = (req as unknown as { timingEvents?: RequestTimingEvents }).timingEvents;
     this.flows.set(req.id, flow);
@@ -3613,6 +3622,21 @@ export class InterceptProxy extends EventEmitter {
   /** Record the call and answer it per its flow; resolves when the app's stream is closed. */
   private runGrpc(req: OngoingRequest, stream: http2.ServerHttp2Stream): Promise<void> {
     const flow = this.flows.get(req.id) ?? { route: 'grpc' as Route };
+    if (flow.loop) {
+      stream.on('error', () => undefined);
+      req.on('error', () => undefined);
+      req.resume();
+      const done = new Promise<void>((resolve) => (stream.closed || stream.destroyed ? resolve() : stream.once('close', () => resolve())));
+      try {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc', 'grpc-status': '14', 'grpc-message': encodeGrpcMessage(GRPC_LOOP_TEXT) }, { endStream: true });
+        setImmediate(() => {
+          if (!stream.closed && !stream.destroyed) stream.close(http2.constants.NGHTTP2_NO_ERROR);
+        });
+      } catch {
+        /* gone */
+      }
+      return done;
+    }
     const headers = req.headers as HeaderBag;
     let path = '/';
     try {
@@ -4469,6 +4493,10 @@ export class InterceptProxy extends EventEmitter {
     const socket = (req as unknown as { socket?: unknown }).socket;
     const gate = lanGateOf(socket);
     const connectTimeoutMs = findOnSocketChain(socket, (o) => (o as Record<symbol, SilentInfo | undefined>)[SILENT_INFO]?.connectTimeoutMs) ?? GRPC_CONNECT_TIMEOUT_MS;
+    if (this.targetsSelf(host, port)) {
+      // CONTRACTS §18.6: the proxy's own listener (directly, a tunnel or Map Remote): it would relay to itself.
+      return this.grpcStatusOnly(call, 14, GRPC_LOOP_TEXT, 'error', GRPC_LOOP_TEXT);
+    }
     const cert = protocol === 'https:' ? this.certFor(host, port) : undefined;
     if (cert) ex.clientCertificate = cert.host;
     const pool = this.grpcPool;
@@ -4487,12 +4515,14 @@ export class InterceptProxy extends EventEmitter {
           rejectUnauthorized: !this.grpcInsecure(host, port, gate),
           ...(cert ? { cert: { pattern: cert.host, options: cert.options } } : {}),
           connectTimeoutMs,
+          connectsToSelf: (ip, p) => this.addressIsSelf(ip, p),
         },
         (p) => this.addTimings(ex.id, p),
       );
     } catch (e) {
       if (!call.isLive()) return;
-      const err = e as Error & { statusCode?: number };
+      const err = e as Error & { statusCode?: number; code?: string };
+      if (err.code === 'E_FI_LOOP') return this.grpcStatusOnly(call, 14, GRPC_LOOP_TEXT, 'error', GRPC_LOOP_TEXT);
       const forbidden = e instanceof SsrfError || err.statusCode === 403;
       const label = net.isIPv6(host) ? `[${host}]` : host;
       const reason = forbidden
@@ -4518,7 +4548,7 @@ export class InterceptProxy extends EventEmitter {
       ex.requestHeaders = recordedHeaders(sendHeaders);
     }
     const upHeaders: http2.OutgoingHttpHeaders = {
-      ...sendHeaders,
+      ...sendHeaders, // no marker of ours: real servers see only the app's metadata (CONTRACTS §18.6)
       ':method': req.method,
       ':path': `${target.pathname}${target.search}`,
       ':authority': authority,
@@ -4604,7 +4634,10 @@ export class InterceptProxy extends EventEmitter {
           } catch {
             /* the app left */
           }
-          if (call.isLive()) this.finish(ex, truncate ? 'blocked' : 'completed');
+          if (!call.isLive()) return;
+          // Our own relay answered (a name that resolves to this machine): the loop, recorded on this one exchange.
+          if (msg === GRPC_LOOP_TEXT) return this.fail(ex, GRPC_LOOP_TEXT);
+          this.finish(ex, truncate ? 'blocked' : 'completed');
         })();
         return;
       }
@@ -4870,6 +4903,26 @@ export class InterceptProxy extends EventEmitter {
       socket.destroy(); // closed (or silent) before the first byte: nothing happened
       return;
     }
+    // CONTRACTS §18.6: send()'s own tunnel (this instance's nonce, from loopback only): always decrypted, and a resend of a
+    // LAN client's call gets that client's LAN guards.
+    const internal = String(req.headers[INTERNAL_TUNNEL_HEADER] ?? '').split(';').map((x) => x.trim());
+    let forceDecrypt = false;
+    if (internal[0]) {
+      const ok = internal[0] === this.hopNonce && !lanGateOf(socket) && isLoopbackHost(normalizeIp(socket.remoteAddress ?? ''));
+      if (!ok) {
+        socket.destroy();
+        return;
+      }
+      if (internal.includes('lan')) {
+        const g = this.lanGate;
+        if (!g || g.closed) {
+          socket.destroy();
+          return;
+        }
+        adoptAsLanSocket(socket, g);
+      }
+      forceDecrypt = true;
+    }
     const kind = classifyFirstBytes(first);
     if (kind === 'other') {
       this.recordSilentFailure(target, 'Not HTTP/2 or TLS inside the silent tunnel; it was closed.', socket);
@@ -4877,6 +4930,7 @@ export class InterceptProxy extends EventEmitter {
       return;
     }
     const decrypt =
+      forceDecrypt ||
       kind === 'h2c' ||
       (this.grpcDecrypt.some((p) => matchesHostPattern(p, host, t.port)) && !this.passthrough.some((p) => matchesHostPattern(p, host, t.port)));
     const raw = this.rawServer;
@@ -5586,6 +5640,13 @@ const REWRITE_SKIPPED = new Set([
 
 /** Headers a replayed response doesn't carry over: the proxy frames the body itself. */
 const REPLAY_DROPPED_HEADERS = new Set(['content-length', 'transfer-encoding', 'connection', 'keep-alive', 'proxy-connection', 'trailer', 'upgrade']);
+/** CONTRACTS §18.6: the hop marker header, and what a call that would loop gets. */
+const HOP_HEADER = 'flutter-intercept-hop';
+const GRPC_LOOP_TEXT = 'Flutter Intercept: the call would loop back to the proxy';
+/** CONTRACTS §18.6: on send()'s own silent CONNECT: `<hop nonce>[; tls][; lan]` (only accepted from loopback). */
+const INTERNAL_TUNNEL_HEADER = 'flutter-intercept-internal';
+/** grpc-timeout is clamped to this (no timer overflow, no call held for days). */
+const GRPC_SEND_MAX_DEADLINE_MS = 3_600_000;
 /** CONTRACTS §18.4: send() caps for gRPC calls. */
 const GRPC_SEND_MAX_MESSAGES = 100;
 const GRPC_SEND_MAX_BYTES = 16 * 1024 * 1024;

@@ -268,11 +268,27 @@ CONTRACTS §18.1–18.5. Tests: `packages/proxy/test/grpc-tools.test.ts`.
   - `:authority` is the new host unless `preserveHost`.
   - The LAN deny check and the client-certificate Origin refusal use the mapped URL.
   - The exchange keeps the app's URL; `simulated: "Mapped to <origin>"`.
-- **send()**: `SendRequest.grpc.messages` opens our own call from the session pool. Rules and the network profile
-  don't apply (it is not the app's traffic).
+- **send()**: `SendRequest.grpc.messages`. As first built it bypassed rules; since REVIEW-12 it takes the app's path
+  (see below).
   - Headers: `content-type: application/grpc` and `te: trailers` are set. Caller pseudo, hop-by-hop, `grpc-encoding`
     and `content-type` headers are dropped. `grpc-timeout: 60S` unless the caller gave a valid one; the deadline
     cancels the call (`error`).
   - Caps: ≤ 100 messages, ≤ 4 MB each, ≤ 16 MB total. `messagesJson` is refused.
   - A resend whose `resentFrom` exchange was `viaLan` needs LAN mode on and passes `lanTargetDenial`; its upstream
     uses the gate's guarded path.
+- **REVIEW-12 (CONTRACTS §18.6):**
+  - Loops: the relay refuses targets on the proxy's own listener (loopback, unspecified, emulator aliases, this
+    machine's addresses, on the loopback or LAN port). The call gets a trailers-only `14` "Flutter Intercept: the
+    call would loop back to the proxy", recorded once. No marker header reaches real servers. Hosts validate Map
+    Remote targets with `targetsProxy(url, ports)` (pure) or `InterceptProxy.targetsProxy(url)`.
+  - A name that resolves to this machine is caught when the upstream socket connects: the remote address is loopback /
+    an interface address and the port is one of ours (`E_FI_LOOP`), giving the same `14` on one exchange.
+  - **Known limit:** a loop through an external TCP forwarder (another port that leads back here) is not detected.
+  - `send()` for gRPC goes through a silent tunnel into the proxy's own loopback listener. The CONNECT carries
+    `flutter-intercept-internal: <nonce>[; tls][; lan]`, accepted from loopback only. That tunnel is always decrypted
+    (TLS to our own MITM). A resend of a LAN call is adopted as a LAN socket of the open gate. The call then takes the
+    app's path: rules, breakpoints, profile, replay incl. `fail`, map remote, LAN guard.
+  - The deadline cancels the call like an app (exchange `aborted`). `grpc-timeout` is clamped to 1 h. An unknown
+    `resentFrom` is refused.
+  - `onGrpcStatus` / breakpoint status messages are capped at 1 KB (`GRPC_STATUS_MESSAGE_MAX_BYTES`).
+    `mentionsGrpcHooks` ignores comments.

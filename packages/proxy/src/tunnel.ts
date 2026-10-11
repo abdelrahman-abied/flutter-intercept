@@ -20,6 +20,9 @@ import { bypassesProxy, connectTunnel, isLoopbackHost, type UpstreamProxySpec } 
 
 export const TUNNEL_CONNECT_TIMEOUT_MS = 30_000;
 
+/** Test seam: a dns.lookup replacement for direct upstream connections. Never set outside tests. */
+export const tunnelTesting: { lookup?: net.LookupFunction } = {};
+
 export interface TunnelUpstream {
   host: string;
   port: number;
@@ -63,7 +66,7 @@ export async function openTunnelUpstream(o: TunnelUpstream): Promise<net.Socket>
     });
   }
   return new Promise((resolve, reject) => {
-    const socket = net.connect({ host: alias ?? host, port: o.port });
+    const socket = net.connect({ host: alias ?? host, port: o.port, ...(tunnelTesting.lookup ? { lookup: tunnelTesting.lookup } : {}) });
     let attempt: number | undefined;
     let lookedUp: number | undefined;
     const limit = o.timeoutMs && o.timeoutMs > 0 ? o.timeoutMs : TUNNEL_CONNECT_TIMEOUT_MS;

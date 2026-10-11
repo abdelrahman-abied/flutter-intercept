@@ -36,6 +36,11 @@ export interface GrpcSessionRequest {
   cert?: { pattern: string; options: tls.ConnectionOptions };
   /** Opening a session (TCP / CONNECT / TLS / h2 preface) gives up after this long. */
   connectTimeoutMs: number;
+  /**
+   * CONTRACTS §18.6: is the address the socket actually connected to one of the proxy's own listeners? (A name that
+   * resolves to this machine on our port.) Then the session is refused with an error whose code is `E_FI_LOOP`.
+   */
+  connectsToSelf?: (ip: string, port: number) => boolean;
 }
 
 export interface GrpcLease {
@@ -193,6 +198,9 @@ export class GrpcSessionPool {
         timeoutMs: r.connectTimeoutMs,
       });
       if (timedOut || this.stopped) throw new Error('cancelled');
+      if (r.connectsToSelf && raw.remoteAddress && raw.remotePort && r.connectsToSelf(raw.remoteAddress, raw.remotePort)) {
+        throw Object.assign(new Error(`${label} is Flutter Intercept itself`), { code: 'E_FI_LOOP' });
+      }
       let sock: net.Socket = raw;
       if (r.protocol === 'https:') {
         const from = performance.now();

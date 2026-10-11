@@ -194,8 +194,43 @@ export type ScriptHook = 'onRequest' | 'onResponse' | 'onGrpcMessage' | 'onGrpcS
 
 /** CONTRACTS §18.2: does the script source mention the gRPC hooks (decided before anything runs)? */
 export function mentionsGrpcHooks(code: unknown): { message: boolean; status: boolean } {
-  const c = typeof code === 'string' ? code : '';
+  const c = withoutComments(typeof code === 'string' ? code : '');
   return { message: /\bonGrpcMessage\b/.test(c), status: /\bonGrpcStatus\b/.test(c) };
+}
+
+/**
+ * The source without `//` and `/* *\/` comments (REVIEW-12: the default template mentions the hooks in comments).
+ * String and template literals are kept as they are (a `//` inside a URL string is not a comment). Linear, no regex
+ * backtracking.
+ */
+export function withoutComments(src: string): string {
+  let out = '';
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    const c = src[i];
+    const d = src[i + 1];
+    if (c === '/' && d === '/') {
+      while (i < n && src[i] !== '\n') i++;
+      continue;
+    }
+    if (c === '/' && d === '*') {
+      const end = src.indexOf('*/', i + 2);
+      i = end < 0 ? n : end + 2;
+      out += ' ';
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') {
+      let j = i + 1;
+      while (j < n && src[j] !== c) j += src[j] === '\\' ? 2 : 1;
+      out += src.slice(i, Math.min(n, j + 1));
+      i = j + 1;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
 }
 
 export interface ScriptOutcome {

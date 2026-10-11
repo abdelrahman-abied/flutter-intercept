@@ -231,8 +231,8 @@ describe('silent tunnels and the relay (h2c)', () => {
     expect(r.messages.map(String)).toEqual(['echo:hi']);
     expect(r.trailers).toMatchObject({ 'grpc-status': '0', 'x-custom-trailer': 'trail-v', 'x-bin-bin': 'AQID' });
     expect(up.events).toContain('meta r1');
-    // the marker never went upstream
-    expect(JSON.stringify(up.seen.at(-1))).not.toMatch(/flutter-intercept/i);
+    // the tunnel marker never went upstream (only the per-instance hop marker of CONTRACTS §18.6 does)
+    expect(JSON.stringify(up.seen.at(-1))).not.toMatch(/flutter-intercept/i); // no marker of ours, ever (CONTRACTS §18.6)
     const ex = await waitFor(proxy, doneGrpc('/t.Echo/Unary'));
     expect(ex).toMatchObject({
       kind: 'grpc',

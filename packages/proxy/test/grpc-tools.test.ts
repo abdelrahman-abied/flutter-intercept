@@ -3,7 +3,10 @@ import { randomBytes } from 'crypto';
 import * as http2 from 'http2';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Exchange, GrpcProxyCodec, InterceptProxy, Rule } from '../src';
-import { grpcApplicable, ruleProblem } from '../src/rules';
+import { grpcApplicable, grpcEditProblem, ruleProblem, targetsProxy } from '../src/rules';
+import { mentionsGrpcHooks } from '../src/script';
+import { tunnelTesting } from '../src/tunnel';
+import * as dns from 'dns';
 import { decodeGrpcMessage } from '../src/grpc';
 import { lanIPv4Addresses, lanTesting } from '../src/lan';
 import { nextExchange, sleep, startProxy } from './helpers';
@@ -240,9 +243,12 @@ describe('send() for gRPC', () => {
     proxy.send({ method: 'POST', url: `http://${target}${o.path}`, initiator: 'editor', headers: o.headers, ...(o.resentFrom ? { resentFrom: o.resentFrom } : {}), grpc: { messages: o.messages ?? [], ...o.extra } } as never);
 
   it('unary, client streaming (all then half-close) and server streaming; recorded with initiator / resentFrom', async () => {
-    const { id } = await send({ path: '/t.Echo/Unary', messages: [b64('hello')], headers: { 'x-req-meta': 'm', 'content-type': 'text/x' }, resentFrom: 'orig-1' });
+    await grpcCall(session, '/t.Echo/Unary', ['orig']);
+    const orig = await waitFor(proxy, doneGrpc('/t.Echo/Unary'));
+    const { id } = await send({ path: '/t.Echo/Unary', messages: [b64('hello')], headers: { 'x-req-meta': 'm', 'content-type': 'text/x' }, resentFrom: orig.id });
     let ex = await waitFor(proxy, (e) => e.id === id && e.state !== 'pending');
-    expect(ex).toMatchObject({ kind: 'grpc', state: 'completed', initiator: 'editor', resentFrom: 'orig-1', grpc: { statusCode: 0, messagesSent: 1, messagesReceived: 1, deadlineMs: 60000 } });
+    expect(ex).toMatchObject({ kind: 'grpc', state: 'completed', initiator: 'editor', resentFrom: orig.id, grpc: { statusCode: 0, messagesSent: 1, messagesReceived: 1, deadlineMs: 60000 } });
+    expect(JSON.stringify(ex.requestHeaders)).not.toMatch(/x-fi-send|flutter-intercept/i);
     expect(ex.frames?.map((f) => [f.dir, text(f.base64)])).toEqual([
       ['send', 'hello'],
       ['receive', 'echo:hello'],
@@ -259,10 +265,10 @@ describe('send() for gRPC', () => {
     expect(ex.responseTrailers?.['x-stream-trailer']).toBe('done');
   });
 
-  it('a given grpc-timeout is the deadline (the call is cancelled and recorded as an error)', async () => {
+  it('a given grpc-timeout is the deadline (the call is cancelled like the app would)', async () => {
     const { id } = await send({ path: '/t.Echo/Slow', messages: [b64('x')], headers: { 'grpc-timeout': '200m' } });
     const ex = await waitFor(proxy, (e) => e.id === id && e.state !== 'pending');
-    expect(ex.state).toBe('error');
+    expect(ex.state).toBe('aborted');
     expect(ex.error).toMatch(/deadline \(200 ms\)/);
     await sleep(100);
     expect(up.events).toContain('cancelled /t.Echo/Slow');
@@ -276,6 +282,33 @@ describe('send() for gRPC', () => {
     await expect(send({ path: '/t.Echo/Unary', extra: { messagesJson: [{}] } })).rejects.toThrow(/encoded by the host/);
     await expect(send({ path: '/not-a-method' })).rejects.toThrow(/Not a gRPC method URL/);
     await expect(proxy.send({ method: 'GET', url: `http://${target}/t.Echo/Unary`, initiator: 'agent', grpc: { messages: [] } })).rejects.toThrow(/POST/);
+    await expect(send({ path: '/t.Echo/Unary', resentFrom: 'evicted-or-unknown' })).rejects.toThrow(/no longer recorded/);
+  });
+
+  it('REVIEW-12 #2: rules, the network profile and replay apply to sent calls like to the app’s', async () => {
+    const sent = async (path: string, messages = [b64('s')]) => {
+      const { id } = await send({ path, messages });
+      return waitFor(proxy, (e) => e.id === id && e.state !== 'pending' && !e.state.startsWith('paused'));
+    };
+    const before = up.events.length;
+    proxy.setRules([rule('b', '*/t.Echo/Unary', { kind: 'block', mode: 'status' })]);
+    expect(await sent('/t.Echo/Unary')).toMatchObject({ state: 'blocked', matchedRuleId: 'b', grpc: { statusCode: 14 } });
+    proxy.setRules([]);
+    proxy.setNetworkProfile({ kind: 'offline' });
+    expect(await sent('/t.Echo/Unary')).toMatchObject({ state: 'blocked', simulated: 'Offline', grpc: { statusCode: 14, statusMessage: 'DNS lookup failed' } });
+    proxy.setNetworkProfile({ kind: 'none' });
+    proxy.setReplay([], { fallback: 'fail' });
+    expect(await sent('/t.Echo/Unary')).toMatchObject({ state: 'blocked', grpc: { statusCode: 14 } });
+    proxy.setReplay(undefined);
+    expect(up.events.length).toBe(before); // none of these reached the server
+    proxy.setRules([rule('m', '*/t.Echo/Unary', { kind: 'mapRemote', to: `http://127.0.0.1:${up2.port}` })]);
+    const m = await sent('/t.Echo/Unary', [b64('mapped')]);
+    expect(m).toMatchObject({ state: 'completed', simulated: `Mapped to http://127.0.0.1:${up2.port}` });
+    expect(up.events.length).toBe(before);
+    proxy.setGrpcCodec({ decode: (_p, d, b) => (d === 'receive' ? { t: Buffer.from(b).toString() } : undefined), encode: (_p, _d, j) => Buffer.from(`${(j as { t: string }).t}!`) });
+    proxy.setRules([rule('mu', '*/t.Echo/Unary', { kind: 'mutate', ops: [{ path: '$.x', op: 'set', value: 1 }] })]);
+    const mu = await sent('/t.Echo/Unary', [b64('q')]);
+    expect(text(mu.frames?.find((f) => f.dir === 'receive')?.base64)).toBe('echo:q!');
   });
 });
 
@@ -318,5 +351,83 @@ describe.skipIf(!LAN_IP)('LAN guard on map remote and send', () => {
       await lanUp.close();
       delete lanTesting.allowTarget;
     }
+  });
+});
+
+// ---------------------------------------------------------------- REVIEW-12 #1: no relay loops
+
+describe('REVIEW-12 #1: gRPC calls never relay to the proxy itself', () => {
+  const settle = async () => {
+    await sleep(500);
+    return proxy.getExchanges().filter((e) => e.kind === 'grpc');
+  };
+
+  it('a direct h2c call to the proxy port: one exchange, 14 "would loop back"', async () => {
+    const direct = http2.connect(`http://127.0.0.1:${proxy.port}`);
+    direct.on('error', () => undefined);
+    const r = await grpcCall(direct, '/t.S/M', ['x']);
+    direct.destroy();
+    expect(r).toMatchObject({ trailersOnly: true, grpcStatus: 14 });
+    expect(decodeGrpcMessage(r.grpcMessage)).toBe('Flutter Intercept: the call would loop back to the proxy');
+    const all = await settle();
+    expect(all.length).toBe(1);
+    expect(all[0]).toMatchObject({ state: 'error', error: 'Flutter Intercept: the call would loop back to the proxy' });
+  });
+
+  it('a Map Remote rule to 127.0.0.1:<proxy port> (or an emulator alias): one exchange; the pure helper flags such targets', async () => {
+    expect(targetsProxy(`http://127.0.0.1:${proxy.port}`, [proxy.port])).toBe(true);
+    expect(targetsProxy(`http://localhost:${proxy.port}/x`, [proxy.port])).toBe(true);
+    expect(targetsProxy(`http://10.0.2.2:${proxy.port}`, [proxy.port])).toBe(true);
+    expect(targetsProxy(`http://127.0.0.1:${proxy.port + 1}`, [proxy.port])).toBe(false);
+    expect(targetsProxy('https://api.example.com', [443])).toBe(false);
+    expect(proxy.targetsProxy(`http://[::1]:${proxy.port}`)).toBe(true);
+    for (const to of [`http://127.0.0.1:${proxy.port}`, `http://10.0.2.2:${proxy.port}`]) {
+      proxy.clear();
+      proxy.setRules([rule('m', '*/t.Echo/*', { kind: 'mapRemote', to })]);
+      const r = await grpcCall(session, '/t.Echo/Unary', ['x']);
+      expect(r).toMatchObject({ trailersOnly: true, grpcStatus: 14 });
+      expect((await settle()).length).toBe(1);
+    }
+  });
+
+  it('a name that resolves to this machine on the proxy port is caught when the socket connects: one exchange', async () => {
+    tunnelTesting.lookup = ((host: string, opts: unknown, cb: (...a: unknown[]) => void) => {
+      const all = typeof opts === 'object' && opts !== null && (opts as { all?: boolean }).all;
+      if (host === 'loops-here.example.test') return all ? cb(null, [{ address: '127.0.0.1', family: 4 }]) : cb(null, '127.0.0.1', 4);
+      return dns.lookup(host, opts as dns.LookupOptions, cb as never);
+    }) as never;
+    try {
+      expect(proxy.targetsProxy(`http://loops-here.example.test:${proxy.port}`)).toBe(false); // not visible before DNS
+      proxy.setRules([rule('m', '*/t.Echo/*', { kind: 'mapRemote', to: `http://loops-here.example.test:${proxy.port}` })]);
+      const r = await grpcCall(session, '/t.Echo/Unary', ['x']);
+      expect(r).toMatchObject({ trailersOnly: true, grpcStatus: 14 });
+      expect(decodeGrpcMessage(r.grpcMessage)).toBe('Flutter Intercept: the call would loop back to the proxy');
+      const all = await settle();
+      expect(all.length).toBe(1);
+      expect(all[0]).toMatchObject({ state: 'error', error: 'Flutter Intercept: the call would loop back to the proxy' });
+    } finally {
+      delete tunnelTesting.lookup;
+    }
+  });
+
+  it('real servers never see a marker of ours (relay, send, map remote)', async () => {
+    await grpcCall(session, '/t.Echo/Unary', ['x']);
+    await proxy.send({ method: 'POST', url: `http://${target}/t.Echo/Unary`, initiator: 'agent', grpc: { messages: [b64('s')] } });
+    await sleep(200);
+    proxy.setRules([rule('m', '*/t.Echo/*', { kind: 'mapRemote', to: `http://127.0.0.1:${up2.port}` })]);
+    await grpcCall(session, '/t.Echo/Unary', ['m']);
+    for (const h of [...up.seen, ...up2.seen]) expect(JSON.stringify(h)).not.toMatch(/flutter-intercept|x-fi-/i);
+  });
+});
+
+describe('REVIEW-12 INFO items', () => {
+  it('hook detection ignores comments; status messages are capped at 1 KB; a sent grpc-timeout is clamped to 1 h', async () => {
+    expect(mentionsGrpcHooks('// function onGrpcMessage(m) {}\n/* onGrpcStatus */ function onRequest() {}')).toEqual({ message: false, status: false });
+    expect(mentionsGrpcHooks("const u = 'http://x'; function onGrpcStatus(s) {}")).toEqual({ message: false, status: true });
+    expect(grpcEditProblem('status', { status: { code: 1, message: 'x'.repeat(1025) } })).toMatch(/over 1 KB/);
+    const { id } = await proxy.send({ method: 'POST', url: `http://${target}/t.Echo/Unary`, initiator: 'agent', headers: { 'grpc-timeout': '99999999H' }, grpc: { messages: [b64('t')] } });
+    const ex = await waitFor(proxy, (e) => e.id === id && e.state !== 'pending');
+    expect(ex.state).toBe('completed');
+    expect(up.seen.at(-1)?.['grpc-timeout']).toBe('1H');
   });
 });

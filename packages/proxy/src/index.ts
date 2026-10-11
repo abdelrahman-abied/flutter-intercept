@@ -26,6 +26,11 @@ export {
   // v0.11.0 (CONTRACTS §17)
   grpcEditProblem,
   GRPC_EDIT_MAX_BYTES,
+  // v0.12.0 (CONTRACTS §18)
+  GRPC_REWRITE_RESERVED,
+  GRPC_TRAILER_RESERVED,
+  targetsProxy,
+  GRPC_STATUS_MESSAGE_MAX_BYTES,
 } from './rules';
 export type { PickedStep, StepAction } from './rules';
 export { requestBodyHash, grpcMessageHash } from './replay';

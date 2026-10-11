@@ -517,6 +517,15 @@ export function onComboConnection(socket: net.Socket): void {
 }
 
 /**
+ * CONTRACTS §18.6: the proxy's own resend of a call a LAN client made arrives on a loopback socket; marking it as a
+ * CONNECT socket of `gate` gives it every LAN guard (target checks, guarded upstream, viaLan) like the original.
+ */
+export function adoptAsLanSocket(socket: net.Socket, gate: LanGate): void {
+  lanSockets.set(socket, { gate, state: 'connect', peer: 'resend' });
+  (socket as unknown as Record<symbol, unknown>)[SOCKET_SELF] = socket;
+}
+
+/**
  * CONTRACTS §14.2: may a CONNECT on this socket be tunnelled by the proxy itself (TLS passthrough)? Not on a closed
  * gate's socket, nor a CONNECT that follows plain requests on a LAN keep-alive connection (it never went through the
  * gate; onComboConnection refuses those too). Non-LAN sockets: yes.
