@@ -2026,3 +2026,17 @@ every decision in the project's interest. Plan and owners: docs/PLAN.md "v0.12.0
 Rewrite validation (reserved metadata, CR/LF, base64 `-bin`), script hooks bounded (time, size, message count per call),
 map remote never bypasses the LAN SSRF guard or the client-certificate Origin rule, send caps and deadline, resend from
 LAN-recorded exchanges only to the same targets the LAN guard allows, agents' `resend_request grpc` behind write access.
+
+### 18.6 REVIEW-12 amendments
+- **No relay loops.** Every relayed / sent gRPC call carries a per-instance hop marker the proxy strips upstream; a call
+  arriving with our marker, or whose upstream target is one of the proxy's own listeners (loopback / emulator aliases /
+  the LAN listener, any of its ports), is answered trailers-only `14` "Flutter Intercept: the call would loop back to the
+  proxy" and recorded once. Map remote rules (shared, personal or agent) whose target is the proxy's own port are refused
+  by validation.
+- **`send()` for gRPC follows the rules like HTTP `send()`.** Block / fault / throttle / grpcMock / mapRemote / rewrite /
+  breakpoints / mutate / scripts, the network profile and replay (incl. `fallback: fail`) apply to resent gRPC calls
+  exactly as to the app's calls (the docs that said otherwise are corrected).
+- Agents' view of `scriptLog` redacts base64 runs (≥ 16 chars) as `[base64 N bytes]`; `messagesJson` "[redacted]"
+  restore only when the edit targets the same method; a total `messagesJson` cap (16 MB encoded); `grpc-timeout` clamped
+  to 1 h; `onGrpcStatus` message ≤ 1 KB; the hook-name check ignores comments; a resend whose original record is gone
+  can't skip the LAN check (refused).
