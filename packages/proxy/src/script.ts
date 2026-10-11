@@ -83,11 +83,17 @@ const BOOTSTRAP = String.raw`(function () {
     var name = input.hook;
     var fn = name === 'onRequest'
       ? (typeof onRequest === 'function' ? onRequest : undefined)
-      : (typeof onResponse === 'function' ? onResponse : undefined);
+      : name === 'onResponse'
+        ? (typeof onResponse === 'function' ? onResponse : undefined)
+        : name === 'onGrpcMessage'
+          ? (typeof onGrpcMessage === 'function' ? onGrpcMessage : undefined)
+          : name === 'onGrpcStatus'
+            ? (typeof onGrpcStatus === 'function' ? onGrpcStatus : undefined)
+            : undefined;
     if (!fn) return stringify({ lines: lines, missing: true });
     var result;
     try {
-      result = name === 'onRequest' ? fn(input.args[0], context) : fn(input.args[0], input.args[1], context);
+      result = name === 'onResponse' ? fn(input.args[0], input.args[1], context) : fn(input.args[0], context);
     } catch (e) {
       return stringify({ lines: lines, error: describe(e) });
     }
@@ -183,6 +189,15 @@ parentPort.on('message', (m) => {
 });`;
 
 /** What a hook call produced. `error` = it threw / timed out / returned something invalid; lines are kept. */
+/** CONTRACTS §13.4 HTTP hooks, §18.2 gRPC hooks. */
+export type ScriptHook = 'onRequest' | 'onResponse' | 'onGrpcMessage' | 'onGrpcStatus';
+
+/** CONTRACTS §18.2: does the script source mention the gRPC hooks (decided before anything runs)? */
+export function mentionsGrpcHooks(code: unknown): { message: boolean; status: boolean } {
+  const c = typeof code === 'string' ? code : '';
+  return { message: /\bonGrpcMessage\b/.test(c), status: /\bonGrpcStatus\b/.test(c) };
+}
+
 export interface ScriptOutcome {
   lines: string[];
   error?: string;
@@ -205,7 +220,7 @@ interface Call {
   key: string;
   code: string;
   filename: string;
-  hook: 'onRequest' | 'onResponse';
+  hook: ScriptHook;
   input: string;
   resolve: (o: ScriptOutcome) => void;
   /** Fails the call if it is still waiting at SCRIPT_QUEUE_WAIT_MS. */
@@ -277,7 +292,7 @@ export class ScriptRunner {
     ruleId: string,
     ruleName: string,
     code: string,
-    hook: 'onRequest' | 'onResponse',
+    hook: ScriptHook,
     args: unknown[],
     ctx: { ruleId: string; exchangeId: string },
   ): Promise<ScriptOutcome> {

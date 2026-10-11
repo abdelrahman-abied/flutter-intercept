@@ -322,7 +322,18 @@ export function ruleProblem(rule: Pick<Rule, 'match' | 'action'>): string | unde
 // ---------------------------------------------------------------- gRPC (CONTRACTS §16.2)
 
 /** Rule actions that apply to gRPC calls (CONTRACTS §16.2); a sequence only when every step is one of them. */
-export const GRPC_ACTIONS: ReadonlySet<RuleAction['kind']> = new Set(['grpcMock', 'block', 'fault', 'throttle', 'breakpoint', 'mutate']);
+export const GRPC_ACTIONS: ReadonlySet<RuleAction['kind']> = new Set([
+  'grpcMock',
+  'block',
+  'fault',
+  'throttle',
+  'breakpoint',
+  'mutate',
+  // CONTRACTS §18 (v0.12.0): every action but cors (browser-only) and mock (HTTP bodies; gRPC has grpcMock)
+  'rewrite',
+  'script',
+  'mapRemote',
+]);
 
 export function grpcApplicable(a: RuleAction | undefined): boolean {
   if (!a || typeof a !== 'object') return false;
@@ -376,6 +387,51 @@ export function grpcMockProblem(a: Extract<RuleAction, { kind: 'grpcMock' }>): s
       if (MOCK_RESERVED.has(lk)) return `${what}: "${k}" is set by the proxy (use code / message for the status).`;
       if (!HEADER_NAME.test(lk)) return `${what}: "${k.slice(0, 60)}" is not a valid header name.`;
       if (typeof v !== 'string' || /[\r\n\0]/.test(v)) return `${what}: the value of "${k}" must be text on one line.`;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * CONTRACTS §18.1: gRPC metadata a rewrite rule may not set or remove (status changes use a breakpoint, mutate or a
+ * script; framing / deadline headers belong to the call). Pseudo headers (`:…`) are refused too.
+ */
+export const GRPC_REWRITE_RESERVED: ReadonlySet<string> = new Set(['grpc-status', 'grpc-message', 'grpc-timeout', 'grpc-encoding', 'grpc-accept-encoding', 'grpc-status-details-bin']);
+/** Also refused in `setTrailers / removeTrailers` (and skipped, with a note, in header rewrites of a gRPC call). */
+export const GRPC_TRAILER_RESERVED: ReadonlySet<string> = new Set([
+  ...GRPC_REWRITE_RESERVED,
+  'content-type',
+  'te',
+  'content-length',
+  'connection',
+  'keep-alive',
+  'proxy-connection',
+  'transfer-encoding',
+  'upgrade',
+  'host',
+  'trailer',
+]);
+
+/** Why a rewrite rule's metadata changes are invalid (CONTRACTS §18.1), or undefined. */
+function rewriteMetadataProblem(a: Extract<RuleAction, { kind: 'rewrite' }>): string | undefined {
+  const sides: Array<[string, Record<string, string> | undefined, string[] | undefined, ReadonlySet<string>]> = [
+    ['request headers', a.request?.setHeaders, a.request?.removeHeaders, GRPC_REWRITE_RESERVED],
+    ['response headers', a.response?.setHeaders, a.response?.removeHeaders, GRPC_REWRITE_RESERVED],
+    ['trailers', a.response?.setTrailers, a.response?.removeTrailers, GRPC_TRAILER_RESERVED],
+  ];
+  for (const [what, set, remove, reserved] of sides) {
+    if (set !== undefined && (typeof set !== 'object' || set === null || Array.isArray(set))) return `Rewrite ${what}: expected an object of name → value.`;
+    if (remove !== undefined && !Array.isArray(remove)) return `Rewrite ${what}: expected a list of names to remove.`;
+    const names = [...Object.keys(set ?? {}), ...(remove ?? []).map(String)];
+    for (const n of names) {
+      const l = n.trim().toLowerCase();
+      if (l.startsWith(':')) return `Rewrite ${what}: pseudo headers such as "${n.slice(0, 40)}" can't be changed.`;
+      if (reserved.has(l)) return `Rewrite ${what}: "${n.slice(0, 40)}" can't be changed${GRPC_REWRITE_RESERVED.has(l) ? ' (use a breakpoint, mutate or a script for the gRPC status)' : ''}.`;
+      if (what === 'trailers' && !HEADER_NAME.test(l)) return `Rewrite trailers: "${n.slice(0, 60)}" is not a valid name.`;
+    }
+    for (const [k, v] of Object.entries(set ?? {})) {
+      if (typeof v !== 'string' || /[\r\n\0]/.test(v)) return `Rewrite ${what}: the value of "${k.slice(0, 40)}" must be text on one line.`;
+      if (k.trim().toLowerCase().endsWith('-bin') && !BASE64.test(v) && !BASE64URL.test(v.replace(/=+$/, ''))) return `Rewrite ${what}: "${k.slice(0, 40)}" is binary metadata; its value must be base64.`;
     }
   }
   return undefined;
@@ -719,6 +775,8 @@ function actionProblem(a: RuleAction | undefined): string | undefined {
     return undefined;
   }
   if (a.kind === 'rewrite') {
+    const meta = rewriteMetadataProblem(a);
+    if (meta) return meta;
     for (const side of [a.request, a.response]) {
       const r = side?.replaceBody;
       if (!r) continue;

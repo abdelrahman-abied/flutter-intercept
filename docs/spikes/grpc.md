@@ -239,3 +239,40 @@ CONTRACTS §17.1–17.4 and §17.7. Tests: `packages/proxy/test/grpc-parity.test
   - #6: mutate decodes messages ≤ 1 MB only and stops for a call after 50 MB or 2 s of codec time (with a note).
   - #7: gRPC replay matches the request's own origin only. A LAN client's gRPC call goes through `lanTargetDenial`
     before any local answer (mock, replay, block), giving `14` + the SSRF text.
+
+## As built — proxy (0.12.0)
+
+CONTRACTS §18.1–18.5. Tests: `packages/proxy/test/grpc-tools.test.ts`.
+
+- `grpcApplicable` / `GRPC_ACTIONS`: every action except `cors` and `mock`.
+- **Rewrite**:
+  - Request metadata changes apply before the call goes upstream; `requestHeaders` records the result.
+  - Response header changes apply to the first HEADERS frame. `setTrailers` / `removeTrailers` apply to the trailers;
+    on a trailers-only answer, both apply to its single frame.
+  - `ruleProblem` refuses pseudo headers and `grpc-status/-message/-timeout/-encoding/-accept-encoding` everywhere.
+    In trailers it also refuses `content-type`, `te` and hop-by-hop names. It refuses CR/LF and non-base64 `-bin`
+    values. (`content-type` stays valid in HTTP rewrites.)
+  - At apply time, a gRPC call also skips `content-type` / `te` header changes, with a note.
+  - `replaceBody` / `response.status` add a note; the metadata parts still apply. `simulated: "Rewritten: metadata"`.
+- **Scripts**: `onGrpcMessage` / `onGrpcStatus` run in the same worker sandbox (200 ms per call, `context.log`).
+  - The hook path is used only when the code mentions the hook (`mentionsGrpcHooks`), like `onResponse` buffering.
+  - Messages over 1 MB aren't passed to the script (note). At most 1000 `onGrpcMessage` calls per call.
+  - `json` is decoded within the REVIEW-11 codec budget.
+  - Returns: `{json}` (encoded with the codec), `{base64}`, `{drop: true}`. Status: `{code?, message?, trailers?}`,
+    checked with `grpcEditProblem`.
+  - A throw, timeout, invalid return or encode error: the original goes on and the error goes to `scriptLog`.
+  - HTTP hooks never run for gRPC calls. A script rule without gRPC hooks lets the call through unchanged.
+- **Map remote**:
+  - `mapRemoteUrl` as for HTTP (`ftp:` etc. → `14` with the rule error). The upstream session comes from the pool for
+    the mapped origin.
+  - `:authority` is the new host unless `preserveHost`.
+  - The LAN deny check and the client-certificate Origin refusal use the mapped URL.
+  - The exchange keeps the app's URL; `simulated: "Mapped to <origin>"`.
+- **send()**: `SendRequest.grpc.messages` opens our own call from the session pool. Rules and the network profile
+  don't apply (it is not the app's traffic).
+  - Headers: `content-type: application/grpc` and `te: trailers` are set. Caller pseudo, hop-by-hop, `grpc-encoding`
+    and `content-type` headers are dropped. `grpc-timeout: 60S` unless the caller gave a valid one; the deadline
+    cancels the call (`error`).
+  - Caps: ≤ 100 messages, ≤ 4 MB each, ≤ 16 MB total. `messagesJson` is refused.
+  - A resend whose `resentFrom` exchange was `viaLan` needs LAN mode on and passes `lanTargetDenial`; its upstream
+    uses the gate's guarded path.
