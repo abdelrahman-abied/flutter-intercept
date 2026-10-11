@@ -180,6 +180,11 @@ describe('action entry (dist/action.js)', () => {
   it('defaults: empty inputs → plain test; approve false; rules none → --no-rules; a recording name is not uploaded', () => {
     expect(actionPlan(readInputs({ FI_INPUT_DEVICE: '  ', FI_INPUT_APPROVE_SHARED_RULES: 'false' }))).toEqual({ argv: ['test'], artifacts: {}, warnings: [] });
     expect(actionPlan({ rules: 'none', record: 'nightly' })).toEqual({ argv: ['test', '--record=nightly', '--no-rules'], artifacts: {}, warnings: [] });
+    expect(actionPlan({ grpc: 'false' }).argv).toEqual(['test', '--no-grpc']);
+    expect(actionPlan({ grpc: 'true', 'grpc-decrypt-hosts': 'grpc.example *.staging.example' }).argv)
+      .toEqual(['test', '--grpc-decrypt-host=grpc.example', '--grpc-decrypt-host=*.staging.example']);
+    expect(() => actionPlan({ 'grpc-decrypt-hosts': '--no-redact' })).toThrow(/isn't a host name/);
+    expect(() => actionPlan({ grpc: 'maybe' })).toThrow(/true or false/);
     // a device id that starts with "-" stays a value
     expect(actionPlan({ device: '--no-rules' }).argv).toEqual(['test', '--device=--no-rules']);
   });

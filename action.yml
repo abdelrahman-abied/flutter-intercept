@@ -60,6 +60,14 @@ inputs:
     description: Also apply shared rules that need approval in the editor (map remote to another host, request header rewrites, scripts). Only for pipelines you control.
     required: false
     default: "false"
+  grpc:
+    description: Intercept the app's gRPC calls (grpc-dart). false = they connect directly.
+    required: false
+    default: "true"
+  grpc-decrypt-hosts:
+    description: Hosts (or globs) whose TLS gRPC is decrypted, for apps that trust the Flutter Intercept CA in debug. One per line or space-separated. Other TLS gRPC is listed undecrypted.
+    required: false
+    default: ""
   flutter-args:
     description: Extra arguments for flutter test (e.g. --flavor dev). One per line, or separated by spaces on a single line. No shell quoting.
     required: false
@@ -124,6 +132,8 @@ runs:
         FI_INPUT_NETWORK_PROFILE: ${{ inputs.network-profile }}
         FI_INPUT_RULES: ${{ inputs.rules }}
         FI_INPUT_APPROVE_SHARED_RULES: ${{ inputs.approve-shared-rules }}
+        FI_INPUT_GRPC: ${{ inputs.grpc }}
+        FI_INPUT_GRPC_DECRYPT_HOSTS: ${{ inputs.grpc-decrypt-hosts }}
         FI_INPUT_FLUTTER_ARGS: ${{ inputs.flutter-args }}
         FI_INPUT_UPLOAD_RECORDING: ${{ inputs.upload-recording }}
       run: exec node "$GITHUB_ACTION_PATH/packages/cli/dist/action.js"

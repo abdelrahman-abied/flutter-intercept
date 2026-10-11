@@ -23,6 +23,8 @@ export const CLI_INPUTS = [
   'network-profile',
   'rules',
   'approve-shared-rules',
+  'grpc',
+  'grpc-decrypt-hosts',
   'flutter-args',
   'upload-recording',
 ] as const;
@@ -126,6 +128,12 @@ export function actionPlan(inputs: ActionInputs): ActionPlan {
     argv.push(/^(none|false)$/i.test(rules) ? '--no-rules' : `--rules=${rules}`);
   }
   if (parseBool('approve-shared-rules', inputs['approve-shared-rules'])) argv.push('--approve-shared-rules');
+  // CONTRACTS §16.6: gRPC interception on (default) or off, TLS gRPC hosts to decrypt.
+  if (inputs.grpc !== undefined && inputs.grpc !== '' && !parseBool('grpc', inputs.grpc)) argv.push('--no-grpc');
+  for (const h of splitList(inputs['grpc-decrypt-hosts'])) {
+    if (h.startsWith('-') || !/^[A-Za-z0-9.*:[\]_-]+$/.test(h)) throw new ActionInputError(`grpc-decrypt-hosts: "${h}" isn't a host name or glob`);
+    argv.push(`--grpc-decrypt-host=${h}`);
+  }
   const flutterArgs = splitList(inputs['flutter-args']);
   if (flutterArgs.length) argv.push('--', ...flutterArgs);
   const artifacts: ActionPlan['artifacts'] = {};
