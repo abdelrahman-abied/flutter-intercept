@@ -101,7 +101,7 @@ export type ViewMsg =
 export type ExportFormat = 'openapi' | 'postman' | 'har';
 
 export type SnippetFormat = 'curl' | 'dart_http' | 'dio';
-export interface SendDraft { method: string; url: string; headers?: Record<string, string | string[]>; body?: string }
+export interface SendDraft { method: string; url: string; headers?: Record<string, string | string[]>; body?: string; grpc?: { messages?: string[]; messagesJson?: unknown[] } }
 
 /** CONTRACTS §10.5: the contract check of one exchange, as the panel shows it. */
 export interface ContractSummary {
