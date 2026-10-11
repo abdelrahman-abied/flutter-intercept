@@ -7,9 +7,9 @@
  *   every argument quoted and caret-escaped (the cross-spawn rules), so `& | < > ^ %` and spaces stay data.
  */
 import { redactText } from '../../extension/src/agent/redact';
-import { ENTRY_SHA_DEFINE_NAME, PROXY_DEFINE_NAME } from './names';
+import { ENTRY_SHA_DEFINE_NAME, GRPC_DEFINE_NAME, PROXY_DEFINE_NAME } from './names';
 
-const OWN = new Set([PROXY_DEFINE_NAME, ENTRY_SHA_DEFINE_NAME]);
+const OWN = new Set([PROXY_DEFINE_NAME, ENTRY_SHA_DEFINE_NAME, GRPC_DEFINE_NAME]);
 
 /**
  * `user:secret@host:port` → `user:***@host:port`. The physical-iPhone proxy define carries the run's LAN token

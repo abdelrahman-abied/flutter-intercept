@@ -25,6 +25,8 @@ import { lanAddressForIphone } from './lanAddress';
 import { LanNetworkWatcher, netFingerprint } from './lanWatch';
 import { LanLifecycle } from './lanLifecycle';
 import { InterceptProxyHost } from './proxyHost';
+import { grpcCodec } from './grpc/index';
+import { createGrpcSchemaService, grpcMockEncoder } from './grpc/service';
 import { createCodegenService } from './codegen/service';
 import type { GeneratedFile } from './codegen/types';
 import { createContractService, DONT_CHECK } from './contract/service';
@@ -275,6 +277,30 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     proxyHost.setTlsPassthrough(vscode.workspace.getConfiguration('flutterIntercept').get('tlsPassthrough', []));
   };
   applyTlsPassthrough();
+  // CONTRACTS §16.4: TLS gRPC hosts to decrypt (a repo may set it: it only widens decryption for apps that trust our CA).
+  const applyGrpcDecryptHosts = () => {
+    proxyHost.setGrpcDecryptHosts(vscode.workspace.getConfiguration('flutterIntercept').get('grpc.decryptHosts', []));
+  };
+  applyGrpcDecryptHosts();
+  const grpc = createGrpcSchemaService({
+    codec: grpcCodec,
+    roots: () => (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+    enabled: () => vscode.workspace.getConfiguration('flutterIntercept').get<boolean>('grpc.enabled', true),
+    watch: false, // fed by VS Code's watcher below
+    log,
+  });
+  context.subscriptions.push({ dispose: () => grpc.dispose() });
+  const grpcWatcher = vscode.workspace.createFileSystemWatcher('**/{*.pb.dart,*.pbgrpc.dart,*.pbenum.dart,.dart_tool/package_config.json}');
+  context.subscriptions.push(
+    grpcWatcher,
+    grpcWatcher.onDidChange((u) => grpc.fileChanged(u.fsPath)),
+    grpcWatcher.onDidCreate((u) => grpc.fileChanged(u.fsPath)),
+    grpcWatcher.onDidDelete((u) => grpc.fileChanged(u.fsPath)),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => grpc.rootsChanged()),
+  );
+  proxyHost.setGrpcMessageEncoder(grpcMockEncoder(grpc));
+  context.subscriptions.push(grpc.onDidChange(() => proxyHost.refreshGrpcMocks()));
+  void grpc.ready();
   /** Runs a tool with an argument array (no shell), stdout as bytes. */
   const execTool = (cmd: string, args: string[], opts?: { timeoutMs?: number; maxBuffer?: number }) =>
     new Promise<{ stdout: Buffer; stderr: string }>((resolve, reject) =>
@@ -428,6 +454,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   const version = String((context.extension?.packageJSON as { version?: string } | undefined)?.version ?? '');
   const controller = new InterceptController({
     host: proxyHost,
+    grpc,
     saveRules: (rules) => {
       void shared.setPersonalRules(rules).catch((e: unknown) => log(`personal rules → shared service: ${String(e)}`)); // REVIEW-7 #1
       return context.workspaceState.update(RULES_KEY, rules);
@@ -504,6 +531,8 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       if (e.affectsConfiguration('flutterIntercept.contractCheck')) controller.recheckContracts();
       if (e.affectsConfiguration('flutterIntercept.upstreamProxy') || e.affectsConfiguration('flutterIntercept.upstreamProxyIgnoreCertErrors') || e.affectsConfiguration('http.proxy') || e.affectsConfiguration('http.noProxy') || e.affectsConfiguration('http.proxySupport')) applyUpstreamProxy();
       if (e.affectsConfiguration('flutterIntercept.tlsPassthrough')) applyTlsPassthrough();
+      if (e.affectsConfiguration('flutterIntercept.grpc.decryptHosts')) applyGrpcDecryptHosts();
+      if (e.affectsConfiguration('flutterIntercept.grpc.enabled')) grpc.enabledChanged();
       if (e.affectsConfiguration('flutterIntercept.clientCertificates')) void applyClientCertificates().catch((err: unknown) => log(`client certificates: ${String(err)}`));
     }),
   );
@@ -550,6 +579,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   context.subscriptions.push({ dispose: () => launcher.dispose() });
   const agentApi = createAgentApi({
     host: proxyHost,
+    grpc,
     applyRules: (rules) => controller.applyRules(rules),
     clear: () => controller.clear(),
     getSettings: agentSettings,
@@ -719,6 +749,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       intercepted.add(session.id);
       debugSessions.set(session.id, session);
       refreshAppPackages(); // pubspec names may have changed since activation
+      void grpc.load();
       controller.setSessions(intercepted.size);
       if (!revealed) {
         revealed = true;

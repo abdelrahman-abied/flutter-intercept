@@ -58,8 +58,10 @@ export function proxyHostFor(deviceId: string | undefined, override?: string): s
 export { PROXY_DEFINE };
 /** CONTRACTS §9.1: `FLUTTER_INTERCEPT_TRACE=0` turns the entry's request → source traces off. */
 export const TRACE_DEFINE = 'FLUTTER_INTERCEPT_TRACE';
+/** CONTRACTS §16.1: `FLUTTER_INTERCEPT_GRPC=0` turns the entry's gRPC (`Socket.connect`) redirect off. */
+export const GRPC_DEFINE = 'FLUTTER_INTERCEPT_GRPC';
 /** Every dart-define we own. */
-export const OUR_DEFINES = [SHA_DEFINE, PROXY_DEFINE, TRACE_DEFINE] as const;
+export const OUR_DEFINES = [SHA_DEFINE, PROXY_DEFINE, TRACE_DEFINE, GRPC_DEFINE] as const;
 
 /**
  * REVIEW-9: the LAN token must never be on a command line (the IntelliJ Flutter plugin logs the full `flutter run`
@@ -125,12 +127,13 @@ export function withShaDefine(toolArgs: unknown, sha: string): string[] {
  * Replaces (never duplicates) both of our defines: the entry hash and the proxy address. With `definesFile` the proxy
  * address is not on the command line: `--dart-define-from-file=<definesFile>` instead (the caller writes the file).
  */
-export function withInterceptDefines(toolArgs: unknown, sha: string, proxyAddress: string, captureSource = true, definesFile?: string): string[] {
+export function withInterceptDefines(toolArgs: unknown, sha: string, proxyAddress: string, captureSource = true, definesFile?: string, grpc = true): string[] {
   return [
     ...stripDefines(toolArgs),
     `--dart-define=${SHA_DEFINE}=${sha}`,
     definesFile ? `${DEFINE_FROM_FILE}=${definesFile}` : `--dart-define=${PROXY_DEFINE}=${proxyAddress}`,
     ...(captureSource ? [] : [`--dart-define=${TRACE_DEFINE}=0`]),
+    ...(grpc ? [] : [`--dart-define=${GRPC_DEFINE}=0`]),
   ];
 }
 
@@ -247,6 +250,8 @@ export interface RewriteContext {
   settingsToolArgs?: string[];
   /** Setting `flutterIntercept.captureSource` (default true); false adds `FLUTTER_INTERCEPT_TRACE=0` (Flutter only). */
   captureSource?: boolean;
+  /** Setting `flutterIntercept.grpc.enabled` (default true); false adds `FLUTTER_INTERCEPT_GRPC=0` (Flutter only). */
+  grpcEnabled?: boolean;
   /**
    * Setting `flutterIntercept.web.enabled` (CONTRACTS §11.3). false/absent = web devices are not intercepted.
    * Web sessions need `caCertPem` (its SPKI pin goes into the browser flags).
@@ -505,7 +510,7 @@ function rewriteOrSkip(input: DebugConfig, ctx: RewriteContext): RewriteResult {
   // LAN (physical iOS): `flutter-intercept:<token>@<lanIp>:<port>`; the token lives only in this define.
   const definesFile = lan && isOurDefinesFile(ctx.lanDefinesFile) ? ctx.lanDefinesFile : undefined;
   const proxyAddress = lan ? lanProxyAddress(lan) : `${proxyHost}:${proxyPort}`;
-  if (flutter) config.toolArgs = withInterceptDefines(config.toolArgs, plan.sha, proxyAddress, ctx.captureSource !== false, definesFile);
+  if (flutter) config.toolArgs = withInterceptDefines(config.toolArgs, plan.sha, proxyAddress, ctx.captureSource !== false, definesFile, ctx.grpcEnabled !== false);
   if (mode === 'before' || mode === 'already') {
     if (!config.cwd && cwd) config.cwd = cwd;
     // Pin the debugger type; otherwise Dart-Code treats a program under .dart_tool/ as plain Dart.

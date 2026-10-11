@@ -87,6 +87,19 @@
           "default": [],
           "markdownDescription": "Hosts (globs on the hostname, e.g. `*.bank.example`) whose HTTPS is passed through **without decryption**, for apps that pin certificates themselves (Dio `validateCertificate`, native pinning). Their connections are listed as tunnels; rules other than block don't apply."
         },
+        "flutterIntercept.grpc.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Intercept the app's **gRPC** calls (grpc-dart, connectrpc). Off: the app connects directly (`FLUTTER_INTERCEPT_GRPC=0`) and no protobuf schema is read from the generated `*.pb*.dart` files. Takes effect on the next launch."
+        },
+        "flutterIntercept.grpc.decryptHosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Hosts (globs on the hostname, e.g. `grpc.example.com`, `*.staging.example`) whose **TLS** gRPC is decrypted. Only for apps that trust the Flutter Intercept CA in debug (pinned to it, or `onBadCertificate`); other TLS gRPC is shown as an undecrypted tunnel. Same host rules as `flutterIntercept.tlsPassthrough`."
+        },
         "flutterIntercept.clientCertificates": {
           "type": "array",
           "default": [],
@@ -304,7 +317,7 @@
         "toolReferenceName": "interceptGetStatus",
         "canBeReferencedInPrompt": true,
         "userDescription": "Show proxy, session and traffic status.",
-        "modelDescription": "Get Flutter Intercept status: whether the intercepting proxy runs, the running debug sessions (device, program), how many requests are recorded and paused, the agent access level, and warnings about traffic that is NOT intercepted (e.g. requests from a background isolate, native HTTP clients that are only listed read-only, requests that bypass the proxy). Also: upstreamProxy (host:port the traffic is chained through; upstreamProxySource \"http.proxy\" = VS Code's proxy setting), tlsPassthrough (host globs whose HTTPS is passed through undecrypted, listed as kind \"tunnel\") and clientCertificates ([{host, loaded, problem?}] — mutual-TLS certificates the proxy presents; a problem means it did not load and the server will likely reject the connection). Call this first to see whether an app is running before using the other tools.",
+        "modelDescription": "Get Flutter Intercept status: whether the intercepting proxy runs, the running debug sessions (device, program), how many requests are recorded and paused, the agent access level, and warnings about traffic that is NOT intercepted (e.g. requests from a background isolate, native HTTP clients that are only listed read-only, requests that bypass the proxy). Also: grpc ({enabled, decryptHosts, problem?, schema: {methods, messages, problems}} — gRPC interception and the protobuf schema read from the app's generated code), upstreamProxy (host:port the traffic is chained through; upstreamProxySource \"http.proxy\" = VS Code's proxy setting), tlsPassthrough (host globs whose HTTPS is passed through undecrypted, listed as kind \"tunnel\") and clientCertificates ([{host, loaded, problem?}] — mutual-TLS certificates the proxy presents; a problem means it did not load and the server will likely reject the connection). Call this first to see whether an app is running before using the other tools.",
         "inputSchema": {
           "type": "object",
           "properties": {},
@@ -323,7 +336,7 @@
         "toolReferenceName": "interceptListRequests",
         "canBeReferencedInPrompt": true,
         "userDescription": "List recorded HTTP requests.",
-        "modelDescription": "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state, start time, kind (\"websocket\", \"sse\", \"http\"), GraphQL operation name, or slowerThanMs (only requests that took longer). Items show kind, the GraphQL operation and captured: \"vm-profile\" for read-only requests of native HTTP clients (no rules apply to them); kind \"tunnel\" items are TLS connections to a flutterIntercept.tlsPassthrough host, passed through undecrypted (notDecrypted: true, bytesSent / bytesReceived, no status, headers or bodies). Returns ids; call get_request for headers and bodies, get_frames for WebSocket messages / SSE events. Secrets are redacted.",
+        "modelDescription": "List HTTP requests the running Flutter/Dart app made (newest first), recorded by Flutter Intercept's proxy. Filter by URL glob (* matches any characters), method, status (code, class like \"4xx\", or \"error\"), state, start time, kind (\"websocket\", \"sse\", \"grpc\", \"tunnel\", \"http\"), GraphQL operation name, or slowerThanMs (only requests that took longer). Items show kind, the GraphQL operation and captured: \"vm-profile\" for read-only requests of native HTTP clients (no rules apply to them); kind \"tunnel\" items are TLS connections to a flutterIntercept.tlsPassthrough host, passed through undecrypted (notDecrypted: true, bytesSent / bytesReceived, no status, headers or bodies; grpcTunnel: true = gRPC over TLS that is not decrypted). kind \"grpc\" items are gRPC calls: url ends in /<package.Service>/<Method>, status is the HTTP status (200 even for gRPC errors) and grpc {status, code, messagesSent, messagesReceived} holds the gRPC result. Returns ids; call get_request for headers and bodies, get_frames for WebSocket messages / SSE events. Secrets are redacted.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -380,14 +393,15 @@
               "description": "Only exchanges that started at or after this time (epoch milliseconds)."
             },
             "kind": {
-              "description": "\"websocket\", \"sse\" (server-sent events), \"tunnel\" (a TLS connection passed through undecrypted for a flutterIntercept.tlsPassthrough host) or \"http\" (everything else).",
               "type": "string",
               "enum": [
                 "http",
                 "websocket",
                 "sse",
-                "tunnel"
-              ]
+                "tunnel",
+                "grpc"
+              ],
+              "description": "\"http\" (plain requests), \"websocket\", \"sse\" (server-sent events), \"grpc\" (gRPC calls: one per call, messages read with get_frames) or \"tunnel\" (a TLS connection passed through undecrypted: a flutterIntercept.tlsPassthrough host, or gRPC over TLS that is not decrypted)."
             },
             "graphqlOperation": {
               "description": "Only GraphQL requests with this operation name (exact, case-sensitive).",
@@ -429,7 +443,7 @@
         "toolReferenceName": "interceptGetRequest",
         "canBeReferencedInPrompt": true,
         "userDescription": "Show one request with headers and bodies.",
-        "modelDescription": "Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), error, and timings (ms per phase: requestMs = receiving the app's request, pausedMs = held at breakpoints, delayMs = added by a mock delay / throttle, dnsMs / connectMs / tlsMs on a new upstream connection or reused: true, sendMs, waitMs = time to first byte from the server, receiveMs = downloading the response; a missing phase did not happen or is unknown). scriptLog holds the lines a user's script rule logged (redacted). Use after list_requests or wait_for_request. Pass snippet (\"curl\", \"dart_http\" or \"dio\") to also get the request as runnable code (redacted values stay \"[redacted]\"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: \"vm-profile\" (read-only, from a native HTTP client). A tunnel (kind \"tunnel\") has no headers or bodies: tunnel {notDecrypted: why, bytesSent, bytesReceived} explains that the host is passed through without decryption (usually because the app pins its certificate) — remove it from flutterIntercept.tlsPassthrough to inspect it. clientCertificate is the host pattern of the mutual-TLS client certificate the proxy presented upstream. multipart/form-data bodies are shown parsed: secret fields \"[redacted]\", file parts \"[file <name>, N bytes]\".",
+        "modelDescription": "Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), error, and timings (ms per phase: requestMs = receiving the app's request, pausedMs = held at breakpoints, delayMs = added by a mock delay / throttle, dnsMs / connectMs / tlsMs on a new upstream connection or reused: true, sendMs, waitMs = time to first byte from the server, receiveMs = downloading the response; a missing phase did not happen or is unknown). scriptLog holds the lines a user's script rule logged (redacted). Use after list_requests or wait_for_request. Pass snippet (\"curl\", \"dart_http\" or \"dio\") to also get the request as runnable code (redacted values stay \"[redacted]\"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: \"vm-profile\" (read-only, from a native HTTP client). A tunnel (kind \"tunnel\") has no headers or bodies: tunnel {notDecrypted: why, bytesSent, bytesReceived} explains that the host is passed through without decryption (usually because the app pins its certificate) — remove it from flutterIntercept.tlsPassthrough to inspect it. clientCertificate is the host pattern of the mutual-TLS client certificate the proxy presented upstream. multipart/form-data bodies are shown parsed: secret fields \"[redacted]\", file parts \"[file <name>, N bytes]\". A gRPC call (kind \"grpc\") shows grpc {service, method, code, status, statusMessage, streaming, requestType, responseType, encodings, deadlineMs, messagesSent, messagesReceived}, responseTrailers, and messages: the first 20 each way decoded to JSON with the app's generated protobuf code (via \"schema\"), or as raw field numbers (via \"raw\"), at most 64 KB in all (read every message with get_frames); secret-named fields and credential metadata (authorization, cookies, custom -bin metadata) read \"[redacted]\".",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -543,6 +557,17 @@
             "includeBrowserInternal": {
               "description": "Flutter Web: also include the browser's own requests (Chrome updates, GCM, optimization guide), which are hidden by default.",
               "type": "boolean"
+            },
+            "kind": {
+              "description": "Only exchanges of this kind, e.g. \"grpc\" for gRPC calls (url then globs the method path: \"*/shop.v1.CartService/AddItem\").",
+              "type": "string",
+              "enum": [
+                "http",
+                "websocket",
+                "sse",
+                "tunnel",
+                "grpc"
+              ]
             }
           },
           "required": [
@@ -878,7 +903,7 @@
         "toolReferenceName": "interceptAssertTraffic",
         "canBeReferencedInPrompt": true,
         "userDescription": "Check that expected requests and responses happened.",
-        "modelDescription": "Check in one call that the app made the expected requests: matching url (glob; * matches any characters) and method since sinceMs (default: the latest launch_app/hot_restart, else all recorded traffic), with expect: status (code, \"2xx\".., \"error\"), count {min, max, exact} (default: at least one), order (URL globs requested in that order), json assertions on every matched response ({path: \"$.items[0].id\", exists | equals | type}), maxDurationMs. withinMs waits (event-driven, max 120 s) for the requests to arrive; it never hangs. Returns {pass, matched, ids, failures: [readable reasons]}. Failure texts name the request, path and expectation but never echo response values; equals compares with the redacted view (a secret only equals \"[redacted]\"). Use it as the final check of a change instead of reading bodies by hand.",
+        "modelDescription": "Check in one call that the app made the expected requests: matching url (glob; * matches any characters) and method since sinceMs (default: the latest launch_app/hot_restart, else all recorded traffic), with expect: status (code, \"2xx\".., \"error\"), count {min, max, exact} (default: at least one), order (URL globs requested in that order), json assertions on every matched response ({path: \"$.items[0].id\", exists | equals | type}), maxDurationMs, grpcStatus (gRPC calls: the gRPC status code or name; gRPC errors have HTTP status 200). kind narrows to one exchange kind (e.g. \"grpc\"). withinMs waits (event-driven, max 120 s) for the requests to arrive; it never hangs. Returns {pass, matched, ids, failures: [readable reasons]}. Failure texts name the request, path and expectation but never echo response values; equals compares with the redacted view (a secret only equals \"[redacted]\"). Use it as the final check of a change instead of reading bodies by hand.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1011,6 +1036,38 @@
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 600000
+                },
+                "grpcStatus": {
+                  "description": "Every matched exchange is a gRPC call that ended with this gRPC status (code or name, e.g. 0 / \"OK\", 14 / \"UNAVAILABLE\"). gRPC errors arrive with HTTP status 200, so use this rather than status.",
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 999
+                    },
+                    {
+                      "type": "string",
+                      "enum": [
+                        "OK",
+                        "CANCELLED",
+                        "UNKNOWN",
+                        "INVALID_ARGUMENT",
+                        "DEADLINE_EXCEEDED",
+                        "NOT_FOUND",
+                        "ALREADY_EXISTS",
+                        "PERMISSION_DENIED",
+                        "RESOURCE_EXHAUSTED",
+                        "FAILED_PRECONDITION",
+                        "ABORTED",
+                        "OUT_OF_RANGE",
+                        "UNIMPLEMENTED",
+                        "INTERNAL",
+                        "UNAVAILABLE",
+                        "DATA_LOSS",
+                        "UNAUTHENTICATED"
+                      ]
+                    }
+                  ]
                 }
               },
               "additionalProperties": false,
@@ -1019,6 +1076,17 @@
             "includeBrowserInternal": {
               "description": "Flutter Web: also include the browser's own requests (Chrome updates, GCM, optimization guide), which are hidden by default.",
               "type": "boolean"
+            },
+            "kind": {
+              "description": "Only exchanges of this kind, e.g. \"grpc\".",
+              "type": "string",
+              "enum": [
+                "http",
+                "websocket",
+                "sse",
+                "tunnel",
+                "grpc"
+              ]
             }
           },
           "required": [
@@ -1040,7 +1108,7 @@
         "toolReferenceName": "interceptGetFrames",
         "canBeReferencedInPrompt": true,
         "userDescription": "Show the messages of a WebSocket or SSE stream.",
-        "modelDescription": "Read the messages of a recorded WebSocket connection or the events of a server-sent events (SSE) stream (list_requests kind \"websocket\" / \"sse\"): oldest first, each with index, dir (\"send\" = app → server, \"receive\"), at (epoch ms), kind (text, binary, ping, pong, close, event), size and text (SSE: event name and id). Binary payloads are summarised as \"[binary N bytes]\"; JSON messages are redacted structurally, other text by pattern (secrets read \"[redacted]\"). Page with since = the returned next; while the connection is open (state \"pending\") new frames keep arriving. Only the newest 500 frames per connection are kept (dropped counts the older ones).",
+        "modelDescription": "Read the messages of a recorded WebSocket connection or the events of a server-sent events (SSE) stream (list_requests kind \"websocket\" / \"sse\"): oldest first, each with index, dir (\"send\" = app → server, \"receive\"), at (epoch ms), kind (text, binary, ping, pong, close, event), size and text (SSE: event name and id). Binary payloads are summarised as \"[binary N bytes]\"; JSON messages are redacted structurally, other text by pattern (secrets read \"[redacted]\"). Page with since = the returned next; while the connection is open (state \"pending\") new frames keep arriving. Only the newest 500 frames per connection are kept (dropped counts the older ones). For a gRPC call (kind \"grpc\") the frames are its messages (kind \"message\", compressed when sent gzip): text is the message decoded to JSON with the app's generated protobuf code (via \"schema\") or as raw field numbers (via \"raw\"), redacted structurally.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1274,6 +1342,45 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 200
+            }
+          },
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_get_grpc_schema",
+        "displayName": "Flutter Intercept: Get gRPC schema",
+        "toolReferenceName": "interceptGetGrpcSchema",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Show the app's gRPC methods and message types.",
+        "modelDescription": "Read the app's gRPC contract from its protoc-generated Dart code (*.pbgrpc.dart, *.pb.dart, *.pbenum.dart in the workspace and in packages that ship services). With method (\"/pkg.Service/Method\"): request and response types, streaming (unary, server, client or bidi), each type's fields (number, JSON name, type, repeated / map / oneof), the enums they use, and skeleton JSON with every field set — the starting point for add_grpc_mock messages. With message: one message or enum type. Without either: the list of methods. Returns {available: false, reason} when gRPC support is off or no generated code was found. Source files are project-relative.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "method": {
+              "description": "A gRPC method: \"/shop.v1.CartService/AddItem\", \"shop.v1.CartService/AddItem\" or \"shop.v1.CartService.AddItem\". Returns its request / response types, fields, streaming and skeleton JSON.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            "message": {
+              "description": "A message or enum type: fully qualified (\"shop.v1.Item\", \"shop.v1.Cart.Line\") or its short / Dart name (\"Item\", \"Cart_Line\").",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            "limit": {
+              "default": 200,
+              "description": "Without method / message: max methods listed (1-500).",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
             }
           },
           "additionalProperties": false
@@ -2676,6 +2783,132 @@
           "required": [
             "url"
           ],
+          "additionalProperties": false
+        },
+        "tags": [
+          "flutter",
+          "http",
+          "network",
+          "flutter-intercept"
+        ]
+      },
+      {
+        "name": "flutter_intercept_add_grpc_mock",
+        "displayName": "Flutter Intercept: Add gRPC mock rule",
+        "toolReferenceName": "interceptAddGrpcMock",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Add a rule that answers a gRPC method with fake messages and status.",
+        "modelDescription": "Make the app's gRPC calls to one method get a fake answer (the real server is not contacted): response messages (JSON objects encoded with the app's own generated protobuf code — get the field names from get_grpc_schema's responseSkeleton — or base64 protobuf), then a gRPC status (code, default 0 = OK) and optional message. Use it to test error handling ({code: \"UNAVAILABLE\"}, {code: 16, message: \"token expired\"}), empty or edge-case responses, and streaming (several messages, gapMs between them). Pass url (a glob ending in \"/<package.Service>/<Method>\", e.g. \"*/shop.v1.CartService/AddItem\") or service + method. The rule is inserted first; times (e.g. 1) or ttlMs remove it automatically, otherwise use remove_rule. HTTP mocks (add_mock) never match gRPC calls; add_block, add_sequence (mock steps are HTTP-only) and simulate_network apply to gRPC too. Only decrypted gRPC calls (kind \"grpc\" in list_requests) can be mocked, not \"tunnel\" ones.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "description": "URL glob naming one gRPC method: \"<scheme>://<host:port>/<package.Service>/<Method>\", e.g. \"*/shop.v1.CartService/AddItem\" (the URL of a gRPC call in list_requests). Or pass service and method instead.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
+            },
+            "service": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 300,
+              "pattern": "^[A-Za-z_][A-Za-z0-9_.]*$",
+              "description": "Fully-qualified gRPC service, e.g. \"shop.v1.CartService\" (get_grpc_schema lists them)."
+            },
+            "method": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+              "description": "gRPC method of that service, e.g. \"AddItem\"."
+            },
+            "code": {
+              "description": "gRPC status to answer with (default 0 = OK), e.g. 14 / \"UNAVAILABLE\", 5 / \"NOT_FOUND\", 16 / \"UNAUTHENTICATED\". With a non-zero code and no messages the call fails at once (trailers-only).",
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 999
+                },
+                {
+                  "type": "string",
+                  "enum": [
+                    "OK",
+                    "CANCELLED",
+                    "UNKNOWN",
+                    "INVALID_ARGUMENT",
+                    "DEADLINE_EXCEEDED",
+                    "NOT_FOUND",
+                    "ALREADY_EXISTS",
+                    "PERMISSION_DENIED",
+                    "RESOURCE_EXHAUSTED",
+                    "FAILED_PRECONDITION",
+                    "ABORTED",
+                    "OUT_OF_RANGE",
+                    "UNIMPLEMENTED",
+                    "INTERNAL",
+                    "UNAVAILABLE",
+                    "DATA_LOSS",
+                    "UNAUTHENTICATED"
+                  ]
+                }
+              ]
+            },
+            "message": {
+              "description": "grpc-message text sent with the status (the error text the app sees).",
+              "type": "string",
+              "maxLength": 1000
+            },
+            "messages": {
+              "description": "Response messages, in order (streaming methods get several). JSON objects in proto3 JSON form (field names as in get_grpc_schema's skeleton; int64 as strings, enums by name, bytes base64), encoded with the app's generated schema; or base64 strings of serialized protobuf (when there is no schema). Not both kinds. Omit for none.",
+              "maxItems": 100,
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {}
+                  },
+                  {
+                    "type": "string",
+                    "maxLength": 4194304
+                  }
+                ]
+              }
+            },
+            "delayMs": {
+              "description": "Wait this long before answering.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 600000
+            },
+            "gapMs": {
+              "description": "Pause between messages (streaming).",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 600000
+            },
+            "times": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "description": "Apply the rule to the first N matching requests only (1-1000); it is then removed automatically."
+            },
+            "ttlMs": {
+              "type": "integer",
+              "minimum": 1000,
+              "maximum": 86400000,
+              "description": "Remove the rule automatically after this many milliseconds (1000-86400000)."
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Optional label; it is shown as \"[agent] <name>\" in the rules list."
+            }
+          },
           "additionalProperties": false
         },
         "tags": [

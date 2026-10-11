@@ -34,6 +34,8 @@ import { LanLifecycle } from '../../extension/src/lanLifecycle';
 import { LanNetworkWatcher, netFingerprint } from '../../extension/src/lanWatch';
 import { registerNotifications, type Notifications } from '../../extension/src/notify';
 import { InterceptProxyHost, type ProxyFactory } from '../../extension/src/proxyHost';
+import { grpcCodec } from '../../extension/src/grpc/index';
+import { createGrpcSchemaService, grpcMockEncoder, type GrpcSchemaService } from '../../extension/src/grpc/service';
 import { diffText } from '../../extension/src/recordings/diff';
 import { createRecordingService } from '../../extension/src/recordings/store';
 import { takeScreenshot } from '../../extension/src/screenshot';
@@ -238,6 +240,7 @@ export class SidecarHost {
   private proxyHost!: InterceptProxyHost;
   private controller!: InterceptController;
   private shared!: NodeSharedRules;
+  private grpc!: GrpcSchemaService;
   private contract!: NodeContractService;
   private vm!: SidecarVm;
   private ui!: UiServer;
@@ -441,6 +444,19 @@ export class SidecarHost {
     this.applyUpstreamProxy();
     this.proxyHost.setTlsPassthrough(this.settings.tlsPassthrough);
     void this.applyClientCertificates();
+    // CONTRACTS §16.4: gRPC decrypt hosts and the schema from the app's generated `*.pb*.dart`.
+    this.proxyHost.setGrpcDecryptHosts(this.settings.grpc?.decryptHosts ?? []);
+    const grpc = (this.grpc = createGrpcSchemaService({
+      codec: grpcCodec,
+      roots: () => this.folders,
+      enabled: () => this.settings.grpc?.enabled !== false,
+      log,
+    }));
+    this.disposers.push(() => grpc.dispose());
+    this.proxyHost.setGrpcMessageEncoder(grpcMockEncoder(grpc));
+    const grpcSub = grpc.onDidChange(() => this.proxyHost.refreshGrpcMocks());
+    this.disposers.push(() => grpcSub.dispose());
+    void grpc.ready();
 
     const exporters = { openapi: toOpenApi, postman: toPostman };
     const shared = this.shared;
@@ -453,6 +469,7 @@ export class SidecarHost {
     };
     this.controller = new InterceptController({
       host: this.proxyHost,
+      grpc,
       saveRules: (rules) => {
         void shared.setPersonalRules(rules).catch((e: unknown) => log(`personal rules → shared service: ${String(e)}`));
         return this.state.update(RULES_KEY, rules);
@@ -536,6 +553,7 @@ export class SidecarHost {
     // AI agents (CONTRACTS §8): the AgentApi behind the MCP server (no Copilot tools outside VS Code).
     this.agentApi = createAgentApi({
       host: this.proxyHost,
+      grpc: this.grpc,
       applyRules: (rules) => this.controller.applyRules(rules),
       clear: () => this.controller.clear(),
       getSettings: () => this.agentSettings(),
@@ -630,6 +648,7 @@ export class SidecarHost {
     this.folders = folders;
     this.shared.rootsChanged();
     this.contract.rootsChanged();
+    this.grpc.rootsChanged();
     this.refreshAppPackages();
   }
 
@@ -735,6 +754,10 @@ export class SidecarHost {
       this.applyUpstreamProxy();
     }
     if (changed('tlsPassthrough')) this.proxyHost.setTlsPassthrough(next.tlsPassthrough);
+    if (changed('grpc')) {
+      this.proxyHost.setGrpcDecryptHosts(next.grpc?.decryptHosts ?? []);
+      if (prev.grpc?.enabled !== next.grpc?.enabled) this.grpc.enabledChanged();
+    }
     // Always re-load: a passphrase changed in the IDE's password store arrives as a `settings` call (REVIEW-9 #7).
     await this.applyClientCertificates();
     if (changed('contractCheck')) this.controller.recheckContracts();
@@ -989,6 +1012,7 @@ export class SidecarHost {
       return { intercepted: false };
     }
     this.launches.delete(record.launchId);
+    void this.grpc.load();
     const deviceId = typeof p.deviceId === 'string' && p.deviceId ? p.deviceId : record.deviceId;
     const vmServiceUri = typeof p.vmServiceUri === 'string' && p.vmServiceUri ? p.vmServiceUri : undefined;
     const web = (p as { webLaunchUrl?: unknown }).webLaunchUrl;

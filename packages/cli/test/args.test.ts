@@ -68,4 +68,13 @@ describe('parseArgs', () => {
   ])('rejects %j', (argv, message) => {
     expect(() => parseArgs(argv as string[])).toThrow(message as RegExp);
   });
+
+  it('parses the gRPC options (CONTRACTS §16.6)', () => {
+    expect(opts(['test', '--grpc-decrypt-host', 'grpc.example', '--grpc-decrypt-host=*.staging.example', '--grpc-decrypt-host', 'grpc.example']).grpcDecryptHosts)
+      .toEqual(['grpc.example', '*.staging.example']);
+    expect(opts(['test', '--no-grpc']).grpc).toBe(false);
+    expect(opts(['test']).grpc).toBeUndefined();
+    expect(() => parseArgs(['test', '--no-grpc', '--grpc-decrypt-host', 'a'])).toThrow(/cannot be combined/);
+    expect(() => parseArgs(['test', '--grpc-decrypt-host'])).toThrow(/needs a value/);
+  });
 });

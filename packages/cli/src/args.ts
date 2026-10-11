@@ -48,6 +48,9 @@ Options:
       --junit <file>             Write the assertion results as JUnit XML.
       --no-redact                Keep secrets in the HAR and in assertion texts.
       --flutter <path>           Flutter executable (default: $FLUTTER_ROOT/bin/flutter, else flutter on PATH).
+      --grpc-decrypt-host <glob> Decrypt TLS gRPC to this host (repeatable). Only for apps that trust the
+                                 Flutter Intercept CA in debug; other TLS gRPC is listed undecrypted.
+      --no-grpc                  Let gRPC calls connect directly (not intercepted).
   -h, --help                     Show this help.
       --version                  Show the version.
 
@@ -62,7 +65,7 @@ Examples:
   flutter-intercept run -d macos --network-profile slow-3g`;
 
 type ValueKey = 'project' | 'device' | 'port' | 'rules' | 'replay' | 'replayFallback' | 'networkProfile' | 'har' | 'record' | 'assert' | 'junit' | 'flutter';
-type FlagKey = 'noRules' | 'approveSharedRules' | 'noRedact' | 'help' | 'version';
+type FlagKey = 'noRules' | 'approveSharedRules' | 'noRedact' | 'noGrpc' | 'help' | 'version';
 
 const VALUE_OPTIONS: Record<string, ValueKey> = {
   '--project': 'project',
@@ -86,6 +89,7 @@ const FLAG_OPTIONS: Record<string, FlagKey> = {
   '--no-rules': 'noRules',
   '--approve-shared-rules': 'approveSharedRules',
   '--no-redact': 'noRedact',
+  '--no-grpc': 'noGrpc',
   '--help': 'help',
   '-h': 'help',
   '--version': 'version',
@@ -100,6 +104,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   const values: Partial<Record<ValueKey, string>> = {};
   const flags = new Set<FlagKey>();
   const positionals: string[] = [];
+  const grpcDecryptHosts: string[] = [];
   let flutterArgs: string[] = [];
   let command: CliOptions['command'] | undefined;
 
@@ -117,6 +122,14 @@ export function parseArgs(argv: string[]): ParsedArgs {
       if (flag) {
         if (inline !== undefined) throw new UsageError(`${name} takes no value`);
         flags.add(flag);
+        continue;
+      }
+      if (name === '--grpc-decrypt-host') {
+        if (inline !== undefined) grpcDecryptHosts.push(requireValue(name, inline));
+        else {
+          grpcDecryptHosts.push(requireValue(name, argv[i + 1]));
+          i++;
+        }
         continue;
       }
       const key = VALUE_OPTIONS[name];
@@ -179,5 +192,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
   if (values.junit !== undefined && values.assert === undefined) throw new UsageError('--junit needs --assert (the report lists the assertions)');
   if (flags.has('noRedact')) options.noRedact = true;
   if (values.flutter !== undefined) options.flutter = values.flutter;
+  if (flags.has('noGrpc') && grpcDecryptHosts.length) throw new UsageError('--grpc-decrypt-host and --no-grpc cannot be combined');
+  if (flags.has('noGrpc')) options.grpc = false;
+  if (grpcDecryptHosts.length) options.grpcDecryptHosts = [...new Set(grpcDecryptHosts)];
   return { kind: 'options', options };
 }

@@ -31,6 +31,8 @@ import { assertionsTable, trafficTable } from './summary';
 import type { CliOptions, CliResult } from './types';
 
 export const ENTRY_SHA_DEFINE = 'FLUTTER_INTERCEPT_ENTRY_SHA';
+/** CONTRACTS §16.1: `=0` turns the entry's gRPC redirect off (`--no-grpc`). */
+export const GRPC_DEFINE = 'FLUTTER_INTERCEPT_GRPC';
 const FINAL = new Set<Exchange['state']>(['completed', 'mocked', 'blocked', 'aborted', 'error']);
 
 /** A setup problem (bad option, missing file, unsupported device): exit code 2, nothing ran. */
@@ -109,7 +111,7 @@ export function flutterExecutable(o: Pick<CliOptions, 'flutter'>, env: NodeJS.Pr
 export function stripOwnDefines(args: string[]): { args: string[]; dropped: string[] } {
   const out: string[] = [];
   const dropped: string[] = [];
-  const own = (v: string) => v.startsWith(`${PROXY_DEFINE}=`) || v.startsWith(`${ENTRY_SHA_DEFINE}=`);
+  const own = (v: string) => v.startsWith(`${PROXY_DEFINE}=`) || v.startsWith(`${ENTRY_SHA_DEFINE}=`) || v.startsWith(`${GRPC_DEFINE}=`);
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a.startsWith('--dart-define=') && own(a.slice('--dart-define='.length))) {
@@ -130,9 +132,13 @@ export function stripOwnDefines(args: string[]): { args: string[]; dropped: stri
  * `proxy`: the define value, or `{definesFile}` — a physical iPhone's token-bearing value is passed in a 0600 JSON file
  * (`--dart-define-from-file`, REVIEW-9), never on the command line.
  */
-export function flutterTestArgs(files: string[], deviceId: string, proxy: string | { definesFile: string }, sha: string, extra: string[]): string[] {
+export function flutterTestArgs(files: string[], deviceId: string, proxy: string | { definesFile: string }, sha: string, extra: string[], grpc = true): string[] {
   const proxyArg = typeof proxy === 'string' ? `--dart-define=${PROXY_DEFINE}=${proxy}` : `--dart-define-from-file=${proxy.definesFile}`;
-  return ['test', ...files, '-d', deviceId, ...extra, proxyArg, `--dart-define=${ENTRY_SHA_DEFINE}=${sha}`];
+  return ['test', ...files, '-d', deviceId, ...extra, proxyArg, `--dart-define=${ENTRY_SHA_DEFINE}=${sha}`, ...grpcDefine(grpc)];
+}
+
+function grpcDefine(grpc: boolean): string[] {
+  return grpc ? [] : [`--dart-define=${GRPC_DEFINE}=0`];
 }
 
 
@@ -270,7 +276,10 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
   let exchanges: Exchange[] = [];
   try {
     const ca = await loadOrCreateCa(tmp);
-    proxy = new InterceptProxy({ port: o.port ?? 0, host: '127.0.0.1', ca: { key: ca.key, cert: ca.cert }, maxExchanges: 20_000 });
+    proxy = new InterceptProxy({
+      port: o.port ?? 0, host: '127.0.0.1', ca: { key: ca.key, cert: ca.cert }, maxExchanges: 20_000,
+      ...(o.grpcDecryptHosts?.length ? { grpcDecryptHosts: o.grpcDecryptHosts } : {}),
+    });
     proxy.on('removed', (ids: string[]) => (evicted += ids.length));
     try {
       await proxy.start();
@@ -349,7 +358,7 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
 
     if (o.command === 'test') {
       for (const f of entries.files) if (!isIntegrationTestPath(projectRoot, f)) throw new SetupError(`internal: ${f} would not run as an integration test`);
-      const args = flutterTestArgs(entries.files.map((f) => path.relative(projectRoot, f)), device!.id, lanDefinesFile ? { definesFile: lanDefinesFile } : proxyAddr, entries.sha, extra);
+      const args = flutterTestArgs(entries.files.map((f) => path.relative(projectRoot, f)), device!.id, lanDefinesFile ? { definesFile: lanDefinesFile } : proxyAddr, entries.sha, extra, o.grpc !== false);
       log(displayCommand(path.basename(flutter), args));
       if (!interrupted) {
         flutterCode = await new Promise<number>((resolve, reject) => {
@@ -364,7 +373,7 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
       const shown = device ? `-d ${device.id} ` : '';
       deps.out('Run your app through the proxy with:');
       for (const e of entries.plans) {
-        const cmd = ['flutter', 'run', '-t', path.relative(deps.cwd, e.entryPath) || e.entryPath, ...(shown ? ['-d', device!.id] : []), ...extra, `--dart-define=${PROXY_DEFINE}=${proxyAddr}`, `--dart-define=${ENTRY_SHA_DEFINE}=${e.sha}`];
+        const cmd = ['flutter', 'run', '-t', path.relative(deps.cwd, e.entryPath) || e.entryPath, ...(shown ? ['-d', device!.id] : []), ...extra, `--dart-define=${PROXY_DEFINE}=${proxyAddr}`, `--dart-define=${ENTRY_SHA_DEFINE}=${e.sha}`, ...grpcDefine(o.grpc !== false)];
         deps.out(`  ${displayCommand(cmd[0], cmd.slice(1))}`);
       }
       if (!device) deps.out(`(Android emulator: ${PROXY_DEFINE}=10.0.2.2:${port}; physical Android: adb reverse tcp:${port} tcp:${port})`);

@@ -36,6 +36,10 @@ export interface CliOptions {
   flutterArgs: string[];
   /** Flutter executable (default `flutter` on PATH, or $FLUTTER_ROOT/bin/flutter). */
   flutter?: string;
+  /** CONTRACTS §16.6: `--no-grpc` = false (the entry connects gRPC directly). Default true. */
+  grpc?: boolean;
+  /** CONTRACTS §16.6: TLS gRPC hosts to decrypt (`--grpc-decrypt-host`, repeatable). */
+  grpcDecryptHosts?: string[];
 }
 
 export interface CliResult {

@@ -133,6 +133,7 @@ function rewriteFor(
     webPacUrl: web.webPacUrl,
     settingsToolArgs: dartSettingsToolArgs(folder),
     captureSource: vscode.workspace.getConfiguration('flutterIntercept', folder?.uri).get<boolean>('captureSource', true),
+    grpcEnabled: vscode.workspace.getConfiguration('flutterIntercept', folder?.uri).get<boolean>('grpc.enabled', true),
     folder: folder?.uri.fsPath,
     workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((w) => w.uri.fsPath),
     activeFile: active?.scheme === 'file' ? active.fsPath : undefined,

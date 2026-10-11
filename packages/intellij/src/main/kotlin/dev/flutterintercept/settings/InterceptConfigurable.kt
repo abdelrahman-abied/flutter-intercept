@@ -24,6 +24,7 @@ class InterceptConfigurable : BoundConfigurable("Flutter Intercept") {
     /** The edited copy; the UI binds to its properties, [apply] stores it. */
     private val working = InterceptSettingsState()
     private var tlsText = ""
+    private var grpcText = ""
     private var certText = ""
 
     private fun load() {
@@ -32,6 +33,8 @@ class InterceptConfigurable : BoundConfigurable("Flutter Intercept") {
         working.tlsPassthrough = s.tlsPassthrough.toMutableList()
         working.clientCertificates = s.clientCertificates.map(ClientCertificateEntry::copy).toMutableList()
         tlsText = s.tlsPassthrough.joinToString("\n")
+        working.grpcDecryptHosts = s.grpcDecryptHosts.toMutableList()
+        grpcText = s.grpcDecryptHosts.joinToString("\n")
         certText = ClientCertificates.format(s.clientCertificates)
     }
 
@@ -56,6 +59,14 @@ class InterceptConfigurable : BoundConfigurable("Flutter Intercept") {
                 row("Notifications:") {
                     comboBox(InterceptSettingsState.NOTIFICATIONS).bindItem(working::notifications.toNullableProperty())
                     comment("When requests fail while the tool window is hidden.")
+                }
+            }
+            group("gRPC") {
+                row { checkBox("Intercept gRPC calls (grpc-dart, connectrpc)").bindSelected(working::grpcEnabled) }
+                row("Decrypt TLS gRPC for hosts:") {}
+                row {
+                    textArea().bindText(::grpcText).rows(2).align(AlignX.FILL)
+                        .comment("One host or glob per line. Only for apps that trust the Flutter Intercept CA in debug; other TLS gRPC is listed undecrypted.")
                 }
             }
             group("Routing") {
@@ -97,6 +108,7 @@ class InterceptConfigurable : BoundConfigurable("Flutter Intercept") {
         val (certs, bad) = ClientCertificates.parse(certText)
         if (bad.isNotEmpty()) throw ConfigurationException("Client certificates: line ${bad.joinToString(", ")} isn't “host = file” or “host = cert, key”.")
         working.tlsPassthrough = tlsText.lines().map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+        working.grpcDecryptHosts = grpcText.lines().map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
         working.clientCertificates = certs.toMutableList()
         working.nodePath = working.nodePath.trim()
         settings.update(working)

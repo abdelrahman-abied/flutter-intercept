@@ -19,6 +19,8 @@ class SettingsTest {
         nativeClients = "proxy"
         upstreamProxy = " http://127.0.0.1:8888 "
         tlsPassthrough = mutableListOf("*.bank.example", " ", "*.bank.example", "pinned.example")
+        grpcEnabled = false
+        grpcDecryptHosts = mutableListOf(" grpc.example ", "", "grpc.example", "*.staging.example")
         clientCertificates = mutableListOf(
             ClientCertificateEntry().also { it.host = "api.example"; it.pfx = "/certs/client.p12" },
             ClientCertificateEntry().also { it.host = "*.corp.example"; it.cert = "/c.pem"; it.key = "/k.pem" },
@@ -51,6 +53,7 @@ class SettingsTest {
         assertEquals(mapOf("access" to "readWrite", "redactSecrets" to true, "screenshots" to true, "mcpPort" to 47823), m["agent"])
         assertFalse(m.containsKey("upstreamProxy"))
         assertFalse(m.containsKey("ideHttpProxy"))
+        assertEquals(mapOf("enabled" to true, "decryptHosts" to emptyList<String>()), m["grpc"])
     }
 
     @Test
@@ -58,7 +61,7 @@ class SettingsTest {
         val json = JsonLineRpc.GSON.toJsonTree(sample().toSidecarSettings(IdeHttpProxy("http://proxy.corp:3128", listOf("localhost")))).asJsonObject
         assertEquals(
             setOf("enabled", "port", "captureSource", "webEnabled", "nativeClients", "backgroundIsolates", "notifications", "contractCheck",
-                "rewriteLocalhost", "upstreamProxy", "upstreamProxyIgnoreCertErrors", "tlsPassthrough", "clientCertificates", "agent", "ideHttpProxy"),
+                "rewriteLocalhost", "upstreamProxy", "upstreamProxyIgnoreCertErrors", "tlsPassthrough", "clientCertificates", "grpc", "agent", "ideHttpProxy"),
             json.keySet(),
         )
         assertEquals("http://127.0.0.1:8888", json.get("upstreamProxy").asString)
@@ -67,6 +70,8 @@ class SettingsTest {
         assertEquals(setOf("host", "pfx"), (certs[0] as JsonObject).keySet())
         assertEquals(setOf("host", "cert", "key"), (certs[1] as JsonObject).keySet())
         assertEquals(setOf("access", "redactSecrets", "screenshots", "mcpPort"), json.getAsJsonObject("agent").keySet())
+        assertFalse(json.getAsJsonObject("grpc").get("enabled").asBoolean)
+        assertEquals(listOf("grpc.example", "*.staging.example"), json.getAsJsonObject("grpc").getAsJsonArray("decryptHosts").map { it.asString })
         assertEquals("http://proxy.corp:3128", json.getAsJsonObject("ideHttpProxy").get("url").asString)
         assertFalse("nodePath is plugin-only", json.has("nodePath"))
     }
@@ -86,8 +91,10 @@ class SettingsTest {
         val s = sample()
         val c = s.copy()
         c.tlsPassthrough.add("x")
+        c.grpcDecryptHosts.add("x")
         c.clientCertificates[0].host = "changed"
         assertEquals(4, s.tlsPassthrough.size)
+        assertEquals(4, s.grpcDecryptHosts.size)
         assertEquals("api.example", s.clientCertificates[0].host)
     }
 

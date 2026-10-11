@@ -47,7 +47,7 @@ export interface LaunchRecord {
 }
 
 export interface LaunchDeps {
-  settings(): { enabled: boolean; port: number; webEnabled: boolean; captureSource: boolean };
+  settings(): { enabled: boolean; port: number; webEnabled: boolean; captureSource: boolean; grpc?: { enabled: boolean } };
   workspaceFolders(): string[];
   proxy: { start(): Promise<number> };
   getCaCertPem(): Promise<string>;
@@ -108,6 +108,7 @@ async function prepare(deps: LaunchDeps, p: PrepareLaunchParams): Promise<{ resu
     enabled: settings.enabled,
     webEnabled: settings.webEnabled,
     captureSource: settings.captureSource,
+    grpcEnabled: settings.grpc?.enabled !== false,
     folder: p.projectRoot,
     workspaceFolders: [...new Set([p.projectRoot, ...deps.workspaceFolders()])],
     settingsToolArgs: [],

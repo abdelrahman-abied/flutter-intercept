@@ -44,6 +44,12 @@ class InterceptSettingsState {
     @XCollection(style = XCollection.Style.v2)
     var clientCertificates: MutableList<ClientCertificateEntry> = mutableListOf()
 
+    /** CONTRACTS §16.4: gRPC interception and the TLS gRPC hosts to decrypt. */
+    var grpcEnabled: Boolean = true
+
+    @XCollection(style = XCollection.Style.v2, elementName = "grpcHost")
+    var grpcDecryptHosts: MutableList<String> = mutableListOf()
+
     var agentAccess: String = "readWrite"            // readWrite | readOnly | off
     var agentRedactSecrets: Boolean = true
     var agentScreenshots: Boolean = true
@@ -55,6 +61,7 @@ class InterceptSettingsState {
     fun copy(): InterceptSettingsState = InterceptSettingsState().also {
         XmlSerializerUtil.copyBean(this, it)
         it.tlsPassthrough = tlsPassthrough.toMutableList()
+        it.grpcDecryptHosts = grpcDecryptHosts.toMutableList()
         it.clientCertificates = clientCertificates.map(ClientCertificateEntry::copy).toMutableList()
     }
 
@@ -87,6 +94,10 @@ class InterceptSettingsState {
                 c.key?.trim()?.takeIf { it.isNotEmpty() }?.let { m["key"] = it }
             }
         }
+        out["grpc"] = linkedMapOf(
+            "enabled" to grpcEnabled,
+            "decryptHosts" to grpcDecryptHosts.map { it.trim() }.filter { it.isNotEmpty() }.distinct(),
+        )
         out["agent"] = linkedMapOf(
             "access" to oneOf(agentAccess, AGENT_ACCESS, "readWrite"),
             "redactSecrets" to agentRedactSecrets,

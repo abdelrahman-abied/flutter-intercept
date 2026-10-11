@@ -400,6 +400,8 @@ describe('helpers', () => {
     expect(flutterTestArgs(['w.dart'], 'IPHONE', { definesFile: '/tmp/x/lan-defines/f.json' }, 'abc', [])).toEqual([
       'test', 'w.dart', '-d', 'IPHONE', '--dart-define-from-file=/tmp/x/lan-defines/f.json', '--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=abc',
     ]);
+    expect(flutterTestArgs(['w.dart'], 'macos', 'localhost:1', 'abc', [], false).slice(-1)).toEqual(['--dart-define=FLUTTER_INTERCEPT_GRPC=0']);
+    expect(stripOwnDefines(['--dart-define=FLUTTER_INTERCEPT_GRPC=1', '--dart-define=X=1']).args).toEqual(['--dart-define=X=1']);
   });
 
   it('finds flutter', () => {
