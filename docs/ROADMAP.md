@@ -148,13 +148,27 @@ in the project's interest. As built: docs/spikes/grpc.md "As built — proxy (0.
 | **Webview** | gRPC pause editor (message / status), Break on this and field mutate on gRPC, edited / dropped badges, gRPC counts in recordings. |
 | **Security (REVIEW-11)** | One 64 MB budget for collected / queued / held gRPC bytes; pauses end with their call; bounded mutate decoding and cached held decodes; same-origin replay and LAN deny first; no request hash in redacted recordings; terminating, linear `.proto` naming and linking. |
 
+### 0.12.0 — gRPC tools complete (built 2026-10-11, CONTRACTS §18, docs/REVIEW-12.md)
+The last HTTP tools that skipped gRPC calls. After 0.12 every rule action applies to gRPC except `cors` (browser-only)
+and `mock` (gRPC has `grpcMock`). As built: docs/spikes/grpc.md "As built — proxy (0.12.0)".
+
+| Item | Notes |
+|---|---|
+| **Rewrite** | Request metadata, response headers, new `response.setTrailers` / `removeTrailers` (trailers-only answers too). Pseudo headers, `content-type`, `te`, `grpc-encoding` / `-accept-encoding` / `-status` / `-message` / `-timeout` refused; CR/LF refused; `-bin` values base64. `replaceBody` / `status` → note, metadata still applied. |
+| **Scripts** | `onGrpcMessage` (`{path, dir, index, json?, base64, size}` → `{json}` / `{base64}` / `{drop}`) and `onGrpcStatus` (`{code?, message?, trailers?}`) on the 0.11 message transform, only when the script defines them. 200 ms per hook, ≤ 1 MB per message, ≤ 1000 messages per call; errors send the original and go to the script log. |
+| **Map remote** | Upstream session to the mapped origin (h2c for `http`, TLS + ALPN h2 for `https`), `:authority` = new host unless `preserveHost`; LAN deny and client-certificate Origin checks on the mapped URL; "Mapped to <origin>". |
+| **Resend / edit & resend** | `send()` with `grpc.messages`: own HTTP/2 call, uncompressed messages then half-close; ≤ 100 messages, 4 MB each, 16 MB total; `grpc-timeout: 60S` default. Rules and the network profile don't apply. Host encodes `messagesJson`; refused when a recorded request message was cut. LAN-recorded calls only with LAN mode on and through `lanTargetDenial`. |
+| **Agents** | `resend_request` with `grpc.messagesJson` or `grpc.messages` (redacted values restored), `add_rewrite` trailers and gRPC validation, `add_map_remote` on gRPC (loopback only). |
+| **Webview** | **More rules…** (rewrite / script / map remote for a route), trailers fields in the rewrite editor, gRPC notes per action, gRPC edit & resend composer, script templates with gRPC hooks. |
+
 **Next / considered (gRPC follow-ups)**
 - A gRPC-Web view (today plain HTTP rows without message decoding).
 - connectrpc over TLS (its HTTP/2 transport uses `SecureSocket.connect`, which the hook can't see).
 - Optional "trust the CA on the iOS simulator" (`simctl keychain add-root-cert`, removed at session end) for a full TLS
   view with default credentials: untested, touches the simulator's trust store, needs its own spike and security
   review (docs/spikes/grpc.md "Open decision"). Android needs a writable-system emulator: document only.
-- Rewrite, scripts and Map Remote for gRPC calls (and resend).
+- A `grpcurl` snippet for gRPC calls in **Copy as…** and `get_request` (snippets are HTTP-only today).
+- Rules (and the network profile) on resent gRPC calls; today a resent call goes straight to the server.
 
 ## 5. Spikes and decisions before building
 - Dio's async stack depth for request → source (0.3).

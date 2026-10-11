@@ -283,8 +283,10 @@ npx flutter-intercept-cli test -d macos --har build/traffic.har
   messages replaced by zeros of the same size and no request hashes: replaying that copy answers several calls to one
   method in recorded order. gRPC over TLS is an undecrypted tunnel unless the host is passed
   with `--grpc-decrypt-host` and the app trusts the run's CA in debug builds (`onBadCertificate`; the CA is new for
-  each run, so pinning it isn't practical here). The other gRPC limits of the extension apply (obfuscated builds,
-  connectrpc over TLS, apps that replace `IOOverrides.global`).
+  each run, so pinning it isn't practical here). Shared rewrite, script and Map Remote rules apply to gRPC calls too
+  (those that need approval only with `--approve-shared-rules`); script hooks get each message as `base64` only,
+  without `json`. The other gRPC limits of the extension apply (obfuscated builds, connectrpc over TLS, apps that
+  replace `IOOverrides.global`).
 - Background isolates (`compute`, `Isolate.run`) aren't set up in CLI runs (`test` or `run`): their HTTP and gRPC
   calls go direct. The editor sets them up through the debug connection.
 - Run one CLI at a time per project: the generated files under `.dart_tool/flutter_intercept/` and

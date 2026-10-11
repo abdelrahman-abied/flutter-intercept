@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.0 (preview)
+
+- **gRPC tools complete**, the same as in the VS Code extension 0.12.0: rewrite rules change gRPC metadata and
+  trailers; scripts run `onGrpcMessage` / `onGrpcStatus` on each message and on the end of the call; Map Remote sends
+  gRPC calls to another server (h2c or TLS); **Resend** and **Edit and resend** work on gRPC calls (messages as JSON
+  or base64). **More rules…** on a call starts a rewrite, script or Map Remote rule for it. Agents:
+  `resend_request` with `grpc`, `add_rewrite` with trailers, `add_map_remote` on gRPC calls.
+- **Security**: independent review docs/REVIEW-12.md.
+
 ## 0.11.0 (preview)
 
 - **gRPC parity**, the same as in the VS Code extension 0.11.0: breakpoints on gRPC messages and on the end of the

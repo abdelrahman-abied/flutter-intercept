@@ -8,7 +8,8 @@ and the traffic shows up.
 
 - Works with **Dio**, **package:http** and plain **`HttpClient`**, which covers anything built on `dart:io`.
 - **gRPC** calls from grpc-dart are intercepted too, each message decoded with your app's own generated code (or
-  your `.proto` files). Pause, edit, mock, record and replay them like HTTP requests.
+  your `.proto` files). Pause, edit, mock, rewrite, script, reroute, resend, record and replay them like HTTP
+  requests.
 - HTTPS works too, and you don't install a certificate on the device, simulator or Mac.
 - Your app's code is never changed. Nothing is added to `pubspec.yaml`, and `flutter build` / CI never see the
   tool.
@@ -79,6 +80,10 @@ and the traffic shows up.
   messages.
 - **Recordings** save gRPC calls with their messages; replay answers them without the server, and a diff compares
   their status, message counts and response shape.
+- **Rewrite** rules change a call's metadata and trailers, **Script (JS)** rules run `onGrpcMessage` /
+  `onGrpcStatus` on its messages and status, **Map remote** sends it to another server, and **Resend** / **Edit and
+  resend** send it again with its recorded or edited messages. **More rules…** on a call starts any of these rules for
+  its method.
 - gRPC over TLS is listed as an undecrypted connection, unless your app trusts Flutter Intercept's CA in debug builds
   and you list the host in `flutterIntercept.grpc.decryptHosts`.
 
@@ -120,6 +125,7 @@ and the traffic shows up.
 **Copy and resend**
 - **Copy as cURL**, **Copy as Dart (http)** or **Copy as Dio** from the detail pane or a row's right-click menu.
 - **Resend** a request unchanged, or **Edit and resend** it. The new request is listed with a link to the original.
+  gRPC calls too ([details](#resend-a-grpc-call-or-edit-it-and-resend)).
 
 **Request and response details**
 - Headers and bodies. gzip/deflate/br are decoded, JSON shows as a collapsible tree, binary bodies show their
@@ -267,7 +273,7 @@ Cursor, Windsurf, and any client that speaks MCP (Model Context Protocol).
 | Find the file and line that sent a request | `get_request_source` |
 | See the structure of a large JSON body without reading it | `get_body_shape` |
 | Slow down or cut off the network (everything, or one URL) | `simulate_network` |
-| Send a recorded request again, optionally edited (same server only) | `resend_request` |
+| Send a recorded request or gRPC call again, optionally edited (same server only) | `resend_request` |
 | Check responses against your Dart models | `check_contract` |
 | Generate a Dart model or a fixture test from recorded traffic | `generate_model`, `generate_fixture_test` |
 | Check traffic with pass/fail expectations (status, count, order, JSON paths, duration) | `assert_traffic` |
@@ -277,8 +283,8 @@ Cursor, Windsurf, and any client that speaks MCP (Model Context Protocol).
 | Save, list, replay or compare traffic recordings | `save_recording`, `list_recordings`, `replay_recording`, `diff_recordings` |
 | Answer successive requests differently (fail twice, then succeed) | `add_sequence` |
 | Make the next requests get 401, and read the token refresh flows | `expire_token`, `get_auth_flows` |
-| Send matching requests to a local server (agents: local targets only) | `add_map_remote` |
-| Change headers, status or body text of real requests and responses | `add_rewrite` |
+| Send matching requests and gRPC calls to a local server (agents: local targets only) | `add_map_remote` |
+| Change headers, status or body text of real requests and responses (gRPC: metadata and trailers) | `add_rewrite` |
 | Write the traffic as an OpenAPI 3.1 file or a Postman collection | `export_openapi`, `export_postman` |
 | Take a screenshot of the running app, with the requests just before it (asks you first) | `take_screenshot` |
 | Answer a gRPC method with messages (JSON) and a status | `add_grpc_mock` |
@@ -297,6 +303,9 @@ errors arrive with HTTP status 200). A breakpoint on a gRPC call pauses each mes
 `list_paused` and `get_request` show `grpcPause` (the held message decoded and redacted, or the status and trailers),
 and `resume_request` takes `grpc: {messageJson | message | drop}` for a message or `grpc: {status, trailers}` for the
 end of the call. `add_mutation` changes fields in gRPC response messages, and the recording tools include gRPC calls.
+`resend_request` sends a gRPC call again with its recorded messages, or with `grpc: {messagesJson | messages}`;
+`add_rewrite` changes gRPC metadata and, with `response.setTrailers` / `removeTrailers`, the trailers; and
+`add_map_remote` sends gRPC calls to a local server too.
 
 In VS Code the tools are named `flutter_intercept_<tool>`; over MCP they use the names above.
 
@@ -320,7 +329,8 @@ In VS Code the tools are named `flutter_intercept_<tool>`; over MCP they use the
   - `readOnly`: agents can look, but changes are refused;
   - `off`: nothing is exposed.
 - **Confirmations.** Every tool that changes something asks you to confirm in the client: adding or removing
-  rules, resuming or aborting requests, clearing traffic, and launching, stopping or restarting the app.
+  rules, resuming or aborting requests, resending requests and gRPC calls, clearing traffic, and launching, stopping
+  or restarting the app.
 - **Secret redaction.** With `flutterIntercept.agent.redactSecrets` on (the default), agents see `[redacted]`
   instead of:
   - authorization, cookie and token-like headers;
@@ -456,24 +466,28 @@ endpoints.
 48. [Read gRPC messages with .proto files](#read-grpc-messages-with-proto-files)
 49. [Fail, slow down or block gRPC calls](#fail-slow-down-or-block-grpc-calls)
 50. [See inside gRPC over TLS](#see-inside-grpc-over-tls)
+51. [Change gRPC metadata and trailers](#change-grpc-metadata-and-trailers)
+52. [Change gRPC calls with a script](#change-grpc-calls-with-a-script)
+53. [Send gRPC calls to another server](#send-grpc-calls-to-another-server)
+54. [Resend a gRPC call, or edit it and resend](#resend-a-grpc-call-or-edit-it-and-resend)
 
 **Devices**
 
-51. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
-52. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
-53. [Run on a physical iPhone](#run-on-a-physical-iphone)
-54. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
+55. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
+56. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
+57. [Run on a physical iPhone](#run-on-a-physical-iphone)
+58. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
 
 **AI agents**
 
-55. [Connect an AI agent](#connect-an-ai-agent)
-56. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
-57. [Control what agents can see and do](#control-what-agents-can-see-and-do)
-58. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
-59. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
-60. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
-61. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
-62. [Let agents work with gRPC calls](#let-agents-work-with-grpc-calls)
+59. [Connect an AI agent](#connect-an-ai-agent)
+60. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
+61. [Control what agents can see and do](#control-what-agents-can-see-and-do)
+62. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
+63. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
+64. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
+65. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
+66. [Let agents work with gRPC calls](#let-agents-work-with-grpc-calls)
 
 ### Run your app with interception
 
@@ -640,7 +654,8 @@ You'll replay a request without touching the app.
 **You should see:** a new row marked **resent**, selected once recorded, with a link back to the original.
 
 **Tip:** resent requests go through the proxy like app traffic, so your rules and the network profile apply.
-**Resend** is disabled for binary or truncated bodies; use **Edit and resend**.
+**Resend** is disabled for binary or truncated bodies; use **Edit and resend**. gRPC calls are resent from their
+recorded messages: see [Resend a gRPC call, or edit it and resend](#resend-a-grpc-call-or-edit-it-and-resend).
 
 ### Simulate a slow, flaky or offline network
 
@@ -952,7 +967,8 @@ You'll point the app at staging or a local backend without changing its URLs.
 original URL. The target's certificate is checked as usual.
 
 **Tip:** requests keep their headers, tokens included, so map only to servers you trust; the editor warns for
-non-local targets. AI agents can only map to local servers (`localhost`, `127.0.0.1`, `::1`).
+non-local targets. AI agents can only map to local servers (`localhost`, `127.0.0.1`, `::1`). gRPC calls can be
+mapped too: see [Send gRPC calls to another server](#send-grpc-calls-to-another-server).
 
 ### Change headers, status or body text
 
@@ -965,7 +981,8 @@ You'll tweak real requests or responses without mocking them.
 
 **You should see:** the real server's answer with your changes, for example a feature-flag header added.
 
-**Tip:** body replacements are plain text, not regexes (up to 20); binary bodies are left alone.
+**Tip:** body replacements are plain text, not regexes (up to 20); binary bodies are left alone. On gRPC calls a
+rewrite changes the metadata and trailers: see [Change gRPC metadata and trailers](#change-grpc-metadata-and-trailers).
 
 ### Chain to Charles, Burp or a corporate proxy
 
@@ -1042,6 +1059,8 @@ You'll write a few lines of JavaScript that change traffic in ways a rule can't.
 server. Hooks must finish quickly (200 ms) and can't use timers, the network, files or `require`. If a script
 throws, the app gets a 502 and the log shows why. To share a script, pick **Edit script in a file**: shared
 scripts wait for your approval, like other rules that change traffic. AI agents can't add, change or read scripts.
+For gRPC calls, scripts define `onGrpcMessage` and `onGrpcStatus` instead: see
+[Change gRPC calls with a script](#change-grpc-calls-with-a-script).
 
 ### Export traffic as OpenAPI or Postman
 
@@ -1323,8 +1342,8 @@ You'll check how your app handles gRPC errors, deadlines and slow streams.
 **You should see:** the row with the status your app received, marked blocked or simulated, and your app's error
 handling run.
 
-**Tip:** **Rewrite**, **Script (JS)**, **CORS** and **Map remote** don't apply to gRPC: such a rule never matches a
-gRPC call (the next rule is tried), and the rule editor says so. gRPC over TLS that isn't decrypted can only be
+**Tip:** only **CORS** and HTTP **Mock response** rules don't apply to gRPC (use a **gRPC mock**): such a rule never
+matches a gRPC call (the next rule is tried), and the rule editor says so. gRPC over TLS that isn't decrypted can only be
 blocked or failed: the connection is then held without an answer, so the app's deadline fires and nothing reaches the
 server.
 
@@ -1369,6 +1388,112 @@ and pass its bytes as `ChannelCredentials.secure(certificates: …)`; that chann
 off. Listing a host whose app doesn't trust the CA makes its TLS handshake fail: when gRPC connections to a host keep
 closing, the app connects to it directly for 30 s and a warning says so. A host in `flutterIntercept.tlsPassthrough`
 is never decrypted.
+
+### Change gRPC metadata and trailers
+
+You'll add, change or remove a gRPC call's metadata and trailers while the real server answers.
+
+1. Select a gRPC call and pick **More rules…** → **Rewrite this…**. The rule editor opens, unsaved, with a
+   **Rewrite** rule for exactly this method.
+2. Under **Request**, **Set headers** / **Remove headers** change the metadata the server receives, for example
+   `x-feature-flags: new-cart`. Under **Response**, they change the response headers the app sees.
+3. **Set trailers** / **Remove trailers** (marked **gRPC only**) change the trailers that end the call, for example
+   remove `x-debug-info`. Then **Add rule**.
+
+**You should see:** the call answered by the real server, with a "Rewritten: metadata" note and your changes in its
+request headers, response headers and **Trailers**.
+
+**Tip:** only custom metadata can change. Pseudo headers (`:path`, `:authority` …), `content-type`, `te`,
+`grpc-encoding`, `grpc-accept-encoding`, `grpc-status`, `grpc-message`, `grpc-timeout` and
+`grpc-status-details-bin` are refused, and so are values with line breaks. Binary metadata (names ending in `-bin`)
+takes base64 values. **Replace in body** and **Status** don't apply to gRPC (the body is protobuf): such a rule still
+changes the metadata, and the editor and the call say so. To change the status, use a
+[breakpoint](#pause-and-edit-grpc-messages) or a [script](#change-grpc-calls-with-a-script); to change fields, use
+[Mutate JSON](#change-fields-in-grpc-responses). Trailers are ignored for HTTP requests. A shared rule that changes
+request metadata waits for your approval, like an HTTP header rewrite.
+
+### Change gRPC calls with a script
+
+You'll run your own JavaScript on each message of a gRPC call and on its final status.
+
+1. Select a gRPC call and pick **More rules…** → **Script for this…** (or **Add rule**, a URL such as
+   `*/shop.v1.CartService/AddItem` and **Script (JS)**).
+2. Write the gRPC hooks, or click **Start from the template**:
+
+   ```js
+   // Each message of a matching call, both ways.
+   // message: { path, dir: 'send' (app → server) | 'receive', index, json?, base64, size }
+   function onGrpcMessage(message, context) {
+     if (message.dir === 'receive' && message.json) {
+       context.log('message', message.index, 'of', message.path);
+       return { json: { ...message.json, quantity: 3 } };
+     }
+     return undefined; // unchanged
+   }
+
+   // The end of the call, before the app gets it.
+   // status: { path, code, message?, trailers }
+   function onGrpcStatus(status, context) {
+     if (status.path.endsWith('/AddItem')) return { code: 14, message: 'backend down' };
+     return undefined;
+   }
+   ```
+
+3. Click **Add rule** and make the app call the method.
+
+**You should see:** the edited messages (badged **edited** in **Messages**, dropped ones **dropped**), the status you
+returned, and the script's lines in the call's **Script log**.
+
+**Tip:** `json` is the message decoded with your app's schema (absent without one); `onGrpcMessage` may return
+`undefined` (unchanged), `{ json }` (encoded with the schema), `{ base64 }` or `{ drop: true }`. `onGrpcStatus` may
+return `{ code, message, trailers }` (code 0–16; trailers are custom metadata, as at a breakpoint). `onRequest` /
+`onResponse` are never called for gRPC calls, and the gRPC hooks never for HTTP: a script without `onGrpcMessage` or
+`onGrpcStatus` lets gRPC calls through unchanged, at full speed. Each hook call gets 200 ms. Messages over 1 MB
+aren't passed to the script, and at most 1000 messages per call are; the rest go through unchanged, with a note. If
+a hook throws, times out, returns something invalid or JSON that doesn't fit the schema, the original message or
+status goes on and the error is in the **Script log** (unlike HTTP, where the app gets a 502). Edited messages are
+sent uncompressed.
+
+### Send gRPC calls to another server
+
+You'll point a gRPC service at staging or a local build of it without changing the app's channel.
+
+1. Select a gRPC call and pick **More rules…** → **Map this to another server…** (or **Add rule**, a URL such as
+   `*/shop.v1.CartService/*` and **Map remote**).
+2. In **Forward to**, enter the server's origin: `http://localhost:9090` for a plain-text (h2c) server, or
+   `https://grpc.staging.example.com` for one with TLS. A URL prefix works as for HTTP.
+3. Tick **Keep the original Host header** only if the target needs the app's `:authority`, then **Add rule**.
+
+**You should see:** the calls answered by the target, with a "Mapped to …" note, while the row keeps the app's URL.
+
+**Tip:** `http://` targets get HTTP/2 over plain text, `https://` targets TLS with HTTP/2; the target's certificate is
+checked as usual, and a client certificate configured for the new host is presented. `:authority` becomes the
+target's host unless you keep the original. Calls keep their metadata, tokens included, so map only to servers you
+trust. A shared rule mapping to a non-local server waits for your approval, and AI agents can only map to local
+servers. It works for every call the proxy can read (plain text, and hosts in `flutterIntercept.grpc.decryptHosts`);
+gRPC over TLS that isn't decrypted can't be mapped.
+
+### Resend a gRPC call, or edit it and resend
+
+You'll send a gRPC call again without the app, unchanged or with other messages.
+
+1. Select a finished gRPC call (it ended with a status).
+2. Click **Resend** to send its recorded request messages and metadata again.
+3. Or click **Edit and resend**: change the method in the URL (`…/shop.v1.CartService/AddItem`), the metadata under
+   **Headers**, and the **Request messages**, as **JSON (encoded with the app's schema)** or **Base64 protobuf**.
+   **+ Add message** adds one. Click **Send** (**Ctrl/Cmd+Enter**).
+
+**You should see:** a new row marked **resent**, with a link back to the original, every response message, the
+status and the trailers.
+
+**Tip:** the proxy opens its own HTTP/2 call to the server in the URL, sends the messages uncompressed and
+half-closes. Unary and server-streaming calls behave as from the app; client-streaming and bidi calls send all their
+messages first, then half-close. Up to 100 messages, 4 MB each and 16 MB in total. The deadline is 60 s unless you add a
+`grpc-timeout` header; after it the call is cancelled. `content-type`, `te`, `grpc-encoding` and pseudo headers are
+set by the proxy. Rules and the network profile don't apply to a resent gRPC call (it isn't the app's traffic).
+**Resend** is disabled when a request message was too large to record in full (64 KB); use **Edit and resend**. A
+call recorded from a physical iPhone is resent only while that session's LAN mode is on, and only to servers it
+allows.
 
 ### Run on an Android emulator or phone
 
@@ -1562,7 +1687,7 @@ Exports follow `flutterIntercept.agent.redactSecrets`.
 
 ### Let agents work with gRPC calls
 
-You'll have an agent read, mock, pause, change, record and check your app's gRPC calls.
+You'll have an agent read, mock, pause, change, reroute, resend, record and check your app's gRPC calls.
 
 1. [Connect your agent](#connect-an-ai-agent), then run **Flutter Intercept: Add AI Agent Instructions** again
    to pick up the new tools.
@@ -1579,6 +1704,11 @@ You'll have an agent read, mock, pause, change, record and check your app's gRPC
      `grpc.status` at the end of the call)
    - "Make `price` null in every `GetProduct` response." (`add_mutation`)
    - "Record checkout, including its gRPC calls, and replay it offline." (`save_recording`, `replay_recording`)
+   - "Resend the last `AddItem` call with quantity 5 and tell me what the server answers." (`resend_request` with
+     `grpc.messagesJson`, then `get_request`)
+   - "Send `x-feature-flags: new-cart` with every `CartService` call and drop the `x-debug-info` trailer."
+     (`add_rewrite` with `request.setHeaders` and `response.removeTrailers`)
+   - "Point `CartService` at my local server on port 9090." (`add_map_remote` to `http://localhost:9090`)
 3. Approve the changes when the client asks.
 
 **You should see:** `[agent] …` gRPC rules in **Rules**, and decoded messages in the agent's answers with secrets
@@ -1590,6 +1720,14 @@ held message reaches the agent decoded and redacted, never as bytes. When it res
 only saw as `[redacted]` keep their original value, and JSON that doesn't fit the schema is refused while the call
 stays paused. `add_block`, `add_sequence` and `simulate_network` apply to gRPC calls too. Calls over TLS that aren't
 decrypted can't be mocked, paused or changed.
+
+`resend_request` takes gRPC calls the app sent that reached the server unchanged (no rule matched them, not from a
+physical iPhone), to the same server only: with no `grpc` it resends the recorded messages, `grpc.messagesJson` is
+encoded with the request type (values seen as `[redacted]` keep the original), and `grpc.messages` takes base64. It
+is refused when a recorded request message was cut (64 KB) and no replacements are given. `add_rewrite` refuses gRPC
+protocol metadata (`grpc-status`, `grpc-timeout`, `content-type` …) and needs base64 for `-bin` values; its
+`replaceBody` and `response.status` don't apply to gRPC (use `add_mutation` or a breakpoint). Agents can't add
+scripts, and `add_map_remote` only maps to local servers.
 
 ## Settings and commands
 
@@ -1664,8 +1802,12 @@ What isn't intercepted, or behaves differently while intercepting:
     interception; its HTTP traffic is unaffected. Layering `IOOverrides.runZoned(createFile: …)` is fine.
   - Not intercepted: connectrpc over TLS, custom `ClientTransportConnector`s. gRPC-Web (`GrpcWebClientChannel`, and
     Flutter Web) is ordinary HTTP and shows as such, without message decoding.
-  - Rewrites, scripts, CORS and Map Remote rules and resend don't apply to gRPC calls. HAR exports and recordings
-    include them; OpenAPI and Postman skip them.
+  - CORS rules and HTTP **Mock response** rules don't apply to gRPC calls (use a gRPC mock); every other rule does.
+    Rewrites change metadata and trailers only, not the body or the status. HAR exports and recordings include
+    gRPC calls; OpenAPI, Postman, the cURL / Dart / Dio snippets and the model and fixture generators skip them.
+  - Script hooks see messages up to 1 MB, at most 1000 per call; the rest go through unchanged.
+  - Resent gRPC calls skip rules and the network profile. Client-streaming and bidi calls are resent with all their
+    messages first, then a half-close; up to 100 messages (16 MB) and a 60 s deadline by default.
   - Breakpoints and Mutate JSON work on whole messages up to 4 MB, with 64 MB of gRPC data held at most across
     calls; Mutate JSON changes response messages up to 1 MB and needs the app's schema. Larger messages go through
     unchanged, with a note.
@@ -1731,6 +1873,12 @@ What isn't intercepted, or behaves differently while intercepting:
 - **Held gRPC data is bounded.** Breakpoints and Mutate JSON hold whole messages of up to 4 MB, all held gRPC data
   shares one 64 MB budget, decoding for Mutate JSON is limited per call, and a pause ends with its call.
   `.proto` files from the workspace are parsed with size, name-length and time limits.
+- **gRPC rewrites, scripts, Map Remote and resend keep the HTTP safeguards.** Rewrites can't touch protocol metadata
+  (`grpc-status`, `grpc-timeout`, `content-type` …), and `-bin` values must be base64. Shared rules that change
+  request metadata or map to another server, and every shared script, wait for your approval. Script hooks are
+  limited per call (200 ms per hook, 1 MB per message, 1000 messages). Map Remote and resend go through the same
+  iPhone LAN checks and client-certificate rules as the app's calls. A resent call is capped (100 messages, 16 MB,
+  60 s by default), and agents can resend only to the call's own server, with write access and your confirmation.
 - **Recordings stay on your machine.** They're saved in `.dart_tool/flutter_intercept/recordings/`; an
   unredacted recording is refused where git would track it. Redacted recordings never contain gRPC messages as
   captured (they're redacted with the schema, or zeroed) nor a hash of them, and gRPC replay answers only the origin

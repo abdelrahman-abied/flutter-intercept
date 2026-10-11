@@ -51,7 +51,10 @@ To use it:
    change it in the next responses (a **Mutate JSON** rule).
 4. **Recordings** save gRPC calls with their messages; replay answers them without the server, and **Diff selected**
    compares their status, message counts and response shape.
-5. For gRPC over TLS, make debug builds trust the CA (**Tools → Flutter Intercept → Save CA Certificate**, or an
+5. **More rules…** on a call starts a **Rewrite** (metadata and trailers), **Script (JS)** (`onGrpcMessage` /
+   `onGrpcStatus`) or **Map remote** rule for its method. **Resend** sends the call again with its recorded messages;
+   **Edit and resend** lets you change the metadata and the messages (JSON or base64) first.
+6. For gRPC over TLS, make debug builds trust the CA (**Tools → Flutter Intercept → Save CA Certificate**, or an
    `onBadCertificate` callback behind `kDebugMode`) and add the host above.
 
 The VS Code tutorials cover it step by step, starting at

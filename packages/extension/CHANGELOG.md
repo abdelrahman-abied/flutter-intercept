@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.12.0
+
+### gRPC tools complete
+
+- **Rewrite on gRPC calls.** Request metadata, response headers and, new, **Set trailers** / **Remove trailers**
+  (custom metadata only). Pseudo headers, `content-type`, `te`, `grpc-encoding`, `grpc-accept-encoding`,
+  `grpc-status`, `grpc-message` and `grpc-timeout` are refused, and `-bin` values must be base64. Body replacements
+  and the status don't apply to gRPC: the metadata parts still apply, with a note.
+- **Scripts on gRPC calls.** `onGrpcMessage(message, context)` sees every message both ways (`json` decoded with the
+  app's schema, `base64`, `size`) and may return `{json}`, `{base64}` or `{drop: true}`; `onGrpcStatus(status,
+  context)` may change the final code, `grpc-message` and trailers. HTTP hooks aren't called for gRPC and vice versa;
+  a script without gRPC hooks lets gRPC calls through untouched. 200 ms per hook, messages up to 1 MB, at most 1000
+  per call; a throw or an invalid return sends the original and logs the error. The script templates include both
+  hooks.
+- **Map Remote on gRPC calls.** A matching call goes to the mapped server over HTTP/2 (`http://` → h2c, `https://` →
+  TLS), with `:authority` set to the new host unless **Keep the original Host header** is ticked, and a "Mapped to …"
+  note.
+- **Resend and Edit and resend for gRPC calls.** **Resend** sends the recorded request messages and metadata again;
+  **Edit and resend** edits the method, metadata and messages (JSON encoded with the schema, or base64). The proxy
+  opens its own HTTP/2 call: up to 100 messages (4 MB each, 16 MB in total), a 60 s deadline unless `grpc-timeout`
+  is given, all messages sent then a half-close. Rules and the network profile don't apply to resent gRPC calls.
+- **More rules…** on a request or gRPC call opens a new **Rewrite**, **Script** or **Map remote** rule for its route
+  in the rule editor.
+- Only CORS and HTTP **Mock response** rules don't apply to gRPC calls now.
+- CLI: shared rewrite, script and Map Remote rules apply to gRPC calls; script hooks get messages as base64 only
+  (the CLI reads no schema).
+
+### Agent API
+- `resend_request` resends gRPC calls: the recorded messages, or `grpc: {messagesJson | messages}`
+  (`messagesJson` values seen as `[redacted]` keep their original value).
+- `add_rewrite` changes gRPC metadata and takes `response.setTrailers` / `removeTrailers`.
+- `add_map_remote` maps gRPC calls too (local targets only, as before).
+
+### Security
+- Independent review: docs/REVIEW-12.md.
+
 ## 0.11.0
 
 ### gRPC parity
