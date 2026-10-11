@@ -200,3 +200,33 @@ client/server helpers in `test/grpc-helpers.ts` (no `@grpc/grpc-js`, no new depe
     message before).
   - #6: gRPC calls get the REVIEW-8 client-certificate Origin refusal (trailers-only `14`, state `blocked`). The
     "Flutter Intercept:" prefix now appears exactly once (`fiText`). `grpcMock.code` was already limited to 0–16.
+
+## As built — proxy (0.11.0)
+
+CONTRACTS §17.1–17.4 and §17.7. Tests: `packages/proxy/test/grpc-parity.test.ts` (node:http2 helpers from 0.10).
+
+- **Transform** (`GrpcMessageTransform`, `grpc.ts`): replaces the observer link of a direction only when that
+  direction has a hook. Request: `breakpoint` request / both. Response: breakpoint response / both, or `mutate`.
+  Without a hook the 0.10 observer stays, with no per-message copies; `grpcTransformStats.created` lets the tests check
+  that. A hooked transform buffers one message (≤ 4 MB of wire bytes) and calls the hook. Until the hook settles,
+  the transform's callback isn't called, so HTTP/2 flow control pushes back. Larger messages stream through with a
+  note and are recorded by the 0.10 parser. A bad flag byte switches that direction to raw passthrough.
+- **Breakpoints**:
+  - Compressed messages are decompressed for the pause (off-loop, capped at 4 MB). An unedited resume forwards the
+    original wire bytes; an edit goes out uncompressed.
+  - One pause at a time per call (`pauseChain`), each with its own `breakpointTimeoutMs` deadline. The other
+    direction keeps flowing unless it is also waiting for a pause.
+  - The status pause runs in `wantTrailers` (after the last response message) or before a trailers-only respond.
+  - `abort` → RST_STREAM CANCEL both ways. The app leaving settles the pause as gone (the exchange is `aborted`).
+  - Held bytes are counted globally (64 MB, then pauses are skipped with a note).
+  - `resume` validates with `grpcEditProblem` (`rules.ts`, pure, exported for the host) plus the exact 4 MB check.
+- **Mutate**: `setGrpcCodec(codec?)`, then `decode` → `applyOps` (`maxTargets` as HTTP) → `encode`. Any miss forwards
+  the original with a note (`mutate: no schema for <path>`, or `mutate: <encode error>`). The replacement is recorded
+  with `edited: true`; `simulated` reads `Mutated: <paths>`.
+- **Replay**: `ReplayStore` keeps gRPC entries by path and never serves them to HTTP lookups. Not replayed: entries
+  with `incomplete: true` (not in the type; read defensively) and entries with a truncated or `sizeUnknown` response
+  frame. The response is built by the shared `grpcAnswer` (grpcMock is the same code). The status trailers carry the
+  recorded `grpc-status` / `grpc-message` / custom trailers; `grpc-encoding` and other wire headers are not sent.
+  **requestHash** = sha256 hex of the first request message's recorded frame bytes (decompressed, ≤ 64 KB, i.e.
+  `base64` decoded). It is exported as `grpcMessageHash`, so the recorder must hash the same bytes. The proxy waits
+  for the first request message only when several entries share the path and some carry a hash.

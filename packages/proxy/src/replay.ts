@@ -45,7 +45,8 @@ function validEntry(e: unknown): e is ReplayEntry {
   if (typeof x.method !== 'string' || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(x.method)) return false;
   if (typeof x.url !== 'string' || !normalizeUrl(x.url)) return false;
   const ws = /^wss?:/i.test(x.url);
-  if (x.kind !== undefined && x.kind !== 'websocket' && x.kind !== 'sse') return false;
+  if (x.kind !== undefined && x.kind !== 'websocket' && x.kind !== 'sse' && x.kind !== 'grpc') return false;
+  if (x.kind === 'grpc' && !validGrpcEntry(x)) return false;
   if ((x.kind === 'websocket') !== ws) return false; // ws(s):// URLs are WebSocket recordings and nothing else
   if (x.frames !== undefined && !Array.isArray(x.frames)) return false;
   if (x.kind === 'websocket' ? x.status !== 101 && x.status !== undefined : !Number.isInteger(x.status) || x.status < 200 || x.status > 599) return false;
@@ -54,6 +55,33 @@ function validEntry(e: unknown): e is ReplayEntry {
   if (x.requestBodyHash !== undefined && typeof x.requestBodyHash !== 'string') return false;
   return true;
 }
+
+/**
+ * CONTRACTS §17.4: a replayable gRPC entry: messages as frames, a status 0–16; never one saved `incomplete` (a
+ * response message truncated or of unknown size: replaying it would send the app a different message).
+ */
+function validGrpcEntry(x: ReplayEntry): boolean {
+  if ((x as { incomplete?: unknown }).incomplete === true) return false;
+  if (!Array.isArray(x.frames)) return false;
+  const g = x.grpc;
+  if (!g || typeof g !== 'object' || !Number.isInteger(g.code) || g.code < 0 || g.code > 16) return false;
+  if (g.message !== undefined && typeof g.message !== 'string') return false;
+  if (g.requestHash !== undefined && typeof g.requestHash !== 'string') return false;
+  if (g.trailers !== undefined && (typeof g.trailers !== 'object' || g.trailers === null)) return false;
+  for (const f of x.frames) {
+    if (!f || typeof f !== 'object' || f.kind !== 'message') return false;
+    if (f.dir === 'receive' && !f.dropped && (f.truncated || f.sizeUnknown)) return false;
+    if (f.base64 !== undefined && typeof f.base64 !== 'string') return false;
+  }
+  return true;
+}
+
+/** sha256 (hex) of a gRPC message as recorded (its frame bytes: decompressed, ≤ 64 KB) — CONTRACTS §17.4 requestHash. */
+export function grpcMessageHash(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+export type GrpcReplayLookup = { entry: ReplayEntry; index: number; of: number } | 'needs-body' | undefined;
 
 /**
  * Entries grouped by exact method + URL and by method + origin + path template. Matching: the exact group first,
@@ -69,6 +97,8 @@ export class ReplayStore {
   readonly skipped: number;
   private readonly exact = new Map<string, ReplayEntry[]>();
   private readonly template = new Map<string, ReplayEntry[]>();
+  /** CONTRACTS §17.4: gRPC entries by path (`/pkg.Service/Method`), in recorded order. */
+  private readonly grpcByPath = new Map<string, ReplayEntry[]>();
   /** Served count per (tier, group key, body hash). */
   private readonly served = new Map<string, number>();
 
@@ -85,9 +115,13 @@ export class ReplayStore {
       }
       const u = normalizeUrl(e.url)!;
       const copy: ReplayEntry = { ...e, method: e.method.toUpperCase(), headers: { ...(e.headers ?? {}) } };
+      size++;
+      if (copy.kind === 'grpc') {
+        push(this.grpcByPath, u.pathname, copy);
+        continue;
+      }
       push(this.exact, exactKey(copy.method, u), copy);
       push(this.template, templateKey(copy.method, u), copy);
-      size++;
     }
     this.size = size;
     this.skipped = skipped;
@@ -121,6 +155,30 @@ export class ReplayStore {
     if (!u) return false;
     const groups = [this.exact.get(exactKey(method, u)), this.matchTemplates ? this.template.get(templateKey(method, u)) : undefined];
     return groups.some((g) => g?.some((e) => e.kind === 'sse'));
+  }
+
+  /**
+   * CONTRACTS §17.4: the recorded call for a gRPC request. Same path (entries of the request's origin first); when
+   * several share it and some carry a `requestHash`, the first request message decides (`'needs-body'` until it is
+   * known; `hash` undefined = none); else the next unused entry in recorded order; then the last one repeats.
+   */
+  lookupGrpc(url: string, first: { hash?: string } | 'unknown', count: boolean): GrpcReplayLookup {
+    const u = normalizeUrl(url);
+    if (!u) return undefined;
+    const all = this.grpcByPath.get(u.pathname);
+    if (!all?.length) return undefined;
+    const same = all.filter((e) => normalizeUrl(e.url)?.origin === u.origin);
+    const group = same.length ? same : all;
+    const hashed = group.length > 1 && group.some((e) => e.grpc?.requestHash);
+    if (hashed && first === 'unknown') return 'needs-body';
+    const hash = typeof first === 'object' ? first.hash : undefined;
+    const byHash = hashed && hash !== undefined ? group.filter((e) => e.grpc?.requestHash === hash) : [];
+    const candidates = byHash.length ? byHash : group;
+    const servedKey = `grpc\n${same.length ? u.origin : ''}${u.pathname}\n${byHash.length ? hash : ''}`;
+    const n = this.served.get(servedKey) ?? 0;
+    const index = Math.min(n, candidates.length - 1);
+    if (count) this.served.set(servedKey, n + 1);
+    return { entry: candidates[index], index, of: candidates.length };
   }
 
   /** Start every key from its first response again. */

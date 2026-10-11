@@ -322,7 +322,7 @@ export function ruleProblem(rule: Pick<Rule, 'match' | 'action'>): string | unde
 // ---------------------------------------------------------------- gRPC (CONTRACTS §16.2)
 
 /** Rule actions that apply to gRPC calls (CONTRACTS §16.2); a sequence only when every step is one of them. */
-export const GRPC_ACTIONS: ReadonlySet<RuleAction['kind']> = new Set(['grpcMock', 'block', 'fault', 'throttle']);
+export const GRPC_ACTIONS: ReadonlySet<RuleAction['kind']> = new Set(['grpcMock', 'block', 'fault', 'throttle', 'breakpoint', 'mutate']);
 
 export function grpcApplicable(a: RuleAction | undefined): boolean {
   if (!a || typeof a !== 'object') return false;
@@ -378,6 +378,40 @@ export function grpcMockProblem(a: Extract<RuleAction, { kind: 'grpcMock' }>): s
       if (typeof v !== 'string' || /[\r\n\0]/.test(v)) return `${what}: the value of "${k}" must be text on one line.`;
     }
   }
+  return undefined;
+}
+
+/** Largest gRPC message a breakpoint edit may carry (CONTRACTS §17.2, the hook cap). */
+export const GRPC_EDIT_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Why a `resume` edit of a paused gRPC call is invalid (CONTRACTS §17.2), or undefined. `pause` = what is held:
+ * a message takes `message` (base64, ≤ 4 MB decoded) or `drop`; the end of the call takes `status` (0–16) and / or
+ * `trailers` (no reserved names). `messageJson` must have been encoded by the host.
+ */
+export function grpcEditProblem(pause: 'message' | 'status', edit: unknown): string | undefined {
+  if (edit === undefined || edit === null) return undefined;
+  if (typeof edit !== 'object' || Array.isArray(edit)) return 'A gRPC edit must be an object.';
+  const e = edit as { message?: unknown; messageJson?: unknown; drop?: unknown; status?: unknown; trailers?: unknown };
+  if (pause === 'message') {
+    if (e.status !== undefined || e.trailers !== undefined) return 'This call is paused at a message: edit the message or drop it (status and trailers are for the end of the call).';
+    if (e.drop !== undefined && e.drop !== true) return 'drop must be true.';
+    if (e.message !== undefined && e.drop) return 'Give either a replacement message or drop, not both.';
+    if (e.message === undefined && e.messageJson !== undefined) return 'messageJson must be encoded by the host (schema) before it reaches the proxy.';
+    if (e.message !== undefined) {
+      if (typeof e.message !== 'string' || (!BASE64.test(e.message) && !BASE64URL.test(e.message))) return 'The replacement message is not base64.';
+      if (Math.floor((e.message.length * 3) / 4) > GRPC_EDIT_MAX_BYTES + 3) return `The replacement message is over ${GRPC_EDIT_MAX_BYTES / 1024 / 1024} MB.`;
+    }
+    return undefined;
+  }
+  if (e.message !== undefined || e.messageJson !== undefined || e.drop !== undefined) return 'This call is paused at its end: edit the status or the trailers (messages are already delivered).';
+  if (e.status !== undefined) {
+    const st = e.status as { code?: unknown; message?: unknown };
+    if (!st || typeof st !== 'object') return 'status must be {code, message?}.';
+    if (!Number.isInteger(st.code) || (st.code as number) < 0 || (st.code as number) > 16) return `gRPC status code must be 0–16, got ${String(st.code)}.`;
+    if (st.message !== undefined && typeof st.message !== 'string') return 'The status message must be text.';
+  }
+  if (e.trailers !== undefined) return grpcMockProblem({ kind: 'grpcMock', trailers: e.trailers as Record<string, string> });
   return undefined;
 }
 

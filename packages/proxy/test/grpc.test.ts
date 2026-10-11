@@ -758,7 +758,7 @@ describe('rules on gRPC calls', () => {
   it('rules with other actions never match a gRPC call (the next rule is tried, with a note); grpcMock never matches HTTP', async () => {
     proxy.setRules([
       rule('mock', '*/t.Echo/Unary', { kind: 'mock', status: 200, body: 'http mock' }),
-      rule('bp', '*/t.Echo/Unary', { kind: 'breakpoint', phase: 'both' }),
+      rule('rw', '*/t.Echo/Unary', { kind: 'rewrite', response: { setHeaders: { 'x-a': 'b' } } }),
       rule('seq', '*/t.Echo/Unary', { kind: 'sequence', steps: [{ action: { kind: 'mock', status: 500, body: '' } }] }),
       rule('g', '*/t.Echo/Unary', { kind: 'grpcMock', code: 5 }),
     ]);
@@ -937,7 +937,7 @@ describe('self-check fallback', () => {
       expect(proxy.grpcSupport()).toEqual({ ok: false, problem: 'test: internals missing' });
       const s = await h2cSession(proxy.port, `127.0.0.1:${up.port}`);
       const r = await grpcCall(s, '/t.Echo/Unary', ['raw']);
-      s.destroy();
+      await new Promise<void>((resolve) => s.close(() => resolve())); // graceful: an abrupt close may end the tunnel as an error
       expect(r.messages.map(String)).toEqual(['echo:raw']);
       const ex = await waitFor(proxy, (e) => e.kind === 'tunnel' && e.state !== 'pending');
       expect(ex).toMatchObject({ grpcTunnel: true, url: `http://127.0.0.1:${up.port}/`, error: expect.stringMatching(/internals missing/) });

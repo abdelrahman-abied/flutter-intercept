@@ -400,6 +400,8 @@ export interface ReplayEntry {
   frames?: Frame[];
   /** kind `grpc`: the recorded status, custom trailers and the sha256 (hex) of the first request message. */
   grpc?: { code: number; message?: string; trailers?: Record<string, string | string[]>; requestHash?: string };
+  /** kind `grpc`: a response message was truncated or not fully measured when recorded — never replayed (§17.4). */
+  incomplete?: true;
 }
 
 export interface ReplayOptions {

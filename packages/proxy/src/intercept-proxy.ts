@@ -37,6 +37,7 @@ import {
 import {
   compileRules,
   grpcApplicable,
+  grpcEditProblem,
   grpcMockProblem,
   isInvalidMatcher,
   mapRemoteUrl,
@@ -45,8 +46,10 @@ import {
   WEBSOCKET_ACTIONS,
   type CompiledRule,
 } from './rules';
-import { ReplayStore, requestBodyHash, type BodyKey } from './replay';
-import { framePayload, sseEventText, sseSchedule, wsScript, type TimedStep } from './replay-stream';
+import { grpcMessageHash, ReplayStore, requestBodyHash, type BodyKey } from './replay';
+import { framePayload, MAX_REPLAY_GAP_MS, sseEventText, sseSchedule, wsScript, type TimedStep } from './replay-stream';
+import { applyOps } from './jsonpath';
+import { MUTATE_MAX_TARGETS } from './mutate';
 import { createUpstreamAgents, isLoopbackHost, parseUpstreamProxy, retireAgents, type UpstreamAgents, type UpstreamProxyConfig, type UpstreamProxySpec } from './upstream-proxy';
 import { matchesHostPattern, normalizeHostname, parseHostPattern, parseHostPatterns, splitHostPort, type HostPattern } from './hosts';
 import { openTunnelUpstream, relay, viaUpstreamProxy } from './tunnel';
@@ -68,6 +71,14 @@ import {
   GRPC_BREAKER_WINDOW_MS,
   GrpcFrameRecorder,
   type GrpcBreakerEvent,
+  decompressPrefix,
+  GRPC_COMPRESSED_KEEP_BYTES,
+  GRPC_HELD_TOTAL_CAP_BYTES,
+  GRPC_HOOK_CAP_BYTES,
+  grpcHookTesting,
+  GrpcMessageTransform,
+  type HookedMessage,
+  type HookOutcome,
   messageFrame,
   Observer,
   parseConnectTimeout,
@@ -152,7 +163,9 @@ import type {
   Exchange,
   FaultKind,
   Frame,
+  GrpcEdit,
   GrpcInfo,
+  GrpcProxyCodec,
   InterceptProxyOptions,
   MutateOp,
   ReplayEntry,
@@ -351,6 +364,10 @@ interface GrpcCall {
   localReset?: boolean;
   /** Response headers time (receiveMs). */
   headAt?: number;
+  /** CONTRACTS §17.2: pauses of this call, one at a time (a message per direction, then the end). */
+  pauseChain?: Promise<unknown>;
+  /** A response-phase breakpoint: the end of the call (its status) is paused too. */
+  statusPause?: boolean;
   isLive(): boolean;
 }
 
@@ -575,6 +592,10 @@ export class InterceptProxy extends EventEmitter {
   private rawServer?: net.Server;
   /** setRules: grpcMock rules refused for their headers / values (disabled, CONTRACTS §16.2). */
   private refused: { id: string; problem: string }[] = [];
+  /** CONTRACTS §17.3: protobuf codec the host injects for mutate rules (setGrpcCodec). */
+  private grpcCodec?: GrpcProxyCodec;
+  /** CONTRACTS §17.7: bytes of gRPC messages held at breakpoints right now, across calls. */
+  private grpcHeld = 0;
   /** CONTRACTS §16.8: when each authority's breaker report was last emitted. */
   private readonly breakerSeen = new Map<string, number>();
 
@@ -1203,6 +1224,14 @@ export class InterceptProxy extends EventEmitter {
   }
 
   /**
+   * CONTRACTS §17.3: the protobuf codec mutate rules use on gRPC response messages (undefined = none: mutate rules then
+   * forward messages unchanged with a note). Synchronous; called only for messages a mutate rule changes.
+   */
+  setGrpcCodec(codec?: GrpcProxyCodec): void {
+    this.grpcCodec = codec && typeof codec.decode === 'function' && typeof codec.encode === 'function' ? codec : undefined;
+  }
+
+  /**
    * CONTRACTS §16.2: whether gRPC interception works with this mockttp (a startup self-check of the internals the
    * relay and silent tunnels use). Not ok: silent tunnels are passed through undecrypted and `problem` says why.
    */
@@ -1429,11 +1458,21 @@ export class InterceptProxy extends EventEmitter {
    * or the client went away). Throws on an invalid edit (bad URL / status, or a body edit of a body
    * that is too large to have been shown in full), leaving it paused.
    */
-  resume(id: string, edit?: RequestEdit | ResponseEdit): void {
+  resume(id: string, edit?: RequestEdit | ResponseEdit | GrpcEdit): void {
     const p = this.paused.get(id);
     if (!p) return;
-    if (edit) validateEdit(p.phase, edit, this.live.get(id)?.ex);
-    p.settle({ kind: 'resume', edit });
+    const ex = this.live.get(id)?.ex;
+    if (ex?.kind === 'grpc') {
+      // CONTRACTS §17.2: a held message takes {message} / {drop}; the end of the call {status, trailers}.
+      const kind = ex.grpcPause?.kind ?? 'message';
+      const why = grpcEditProblem(kind, edit);
+      if (why) throw new Error(why);
+      const msg = (edit as GrpcEdit | undefined)?.message;
+      if (msg !== undefined && Buffer.from(msg, 'base64').length > (grpcHookTesting.hookCap ?? GRPC_HOOK_CAP_BYTES)) {
+        throw new Error('The replacement message is over 4 MB.');
+      }
+    } else if (edit) validateEdit(p.phase, edit as RequestEdit | ResponseEdit, ex);
+    p.settle({ kind: 'resume', edit: edit as RequestEdit | ResponseEdit });
   }
 
   /** Abort a paused exchange: the client's connection is reset, state 'aborted'. No-op if not paused. */
@@ -3245,9 +3284,11 @@ export class InterceptProxy extends EventEmitter {
   /** A gRPC call's flow: the first applicable rule (or sequence step), the network profile. */
   private decideGrpc(req: OngoingRequest): Flow {
     const m = this.matchRule(req.method, req.url, { count: true, grpc: true });
-    let flow = this.grpcFlowFor(m.rule, m.action, m.note, m.step);
+    let flow = this.grpcFlowFor(req.url, m.rule, m.action, m.note, m.step);
     // REVIEW-10 #6 (REVIEW-8 #1): a web page's call to a client-certificate host is refused before any connection.
-    const refused = !flow.fault && (!flow.action || flow.action.kind === 'throttle') ? this.certRefusal(req.url, req.headers as HeaderBag) : undefined;
+    const k = flow.action?.kind;
+    const forwards = !flow.fault && !flow.replay && (!k || k === 'throttle' || k === 'breakpoint' || k === 'mutate');
+    const refused = forwards ? this.certRefusal(req.url, req.headers as HeaderBag) : undefined;
     if (refused) flow = { route: 'grpc', ...(m.rule ? { rule: m.rule } : {}), refused };
     const meta = this.reqMeta.get(req);
     if (meta?.traceId) flow.traceId = meta.traceId;
@@ -3264,7 +3305,12 @@ export class InterceptProxy extends EventEmitter {
   }
 
   /** Like flowFor, for the actions that apply to gRPC: faults, throttle (+ the profile and its drop rate), block, grpcMock. */
-  private grpcFlowFor(rule: Rule | undefined, action: Applied, note?: string, step?: number): Flow {
+  private grpcFlowFor(url: string, rule: Rule | undefined, action: Applied, note?: string, step?: number): Flow {
+    const store = this.replayStore;
+    if (!rule && store?.lookupGrpc(url, 'unknown', false)) {
+      // CONTRACTS §17.4: answered from the recording (like a grpcMock); the entry is chosen once the call starts.
+      return { route: 'grpc', replay: 'deferred', simulated: `Replayed from ${store.name ?? 'a recording'}`, ...(note ? { note } : {}) };
+    }
     let flow: Flow = { route: 'grpc', ...(rule ? { rule } : {}), ...(action ? { action } : {}) };
     let dropRate: number | undefined;
     if (action?.kind === 'fault') {
@@ -3275,14 +3321,13 @@ export class InterceptProxy extends EventEmitter {
       flow.simulated = throttleLabel(action);
       dropRate = action.dropRate;
     }
-    const reachesNetwork = !action || action.kind === 'throttle';
+    const reachesNetwork = !action || action.kind === 'throttle' || action.kind === 'breakpoint' || action.kind === 'mutate';
     const p = this.profile;
-    const store = this.replayStore;
     if (reachesNetwork && p.kind === 'offline') {
       flow = { route: 'grpc', ...(rule ? { rule } : {}), fault: 'dns', simulated: describeProfile(p) };
       dropRate = undefined;
     } else if (!rule && store?.fallback === 'fail') {
-      // Replay (CONTRACTS §12.4) never answers gRPC, but its "fail" fallback (offline demo) still keeps it off the network.
+      // Not in the recording (CONTRACTS §17.4): the "fail" fallback (offline demo) keeps it off the network.
       flow = { route: 'grpc', fault: 'dns', simulated: `Not in the recording${store.name ? ` "${store.name}"` : ''} (replay: fail)` };
       dropRate = undefined;
     } else if (reachesNetwork && p.kind === 'throttle' && action?.kind !== 'throttle') {
@@ -3391,6 +3436,7 @@ export class InterceptProxy extends EventEmitter {
     else if (flow.fault) work = this.grpcFault(call, flow.fault);
     else if (a?.kind === 'block') work = this.grpcBlock(call, a);
     else if (a?.kind === 'grpcMock') work = this.grpcMock(call, a);
+    else if (flow.replay) work = this.grpcReplay(call);
     else work = this.grpcRelay(call, false);
     work.catch((e: unknown) => {
       if (call.isLive()) this.fail(ex, `The gRPC relay failed: ${(e as Error)?.message ?? String(e)}`);
@@ -3400,8 +3446,8 @@ export class InterceptProxy extends EventEmitter {
   }
 
   /** Request messages of a call answered locally: read (and recorded) as they come. */
-  private drainGrpcRequest(call: GrpcCall): void {
-    const parser = this.grpcRequestParser(call);
+  private drainGrpcRequest(call: GrpcCall, onFrame?: (f: Frame) => void): void {
+    const parser = this.grpcRequestParser(call, onFrame).parser;
     call.req.on('data', (c: Buffer) => parser.push(c));
     call.req.once('end', () => {
       if (call.isLive()) this.setRequestMs(call.ex, call.flow.te, performance.now());
@@ -3409,13 +3455,28 @@ export class InterceptProxy extends EventEmitter {
     call.req.on('error', () => undefined);
   }
 
-  private grpcRequestParser(call: GrpcCall): GrpcMessageParser {
-    const rec = new GrpcFrameRecorder('send', () => call.info.requestEncoding, (f) => this.addFrame(call.ex, f, true));
-    return new GrpcMessageParser((m) => {
+  /** Records one direction: a parser (counts + frames) and its recorder (also used by the hooks). */
+  private grpcRequestParser(call: GrpcCall, onFrame?: (f: Frame) => void): { parser: GrpcMessageParser; rec: GrpcFrameRecorder } {
+    return this.grpcRecording(call, 'send', onFrame);
+  }
+
+  private grpcRecording(call: GrpcCall, dir: Frame['dir'], onFrame?: (f: Frame) => void): { parser: GrpcMessageParser; rec: GrpcFrameRecorder } {
+    const { info } = call;
+    const rec = new GrpcFrameRecorder(
+      dir,
+      () => (dir === 'send' ? info.requestEncoding : info.responseEncoding),
+      (f) => {
+        this.addFrame(call.ex, f, true);
+        onFrame?.(f);
+      },
+    );
+    const parser = new GrpcMessageParser((m) => {
       if (!call.isLive()) return;
-      call.info.messagesSent++;
+      if (dir === 'send') info.messagesSent++;
+      else info.messagesReceived++;
       rec.push(m);
     });
+    return { parser, rec };
   }
 
   /** The app's stream closed. Unless the call already ended, the app cancelled it (or its connection went away). */
@@ -3431,6 +3492,7 @@ export class InterceptProxy extends EventEmitter {
     const hold = this.holds.get(ex.id);
     if (hold) return hold(true); // the timeout fault: the app gave up
     if (!call.isLive() || call.localReset) return;
+    const paused = this.paused.get(ex.id);
     const code = stream.rstCode;
     const deadline = call.info.deadlineMs;
     const elapsedMs = Date.now() - ex.startedAt;
@@ -3442,7 +3504,10 @@ export class InterceptProxy extends EventEmitter {
         : code
           ? `The app reset the stream (${h2CodeName(code)}).`
           : 'The app closed the connection before the call ended.';
+    if (paused) ex.error = `${ex.error} (it was paused at a breakpoint)`;
+    delete ex.grpcPause;
     this.finish(ex, 'aborted');
+    paused?.settle({ kind: 'gone' });
   }
 
   /** Reset the app's stream (RST_STREAM `code`); its close is then ours, not the app's. */
@@ -3545,14 +3610,80 @@ export class InterceptProxy extends EventEmitter {
     }
   }
 
-  /**
-   * grpcMock: after `delayMs`, response headers (`content-type: application/grpc` + `headers`), each message `gapMs`
-   * apart, then the status trailers. A non-zero code without messages is trailers-only. Never waits for the app to
-   * half-close (bidi).
-   */
+  /** grpcMock: after `delayMs`, `headers`, each message `gapMs` apart, then the status (CONTRACTS §16.2). */
   private async grpcMock(call: GrpcCall, a: Extract<RuleAction, { kind: 'grpcMock' }>): Promise<void> {
-    const { ex, info, stream } = call;
+    const messages = (a.messages ?? []).map((m) => Buffer.from(String(m), 'base64'));
+    const gap = a.gapMs && a.gapMs > 0 ? a.gapMs : 0;
     this.drainGrpcRequest(call);
+    await this.grpcAnswer(call, {
+      code: a.code ?? 0,
+      message: a.message,
+      messages,
+      gaps: messages.map((_, i) => (i === 0 ? 0 : gap)),
+      headers: a.headers,
+      trailers: a.trailers,
+      delayMs: a.delayMs,
+    });
+  }
+
+  /**
+   * CONTRACTS §17.4: a recorded call answers like a grpcMock — its response headers (minus pseudo / content-type /
+   * status / encoding), its response messages (sent uncompressed, recorded gaps capped at 5 s), its status and
+   * trailers. When several recorded calls share the path and carry a requestHash, the first request message picks one.
+   */
+  private async grpcReplay(call: GrpcCall): Promise<void> {
+    const store = this.replayStore;
+    let firstFrame: ((f: Frame | undefined) => void) | undefined;
+    const first = new Promise<Frame | undefined>((r) => (firstFrame = r));
+    let seen = false;
+    this.drainGrpcRequest(call, (f) => {
+      if (f.dir === 'send' && !seen) {
+        seen = true;
+        firstFrame?.(f);
+      }
+    });
+    call.req.once('end', () => setTimeout(() => firstFrame?.(undefined), 50)); // the last frame may still be decompressing
+    call.stream.once('close', () => firstFrame?.(undefined));
+    let hit = store?.lookupGrpc(call.req.url, 'unknown', false);
+    if (hit === 'needs-body') {
+      const f = await first;
+      if (!call.isLive()) return;
+      const hash = f ? grpcMessageHash(Buffer.from(f.base64 ?? '', 'base64')) : undefined;
+      hit = store?.lookupGrpc(call.req.url, { hash }, true);
+    } else if (hit) hit = store?.lookupGrpc(call.req.url, 'unknown', true);
+    if (!hit || hit === 'needs-body') return this.grpcStatusOnly(call, 14, 'Flutter Intercept: not in the recording', 'error', 'Not in the recording.');
+    const e = hit.entry;
+    const frames = (e.frames ?? []).filter((f) => f.kind === 'message' && f.dir === 'receive' && !f.dropped);
+    const clean = (h: Record<string, string | string[]> | undefined): Record<string, string> => {
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(h ?? {})) {
+        const lk = k.toLowerCase();
+        const val = Array.isArray(v) ? v.join(', ') : v;
+        if (!HTTP_TOKEN.test(lk) || lk.startsWith(':') || REPLAY_GRPC_DROPPED.has(lk) || typeof val !== 'string' || /[\r\n\0]/.test(val)) continue;
+        out[lk] = val;
+      }
+      return out;
+    };
+    await this.grpcAnswer(call, {
+      code: e.grpc?.code ?? 0,
+      message: e.grpc?.message,
+      messages: frames.map((f) => Buffer.from(f.base64 ?? '', 'base64')),
+      gaps: frames.map((f, i) => (i === 0 ? 0 : Math.min(MAX_REPLAY_GAP_MS, Math.max(0, f.at - frames[i - 1].at)))),
+      headers: clean(e.headers),
+      trailers: clean(e.grpc?.trailers),
+    });
+  }
+
+  /**
+   * A local answer (grpcMock, replay): after `delayMs`, response headers (`content-type: application/grpc` +
+   * `headers`), each message after its gap, then the status trailers. A non-zero code without messages is
+   * trailers-only. Never waits for the app to half-close (bidi).
+   */
+  private async grpcAnswer(
+    call: GrpcCall,
+    a: { code: number; message?: string; messages: Buffer[]; gaps: number[]; headers?: Record<string, string>; trailers?: Record<string, string>; delayMs?: number },
+  ): Promise<void> {
+    const { ex, info, stream } = call;
     const open = () => call.isLive() && !stream.closed && !stream.destroyed;
     if (a.delayMs && a.delayMs > 0) {
       const from = performance.now();
@@ -3560,8 +3691,8 @@ export class InterceptProxy extends EventEmitter {
       if (call.isLive()) this.addPhase(ex, 'delayMs', performance.now() - from);
       if (!open()) return;
     }
-    const code = a.code ?? 0;
-    const messages = (a.messages ?? []).map((m) => Buffer.from(String(m), 'base64'));
+    const code = a.code;
+    const messages = a.messages;
     const lower = (h: Record<string, string> | undefined) => Object.fromEntries(Object.entries(h ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
     const headers: Record<string, string> = { 'content-type': 'application/grpc', ...lower(a.headers) };
     const trailers: Record<string, string> = {
@@ -3598,17 +3729,238 @@ export class InterceptProxy extends EventEmitter {
     ex.status = 200;
     ex.responseHeaders = { ...headers };
     this.emitChange(ex);
-    const gap = a.gapMs && a.gapMs > 0 ? a.gapMs : 0;
     for (let i = 0; i < messages.length; i++) {
+      if (a.gaps[i] > 0) await sleep(a.gaps[i]);
       if (!open()) return;
       const m = messages[i];
       const ok = stream.write(frameMessage(m));
       info.messagesReceived++;
       this.addFrame(ex, messageFrame('receive', { compressed: false, size: m.length, kept: m, complete: true }));
       if (!ok) await new Promise<void>((r) => (stream.once('drain', r), stream.once('close', r)));
-      if (gap && i < messages.length - 1) await sleep(gap);
     }
     if (open()) stream.end();
+  }
+
+  // ---------------------------------------------------------------- gRPC breakpoints and mutate (CONTRACTS §17.1–17.3)
+
+  /** A non-error note on the exchange (shown with it), once per text. */
+  private grpcNote(call: GrpcCall, text: string): void {
+    const ex = call.ex;
+    if (ex.error?.includes(text)) return;
+    ex.error = ex.error ? `${ex.error} ${text}` : text;
+  }
+
+  /** The hooked link of one direction: whole messages through grpcHook; oversized ones recorded and passed on. */
+  private grpcTransform(call: GrpcCall, dir: Frame['dir'], recording: { parser: GrpcMessageParser; rec: GrpcFrameRecorder }): GrpcMessageTransform {
+    const cap = () => grpcHookTesting.hookCap ?? GRPC_HOOK_CAP_BYTES;
+    return new GrpcMessageTransform({
+      cap,
+      onMessage: (m) => this.grpcHook(call, dir, m, recording.rec),
+      onOversize: (bytes, start) => {
+        if (start) this.grpcNote(call, `A message over ${Math.round(cap() / 1024 / 1024)} MB was forwarded unchanged (not paused / not mutated).`);
+        recording.parser.push(bytes);
+      },
+    });
+  }
+
+  /** One whole message of a hooked direction: mutate (response) or pause it; record what was delivered. */
+  private async grpcHook(call: GrpcCall, dir: Frame['dir'], m: HookedMessage, rec: GrpcFrameRecorder): Promise<HookOutcome> {
+    const { info, flow } = call;
+    const cap = grpcHookTesting.hookCap ?? GRPC_HOOK_CAP_BYTES;
+    const count = () => {
+      if (dir === 'send') info.messagesSent++;
+      else info.messagesReceived++;
+    };
+    const record = (payload: Buffer, compressed: boolean, extra?: Pick<Frame, 'dropped' | 'edited'>) => {
+      if (!call.isLive()) return;
+      count();
+      const kept = compressed ? payload.subarray(0, GRPC_COMPRESSED_KEEP_BYTES) : payload;
+      rec.push({ compressed, size: payload.length, kept, complete: kept.length === payload.length }, extra);
+    };
+    const forward = (): HookOutcome => {
+      record(m.payload, m.compressed);
+      return { kind: 'forward' };
+    };
+    if (!call.isLive()) return { kind: 'forward' };
+    let plain = m.payload;
+    if (m.compressed) {
+      const enc = dir === 'send' ? info.requestEncoding : info.responseEncoding;
+      if (enc !== 'gzip' && enc !== 'deflate') {
+        this.grpcNote(call, `A message compressed with ${enc ?? 'an unknown encoding'} can't be read; it was forwarded unchanged (not paused / not mutated).`);
+        return forward();
+      }
+      const r = await decompressPrefix(m.payload, enc, cap);
+      if (!r || !r.complete) {
+        this.grpcNote(call, `A compressed message over ${Math.round(cap / 1024 / 1024)} MB (or unreadable) was forwarded unchanged (not paused / not mutated).`);
+        return forward();
+      }
+      plain = r.data;
+    }
+    const a = flow.action;
+    if (a?.kind === 'mutate') return dir === 'receive' ? this.grpcMutate(call, a.ops, plain, forward, record) : forward();
+    return this.grpcPauseMessage(call, dir, m, plain, forward, record);
+  }
+
+  /** CONTRACTS §17.3: decode with the injected codec, applyOps, encode; any failure forwards the original with a note. */
+  private grpcMutate(
+    call: GrpcCall,
+    ops: MutateOp[],
+    plain: Buffer,
+    forward: () => HookOutcome,
+    record: (p: Buffer, c: boolean, extra?: Pick<Frame, 'dropped' | 'edited'>) => void,
+  ): HookOutcome {
+    let path = '/';
+    try {
+      path = new URL(call.ex.url).pathname;
+    } catch {
+      /* keep / */
+    }
+    const codec = this.grpcCodec;
+    let json: unknown;
+    try {
+      json = codec?.decode(path, 'receive', plain);
+    } catch {
+      json = undefined;
+    }
+    if (json === undefined) {
+      this.grpcNote(call, `mutate: no schema for ${path}; messages were forwarded unchanged.`);
+      return forward();
+    }
+    let out: Uint8Array;
+    try {
+      const changed = applyOps(json, ops, { maxTargets: MUTATE_MAX_TARGETS }).value;
+      out = codec!.encode(path, 'receive', changed);
+    } catch (e) {
+      this.grpcNote(call, `mutate: ${(e as Error)?.message ?? String(e)}; the original message was forwarded.`);
+      return forward();
+    }
+    const payload = Buffer.from(out.buffer, out.byteOffset, out.byteLength);
+    record(payload, false, { edited: true });
+    call.ex.simulated = `Mutated: ${ops.map((o) => o.path).join(', ')}`.slice(0, 200);
+    return { kind: 'replace', payload };
+  }
+
+  /** Run `fn` as this call's next pause (one pause at a time per call; each has its own deadline). */
+  private grpcSerialPause<T>(call: GrpcCall, fn: () => Promise<T>): Promise<T> {
+    const p = (call.pauseChain ?? Promise.resolve()).then(fn);
+    call.pauseChain = p.catch(() => undefined);
+    return p;
+  }
+
+  /** CONTRACTS §17.2: hold one message until resume (edit / drop), abort, the app leaving or the timeout. */
+  private grpcPauseMessage(
+    call: GrpcCall,
+    dir: Frame['dir'],
+    m: HookedMessage,
+    plain: Buffer,
+    forward: () => HookOutcome,
+    record: (p: Buffer, c: boolean, extra?: Pick<Frame, 'dropped' | 'edited'>) => void,
+  ): Promise<HookOutcome> {
+    return this.grpcSerialPause(call, async (): Promise<HookOutcome> => {
+      const { ex } = call;
+      if (!call.isLive()) return { kind: 'drop' };
+      if (this.grpcHeld + plain.length > (grpcHookTesting.heldTotalCap ?? GRPC_HELD_TOTAL_CAP_BYTES)) {
+        this.grpcNote(call, 'Breakpoint skipped for a message: 64 MB of gRPC messages are already held.');
+        return forward();
+      }
+      this.grpcHeld += plain.length;
+      let d: Decision;
+      try {
+        ex.grpcPause = { kind: 'message', dir, index: m.index, base64: plain.toString('base64'), size: plain.length };
+        const decision = this.pause(ex, dir === 'send' ? 'request' : 'response');
+        this.emitChange(ex);
+        d = await decision;
+      } finally {
+        this.grpcHeld -= plain.length;
+        delete ex.grpcPause;
+      }
+      if (d.kind === 'gone' || !call.isLive()) return { kind: 'drop' };
+      if (d.kind === 'abort') {
+        this.grpcAbort(call);
+        return { kind: 'drop' };
+      }
+      ex.state = 'pending';
+      const e = d.edit as GrpcEdit | undefined;
+      let out: HookOutcome;
+      if (e?.drop) {
+        record(m.payload, m.compressed, { dropped: true });
+        out = { kind: 'drop' };
+      } else if (e?.message !== undefined) {
+        const payload = Buffer.from(e.message, 'base64');
+        record(payload, false, { edited: true });
+        out = { kind: 'replace', payload };
+      } else out = forward();
+      this.emitChange(ex);
+      return out;
+    });
+  }
+
+  /**
+   * CONTRACTS §17.2: hold the end of the call (its trailers, or a trailers-only answer). Resolves with the headers
+   * to set / remove on the status frame, or undefined when the call ended meanwhile (aborted, the app left).
+   */
+  private grpcStatusBreakpoint(call: GrpcCall, t: HeaderBag): Promise<{ headers: Record<string, string>; removed: string[] } | undefined> {
+    return this.grpcSerialPause(call, async () => {
+      const { ex, info } = call;
+      if (!call.isLive()) return undefined;
+      const custom = recordedHeaders(t);
+      for (const k of ['grpc-status', 'grpc-message', 'content-type']) delete custom[k];
+      const code = parseGrpcStatus(t['grpc-status']) ?? 0;
+      const message = decodeGrpcMessage(t['grpc-message']);
+      ex.grpcPause = { kind: 'status', code, ...(message !== undefined ? { message } : {}), trailers: custom };
+      const decision = this.pause(ex, 'response');
+      this.emitChange(ex);
+      const d = await decision;
+      delete ex.grpcPause;
+      if (d.kind === 'gone' || !call.isLive()) return undefined;
+      if (d.kind === 'abort') {
+        this.grpcAbort(call);
+        return undefined;
+      }
+      ex.state = 'pending';
+      const e = d.edit as GrpcEdit | undefined;
+      const headers: Record<string, string> = {};
+      const removed: string[] = [];
+      if (e?.status) {
+        headers['grpc-status'] = String(e.status.code);
+        info.statusCode = e.status.code;
+        if (e.status.message) {
+          headers['grpc-message'] = encodeGrpcMessage(e.status.message);
+          info.statusMessage = e.status.message;
+        } else {
+          removed.push('grpc-message');
+          delete info.statusMessage;
+        }
+      }
+      if (e?.trailers) {
+        for (const k of Object.keys(custom)) removed.push(k);
+        for (const [k, v] of Object.entries(e.trailers)) {
+          const lk = k.toLowerCase();
+          headers[lk] = v;
+          const i = removed.indexOf(lk);
+          if (i >= 0) removed.splice(i, 1);
+        }
+      }
+      if (e?.status || e?.trailers) ex.simulated = ex.simulated ? `${ex.simulated} · Status edited at a breakpoint` : 'Status edited at a breakpoint';
+      this.emitChange(ex);
+      return { headers, removed };
+    });
+  }
+
+  /** abort(id) on a paused gRPC call: RST_STREAM CANCEL both ways. */
+  private grpcAbort(call: GrpcCall): void {
+    const { ex, up } = call;
+    call.localReset = true;
+    try {
+      if (up && !up.closed && !up.destroyed) up.close(http2.constants.NGHTTP2_CANCEL);
+    } catch {
+      /* gone */
+    }
+    this.grpcReset(call, http2.constants.NGHTTP2_CANCEL);
+    if (call.isLive()) {
+      ex.error = 'Aborted at a breakpoint.';
+      this.finish(ex, 'aborted');
+    }
   }
 
   /** Does upstream TLS to this server skip verification (ignoreUpstreamCertErrors, or a MITM upstream proxy's flag)? */
@@ -3706,9 +4058,15 @@ export class InterceptProxy extends EventEmitter {
       call.upError ??= e;
     });
 
-    // app → (record) → (upload pacing) → server; pipes carry HTTP/2 flow control both ways.
-    const reqParser = this.grpcRequestParser(call);
-    let upSrc: Readable = req.pipe(new Observer((c) => reqParser.push(c)));
+    // app → (record / hooks) → (upload pacing) → server; pipes carry HTTP/2 flow control both ways. Without a
+    // breakpoint / mutate hook for a direction its link is the 0.10 observer (no per-message copies).
+    const a = flow.action;
+    const phase = a?.kind === 'breakpoint' ? a.phase : undefined;
+    call.statusPause = phase === 'response' || phase === 'both';
+    const hookSend = phase === 'request' || phase === 'both';
+    const hookReceive = call.statusPause || a?.kind === 'mutate';
+    const sendRec = this.grpcRecording(call, 'send');
+    let upSrc: Readable = req.pipe(hookSend ? this.grpcTransform(call, 'send', sendRec) : new Observer((c) => sendRec.parser.push(c)));
     const upload = flow.throttle?.uploadKbps;
     if (upload && upload > 0) upSrc = upSrc.pipe(new PacedStream({ kbps: upload }));
     upSrc.pipe(up);
@@ -3735,30 +4093,37 @@ export class InterceptProxy extends EventEmitter {
         const msg = decodeGrpcMessage(h['grpc-message']);
         if (msg !== undefined) info.statusMessage = msg;
         call.localReset = true;
-        try {
-          stream.respond(fwd, { endStream: true });
-          this.grpcEndRequestSide(call);
-        } catch {
-          /* the app left */
-        }
         this.addTimings(ex.id, { receiveMs: 0 });
-        this.finish(ex, truncate ? 'blocked' : 'completed');
+        void (async () => {
+          let out = fwd;
+          if (call.statusPause) {
+            // CONTRACTS §17.2: a trailers-only answer is held as the end of the call too.
+            const edited = await this.grpcStatusBreakpoint(call, h as HeaderBag);
+            if (!edited) return;
+            out = { ':status': status, ...forwardableHeaders(h as HeaderBag), ...edited.headers };
+            for (const k of edited.removed) delete out[k];
+            ex.responseHeaders = recordedHeaders(out as HeaderBag);
+          }
+          try {
+            stream.respond(out, { endStream: true });
+            this.grpcEndRequestSide(call);
+          } catch {
+            /* the app left */
+          }
+          if (call.isLive()) this.finish(ex, truncate ? 'blocked' : 'completed');
+        })();
         return;
       }
       stream.removeAllListeners('wantTrailers'); // the compatibility response's own (ERR_HTTP2_TRAILERS_ALREADY_SENT)
-      stream.on('wantTrailers', () => this.sendGrpcTrailers(call));
+      stream.on('wantTrailers', () => void this.sendGrpcTrailers(call));
       try {
         stream.respond(fwd, { waitForTrailers: true });
       } catch {
         return;
       }
       this.emitChange(ex);
-      const resRec = new GrpcFrameRecorder('receive', () => info.responseEncoding, (f) => this.addFrame(ex, f, true));
-      const resParser = new GrpcMessageParser((m) => {
-        if (!call.isLive()) return;
-        info.messagesReceived++;
-        resRec.push(m);
-      });
+      const recvRec = this.grpcRecording(call, 'receive');
+      const resParser = recvRec.parser;
       if (truncate) {
         const cut = new FirstMessageCut();
         up.on('data', (c: Buffer) => {
@@ -3783,7 +4148,7 @@ export class InterceptProxy extends EventEmitter {
         });
         return;
       }
-      let tail: Readable = up.pipe(new Observer((c) => resParser.push(c)));
+      let tail: Readable = up.pipe(hookReceive ? this.grpcTransform(call, 'receive', recvRec) : new Observer((c) => resParser.push(c)));
       const kbps = flow.throttle?.kbps;
       if (kbps && kbps > 0) tail = tail.pipe(new PacedStream({ kbps }));
       call.respTail = tail;
@@ -3802,8 +4167,17 @@ export class InterceptProxy extends EventEmitter {
   }
 
   /** The app's response body ended: the server's trailers (or a failure status, or none) end it. */
-  private sendGrpcTrailers(call: GrpcCall): void {
+  private async sendGrpcTrailers(call: GrpcCall): Promise<void> {
     const { ex, stream } = call;
+    if (call.upTrailers && call.statusPause) {
+      // CONTRACTS §17.2: the end of the call is held after the last response message.
+      const edited = await this.grpcStatusBreakpoint(call, call.upTrailers as HeaderBag);
+      if (!edited) return;
+      const next: Record<string, string | string[]> = { ...forwardableHeaders(call.upTrailers as HeaderBag), ...edited.headers };
+      for (const k of edited.removed) delete next[k];
+      call.upTrailers = next as http2.IncomingHttpHeaders;
+      ex.responseTrailers = recordedHeaders(next);
+    }
     const t: http2.OutgoingHttpHeaders = call.upTrailers ? forwardableHeaders(call.upTrailers as HeaderBag) : (call.failTrailers ?? {});
     call.localReset = true;
     try {
@@ -4711,6 +5085,19 @@ const REWRITE_SKIPPED = new Set([
 
 /** Headers a replayed response doesn't carry over: the proxy frames the body itself. */
 const REPLAY_DROPPED_HEADERS = new Set(['content-length', 'transfer-encoding', 'connection', 'keep-alive', 'proxy-connection', 'trailer', 'upgrade']);
+/** CONTRACTS §17.4: recorded gRPC headers / trailers a replay doesn't send (the proxy sets them, or they'd be wrong). */
+const REPLAY_GRPC_DROPPED = new Set([
+  ...REPLAY_DROPPED_HEADERS,
+  'content-type',
+  'grpc-status',
+  'grpc-message',
+  'grpc-encoding',
+  'host',
+  'http2-settings',
+  'proxy-authorization',
+  'te',
+  'date',
+]);
 
 interface HeaderSets {
   /** Lower-case names removed (set names are removed too, before being added). */

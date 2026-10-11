@@ -280,11 +280,12 @@ export class GrpcFrameRecorder {
     private readonly sink: (f: Frame) => void,
   ) {}
 
-  push(m: GrpcWireMessage): void {
+  /** `extra`: flags for the frame (CONTRACTS §17.2: `dropped`, `edited`). */
+  push(m: GrpcWireMessage, extra?: Pick<Frame, 'dropped' | 'edited'>): void {
     const at = Date.now();
     const enc = this.encoding();
     if (!m.compressed || (enc !== 'gzip' && enc !== 'deflate') || !m.kept.length) {
-      const f = messageFrame(this.dir, m, at);
+      const f = { ...messageFrame(this.dir, m, at), ...extra };
       if (!this.pending) return this.deliver(f);
       this.tail = this.tail.then(() => this.deliver(f));
       return;
@@ -294,7 +295,7 @@ export class GrpcFrameRecorder {
     this.tail = this.tail.then(async () => {
       const r = await work;
       this.pending--;
-      const f: Frame = { dir: this.dir, at, kind: 'message', size: m.size, compressed: true };
+      const f: Frame = { dir: this.dir, at, kind: 'message', size: m.size, compressed: true, ...extra };
       if (r?.data.length) f.base64 = r.data.toString('base64');
       if (r?.complete && m.complete) f.size = r.data.length;
       else {
@@ -423,4 +424,137 @@ const H2_CODES = [
 /** An HTTP/2 error code in words (`CANCEL`, `INTERNAL_ERROR`, or `code 42`). */
 export function h2CodeName(code: number | undefined): string {
   return code !== undefined && H2_CODES[code] ? H2_CODES[code] : `code ${code}`;
+}
+
+// ---------------------------------------------------------------- CONTRACTS §17.1: the message transform
+
+/** Messages larger than this (decompressed) are never held or rewritten: forwarded unchanged with a note. */
+export const GRPC_HOOK_CAP_BYTES = 4 * 1024 * 1024;
+/** Held (paused) message bytes across all calls; beyond it new pauses are skipped with a note. */
+export const GRPC_HELD_TOTAL_CAP_BYTES = 64 * 1024 * 1024;
+/** Test seams. Never set outside tests. */
+export const grpcHookTesting: { hookCap?: number; heldTotalCap?: number } = {};
+/** How many hooked transforms were created (tests: the fast path creates none). */
+export const grpcTransformStats = { created: 0 };
+
+/** One whole message a hook sees: its wire payload (compressed if `compressed`) and its index in its direction. */
+export interface HookedMessage {
+  index: number;
+  compressed: boolean;
+  payload: Buffer;
+}
+
+export type HookOutcome = { kind: 'forward' } | { kind: 'replace'; payload: Buffer } | { kind: 'drop' };
+
+/**
+ * Re-frames one direction of a call message by message (CONTRACTS §17.1). Each whole message (≤ the hook cap) goes
+ * to `onMessage`, which may forward it, replace it (sent uncompressed, flag 0) or drop it; until its promise settles
+ * the transform holds the rest of the stream (its callback isn't called, so HTTP/2 flow control pushes back on the
+ * sender). Larger messages stream through unchanged, shown to `onOversize` as raw bytes (header first). Bytes that
+ * aren't gRPC framing (a bad flag byte) pass through unchanged from there on.
+ */
+export class GrpcMessageTransform extends Transform {
+  private readonly header = Buffer.alloc(5);
+  private fill = 0;
+  private mode: 'header' | 'payload' | 'stream' | 'raw' = 'header';
+  private remaining = 0;
+  private parts: Buffer[] = [];
+  private index = 0;
+
+  constructor(
+    private readonly o: {
+      cap: () => number;
+      onMessage: (m: HookedMessage) => HookOutcome | Promise<HookOutcome>;
+      /** Bytes of a message over the cap (its header first, then its payload as it streams). */
+      onOversize: (bytes: Buffer, start?: { index: number; size: number }) => void;
+    },
+  ) {
+    super();
+    grpcTransformStats.created++;
+  }
+
+  override _transform(chunk: Buffer, _e: BufferEncoding, cb: TransformCallback): void {
+    this.work(chunk).then(
+      () => cb(),
+      (e: Error) => cb(e),
+    );
+  }
+
+  override _flush(cb: TransformCallback): void {
+    // A stream that ended mid-message: pass what there is on unchanged (the peer sees the same truncation).
+    if (this.mode === 'header' && this.fill) this.push(Buffer.from(this.header.subarray(0, this.fill)));
+    if (this.mode === 'payload') {
+      this.push(Buffer.from(this.header));
+      for (const p of this.parts) this.push(p);
+    }
+    cb();
+  }
+
+  private async work(chunk: Buffer): Promise<void> {
+    let off = 0;
+    while (off < chunk.length) {
+      if (this.destroyed) return;
+      if (this.mode === 'raw') {
+        this.push(chunk.subarray(off));
+        return;
+      }
+      if (this.mode === 'header') {
+        const take = Math.min(5 - this.fill, chunk.length - off);
+        chunk.copy(this.header, this.fill, off, off + take);
+        this.fill += take;
+        off += take;
+        if (this.fill < 5) return;
+        this.fill = 0;
+        const flag = this.header[0];
+        if (flag !== 0 && flag !== 1) {
+          this.mode = 'raw';
+          this.push(Buffer.from(this.header));
+          continue;
+        }
+        this.remaining = this.header.readUInt32BE(1);
+        if (this.remaining > this.o.cap()) {
+          this.mode = 'stream';
+          const h = Buffer.from(this.header);
+          this.push(h);
+          this.o.onOversize(h, { index: this.index++, size: this.remaining });
+          continue;
+        }
+        this.mode = 'payload';
+        this.parts = [];
+        if (this.remaining === 0) await this.message();
+        continue;
+      }
+      const take = Math.min(this.remaining, chunk.length - off);
+      const part = chunk.subarray(off, off + take);
+      off += take;
+      this.remaining -= take;
+      if (this.mode === 'stream') {
+        this.push(part);
+        this.o.onOversize(part);
+        if (this.remaining === 0) this.mode = 'header';
+        continue;
+      }
+      this.parts.push(part);
+      if (this.remaining === 0) await this.message();
+    }
+  }
+
+  private async message(): Promise<void> {
+    const header = Buffer.from(this.header);
+    const payload = this.parts.length === 1 ? this.parts[0] : Buffer.concat(this.parts);
+    this.parts = [];
+    this.mode = 'header';
+    const m: HookedMessage = { index: this.index++, compressed: header[0] === 1, payload };
+    let out: HookOutcome;
+    try {
+      out = await this.o.onMessage(m);
+    } catch {
+      out = { kind: 'forward' };
+    }
+    if (this.destroyed) return;
+    if (out.kind === 'forward') {
+      this.push(header);
+      if (payload.length) this.push(payload);
+    } else if (out.kind === 'replace') this.push(frameMessage(out.payload));
+  }
 }

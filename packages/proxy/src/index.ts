@@ -23,9 +23,12 @@ export {
   GRPC_ACTIONS,
   grpcApplicable,
   grpcMockProblem,
+  // v0.11.0 (CONTRACTS §17)
+  grpcEditProblem,
+  GRPC_EDIT_MAX_BYTES,
 } from './rules';
 export type { PickedStep, StepAction } from './rules';
-export { requestBodyHash } from './replay';
+export { requestBodyHash, grpcMessageHash } from './replay';
 export { parseUpstreamProxy, parseNoProxy } from './upstream-proxy';
 export type { UpstreamProxyConfig } from './upstream-proxy';
 // v0.8.0 (CONTRACTS §14)
@@ -85,6 +88,8 @@ export {
   frameMessage,
   GRPC_BREAKER_EVENT,
   GRPC_BREAKER_WINDOW_MS,
+  GRPC_HOOK_CAP_BYTES,
+  GRPC_HELD_TOTAL_CAP_BYTES,
 } from './grpc';
 export type { GrpcBreakerEvent } from './grpc';
 export type { GrpcSupport } from './silent';
