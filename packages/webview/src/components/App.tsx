@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useReducer, useRef } from 'preact/hooks';
+import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import { AppContext, useApp } from '../context';
-import type { Host } from '../host';
+import type { ConnectionState, Host } from '../host';
 import type { HostMsg, Status } from '../protocol';
 import { agentLine } from '../util';
 import { FALLBACK_LABEL, pendingApprovalText, INSECURE_TITLE, SHARED_FILE } from '../scenarios';
@@ -16,7 +16,7 @@ import { Icon } from './Icon';
 import { AuthFlowsView } from './AuthFlowsView';
 import { RecordingsView } from './RecordingsView';
 import { RulesView } from './RulesView';
-import { Toolbar } from './Toolbar';
+import { inIde, Toolbar } from './Toolbar';
 import { TrafficList } from './TrafficList';
 
 const NOTICE_MS = 8000;
@@ -70,6 +70,7 @@ export function App({ host }: { host: Host }) {
     <AppContext.Provider value={ctx}>
       <div class="app">
         <Toolbar />
+        {host.onConnection && <ConnectionBar host={host} />}
         <HostErrorBar />
         <NoticeBar />
         <ReplayBar />
@@ -166,14 +167,16 @@ function EmptyState() {
   return (
     <div class="empty">
       <h2>No traffic yet</h2>
-      <p class="lead">Press <kbd>F5</kbd> to run your Flutter app — traffic appears here.</p>
+      {inIde()
+        ? <p class="lead">Run or debug your Flutter app from the IDE — traffic appears here.</p>
+        : <p class="lead">Press <kbd>F5</kbd> to run your Flutter app — traffic appears here.</p>}
       <p class="muted">
         No code changes needed: Flutter Intercept routes the app's <code>dart:io</code> HTTP (Dio, http, HttpClient) through
         a local proxy while you debug.
       </p>
       <p class="muted">
         {!connected
-          ? 'Connecting to the extension…'
+          ? (inIde() ? 'Connecting to Flutter Intercept…' : 'Connecting to the extension…')
           : status.proxyRunning
             ? `Proxy listening on port ${status.port ?? '?'} · ${status.sessions} debug session${status.sessions === 1 ? '' : 's'}.`
             : 'The proxy starts with your first Flutter debug session.'}
@@ -358,6 +361,25 @@ export function SharedRulesBanner() {
           {sr.pending.map((p, i) => <li key={i}><strong>{p.name}</strong> — {p.reason}</li>)}
         </ul>
       )}
+    </div>
+  );
+}
+
+/**
+ * CONTRACTS §15.1: the WebSocket host (Android Studio / IntelliJ) can lose the sidecar — e.g. while the IDE restarts
+ * it. Messages posted meanwhile are queued, and the reconnect resyncs everything with a fresh snapshot.
+ */
+function ConnectionBar({ host }: { host: Host }) {
+  const [conn, setConn] = useState<ConnectionState>('open');
+  useEffect(() => host.onConnection?.(setConn), [host]);
+  if (conn !== 'reconnecting') return null;
+  return (
+    <div class="connection-bar" role="alert" aria-label="Connection">
+      <span class="connection-spinner" aria-hidden="true" />
+      <span class="connection-text">Reconnecting to Flutter Intercept…</span>
+      <span class="muted">Your actions are kept and sent once it's back.</span>
+      <span class="spacer" />
+      {host.reconnectNow && <Button onClick={() => host.reconnectNow!()} title="Try to reconnect now instead of waiting">Retry now</Button>}
     </div>
   );
 }

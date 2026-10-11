@@ -1,6 +1,6 @@
 import { render } from 'preact';
 import { App } from './components/App';
-import { createVsCodeHost } from './host';
+import { createHost, scrubTokenFromAddressBar, wsUrl } from './host';
 import './styles.css';
 
 function mount() {
@@ -10,7 +10,12 @@ function mount() {
     root.id = 'root';
     document.body.appendChild(root);
   }
-  render(<App host={createVsCodeHost()} />, root);
+  // Android Studio / IntelliJ (CONTRACTS §15.1): the sidecar page sets body.fi-ide too; added here in case it didn't.
+  if (wsUrl()) {
+    document.body.classList.add('fi-ide');
+    scrubTokenFromAddressBar();
+  }
+  render(<App host={createHost()} />, root);
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount);

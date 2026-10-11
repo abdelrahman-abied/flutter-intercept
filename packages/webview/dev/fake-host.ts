@@ -5,7 +5,7 @@
  *
  * URL params:  ?n=40 preloaded exchanges · ?ui={"view":"rules"} initial persisted UI state
  *               · ?rate=900 ms between new exchanges · ?stream=0
- *              ?empty=1 start with no traffic · ?theme=vscode-light|vscode-high-contrast
+ *              ?empty=1 start with no traffic · ?theme=vscode-light|vscode-high-contrast|fi-ide|fi-ide%20ide-dark
  *              ?bpTimeout=300000 breakpoint auto-resume · ?clientTimeout=120000 fake app gives up while paused
  *              ?max=1000 ring buffer (evictions are reported with a 'removed' message)
  *              ?lan=1 start with the iPhone LAN listener open (dev bar: open/close LAN)

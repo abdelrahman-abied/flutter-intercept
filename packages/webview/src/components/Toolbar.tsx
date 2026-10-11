@@ -138,12 +138,14 @@ export function Toolbar() {
       )}
       <span class="spacer" />
       <ExportMenu />
-      <Button kind="icon" title={inEditor()
-        ? 'Move Flutter Intercept to its own window'
-        : 'Open Flutter Intercept in its own window (an editor tab you can move to another screen)'}
-        onClick={() => post({ type: 'openInNewWindow' })}>
-        <Icon name="window" />
-      </Button>
+      {!inIde() && (
+        <Button kind="icon" title={inEditor()
+          ? 'Move Flutter Intercept to its own window'
+          : 'Open Flutter Intercept in its own window (an editor tab you can move to another screen)'}
+          onClick={() => post({ type: 'openInNewWindow' })}>
+          <Icon name="window" />
+        </Button>
+      )}
       {paused > 0 && (
         <button type="button" class="paused-alert" onClick={() => dispatch({ type: 'showPaused' })}
           title="Exchanges are waiting at a breakpoint. The app is blocked until you resume or abort them. Click to jump to the next one.">
@@ -158,6 +160,11 @@ export function Toolbar() {
 /** The view is an editor tab / its own window (CONTRACTS §13.1): the host adds `fi-panel` only in the panel. */
 export function inEditor(): boolean {
   return typeof document !== 'undefined' && !document.body.classList.contains('fi-panel') && !document.body.classList.contains('fi-sidebar');
+}
+
+/** Shown in Android Studio / IntelliJ (CONTRACTS §15.1): the sidecar page adds `fi-ide` to <body>. */
+export function inIde(): boolean {
+  return typeof document !== 'undefined' && document.body.classList.contains('fi-ide');
 }
 
 /**

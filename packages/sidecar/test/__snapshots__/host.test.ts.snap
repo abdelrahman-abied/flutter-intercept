@@ -1,0 +1,108 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`SidecarHost > prepareLaunch rewrites per device kind like the VS Code provider 1`] = `
+{
+  "android-device R5CT1234567": {
+    "additionalArgs": [
+      "--flavor",
+      "dev",
+      "--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=<sha>",
+      "--dart-define=FLUTTER_INTERCEPT_PROXY=localhost:<port>",
+    ],
+    "kind": "rewrite",
+    "program": "<project>/.dart_tool/flutter_intercept/entry_lib__main.dart",
+  },
+  "android-emulator Pixel_9_API_36": {
+    "additionalArgs": [
+      "--flavor",
+      "dev",
+      "--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=<sha>",
+      "--dart-define=FLUTTER_INTERCEPT_PROXY=10.0.2.2:<port>",
+    ],
+    "kind": "rewrite",
+    "program": "<project>/.dart_tool/flutter_intercept/entry_lib__main.dart",
+  },
+  "android-emulator emulator-5554": {
+    "additionalArgs": [
+      "--flavor",
+      "dev",
+      "--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=<sha>",
+      "--dart-define=FLUTTER_INTERCEPT_PROXY=10.0.2.2:<port>",
+    ],
+    "kind": "rewrite",
+    "program": "<project>/.dart_tool/flutter_intercept/entry_lib__main.dart",
+  },
+  "ios-device 00008110-001234567890801E": {
+    "additionalArgs": [
+      "--flavor",
+      "dev",
+      "--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=<sha>",
+      "--dart-define=FLUTTER_INTERCEPT_PROXY=flutter-intercept:<token>@192.168.77.7:50123",
+    ],
+    "kind": "rewrite",
+    "note": "Physical iPhone: the app reaches the proxy over Wi-Fi (LAN mode, token-protected)",
+    "program": "<project>/.dart_tool/flutter_intercept/entry_lib__main.dart",
+  },
+  "ios-simulator A1B2C3D4-0000-1111-2222-333344445555": {
+    "additionalArgs": [
+      "--flavor",
+      "dev",
+      "--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=<sha>",
+      "--dart-define=FLUTTER_INTERCEPT_PROXY=localhost:<port>",
+    ],
+    "kind": "rewrite",
+    "program": "<project>/.dart_tool/flutter_intercept/entry_lib__main.dart",
+  },
+  "linux linux": {
+    "additionalArgs": [
+      "--flavor",
+      "dev",
+      "--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=<sha>",
+      "--dart-define=FLUTTER_INTERCEPT_PROXY=localhost:<port>",
+    ],
+    "kind": "rewrite",
+    "program": "<project>/.dart_tool/flutter_intercept/entry_lib__main.dart",
+  },
+  "macos macos": {
+    "additionalArgs": [
+      "--flavor",
+      "dev",
+      "--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=<sha>",
+      "--dart-define=FLUTTER_INTERCEPT_PROXY=localhost:<port>",
+    ],
+    "kind": "rewrite",
+    "program": "<project>/.dart_tool/flutter_intercept/entry_lib__main.dart",
+  },
+  "other -": {
+    "additionalArgs": [
+      "--flavor",
+      "dev",
+      "--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=<sha>",
+      "--dart-define=FLUTTER_INTERCEPT_PROXY=localhost:<port>",
+    ],
+    "kind": "rewrite",
+    "program": "<project>/.dart_tool/flutter_intercept/entry_lib__main.dart",
+  },
+  "web chrome": {
+    "additionalArgs": [
+      "--flavor",
+      "dev",
+      "--web-browser-flag=--proxy-pac-url=http://127.0.0.1:<port>/flutter-intercept-<port>.pac",
+      "--web-browser-flag=--ignore-certificate-errors-spki-list=<pin>",
+    ],
+    "kind": "rewrite",
+    "note": "Flutter Web: the browser is started with the Flutter Intercept proxy",
+    "program": "<project>/lib/main.dart",
+  },
+  "windows windows": {
+    "additionalArgs": [
+      "--flavor",
+      "dev",
+      "--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA=<sha>",
+      "--dart-define=FLUTTER_INTERCEPT_PROXY=localhost:<port>",
+    ],
+    "kind": "rewrite",
+    "program": "<project>/.dart_tool/flutter_intercept/entry_lib__main.dart",
+  },
+}
+`;

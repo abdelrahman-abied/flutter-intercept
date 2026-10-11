@@ -1,0 +1,23 @@
+<!-- Run integration extensions (agent R, run/**), included from plugin.xml. See docs/spikes/intellij-run.md. -->
+<idea-plugin>
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Before io.flutter.run.FlutterRunner (registered without an order): takes Flutter Run / Debug / Android Profiler
+             launches, prepares them through the sidecar and delegates a patched copy (or the unchanged configuration). -->
+        <programRunner id="flutterInterceptRunner" order="first"
+                       implementation="dev.flutterintercept.run.InterceptFlutterRunner"/>
+    </extensions>
+
+    <actions>
+        <!-- Manual path: the selected Flutter configuration through our runner, whatever runner wins automatically. -->
+        <action id="FlutterIntercept.RunWithIntercept" class="dev.flutterintercept.run.RunWithInterceptAction"
+                text="Run with Flutter Intercept" description="Run the selected Flutter configuration with its HTTP traffic routed through Flutter Intercept"
+                icon="AllIcons.Actions.Execute">
+            <add-to-group group-id="RunMenu" anchor="last"/>
+        </action>
+        <action id="FlutterIntercept.DebugWithIntercept" class="dev.flutterintercept.run.DebugWithInterceptAction"
+                text="Debug with Flutter Intercept" description="Debug the selected Flutter configuration with its HTTP traffic routed through Flutter Intercept"
+                icon="AllIcons.Actions.StartDebugger">
+            <add-to-group group-id="RunMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

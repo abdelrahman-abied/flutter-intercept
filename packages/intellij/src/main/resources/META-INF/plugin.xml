@@ -1,0 +1,84 @@
+<!-- Flutter Intercept for Android Studio / IntelliJ IDEA (CONTRACTS §15). id, name, version and since-build are
+     patched from build.gradle.kts / gradle.properties. -->
+<idea-plugin xmlns:xi="http://www.w3.org/2001/XInclude">
+    <id>dev.flutterintercept</id>
+    <name>Flutter Intercept</name>
+    <vendor url="https://github.com/abdelrahman-abied/flutter-intercept">Abdulrahman Obaid</vendor>
+
+    <description><![CDATA[
+    <p>See, mock, pause and replay your Flutter app's HTTP traffic with no app code changes.</p>
+    <ul>
+      <li>Run or debug a Flutter app as usual: its <code>dart:io</code> traffic goes through a local proxy.</li>
+      <li>Inspect requests, mock responses, set breakpoints, throttle, replay and export (OpenAPI, Postman).</li>
+      <li>Jump from a request to the line of code that made it.</li>
+      <li>Let AI agents (Claude Code, Cursor, Gemini CLI, …) read and shape traffic over MCP, with your approval.</li>
+    </ul>
+    <p>Needs Node.js 18 or later (found on PATH, or set in Settings → Tools → Flutter Intercept).</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>io.flutter</depends>
+    <depends>Dart</depends>
+
+    <!-- Run integration (agent R, run/**): its extensions live in META-INF/flutter-intercept-run.xml. -->
+    <xi:include href="/META-INF/flutter-intercept-run.xml" xpointer="xpointer(/idea-plugin/*)">
+        <xi:fallback/>
+    </xi:include>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="dev.flutterintercept.settings.InterceptSettings"/>
+        <applicationService serviceImplementation="dev.flutterintercept.sidecar.SidecarProcess"/>
+        <projectService serviceInterface="dev.flutterintercept.api.InterceptSidecar"
+                        serviceImplementation="dev.flutterintercept.core.InterceptSidecarImpl"/>
+
+        <applicationConfigurable parentId="tools" id="dev.flutterintercept.settings" displayName="Flutter Intercept"
+                                 instance="dev.flutterintercept.settings.InterceptConfigurable"/>
+
+        <toolWindow id="Flutter Intercept" anchor="bottom" icon="/icons/traffic.svg" canCloseContents="false"
+                    factoryClass="dev.flutterintercept.toolwindow.InterceptToolWindowFactory"/>
+
+        <statusBarWidgetFactory id="FlutterInterceptStatus" order="after positionWidget"
+                                implementation="dev.flutterintercept.status.InterceptStatusBarWidgetFactory"/>
+
+        <notificationGroup id="Flutter Intercept" displayType="BALLOON"/>
+
+        <postStartupActivity implementation="dev.flutterintercept.core.InterceptProjectActivity"/>
+    </extensions>
+
+    <applicationListeners>
+        <listener class="dev.flutterintercept.core.InterceptLafListener" topic="com.intellij.ide.ui.LafManagerListener"/>
+        <listener class="dev.flutterintercept.core.InterceptFileSavedListener" topic="com.intellij.openapi.fileEditor.FileDocumentManagerListener"/>
+    </applicationListeners>
+
+    <projectListeners>
+        <listener class="dev.flutterintercept.core.InterceptToolWindowListener" topic="com.intellij.openapi.wm.ex.ToolWindowManagerListener"/>
+    </projectListeners>
+
+    <actions>
+        <group id="FlutterIntercept.Menu" text="Flutter Intercept" popup="true" icon="/icons/traffic.svg">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <action id="FlutterIntercept.OpenTraffic" class="dev.flutterintercept.actions.OpenTrafficAction"
+                    text="Open Traffic" description="Show the Flutter Intercept tool window" icon="/icons/traffic.svg"/>
+            <action id="FlutterIntercept.Toggle" class="dev.flutterintercept.actions.ToggleInterceptionAction"
+                    text="Toggle Interception" description="Turn routing Flutter runs through Flutter Intercept on or off"/>
+            <action id="FlutterIntercept.Clear" class="dev.flutterintercept.actions.ClearTrafficAction"
+                    text="Clear Traffic" description="Clear the list (requests in flight stay)"/>
+            <reference ref="FlutterIntercept.RunWithIntercept"/>
+            <reference ref="FlutterIntercept.DebugWithIntercept"/>
+            <separator/>
+            <action id="FlutterIntercept.ConnectAgent" class="dev.flutterintercept.actions.ConnectAgentAction"
+                    text="Connect AI Agent…" description="Copy the MCP setup for Claude Code, Cursor, Windsurf, Gemini CLI or another client"/>
+            <action id="FlutterIntercept.ExportOpenApi" class="dev.flutterintercept.actions.ExportOpenApiAction"
+                    text="Export Traffic as OpenAPI…" description="Write the recorded traffic to an OpenAPI 3.1 file"/>
+            <action id="FlutterIntercept.ExportPostman" class="dev.flutterintercept.actions.ExportPostmanAction"
+                    text="Export Traffic as Postman Collection…" description="Write the recorded traffic to a Postman collection"/>
+            <action id="FlutterIntercept.SaveCaCertificate" class="dev.flutterintercept.actions.SaveCaCertificateAction"
+                    text="Save CA Certificate…" description="Save the public CA certificate of the local proxy"/>
+            <action id="FlutterIntercept.SetPassphrase" class="dev.flutterintercept.actions.SetPassphraseAction"
+                    text="Set Client Certificate Passphrase…" description="Store or clear a client certificate's passphrase in the IDE's password safe"/>
+            <separator/>
+            <action id="FlutterIntercept.RestartSidecar" class="dev.flutterintercept.actions.RestartSidecarAction"
+                    text="Restart Flutter Intercept" description="Restart the local proxy process"/>
+        </group>
+    </actions>
+</idea-plugin>

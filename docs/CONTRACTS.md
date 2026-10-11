@@ -1541,3 +1541,14 @@ Android Studio ── plugin (Kotlin) ──stdio JSON──▶ node sidecar.js 
 `./gradlew buildPlugin` produces `flutter-intercept-intellij-<version>.zip` containing the plugin jar and
 `sidecar/sidecar.js` + `sidecar/webview/*` (built by `npm run build -w @flutter-intercept/sidecar` first). Publishing to
 the JetBrains Marketplace is the owner's step (token); `verifyPlugin` must pass for 262.
+
+### 15.4 Android Studio has no JCEF (as built)
+Android Studio 2026.2 ships neither `com.intellij.ui.jcef` nor a Chromium-enabled JBR (the Flutter plugin uses
+JxBrowser instead). The plugin reaches JCEF by reflection (works in IntelliJ IDEA); in Android Studio the tool window
+offers **Open Traffic in Browser** — the main path there, not an edge case. So the UI URL must be safe to land in
+browser history: `uiUrl` (plugin → sidecar) returns a fresh **one-time** URL `/?t=<one-time token>`; the sidecar
+exchanges it for an `HttpOnly; SameSite=Strict; Path=/` session cookie and redirects to `/` (a used or expired token
+— 60 s — is refused). The page's WebSocket authenticates with the cookie (same origin) or the page-embedded
+`__FI_WS__` token, which never appears in the address bar. The webview also strips any `?t=` with
+`history.replaceState`. JCEF clients use the same flow.
+

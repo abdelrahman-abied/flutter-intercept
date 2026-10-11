@@ -30,7 +30,8 @@ interface InterceptSidecar {
     fun isEnabled(): Boolean
     /** Blocking, bounded (≤ 10 s); returns Skip with a reason on any failure — a launch is never blocked by us. */
     fun prepareLaunch(request: LaunchRequest): LaunchPlan
-    fun sessionStarted(launchId: String, sessionId: String, deviceId: String?, vmServiceUri: String?)
+    /** `webLaunchUrl`: Flutter Web app URL when known (screenshots of the right tab). */
+    fun sessionStarted(launchId: String, sessionId: String, deviceId: String?, vmServiceUri: String?, webLaunchUrl: String? = null)
     fun sessionEnded(sessionId: String)
 
     companion object {

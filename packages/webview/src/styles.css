@@ -1264,3 +1264,34 @@ textarea.script-code { width: 100%; min-height: 160px; tab-size: 2; white-space:
 /* §14.2 passthrough hosts, §14.6 upstream from VS Code's http.proxy */
 .passthrough-status { overflow: hidden; text-overflow: ellipsis; }
 .rec-streams { margin-top: 2px; }
+
+/* ------------------------------------------------------------------ v0.9.0 (CONTRACTS §15.1) */
+
+/* Android Studio / IntelliJ: the sidecar page adds `fi-ide` to <body> and a stylesheet defining the same --vscode-*
+   variables from the IDE theme. The tool window behaves like the editor-tab mode (no fi-panel class): full height. */
+body.fi-ide { --fi-bg: var(--vscode-editor-background); }
+/* VS Code-only affordances (e.g. "Open in its own window") are not rendered under fi-ide (Toolbar inIde()). */
+
+/* WebSocket host lost the sidecar: a clear bar while it reconnects. */
+.connection-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px;
+  flex: none;
+  color: var(--vscode-foreground);
+  background: var(--vscode-inputValidation-warningBackground, var(--vscode-editorWidget-background, transparent));
+  border-bottom: 1px solid var(--vscode-inputValidation-warningBorder, var(--fi-border));
+}
+.connection-text { font-weight: 600; }
+.connection-spinner {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  border: 2px solid var(--fi-muted);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: fi-spin 1s linear infinite;
+}
+@keyframes fi-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .connection-spinner { animation: none; } }

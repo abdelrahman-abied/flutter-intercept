@@ -68,6 +68,8 @@ export interface SessionStartedParams {
   deviceId?: string;
   /** VM service WebSocket URI when the plugin knows it (enables isolates, native profile, screenshots). Never logged. */
   vmServiceUri?: string;
+  /** Flutter Web: the app's URL (flutter_tools `app.webLaunchUrl`), for screenshots of the right tab. */
+  webLaunchUrl?: string;
 }
 export interface SessionEndedParams { sessionId: string }
 
@@ -76,10 +78,15 @@ export type PluginRequest =
   | { method: 'settings'; params: { settings: SidecarSettings } }
   | { method: 'theme'; params: { theme: InitParams['theme'] } }
   | { method: 'prepareLaunch'; params: PrepareLaunchParams }   // → PrepareLaunchResult
-  | { method: 'sessionStarted'; params: SessionStartedParams }
+  | { method: 'sessionStarted'; params: SessionStartedParams }  // → { intercepted: boolean }
   | { method: 'sessionEnded'; params: SessionEndedParams }
-  | { method: 'connectAgent'; params: { client: 'claude' | 'cursor' | 'gemini' | 'windsurf' | 'other' } } // → { text: string } to copy
-  | { method: 'command'; params: { name: 'clear' | 'toggle' | 'exportOpenApi' | 'exportPostman' | 'saveCaCertificate' } }
+  | { method: 'connectAgent'; params: { client: 'claude' | 'cursor' | 'gemini' | 'windsurf' | 'other' } } // → { text: string } to copy; error code `unavailable` when agent access is off
+  | { method: 'command'; params: { name: 'clear' | 'toggle' | 'exportOpenApi' | 'exportPostman' | 'saveCaCertificate' } } // → { enabled } | { path } | {}
+  // Added while building (sidecar report):
+  | { method: 'workspaceFolders'; params: { workspaceFolders: string[] } } // a project window opened / closed
+  | { method: 'uiVisible'; params: { visible: boolean } }                  // the tool window is on screen (no failure notifications then)
+  | { method: 'fileSaved'; params: { path: string } }                      // → { approved: boolean } (a script file saved in the IDE is approved, like VS Code)
+  | { method: 'uiUrl'; params?: undefined }                                // → { url } a fresh one-time UI URL (system-browser fallback, CONTRACTS §15.4)
   | { method: 'shutdown'; params?: undefined };
 
 // ── sidecar → plugin requests (UI the sidecar can't do itself) ───────────────────────────────────────────
@@ -93,10 +100,14 @@ export type SidecarRequest =
   | { method: 'ui.save'; params: { defaultPath: string; filters?: Record<string, string[]> } }                                              // → path | null
   | { method: 'ui.confirm'; params: { message: string; detail?: string; buttons: string[]; modal?: boolean } }                              // → button | null
   | { method: 'ui.notify'; params: { level: 'info' | 'warning' | 'error'; message: string; buttons?: string[] } }                           // → button | null
-  | { method: 'ui.reveal'; params?: { exchangeId?: string } };                                                                              // focus the tool window
+  | { method: 'ui.reveal'; params?: { exchangeId?: string } }                                                                               // focus the tool window
+  /** A client-certificate passphrase from the IDE's password store, without prompting; error / null = none. */
+  | { method: 'secrets.clientCertPassphrase'; params: { host: string } };                                                                  // → string | null
 
 // ── sidecar → plugin events ──────────────────────────────────────────────────────────────────────────────
 export type SidecarEvent =
   | { event: 'ready'; data: InitResult }
   | { event: 'status'; data: { proxyRunning: boolean; port?: number; enabled: boolean; sessions: number; paused: number; lan?: boolean } }
-  | { event: 'log'; data: { line: string } };
+  | { event: 'log'; data: { line: string } }  // the same lines also go to stderr: the plugin logs one of the two
+  /** The user changed a setting from the UI (toggle, a notification's "Turn off"): persist it in the plugin's settings. */
+  | { event: 'settingsChanged'; data: Partial<Pick<SidecarSettings, 'enabled' | 'notifications'>> };
