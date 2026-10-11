@@ -158,7 +158,7 @@ export class ReplayStore {
   }
 
   /**
-   * CONTRACTS §17.4: the recorded call for a gRPC request. Same path (entries of the request's origin first); when
+   * CONTRACTS §17.4: the recorded call for a gRPC request. Same origin and path (REVIEW-11 #7); when
    * several share it and some carry a `requestHash`, the first request message decides (`'needs-body'` until it is
    * known; `hash` undefined = none); else the next unused entry in recorded order; then the last one repeats.
    */
@@ -167,14 +167,16 @@ export class ReplayStore {
     if (!u) return undefined;
     const all = this.grpcByPath.get(u.pathname);
     if (!all?.length) return undefined;
-    const same = all.filter((e) => normalizeUrl(e.url)?.origin === u.origin);
-    const group = same.length ? same : all;
+    // REVIEW-11 #7: the request's own origin only (scheme + host + port), like HTTP replay keys: a call recorded from
+    // one server never answers a call to another.
+    const group = all.filter((e) => normalizeUrl(e.url)?.origin === u.origin);
+    if (!group.length) return undefined;
     const hashed = group.length > 1 && group.some((e) => e.grpc?.requestHash);
     if (hashed && first === 'unknown') return 'needs-body';
     const hash = typeof first === 'object' ? first.hash : undefined;
     const byHash = hashed && hash !== undefined ? group.filter((e) => e.grpc?.requestHash === hash) : [];
     const candidates = byHash.length ? byHash : group;
-    const servedKey = `grpc\n${same.length ? u.origin : ''}${u.pathname}\n${byHash.length ? hash : ''}`;
+    const servedKey = `grpc\n${u.origin}${u.pathname}\n${byHash.length ? hash : ''}`;
     const n = this.served.get(servedKey) ?? 0;
     const index = Math.min(n, candidates.length - 1);
     if (count) this.served.set(servedKey, n + 1);

@@ -230,3 +230,12 @@ CONTRACTS §17.1–17.4 and §17.7. Tests: `packages/proxy/test/grpc-parity.test
   **requestHash** = sha256 hex of the first request message's recorded frame bytes (decompressed, ≤ 64 KB, i.e.
   `base64` decoded). It is exported as `grpcMessageHash`, so the recorder must hash the same bytes. The proxy waits
   for the first request message only when several entries share the path and some carry a hash.
+- **REVIEW-11 fixes:**
+  - #4: one 64 MB budget covers message bytes being collected, queued and held (plus decompressed and base64 copies).
+    Bytes are reserved when a message header is read and released when the message leaves the transform or the stream
+    dies. Over budget, the message streams through unhooked with a note.
+  - #5: `finish()` settles a gRPC call's pause, so the timer is cleared and the bytes freed. A held trailers-only
+    status no longer sets `localReset` before it resolves, so the app's cancel ends the call `aborted`.
+  - #6: mutate decodes messages ≤ 1 MB only and stops for a call after 50 MB or 2 s of codec time (with a note).
+  - #7: gRPC replay matches the request's own origin only. A LAN client's gRPC call goes through `lanTargetDenial`
+    before any local answer (mock, replay, block), giving `14` + the SSRF text.

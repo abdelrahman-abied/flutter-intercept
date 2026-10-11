@@ -935,12 +935,16 @@ describe('self-check fallback', () => {
     const proxy = await startProxy();
     try {
       expect(proxy.grpcSupport()).toEqual({ ok: false, problem: 'test: internals missing' });
+      const snapshots: Exchange[] = [];
+      proxy.on('exchange', (e) => snapshots.push(e));
       const s = await h2cSession(proxy.port, `127.0.0.1:${up.port}`);
       const r = await grpcCall(s, '/t.Echo/Unary', ['raw']);
       await new Promise<void>((resolve) => s.close(() => resolve())); // graceful: an abrupt close may end the tunnel as an error
       expect(r.messages.map(String)).toEqual(['echo:raw']);
       const ex = await waitFor(proxy, (e) => e.kind === 'tunnel' && e.state !== 'pending');
-      expect(ex).toMatchObject({ grpcTunnel: true, url: `http://127.0.0.1:${up.port}/`, error: expect.stringMatching(/internals missing/) });
+      expect(ex).toMatchObject({ grpcTunnel: true, url: `http://127.0.0.1:${up.port}/` });
+      // the note is on the tunnel while it is open (a teardown error may replace it at the end)
+      expect(snapshots.some((e) => e.kind === 'tunnel' && /internals missing/.test(e.error ?? ''))).toBe(true);
       expect(proxy.getExchanges().some((e) => e.kind === 'grpc')).toBe(false);
     } finally {
       await proxy.stop();

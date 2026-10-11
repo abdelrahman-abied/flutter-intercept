@@ -368,6 +368,12 @@ interface GrpcCall {
   pauseChain?: Promise<unknown>;
   /** A response-phase breakpoint: the end of the call (its status) is paused too. */
   statusPause?: boolean;
+  /** Hooked links (destroyed with the call, releasing their budget). */
+  transforms?: GrpcMessageTransform[];
+  /** REVIEW-11 #6: codec work spent on this call by mutate (bytes decoded, ms). */
+  mutateBytes?: number;
+  mutateMs?: number;
+  mutateStopped?: boolean;
   isLive(): boolean;
 }
 
@@ -1890,6 +1896,15 @@ export class InterceptProxy extends EventEmitter {
   private finish(ex: Exchange, state: Exchange['state']): void {
     const live = this.live.get(ex.id);
     if (live?.ex === ex) this.setRequestMs(ex, live.flow.te);
+    if (ex.kind === 'grpc') {
+      // REVIEW-11 #5: a pause ends with its call (its timer cleared, its held bytes freed by the pauser).
+      delete ex.grpcPause;
+      const p = this.paused.get(ex.id);
+      if (p && live?.ex === ex) {
+        this.live.delete(ex.id); // the pauser sees the call as gone
+        p.settle({ kind: 'gone' });
+      }
+    }
     ex.state = state;
     ex.durationMs = Date.now() - ex.startedAt;
     delete ex.pausedAt;
@@ -3428,6 +3443,31 @@ export class InterceptProxy extends EventEmitter {
     }
     const a = flow.action;
     let work: Promise<void>;
+    const gate = lanGateOf((req as unknown as { socket?: unknown }).socket);
+    if (gate) {
+      // REVIEW-11 #7: like HTTP's LAN deny rule, before any local answer (mock, replay, block…): a LAN client's call to
+      // this machine or its other networks is refused, in gRPC terms (UNAVAILABLE).
+      work = (gate.closed ? Promise.resolve(`${SSRF_MARKER}: LAN mode is off.`) : lanTargetDenial(req.url, gate.host)).then((reason) => {
+        if (reason) {
+          this.drainGrpcRequest(call);
+          return this.grpcStatusOnly(call, 14, fiText(reason), 'error', reason);
+        }
+        return this.grpcDispatch(call);
+      });
+    } else work = this.grpcDispatch(call);
+    work.catch((e: unknown) => {
+      if (call.isLive()) this.fail(ex, `The gRPC relay failed: ${(e as Error)?.message ?? String(e)}`);
+      this.grpcReset(call, http2.constants.NGHTTP2_INTERNAL_ERROR);
+    });
+    return closed;
+  }
+
+  /** The answer per the call's flow: refusal, fault, block, mock, replay, or the relay. */
+  private grpcDispatch(call: GrpcCall): Promise<void> {
+    const { flow } = call;
+    const a = flow.action;
+    if (!call.isLive()) return Promise.resolve();
+    let work: Promise<void>;
     if (flow.refused) {
       this.drainGrpcRequest(call);
       this.grpcStatusOnly(call, 14, fiText(flow.refused), 'blocked', flow.refused);
@@ -3438,11 +3478,7 @@ export class InterceptProxy extends EventEmitter {
     else if (a?.kind === 'grpcMock') work = this.grpcMock(call, a);
     else if (flow.replay) work = this.grpcReplay(call);
     else work = this.grpcRelay(call, false);
-    work.catch((e: unknown) => {
-      if (call.isLive()) this.fail(ex, `The gRPC relay failed: ${(e as Error)?.message ?? String(e)}`);
-      this.grpcReset(call, http2.constants.NGHTTP2_INTERNAL_ERROR);
-    });
-    return closed;
+    return work;
   }
 
   /** Request messages of a call answered locally: read (and recorded) as they come. */
@@ -3489,10 +3525,11 @@ export class InterceptProxy extends EventEmitter {
         /* gone */
       }
     }
+    for (const t of call.transforms ?? []) t.destroy();
     const hold = this.holds.get(ex.id);
     if (hold) return hold(true); // the timeout fault: the app gave up
-    if (!call.isLive() || call.localReset) return;
     const paused = this.paused.get(ex.id);
+    if (!call.isLive() || (call.localReset && !paused)) return;
     const code = stream.rstCode;
     const deadline = call.info.deadlineMs;
     const elapsedMs = Date.now() - ex.startedAt;
@@ -3753,14 +3790,30 @@ export class InterceptProxy extends EventEmitter {
   /** The hooked link of one direction: whole messages through grpcHook; oversized ones recorded and passed on. */
   private grpcTransform(call: GrpcCall, dir: Frame['dir'], recording: { parser: GrpcMessageParser; rec: GrpcFrameRecorder }): GrpcMessageTransform {
     const cap = () => grpcHookTesting.hookCap ?? GRPC_HOOK_CAP_BYTES;
-    return new GrpcMessageTransform({
+    const t = new GrpcMessageTransform({
       cap,
+      reserve: (n) => this.grpcReserve(n),
+      release: (n) => this.grpcRelease(n),
       onMessage: (m) => this.grpcHook(call, dir, m, recording.rec),
       onOversize: (bytes, start) => {
-        if (start) this.grpcNote(call, `A message over ${Math.round(cap() / 1024 / 1024)} MB was forwarded unchanged (not paused / not mutated).`);
+        if (start?.reason === 'cap') this.grpcNote(call, `A message over ${Math.round(cap() / 1024 / 1024)} MB was forwarded unchanged (not paused / not mutated).`);
+        else if (start) this.grpcNote(call, 'A message was forwarded unchanged (not paused / not mutated): too much gRPC data is held right now.');
         recording.parser.push(bytes);
       },
     });
+    (call.transforms ??= []).push(t);
+    return t;
+  }
+
+  /** REVIEW-11 #4: one budget for gRPC message bytes being collected, queued or held by hooks, across calls. */
+  private grpcReserve(n: number): boolean {
+    if (this.grpcHeld + n > (grpcHookTesting.heldTotalCap ?? GRPC_HELD_TOTAL_CAP_BYTES)) return false;
+    this.grpcHeld += n;
+    return true;
+  }
+
+  private grpcRelease(n: number): void {
+    this.grpcHeld = Math.max(0, this.grpcHeld - n);
   }
 
   /** One whole message of a hooked direction: mutate (response) or pause it; record what was delivered. */
@@ -3798,7 +3851,17 @@ export class InterceptProxy extends EventEmitter {
     }
     const a = flow.action;
     if (a?.kind === 'mutate') return dir === 'receive' ? this.grpcMutate(call, a.ops, plain, forward, record) : forward();
-    return this.grpcPauseMessage(call, dir, m, plain, forward, record);
+    // The decompressed copy counts too (the wire bytes were reserved by the transform).
+    const extra = m.compressed ? plain.length : 0;
+    if (extra && !this.grpcReserve(extra)) {
+      this.grpcNote(call, 'A message was forwarded unchanged (not paused / not mutated): too much gRPC data is held right now.');
+      return forward();
+    }
+    try {
+      return await this.grpcPauseMessage(call, dir, m, plain, forward, record);
+    } finally {
+      if (extra) this.grpcRelease(extra);
+    }
   }
 
   /** CONTRACTS §17.3: decode with the injected codec, applyOps, encode; any failure forwards the original with a note. */
@@ -3816,12 +3879,27 @@ export class InterceptProxy extends EventEmitter {
       /* keep / */
     }
     const codec = this.grpcCodec;
+    // REVIEW-11 #6: the codec runs on the event loop — small messages only, and a budget per call.
+    if (plain.length > GRPC_MUTATE_MAX_BYTES) {
+      this.grpcNote(call, `mutate: messages over ${GRPC_MUTATE_MAX_BYTES / 1024 / 1024} MB are forwarded unchanged.`);
+      return forward();
+    }
+    if (call.mutateStopped) return forward();
+    if ((call.mutateBytes ?? 0) + plain.length > GRPC_MUTATE_CALL_BYTES || (call.mutateMs ?? 0) > GRPC_MUTATE_CALL_MS) {
+      call.mutateStopped = true;
+      this.grpcNote(call, `mutate: stopped for this call after ${GRPC_MUTATE_CALL_BYTES / 1024 / 1024} MB or ${GRPC_MUTATE_CALL_MS / 1000} s of decoding; later messages were forwarded unchanged.`);
+      return forward();
+    }
+    call.mutateBytes = (call.mutateBytes ?? 0) + plain.length;
+    const t0 = performance.now();
+    const spent = () => (call.mutateMs = (call.mutateMs ?? 0) + (performance.now() - t0));
     let json: unknown;
     try {
       json = codec?.decode(path, 'receive', plain);
     } catch {
       json = undefined;
     }
+    if (json === undefined) spent();
     if (json === undefined) {
       this.grpcNote(call, `mutate: no schema for ${path}; messages were forwarded unchanged.`);
       return forward();
@@ -3831,9 +3909,11 @@ export class InterceptProxy extends EventEmitter {
       const changed = applyOps(json, ops, { maxTargets: MUTATE_MAX_TARGETS }).value;
       out = codec!.encode(path, 'receive', changed);
     } catch (e) {
+      spent();
       this.grpcNote(call, `mutate: ${(e as Error)?.message ?? String(e)}; the original message was forwarded.`);
       return forward();
     }
+    spent();
     const payload = Buffer.from(out.buffer, out.byteOffset, out.byteLength);
     record(payload, false, { edited: true });
     call.ex.simulated = `Mutated: ${ops.map((o) => o.path).join(', ')}`.slice(0, 200);
@@ -3859,11 +3939,12 @@ export class InterceptProxy extends EventEmitter {
     return this.grpcSerialPause(call, async (): Promise<HookOutcome> => {
       const { ex } = call;
       if (!call.isLive()) return { kind: 'drop' };
-      if (this.grpcHeld + plain.length > (grpcHookTesting.heldTotalCap ?? GRPC_HELD_TOTAL_CAP_BYTES)) {
+      // The pause's base64 copy (shown to the host) counts on top of the reserved wire bytes.
+      const copy = Math.ceil(plain.length / 3) * 4;
+      if (!this.grpcReserve(copy)) {
         this.grpcNote(call, 'Breakpoint skipped for a message: 64 MB of gRPC messages are already held.');
         return forward();
       }
-      this.grpcHeld += plain.length;
       let d: Decision;
       try {
         ex.grpcPause = { kind: 'message', dir, index: m.index, base64: plain.toString('base64'), size: plain.length };
@@ -3871,7 +3952,7 @@ export class InterceptProxy extends EventEmitter {
         this.emitChange(ex);
         d = await decision;
       } finally {
-        this.grpcHeld -= plain.length;
+        this.grpcRelease(copy);
         delete ex.grpcPause;
       }
       if (d.kind === 'gone' || !call.isLive()) return { kind: 'drop' };
@@ -4092,7 +4173,7 @@ export class InterceptProxy extends EventEmitter {
         if (code !== undefined) info.statusCode = code;
         const msg = decodeGrpcMessage(h['grpc-message']);
         if (msg !== undefined) info.statusMessage = msg;
-        call.localReset = true;
+        if (!call.statusPause) call.localReset = true; // held: the app may still cancel meanwhile (REVIEW-11 #5)
         this.addTimings(ex.id, { receiveMs: 0 });
         void (async () => {
           let out = fwd;
@@ -4104,6 +4185,8 @@ export class InterceptProxy extends EventEmitter {
             for (const k of edited.removed) delete out[k];
             ex.responseHeaders = recordedHeaders(out as HeaderBag);
           }
+          if (!call.isLive() || stream.closed || stream.destroyed) return;
+          call.localReset = true;
           try {
             stream.respond(out, { endStream: true });
             this.grpcEndRequestSide(call);
@@ -5085,6 +5168,10 @@ const REWRITE_SKIPPED = new Set([
 
 /** Headers a replayed response doesn't carry over: the proxy frames the body itself. */
 const REPLAY_DROPPED_HEADERS = new Set(['content-length', 'transfer-encoding', 'connection', 'keep-alive', 'proxy-connection', 'trailer', 'upgrade']);
+/** REVIEW-11 #6: mutate decodes synchronously, so only messages up to this size, and per call at most this much work. */
+const GRPC_MUTATE_MAX_BYTES = 1024 * 1024;
+const GRPC_MUTATE_CALL_BYTES = 50 * 1024 * 1024;
+const GRPC_MUTATE_CALL_MS = 2000;
 /** CONTRACTS §17.4: recorded gRPC headers / trailers a replay doesn't send (the proxy sets them, or they'd be wrong). */
 const REPLAY_GRPC_DROPPED = new Set([
   ...REPLAY_DROPPED_HEADERS,

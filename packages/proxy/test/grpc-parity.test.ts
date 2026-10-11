@@ -4,8 +4,10 @@ import * as http2 from 'http2';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Exchange, GrpcProxyCodec, InterceptProxy, ReplayEntry, Rule } from '../src';
 import { decodeGrpcMessage, grpcHookTesting, grpcTransformStats } from '../src/grpc';
+import { lanIPv4Addresses, lanTesting } from '../src/lan';
+import { randomBytes } from 'crypto';
 import { nextExchange, sleep, startProxy } from './helpers';
-import { grpcCall, h2cSession, startGrpcServer, type GrpcServer } from './grpc-helpers';
+import { frame, grpcCall, h2cSession, startGrpcServer, type GrpcServer } from './grpc-helpers';
 
 const C = http2.constants;
 const rule = (id: string, url: string, action: Rule['action']): Rule => ({ id, enabled: true, match: { url }, action });
@@ -186,7 +188,7 @@ describe('gRPC breakpoints', () => {
     const r2 = await grpcCall(session, '/t.Echo/Unary', ['small']);
     expect(r2.messages.map(String)).toEqual(['echo:small']);
     ex = await waitFor(proxy, (e) => doneGrpc('/t.Echo/Unary')(e) && e.id !== ex.id);
-    expect(ex.error).toMatch(/64 MB of gRPC messages are already held/);
+    expect(ex.error).toMatch(/too much gRPC data is held right now/); // REVIEW-11 #4: refused when collecting starts
   });
 
   it('gzip messages are paused decompressed; an edit goes out uncompressed', async () => {
@@ -320,5 +322,119 @@ describe('replay of recorded gRPC calls', () => {
     proxy.setReplay([], { fallback: 'fail' });
     const r = await grpcCall(session, '/t.Echo/Unary', ['x']);
     expect(r).toMatchObject({ trailersOnly: true, grpcStatus: 14 });
+  });
+});
+
+// ---------------------------------------------------------------- REVIEW-11 regressions
+
+const internals = (p: InterceptProxy) => p as unknown as { grpcHeld: number; paused: Map<string, unknown> };
+
+describe('REVIEW-11', () => {
+  it('#4 collected / held hook bytes stay within the budget; beyond it messages stream through with a note', async () => {
+    grpcHookTesting.heldTotalCap = 10 * 1024 * 1024;
+    proxy.setRules([rule('bp', '*/t.Echo/Unary', { kind: 'breakpoint', phase: 'request' })]);
+    const size = 4 * 1024 * 1024 - 64;
+    const streams: http2.ClientHttp2Stream[] = [];
+    for (let i = 0; i < 8; i++) {
+      const s = session.request({ ':method': 'POST', ':path': '/t.Echo/Unary', 'content-type': 'application/grpc', te: 'trailers' });
+      s.on('error', () => undefined);
+      s.write(frame(Buffer.alloc(size)).subarray(0, 5 + size - 1)); // never completes: nothing pauses
+      streams.push(s);
+    }
+    await sleep(800);
+    expect(internals(proxy).grpcHeld).toBeLessThanOrEqual(10 * 1024 * 1024);
+    expect(internals(proxy).grpcHeld).toBeGreaterThan(0);
+    expect(proxy.getExchanges().some((e) => (e.error ?? '').includes('too much gRPC data is held'))).toBe(true);
+    for (const s of streams) s.close(C.NGHTTP2_CANCEL);
+    await sleep(200);
+    expect(internals(proxy).grpcHeld).toBe(0);
+  });
+
+  it('#5a a held message ends with its call when the server resets: pause settled, bytes freed, state error', async () => {
+    proxy.setRules([rule('bp', '*/t.Echo/ResetNow', { kind: 'breakpoint', phase: 'request' })]);
+    const r = await grpcCall(session, '/t.Echo/ResetNow', [Buffer.alloc(1024 * 1024, 1)]);
+    expect(r).toMatchObject({ trailersOnly: true, grpcStatus: 14 });
+    const ex = await waitFor(proxy, doneGrpc('/t.Echo/ResetNow'));
+    await sleep(10);
+    expect(ex.state).toBe('error');
+    expect(ex.grpcPause).toBeUndefined();
+    expect(internals(proxy).paused.size).toBe(0);
+    expect(internals(proxy).grpcHeld).toBe(0);
+  });
+
+  it('#5b a held trailers-only status honours the app’s cancel: aborted, nothing left paused', async () => {
+    proxy.setRules([rule('bp', '*/t.Echo/Fail', { kind: 'breakpoint', phase: 'response' })]);
+    const call = grpcCall(session, '/t.Echo/Fail', ['x'], { deadlineMs: 400 });
+    await paused(proxy, pausedStatus);
+    expect((await call).rstCode).toBe(C.NGHTTP2_CANCEL);
+    const ex = await waitFor(proxy, doneGrpc('/t.Echo/Fail'));
+    expect(ex.state).toBe('aborted');
+    expect(ex.grpcPause).toBeUndefined();
+    expect(internals(proxy).paused.size).toBe(0);
+  });
+
+  it('#6 mutate: messages over 1 MB are not decoded; a call stops mutating after its codec budget', async () => {
+    let calls = 0;
+    proxy.setGrpcCodec({
+      decode(_p, _d, bytes) {
+        calls++;
+        const until = Date.now() + 700;
+        while (Date.now() < until) {
+          /* a slow schema */
+        }
+        return { s: Buffer.from(bytes).toString() };
+      },
+      encode: (_p, _d, json) => Buffer.from(`m:${(json as { s: string }).s}`),
+    });
+    proxy.setRules([rule('m', '*/t.Echo/*', { kind: 'mutate', ops: [{ path: '$.x', op: 'set', value: 1 }] })]);
+    const big = await grpcCall(session, '/t.Echo/Unary', [Buffer.alloc(1024 * 1024 + 10, 65)]);
+    expect(big.messages[0].length).toBe(1024 * 1024 + 15);
+    expect(calls).toBe(0);
+    expect((await waitFor(proxy, doneGrpc('/t.Echo/Unary'))).error).toMatch(/over 1 MB are forwarded unchanged/);
+    const s = await grpcCall(session, '/t.Echo/ServerStream', ['5']);
+    expect(calls).toBe(3); // 3 × 0.7 s > 2 s, then stopped
+    expect(s.messages.map(String)).toEqual(['m:msg0', 'm:msg1', 'm:msg2', 'msg3', 'msg4']);
+    expect((await waitFor(proxy, doneGrpc('/t.Echo/ServerStream'))).error).toMatch(/mutate: stopped for this call/);
+  }, 20_000);
+
+  it('#7 replay never answers across origins (the fallback applies)', async () => {
+    proxy.setReplay(
+      [{ kind: 'grpc', method: 'POST', url: 'https://api.a.example/t.Echo/Unary', status: 200, headers: {}, frames: [{ dir: 'receive', at: 0, kind: 'message', size: 5, base64: b64('tokA!') }], grpc: { code: 0 } }],
+      { fallback: 'passthrough' },
+    );
+    expect((await grpcCall(session, '/t.Echo/Unary', ['real'])).messages.map(String)).toEqual(['echo:real']);
+    proxy.setReplay(
+      [{ kind: 'grpc', method: 'POST', url: 'https://api.a.example/t.Echo/Unary', status: 200, headers: {}, frames: [], grpc: { code: 0 } }],
+      { fallback: 'fail' },
+    );
+    expect(await grpcCall(session, '/t.Echo/Unary', ['x'])).toMatchObject({ trailersOnly: true, grpcStatus: 14 });
+  });
+});
+
+const LAN_IP = lanIPv4Addresses()[0];
+
+describe.skipIf(!LAN_IP)('REVIEW-11 #7: the LAN deny rule comes before local gRPC answers', () => {
+  it('a LAN client’s call to a forbidden target gets UNAVAILABLE, not the mock or the recording', async () => {
+    const token = randomBytes(32).toString('base64url');
+    const auth = `Basic ${Buffer.from(`flutter-intercept:${token}`).toString('base64')}`;
+    const lanUp = await startGrpcServer({ host: LAN_IP });
+    let checks = 0;
+    lanTesting.allowTarget = (ip, port) => ip === LAN_IP && port === lanUp.port && ++checks === 1; // the gate's check only
+    const p = await startProxy();
+    try {
+      const lanPort = (await p.openLan({ host: LAN_IP!, token })).port;
+      p.setRules([rule('g', '*/t.Echo/Unary', { kind: 'grpcMock', messages: [b64('mocked')] })]);
+      const s = await h2cSession(lanPort, `${LAN_IP}:${lanUp.port}`, { host: LAN_IP, headers: { 'Proxy-Authorization': auth } });
+      const r = await grpcCall(s, '/t.Echo/Unary', ['x']);
+      s.destroy();
+      expect(r).toMatchObject({ trailersOnly: true, grpcStatus: 14, messages: [] });
+      expect(decodeGrpcMessage(r.grpcMessage)).toMatch(/^Flutter Intercept: blocked a LAN client/);
+      const ex = await waitFor(p, doneGrpc('/t.Echo/Unary'));
+      expect(ex).toMatchObject({ state: 'error', viaLan: true });
+    } finally {
+      await p.stop();
+      await lanUp.close();
+      delete lanTesting.allowTarget;
+    }
   });
 });

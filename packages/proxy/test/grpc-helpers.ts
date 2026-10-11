@@ -77,6 +77,12 @@ export async function startGrpcServer(opts: { tls?: { key: string; cert: string 
     const enc = headers['grpc-encoding'];
     const decode = (m: { compressed: boolean; payload: Buffer }) => (m.compressed && enc === 'gzip' ? zlib.gunzipSync(m.payload) : m.payload);
     const name = path.split('/').pop();
+    if (name === 'ResetNow') {
+      // Resets as soon as the call starts (before reading anything).
+      done = true;
+      stream.close(C.NGHTTP2_INTERNAL_ERROR);
+      return;
+    }
     if (name === 'Fail') {
       done = true;
       stream.respond({ ':status': 200, 'content-type': 'application/grpc', 'grpc-status': '14', 'grpc-message': 'upstream%20says%20no' }, { endStream: true });

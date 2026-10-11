@@ -460,17 +460,33 @@ export class GrpcMessageTransform extends Transform {
   private remaining = 0;
   private parts: Buffer[] = [];
   private index = 0;
+  /** Budget bytes reserved for the message being collected / hooked (REVIEW-11 #4). */
+  private reserved = 0;
 
   constructor(
     private readonly o: {
       cap: () => number;
+      /** Reserve bytes of the global held budget for a message about to be collected (false = over budget). */
+      reserve: (n: number) => boolean;
+      release: (n: number) => void;
       onMessage: (m: HookedMessage) => HookOutcome | Promise<HookOutcome>;
-      /** Bytes of a message over the cap (its header first, then its payload as it streams). */
-      onOversize: (bytes: Buffer, start?: { index: number; size: number }) => void;
+      /** Bytes of a message streamed through unhooked (its header first, then its payload as it streams). */
+      onOversize: (bytes: Buffer, start?: { index: number; size: number; reason: 'cap' | 'budget' }) => void;
     },
   ) {
     super();
     grpcTransformStats.created++;
+  }
+
+  override _destroy(err: Error | null, cb: (e: Error | null) => void): void {
+    this.releaseReserved();
+    this.parts = [];
+    cb(err);
+  }
+
+  private releaseReserved(): void {
+    if (this.reserved) this.o.release(this.reserved);
+    this.reserved = 0;
   }
 
   override _transform(chunk: Buffer, _e: BufferEncoding, cb: TransformCallback): void {
@@ -487,6 +503,8 @@ export class GrpcMessageTransform extends Transform {
       this.push(Buffer.from(this.header));
       for (const p of this.parts) this.push(p);
     }
+    this.parts = [];
+    this.releaseReserved();
     cb();
   }
 
@@ -512,13 +530,16 @@ export class GrpcMessageTransform extends Transform {
           continue;
         }
         this.remaining = this.header.readUInt32BE(1);
-        if (this.remaining > this.o.cap()) {
+        const overCap = this.remaining > this.o.cap();
+        if (overCap || !this.o.reserve(this.remaining)) {
           this.mode = 'stream';
           const h = Buffer.from(this.header);
           this.push(h);
-          this.o.onOversize(h, { index: this.index++, size: this.remaining });
+          this.o.onOversize(h, { index: this.index++, size: this.remaining, reason: overCap ? 'cap' : 'budget' });
+          if (this.remaining === 0) this.mode = 'header';
           continue;
         }
+        this.reserved = this.remaining;
         this.mode = 'payload';
         this.parts = [];
         if (this.remaining === 0) await this.message();
@@ -551,6 +572,7 @@ export class GrpcMessageTransform extends Transform {
     } catch {
       out = { kind: 'forward' };
     }
+    this.releaseReserved(); // the message leaves the transform now (pushed downstream or dropped)
     if (this.destroyed) return;
     if (out.kind === 'forward') {
       this.push(header);
