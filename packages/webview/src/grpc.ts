@@ -287,6 +287,7 @@ export function grpcActionNote(kind: string, stepKinds?: readonly string[]): str
 /** CONTRACTS §18.1: metadata a rewrite may not set or remove on gRPC calls (status changes: breakpoint / mutate / script). */
 const RESERVED_GRPC_METADATA = new Set([
   'content-type', 'te', 'grpc-encoding', 'grpc-accept-encoding', 'grpc-status', 'grpc-message', 'grpc-timeout',
+  'grpc-status-details-bin', // REVIEW-12 / CONTRACTS §18.6: rich error details belong to the status
 ]);
 export function reservedGrpcMetadata(name: string): boolean {
   const n = name.trim().toLowerCase();
@@ -299,7 +300,8 @@ export function grpcMetadataError(name: string, value: string | undefined, what:
   if (!n) return undefined;
   if (reservedGrpcMetadata(n)) {
     return `${what} “${n}” can't be changed on gRPC calls (pseudo headers, content-type, te, grpc-encoding, grpc-accept-encoding, ` +
-      'grpc-status, grpc-message and grpc-timeout are reserved — change the status with a breakpoint, Mutate JSON or a script)';
+      'grpc-status, grpc-message, grpc-status-details-bin and grpc-timeout are reserved — change the status with a breakpoint, ' +
+      'Mutate JSON or a script)';
   }
   if (value !== undefined && /-bin$/i.test(n) && !isBase64(value.trim())) return `${what} “${n}”: a -bin value must be base64`;
   return undefined;

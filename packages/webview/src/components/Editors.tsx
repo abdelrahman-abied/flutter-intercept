@@ -342,9 +342,9 @@ function GrpcComposerView() {
           <Button kind="icon" title="Close (Esc)" onClick={close}><Icon name="close" /></Button>
         </div>
         <p class="hint">
-          The proxy opens its own HTTP/2 call (POST, content-type application/grpc), sends these messages, half-closes and
-          lists the call with every response message — rules and the network profile apply. Deadline 60 s unless a
-          grpc-timeout header says otherwise.
+          Sent through the proxy like app traffic: rules and the network profile apply, and the call appears in the list
+          with every response message. The proxy opens its own HTTP/2 call (POST, content-type application/grpc), sends
+          these messages and half-closes. Deadline 60 s unless a grpc-timeout header says otherwise.
         </p>
         <div class="pe-line">
           <input class="pe-url" aria-label="URL" spellcheck={false} value={draft.url} disabled={busy}

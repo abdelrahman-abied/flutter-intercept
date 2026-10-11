@@ -106,6 +106,8 @@ describe('pure helpers (CONTRACTS §18)', () => {
 
   it('reserved gRPC metadata in headers: refused on gRPC URLs only', () => {
     expect(reservedGrpcMetadata('grpc-timeout')).toBe(true);
+    expect(reservedGrpcMetadata('grpc-status-details-bin')).toBe(true); // REVIEW-12
+    expect(rewriteError({ ...emptyRewriteForm(), removeTrailers: 'grpc-status-details-bin' })).toMatch(/reserved/);
     expect(reservedGrpcMetadata('Content-Type')).toBe(true);
     expect(reservedGrpcMetadata('authorization')).toBe(false);
     expect(grpcMetadataError('x-ok', 'v', 'Header')).toBeUndefined();
@@ -195,6 +197,7 @@ describe('Resend / Edit & resend for gRPC calls', () => {
     await click(button(/Edit and resend/, $('.detail-actions')!));
     const editor = $('.grpc-composer')!;
     expect(editor.textContent).toContain(`from ${URL_G}`);
+    expect($('.hint', editor)!.textContent).toMatch(/^\s*Sent through the proxy like app traffic: rules and the network profile apply/);
     expect($<HTMLTextAreaElement>('textarea[aria-label="Request message 1"]')!.value).toBe('{\n  "id": "42"\n}');
     expect($$('.grpc-composer .he-name').map((i) => (i as HTMLInputElement).value)).toEqual(['authorization', 'x-user']);
     await click(button('+ Add message', editor));
