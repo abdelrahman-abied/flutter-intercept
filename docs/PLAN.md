@@ -246,3 +246,13 @@ case (breakpoint edit seen by the app, mutate seen, record → replay codes 0/5/
 runs the machine lost its internet connection once and the Android emulator hung (adb unresponsive); its agent and
 device cases were not rerun for 0.11 (0.10 passed them). Not verified: Android emulator for 0.11, physical iPhone,
 connectrpc against a real app, mTLS on gRPC upstreams, IPv6 targets, Edge.
+
+
+## v0.12.0 — gRPC tools complete (started 2026-10-11, branch `feature/0.12.0`)
+Contract: CONTRACTS §18. Owner instruction: take every decision in the project's interest; multi-agent.
+| Agent | Owns |
+|---|---|
+| P proxy | rewrite metadata / trailers, gRPC script hooks, map remote upstream, `send` for gRPC, `grpcApplicable` — `packages/proxy/**` except `types.ts` |
+| H host + agents | rule validation + shared-rule approval for gRPC rewrites / scripts / map remote, resend / edit & resend (messagesJson encoding), script template with gRPC hooks, agent tools — `src/agent/**`, `src/ui/controller.ts`, `src/proxyHost.ts`, `src/rules/**`, `src/grpc/service.ts`, their tests, `test/integration/suite/agent.ts` |
+| W webview | rewrite trailers fields, scripts / map remote / resend / edit & resend on gRPC rows, notes removed — `packages/webview/**` except `protocol.ts` |
+| lead | contract, types, wiring, docs, E2E, review |

@@ -1970,3 +1970,59 @@ The transform's caps (4 MB hold, decompression bound), held-message memory per c
 messages across calls, beyond that new pauses are skipped with a note), codec calls bounded (no recursion bombs:
 §16.3 limits), recordings never write unredacted messages when `redact` is set, `.proto` parser bounded and linear,
 `resume` edits validated (base64, size, status range, trailer names).
+
+
+## 18. v0.12.0 — gRPC tools complete (2026-10-11)
+
+Goal: the last HTTP tools that skip gRPC calls — **rewrite**, **scripts**, **map remote** and **resend / edit &
+resend** — now work on gRPC (grpc-dart calls the proxy can read: h2c and `grpcDecryptHosts`). Owner instruction: take
+every decision in the project's interest. Plan and owners: docs/PLAN.md "v0.12.0". Types already in code:
+`packages/proxy/src/types.ts` (`RewriteSpec.setTrailers / removeTrailers`, `GrpcScriptMessage`, `GrpcScriptStatus`,
+`SendRequest.grpc`). After 0.12 `grpcApplicable` covers every rule action except `cors` (browser-only) — and `mock`
+(HTTP bodies; gRPC has `grpcMock`).
+
+### 18.1 Rewrite (metadata)
+- `rewrite.request.setHeaders / removeHeaders` change the gRPC request metadata before it goes upstream;
+  `rewrite.response.setHeaders / removeHeaders` the response headers; new `rewrite.response.setTrailers /
+  removeTrailers` the trailers (custom metadata only). Pseudo headers, `content-type`, `te`, `grpc-encoding`,
+  `grpc-accept-encoding`, `grpc-status`, `grpc-message`, `grpc-timeout` are refused in set / remove (status changes use a
+  breakpoint, mutate or a `script`); `-bin` values must be valid base64. `replaceBody` and `response.status` don't apply
+  to gRPC (protobuf bodies; use `mutate` / `script`) — such a rule still applies its metadata parts and the exchange
+  gets a note. `setTrailers / removeTrailers` are ignored for HTTP (plain HTTP/1.1 has no trailers in practice).
+- Shared-rule approval as today (request-header rewrites need approval).
+
+### 18.2 Scripts
+- A `script` rule's code may also define `onGrpcMessage(message, context)` and `onGrpcStatus(status, context)`; HTTP
+  hooks (`onRequest` / `onResponse`) are not called for gRPC calls and vice versa.
+- `onGrpcMessage` receives `GrpcScriptMessage {path, dir, index, json?, base64, size}` for every message of a matching
+  call (both directions), `json` decoded with the host codec (absent with no schema / over 1 MB). Return `undefined`
+  (unchanged), `{json}` (encoded with the schema; encode errors go to the script log and the original is sent),
+  `{base64}`, or `{drop: true}`. `onGrpcStatus` receives `GrpcScriptStatus {path, code, message?, trailers}` before
+  the trailers go to the app and may return `{code?, message?, trailers?}` (same validation as a breakpoint status
+  edit). Same sandbox, time limit per call (the 0.7 script limits), `context.log` → `scriptLog`; a throw → original
+  passes, error logged. Hooks run on the 0.11 message transform (hook path only when a script rule matches).
+
+### 18.3 Map remote
+- `mapRemote.to` (origin or URL prefix) sends a matching gRPC call to another server: upstream session to the mapped
+  origin (same LAN SSRF guard, upstream proxy, client certificates for the new host), `:authority` = the new host unless
+  `preserveHost`, `:path` rewritten by prefix like HTTP. `https` targets use TLS + ALPN h2, `http` targets h2c. The
+  exchange keeps the app's URL and gets `simulated: "Mapped to <origin>"` like HTTP. Shared-rule approval as today.
+
+### 18.4 Resend / edit & resend
+- `InterceptProxy.send` accepts `SendRequest.grpc = {messages: string[] (base64)}` for a gRPC URL
+  (`/pkg.Service/Method`, method POST): the proxy opens its own HTTP/2 call (same upstream path as the relay,
+  `content-type: application/grpc`, `te: trailers`, the given headers minus pseudo / hop-by-hop / `grpc-encoding`), sends
+  the messages uncompressed, half-closes, and records a normal gRPC exchange (`initiator`, `resentFrom`) with all
+  response messages, status and trailers. Unary and server-streaming; client / bidi streaming send all messages then
+  half-close (documented). ≤ 100 messages, ≤ 4 MB each, ≤ 16 MB total; deadline 60 s (`grpc-timeout: 60S`) unless the
+  headers carry one.
+- Host: `resend` of a gRPC exchange re-sends its recorded request messages (refused when one was truncated /
+  `sizeUnknown`); edit & resend takes `messagesJson` (encoded with the request type) or base64. Agents:
+  `resend_request` gains `grpc: {messagesJson? | messages?}`; `get_request` snippets stay HTTP-only (a `grpcurl`
+  snippet is a later item).
+- Webview: Resend / Edit & resend for gRPC rows (JSON editor per message when the schema decodes, base64 otherwise).
+
+### 18.5 Security review items
+Rewrite validation (reserved metadata, CR/LF, base64 `-bin`), script hooks bounded (time, size, message count per call),
+map remote never bypasses the LAN SSRF guard or the client-certificate Origin rule, send caps and deadline, resend from
+LAN-recorded exchanges only to the same targets the LAN guard allows, agents' `resend_request grpc` behind write access.

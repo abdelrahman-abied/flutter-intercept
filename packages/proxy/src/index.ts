@@ -74,6 +74,8 @@ export type {
   GrpcPause,
   GrpcEdit,
   GrpcProxyCodec,
+  GrpcScriptMessage,
+  GrpcScriptStatus,
 } from './types';
 // v0.10.0 (CONTRACTS §16.2)
 export {

@@ -234,7 +234,9 @@ export type RuleAction =
   /** Forward to another server (origin, or URL prefix replacing the matched prefix); the app sees the original URL. */
   | { kind: 'mapRemote'; to: string; preserveHost?: boolean }
   /** Change headers / status / body text of the real request or response (literal find/replace, no regex). */
-  | { kind: 'rewrite'; request?: RewriteSpec; response?: RewriteSpec & { status?: number } }
+  | { kind: 'rewrite'; request?: RewriteSpec; response?: RewriteSpec & { status?: number;
+      /** CONTRACTS §18.1: gRPC trailers (custom metadata only); ignored for HTTP. */
+      setTrailers?: Record<string, string>; removeTrailers?: string[] } }
   // CONTRACTS §13.4 (v0.7.0)
   /**
    * Run JavaScript hooks (`onRequest` / `onResponse`, see ScriptRequest) on matching traffic. `code` is the
@@ -323,6 +325,27 @@ export interface SendRequest {
   body?: string;
   initiator: 'editor' | 'agent';
   resentFrom?: string;
+  /** CONTRACTS §18.4: send a gRPC call (url `/pkg.Service/Method`, method POST): the request messages, base64. */
+  grpc?: { messages: string[]; messagesJson?: unknown[] };
+}
+
+/** CONTRACTS §18.2: what a script's `onGrpcMessage(message, context)` receives. */
+export interface GrpcScriptMessage {
+  path: string;                    // /pkg.Service/Method
+  dir: 'send' | 'receive';
+  index: number;
+  /** Decoded with the app's schema; absent without one or over 1 MB. */
+  json?: unknown;
+  base64: string;
+  size: number;
+}
+
+/** CONTRACTS §18.2: what `onGrpcStatus(status, context)` receives (and may return edited: code / message / trailers). */
+export interface GrpcScriptStatus {
+  path: string;
+  code: number;
+  message?: string;
+  trailers: Record<string, string | string[]>;
 }
 
 // `headers`, when present, REPLACES the whole header set. `body` is the decoded text;
