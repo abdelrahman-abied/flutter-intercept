@@ -183,11 +183,15 @@ function grpcTarget(i: Record<string, unknown>, fmt: (v: unknown) => string): st
   return i.url !== undefined ? fmt(i.url) : fmt(`${String(i.service ?? '?')}/${String(i.method ?? '?')}`);
 }
 
-/** `14 (UNAVAILABLE)` / `OK` for a gRPC code given as number or name. */
-function grpcCodeText(code: unknown): string {
-  if (code === undefined || code === 0 || code === 'OK') return 'OK';
-  const name = typeof code === 'number' ? GRPC_CODE_NAMES[code] : undefined;
-  return name ? `${code} (${name})` : String(code).replace(/[\r\n]/g, ' ').slice(0, 40);
+/**
+ * `14 (UNAVAILABLE)` / `OK` for a valid gRPC code (0–16 or a canonical name); anything else (refused by validation
+ * anyway) is shown only as inline code (REVIEW-10 #6).
+ */
+function grpcCodeText(value: unknown): string {
+  if (value === undefined || value === 0 || value === 'OK') return 'OK';
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < GRPC_CODE_NAMES.length) return `${value} (${GRPC_CODE_NAMES[value]})`;
+  if (typeof value === 'string' && (GRPC_CODE_NAMES as readonly string[]).includes(value)) return `${GRPC_CODE_NAMES.indexOf(value as (typeof GRPC_CODE_NAMES)[number])} (${value})`;
+  return `invalid code ${code(String(value).slice(0, 40))}`;
 }
 
 /** "500 ×2, then the real server" for add_sequence's steps. */
@@ -442,7 +446,7 @@ export function confirmationText(
       return {
         title: 'Add a gRPC mock rule',
         message:
-          `Answer gRPC calls to ${code(i.url ?? `${String(i.service ?? '?')}/${String(i.method ?? '?')}`)} with ${n ? `**${n}** message${n === 1 ? '' : 's'}` : 'no messages'}, then status **${grpcCodeText(i.code)}**${msg}` +
+          `Answer gRPC calls to ${code(i.url ?? `${String(i.service ?? '?')}/${String(i.method ?? '?')}`)} with ${n ? `**${n}** message${n === 1 ? '' : 's'}` : 'no messages'}, then status ${grpcCodeText(i.code).replace(/^([^`]+)$/, '**$1**')}${msg}` +
           `${typeof i.delayMs === 'number' && i.delayMs ? `, after ${i.delayMs} ms` : ''}${named}${spendText(i)}.\n\n` +
           'Inserted as the first rule: matching calls from the app get this answer and never reach the server.',
       };

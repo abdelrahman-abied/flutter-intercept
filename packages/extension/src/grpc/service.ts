@@ -269,6 +269,30 @@ export function createGrpcSchemaService(deps: GrpcSchemaServiceDeps): GrpcSchema
   return service;
 }
 
+/**
+ * REVIEW-10 #4 backstop: every absolute path in `text` (POSIX `/…`, Windows `C:\…`, UNC `\\host\…`, `file://` URIs),
+ * starting at the beginning or after whitespace / a quote / a bracket, replaced by `show(path)`.
+ */
+export function scrubAbsolutePaths(text: string, show: (absPath: string) => string, literals: readonly string[] = []): string {
+  // A path to a .dart / .json file may contain spaces ("/Users/Ada Lovelace/app/x.pb.dart"): matched up to the
+  // extension first; other paths end at whitespace or punctuation.
+  const PATH = /(^|[\s"'`(\[{<=])(file:\/\/[^"'`()\]}<>\n]*?\.(?:dart|json)\b|file:\/\/[^\s"'`()\]}<>,;]+|\/[^"'`()\]}<>\n:]*?\.(?:dart|json)\b|\/[^\s"'`()\]}<>:,;]+|[A-Za-z]:[\\/][^"'`()\]}<>\n:]*?\.(?:dart|json)\b|[A-Za-z]:[\\/][^\s"'`()\]}<>:,;]+|\\\\[^\s"'`()\]}<>:,;]+)/g;
+  let out = text.replace(PATH, (_m, pre: string, p: string) => {
+    let abs = p;
+    if (abs.startsWith('file://')) {
+      try {
+        abs = decodeURIComponent(new URL(abs).pathname);
+      } catch {
+        abs = abs.slice('file://'.length);
+      }
+    }
+    return `${pre}${show(abs)}`;
+  });
+  // Last guard: known folders (project root, home) never survive, whatever text surrounds them.
+  for (const lit of literals) if (lit && lit.length > 1) out = out.split(lit).join('…');
+  return out;
+}
+
 // ------------------------------------------------------------------ methods and URLs
 
 /** `/pkg.Service/Method` of a gRPC exchange URL (its path), or undefined. */

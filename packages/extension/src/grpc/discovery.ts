@@ -8,6 +8,8 @@
  * - Never follows symbolic links (files or folders), and every file read must real-resolve inside the root it was found
  *   under (no escapes through a symlinked parent). `build/`, `.dart_tool/`, `.git/`, `node_modules/` and the other
  *   tool folders are skipped (package_config.json is read directly).
+ * - Every file carries a display `label` (root-relative or `package:<name>/…`) for problem texts; Node errors are
+ *   reported by code (`EACCES`, `ENOENT`), never by their message (it holds the absolute path) — REVIEW-10 #4.
  * - Caps: MAX_GRPC_FILES files, MAX_GRPC_FILE_BYTES each (larger files are skipped and reported), MAX_GRPC_TOTAL_BYTES in
  *   all, MAX_DIR_ENTRIES directory entries visited. Problems are plain words (≤ 50).
  */
@@ -220,12 +222,14 @@ class Scan {
     try {
       text = await this.f.readFile(real);
     } catch (e) {
-      this.problem(`gRPC schema: could not read ${label}: ${(e as Error)?.message ?? String(e)}`.slice(0, 300));
+      // REVIEW-10 #4: Node's error text carries the absolute path; only its code is reported.
+      const code = (e as NodeJS.ErrnoException)?.code;
+      this.problem(`gRPC schema: could not read ${label}${typeof code === 'string' && /^[A-Z0-9_]{2,20}$/.test(code) ? ` (${code})` : ''}`);
       return;
     }
     if (text.length > MAX_GRPC_FILE_BYTES) return; // changed in between
     this.bytes += st.size;
-    this.files.push({ path: file, text });
+    this.files.push({ path: file, text, label });
   }
 }
 
@@ -253,7 +257,7 @@ export async function discoverGrpcFiles(roots: readonly string[], f: GrpcFs = no
     const found = await scan.walk(root, GRPC_FILE);
     if (found.length) scan.sources.push(root);
     for (const file of found) {
-      await scan.read(file, real, path.relative(root, file) || path.basename(file));
+      await scan.read(file, real, path.relative(root, file).split(path.sep).join('/') || path.basename(file));
       if (scan.stopped) return result(scan);
     }
   }

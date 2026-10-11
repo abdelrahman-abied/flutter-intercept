@@ -31,7 +31,9 @@
  *   TLS passthrough list, also a constructor option) and reports the proxy's gRPC self-check (`grpcProblem`); event
  *   'grpc' after either changes. `grpcMock.messagesJson` (also in sequence steps) is encoded into `messages` through an
  *   injected encoder (`setGrpcMessageEncoder`, src/grpc/service.ts `grpcMockEncoder`) before rules reach the proxy, like
- *   `mock.bodyFile`: a rule whose messages can't be encoded is skipped and reported as a warning.
+ *   `mock.bodyFile`: a rule whose messages can't be encoded is skipped and reported as a warning. §16.8: the proxy's
+ *   'grpcBreaker' event becomes a `bypass` session warning (`grpc-breaker:<authority>`), cleared with
+ *   `clearGrpcBreakerWarnings()` (the controller calls it when the last debug session ends) and on proxy stop.
  */
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
@@ -94,6 +96,8 @@ export interface ProxyLike {
   setGrpcDecryptHosts?(hosts: string[]): void | { hosts: string[]; problems: string[] };
   /** The gRPC self-check of the mockttp internals the silent tunnels use. */
   grpcSupport?(): { ok: boolean; problem?: string };
+  /** CONTRACTS §16.8: the entry's breaker sent an app's gRPC connections to an authority direct (`{authority, viaLan}`). */
+  on(event: 'grpcBreaker', l: (info: unknown) => void): unknown;
 }
 
 /** REVIEW-6 #1: `host:port` of an upstream proxy URL — never user info, path or query. */
@@ -474,6 +478,8 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private grpcHostsUnsupportedLogged = false;
   private grpcCheck?: { ok: boolean; problem?: string };
   private grpcEncoder?: GrpcMessageEncoder;
+  /** §16.8 breaker warnings by authority (insertion order kept). */
+  private readonly breakerWarnings = new Map<string, SessionWarning>();
 
   constructor(private readonly opts: InterceptProxyHostOptions) {
     super();
@@ -564,6 +570,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       proxy.on('removed', (ids) => this.emit('removed', ids));
       proxy.on('rule-spent', (ruleId, reason) => this.emit('rule-spent', ruleId, reason));
       proxy.on('rule-hit', (ruleId, used) => this.emit('rule-hit', ruleId, used));
+      proxy.on('grpcBreaker', (info) => this.onGrpcBreaker(info));
       this.proxy = proxy;
       if (this.setConfigWarningLater !== undefined) {
         this.setConfigWarning('tlsPassthrough', this.setConfigWarningLater || undefined);
@@ -591,6 +598,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       this.emit('lan', undefined);
     }
     this.proxy = undefined;
+    this.clearGrpcBreakerWarnings();
     try {
       if (proxy) {
         await proxy.stop();
@@ -1040,6 +1048,39 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     }
   }
 
+  /**
+   * CONTRACTS §16.8: the entry's circuit breaker tripped for `authority` (the app connected to it directly for 30 s).
+   * Shown as a `bypass` session warning until the debug sessions end. The payload comes from the proxy: checked and
+   * capped, never trusted as markup.
+   */
+  private onGrpcBreaker(info: unknown): void {
+    const raw = info && typeof info === 'object' ? (info as { authority?: unknown }).authority : undefined;
+    if (typeof raw !== 'string') return;
+    const authority = raw.replace(/[\0-\x1f\x7f]+/g, '').trim().slice(0, 300);
+    if (!authority) return;
+    const id = `grpc-breaker:${authority}`;
+    if (this.breakerWarnings.has(id)) return;
+    if (this.breakerWarnings.size >= MAX_WARNINGS_PER_SESSION) return;
+    const before = JSON.stringify(this.warnings);
+    this.breakerWarnings.set(id, {
+      id,
+      kind: 'bypass',
+      text: `gRPC connections to ${authority} kept closing, so the app connected directly for 30 s — rules and network simulation didn't apply to them meanwhile.`.slice(0, MAX_WARNING_TEXT),
+    });
+    this.opts.log?.(`gRPC: the app connected to ${authority} directly for 30 s (connections kept closing)`);
+    const after = this.warnings;
+    if (JSON.stringify(after) !== before) this.emit('warnings', after);
+  }
+
+  /** Drops the §16.8 breaker warnings (the debug sessions ended, or the proxy stopped). */
+  clearGrpcBreakerWarnings(): void {
+    if (!this.breakerWarnings.size) return;
+    const before = JSON.stringify(this.warnings);
+    this.breakerWarnings.clear();
+    const after = this.warnings;
+    if (JSON.stringify(after) !== before) this.emit('warnings', after);
+  }
+
   /** Applies the decrypt list; returns the proxy's problems (patterns it dropped or refused). */
   private applyGrpcDecryptHosts(proxy: ProxyLike): string[] {
     if (proxy.setGrpcDecryptHosts) {
@@ -1265,7 +1306,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   get warnings(): SessionWarning[] {
     const seen = new Set<string>();
     const out: SessionWarning[] = [];
-    for (const list of [...this.sessionWarnings.values(), this.bodyWarnings, [...this.configWarnings.values()]]) {
+    for (const list of [...this.sessionWarnings.values(), [...this.breakerWarnings.values()], this.bodyWarnings, [...this.configWarnings.values()]]) {
       for (const w of list) {
         if (seen.has(w.id)) continue;
         seen.add(w.id);

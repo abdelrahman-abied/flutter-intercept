@@ -33,6 +33,10 @@ class FakeHost extends EventEmitter implements ControllerHost {
   async send() {
     return { id: 's' };
   }
+  breakerCleared = 0;
+  clearGrpcBreakerWarnings() {
+    this.breakerCleared++;
+  }
 }
 
 const controllers: InterceptController[] = [];
@@ -54,6 +58,17 @@ type GrpcStatusT = { enabled: boolean; decryptHosts: string[]; problem?: string;
 const lastStatus = (msgs: HostMsg[]) => (msgs.filter((m) => m.type === 'status').at(-1) as { status: Status & { grpc?: GrpcStatusT } } | undefined)?.status;
 const errors = (msgs: HostMsg[]) => msgs.filter((m): m is Extract<HostMsg, { type: 'error' }> => m.type === 'error').map((m) => m.message);
 const decodedOf = (replies: HostMsg[]) => (replies.find((m) => (m as { type: string }).type === 'grpcDecoded') as unknown as { id: string; decoded: GrpcDecoded } | undefined);
+
+describe('breaker warnings (CONTRACTS §16.8)', () => {
+  it('are cleared when the last debug session ends', () => {
+    const { host, c } = setup();
+    c.setSessions(2);
+    c.setSessions(1);
+    expect(host.breakerCleared).toBe(0);
+    c.setSessions(0);
+    expect(host.breakerCleared).toBe(1);
+  });
+});
 
 describe('Status.grpc (CONTRACTS §16.4)', () => {
   it('only with the schema service wired; host decrypt hosts / problem and schema counts', () => {
@@ -206,6 +221,7 @@ describe('validateRule grpcMock (CONTRACTS §16.2)', () => {
     const bad: [Record<string, unknown>, RegExp][] = [
       [{ code: -1 }, /code must be a gRPC status code/],
       [{ code: 1.5 }, /code must be/],
+      [{ code: 17 }, /code must be a gRPC status code \(an integer 0–16/],
       [{ message: 'x'.repeat(5000) }, /message must be text/],
       [{ messages: ['AA=='], messagesJson: [{}] }, /not both/],
       [{ messages: ['not base64!'] }, /messages\[0\] must be base64/],

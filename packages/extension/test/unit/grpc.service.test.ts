@@ -6,7 +6,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { discoverGrpcFiles, isGrpcSchemaPath, MAX_GRPC_FILE_BYTES, parsePackageDirs, type GrpcDirent, type GrpcFs } from '../../src/grpc/discovery';
-import { createGrpcSchemaService, decodeGrpcMessages, grpcCodeName, grpcMethodFromGlob, grpcMethodPath, grpcMockEncoder, hexOf, normalizeMethodName, rawToJson } from '../../src/grpc/service';
+import { createGrpcSchemaService, scrubAbsolutePaths, decodeGrpcMessages, grpcCodeName, grpcMethodFromGlob, grpcMethodPath, grpcMockEncoder, hexOf, normalizeMethodName, rawToJson } from '../../src/grpc/service';
 import type { GrpcSourceFile } from '../../src/grpc/types';
 import { fakeCodec, fakeGrpc, grpcCall, pb, pb64 } from './grpc.fakes';
 
@@ -58,9 +58,12 @@ class MemFs implements GrpcFs {
     for (const [from, to] of this.links) if (r.startsWith(from + path.sep)) return path.join(to, r.slice(from.length + 1));
     return r;
   }
+  failRead = new Map<string, string>();
   async readFile(p: string) {
     const r = path.resolve(p);
     this.reads.push(r);
+    const code = this.failRead.get(r);
+    if (code) throw Object.assign(new Error(`${code}: permission denied, open '${r}'`), { code });
     const t = this.files.get(r);
     if (t === undefined) throw new Error('ENOENT');
     return t;
@@ -127,6 +130,19 @@ describe('discoverGrpcFiles (CONTRACTS §16.3)', () => {
     expect(rel(r.files)).toEqual([path.resolve('/ws/app/lib/a.pbgrpc.dart')]);
     expect(r.problems.join(' ')).toMatch(/swapped\.pb\.dart: it resolves outside its folder/);
     expect(f.reads.some((x) => x.startsWith(path.resolve('/etc')) || x.startsWith(path.resolve('/elsewhere')))).toBe(false);
+  });
+
+  it('labels files root-relative / package:…, and reports read errors by code only (REVIEW-10 #4)', async () => {
+    const f = new MemFs();
+    f.add('/ws/app/lib/gen/a.pbgrpc.dart');
+    f.add('/ws/app/lib/gen/locked.pb.dart');
+    f.failRead.set(path.resolve('/ws/app/lib/gen/locked.pb.dart'), 'EACCES');
+    f.add('/ws/app/.dart_tool/package_config.json', JSON.stringify({ packages: [{ name: 'api', rootUri: 'file:///pub/api-1', packageUri: 'lib/' }] }));
+    f.add('/pub/api-1/lib/src/s.pbgrpc.dart');
+    const r = await discoverGrpcFiles(['/ws/app'], f);
+    expect(r.files.map((x) => x.label).sort()).toEqual(['lib/gen/a.pbgrpc.dart', 'package:api/src/s.pbgrpc.dart']);
+    expect(r.problems).toEqual(['gRPC schema: could not read lib/gen/locked.pb.dart (EACCES)']);
+    expect(JSON.stringify(r.problems)).not.toContain(path.resolve('/ws'));
   });
 
   it('skips files over 2 MB and reports it', async () => {
@@ -266,6 +282,16 @@ describe('gRPC helpers', () => {
     expect(normalizeMethodName('nope')).toBeUndefined();
     expect(grpcCodeName(14)).toBe('UNAVAILABLE');
     expect(grpcCodeName(99)).toBe('99');
+  });
+
+  it('scrubAbsolutePaths replaces POSIX, Windows, UNC and file:// paths (also with spaces) and known folders', () => {
+    const show = (p: string) => `<${path.basename(p.replace(/\\/g, '/'))}>`;
+    expect(scrubAbsolutePaths('/Users/Ada Lovelace/app/lib/x.pb.dart: Order.total uses Money', show)).toBe('<x.pb.dart>: Order.total uses Money');
+    expect(scrubAbsolutePaths("could not read 'C:\\Users\\ada\\app\\y.pbgrpc.dart' now", show)).toBe("could not read '<y.pbgrpc.dart>' now");
+    expect(scrubAbsolutePaths('see file:///home/ada/z.pb.dart and \\\\srv\\share\\w', show)).toBe('see <z.pb.dart> and <w>');
+    expect(scrubAbsolutePaths('package:api/src/s.pb.dart: fine, ratio 1/2', show)).toBe('package:api/src/s.pb.dart: fine, ratio 1/2');
+    expect(scrubAbsolutePaths('in /home/ada', show, ['/home/ada'])).not.toContain('/home/ada');
+    expect(scrubAbsolutePaths('x=/home/ada/secret', () => '…', ['/home/ada'])).toBe('x=…');
   });
 
   it('rawToJson groups repeated field numbers', () => {

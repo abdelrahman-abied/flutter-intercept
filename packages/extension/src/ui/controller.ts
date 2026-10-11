@@ -127,6 +127,8 @@ export interface ControllerHost {
   readonly grpcProblem?: string;
   /** Fires after the decrypt hosts or the self-check result changed. */
   on(event: 'grpc', l: (info: unknown) => void): unknown;
+  /** CONTRACTS §16.8: drop the gRPC breaker warnings (called when the last debug session ends). */
+  clearGrpcBreakerWarnings?(): void;
 }
 
 /**
@@ -769,14 +771,14 @@ const GRPC_MOCK_FORBIDDEN = new Set(['content-type', 'grpc-status', 'grpc-messag
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 /**
- * CONTRACTS §16.2: `grpcMock` — code an integer 0–999 (canonical 0–16), message ≤ 4 KB, `messages` (base64 protobuf
+ * CONTRACTS §16.2 / §16.8: `grpcMock` — code an integer 0–16, message ≤ 4 KB, `messages` (base64 protobuf
  * payloads) or `messagesJson` (JSON values the host encodes with the app's schema), not both, ≤ 1000 and ≤ 4 MB together;
  * headers / trailers without pseudo headers, content-type, grpc-status / grpc-message or connection headers; delayMs /
  * gapMs 0–600000.
  */
 function checkGrpcMock(a: Record<string, unknown>, aw: string): void {
   onlyKeys(a, ['kind', 'code', 'message', 'messages', 'messagesJson', 'headers', 'trailers', 'delayMs', 'gapMs'], aw);
-  if (a.code !== undefined && !isInt(a.code, 0, 999)) fail(aw, 'code must be a gRPC status code (an integer 0–16, e.g. 14 = UNAVAILABLE)');
+  if (a.code !== undefined && !isInt(a.code, 0, 16)) fail(aw, 'code must be a gRPC status code (an integer 0–16, e.g. 14 = UNAVAILABLE)');
   if (a.message !== undefined && (typeof a.message !== 'string' || a.message.length > MAX_GRPC_MESSAGE_TEXT)) fail(aw, `message must be text of at most ${MAX_GRPC_MESSAGE_TEXT} characters`);
   if (a.messages !== undefined && a.messagesJson !== undefined) fail(aw, 'pass messages (base64) or messagesJson (JSON), not both');
   let bytes = 0;
@@ -1310,6 +1312,8 @@ export class InterceptController {
   setSessions(n: number): void {
     if (n === this.sessions) return;
     this.sessions = n;
+    // CONTRACTS §16.8: breaker warnings belong to the sessions that saw them.
+    if (n === 0) this.deps.host.clearGrpcBreakerWarnings?.();
     this.broadcastStatus();
   }
 

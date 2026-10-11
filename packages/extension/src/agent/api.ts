@@ -3,6 +3,7 @@
  * language model tools only translate to `call(tool, input)`. No `vscode` import: everything it
  * needs comes in through `AgentApiDeps` (wired by extension.ts).
  */
+import * as os from 'os';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import type { Body, Exchange, Matcher, ReplayEntry, ReplayOptions, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest, StackFrame } from '@flutter-intercept/proxy';
@@ -21,7 +22,7 @@ import { buildHar, writeExportFile, writeHar } from './har';
 import { pathError, select } from './paths';
 import { corsPolicyShort, urlGlobHasHost } from './corsPolicy';
 import { isSensitiveField, isSensitiveHeader, REDACTED, redactBody, redactBodyText, redactGrpcMetadata, redactLogLine, redactFrameText, redactHeaders, redactQueryString, redactSecretValues, redactText, redactUrl } from './redact';
-import { decodeGrpcMessages, GRPC_CODE_NAMES, grpcCodeName, grpcMethodFromGlob, grpcMethodPath, normalizeMethodName, type DecodedMessage, type GrpcDeps } from '../grpc/service';
+import { decodeGrpcMessages, scrubAbsolutePaths, GRPC_CODE_NAMES, grpcCodeName, grpcMethodFromGlob, grpcMethodPath, normalizeMethodName, type DecodedMessage, type GrpcDeps } from '../grpc/service';
 import type { GrpcMethod, GrpcSchema, ProtoFieldType, ProtoMessage } from '../grpc/types';
 import { parsePath, type PathSegment } from '@flutter-intercept/proxy/jsonpath';
 import {
@@ -582,6 +583,36 @@ export class AgentApi implements AgentTools {
     }
   }
 
+  /**
+   * REVIEW-10 #5: a grpcMock's base64 `messages` as get_request would show them (redaction on): decoded with the schema
+   * of the method its URL names → redacted JSON, else the raw decode redacted by value, else "[binary N bytes]".
+   */
+  private grpcMockMessagesView(matchUrl: string, messages: readonly string[]): unknown[] {
+    const methodPath = grpcMethodFromGlob(matchUrl);
+    const frames = messages.map((b64, i) => {
+      const size = typeof b64 === 'string' ? Buffer.from(b64, 'base64').length : 0;
+      return { dir: 'receive' as const, at: i, kind: 'message' as const, base64: typeof b64 === 'string' ? b64 : '', size };
+    });
+    const decoded = decodeGrpcMessages({ url: `http://mock.invalid${methodPath ?? '/'}`, frames }, this.deps.grpc);
+    return frames.map((f, i) => {
+      const d = decoded.messages.find((m) => m.frame === i);
+      if (d && d.json !== undefined && d.via !== 'none') return { via: d.via, json: redactJsonValue(d.json) };
+      return `[binary ${f.size} bytes]`;
+    });
+  }
+
+  /** REVIEW-10 #4: a problem / error text for agents — absolute paths become project-relative (or a base name). */
+  private scrub(t: string): string {
+    const root = this.deps.projectRoot();
+    let home = '';
+    try {
+      home = os.homedir();
+    } catch {
+      home = '';
+    }
+    return this.text(scrubAbsolutePaths(String(t), (abs) => this.projectPath(abs) ?? (path.basename(abs) || '…'), [root ?? '', home]));
+  }
+
   /** A decoded message's JSON as agents see it (secret-named fields and credential-looking values redacted). */
   private grpcJson(v: unknown): unknown {
     return this.redact ? redactJsonValue(v) : v;
@@ -598,7 +629,7 @@ export class AgentApi implements AgentTools {
       ...(m.compressed ? { compressed: true } : {}),
       ...(m.truncated ? { truncated: true } : {}),
       ...(m.json !== undefined ? { json: this.grpcJson(m.json) } : {}),
-      ...(m.error ? { error: this.text(m.error) } : {}),
+      ...(m.error ? { error: this.scrub(m.error) } : {}),
     };
   }
 
@@ -681,7 +712,7 @@ export class AgentApi implements AgentTools {
       ...(text !== undefined ? { text: cut ? text.slice(0, maxChars) : text } : f.kind === 'message' ? { text: `[binary ${f.size} bytes]`, binary: true } : {}),
       ...(cut || f.truncated ? { truncated: true } : {}),
       ...(cut ? { textChars: text!.length } : {}),
-      ...(d?.error ? { error: this.text(d.error) } : {}),
+      ...(d?.error ? { error: this.scrub(d.error) } : {}),
     };
   }
 
@@ -729,7 +760,7 @@ export class AgentApi implements AgentTools {
     try {
       enabled = g ? g.enabled() : true;
       const st = g?.status();
-      if (st) schema = { methods: st.methods, messages: st.messages, ...(st.problems.length ? { problems: st.problems.slice(0, 10).map((p) => this.text(p)) } : {}) };
+      if (st) schema = { methods: st.methods, messages: st.messages, ...(st.problems.length ? { problems: st.problems.slice(0, 10).map((p) => this.scrub(p)) } : {}) };
     } catch {
       // reported as unknown
     }
@@ -783,7 +814,8 @@ export class AgentApi implements AgentTools {
     const action = (a: RuleAction | { kind: 'passthrough' }): RuleAction | { kind: 'passthrough' } => {
       switch (a.kind) {
         case 'mock':
-          return a.headers ? { ...a, headers: headers(a.headers) } : a;
+          // REVIEW-10 #5: a mock made from a captured response carries its body (tokens included).
+          return { ...a, ...(a.headers ? { headers: headers(a.headers) } : {}), ...(typeof a.body === 'string' ? { body: redactBodyText(a.body, a.headers) } : {}) };
         case 'mapRemote':
           return { ...a, to: redactUrl(a.to) };
         case 'grpcMock':
@@ -792,6 +824,8 @@ export class AgentApi implements AgentTools {
             ...(a.headers ? { headers: headers(a.headers) } : {}),
             ...(a.trailers ? { trailers: headers(a.trailers) } : {}),
             ...(a.messagesJson ? { messagesJson: a.messagesJson.map((m) => redactJsonValue(m)) } : {}),
+            // objects in place of base64 strings: what get_request shows (not a rule the proxy could use)
+            ...(a.messages ? { messages: this.grpcMockMessagesView(rule.match?.url ?? '', a.messages) as unknown as string[] } : {}),
           };
         case 'rewrite':
           return { ...a, ...(a.request ? { request: spec(a.request) } : {}), ...(a.response ? { response: spec(a.response) } : {}) };
@@ -2108,7 +2142,7 @@ export class AgentApi implements AgentTools {
     if (i.method !== undefined && i.message !== undefined) throw new AgentToolError('pass method or message, not both', 'invalid');
     const schema = g.schema();
     const st = g.status();
-    const problems = (st?.problems ?? []).slice(0, 10).map((p) => this.text(p));
+    const problems = (st?.problems ?? []).slice(0, 10).map((p) => this.scrub(p));
     if (!schema) {
       return {
         available: false,

@@ -31,6 +31,7 @@ function factory(made: Fake[], o: { grpc?: boolean; support?: { ok: boolean; pro
       resume: () => undefined,
       abort: () => undefined,
       on: (ev: string, l: (...a: any[]) => void) => ee.on(ev, l),
+      emit: (ev: string, ...a: unknown[]) => ee.emit(ev, ...a),
       ...(o.grpc === false
         ? {}
         : {
@@ -62,6 +63,41 @@ describe('normalizeGrpcDecryptHosts (CONTRACTS §16.4)', () => {
     expect(r.problems.every((p) => p.startsWith('flutterIntercept.grpc.decryptHosts'))).toBe(true);
     expect(normalizeGrpcDecryptHosts('x').problems[0]).toMatch(/must be a list/);
     expect(normalizeGrpcDecryptHosts(undefined)).toEqual({ hosts: [], problems: [] });
+  });
+});
+
+describe('gRPC breaker warnings (CONTRACTS §16.8)', () => {
+  it("turn the proxy's 'grpcBreaker' event into one bypass warning per authority, cleared on demand and on stop", async () => {
+    const made: Fake[] = [];
+    let proxyEmit: ((ev: string, ...a: unknown[]) => void) | undefined;
+    const h = new InterceptProxyHost({
+      getPort: () => 9100,
+      factory: (opts) => {
+        const p = factory(made)(opts) as any;
+        proxyEmit = p.emit;
+        return p;
+      },
+      canRestart: () => true,
+    });
+    await h.start();
+    const seen: unknown[] = [];
+    h.on('warnings', (w) => seen.push(w));
+    proxyEmit!('grpcBreaker', { authority: 'api.example.com:443', viaLan: false });
+    proxyEmit!('grpcBreaker', { authority: 'api.example.com:443', viaLan: true });
+    proxyEmit!('grpcBreaker', { authority: 'evil\r\n.example:1' });
+    proxyEmit!('grpcBreaker', { nope: 1 });
+    proxyEmit!('grpcBreaker', 'x');
+    expect(h.warnings).toEqual([
+      { id: 'grpc-breaker:api.example.com:443', kind: 'bypass', text: "gRPC connections to api.example.com:443 kept closing, so the app connected directly for 30 s — rules and network simulation didn't apply to them meanwhile." },
+      expect.objectContaining({ id: 'grpc-breaker:evil.example:1' }),
+    ]);
+    expect(seen).toHaveLength(2);
+    h.clearGrpcBreakerWarnings();
+    expect(h.warnings).toEqual([]);
+    proxyEmit!('grpcBreaker', { authority: 'b.example:50051' });
+    expect(h.warnings).toHaveLength(1);
+    await h.stop();
+    expect(h.warnings).toEqual([]);
   });
 });
 

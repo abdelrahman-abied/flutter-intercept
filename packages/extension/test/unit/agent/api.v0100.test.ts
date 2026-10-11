@@ -217,6 +217,59 @@ describe('add_grpc_mock (CONTRACTS §16.4)', () => {
   });
 });
 
+describe('REVIEW-10 #4 / #5 / #6', () => {
+  const JWT = ['eyJhbGciOiJIUzI1NiJ9', 'eyJzdWIiOiJhZGEifQ', 'c2lnbmF0dXJlLXZhbHVl'].join('.');
+
+  it('schema problems reach agents without absolute paths (project root, home folder)', async () => {
+    const home = os.homedir();
+    const root = path.join(home, 'Projects With Space', 'app');
+    const problems = [
+      `${root}/lib/gen/order.pb.dart: couldn't read class Broken (no BuilderInfo)`,
+      `gRPC schema: could not read ${path.join(home, '.pub-cache', 'x', 'lib', 'y.pb.dart')}`,
+      `file://${root}/lib/gen/z.pbgrpc.dart: odd`,
+    ];
+    const g = fakeGrpc({ schema: null, status: { methods: 0, messages: 0, problems, files: 3 } });
+    const { api } = setup({ grpc: g, root });
+    const st = JSON.stringify(await api.call('get_status', {}));
+    const gs = JSON.stringify(await api.call('get_grpc_schema', {}));
+    for (const out of [st, gs]) {
+      expect(out).not.toContain(root);
+      expect(out).not.toContain(home);
+    }
+    expect(JSON.parse(gs).problems).toEqual(["lib/gen/order.pb.dart: couldn't read class Broken (no BuilderInfo)", 'gRPC schema: could not read y.pb.dart', 'lib/gen/z.pbgrpc.dart: odd']);
+  });
+
+  it('list_rules shows grpcMock messages as get_request would, and HTTP mock bodies redacted', async () => {
+    const { api, host } = setup();
+    host.rules = validateRules([
+      { id: 'a', enabled: true, match: { url: '*/shop.v1.CartService/AddItem' }, action: { kind: 'grpcMock', messages: [pb64({ total: '1', sessionToken: 'tok-zz' }), Buffer.from('garbage').toString('base64')] } },
+      { id: 'b', enabled: true, match: { url: '*/auth.v1.Auth/Login' }, action: { kind: 'grpcMock', messages: [pb64({ access: JWT })] } },
+      { id: 'c', enabled: true, match: { url: 'https://api.example.com/login' }, action: { kind: 'mock', status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ access_token: 'abc-123', user: 'ada' }) } },
+      { id: 'd', enabled: true, match: { url: 'http://h:1/shop.v1.CartService/AddItem' }, action: { kind: 'sequence', steps: [{ action: { kind: 'grpcMock', messages: [pb64({ password: 'pw-9' })] } }] } },
+    ]);
+    const text = JSON.stringify(await api.call('list_rules', {}));
+    for (const secret of ['tok-zz', JWT, 'abc-123', 'pw-9', pb64({ access: JWT })]) expect(text).not.toContain(secret);
+    const rules = JSON.parse(text).rules;
+    expect(rules[0].action.messages).toEqual([{ via: 'schema', json: { total: '1', sessionToken: '[redacted]' } }, '[binary 7 bytes]']);
+    expect(rules[1].action.messages[0].via).toBe('raw'); // unknown method: raw, redacted by value
+    expect(JSON.parse(rules[2].action.body)).toEqual({ access_token: '[redacted]', user: 'ada' });
+    // redaction off: the user's own values
+    const raw = setup({ redact: false });
+    raw.host.rules = host.rules;
+    expect(JSON.stringify(await raw.api.call('list_rules', {}))).toContain(pb64({ access: JWT }));
+  });
+
+  it('grpcMock codes are 0–16; confirmations only show validated codes', async () => {
+    const { api } = setup();
+    await rejectsWith(api.call('add_grpc_mock', { url: '*/x.Y/Z', code: 17 }), /invalid input/, 'invalid');
+    expect(() => parseToolInput('add_grpc_mock', { url: '*/x.Y/Z', code: 16 })).not.toThrow();
+    expect(() => parseToolInput('assert_traffic', { url: '*', expect: { grpcStatus: 42 } })).not.toThrow(); // a server may send any code
+    const c = confirmationText('add_grpc_mock', { url: '*/x.Y/Z', code: '**OK** [x](command:evil)' });
+    expect(c.message).toContain('then status invalid code `**OK** [x](command:evil)`');
+    expect(confirmationText('add_grpc_mock', { url: '*/x.Y/Z', code: 'NOT_FOUND' }).message).toContain('then status **5 (NOT_FOUND)**');
+  });
+});
+
 describe('get_grpc_schema (CONTRACTS §16.4)', () => {
   it('lists methods; describes a method with fields, enums, skeletons and project-relative files', async () => {
     const { api } = setup();
