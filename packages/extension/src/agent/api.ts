@@ -22,7 +22,7 @@ import { buildHar, writeExportFile, writeHar } from './har';
 import { pathError, select } from './paths';
 import { corsPolicyShort, urlGlobHasHost } from './corsPolicy';
 import { isSensitiveField, isSensitiveHeader, REDACTED, redactBody, redactBodyText, redactGrpcMetadata, redactLogLine, redactFrameText, redactHeaders, redactQueryString, redactSecretValues, redactText, redactUrl } from './redact';
-import { decodeGrpcMessages, scrubAbsolutePaths, GRPC_CODE_NAMES, grpcCodeName, grpcMethodFromGlob, grpcMethodPath, normalizeMethodName, type DecodedMessage, type GrpcDeps } from '../grpc/service';
+import { decodeGrpcMessages, decodeHeldMessage, scrubAbsolutePaths, GRPC_CODE_NAMES, grpcCodeName, grpcMethodFromGlob, grpcMethodPath, normalizeMethodName, type DecodedMessage, type GrpcDeps } from '../grpc/service';
 import type { GrpcMethod, GrpcSchema, ProtoFieldType, ProtoMessage } from '../grpc/types';
 import { parsePath, type PathSegment } from '@flutter-intercept/proxy/jsonpath';
 import {
@@ -643,7 +643,7 @@ export class AgentApi implements AgentTools {
     let json: unknown;
     let jsonOmitted = false;
     if (d?.json !== undefined && d.via !== 'none') {
-      json = this.grpcJson(d.json);
+      json = this.heldJson(d);
       if (JSON.stringify(json).length > MAX_GRPC_MESSAGES_JSON) {
         json = undefined;
         jsonOmitted = true;
@@ -663,11 +663,17 @@ export class AgentApi implements AgentTools {
     };
   }
 
-  /** The message a gRPC breakpoint holds, decoded (schema, else raw). */
+  /** The message a gRPC breakpoint holds, decoded (schema, else raw; cached, ≤ 1 MB: REVIEW-11 #6). */
   private decodeHeld(e: Exchange): DecodedMessage | undefined {
-    const p = e.grpcPause;
-    if (p?.kind !== 'message' || typeof p.base64 !== 'string') return undefined;
-    return decodeGrpcMessages({ url: e.url, frames: [] }, this.deps.grpc, { frames: [{ dir: p.dir, at: e.pausedAt ?? e.startedAt, kind: 'message', base64: p.base64, size: p.size }] }).messages[0];
+    return decodeHeldMessage(e, this.deps.grpc);
+  }
+
+  /** The redacted JSON of a decoded held message, computed once per decode (REVIEW-11 #6). */
+  private readonly heldRedacted = new WeakMap<DecodedMessage, unknown>();
+  private heldJson(d: DecodedMessage): unknown {
+    if (!this.redact) return d.json;
+    if (!this.heldRedacted.has(d)) this.heldRedacted.set(d, redactJsonValue(d.json));
+    return this.heldRedacted.get(d);
   }
 
   /**
@@ -679,7 +685,12 @@ export class AgentApi implements AgentTools {
     const r = raw as Record<string, unknown>;
     if (r.messageJson === undefined) return raw;
     const d = this.decodeHeld(e);
-    if (d?.via !== 'schema' || d.json === undefined) return raw;
+    if (d?.via !== 'schema' || d.json === undefined) {
+      if (JSON.stringify(r.messageJson)?.includes(REDACTED)) {
+        throw new AgentToolError('messageJson contains "[redacted]", but the held message could not be decoded to restore those values; pass the full message or message (base64)', 'invalid');
+      }
+      return raw;
+    }
     const restore = (v: unknown, orig: unknown, depth: number): unknown => {
       if (depth > 64) return v;
       if (v === REDACTED && orig !== undefined) return orig;

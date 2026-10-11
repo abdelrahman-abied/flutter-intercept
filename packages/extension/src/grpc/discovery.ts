@@ -11,7 +11,7 @@
  *   tool folders are skipped (package_config.json is read directly).
  * - Every file carries a display `label` (root-relative or `package:<name>/…`) for problem texts; Node errors are
  *   reported by code (`EACCES`, `ENOENT`), never by their message (it holds the absolute path) — REVIEW-10 #4.
- * - Caps: MAX_GRPC_FILES files, MAX_GRPC_FILE_BYTES each (larger files are skipped and reported), MAX_GRPC_TOTAL_BYTES in
+ * - Caps: MAX_GRPC_FILES generated Dart files and, separately, MAX_PROTO_FILES `.proto` files, MAX_GRPC_FILE_BYTES each (larger files are skipped and reported), MAX_GRPC_TOTAL_BYTES in
  *   all, MAX_DIR_ENTRIES directory entries visited. Problems are plain words (≤ 50).
  */
 import * as fs from 'fs';
@@ -20,6 +20,8 @@ import { fileURLToPath, pathToFileURL } from 'url';
 import type { GrpcSourceFile } from './types';
 
 export const MAX_GRPC_FILES = 5000;
+/** REVIEW-11 #8: `.proto` files have their own cap (they never take room from the generated Dart). */
+export const MAX_PROTO_FILES = 2000;
 export const MAX_GRPC_FILE_BYTES = 2 * 1024 * 1024;
 export const MAX_GRPC_TOTAL_BYTES = 50 * 1024 * 1024;
 /** Directory entries looked at in one scan (all roots and packages together). */
@@ -147,6 +149,8 @@ class Scan {
   private bytes = 0;
   private full = false;
   private warnedEntries = false;
+  private dartCount = 0;
+  private protoCount = 0;
 
   constructor(private readonly f: GrpcFs) {}
 
@@ -202,7 +206,12 @@ class Scan {
       this.problem(`gRPC schema: skipped ${label}: it resolves outside its folder`);
       return;
     }
-    if (this.files.length >= MAX_GRPC_FILES) {
+    const proto = PROTO_FILE.test(file);
+    if (proto && this.protoCount >= MAX_PROTO_FILES) {
+      this.problem(`gRPC schema: only the first ${MAX_PROTO_FILES} .proto files are read`);
+      return;
+    }
+    if (!proto && this.dartCount >= MAX_GRPC_FILES) {
       this.problem(`gRPC schema: only the first ${MAX_GRPC_FILES} generated files are read`);
       this.full = true;
       return;
@@ -234,6 +243,8 @@ class Scan {
     }
     if (text.length > MAX_GRPC_FILE_BYTES) return; // changed in between
     this.bytes += st.size;
+    if (proto) this.protoCount++;
+    else this.dartCount++;
     this.files.push({ path: file, text, label });
   }
 }

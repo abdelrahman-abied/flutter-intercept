@@ -63,7 +63,7 @@ import type { SharedRulesService, SharedRulesState } from '../rules/types';
 import type { ToOpenApi, ToPostman } from '../export/types';
 import { scriptFileOf, scriptFileSyntaxError, scriptTemplate } from '../rules/scriptFile';
 import { buildHar, ensureDirInside, EXPORT_DIR, type HarGrpcDecoder } from '../agent/har';
-import { decodeGrpcMessages, grpcMethodPath, grpcProxyCodec, hexOf, MAX_CODEC_BYTES, type GrpcDeps } from '../grpc/service';
+import { decodeGrpcMessages, decodeHeldMessage, grpcMethodPath, grpcProxyCodec, hexOf, MAX_CODEC_BYTES, type GrpcDeps } from '../grpc/service';
 import { gitIgnoreStatus, type GitignoreFs } from '../recordings/gitignore';
 import type { AgentStatus, AuthFlowSummary, ContractSummary, ExportFormat, GrpcDecoded, GrpcStatus, HostMsg, RecordingSummary, SendDraft, SessionWarning, SnippetFormat, Status, ViewMsg } from './protocol';
 
@@ -1335,7 +1335,7 @@ export class InterceptController {
   private pausedView(ex: Exchange, g: GrpcDeps | undefined): Pick<GrpcDecoded, 'paused'> {
     const p = ex.grpcPause;
     if (p?.kind !== 'message' || typeof p.base64 !== 'string') return {};
-    const d = decodeGrpcMessages({ url: ex.url, frames: [] }, g, { frames: [{ dir: p.dir, at: ex.pausedAt ?? ex.startedAt, kind: 'message', base64: p.base64, size: p.size }] }).messages[0];
+    const d = decodeHeldMessage(ex, g); // cached, ≤ 1 MB decoded (REVIEW-11 #6)
     if (!d) return {};
     let json: string | undefined;
     try {

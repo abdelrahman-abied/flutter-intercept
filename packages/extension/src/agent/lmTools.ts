@@ -422,7 +422,7 @@ export function confirmationText(
         title: 'Save a traffic recording',
         message:
           `Save ${i.url ? `the finished requests matching ${code(i.url)}` : 'every finished HTTP request'}${typeof i.sinceMs === 'number' ? ` since ${new Date(i.sinceMs).toISOString()}` : ''} as recording ${code(i.name ?? '?')} ` +
-          `in the project's \`.dart_tool/flutter_intercept/recordings/\`${i.redact === false ? ', **with secrets unredacted** (real tokens and cookies are written to the file)' : ' (secrets redacted)'}.`,
+          `in the project's \`.dart_tool/flutter_intercept/recordings/\`${i.redact === false ? ', **with secrets unredacted** (real tokens and cookies are written to the file)' : ' (secrets redacted; in gRPC messages, fields the app\'s schema doesn\'t name are redacted by value only)'}.`,
       };
     case 'replay_recording':
       return i.id

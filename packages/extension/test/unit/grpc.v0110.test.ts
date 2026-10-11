@@ -248,7 +248,7 @@ describe('recordings with gRPC (CONTRACTS §17.4)', () => {
     expect(Buffer.from(e.frames[0].base64, 'base64').toString()).toBe('PB:{"sku":"A1","quantity":2,"sessionToken":"[redacted]"}');
     expect(e.requestHeaders).toMatchObject({ authorization: '[redacted]', 'x-session-bin': '[redacted]' });
     expect(e.grpc.trailers).toMatchObject({ 'set-cookie': '[redacted]', 'x-trace-bin': '[redacted]' });
-    expect(e.grpc.requestHash).toBe(sha(call.frames![0].base64!)); // of what the app sent: replay still matches
+    expect(e.grpc.requestHash).toBeUndefined(); // REVIEW-11 #2: no hash of the unredacted request
     const blind = await svc(null).save('R2', [call], { redact: true });
     const e2 = JSON.parse(fs.readFileSync(blind.path, 'utf8')).entries[0];
     for (const f of e2.frames) expect(Buffer.from(f.base64, 'base64').every((x: number) => x === 0)).toBe(true);
@@ -289,7 +289,7 @@ describe('recordings with gRPC (CONTRACTS §17.4)', () => {
       [(d) => (d.version = 2), /gRPC entries need version 3/],
       [(d) => (d.entries[0].method = 'GET'), /must be POST/],
       [(d) => (d.entries[0].grpc = undefined), /grpc must be an object/],
-      [(d) => (d.entries[0].grpc.code = -1), /code must be a gRPC status code/],
+      [(d) => (d.entries[0].grpc.code = -1), /code must be a canonical gRPC status code/],
       [(d) => (d.entries[0].grpc.requestHash = 'xyz'), /sha256/],
       [(d) => (d.entries[0].grpc.extra = 1), /unknown field/],
       [(d) => (d.entries[0].frames[0].kind = 'text'), /must be "message" in a gRPC recording/],
@@ -330,5 +330,74 @@ describe('recordings with gRPC (CONTRACTS §17.4)', () => {
     const empty = await svc().load((await svc().save('C', [{ id: 'h', startedAt: 1, method: 'GET', url: 'https://x.example/a', requestHeaders: {}, status: 200, state: 'completed' }])).id);
     // two origins: routes carry the origin
     expect(diff(a, empty)).toContainEqual({ route: 'gRPC http://10.0.2.2:50051/shop.v1.CartService/AddItem', change: 'removed', detail: '1 call, gRPC OK' });
+  });
+});
+
+// ------------------------------------------------------------------ REVIEW-11 fixes
+import { clearHeldMessageCache, decodeHeldMessage, MAX_VIEW_DECODE_BYTES } from '../../src/grpc/service';
+import { MAX_PROTO_FILES } from '../../src/grpc/discovery';
+
+describe('REVIEW-11', () => {
+  it('#2: redacted recordings keep no requestHash (save, redacted export); unredacted ones do', async () => {
+    const call = grpcCall();
+    const s = svc();
+    const red = await s.save('R', [call], { redact: true });
+    expect(JSON.parse(fs.readFileSync(red.path, 'utf8')).entries[0].grpc).not.toHaveProperty('requestHash');
+    expect(toReplay(await s.load(red.id))[0].grpc).not.toHaveProperty('requestHash');
+    const plain = await s.save('P', [call]);
+    expect(JSON.parse(fs.readFileSync(plain.path, 'utf8')).entries[0].grpc.requestHash).toMatch(/^[0-9a-f]{64}$/);
+    const out = path.join(root, 'shared.json');
+    await s.export(plain.id, out, { redact: true });
+    const exported = JSON.parse(fs.readFileSync(out, 'utf8')).entries[0];
+    expect(exported.grpc).not.toHaveProperty('requestHash');
+    expect(fs.readFileSync(out, 'utf8')).not.toContain('tok-123');
+  });
+
+  it('#8: status codes outside 0–16 are refused in files and left out when saving', async () => {
+    const s = svc();
+    const meta = await s.save('C', [grpcCall(), grpcCall({ id: 'odd', grpc: { service: 's', method: 'm', statusCode: 20, messagesSent: 1, messagesReceived: 1 } })]);
+    expect(meta.exchanges).toBe(1);
+    const d = JSON.parse(fs.readFileSync(meta.path, 'utf8'));
+    d.entries[0].grpc.code = 17;
+    expect(() => validateRecording(d, 'c', '/c.json')).toThrow(/canonical gRPC status code \(0–16\): calls that ended with another code can't be replayed/);
+  });
+
+  it('#8: .proto files have their own cap, separate from the generated Dart', async () => {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fi-pcap-')));
+    try {
+      fs.mkdirSync(path.join(dir, 'protos'));
+      for (let i = 0; i < MAX_PROTO_FILES + 3; i++) fs.writeFileSync(path.join(dir, 'protos', `p${i}.proto`), '');
+      fs.mkdirSync(path.join(dir, 'lib'));
+      fs.writeFileSync(path.join(dir, 'lib', 'a.pbgrpc.dart'), '');
+      const r = await discoverGrpcFiles([dir]);
+      expect(r.files.filter((f) => f.path.endsWith('.proto'))).toHaveLength(MAX_PROTO_FILES);
+      expect(r.files.some((f) => f.path.endsWith('a.pbgrpc.dart'))).toBe(true);
+      expect(r.problems).toContain(`gRPC schema: only the first ${MAX_PROTO_FILES} .proto files are read`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('#6: the held message is decoded once per pause (LRU), again after a schema change, and not beyond 1 MB', () => {
+    clearHeldMessageCache();
+    const g = fakeGrpc();
+    let calls = 0;
+    const real = g.codec.decodeMessage;
+    g.codec.decodeMessage = (...a) => (calls++, real(...a));
+    const e = grpcCall({ id: 'h1', state: 'paused-response', pausedAt: 7, grpcPause: { kind: 'message', dir: 'receive', index: 0, base64: pb64({ total: '1' }), size: 14 } });
+    const a = decodeHeldMessage(e, g);
+    const b = decodeHeldMessage(e, g);
+    expect(a).toBe(b);
+    expect(calls).toBe(1);
+    expect(a).toMatchObject({ via: 'schema', json: { total: '1' } });
+    decodeHeldMessage({ ...e, grpcPause: { ...(e.grpcPause as any), index: 1 } }, g); // the next held message
+    expect(calls).toBe(2);
+    const big = 'A'.repeat(Math.ceil(((MAX_VIEW_DECODE_BYTES + 4) * 4) / 3 / 4) * 4);
+    const huge = decodeHeldMessage({ ...e, id: 'h2', grpcPause: { kind: 'message', dir: 'receive', index: 0, base64: big, size: MAX_VIEW_DECODE_BYTES + 4 } }, g)!;
+    expect(calls).toBe(2);
+    expect(huge.via).toBe('none');
+    expect(huge.error).toMatch(/over the 1 MB shown decoded/);
+    expect(huge.bytes!.length).toBe(4098);
+    expect(decodeHeldMessage(grpcCall(), g)).toBeUndefined();
   });
 });

@@ -154,3 +154,27 @@ describe('recordings tools with gRPC (CONTRACTS §17.4)', () => {
     expect(((await api.call('list_recordings', {})) as any).recordings[0]).toMatchObject({ grpc: 1 });
   });
 });
+
+describe('REVIEW-11 #6 for agents', () => {
+  it('repeated list_paused / get_request reuse one decode of the held message', async () => {
+    const { clearHeldMessageCache } = await import('../../../src/grpc/service');
+    clearHeldMessageCache();
+    const { api, host } = setup();
+    const g = (api as any).deps.grpc;
+    let calls = 0;
+    const real = g.codec.decodeMessage;
+    g.codec.decodeMessage = (...a: unknown[]) => (calls++, real(...a));
+    host.exchanges = [held()];
+    for (let i = 0; i < 5; i++) await api.call('list_paused', {});
+    expect(calls).toBe(1);
+    await api.call('get_request', { id: 'p', includeBodies: false }); // grpcPause from the cache
+    expect(calls).toBe(1);
+  });
+
+  it('messageJson with "[redacted]" is refused when the held message could not be decoded', async () => {
+    const { api, host } = setup();
+    host.exchanges = [held({ grpcPause: { kind: 'message', dir: 'receive', index: 0, base64: Buffer.from('garbage').toString('base64'), size: 7 } })];
+    await rejectsWith(api.call('resume_request', { id: 'p', grpc: { messageJson: { total: '[redacted]' } } }), /could not be decoded to restore/, 'invalid');
+    expect(host.resumed).toEqual([]);
+  });
+});

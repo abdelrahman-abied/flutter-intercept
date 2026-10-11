@@ -11,6 +11,9 @@
  *   response message was cut / of unknown size or frames were dropped. Redacted: URL, metadata and the status message
  *   like agent views; each message decoded with the schema, redacted (`redactJsonValue`) and re-encoded — or, without a
  *   schema / when that fails, replaced by zero bytes of the recorded length. Raw protobuf never survives redaction.
+ *   Fields the schema doesn't know (`#<n>` in the decoded JSON) have no name, so they are redacted by value only (JWTs,
+ *   long opaque tokens). A redacted recording keeps no `requestHash` (REVIEW-11 #2): replay answers several calls of
+ *   one method in recorded order instead of by request.
  * - `grpcReplayEntry`: a `ReplayEntry` of kind `grpc` (the proxy answers it like a grpcMock).
  * - `firstResponseJson`: the first response message decoded with the schema (diff's shape comparison).
  */
@@ -26,7 +29,8 @@ import type { RecordedExchange } from './types';
 export type RecordingGrpc = Pick<GrpcDeps, 'codec' | 'schema' | 'enabled'>;
 
 /** gRPC status codes a file may hold (servers may send any; the canonical ones are 0–16). */
-export const MAX_RECORDED_GRPC_CODE = 999;
+/** REVIEW-11 #8: the proxy replays only canonical codes (0–16); other codes are refused with the entry. */
+export const MAX_RECORDED_GRPC_CODE = 16;
 export const MAX_GRPC_STATUS_MESSAGE = 4096;
 /** Replay gaps between recorded messages are capped (CONTRACTS §17.4). */
 export const MAX_REPLAY_GAP_MS = 5000;
@@ -124,7 +128,9 @@ export function recordGrpc(e: RecordedExchange, base: RecordedExchange, redact: 
     e.incomplete === true ||
     capped.dropped > 0 ||
     capped.frames.some((f) => f.dir === 'receive' && (f.truncated || f.sizeUnknown || typeof f.base64 !== 'string'));
-  const hash = e.grpcRequestHash ?? firstRequestHash(e.frames);
+  // REVIEW-11 #2: a redacted recording keeps no hash of the unredacted request (a low-entropy secret in it — a PIN, an
+  // OTP — could be guessed offline from it); replay then answers that method's calls in recorded order.
+  const hash = redact ? undefined : (e.grpcRequestHash ?? firstRequestHash(e.frames));
   const code = e.grpc?.statusCode ?? 0;
   const message = e.grpc?.statusMessage;
   const trailers = customMetadata(e.responseTrailers);
@@ -140,6 +146,7 @@ export function recordGrpc(e: RecordedExchange, base: RecordedExchange, redact: 
     out.responseHeaders = redactGrpcMetadata(e.responseHeaders) ?? {};
   }
   if (hash) out.grpcRequestHash = hash;
+  else delete out.grpcRequestHash;
   if (incomplete) out.incomplete = true;
   return out;
 }

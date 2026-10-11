@@ -166,7 +166,7 @@ export function validEntry(v: unknown, where: string): RecordedExchange {
     const g = v.grpc as Record<string, unknown>;
     const gw = `${where}.grpc`;
     for (const k of Object.keys(g)) if (!['code', 'message', 'trailers', 'requestHash'].includes(k)) fail(gw, `has an unknown field ${JSON.stringify(k.slice(0, 40))}`);
-    if (!Number.isInteger(g.code) || (g.code as number) < 0 || (g.code as number) > MAX_RECORDED_GRPC_CODE) fail(`${gw}.code`, `must be a gRPC status code (0–${MAX_RECORDED_GRPC_CODE})`);
+    if (!Number.isInteger(g.code) || (g.code as number) < 0 || (g.code as number) > MAX_RECORDED_GRPC_CODE) fail(`${gw}.code`, `must be a canonical gRPC status code (0–${MAX_RECORDED_GRPC_CODE}): calls that ended with another code can't be replayed`);
     if (g.message !== undefined && (typeof g.message !== 'string' || g.message.length > MAX_GRPC_STATUS_MESSAGE)) fail(`${gw}.message`, `must be a string of at most ${MAX_GRPC_STATUS_MESSAGE} characters`);
     if (g.requestHash !== undefined && (typeof g.requestHash !== 'string' || !/^[0-9a-f]{64}$/.test(g.requestHash))) fail(`${gw}.requestHash`, 'must be a sha256 hex digest');
     const trailers = g.trailers !== undefined ? validHeaders(g.trailers, `${gw}.trailers`) : undefined;

@@ -460,6 +460,63 @@ export function decodeGrpcMessages(
   return { ...(methodPath ? { path: methodPath } : {}), ...(method ? { method } : {}), messages };
 }
 
+// ------------------------------------------------------------------ REVIEW-11 #6: the message a breakpoint holds
+
+/** Held messages larger than this are not decoded for display (the panel and agents show a note; edits still work). */
+export const MAX_VIEW_DECODE_BYTES = 1024 * 1024;
+/** Decoded held messages kept (LRU), so repeated list_paused / get_request / decodeGrpc don't decode again. */
+export const HELD_CACHE_ENTRIES = 16;
+
+const heldCache = new Map<string, { schema: GrpcSchema | undefined; decoded: DecodedMessage }>();
+
+/** Test hook. */
+export function clearHeldMessageCache(): void {
+  heldCache.clear();
+}
+
+/**
+ * The message a gRPC breakpoint holds (`exchange.grpcPause`), decoded (schema, else raw) for display — cached per
+ * exchange id + pause identity + schema (bounded LRU), and only up to MAX_VIEW_DECODE_BYTES: a larger message comes back
+ * `via: 'none'` with an explanation and its first 4 KB as `bytes` (for hex). Undefined when nothing is held.
+ */
+export function decodeHeldMessage(e: Pick<Exchange, 'id' | 'url' | 'grpcPause' | 'pausedAt' | 'startedAt'>, grpc: Pick<GrpcDeps, 'codec' | 'schema'> | undefined): DecodedMessage | undefined {
+  const p = e.grpcPause;
+  if (p?.kind !== 'message' || typeof p.base64 !== 'string') return undefined;
+  let schema: GrpcSchema | undefined;
+  try {
+    schema = grpc?.schema();
+  } catch {
+    schema = undefined;
+  }
+  const key = `${e.id}\0${p.dir}\0${p.index}\0${p.size}\0${p.base64.length}\0${e.pausedAt ?? ''}\0${grpc ? 1 : 0}`;
+  const hit = heldCache.get(key);
+  if (hit && hit.schema === schema) {
+    heldCache.delete(key);
+    heldCache.set(key, hit);
+    return hit.decoded;
+  }
+  const at = e.pausedAt ?? e.startedAt;
+  const bytesLen = Math.floor((p.base64.length * 3) / 4);
+  let decoded: DecodedMessage;
+  if (bytesLen > MAX_VIEW_DECODE_BYTES) {
+    const head = p.base64.slice(0, 5464); // 4 KB of bytes, a multiple of 4 characters
+    decoded = {
+      frame: 0,
+      dir: p.dir,
+      at,
+      size: p.size,
+      via: 'none',
+      bytes: new Uint8Array(Buffer.from(head, 'base64')),
+      error: `the held message is ${p.size} bytes, over the ${MAX_VIEW_DECODE_BYTES / 1024 / 1024} MB shown decoded; resume it unchanged, drop it, or replace it with message (base64)`,
+    };
+  } else {
+    decoded = decodeGrpcMessages({ url: e.url, frames: [] }, grpc, { frames: [{ dir: p.dir, at, kind: 'message', base64: p.base64, size: p.size }] }).messages[0];
+  }
+  heldCache.set(key, { schema, decoded });
+  while (heldCache.size > HELD_CACHE_ENTRIES) heldCache.delete(heldCache.keys().next().value as string);
+  return decoded;
+}
+
 // ------------------------------------------------------------------ CONTRACTS §17.3: the proxy's codec
 
 /** The largest message the proxy's hooks hand to the codec (§17.1). */
