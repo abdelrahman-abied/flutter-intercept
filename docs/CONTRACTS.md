@@ -1823,3 +1823,31 @@ Silent tunnels: no auth bypass versus normal CONNECT (LAN token, pinned peer, ca
 anything but CONNECT, never forwarded; upstream h2 sessions never shared across LAN gates; connect timeout bounded;
 SSRF guard on every upstream session; parsers (gRPC framing, gzip with a decompression cap, raw protobuf, `.pb.dart`
 tokenizer) bounded; redaction of decoded messages and metadata for agents; `grpcMock` header validation.
+
+### 16.8 REVIEW-10 amendments
+- **Held, not closed (REVIEW-10 #1).** A silent passthrough tunnel (undecrypted TLS gRPC) that a block rule, the
+  offline profile, `replay: fail` or a throttle drop cuts is **held**: no bytes relayed either way, the app's socket
+  kept open until the app closes it or `breakpointTimeoutMs` passes (then reset). The exchange shows the reason as
+  today. To grpc-dart that is an unreachable network (its deadline fires), not a connected-then-lost connection, so no
+  reconnect storm and no breaker trip. Normal (non-silent) tunnels keep the §14.8 behaviour.
+- **Breaker report.** When the entry's breaker trips for an authority it opens one more connection to the proxy and
+  writes `CONNECT <authority> HTTP/1.1\r\nHost: <authority>\r\nFlutter-Intercept-Tunnel: breaker\r\n`
+  `[Proxy-Authorization: …\r\n]\r\n`, then closes it (best effort, never awaited by the app's connect). The proxy runs
+  the same LAN checks, records no exchange, and emits `'grpcBreaker' {authority, viaLan}` (once per authority per
+  60 s). The host shows `SessionWarning {kind: 'bypass', id: 'grpc-breaker:<authority>'}`: "gRPC connections to
+  <authority> kept closing, so the app connected directly for 30 s — rules and network simulation didn't apply to
+  them meanwhile." The entry's console note says the same.
+- **Decompression (REVIEW-10 #3).** Only kept message bytes are decompressed, streaming, stopping after the frame cap
+  (64 KB) + 1 byte of output; messages past the frame cap are counted, never decompressed. When decompression stopped
+  early the frame has `sizeUnknown: true` and `size` = the compressed (wire) size; the UI shows "≥ 64 KB".
+- **Relay hardening (REVIEW-10 #6).** `decideGrpc` applies the REVIEW-8 client-certificate Origin refusal (trailers-only
+  `14`); no doubled "Flutter Intercept:" prefix in `grpc-message`.
+- **Status codes**: `grpcMock.code` is an integer 0–16 everywhere (agent schema, host validation, proxy).
+- **Schema (REVIEW-10 #2, #4, #6)**: parsing is linear-time with a per-file budget (≈ 2 M tokens or 200 ms → skipped
+  with a problem "too complex to read"); problem texts use the display label (`GrpcSourceFile.label`: root-relative or
+  `package:<name>/…`), never an absolute path; Node errors as codes (`EACCES`, `ENOENT`); decoded JSON keeps
+  `__proto__` as an own property.
+- **Agents (REVIEW-10 #4, #5, #6)**: problems scrubbed of absolute paths as a backstop; `list_rules` shows grpcMock
+  `messages` as `get_request` would (schema decode → redacted JSON, else raw decode redacted by value, else
+  `[binary N bytes]`) and HTTP `mock.body` through `redactBodyText`; confirmations show only validated values; tool
+  descriptions say that without the app's generated code redaction is by value only.

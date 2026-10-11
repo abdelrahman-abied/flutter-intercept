@@ -5,6 +5,8 @@
 export interface GrpcSourceFile {
   path: string;
   text: string;
+  /** CONTRACTS §16.8: what problem texts show (root-relative or `package:<name>/…`); defaults to the base name. */
+  label?: string;
 }
 
 export type ProtoScalar =

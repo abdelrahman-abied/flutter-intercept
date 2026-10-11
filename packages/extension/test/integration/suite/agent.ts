@@ -1122,6 +1122,12 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
     // assert_traffic expect.grpcStatus, both after hot restarts; get_status grpc.
     if (process.env.FI_AGENT_GRPC === '1') {
       const GET_ORDER = '/demo.orders.v1.OrderService/GetOrder';
+      // The demo's gRPC batch runs only with GRPC_PORT (lib/grpc_demo.dart): the server's h2c port, FI_GRPC_PORT.
+      const grpcPort = Number(process.env.FI_GRPC_PORT) || 50051;
+      const grpcDartCfg = vscode.workspace.getConfiguration('dart');
+      const grpcRunArgsBefore = grpcDartCfg.inspect<string[]>('flutterRunAdditionalArgs')?.globalValue;
+      await grpcDartCfg.update('flutterRunAdditionalArgs', [...(grpcRunArgsBefore ?? []), `--dart-define=GRPC_PORT=${grpcPort}`], vscode.ConfigurationTarget.Global);
+      try {
       for (const dev of devices) {
         const out: RunOutcome = { name: `AGENT ${dev} v0.10.0 over MCP: gRPC list/get/frames, get_grpc_schema, add_grpc_mock, assert grpcStatus`, output: '', proxyHits: [], failures: [], ms: 0 };
         const f = out.failures;
@@ -1201,6 +1207,9 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
         out.ms = Date.now() - t0;
         results.push(out);
         console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+      }
+      } finally {
+        await grpcDartCfg.update('flutterRunAdditionalArgs', grpcRunArgsBefore, vscode.ConfigurationTarget.Global).then(undefined, () => undefined);
       }
     }
 

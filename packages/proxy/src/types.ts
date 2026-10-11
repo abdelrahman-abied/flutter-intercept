@@ -138,6 +138,7 @@ export interface Frame {
   id?: string;                     // SSE `id:`
   closeCode?: number;              // close frames
   compressed?: true;               // gRPC message sent compressed (base64/size are the decompressed bytes)
+  sizeUnknown?: true;              // CONTRACTS §16.8: decompression stopped at the frame cap; size = compressed (wire) size
 }
 
 export interface GraphqlInfo {
