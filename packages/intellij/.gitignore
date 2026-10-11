@@ -5,3 +5,7 @@ build/
 out/
 *.iml
 .idea/
+bin/
+.project
+.classpath
+.settings/
