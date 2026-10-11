@@ -8,15 +8,25 @@ import { FRAME_PAYLOAD_CAP } from './frames';
 /** The marker header of a silent CONNECT (CONTRACTS §16.1), and the entry's connect timeout header. */
 export const SILENT_TUNNEL_HEADER = 'flutter-intercept-tunnel';
 export const CONNECT_TIMEOUT_HEADER = 'flutter-intercept-connect-timeout';
+/** CONTRACTS §16.8: the event a breaker report emits on InterceptProxy, at most once per authority per window. */
+export const GRPC_BREAKER_EVENT = 'grpcBreaker';
+export const GRPC_BREAKER_WINDOW_MS = 60_000;
+export interface GrpcBreakerEvent {
+  /** `host:port` (IPv6 in brackets, host lower-cased) the app connected to directly for 30 s. */
+  authority: string;
+  /** The report came through the LAN listener (a physical device). */
+  viaLan: boolean;
+}
 /** Upstream connect timeout for gRPC sessions and silent passthrough tunnels: default and maximum (ms). */
 export const GRPC_CONNECT_TIMEOUT_MS = 30_000;
 export const GRPC_CONNECT_TIMEOUT_MAX_MS = 60_000;
 /** A silent tunnel whose first payload byte never comes is closed after this long. */
 export const SILENT_FIRST_BYTE_MS = 30_000;
-/** Compressed messages are kept (to decompress for display) up to this size; bigger ones are only counted. */
-export const GRPC_COMPRESSED_KEEP_BYTES = 4 * 1024 * 1024;
-/** Decompression output cap per message (gzip bombs). */
-export const GRPC_DECOMPRESS_CAP_BYTES = 16 * 1024 * 1024;
+/**
+ * CONTRACTS §16.8 (REVIEW-10 #3): of a compressed message only this prefix is kept, and only it is decompressed
+ * (streaming, stopping after FRAME_PAYLOAD_CAP + 1 bytes of output), never the whole message.
+ */
+export const GRPC_COMPRESSED_KEEP_BYTES = 256 * 1024;
 /** Idle upstream HTTP/2 sessions are closed after this long (CONTRACTS §16.2, like the HTTP pool). */
 export const GRPC_SESSION_IDLE_MS = 30_000;
 
@@ -176,7 +186,7 @@ export class GrpcMessageParser {
         this.headerFill = 0;
         this.parts = [];
         this.keptBytes = 0;
-        this.keepLimit = this.compressed ? (this.size <= GRPC_COMPRESSED_KEEP_BYTES ? this.size : 0) : Math.min(this.size, FRAME_PAYLOAD_CAP);
+        this.keepLimit = Math.min(this.size, this.compressed ? GRPC_COMPRESSED_KEEP_BYTES : FRAME_PAYLOAD_CAP);
         if (this.remaining === 0) this.emit();
         continue;
       }
@@ -207,33 +217,106 @@ export class GrpcMessageParser {
 }
 
 /**
- * A message as a Frame (`kind: 'message'`): `base64` of the first 64 KB of the (decompressed) payload, `size` the full
- * (decompressed) size. A compressed message is decompressed for gzip / deflate only, capped at
- * GRPC_DECOMPRESS_CAP_BYTES; when that's impossible the frame keeps the wire bytes' size, no payload, `truncated`.
+ * A message as a Frame (`kind: 'message'`), synchronously: `base64` of the first 64 KB of the payload, `size` the
+ * full (wire) size. Compressed messages get no payload here (see GrpcFrameRecorder, which decompresses gzip / deflate
+ * prefixes off the event loop); unknown encodings stay that way: `compressed`, `truncated`, no payload.
  */
-export function messageFrame(dir: Frame['dir'], m: GrpcWireMessage, encoding: string | undefined, at = Date.now()): Frame {
-  let data: Buffer | undefined = m.kept;
-  let size = m.size;
-  let truncated = !m.complete;
+export function messageFrame(dir: Frame['dir'], m: GrpcWireMessage, at = Date.now()): Frame {
+  const f: Frame = { dir, at, kind: 'message', size: m.size };
   if (m.compressed) {
-    data = undefined;
-    truncated = true;
-    if (m.complete && (encoding === 'gzip' || encoding === 'deflate')) {
-      try {
-        const out = encoding === 'gzip' ? zlib.gunzipSync(m.kept, { maxOutputLength: GRPC_DECOMPRESS_CAP_BYTES }) : zlib.inflateSync(m.kept, { maxOutputLength: GRPC_DECOMPRESS_CAP_BYTES });
-        size = out.length;
-        data = out.subarray(0, FRAME_PAYLOAD_CAP);
-        truncated = out.length > FRAME_PAYLOAD_CAP;
-      } catch {
-        data = undefined;
+    f.compressed = true;
+    if (m.size > 0) f.truncated = true;
+    return f;
+  }
+  const data = m.kept.subarray(0, FRAME_PAYLOAD_CAP);
+  if (data.length) f.base64 = data.toString('base64');
+  if (m.size > data.length) f.truncated = true;
+  return f;
+}
+
+/**
+ * Decompress (gzip / deflate) the start of `input`, streaming in zlib's thread pool, stopping once more than `cap`
+ * bytes came out. `complete` = the whole stream decompressed within the cap. undefined = nothing could be decoded.
+ */
+export function decompressPrefix(input: Buffer, encoding: 'gzip' | 'deflate', cap = FRAME_PAYLOAD_CAP): Promise<{ data: Buffer; complete: boolean } | undefined> {
+  return new Promise((resolve) => {
+    const z = encoding === 'gzip' ? zlib.createGunzip({ chunkSize: cap + 1024 }) : zlib.createInflate({ chunkSize: cap + 1024 });
+    const parts: Buffer[] = [];
+    let n = 0;
+    let done = false;
+    const finish = (complete: boolean) => {
+      if (done) return;
+      done = true;
+      z.removeAllListeners('data');
+      z.on('error', () => undefined);
+      z.destroy();
+      const data = Buffer.concat(parts, n);
+      resolve(!data.length && !complete ? undefined : { data: data.subarray(0, cap), complete: complete && n <= cap });
+    };
+    z.on('data', (d: Buffer) => {
+      parts.push(d);
+      n += d.length;
+      if (n > cap) finish(false);
+    });
+    z.once('end', () => finish(true));
+    z.once('error', () => finish(false));
+    z.end(input);
+  });
+}
+
+/**
+ * Turns one direction's messages into frames, in order (CONTRACTS §16.8). Uncompressed messages are framed at once;
+ * gzip / deflate ones are decompressed asynchronously from their kept prefix (≤ GRPC_COMPRESSED_KEEP_BYTES of input,
+ * ≤ 64 KB + 1 of output): exact `size` when the whole message decompressed within that, else `sizeUnknown` with the
+ * wire size. Frames reach `sink` in message order.
+ */
+export class GrpcFrameRecorder {
+  private tail: Promise<void> = Promise.resolve();
+  private pending = 0;
+
+  constructor(
+    private readonly dir: Frame['dir'],
+    private readonly encoding: () => string | undefined,
+    private readonly sink: (f: Frame) => void,
+  ) {}
+
+  push(m: GrpcWireMessage): void {
+    const at = Date.now();
+    const enc = this.encoding();
+    if (!m.compressed || (enc !== 'gzip' && enc !== 'deflate') || !m.kept.length) {
+      const f = messageFrame(this.dir, m, at);
+      if (!this.pending) return this.deliver(f);
+      this.tail = this.tail.then(() => this.deliver(f));
+      return;
+    }
+    this.pending++;
+    const work = decompressPrefix(m.kept, enc);
+    this.tail = this.tail.then(async () => {
+      const r = await work;
+      this.pending--;
+      const f: Frame = { dir: this.dir, at, kind: 'message', size: m.size, compressed: true };
+      if (r?.data.length) f.base64 = r.data.toString('base64');
+      if (r?.complete && m.complete) f.size = r.data.length;
+      else {
+        f.sizeUnknown = true;
+        f.truncated = true;
       }
+      this.deliver(f);
+    });
+  }
+
+  /** Resolves when every frame pushed so far was delivered. */
+  idle(): Promise<void> {
+    return this.tail;
+  }
+
+  private deliver(f: Frame): void {
+    try {
+      this.sink(f);
+    } catch {
+      /* recording never breaks the relay */
     }
   }
-  const f: Frame = { dir, at, kind: 'message', size };
-  if (data && data.length) f.base64 = data.toString('base64');
-  if (truncated && size > 0) f.truncated = true;
-  if (m.compressed) f.compressed = true;
-  return f;
 }
 
 /** Hop-by-hop / connection-specific headers HTTP/2 must not carry (node refuses them). */

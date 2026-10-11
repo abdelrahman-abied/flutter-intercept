@@ -7,16 +7,21 @@ import * as net from 'net';
 import * as tls from 'tls';
 import * as zlib from 'zlib';
 import { randomBytes, X509Certificate } from 'crypto';
+import { performance } from 'perf_hooks';
 import { generateCACertificate } from 'mockttp';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import type { Exchange, InterceptProxy, Rule } from '../src';
+import type { Exchange, Frame, InterceptProxy, Rule } from '../src';
 import { ruleFromExchange, ruleProblem } from '../src/rules';
 import {
   classifyFirstBytes,
   decodeGrpcMessage,
   encodeGrpcMessage,
+  decompressPrefix,
   FirstMessageCut,
+  GRPC_BREAKER_EVENT,
+  GrpcFrameRecorder,
   GrpcMessageParser,
+  type GrpcBreakerEvent,
   isGrpcContentType,
   messageFrame,
   parseConnectTimeout,
@@ -87,19 +92,47 @@ describe('gRPC wire helpers (unit)', () => {
     expect(got.length).toBe(before);
   });
 
-  it('message frames: gzip decompressed (capped), base64 ≤ 64 KB, size = full size', () => {
-    const payload = Buffer.alloc(100_000, 'z');
-    const gz = zlib.gzipSync(payload);
-    const f = messageFrame('receive', { compressed: true, size: gz.length, kept: gz, complete: true }, 'gzip', 1);
-    expect(f).toMatchObject({ dir: 'receive', kind: 'message', size: 100_000, compressed: true, truncated: true });
-    expect(Buffer.from(f.base64!, 'base64').length).toBe(64 * 1024);
-    // a gzip bomb stops at the cap: no payload, the wire size
-    const bomb = zlib.gzipSync(Buffer.alloc(20 * 1024 * 1024));
-    const b = messageFrame('receive', { compressed: true, size: bomb.length, kept: bomb, complete: true }, 'gzip');
-    expect(b).toMatchObject({ size: bomb.length, compressed: true, truncated: true });
-    expect(b.base64).toBeUndefined();
-    // unknown encoding: counted only
-    expect(messageFrame('send', { compressed: true, size: 3, kept: Buffer.from([1, 2, 3]), complete: true }, 'snappy')).toMatchObject({ size: 3, compressed: true, truncated: true });
+  it('message frames: only the kept prefix is decompressed, streaming, stopping after 64 KB + 1 (REVIEW-10 #3)', async () => {
+    const frames: Frame[] = [];
+    const rec = new GrpcFrameRecorder('receive', () => 'gzip', (f) => frames.push(f));
+    const push = (payload: Buffer, compressed = true) => {
+      const p = new GrpcMessageParser((m) => rec.push(m));
+      p.push(frame(compressed ? zlib.gzipSync(payload) : payload, compressed));
+    };
+    push(Buffer.from('small'));
+    push(Buffer.alloc(100_000, 'z')); // decompresses past the cap: stopped early
+    push(Buffer.from('plain'), false); // uncompressed after compressed: order kept
+    push(randomBytes(400_000)); // incompressible, only the first 256 KB kept: stopped early too
+    await rec.idle();
+    expect(frames.map((f) => [f.size, !!f.sizeUnknown, !!f.truncated, !!f.compressed])).toEqual([
+      [5, false, false, true],
+      [zlib.gzipSync(Buffer.alloc(100_000, 'z')).length, true, true, true],
+      [5, false, false, false],
+      [expect.any(Number), true, true, true],
+    ]);
+    expect(Buffer.from(frames[0].base64!, 'base64').toString()).toBe('small');
+    expect(Buffer.from(frames[1].base64!, 'base64')).toEqual(Buffer.alloc(64 * 1024, 'z'));
+    expect(frames[3].size).toBeGreaterThan(400_000);
+    expect(await decompressPrefix(Buffer.from('not gzip'), 'gzip')).toBeUndefined();
+    // unknown encodings: counted, never decoded
+    expect(messageFrame('send', { compressed: true, size: 3, kept: Buffer.from([1, 2, 3]), complete: true })).toMatchObject({ size: 3, compressed: true, truncated: true });
+  });
+
+  it('1000 gzip bombs on one call cost < 100 ms of event-loop time (REVIEW-10 #3)', async () => {
+    const bomb = frame(zlib.gzipSync(Buffer.alloc(16 * 1024 * 1024 - 1)), true); // ≈ 16 KB → 16 MB
+    const wire = Buffer.concat(Array.from({ length: 1000 }, () => bomb));
+    let n = 0;
+    const rec = new GrpcFrameRecorder('receive', () => 'gzip', (f) => {
+      n++;
+      expect(f.sizeUnknown).toBe(true);
+    });
+    const parser = new GrpcMessageParser((m) => rec.push(m));
+    const before = performance.eventLoopUtilization();
+    for (let i = 0; i < wire.length; i += 16 * 1024) parser.push(wire.subarray(i, i + 16 * 1024)); // like h2 DATA frames
+    await rec.idle();
+    const used = performance.eventLoopUtilization(before);
+    expect(n).toBe(1000);
+    expect(used.active).toBeLessThan(100);
   });
 
   it('first bytes: h2c preface (even partial), TLS, other; the truncate cutter', () => {
@@ -274,7 +307,8 @@ describe('silent tunnels and the relay (h2c)', () => {
     const r = await grpcCall(session, '/t.Echo/Gzip', ['zipped'], { gzip: true });
     expect(r.compressed).toEqual([true]);
     expect(r.messages.map(String)).toEqual(['gz:zipped']);
-    const ex = await waitFor(proxy, doneGrpc('/t.Echo/Gzip'));
+    // compressed frames are decompressed asynchronously and may join the exchange just after it finished
+    const ex = await waitFor(proxy, (e) => doneGrpc('/t.Echo/Gzip')(e) && (e.frames?.length ?? 0) === 2);
     expect(ex.grpc).toMatchObject({ requestEncoding: 'gzip', responseEncoding: 'gzip' });
     expect(ex.frames?.map((f) => [f.dir, f.compressed, Buffer.from(f.base64!, 'base64').toString(), f.size])).toEqual([
       ['send', true, 'zipped', 6],
@@ -468,17 +502,64 @@ describe('TLS silent tunnels', () => {
     session.destroy();
   });
 
-  it('a block rule on the passthrough tunnel resets it after the handshake; the server never sees the call', async () => {
-    proxy.setRules([rule('b', `https://127.0.0.1:${up.port}/*`, { kind: 'block', mode: 'reset' }, { match: { method: 'CONNECT', url: `https://127.0.0.1:${up.port}/*` } })]);
-    const before = up.events.length;
-    const { session } = await tlsSession(proxy.port, `127.0.0.1:${up.port}`);
-    const r = await grpcCall(session, '/t.Echo/Unary', ['x']);
-    session.destroy();
-    expect(r.messages).toEqual([]);
-    expect(r.grpcStatus).toBeUndefined();
-    const ex = await waitFor(proxy, (e) => e.kind === 'tunnel' && e.state !== 'pending');
+  /** A TLS client inside a silent tunnel; resolves whether the handshake completed within `ms`. */
+  async function heldClient(port: number, target: string, ms = 300) {
+    const sock = await silentSocket(port, target);
+    const t = tls.connect({ socket: sock, servername: 'localhost', ALPNProtocols: ['grpc-exp', 'h2'], rejectUnauthorized: false });
+    t.on('error', () => undefined);
+    let secure = false;
+    t.once('secureConnect', () => (secure = true));
+    await sleep(ms);
+    return { t, sock, secure };
+  }
+
+  it('block / offline / replay: fail hold a silent passthrough tunnel: no answer, no close, the server never contacted (REVIEW-10 #1)', async () => {
+    const target = `127.0.0.1:${up.port}`;
+    const before = up.connections;
+    proxy.setRules([rule('b', `https://${target}/*`, { kind: 'block', mode: 'reset' }, { match: { method: 'CONNECT', url: `https://${target}/*` } })]);
+    const a = await heldClient(proxy.port, target);
+    expect(a.secure).toBe(false);
+    expect(a.sock.destroyed).toBe(false);
+    a.t.destroy(); // the app gives up (its deadline)
+    let ex = await waitFor(proxy, (e) => e.kind === 'tunnel' && e.state !== 'pending');
     expect(ex).toMatchObject({ state: 'blocked', grpcTunnel: true, matchedRuleId: 'b' });
-    expect(up.events.length).toBe(before);
+    expect(ex.simulated).toMatch(/^Blocked \(held without an answer; the app gave up after \d+\.\d s\)$/);
+    proxy.setRules([]);
+    proxy.setReplay([], { fallback: 'fail' });
+    const b = await heldClient(proxy.port, target);
+    expect(b.secure).toBe(false);
+    b.t.destroy();
+    ex = await waitFor(proxy, (e) => e.kind === 'tunnel' && e.state !== 'pending' && e.id !== ex.id);
+    expect(ex.simulated).toMatch(/^Not in the recording \(replay: fail\) \(held/);
+    proxy.setReplay(undefined);
+    expect(up.connections).toBe(before);
+  });
+
+  it('a held tunnel is reset after breakpointTimeoutMs (offline profile)', async () => {
+    const p2 = await startProxy({ ca, breakpointTimeoutMs: 400 });
+    try {
+      p2.setNetworkProfile({ kind: 'offline' });
+      const c = await heldClient(p2.port, `127.0.0.1:${up.port}`, 50);
+      await once(c.sock, 'close');
+      const ex = await waitFor(p2, (e) => e.kind === 'tunnel' && e.state !== 'pending');
+      expect(ex.simulated).toMatch(/^Offline \(held without an answer; reset after 0\.\d s\)$/);
+    } finally {
+      await p2.stop();
+    }
+  });
+
+  it('a web page’s gRPC call to a client-certificate host is refused before any connection (REVIEW-10 #6)', async () => {
+    proxy.setGrpcDecryptHosts(['127.0.0.1']);
+    expect(proxy.setClientCertificates([{ host: '127.0.0.1', cert: upCert.cert, key: upCert.key }])).toEqual([{ host: '127.0.0.1' }]);
+    const before = up.connections;
+    const { session } = await tlsSession(proxy.port, `127.0.0.1:${up.port}`, { ca: ca.cert });
+    const r = await grpcCall(session, '/t.Echo/Unary', ['x'], { metadata: { origin: 'https://ads.example' } });
+    session.destroy();
+    expect(r).toMatchObject({ trailersOnly: true, grpcStatus: 14 });
+    expect(decodeGrpcMessage(r.grpcMessage)).toMatch(/^Flutter Intercept: Refused: a client certificate/);
+    const ex = await waitFor(proxy, doneGrpc('/t.Echo/Unary'));
+    expect(ex.state).toBe('blocked');
+    expect(up.connections).toBe(before);
   });
 
   it('HTTP/1.1 clients and a Chrome-like ALPN offer still get HTTP/1.1; an h2-only offer gets h2', async () => {
@@ -808,6 +889,39 @@ describe('upstream sessions', () => {
   });
 });
 
+// ---------------------------------------------------------------- breaker reports (CONTRACTS §16.8)
+
+describe('breaker reports', () => {
+  it('Flutter-Intercept-Tunnel: breaker → one grpcBreaker event per authority per 60 s; never answered, no exchange', async () => {
+    const proxy = await startProxy();
+    try {
+      const events: GrpcBreakerEvent[] = [];
+      proxy.on(GRPC_BREAKER_EVENT, (e: GrpcBreakerEvent) => events.push(e));
+      const report = async (authority: string) => {
+        const s = net.connect(proxy.port, '127.0.0.1');
+        await once(s, 'connect');
+        const got: Buffer[] = [];
+        s.on('data', (d) => got.push(d));
+        s.on('error', () => undefined);
+        s.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\nFlutter-Intercept-Tunnel: Breaker\r\n\r\n`);
+        await once(s, 'close');
+        return Buffer.concat(got).length;
+      };
+      expect(await report('API.example.test:443')).toBe(0);
+      expect(await report('api.example.test:443')).toBe(0);
+      expect(await report('[::1]:50051')).toBe(0);
+      await sleep(20);
+      expect(events).toEqual([
+        { authority: 'api.example.test:443', viaLan: false },
+        { authority: '[::1]:50051', viaLan: false },
+      ]);
+      expect(proxy.getExchanges()).toEqual([]);
+    } finally {
+      await proxy.stop();
+    }
+  });
+});
+
 // ---------------------------------------------------------------- self-check fallback
 
 describe('self-check fallback', () => {
@@ -913,7 +1027,7 @@ describe.skipIf(!LAN_IP)('silent tunnels from LAN clients', () => {
     const r = await grpcCall(s, '/t.Echo/Unary', ['x']);
     s.destroy();
     expect(r).toMatchObject({ trailersOnly: true, grpcStatus: 14 });
-    expect(decodeGrpcMessage(r.grpcMessage)).toMatch(/blocked a LAN client/);
+    expect(decodeGrpcMessage(r.grpcMessage)).toMatch(/^Flutter Intercept: blocked a LAN client/); // the prefix once
     const ex = await waitFor(proxy, doneGrpc('/t.Echo/Unary'));
     expect(ex).toMatchObject({ state: 'error', viaLan: true });
     expect(up.connections).toBe(0);
@@ -931,6 +1045,29 @@ describe.skipIf(!LAN_IP)('silent tunnels from LAN clients', () => {
     });
     s.destroy();
     expect(status).toBe(403);
+    expect(up.connections).toBe(0);
+  });
+
+  it('breaker reports from the LAN: with the token → viaLan event; a bad token is dropped silently', async () => {
+    const events: GrpcBreakerEvent[] = [];
+    proxy.on(GRPC_BREAKER_EVENT, (e: GrpcBreakerEvent) => events.push(e));
+    const report = async (headers: string) => {
+      const s = net.connect(lanPort, LAN_IP);
+      await once(s, 'connect');
+      s.on('error', () => undefined);
+      const got: Buffer[] = [];
+      s.on('data', (d) => got.push(d));
+      s.write(`CONNECT ${LAN_IP}:${up.port} HTTP/1.1\r\nHost: x\r\nFlutter-Intercept-Tunnel: breaker\r\n${headers}\r\n`);
+      await once(s, 'close');
+      return Buffer.concat(got).length;
+    };
+    expect(await report(`Proxy-Authorization: ${auth('nope-nope-nope-nope')}\r\n`)).toBe(0);
+    await sleep(20);
+    expect(events).toEqual([]);
+    expect(await report(`Proxy-Authorization: ${auth()}\r\n`)).toBe(0);
+    await sleep(20);
+    expect(events).toEqual([{ authority: `${LAN_IP}:${up.port}`, viaLan: true }]);
+    expect(proxy.getExchanges()).toEqual([]);
     expect(up.connections).toBe(0);
   });
 

@@ -103,7 +103,17 @@ const RESPONSE_400 = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnectio
 
 /** The silent-tunnel marker value (CONTRACTS §16.1): exactly one header, `silent`, case-insensitive. */
 export function isSilentMarker(v: string | string[] | undefined): boolean {
-  return typeof v === 'string' && v.trim().toLowerCase() === 'silent';
+  return tunnelMarker(v) === 'silent';
+}
+
+/**
+ * `Flutter-Intercept-Tunnel` on a CONNECT: `silent` (the entry's gRPC hook, CONTRACTS §16.1) or `breaker` (its
+ * circuit-breaker report, §16.8). Neither is ever answered. Exactly one header, case-insensitive.
+ */
+export function tunnelMarker(v: string | string[] | undefined): 'silent' | 'breaker' | undefined {
+  if (typeof v !== 'string') return undefined;
+  const t = v.trim().toLowerCase();
+  return t === 'silent' || t === 'breaker' ? t : undefined;
 }
 
 export function refuse(socket: net.Socket, response: string): void {
@@ -737,7 +747,8 @@ export class LanGate {
     }
     const isConnect = method === 'CONNECT';
     // CONTRACTS §16.2: a silent CONNECT (the entry's gRPC hook) never reads a reply, so a refusal is a close.
-    const silent = isConnect && isSilentMarker(rawHeaderValue(raw, 'flutter-intercept-tunnel'));
+    const marker = isConnect ? tunnelMarker(rawHeaderValue(raw, 'flutter-intercept-tunnel')) : undefined;
+    const silent = marker !== undefined; // a breaker report is never answered either
     const deny = (response: string) => (silent ? void socket.destroy() : refuse(socket, response));
     // Token AND pinned peer: another IP with the right token is refused like a wrong token.
     if (!this.admits(rawHeaderValue(raw, 'proxy-authorization'), info.peer)) return deny(RESPONSE_407);
@@ -749,7 +760,7 @@ export class LanGate {
         await precheckTarget(t[1], Number(t[2]), this.host);
       } catch (e) {
         if (e instanceof SsrfError) {
-          this.cb.onBlockedConnect(target, e.message);
+          if (marker !== 'breaker') this.cb.onBlockedConnect(target, e.message); // breaker reports record nothing
           return deny(RESPONSE_403);
         }
         return deny(RESPONSE_400);

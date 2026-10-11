@@ -142,7 +142,8 @@ How to handle TLS gRPC with default credentials, which is most production-style 
 ## As built — proxy (0.10.0)
 
 Files: `packages/proxy/src/grpc.ts` (framing, bounded message parser, gzip/deflate decode capped at 16 MB per message,
-`grpc-message` / `grpc-timeout` / connect-timeout parsing, first-byte classification, truncate cutter),
+`grpc-message` / `grpc-timeout` / connect-timeout parsing, first-byte classification, truncate cutter; since
+REVIEW-10 prefix-only streaming decompression, see below),
 `grpc-upstream.ts` (HTTP/2 session pool), `silent.ts` (self-check + injection into mockttp), changes in
 `intercept-proxy.ts`, `lan.ts`, `tunnel.ts`, `rules.ts`, `index.ts`. Tests: `test/grpc.test.ts` with node:http2
 client/server helpers in `test/grpc-helpers.ts` (no `@grpc/grpc-js`, no new dependency).
@@ -183,3 +184,19 @@ client/server helpers in `test/grpc-helpers.ts` (no `@grpc/grpc-js`, no new depe
 - Not done / known: gRPC-Web; breakpoints, mutate, rewrite, script, cors, mapRemote and replay on gRPC; non-gRPC
   HTTP/2 still uses mockttp's passthrough (h2c upstream 502, trailers-only lost). Replay never answers gRPC, but its
   `fail` fallback answers gRPC calls no rule matched with `14` "DNS lookup failed" (like the offline profile).
+- **REVIEW-10 fixes (CONTRACTS §16.8).**
+  - #1: a silent passthrough tunnel cut by a block rule, a fault, the offline profile, `replay: fail` or a throttle
+    drop is held at once. The server is not contacted and nothing is relayed. The app's bytes are read and dropped
+    until it closes (`simulated: "<label> (held without an answer; the app gave up after N s)"`) or
+    `breakpointTimeoutMs` passes (then reset). Non-silent tunnels are unchanged.
+  - Breaker reports: a `Flutter-Intercept-Tunnel: breaker` CONNECT gets the gate's checks and is never answered. It
+    records no exchange, not even a gate SSRF refusal. The proxy emits `'grpcBreaker' {authority, viaLan}` (exported
+    `GRPC_BREAKER_EVENT`, `GrpcBreakerEvent`) at most once per normalised authority per 60 s, and tracks at most 1000
+    authorities.
+  - #3: compressed messages keep ≤ 256 KB of wire bytes. `GrpcFrameRecorder` decompresses that prefix with
+    `createGunzip` / `createInflate`, stops after 64 KB + 1 of output and delivers frames in order. When it stops
+    early the frame has `sizeUnknown` and the wire size. Frames that finish after the call ended still join the stored
+    exchange. Measured: 1000 gzip bombs (16 KB → 16 MB each) cost ≈ 24 ms of event-loop time in total (≈ 4 ms per
+    message before).
+  - #6: gRPC calls get the REVIEW-8 client-certificate Origin refusal (trailers-only `14`, state `blocked`). The
+    "Flutter Intercept:" prefix now appears exactly once (`fiText`). `grpcMock.code` was already limited to 0–16.

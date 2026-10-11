@@ -80,7 +80,10 @@ export {
   encodeGrpcMessage,
   decodeGrpcMessage,
   frameMessage,
+  GRPC_BREAKER_EVENT,
+  GRPC_BREAKER_WINDOW_MS,
 } from './grpc';
+export type { GrpcBreakerEvent } from './grpc';
 export type { GrpcSupport } from './silent';
 export { NETWORK_PRESETS, NO_PROFILE, presetProfile, describeProfile } from './network';
 export type { NetworkProfile, NetworkPreset, NetworkPresetId } from './network';
