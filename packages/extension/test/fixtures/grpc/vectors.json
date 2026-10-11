@@ -1,0 +1,717 @@
+[
+ {
+  "name": "scalars: typical",
+  "type": "fi.shop.v1.Scalars",
+  "base64": "CQAAAAAAAApAFc3MjD8Y1v//////////ASD/////////7/8BKIDQrPMOMP///////////wE4DUD///////////8BTf////9RywT7cR8BAABdAAAAgGH7/////////2gBcg9ow6lsbG8g4pyTIPCfmIB6BQABAvr/gAEAigEAkAED",
+  "json": {
+   "d": 3.25,
+   "f": 1.1,
+   "i32": -42,
+   "i64": "-9007199254740993",
+   "u32": 4000000000,
+   "u64": "18446744073709551615",
+   "s32": -7,
+   "s64": "-9223372036854775808",
+   "fx32": 4294967295,
+   "fx64": "1234567890123",
+   "sfx32": -2147483648,
+   "sfx64": "-5",
+   "b": true,
+   "s": "héllo ✓ 😀",
+   "by": "AAEC+v8=",
+   "optI32": 0,
+   "optS": "",
+   "color": "BLUE"
+  },
+  "dartJson": {
+   "d": 3.25,
+   "f": 1.100000023841858,
+   "i32": -42,
+   "i64": "-9007199254740993",
+   "u32": 4000000000,
+   "u64": "18446744073709551615",
+   "s32": -7,
+   "s64": "0",
+   "fx32": 4294967295,
+   "fx64": "1234567890123",
+   "sfx32": -2147483648,
+   "sfx64": "-5",
+   "b": true,
+   "s": "héllo ✓ 😀",
+   "by": "AAEC+v8=",
+   "optI32": 0,
+   "optS": "",
+   "color": "BLUE"
+  }
+ },
+ {
+  "name": "scalars: extremes",
+  "type": "fi.shop.v1.Scalars",
+  "base64": "CQAAAAAAAPB/FQAAgP8Y/////wcg//////////9/KAE4/////w9A/v//////////AVH//////////2EAAAAAAAAAgA==",
+  "json": {
+   "d": "Infinity",
+   "f": "-Infinity",
+   "i32": 2147483647,
+   "i64": "9223372036854775807",
+   "u32": 1,
+   "s32": -2147483648,
+   "s64": "9223372036854775807",
+   "fx64": "18446744073709551615",
+   "sfx64": "-9223372036854775808"
+  },
+  "dartJson": {
+   "d": "Infinity",
+   "f": "-Infinity",
+   "i32": 2147483647,
+   "i64": "9223372036854775807",
+   "u32": 1,
+   "s32": -2147483648,
+   "s64": "-1",
+   "fx64": "-1",
+   "sfx64": "-9223372036854775808"
+  }
+ },
+ {
+  "name": "scalars: nan",
+  "type": "fi.shop.v1.Scalars",
+  "base64": "CQAAAAAAAPh/FQAAAD8=",
+  "json": {
+   "d": "NaN",
+   "f": 0.5
+  },
+  "dartJson": {
+   "d": "NaN",
+   "f": 0.5
+  }
+ },
+ {
+  "name": "scalars: empty",
+  "type": "fi.shop.v1.Scalars",
+  "base64": "",
+  "json": {},
+  "dartJson": {}
+ },
+ {
+  "name": "repeats",
+  "type": "fi.shop.v1.Repeats",
+  "base64": "ChgAAAAAAAD4PwAAAAAAAADAAAAAAAAAAAASBAAAgD4aDQH///////////8BrAIiFAH///////////8B//////////9/KgYA/////w8yCoCAgICAgICAgAE6AwECf0IBBUoEBwAAAFIICAAAAAAAAABaBPf///9iCPb/////////agMBAAFyAWFyAHIDY2NjegEBegB6Av/+ggEDAQIAigENCgNFVVIQDBiAyrXuAYoBAJABBZAB+v//////////AZAB8KIE",
+  "json": {
+   "d": [
+    1.5,
+    -2.0,
+    0.0
+   ],
+   "f": [
+    0.25
+   ],
+   "i32": [
+    1,
+    -1,
+    300
+   ],
+   "i64": [
+    "1",
+    "-1",
+    "9223372036854775807"
+   ],
+   "u32": [
+    0,
+    4294967295
+   ],
+   "u64": [
+    "9223372036854775808"
+   ],
+   "s32": [
+    -1,
+    1,
+    -64
+   ],
+   "s64": [
+    "-3"
+   ],
+   "fx32": [
+    7
+   ],
+   "fx64": [
+    "8"
+   ],
+   "sfx32": [
+    -9
+   ],
+   "sfx64": [
+    "-10"
+   ],
+   "b": [
+    true,
+    false,
+    true
+   ],
+   "s": [
+    "a",
+    "",
+    "ccc"
+   ],
+   "by": [
+    "AQ==",
+    "",
+    "//4="
+   ],
+   "colors": [
+    "RED",
+    "GREEN",
+    "COLOR_UNSPECIFIED"
+   ],
+   "moneys": [
+    {
+     "currency": "EUR",
+     "units": "12",
+     "nanos": 500000000
+    },
+    {}
+   ],
+   "unpacked": [
+    5,
+    -6,
+    70000
+   ]
+  },
+  "dartJson": {
+   "d": [
+    1.5,
+    -2,
+    0
+   ],
+   "f": [
+    0.25
+   ],
+   "i32": [
+    1,
+    -1,
+    300
+   ],
+   "i64": [
+    "1",
+    "-1",
+    "9223372036854775807"
+   ],
+   "u32": [
+    0,
+    4294967295
+   ],
+   "u64": [
+    "9223372036854775808"
+   ],
+   "s32": [
+    -1,
+    1,
+    -64
+   ],
+   "s64": [
+    "-3"
+   ],
+   "fx32": [
+    7
+   ],
+   "fx64": [
+    "8"
+   ],
+   "sfx32": [
+    -9
+   ],
+   "sfx64": [
+    "-10"
+   ],
+   "b": [
+    true,
+    false,
+    true
+   ],
+   "s": [
+    "a",
+    "",
+    "ccc"
+   ],
+   "by": [
+    "AQ==",
+    "",
+    "//4="
+   ],
+   "colors": [
+    "RED",
+    "GREEN",
+    "COLOR_UNSPECIFIED"
+   ],
+   "moneys": [
+    {
+     "currency": "EUR",
+     "units": "12",
+     "nanos": 500000000
+    },
+    {}
+   ],
+   "unpacked": [
+    5,
+    -6,
+    70000
+   ]
+  }
+ },
+ {
+  "name": "order: everything",
+  "type": "fi.shop.v1.Order",
+  "base64": "CgNvLTESKQoFU0tVLTEQAxoNCgNVU0QQCRiA54jYAyACKgsKCWdpZnQgd3JhcCoAEgcKBVNLVS0yGgoKA2VudhIDZGV2GgkKBWVtcHR5EgAiLQgBEikKBVNLVS0xEAMaDQoDVVNEEAkYgOeI2AMgAioLCglnaWZ0IHdyYXAqACIPCP7//////////wESAhABKgcKA3NreRADKggKBG5vbmUQADINCP///////////wEQATIMCP//////////fxAAOgcIARIDAQIDOgQIABIAQg0I////////////ARACWggKA0pQWRDoB6IBCwiA4s+qBhDAqdM6qgEICFoQgMq17gGyAQ8KDWxlYXZlIGF0IGRvb3K6AQsIgYCAgICAgICAAcIBWQoOCgFuEgkRAAAAAAAA+D8KCAoBcxIDGgF4CgcKAWISAiABCgcKAXoSAggAChkKAWwSFDISCgkRAAAAAAAA8D8KBRoDdHdvChAKAW8SCyoJCgcKAWsSAiAAygEFGgNhbnnSASEKCG9yZGVyX2lkCglsaW5lcy5za3UKCmNyZWF0ZWRfYXTaAS4KI3R5cGUuZ29vZ2xlYXBpcy5jb20vZmkuY29tbW9uLk1vbmV5EgcKA0dCUBAF4gECCAHqAREKA3AtMFIHdG9rXzEyM/ABAfABAvoBDXJlc2VydmVkIHdvcmSCAhBjdXN0b20ganNvbiBuYW1ligIICgIIAAoCIAGSAgUKA3Jhdw==",
+  "json": {
+   "orderId": "o-1",
+   "lines": [
+    {
+     "sku": "SKU-1",
+     "qty": 3,
+     "price": {
+      "currency": "USD",
+      "units": "9",
+      "nanos": 990000000
+     },
+     "kind": "DIGITAL",
+     "notes": [
+      {
+       "text": "gift wrap"
+      },
+      {}
+     ]
+    },
+    {
+     "sku": "SKU-2"
+    }
+   ],
+   "labels": {
+    "env": "dev",
+    "empty": ""
+   },
+   "linesByNo": {
+    "-2": {
+     "qty": 1
+    },
+    "1": {
+     "sku": "SKU-1",
+     "qty": 3,
+     "price": {
+      "currency": "USD",
+      "units": "9",
+      "nanos": 990000000
+     },
+     "kind": "DIGITAL",
+     "notes": [
+      {
+       "text": "gift wrap"
+      },
+      {}
+     ]
+    }
+   },
+   "colorsByName": {
+    "sky": "BLUE",
+    "none": "COLOR_UNSPECIFIED"
+   },
+   "flags": {
+    "-1": true,
+    "9223372036854775807": false
+   },
+   "blobs": {
+    "true": "AQID",
+    "false": ""
+   },
+   "levels": {
+    "18446744073709551615": "LEVEL_HIGH"
+   },
+   "cash": {
+    "currency": "JPY",
+    "units": "1000"
+   },
+   "createdAt": "2023-11-14T22:13:20.123Z",
+   "ttl": "90.500s",
+   "note": "leave at door",
+   "big": "-9223372036854775807",
+   "meta": {
+    "z": null,
+    "o": {
+     "k": false
+    },
+    "n": 1.5,
+    "l": [
+     1.0,
+     "two"
+    ],
+    "b": true,
+    "s": "x"
+   },
+   "anyValue": "any",
+   "mask": "orderId,lines.sku,createdAt",
+   "extra": {
+    "@type": "type.googleapis.com/fi.common.Money",
+    "currency": "GBP",
+    "units": "5"
+   },
+   "gift": true,
+   "parent": {
+    "orderId": "p-0",
+    "cardToken": "tok_123",
+    "level": "LEVEL_LOW"
+   },
+   "level": "LEVEL_HIGH",
+   "class": "reserved word",
+   "customJson": "custom json name",
+   "listValue": [
+    null,
+    true
+   ],
+   "rawValue": "cmF3"
+  },
+  "dartJson": {
+   "orderId": "o-1",
+   "lines": [
+    {
+     "sku": "SKU-1",
+     "qty": 3,
+     "price": {
+      "currency": "USD",
+      "units": "9",
+      "nanos": 990000000
+     },
+     "kind": "DIGITAL",
+     "notes": [
+      {
+       "text": "gift wrap"
+      },
+      {}
+     ]
+    },
+    {
+     "sku": "SKU-2"
+    }
+   ],
+   "labels": {
+    "env": "dev",
+    "empty": ""
+   },
+   "linesByNo": {
+    "1": {
+     "sku": "SKU-1",
+     "qty": 3,
+     "price": {
+      "currency": "USD",
+      "units": "9",
+      "nanos": 990000000
+     },
+     "kind": "DIGITAL",
+     "notes": [
+      {
+       "text": "gift wrap"
+      },
+      {}
+     ]
+    },
+    "-2": {
+     "qty": 1
+    }
+   },
+   "colorsByName": {
+    "sky": "BLUE",
+    "none": "COLOR_UNSPECIFIED"
+   },
+   "flags": {
+    "-1": true,
+    "9223372036854775807": false
+   },
+   "blobs": {
+    "true": "AQID",
+    "false": ""
+   },
+   "levels": {
+    "18446744073709551615": "LEVEL_HIGH"
+   },
+   "cash": {
+    "currency": "JPY",
+    "units": "1000"
+   },
+   "createdAt": "2023-11-14T22:13:20.123Z",
+   "ttl": "90.5s",
+   "note": "leave at door",
+   "big": "-9223372036854775807",
+   "meta": {
+    "n": 1.5,
+    "s": "x",
+    "b": true,
+    "z": null,
+    "l": [
+     1.0,
+     "two"
+    ],
+    "o": {
+     "k": false
+    }
+   },
+   "anyValue": "any",
+   "mask": "orderId,lines.sku,createdAt",
+   "extra": {
+    "currency": "GBP",
+    "units": "5",
+    "@type": "type.googleapis.com/fi.common.Money"
+   },
+   "gift": true,
+   "parent": {
+    "orderId": "p-0",
+    "cardToken": "tok_123",
+    "level": "LEVEL_LOW"
+   },
+   "level": "LEVEL_HIGH",
+   "class": "reserved word",
+   "customJson": "custom json name",
+   "listValue": [
+    null,
+    true
+   ],
+   "rawValue": "cmF3"
+  }
+ },
+ {
+  "name": "order: oneof invoice",
+  "type": "fi.shop.v1.Order",
+  "base64": "CgNvLTJgAQ==",
+  "json": {
+   "orderId": "o-2",
+   "invoice": true
+  },
+  "dartJson": {
+   "orderId": "o-2",
+   "invoice": true
+  }
+ },
+ {
+  "name": "order: timestamp/duration edge",
+  "type": "fi.shop.v1.Order",
+  "base64": "ogELCICSuMOY/v///wGqARYI/f//////////ARCY+P////////8BugEA2gE1Ci10eXBlLmdvb2dsZWFwaXMuY29tL2dvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASBAgBEAHiAQA=",
+  "json": {
+   "createdAt": "0001-01-01T00:00:00Z",
+   "ttl": "-3.000001s",
+   "big": "0",
+   "extra": {
+    "@type": "type.googleapis.com/google.protobuf.Timestamp",
+    "value": "1970-01-01T00:00:01.000000001Z"
+   },
+   "gift": false
+  },
+  "dartJson": {
+   "createdAt": "0001-01-01T00:00:00Z",
+   "ttl": "-3.000001s",
+   "big": "0",
+   "extra": {
+    "@type": "type.googleapis.com/google.protobuf.Timestamp",
+    "value": "1970-01-01T00:00:01.000000001Z"
+   },
+   "gift": false
+  }
+ },
+ {
+  "name": "order line",
+  "type": "fi.shop.v1.Order.Line",
+  "base64": "CgVTS1UtMRADGg0KA1VTRBAJGIDniNgDIAIqCwoJZ2lmdCB3cmFwKgA=",
+  "json": {
+   "sku": "SKU-1",
+   "qty": 3,
+   "price": {
+    "currency": "USD",
+    "units": "9",
+    "nanos": 990000000
+   },
+   "kind": "DIGITAL",
+   "notes": [
+    {
+     "text": "gift wrap"
+    },
+    {}
+   ]
+  },
+  "dartJson": {
+   "sku": "SKU-1",
+   "qty": 3,
+   "price": {
+    "currency": "USD",
+    "units": "9",
+    "nanos": 990000000
+   },
+   "kind": "DIGITAL",
+   "notes": [
+    {
+     "text": "gift wrap"
+    },
+    {}
+   ]
+  }
+ },
+ {
+  "name": "outer",
+  "type": "fi.shop.v1.Outer",
+  "base64": "CgIIARICCAIaAggD",
+  "json": {
+   "inner": {
+    "z": 1
+   },
+   "flat": {
+    "y": 2
+   },
+   "list": {
+    "x": 3
+   }
+  },
+  "dartJson": {
+   "inner": {
+    "z": 1
+   },
+   "flat": {
+    "y": 2
+   },
+   "list": {
+    "x": 3
+   }
+  }
+ },
+ {
+  "name": "money",
+  "type": "fi.common.Money",
+  "base64": "CgNDSEYQ////////////ARj///////////8B",
+  "json": {
+   "currency": "CHF",
+   "units": "-1",
+   "nanos": -1
+  },
+  "dartJson": {
+   "currency": "CHF",
+   "units": "-1",
+   "nanos": -1
+  }
+ },
+ {
+  "name": "legacy proto2 (defaults present on the wire)",
+  "type": "fi.legacy.Legacy",
+  "base64": "CgJMMRAAGgMBAgMgBCAFKAEyAggAOgBA/v//////////AUgDUQMAAAAAAAAAWQAAAAAAAOA/ZQAAAIBqAggBagsI////////////AXACcAF6BG5vbmU=",
+  "json": {
+   "id": "L1",
+   "count": 0,
+   "nums": [
+    1,
+    2,
+    3
+   ],
+   "loose": [
+    4,
+    5
+   ],
+   "kind": "A",
+   "sub": {
+    "v": 0
+   },
+   "data": "",
+   "big": "18446744073709551614",
+   "neg": "-2",
+   "f64": "3",
+   "ratio": 0.5,
+   "flt": -0.0,
+   "subs": [
+    {
+     "v": 1
+    },
+    {
+     "v": -1
+    }
+   ],
+   "kinds": [
+    "B",
+    "A"
+   ],
+   "name": "none"
+  },
+  "dartJson": {
+   "id": "L1",
+   "count": 0,
+   "nums": [
+    1,
+    2,
+    3
+   ],
+   "loose": [
+    4,
+    5
+   ],
+   "kind": "A",
+   "sub": {
+    "v": 0
+   },
+   "big": "18446744073709551614",
+   "neg": "-2",
+   "f64": "3",
+   "ratio": 0.5,
+   "flt": 0,
+   "subs": [
+    {
+     "v": 1
+    },
+    {
+     "v": -1
+    }
+   ],
+   "kinds": [
+    "B",
+    "A"
+   ],
+   "name": "none"
+  }
+ },
+ {
+  "name": "bare (no package, recursive)",
+  "type": "Bare",
+  "base64": "CgRyb290EgkKAmMxEgMKAWcSAA==",
+  "json": {
+   "a": "root",
+   "children": [
+    {
+     "a": "c1",
+     "children": [
+      {
+       "a": "g"
+      }
+     ]
+    },
+    {}
+   ]
+  },
+  "dartJson": {
+   "a": "root",
+   "children": [
+    {
+     "a": "c1",
+     "children": [
+      {
+       "a": "g"
+      }
+     ]
+    },
+    {}
+   ]
+  }
+ },
+ {
+  "name": "empty",
+  "type": "google.protobuf.Empty",
+  "base64": "",
+  "json": {},
+  "dartJson": {}
+ },
+ {
+  "name": "unknown fields (Money bytes read as GetOrderRequest)",
+  "type": "fi.shop.v1.GetOrderRequest",
+  "base64": "CgNVU0QQBxgD",
+  "json": {
+   "orderId": "USD"
+  }
+ }
+]

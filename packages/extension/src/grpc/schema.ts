@@ -1,0 +1,434 @@
+// CONTRACTS §16.3: links parsed protoc_plugin files into a GrpcSchema (Dart classes → fully-qualified proto
+// names, import prefixes, package: URIs, well-known types). Pure; never throws; ≤ 50 plain-words problems.
+
+import type {
+  GrpcMethod,
+  GrpcSchema,
+  GrpcSourceFile,
+  ProtoEnum,
+  ProtoField,
+  ProtoFieldType,
+  ProtoMessage,
+  ProtoScalar,
+} from './types';
+import { ParsedEnum, ParsedField, ParsedFile, ParsedMessage, parseGeneratedFile, TypeRef } from './parse';
+import { builtinWellKnownTypes, WKT_FILES } from './wkt';
+
+export const MAX_FILES = 5000;
+export const MAX_FILE_BYTES = 2 * 1024 * 1024;
+export const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
+const MAX_PROBLEMS = 50;
+
+/** Files the schema reads: `*.pb.dart`, `*.pbenum.dart`, `*.pbgrpc.dart` (not `*.pbjson.dart` / `*.pbserver.dart`). */
+export function isGrpcGeneratedFile(path: string): boolean {
+  return /\.(pb|pbenum|pbgrpc)\.dart$/i.test(path);
+}
+
+const SCALAR_BY_SUFFIX: Record<string, ProtoScalar> = {
+  B: 'bool',
+  Y: 'bytes',
+  S: 'string',
+  D: 'double',
+  F: 'float',
+  '3': 'int32',
+  '6': 'int64',
+  S3: 'sint32',
+  S6: 'sint64',
+  U3: 'uint32',
+  U6: 'uint64',
+  F3: 'fixed32',
+  F6: 'fixed64',
+  SF3: 'sfixed32',
+  SF6: 'sfixed64',
+};
+
+interface Code {
+  label: 'O' | 'P' | 'K' | 'Q';
+  kind: 'scalar' | 'enum' | 'message';
+  scalar?: ProtoScalar;
+}
+
+/** `KU6` → packed repeated uint64; `OM` → optional message; `QE` → required enum; groups read as messages. */
+function readCode(code: string): Code | undefined {
+  const m = /^([OPKQ])(.+)$/.exec(code);
+  if (!m) return undefined;
+  const label = m[1] as Code['label'];
+  const s = m[2];
+  if (s === 'E') return { label, kind: 'enum' };
+  if (s === 'M' || s === 'G') return { label, kind: 'message' };
+  const scalar = SCALAR_BY_SUFFIX[s];
+  return scalar ? { label, kind: 'scalar', scalar } : undefined;
+}
+
+const norm = (p: string) => p.replace(/\\/g, '/');
+
+function dirname(p: string): string {
+  const i = p.lastIndexOf('/');
+  return i < 0 ? '' : p.slice(0, i);
+}
+
+function joinPath(dir: string, rel: string): string {
+  const parts = (dir ? `${dir}/${rel}` : rel).split('/');
+  const out: string[] = [];
+  for (const part of parts) {
+    if (part === '.' || (part === '' && out.length > 0)) continue;
+    if (part === '..' && out.length && out[out.length - 1] !== '..' && out[out.length - 1] !== '') out.pop();
+    else out.push(part);
+  }
+  return out.join('/');
+}
+
+const baseOf = (p: string) => p.replace(/\.(pb|pbenum|pbgrpc|pbjson|pbserver)\.dart$/i, '');
+
+interface Decl {
+  file: ParsedFile;
+  kind: 'message' | 'enum';
+  msg?: ParsedMessage;
+  en?: ParsedEnum;
+  fq: string;
+}
+
+class Schema implements GrpcSchema {
+  readonly methods: GrpcMethod[] = [];
+  readonly messages: ProtoMessage[] = [];
+  readonly problems: string[] = [];
+  readonly enums: ProtoEnum[] = [];
+  private readonly methodByPath = new Map<string, GrpcMethod>();
+  private readonly messageByName = new Map<string, ProtoMessage>();
+  private readonly enumByName = new Map<string, ProtoEnum>();
+
+  method(path: string): GrpcMethod | undefined {
+    if (typeof path !== 'string') return undefined;
+    let p = path.trim();
+    const scheme = p.indexOf('://');
+    if (scheme >= 0) {
+      const slash = p.indexOf('/', scheme + 3);
+      p = slash < 0 ? '/' : p.slice(slash);
+    }
+    p = p.replace(/[?#].*$/, '');
+    if (!p.startsWith('/')) p = `/${p}`;
+    return this.methodByPath.get(p);
+  }
+
+  message(name: string): ProtoMessage | undefined {
+    return typeof name === 'string' ? this.messageByName.get(cleanName(name)) : undefined;
+  }
+
+  enumType(name: string): ProtoEnum | undefined {
+    return typeof name === 'string' ? this.enumByName.get(cleanName(name)) : undefined;
+  }
+
+  addProblem(p: string): void {
+    if (this.problems.length < MAX_PROBLEMS && !this.problems.includes(p)) this.problems.push(p);
+  }
+
+  addMessage(m: ProtoMessage): boolean {
+    if (this.messageByName.has(m.name)) return false;
+    this.messageByName.set(m.name, m);
+    this.messages.push(m);
+    return true;
+  }
+
+  addEnum(e: ProtoEnum): boolean {
+    if (this.enumByName.has(e.name)) return false;
+    this.enumByName.set(e.name, e);
+    this.enums.push(e);
+    return true;
+  }
+
+  addMethod(m: GrpcMethod): void {
+    if (this.methodByPath.has(m.path)) return;
+    this.methodByPath.set(m.path, m);
+    this.methods.push(m);
+  }
+}
+
+/** `.pkg.Msg` / `type.googleapis.com/pkg.Msg` → `pkg.Msg`. */
+function cleanName(name: string): string {
+  let n = name.trim();
+  const slash = n.lastIndexOf('/');
+  if (slash >= 0) n = n.slice(slash + 1);
+  return n.startsWith('.') ? n.slice(1) : n;
+}
+
+/** Parses and links protoc_plugin output. Never throws. */
+export function loadGrpcSchema(files: GrpcSourceFile[]): GrpcSchema {
+  const schema = new Schema();
+  try {
+    link(schema, Array.isArray(files) ? files : []);
+  } catch (e) {
+    schema.addProblem(`couldn't build the gRPC schema (${(e as Error).message})`);
+  }
+  return schema;
+}
+
+function link(schema: Schema, input: GrpcSourceFile[]): void {
+  // 1. parse, within the caps
+  const parsed: ParsedFile[] = [];
+  let total = 0;
+  let count = 0;
+  for (const f of input) {
+    if (!f || typeof f.path !== 'string' || typeof f.text !== 'string') continue;
+    if (!isGrpcGeneratedFile(f.path)) continue;
+    if (++count > MAX_FILES) {
+      schema.addProblem(`more than ${MAX_FILES} generated files; the rest were skipped`);
+      break;
+    }
+    if (f.text.length > MAX_FILE_BYTES) {
+      schema.addProblem(`${f.path}: larger than 2 MB, skipped`);
+      continue;
+    }
+    total += f.text.length;
+    if (total > MAX_TOTAL_BYTES) {
+      schema.addProblem('more than 50 MB of generated code; the rest was skipped');
+      break;
+    }
+    const p = parseGeneratedFile(norm(f.path), f.text);
+    p.problems.forEach((x) => schema.addProblem(x));
+    parsed.push(p);
+  }
+
+  const byPath = new Map<string, ParsedFile>();
+  for (const p of parsed) if (!byPath.has(p.path)) byPath.set(p.path, p);
+
+  // 2. declarations: messages by their BuilderInfo name; enums named after their parent message.
+  const declsByFile = new Map<ParsedFile, Map<string, Decl>>();
+  const declsByClass = new Map<string, Decl[]>();
+  const addDecl = (d: Decl) => {
+    const cls = d.msg?.dartClass ?? d.en!.dartClass;
+    let m = declsByFile.get(d.file);
+    if (!m) declsByFile.set(d.file, (m = new Map()));
+    if (!m.has(cls)) m.set(cls, d);
+    const list = declsByClass.get(cls) ?? [];
+    list.push(d);
+    declsByClass.set(cls, list);
+  };
+  const messagesByBase = new Map<string, ParsedMessage[]>();
+  for (const f of parsed) {
+    for (const m of f.messages) {
+      const fq = m.pkg ? `${m.pkg}.${m.relName}` : m.relName;
+      addDecl({ file: f, kind: 'message', msg: m, fq });
+      const b = baseOf(f.path);
+      messagesByBase.set(b, [...(messagesByBase.get(b) ?? []), m]);
+    }
+  }
+  const packageByBase = (b: string): string | undefined => {
+    const ms = messagesByBase.get(b);
+    if (ms?.length) return ms[0].pkg;
+    const grpc = byPath.get(`${b}.pbgrpc.dart`);
+    const path = grpc?.serviceMethods[0]?.path ?? grpc?.clientMethods[0]?.path;
+    if (path) {
+      const svc = path.split('/')[1] ?? '';
+      const dot = svc.lastIndexOf('.');
+      return dot < 0 ? '' : svc.slice(0, dot);
+    }
+    return undefined;
+  };
+  for (const f of parsed) {
+    for (const en of f.enums) {
+      const b = baseOf(f.path);
+      const siblings = messagesByBase.get(b) ?? [];
+      let parent: ParsedMessage | undefined;
+      for (const m of siblings) {
+        if (en.dartClass.startsWith(`${m.dartClass}_`) && (!parent || m.dartClass.length > parent.dartClass.length)) parent = m;
+      }
+      let fq: string;
+      if (parent) {
+        const rest = en.dartClass.slice(parent.dartClass.length + 1).replace(/_+$/, '') || en.dartClass;
+        fq = `${parent.pkg ? `${parent.pkg}.` : ''}${parent.relName}.${rest}`;
+      } else {
+        const pkg = packageByBase(b) ?? wktPackage(f.path);
+        const bare = en.dartClass.replace(/_+$/, '') || en.dartClass;
+        fq = pkg ? `${pkg}.${bare}` : bare;
+      }
+      addDecl({ file: f, kind: 'enum', en, fq });
+    }
+  }
+
+  // 3. resolution of Dart references in a file's scope
+  const packageUris = new Map<string, ParsedFile[]>();
+  const resolveUri = (from: ParsedFile, uri: string): ParsedFile[] => {
+    if (uri.startsWith('dart:')) return [];
+    if (uri.startsWith('package:')) {
+      const hit = packageUris.get(uri);
+      if (hit) return hit;
+      const found = resolvePackageUri(uri);
+      packageUris.set(uri, found);
+      return found;
+    }
+    const target = byPath.get(joinPath(dirname(from.path), uri));
+    return target ? [target] : [];
+  };
+  /** `package:foo/x.pb.dart` → files ending in `/lib/x.pb.dart`, preferring a `foo` or `foo-1.2.3` root. */
+  const resolvePackageUri = (uri: string): ParsedFile[] => {
+    const rest = uri.slice('package:'.length);
+    const slash = rest.indexOf('/');
+    if (slash < 0) return [];
+    const pkg = rest.slice(0, slash);
+    const tail = `/lib/${rest.slice(slash + 1)}`;
+    const hits = parsed.filter((p) => p.path.endsWith(tail) || p.path === tail.slice(1));
+    const preferred = hits.filter((p) => {
+      const seg = p.path.slice(0, p.path.length - tail.length).split('/').pop() ?? '';
+      return seg === pkg || seg.startsWith(`${pkg}-`);
+    });
+    return preferred.length ? preferred : hits;
+  };
+
+  /** Classes visible through a file: its own plus what it exports (transitively, bounded). */
+  const visible = (f: ParsedFile, cls: string, depth = 0): Decl | undefined => {
+    const own = declsByFile.get(f)?.get(cls);
+    if (own || depth > 4) return own;
+    for (const e of f.exports) {
+      for (const t of resolveUri(f, e)) {
+        const d = visible(t, cls, depth + 1);
+        if (d) return d;
+      }
+    }
+    return undefined;
+  };
+
+  const unresolved = new Set<string>();
+  const usedWkt = new Set<string>();
+  const resolve = (from: ParsedFile, ref: TypeRef, where: string): { decl?: Decl; fq?: string } => {
+    let uris: string[];
+    if (ref.prefix) uris = from.imports.filter((i) => i.prefix === ref.prefix).map((i) => i.uri);
+    else {
+      const own = visible(from, ref.cls);
+      if (own) return { decl: own };
+      uris = from.imports.filter((i) => !i.prefix).map((i) => i.uri);
+    }
+    for (const uri of uris) {
+      for (const t of resolveUri(from, uri)) {
+        const d = visible(t, ref.cls);
+        if (d) return { decl: d };
+      }
+    }
+    // A well-known type whose generated file wasn't passed in: the built-in definition.
+    for (const uri of uris) {
+      const file = wktFileOf(uri) ?? '';
+      if (WKT_FILES[file]?.includes(ref.cls)) {
+        usedWkt.add(file);
+        return { fq: `google.protobuf.${ref.cls}` };
+      }
+    }
+    // Same class name declared once anywhere (a path we couldn't map, e.g. a renamed package root).
+    const all = declsByClass.get(ref.cls) ?? [];
+    if (all.length) {
+      const sameDir = all.find((d) => dirname(d.file.path) === dirname(from.path));
+      return { decl: sameDir ?? all[0] };
+    }
+    const key = `${from.path}|${ref.prefix ?? ''}.${ref.cls}`;
+    if (!unresolved.has(key)) {
+      unresolved.add(key);
+      const via = uris.length ? ` (from '${uris[0]}')` : '';
+      schema.addProblem(`${from.path}: ${where} uses ${ref.cls}${via}, which isn't among the loaded generated files; its contents are shown raw`);
+    }
+    return { fq: ref.cls.replace(/_/g, '.') };
+  };
+
+  const typeOf = (from: ParsedFile, code: Code | undefined, ref: TypeRef | undefined, where: string): ProtoFieldType | undefined => {
+    if (!code) return undefined;
+    if (code.kind === 'scalar') return { kind: 'scalar', scalar: code.scalar! };
+    if (!ref) {
+      schema.addProblem(`${from.path}: ${where} has no ${code.kind} type`);
+      return undefined;
+    }
+    const r = resolve(from, ref, where);
+    const fq = r.decl?.fq ?? r.fq!;
+    return code.kind === 'enum' ? { kind: 'enum', type: fq } : { kind: 'message', type: fq };
+  };
+
+  // 4. messages and enums
+  for (const f of parsed) {
+    for (const en of f.enums) {
+      const d = declsByFile.get(f)?.get(en.dartClass);
+      if (d) schema.addEnum({ name: d.fq, dartClass: en.dartClass, values: en.values, file: f.path });
+    }
+  }
+  for (const f of parsed) {
+    for (const m of f.messages) {
+      const d = declsByFile.get(f)?.get(m.dartClass);
+      if (!d || d.msg !== m) continue;
+      const fields: ProtoField[] = [];
+      for (const pf of m.fields) {
+        const field = toField(f, m, pf, typeOf);
+        if (field) fields.push(field);
+        else schema.addProblem(`${f.path}: ${m.dartClass} field ${pf.number} (${pf.name}) has a type this version can't read`);
+      }
+      schema.addMessage({ name: d.fq, dartClass: m.dartClass, fields, file: f.path, line: m.line });
+    }
+  }
+
+  // 5. methods: the server base class knows streaming for sure; the client class fills in the rest.
+  const methodFrom = (f: ParsedFile, m: { path: string; req?: TypeRef; res?: TypeRef; line: number }, cs: boolean, ss: boolean): GrpcMethod | undefined => {
+    if (!m.req || !m.res) {
+      schema.addProblem(`${f.path}: method ${m.path} has no request / response type`);
+      return undefined;
+    }
+    const req = typeOf(f, { label: 'O', kind: 'message' }, m.req, `method ${m.path}`);
+    const res = typeOf(f, { label: 'O', kind: 'message' }, m.res, `method ${m.path}`);
+    if (req?.kind !== 'message' || res?.kind !== 'message') return undefined;
+    return { path: m.path, requestType: req.type, responseType: res.type, clientStreaming: cs, serverStreaming: ss, file: f.path, line: m.line };
+  };
+  const service = new Map<string, { f: ParsedFile; cs: boolean; ss: boolean }>();
+  for (const f of parsed) for (const s of f.serviceMethods) if (!service.has(s.path)) service.set(s.path, { f, cs: s.clientStreaming, ss: s.serverStreaming });
+  const fromClient = new Set<string>();
+  for (const f of parsed) {
+    for (const c of f.clientMethods) {
+      const s = service.get(c.path);
+      const m = methodFrom(f, c, s?.cs ?? c.clientStreaming ?? false, s?.ss ?? c.serverStreaming ?? false);
+      if (m) {
+        schema.addMethod(m);
+        fromClient.add(c.path);
+      }
+    }
+  }
+  for (const f of parsed) {
+    for (const s of f.serviceMethods) {
+      if (fromClient.has(s.path)) continue;
+      const m = methodFrom(f, s, s.clientStreaming, s.serverStreaming);
+      if (m) schema.addMethod(m);
+    }
+  }
+
+  // 6. well-known types referenced but not loaded
+  // (an Any can carry any of them, so it brings them all)
+  for (const wkt of builtinWellKnownTypes(usedWkt.has('any') ? undefined : usedWkt)) {
+    if ('fields' in wkt) schema.addMessage(wkt);
+    else schema.addEnum(wkt);
+  }
+}
+
+function toField(
+  f: ParsedFile,
+  m: ParsedMessage,
+  pf: ParsedField,
+  typeOf: (from: ParsedFile, code: Code | undefined, ref: TypeRef | undefined, where: string) => ProtoFieldType | undefined,
+): ProtoField | undefined {
+  const where = `${m.dartClass}.${pf.name}`;
+  if (pf.map) {
+    const key = readCode(pf.map.keyCode);
+    const value = typeOf(f, readCode(pf.map.valueCode), pf.map.valueRef, where);
+    if (key?.kind !== 'scalar' || !value || value.kind === 'map') return undefined;
+    return { number: pf.number, name: pf.name, type: { kind: 'map', key: key.scalar!, value } };
+  }
+  const code = readCode(pf.code ?? '');
+  const type = typeOf(f, code, pf.ref, where);
+  if (!code || !type) return undefined;
+  const field: ProtoField = { number: pf.number, name: pf.name, type };
+  if (code.label === 'P' || code.label === 'K') field.repeated = true;
+  if (code.label === 'K') field.packed = true;
+  if (code.label === 'Q') field.required = true;
+  if (pf.oneof) field.oneof = pf.oneof;
+  return field;
+}
+
+/** `package:protobuf/well_known_types/google/protobuf/timestamp.pb.dart` / `google/protobuf/timestamp.pb.dart` → `timestamp`. */
+function wktFileOf(uri: string): string | undefined {
+  const m = /(?:^|\/)google\/protobuf\/([a-z_]+)\.(?:pb|pbenum)\.dart$/.exec(uri);
+  return m?.[1];
+}
+
+function wktPackage(path: string): string | undefined {
+  return wktFileOf(path) ? 'google.protobuf' : undefined;
+}

@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package fi.common;
+
+message Money {
+  string currency = 1;
+  int64 units = 2;
+  int32 nanos = 3;
+}
+
+enum Level {
+  LEVEL_UNSPECIFIED = 0;
+  LEVEL_LOW = 1;
+  LEVEL_HIGH = 2;
+}

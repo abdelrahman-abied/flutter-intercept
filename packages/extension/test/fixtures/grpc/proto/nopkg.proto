@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+message Bare {
+  string a = 1;
+  repeated Bare children = 2;
+}
+
+service NoPkg {
+  rpc Echo(Bare) returns (Bare);
+}

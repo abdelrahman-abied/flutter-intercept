@@ -1,0 +1,32 @@
+syntax = "proto2";
+
+package fi.legacy;
+
+message Legacy {
+  enum Kind {
+    A = 1;
+    B = 2;
+  }
+  message Sub {
+    required int32 v = 1;
+  }
+  required string id = 1;
+  optional int32 count = 2 [default = 7];
+  repeated int32 nums = 3 [packed = true];
+  repeated int32 loose = 4;
+  optional Kind kind = 5 [default = B];
+  required Sub sub = 6;
+  optional bytes data = 7 [default = "abc"];
+  optional uint64 big = 8;
+  optional sint64 neg = 9;
+  optional fixed64 f64 = 10;
+  optional double ratio = 11 [default = 0.5];
+  optional float flt = 12;
+  repeated Sub subs = 13;
+  repeated Kind kinds = 14;
+  optional string name = 15 [default = "none"];
+}
+
+service LegacyService {
+  rpc Process(Legacy) returns (Legacy);
+}

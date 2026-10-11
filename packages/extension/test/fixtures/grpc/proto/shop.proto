@@ -1,0 +1,140 @@
+syntax = "proto3";
+
+package fi.shop.v1;
+
+import "common.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+enum Color {
+  COLOR_UNSPECIFIED = 0;
+  RED = 1;
+  GREEN = 2;
+  BLUE = 3;
+}
+
+message Scalars {
+  double d = 1;
+  float f = 2;
+  int32 i32 = 3;
+  int64 i64 = 4;
+  uint32 u32 = 5;
+  uint64 u64 = 6;
+  sint32 s32 = 7;
+  sint64 s64 = 8;
+  fixed32 fx32 = 9;
+  fixed64 fx64 = 10;
+  sfixed32 sfx32 = 11;
+  sfixed64 sfx64 = 12;
+  bool b = 13;
+  string s = 14;
+  bytes by = 15;
+  optional int32 opt_i32 = 16;
+  optional string opt_s = 17;
+  Color color = 18;
+}
+
+message Repeats {
+  repeated double d = 1;
+  repeated float f = 2;
+  repeated int32 i32 = 3;
+  repeated int64 i64 = 4;
+  repeated uint32 u32 = 5;
+  repeated uint64 u64 = 6;
+  repeated sint32 s32 = 7;
+  repeated sint64 s64 = 8;
+  repeated fixed32 fx32 = 9;
+  repeated fixed64 fx64 = 10;
+  repeated sfixed32 sfx32 = 11;
+  repeated sfixed64 sfx64 = 12;
+  repeated bool b = 13;
+  repeated string s = 14;
+  repeated bytes by = 15;
+  repeated Color colors = 16;
+  repeated fi.common.Money moneys = 17;
+  repeated int32 unpacked = 18 [packed = false];
+}
+
+message Order {
+  message Line {
+    enum Kind {
+      KIND_UNSPECIFIED = 0;
+      PHYSICAL = 1;
+      DIGITAL = 2;
+    }
+    message Note {
+      string text = 1;
+    }
+    string sku = 1;
+    int32 qty = 2;
+    fi.common.Money price = 3;
+    Kind kind = 4;
+    repeated Note notes = 5;
+  }
+
+  string order_id = 1;
+  repeated Line lines = 2;
+  map<string, string> labels = 3;
+  map<int32, Line> lines_by_no = 4;
+  map<string, Color> colors_by_name = 5;
+  map<int64, bool> flags = 6;
+  map<bool, bytes> blobs = 7;
+  map<uint64, fi.common.Level> levels = 8;
+  oneof payment {
+    string card_token = 10;
+    fi.common.Money cash = 11;
+    bool invoice = 12;
+  }
+  google.protobuf.Timestamp created_at = 20;
+  google.protobuf.Duration ttl = 21;
+  google.protobuf.StringValue note = 22;
+  google.protobuf.Int64Value big = 23;
+  google.protobuf.Struct meta = 24;
+  google.protobuf.Value any_value = 25;
+  google.protobuf.FieldMask mask = 26;
+  google.protobuf.Any extra = 27;
+  google.protobuf.BoolValue gift = 28;
+  Order parent = 29;
+  fi.common.Level level = 30;
+  string class = 31;
+  string custom = 32 [json_name = "customJson"];
+  google.protobuf.ListValue list_value = 33;
+  google.protobuf.BytesValue raw_value = 34;
+}
+
+// A message whose name clashes with a Dart core type.
+message List {
+  int32 x = 1;
+}
+
+// A top-level message whose Dart class looks like a nested one.
+message Outer_Inner {
+  int32 y = 1;
+}
+
+message Outer {
+  message Inner {
+    int32 z = 1;
+  }
+  Inner inner = 1;
+  Outer_Inner flat = 2;
+  List list = 3;
+}
+
+message GetOrderRequest {
+  string order_id = 1;
+}
+
+service ShopService {
+  rpc GetOrder(GetOrderRequest) returns (Order);
+  rpc WatchOrders(GetOrderRequest) returns (stream Order);
+  rpc UploadLines(stream Order.Line) returns (Order);
+  rpc Chat(stream Scalars) returns (stream Scalars);
+  rpc Ping(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc Nested(Outer) returns (fi.common.Money);
+}
