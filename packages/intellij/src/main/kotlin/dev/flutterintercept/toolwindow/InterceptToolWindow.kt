@@ -1,5 +1,6 @@
 // CONTRACTS §15.1: tool window "Flutter Intercept" (bottom) showing the sidecar's traffic UI in JCEF, reloaded when
-// the sidecar restarts. Without JCEF (Android Studio 2026.2 ships none) it offers the UI in the system browser.
+// the sidecar restarts. Browsers, in order: JCEF (IntelliJ IDEA) → the Flutter plugin's embedded JxBrowser (Android
+// Studio, the one Flutter DevTools uses) → "Open Traffic in Browser" (system browser).
 package dev.flutterintercept.toolwindow
 
 import com.intellij.openapi.Disposable
@@ -51,8 +52,11 @@ object InterceptToolWindow {
 }
 
 class InterceptToolWindowPanel(private val project: Project) : JPanel(BorderLayout()), Disposable {
+    private companion object {
+        val LOG = com.intellij.openapi.diagnostic.Logger.getInstance(InterceptToolWindowPanel::class.java)
+    }
     private val sidecar = SidecarProcess.getInstance()
-    private var browser: JcefBridge.Browser? = null
+    private var browser: EmbeddedView? = null
     private var browserDisposable: Disposable? = null
     private val jcef = JcefBridge.isSupported()
 
@@ -80,30 +84,92 @@ class InterceptToolWindowPanel(private val project: Project) : JPanel(BorderLayo
         ApplicationManager.getApplication().invokeLater({ if (!project.isDisposed) block() }, ModalityState.any())
     }
 
+    private val flutterBrowser = FlutterEmbeddedBrowser()
+    private var embedding = false
+    /** Why the embedded browser isn't used (shown on the fallback panel), once known. */
+    private var embeddedProblem: String? = null
+
     private fun showUi(init: InitResult) {
-        if (!jcef) {
-            showExternal(init)
-            return
-        }
         val existing = browser
         if (existing != null) {
             if (componentCount == 0 || getComponent(0) !== existing.component) setContent(existing.component)
             loadFresh()
             return
         }
-        val parent = Disposer.newDisposable(this, "Flutter Intercept JCEF")
-        // The guard reads the sidecar's current origin, so a restart on a new port stays inside JCEF (REVIEW-9 #4).
+        if (embedding) return
+        // The guard reads the sidecar's current origin, so a restart on a new port stays inside (REVIEW-9 #4).
         val guard = NavigationGuard(currentOrigin = { sidecar.init?.uiOrigin }, loadFresh = { onEdt { loadFresh() } })
-        val created = JcefBridge.create("about:blank", guard, parent)
-        if (created == null) {
-            Disposer.dispose(parent)
-            showExternal(init)
-            return
+        when (if (embeddedProblem != null) BrowserChoice.EXTERNAL else chooseBrowser(jcef, flutterBrowser.isPresent())) {
+            BrowserChoice.JCEF -> {
+                val parent = Disposer.newDisposable(this, "Flutter Intercept JCEF")
+                val created = JcefBridge.create("about:blank", guard, parent)
+                if (created == null) {
+                    Disposer.dispose(parent)
+                    fallBack(init, "JCEF couldn't create a browser")
+                    return
+                }
+                attach(created, parent)
+            }
+            BrowserChoice.FLUTTER -> openFlutterBrowser(init, guard)
+            BrowserChoice.EXTERNAL -> {
+                if (embeddedProblem == null) embeddedProblem = "neither JCEF nor the Flutter plugin's embedded browser is available"
+                showExternal(init)
+            }
         }
-        browser = created
+    }
+
+    private fun attach(view: EmbeddedView, parent: Disposable) {
+        browser = view
         browserDisposable = parent
-        setContent(created.component)
+        setContent(view.component)
         loadFresh()
+    }
+
+    /** Android Studio: the Flutter plugin's JxBrowser (installed on first use, like for DevTools). */
+    private fun openFlutterBrowser(init: InitResult, guard: NavigationGuard) {
+        embedding = true
+        showMessage("Preparing the embedded browser… (the first time, the Flutter plugin downloads it, as for DevTools)", false)
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val problem = flutterBrowser.ensureInstalled(project)
+            onEdt {
+                if (problem != null) {
+                    embedding = false
+                    fallBack(init, problem)
+                    return@onEdt
+                }
+                openFlutterTab(init, guard, attempt = 0)
+            }
+        }
+    }
+
+    private fun openFlutterTab(init: InitResult, guard: NavigationGuard, attempt: Int) {
+        val parent = Disposer.newDisposable(this, "Flutter Intercept JxBrowser")
+        when (val r = flutterBrowser.open(project, guard, parent)) {
+            is FlutterEmbeddedBrowser.Result.Ready -> {
+                embedding = false
+                LOG.info("Flutter Intercept: showing the traffic view in the Flutter plugin's embedded browser")
+                attach(r.view, parent)
+            }
+            is FlutterEmbeddedBrowser.Result.Unavailable -> {
+                Disposer.dispose(parent)
+                // Right after installation the Flutter plugin sets its engine asynchronously: retry briefly.
+                if (r.reason.contains("isn't ready yet") && attempt < 20) {
+                    com.intellij.util.concurrency.AppExecutorUtil.getAppScheduledExecutorService().schedule(
+                        { onEdt { openFlutterTab(init, guard, attempt + 1) } }, 500, java.util.concurrent.TimeUnit.MILLISECONDS,
+                    )
+                } else {
+                    embedding = false
+                    fallBack(init, r.reason)
+                }
+            }
+        }
+    }
+
+    /** One clear log line, then the system-browser panel. */
+    private fun fallBack(init: InitResult, reason: String) {
+        embeddedProblem = reason
+        LOG.info("Flutter Intercept: traffic view falls back to the system browser: $reason")
+        showExternal(init)
     }
 
     @Volatile private var fetching = false
@@ -124,8 +190,8 @@ class InterceptToolWindowPanel(private val project: Project) : JPanel(BorderLayo
     private fun showExternal(init: InitResult) {
         val box = centered()
         val text = JBLabel(
-            "<html><div style='text-align:center'>This IDE has no embedded browser (JCEF), so the traffic view opens " +
-                "in your web browser.<br>It stays private to this computer and works only while the IDE runs. Browser " +
+            "<html><div style='text-align:center'>The traffic view can't show inside the IDE here (" +
+                escape(embeddedProblem ?: "no embedded browser") + "), so it opens in your web browser.<br>It stays private to this computer and works only while the IDE runs. Browser " +
                 "extensions allowed to read local (127.0.0.1) pages can see it too.</div></html>",
             SwingConstants.CENTER,
         )
@@ -142,7 +208,14 @@ class InterceptToolWindowPanel(private val project: Project) : JPanel(BorderLayo
             }
         }
         box.add(text, row(0))
-        box.add(JPanel(FlowLayout()).apply { isOpaque = false; add(open) }, row(1))
+        val retry = JButton("Show It Inside the IDE").apply {
+            isVisible = embeddedProblem != null && (jcef || flutterBrowser.isPresent())
+            addActionListener {
+                embeddedProblem = null
+                sidecar.init?.let { showUi(it) }
+            }
+        }
+        box.add(JPanel(FlowLayout()).apply { isOpaque = false; add(open); add(retry) }, row(1))
         setContent(box)
     }
 

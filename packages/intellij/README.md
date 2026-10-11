@@ -15,11 +15,13 @@ the agent tools run in a small Node process the plugin starts for you.
 1. Open your Flutter project and run or debug it as usual (debug or profile mode). Flutter Intercept launches a
    copy of your run configuration with its generated entry point; your saved configuration is never changed.
    Or use **Run → Run with Flutter Intercept** / **Debug with Flutter Intercept**.
-2. Open the **Flutter Intercept** tool window.
-   - **IntelliJ IDEA** shows the traffic inside the IDE.
-   - **Android Studio** has no embedded browser, so click **Open Traffic in Browser**: the traffic view opens in
-     your browser on a private local address. Each click makes a new single-use link; reopening an old link from
-     the browser history shows "open it again from the IDE".
+2. Open the **Flutter Intercept** tool window. The traffic shows inside the IDE:
+   - **Android Studio** shows it with the Flutter plugin's embedded browser, the same one Flutter DevTools uses.
+     The first time, the Flutter plugin downloads that browser (as it does for DevTools); the tool window says so.
+   - **IntelliJ IDEA** shows it in its built-in browser (JCEF).
+   - If neither is available, the tool window says why and offers **Open Traffic in Browser**: the traffic view
+     opens in your web browser on a private local address. Each click makes a new single-use link; reopening an old
+     link from the browser history shows "open it again from the IDE".
 3. Mock, block, pause, throttle, record, replay and export exactly as described in the
    [tutorials](../extension/README.md#tutorials).
 
@@ -29,7 +31,7 @@ Certificate Passphrase. Settings live in **Settings → Tools → Flutter Interc
 
 ## Differences from VS Code
 
-- Android Studio shows the traffic in your browser (see above).
+- Android Studio shows the traffic through the Flutter plugin's embedded browser (see above).
 - No editor diagnostics for the model check (the results show in the traffic view).
 - Agents can't start or stop the app (`launch_app`, `stop_app`, `hot_restart`): use the IDE's Run and Stop.
 - GitHub Copilot's VS Code tools aren't available; MCP clients (Claude Code, Cursor, Windsurf, Gemini CLI) work.
@@ -46,5 +48,13 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 ```
 
 Install the zip with **Settings → Plugins → ⚙ → Install Plugin from Disk…**. The build uses your local Android
-Studio and its Flutter / Dart plugins; set `platformPath` / `flutterPluginPath` / `dartPluginPath` in
+Studio and its Flutter / Dart plugins; set `platformLocalPath` / `flutterPluginPath` / `dartPluginPath` in
 `gradle.properties` if they live elsewhere. Design and protocol: [docs/CONTRACTS.md §15](../../docs/CONTRACTS.md).
+
+## Note: the Flutter plugin's embedded browser
+
+Android Studio ships no JCEF, so in Android Studio the tool window borrows the Flutter plugin's embedded browser
+(`io.flutter.jxbrowser`, the JxBrowser setup Flutter DevTools uses). That isn't a public API of the Flutter plugin:
+the plugin reaches it through reflection, checks every class and method it needs first, and falls back to **Open
+Traffic in Browser** (with one log line saying why) when something doesn't match. A new Flutter plugin release may
+need an update here; the adapter is `src/main/kotlin/dev/flutterintercept/toolwindow/FlutterEmbeddedBrowser.kt`.

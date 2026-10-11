@@ -103,7 +103,9 @@ describe('UiServer', () => {
     expect(csp).toBe(
       `default-src 'none'; style-src ${origin}; script-src 'nonce-${nonce}'; img-src ${origin} data:; font-src ${origin}; connect-src ws://127.0.0.1:${port}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
     );
-    expect(r.body).toContain(`content="${csp}"`);
+    // frame-ancestors only works as a header; the meta copy leaves it out.
+    expect(r.body).toContain(`content="${csp.replace("; frame-ancestors 'none'", '')}"`);
+    expect(csp).toContain("frame-ancestors 'none'");
     expect(wsA).toMatch(new RegExp(`^ws://127\\.0\\.0\\.1:${port}/ws\\?t=[A-Za-z0-9_-]{43}$`));
     expect(r.body).toContain(`<script nonce="${nonce}">window.__FI_WS__ = "${wsA}";</script>`);
     expect(r.body.indexOf('__FI_WS__')).toBeLessThan(r.body.indexOf('webview.js'));

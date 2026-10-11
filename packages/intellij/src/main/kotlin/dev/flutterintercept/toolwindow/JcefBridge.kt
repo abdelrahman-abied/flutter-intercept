@@ -45,16 +45,16 @@ object JcefBridge {
         }
     }
 
-    class Browser internal constructor(private val impl: Any, private val guard: NavigationGuard) {
-        val component: JComponent get() = impl.javaClass.getMethod("getComponent").invoke(impl) as JComponent
+    class Browser internal constructor(private val impl: Any, private val guard: NavigationGuard) : EmbeddedView {
+        override val component: JComponent get() = impl.javaClass.getMethod("getComponent").invoke(impl) as JComponent
 
         /** Loads a fresh one-time URL (never the same one twice: it's spent once served). */
-        fun load(url: String) {
+        override fun load(url: String) {
             guard.expect(url)
             impl.javaClass.getMethod("loadURL", String::class.java).invoke(impl, url)
         }
 
-        fun dispose() {
+        override fun dispose() {
             (impl as? Disposable)?.let { Disposer.dispose(it) }
         }
     }

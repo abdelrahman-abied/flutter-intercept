@@ -72,6 +72,16 @@ class PluginPlatformTest : BasePlatformTestCase() {
         assertTrue(e is RpcException)
     }
 
+    fun testChangedFlutterPluginApiFallsBackCleanly() {
+        val renamed = dev.flutterintercept.toolwindow.FlutterEmbeddedBrowser(
+            names = dev.flutterintercept.toolwindow.FlutterEmbeddedBrowser.ClassNames(embeddedBrowser = "io.flutter.jxbrowser.Gone"),
+        )
+        assertNotNull(renamed.ensureInstalled(project, 1))
+        val guard = dev.flutterintercept.toolwindow.NavigationGuard({ null }, {}, {})
+        val r = renamed.open(project, guard, testRootDisposable)
+        assertTrue(r is dev.flutterintercept.toolwindow.FlutterEmbeddedBrowser.Result.Unavailable)
+    }
+
     fun testDataDirIsDurableAndPrivate() {
         val dir = SidecarProcess.dataDir()
         assertTrue(dir.path, dir.path.startsWith(com.intellij.openapi.application.PathManager.getConfigPath()))

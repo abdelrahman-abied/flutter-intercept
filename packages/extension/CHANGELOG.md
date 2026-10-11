@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0
+
+- **Android Studio and IntelliJ IDEA**: a preview plugin with the same engine (packages/intellij). The traffic view's
+  WebSocket mode used there doesn't change anything in VS Code.
+- **Security**: "Create file" from the traffic view writes silently only under `.vscode/flutter-intercept/`, refuses
+  build, platform and IDE configuration files, and asks before anything else. A physical iPhone's proxy credentials
+  are passed to `flutter` in a private file instead of on the command line, so they no longer appear in logs.
+  Independent review: docs/REVIEW-9.md.
+
 ## 0.8.0
 
 ### CI, pinned hosts, certificates and coverage

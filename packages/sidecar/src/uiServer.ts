@@ -104,7 +104,7 @@ export function pageHtml(args: { origin: string; wsToken: string; nonce: string;
 <html lang="en" data-fi-theme="${theme}">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy(origin, n)}">
+  <meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy(origin, n).replace(/; frame-ancestors 'none'/, '')}">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="referrer" content="no-referrer">
   <link rel="stylesheet" href="${origin}/theme.css">
