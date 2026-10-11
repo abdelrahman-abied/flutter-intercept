@@ -1120,6 +1120,8 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
     // list_requests kind "grpc", get_request (gRPC info, trailers, schema-decoded messages), get_frames,
     // get_grpc_schema (method + skeleton), add_grpc_mock with JSON messages (times 1) and with an error status,
     // assert_traffic expect.grpcStatus, both after hot restarts; get_status grpc.
+    // v0.12.0 (CONTRACTS §18): add_rewrite of a response header the demo prints (x-demo-server) plus a trailer, and
+    // resend_request grpc.messagesJson (the resent call's status and decoded response).
     // v0.11.0 (CONTRACTS §17): a response breakpoint edited through resume_request grpc.messageJson (the app prints the
     // edited id), a mutate rule on the response message, and save_recording → replay_recording (fallback "fail").
     if (process.env.FI_AGENT_GRPC === '1') {
@@ -1286,6 +1288,47 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
             notes.push(`breakpoint edit seen, mutate seen, replay → codes ${codes.join('/')}`);
           } finally {
             await mcpCall('replay_recording', {}).catch(() => undefined);
+          }
+
+          // ---- v0.12.0 (CONTRACTS §18): a response-header rewrite the demo prints, resend with messagesJson ----
+          // 4. Rewrite x-demo-server (the demo prints it as "server") on the unary call.
+          await batchIdle();
+          const anyCall = (await mcpCall('list_requests', { url: `*${GET_ORDER}`, kind: 'grpc', sinceMs: cleanAt, limit: 1 })).result.items?.[0];
+          const grpcOrigin = anyCall ? new URL(anyCall.url).origin : `http://127.0.0.1:${grpcPort}`;
+          const rwr = await mcpCall('add_rewrite', { url: `${grpcOrigin}${GET_ORDER}`, response: { setHeaders: { 'x-demo-server': 'fi-rewritten' }, setTrailers: { 'x-fi-trailer': 'set' } }, name: 'grpc rewrite' });
+          if (rwr.isError || !rwr.result.ruleId) throw new Error(`add_rewrite (gRPC): ${rwr.text.slice(0, 300)}`);
+          ruleIds.push(rwr.result.ruleId);
+          from = session ? outputOf(session).length : 0;
+          const rewriteAt = Date.now();
+          h = await mcpCall('hot_restart', { sessionId });
+          if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+          await unaryLine(from, /fi-rewritten/, 'response-header rewrite');
+          const rwCall = await mcpCall('wait_for_request', { url: `*${GET_ORDER}`, kind: 'grpc', sinceMs: rewriteAt, timeoutMs: 60_000 });
+          if (!rwCall.isError && !rwCall.result.timedOut) {
+            const t = (await mcpCall('get_request', { id: rwCall.result.id, includeBodies: false })).result.responseTrailers ?? {};
+            if (t['x-fi-trailer'] !== 'set') f.push(`rewritten trailer missing: ${JSON.stringify(t).slice(0, 200)}`);
+          }
+          for (const id of ruleIds.splice(0)) await mcpCall('remove_rule', { ruleId: id }).catch(() => undefined);
+
+          // 5. Resend the clean run's unary GetOrder with another order id (messagesJson): the server answers it.
+          await batchIdle();
+          const clean = ((await mcpCall('list_requests', { url: `*${GET_ORDER}`, kind: 'grpc', sinceMs: cleanAt, limit: 50 })).result.items ?? []) as any[];
+          const unary = clean.find((x) => x.grpc?.code === 0 && !x.matchedRuleId && !x.initiator && !x.simulated);
+          if (!unary) f.push(`no clean GetOrder call to resend: ${JSON.stringify(clean).slice(0, 300)}`);
+          else {
+            const rs = await mcpCall('resend_request', { id: unary.id, grpc: { messagesJson: [{ id: 'A-2002', includeItems: false }] } });
+            if (rs.isError || !rs.result.id) f.push(`resend_request grpc: ${rs.text.slice(0, 300)}`);
+            else {
+              let g: any;
+              for (const deadline = Date.now() + 30_000; Date.now() < deadline; ) {
+                g = (await mcpCall('get_request', { id: rs.result.id })).result;
+                if (g.state && g.state !== 'pending') break;
+                await sleep(300);
+              }
+              const got = (g?.messages ?? []).find((m: any) => m.dir === 'receive');
+              if (g?.grpc?.code !== 0 || got?.json?.id !== 'A-2002' || g?.initiator !== 'agent') f.push(`resent GetOrder: ${JSON.stringify(g).slice(0, 400)}`);
+              notes.push(`rewrite seen; resend → ${g?.grpc?.status} ${got?.json?.id}`);
+            }
           }
 
           const s2 = await mcpCall('stop_app', { sessionId });

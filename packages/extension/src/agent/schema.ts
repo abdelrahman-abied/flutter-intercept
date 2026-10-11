@@ -219,6 +219,8 @@ const rewriteResponse = z
     setHeaders: rewriteHeaders.optional(),
     removeHeaders: z.array(z.string().min(1).max(200)).max(MAX_REWRITE_HEADERS).optional(),
     replaceBody: replaceBody.optional(),
+    setTrailers: z.record(z.string(), z.string()).optional().describe('gRPC calls: trailers to set (custom metadata; not grpc-status / grpc-message). Ignored for HTTP.'),
+    removeTrailers: z.array(z.string().min(1).max(200)).max(MAX_REWRITE_HEADERS).optional().describe('gRPC calls: trailers to remove. Ignored for HTTP.'),
   })
   .describe("Changes to the real server's response before the app gets it.");
 
@@ -368,7 +370,21 @@ export const toolSchemas = {
     ttlMs: ttlMs.optional(),
     name: ruleName.optional(),
   }),
-  resend_request: z.strictObject({ id, edit: requestEditSchema.optional() }),
+  resend_request: z.strictObject({
+    id,
+    edit: requestEditSchema.optional(),
+    grpc: z
+      .strictObject({
+        messagesJson: z
+          .array(z.unknown())
+          .max(100)
+          .optional()
+          .describe('Request messages as JSON (proto3 JSON, as get_request shows them), encoded with the request type. "[redacted]" values keep the original message\'s value.'),
+        messages: z.array(z.string().max(6 * 1024 * 1024)).max(100).optional().describe('Request messages as base64 protobuf bytes.'),
+      })
+      .optional()
+      .describe('gRPC calls only: replacement request messages (default: the recorded ones).'),
+  }),
   // CONTRACTS §10.6
   check_contract: z.strictObject({
     id: id.optional().describe('Check this one exchange. Omit to check the latest matching JSON responses.'),
@@ -695,7 +711,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   resend_request: {
     title: 'Resend a request',
-    model: 'Send a recorded request again through the proxy, optionally edited (method, url, headers, body), without involving the app — e.g. to check a fix on the backend or try a different payload. Only for an app request that reached the real server unchanged (state "completed", no rule matched it, not from a physical device over LAN), and only to that request\'s own origin: edit.url may change path and query, never scheme, host or port. Anything else is refused with the reason. Omitted fields keep the original, including secret headers you only see as "[redacted]"; a "[redacted]" value in edit.headers (or the query) is replaced by the original. Rules and the network profile apply. Returns {id, sinceMs}: the new exchange starts "pending"; wait for it with wait_for_request (same url, that sinceMs) or check get_request(id).',
+    model: 'Send a recorded request again through the proxy, optionally edited (method, url, headers, body), without involving the app — e.g. to check a fix on the backend or try a different payload. Only for an app request that reached the real server unchanged (state "completed", no rule matched it, not from a physical device over LAN), and only to that request\'s own origin: edit.url may change path and query, never scheme, host or port. Anything else is refused with the reason. Omitted fields keep the original, including secret headers you only see as "[redacted]"; a "[redacted]" value in edit.headers (or the query) is replaced by the original. Rules and the network profile apply. Returns {id, sinceMs}: the new exchange starts "pending"; wait for it with wait_for_request (same url, that sinceMs) or check get_request(id). A gRPC call (kind "grpc") is resent with its recorded request messages, or with grpc.messagesJson (JSON per message, encoded with the request type; values you only saw as "[redacted]" keep the original) or grpc.messages (base64); refused when a recorded request message was cut (64 KB) unless you pass replacements. The resent call is recorded with its decoded response messages and status (get_request).',
     user: 'Send a recorded request again, optionally edited.',
   },
   check_contract: {
@@ -778,7 +794,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   add_map_remote: {
     title: 'Map requests to a local server',
-    model: 'Redirect matching requests to a local backend (http://localhost:<port>, 127.0.0.1 or [::1], optionally with a path prefix): the path and query after the matched URL are kept, the app still sees the original URL, and exchanges carry simulated: "Mapped to <origin>". Requests keep their headers (including credentials), so map only to your own local server. Agents can only map to loopback targets; the user can map elsewhere from the panel. The url must name a host. Inserted first; remove it with remove_rule when done.',
+    model: 'Redirect matching requests to a local backend (http://localhost:<port>, 127.0.0.1 or [::1], optionally with a path prefix): the path and query after the matched URL are kept, the app still sees the original URL, and exchanges carry simulated: "Mapped to <origin>". Requests keep their headers (including credentials), so map only to your own local server. Agents can only map to loopback targets; the user can map elsewhere from the panel. The url must name a host. Inserted first; remove it with remove_rule when done. Works for gRPC calls too (the call goes to the mapped origin over HTTP/2: http targets h2c, https targets TLS).',
     user: 'Send matching requests to a local server instead.',
   },
   // CONTRACTS §13.8
@@ -812,7 +828,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   add_rewrite: {
     title: 'Add a rewrite rule',
-    model: 'Let matching requests reach the real server but change them on the way: request {setHeaders, removeHeaders, replaceBody} before forwarding, response {status, setHeaders, removeHeaders, replaceBody} before the app gets it. replaceBody is a literal find/replace on the decoded text (1-20 replacements, no regex). Use it for feature flags in headers, forcing a status, or patching a response text. Refused: setting request headers that carry credentials (Authorization, Cookie, *token*, *session*, *api-key* …); setting Location, Refresh, Set-Cookie, Content-Security-Policy, Access-Control-*, X-Forwarded-*, Forwarded, Host or method-override headers, or an HTML/JavaScript content-type; "[redacted]" values; request.replaceBody; markup or script in replacements; and — while secrets are redacted — response replaceBody (a find/replace could reveal redacted values); use add_mutation for JSON fields. The url must name a host. Inserted first; times / ttlMs remove it automatically, otherwise use remove_rule.',
+    model: 'Let matching requests reach the real server but change them on the way: request {setHeaders, removeHeaders, replaceBody} before forwarding, response {status, setHeaders, removeHeaders, replaceBody} before the app gets it. replaceBody is a literal find/replace on the decoded text (1-20 replacements, no regex). Use it for feature flags in headers, forcing a status, or patching a response text. Refused: setting request headers that carry credentials (Authorization, Cookie, *token*, *session*, *api-key* …); setting Location, Refresh, Set-Cookie, Content-Security-Policy, Access-Control-*, X-Forwarded-*, Forwarded, Host or method-override headers, or an HTML/JavaScript content-type; "[redacted]" values; request.replaceBody; markup or script in replacements; and — while secrets are redacted — response replaceBody (a find/replace could reveal redacted values); use add_mutation for JSON fields. The url must name a host. Inserted first; times / ttlMs remove it automatically, otherwise use remove_rule. gRPC calls (url ending in /<package.Service>/<Method>): setHeaders / removeHeaders change the request metadata or response headers, response.setTrailers / removeTrailers the trailers (custom metadata); protocol metadata (content-type, te, grpc-status, grpc-message, grpc-timeout, grpc-encoding) is refused and -bin values must be base64; replaceBody and response.status do not apply to gRPC (use add_mutation or a breakpoint).',
     user: 'Add a rule that changes headers, status or body text of real requests or responses.',
   },
 };

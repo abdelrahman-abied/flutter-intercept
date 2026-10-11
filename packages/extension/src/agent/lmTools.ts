@@ -231,6 +231,11 @@ function rewriteText(side: string, spec: unknown): string | undefined {
   if (names.length) parts.push(`set ${names.slice(0, 6).map((k) => `${code(k)}: ${code(String(set[k]).length > 60 ? `${String(set[k]).slice(0, 60)}…` : set[k])}`).join(', ')}${names.length > 6 ? ` and ${names.length - 6} more` : ''}`);
   if (Array.isArray(r.removeHeaders) && r.removeHeaders.length) parts.push(`remove ${r.removeHeaders.slice(0, 6).map(code).join(', ')}${r.removeHeaders.length > 6 ? ' …' : ''}`);
   if (Array.isArray(r.replaceBody) && r.replaceBody.length) parts.push(`${r.replaceBody.length} body text replacement(s)`);
+  // CONTRACTS §18.1: gRPC trailers
+  const tr = obj(r.setTrailers);
+  const tnames = Object.keys(tr);
+  if (tnames.length) parts.push(`set gRPC trailers ${tnames.slice(0, 6).map((k) => `${code(k)}: ${code(String(tr[k]).length > 60 ? `${String(tr[k]).slice(0, 60)}…` : tr[k])}`).join(', ')}${tnames.length > 6 ? ` and ${tnames.length - 6} more` : ''}`);
+  if (Array.isArray(r.removeTrailers) && r.removeTrailers.length) parts.push(`remove gRPC trailers ${r.removeTrailers.slice(0, 6).map(code).join(', ')}${r.removeTrailers.length > 6 ? ' …' : ''}`);
   return parts.length ? `${side}: ${parts.join('; ')}` : undefined;
 }
 
@@ -378,7 +383,13 @@ export function confirmationText(
           };
     case 'resend_request': {
       const e = obj(i.edit);
-      const parts = [e.headers && 'headers replaced', e.body !== undefined && `body (${String(e.body).length} chars)`].filter(Boolean);
+      const g = obj(i.grpc);
+      const parts = [
+        e.headers && 'headers replaced',
+        e.body !== undefined && `body (${String(e.body).length} chars)`,
+        Array.isArray(g.messagesJson) && `${g.messagesJson.length} gRPC request message(s) as JSON`,
+        Array.isArray(g.messages) && `${g.messages.length} gRPC request message(s) as protobuf`,
+      ].filter(Boolean);
       const extra = parts.length ? ` Also edited: ${parts.join(', ')}.` : '';
       if (!request) {
         return { title: 'Resend a request', message: `Resend recorded request ${code(i.id)} to the real server with its original credentials (the request was not found, so the call will fail).${extra}` };

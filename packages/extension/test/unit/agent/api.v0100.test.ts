@@ -159,7 +159,7 @@ describe('get_request / get_frames on a gRPC call', () => {
   it('resend_request refuses gRPC calls; add_mock refuses a known gRPC method', async () => {
     const { api, host } = setup();
     host.exchanges = [grpcCall({ id: 'g' })];
-    await rejectsWith(api.call('resend_request', { id: 'g' }), /gRPC call/, 'invalid');
+    expect(await api.call('resend_request', { id: 'g' })).toMatchObject({ id: 'sent', messages: 1 }); // 0.12: gRPC resend
     await rejectsWith(api.call('add_mock', { url: '*/shop.v1.CartService/AddItem', body: {} }), /use add_grpc_mock/, 'invalid');
   });
 });

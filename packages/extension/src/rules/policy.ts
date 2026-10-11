@@ -5,7 +5,9 @@
  *   redirect it, change what the real server receives, serve pages / scripts to the Flutter Web debug browser, or run
  *   JavaScript in the proxy (every shared `script` rule, CONTRACTS §13.4).
  *   Held back until the user approves that rule (src/rules/core.ts): see `approvalReasons` for the list; sequence
- *   steps are inspected the same way.
+ *   steps are inspected the same way. CONTRACTS §18: gRPC calls use the same actions (request-metadata rewrites, map
+ *   remote, scripts with `onGrpcMessage` / `onGrpcStatus`), so they are gated exactly like HTTP; trailers a rewrite sets
+ *   are checked like response headers.
  * - Secrets: shared rules, body files and script files are committed with the code, so writing them is refused when a value looks
  *   like a credential: JWTs, Bearer/Basic credentials, long random tokens, AWS access key ids, PEM private keys,
  *   `user:pass@` in URLs, and any non-placeholder value under a credential name (JSON key, form field, query
@@ -118,6 +120,8 @@ function actionApprovalReasons(a: AnyAction): string[] {
       const res = a.response;
       if (typeof res?.status === 'number' && res.status >= 300 && res.status < 400) out.push(`turns the response into a redirect (status ${res.status})`);
       out.push(...responseHeaderReasons(res?.setHeaders));
+      // CONTRACTS §18.1: gRPC trailers are response metadata too
+      out.push(...responseHeaderReasons(res?.setTrailers).map((r) => `${r} as a gRPC trailer`));
       if (res?.removeHeaders?.some((n) => n.toLowerCase().startsWith('content-security-policy'))) out.push("removes the page's Content-Security-Policy");
       for (const r of res?.replaceBody ?? []) {
         if (/<|javascript:/i.test(r.replace)) {
@@ -354,7 +358,7 @@ function actionSecret(a: AnyAction, bodyFileText: (path: string) => string | und
       return k ? `the map remote target contains what looks like ${k}` : undefined;
     }
     case 'rewrite': {
-      const h = headersSecret(a.request?.setHeaders, 'request') ?? headersSecret(a.response?.setHeaders, 'response');
+      const h = headersSecret(a.request?.setHeaders, 'request') ?? headersSecret(a.response?.setHeaders, 'response') ?? headersSecret(a.response?.setTrailers, 'response');
       if (h) return h;
       for (const r of [...(a.request?.replaceBody ?? []), ...(a.response?.replaceBody ?? [])]) {
         const k = (typeof r.replace === 'string' ? bodySecretKind(r.replace) : undefined) ?? (typeof r.find === 'string' ? textSecretKind(r.find) : undefined);

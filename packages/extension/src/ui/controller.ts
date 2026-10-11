@@ -63,7 +63,7 @@ import type { SharedRulesService, SharedRulesState } from '../rules/types';
 import type { ToOpenApi, ToPostman } from '../export/types';
 import { scriptFileOf, scriptFileSyntaxError, scriptTemplate } from '../rules/scriptFile';
 import { buildHar, ensureDirInside, EXPORT_DIR, type HarGrpcDecoder } from '../agent/har';
-import { decodeGrpcMessages, decodeHeldMessage, grpcMethodPath, grpcProxyCodec, hexOf, MAX_CODEC_BYTES, type GrpcDeps } from '../grpc/service';
+import { decodeGrpcMessages, decodeHeldMessage, grpcMethodFromGlob, grpcMethodPath, grpcProxyCodec, hexOf, MAX_CODEC_BYTES, type GrpcDeps } from '../grpc/service';
 import { gitIgnoreStatus, type GitignoreFs } from '../recordings/gitignore';
 import type { AgentStatus, AuthFlowSummary, ContractSummary, ExportFormat, GrpcDecoded, GrpcStatus, HostMsg, RecordingSummary, SendDraft, SessionWarning, SnippetFormat, Status, ViewMsg } from './protocol';
 
@@ -640,7 +640,7 @@ export function validateRule(raw: unknown, where = 'rule'): Rule {
   // `file` supplies the code is checked as if it had code (the host reads the file before the proxy gets it).
   const probe =
     action.kind === 'script' && action.file !== undefined && !action.code.trim() ? { ...out, action: { ...action, code: '/* read from file */' } } : out;
-  const problem = ruleProblem(probe as unknown as Rule);
+  const problem = ruleProblem(probe as unknown as Rule) ?? grpcRewriteProblem(out as unknown as Rule);
   if (problem) fail(where, problem);
   return out as unknown as Rule;
 }
@@ -989,16 +989,66 @@ export function checkMapTarget(v: unknown, where = 'mapRemote'): URL {
 }
 
 /** Validates one side of a rewrite; returns the total length of its find + replace texts. */
+/**
+ * CONTRACTS §18.1: gRPC metadata a rewrite may not set or remove anywhere (the proxy and the protocol own it). For a rule
+ * whose URL names a gRPC method, `content-type` and `te` are refused too (validateRule: `grpcRewriteProblem`).
+ */
+export const GRPC_RESERVED_METADATA = new Set(['grpc-encoding', 'grpc-accept-encoding', 'grpc-status', 'grpc-message', 'grpc-timeout', 'grpc-status-details-bin']);
+const GRPC_CALL_RESERVED = new Set(['content-type', 'te']);
+
+/** `-bin` metadata values must be base64 (padded or not, standard or URL alphabet), CONTRACTS §18.1. */
+function checkBinValue(name: string, value: unknown, where: string): void {
+  if (!/-bin$/i.test(name)) return;
+  if (typeof value !== 'string' || !/^[A-Za-z0-9+/_-]*={0,2}$/.test(value)) fail(where, `"${name}" is binary metadata (-bin): its value must be base64`);
+}
+
+/** CONTRACTS §18.1: names a rewrite may not touch on a gRPC call (any side, set or remove). */
+function grpcMetadataNames(spec: Record<string, unknown> | undefined): string[] {
+  if (!spec) return [];
+  return [
+    ...Object.keys(isObj(spec.setHeaders) ? spec.setHeaders : {}),
+    ...(Array.isArray(spec.removeHeaders) ? (spec.removeHeaders as unknown[]).filter((x): x is string => typeof x === 'string') : []),
+    ...Object.keys(isObj(spec.setTrailers) ? spec.setTrailers : {}),
+    ...(Array.isArray(spec.removeTrailers) ? (spec.removeTrailers as unknown[]).filter((x): x is string => typeof x === 'string') : []),
+  ];
+}
+
+/**
+ * CONTRACTS §18.1: for a rule whose URL names a gRPC method, a rewrite may not set / remove `content-type` or `te`
+ * either (reserved `grpc-*` names are refused for every rewrite in `checkRewriteSpec`). Undefined when fine.
+ */
+export function grpcRewriteProblem(rule: { match: { url: string }; action: RuleAction }): string | undefined {
+  if (!grpcMethodFromGlob(rule.match.url)) return undefined;
+  const visit = (a: RuleAction | { kind: 'passthrough' }): string | undefined => {
+    if (a.kind === 'sequence') {
+      for (const st of a.steps ?? []) {
+        const r = visit(st.action as RuleAction);
+        if (r) return r;
+      }
+      return undefined;
+    }
+    if (a.kind !== 'rewrite') return undefined;
+    for (const name of [...grpcMetadataNames(a.request as Record<string, unknown> | undefined), ...grpcMetadataNames(a.response as Record<string, unknown> | undefined)]) {
+      const n = name.toLowerCase();
+      if (n.startsWith(':') || GRPC_CALL_RESERVED.has(n)) return `"${name}" can't be changed on a gRPC call (the proxy and the protocol own it)`;
+    }
+    return undefined;
+  };
+  return visit(rule.action);
+}
+
 function checkRewriteSpec(raw: unknown, where: string, side: 'request' | 'response'): number {
   if (!isObj(raw)) fail(where, 'must be an object');
-  onlyKeys(raw, side === 'response' ? ['setHeaders', 'removeHeaders', 'replaceBody', 'status'] : ['setHeaders', 'removeHeaders', 'replaceBody'], where);
+  onlyKeys(raw, side === 'response' ? ['setHeaders', 'removeHeaders', 'replaceBody', 'status', 'setTrailers', 'removeTrailers'] : ['setHeaders', 'removeHeaders', 'replaceBody'], where);
   if (side === 'response' && raw.status !== undefined) checkStatus(raw.status, where);
   const forbidden = side === 'request' ? REWRITE_REQUEST_FORBIDDEN : REWRITE_RESPONSE_FORBIDDEN;
   let headers = 0;
   if (raw.setHeaders !== undefined) {
     checkHeaders(raw.setHeaders, `${where}.setHeaders`, false);
-    for (const name of Object.keys(raw.setHeaders as object)) {
+    for (const [name, value] of Object.entries(raw.setHeaders as Record<string, unknown>)) {
       if (forbidden.has(name.toLowerCase())) fail(`${where}.setHeaders`, `"${name}" can't be set by a rewrite (the proxy manages it)`);
+      if (GRPC_RESERVED_METADATA.has(name.toLowerCase())) fail(`${where}.setHeaders`, `"${name}" can't be set by a rewrite (gRPC protocol metadata; change the status with a breakpoint, mutate or a script)`);
+      checkBinValue(name, value, `${where}.setHeaders`);
       headers++;
     }
   }
@@ -1006,6 +1056,26 @@ function checkRewriteSpec(raw: unknown, where: string, side: 'request' | 'respon
     if (!Array.isArray(raw.removeHeaders)) fail(where, 'removeHeaders must be a list of header names');
     for (const name of raw.removeHeaders) {
       if (typeof name !== 'string' || !TOKEN.test(name)) fail(`${where}.removeHeaders`, `invalid header name ${JSON.stringify(name)}`);
+      if (GRPC_RESERVED_METADATA.has(name.toLowerCase())) fail(`${where}.removeHeaders`, `"${name}" can't be removed by a rewrite (gRPC protocol metadata)`);
+      headers++;
+    }
+  }
+  // CONTRACTS §18.1: gRPC trailers (custom metadata only; ignored for HTTP)
+  if (raw.setTrailers !== undefined) {
+    checkHeaders(raw.setTrailers, `${where}.setTrailers`, false);
+    for (const [name, value] of Object.entries(raw.setTrailers as Record<string, unknown>)) {
+      const n = name.toLowerCase();
+      if (n.startsWith(':') || GRPC_RESERVED_METADATA.has(n) || GRPC_MOCK_FORBIDDEN.has(n)) fail(`${where}.setTrailers`, `"${name}" can't be set as a trailer (the proxy sets it; change the status with a breakpoint, mutate or a script)`);
+      checkBinValue(name, value, `${where}.setTrailers`);
+      headers++;
+    }
+  }
+  if (raw.removeTrailers !== undefined) {
+    if (!Array.isArray(raw.removeTrailers)) fail(where, 'removeTrailers must be a list of trailer names');
+    for (const name of raw.removeTrailers) {
+      if (typeof name !== 'string' || !TOKEN.test(name)) fail(`${where}.removeTrailers`, `invalid trailer name ${JSON.stringify(name)}`);
+      const n = name.toLowerCase();
+      if (GRPC_RESERVED_METADATA.has(n) || GRPC_MOCK_FORBIDDEN.has(n)) fail(`${where}.removeTrailers`, `"${name}" can't be removed (gRPC protocol metadata)`);
       headers++;
     }
   }
@@ -1111,16 +1181,92 @@ export function sanitizeSendHeaders(h: Record<string, string | string[]> | undef
 export function validateSendDraft(raw: unknown): SendDraft {
   const where = 'send';
   if (!isObj(raw)) fail(where, 'request must be an object');
-  onlyKeys(raw, ['method', 'url', 'headers', 'body'], where);
+  onlyKeys(raw, ['method', 'url', 'headers', 'body', 'grpc'], where);
   if (typeof raw.method !== 'string' || !TOKEN.test(raw.method)) fail(where, 'method must be an HTTP method name');
   checkUrl(raw.url, where);
   if (raw.headers !== undefined) checkHeaders(raw.headers, where, true);
   if (raw.body !== undefined) checkBody(raw.body, where);
+  const grpc = raw.grpc !== undefined ? checkSendGrpc(raw, where) : undefined;
+  const headers = raw.headers !== undefined ? sanitizeSendHeaders(raw.headers as Record<string, string | string[]>) : undefined;
   return {
     method: raw.method.toUpperCase(),
     url: raw.url as string,
-    ...(raw.headers !== undefined ? { headers: sanitizeSendHeaders(raw.headers as Record<string, string | string[]>) } : {}),
+    ...(headers !== undefined ? { headers: grpc ? sanitizeGrpcSendHeaders(headers) : headers } : {}),
     ...(raw.body !== undefined ? { body: raw.body as string } : {}),
+    ...(grpc ? { grpc } : {}),
+  };
+}
+
+/** CONTRACTS §18.4: send caps (the proxy enforces them too). */
+export const MAX_SEND_GRPC_MESSAGES = 100;
+export const MAX_SEND_GRPC_TOTAL_BYTES = 16 * 1024 * 1024;
+
+/** `send.grpc`: POST to a gRPC method URL, no body, exactly one of `messages` (base64) / `messagesJson`, within the caps. */
+function checkSendGrpc(raw: Record<string, unknown>, where: string): { messages?: string[]; messagesJson?: unknown[] } {
+  const g = raw.grpc;
+  if (!isObj(g)) fail(where, 'grpc must be an object {messages} or {messagesJson}');
+  onlyKeys(g, ['messages', 'messagesJson'], `${where}.grpc`);
+  if (String(raw.method).toUpperCase() !== 'POST') fail(where, 'a gRPC call is sent with method POST');
+  if (raw.body !== undefined) fail(where, 'a gRPC call has no body: pass grpc.messages or grpc.messagesJson');
+  if (!grpcMethodPath(String(raw.url))) fail(where, 'the URL of a gRPC call ends in /<package.Service>/<Method>');
+  if ((g.messages === undefined) === (g.messagesJson === undefined)) fail(`${where}.grpc`, 'pass exactly one of messages (base64) or messagesJson');
+  if (g.messages !== undefined) {
+    if (!Array.isArray(g.messages) || g.messages.length > MAX_SEND_GRPC_MESSAGES) fail(`${where}.grpc`, `messages must be a list of at most ${MAX_SEND_GRPC_MESSAGES} base64 protobuf messages`);
+    let total = 0;
+    g.messages.forEach((m, i) => {
+      if (typeof m !== 'string' || m.length > MAX_GRPC_EDIT_B64 || !BASE64.test(m)) fail(`${where}.grpc`, `messages[${i}] must be base64 of a serialized protobuf message (at most 4 MB)`);
+      total += Math.floor((m.length * 3) / 4);
+    });
+    if (total > MAX_SEND_GRPC_TOTAL_BYTES) fail(`${where}.grpc`, 'the messages must total at most 16 MB');
+    return { messages: [...(g.messages as string[])] };
+  }
+  if (!Array.isArray(g.messagesJson) || g.messagesJson.length > MAX_SEND_GRPC_MESSAGES) fail(`${where}.grpc`, `messagesJson must be a list of at most ${MAX_SEND_GRPC_MESSAGES} JSON messages`);
+  g.messagesJson.forEach((m, i) => {
+    if (!isJsonValue(m)) fail(`${where}.grpc`, `messagesJson[${i}] must be a JSON value`);
+    if (JSON.stringify(m).length > MAX_CODEC_BYTES) fail(`${where}.grpc`, `messagesJson[${i}] must be at most 4 MB as JSON`);
+  });
+  return { messagesJson: [...(g.messagesJson as unknown[])] };
+}
+
+/** Request metadata a gRPC send never forwards (the proxy sets content-type / te / encodings itself, CONTRACTS §18.4). */
+const GRPC_SEND_DROPPED = new Set(['content-type', 'te', 'grpc-encoding', 'grpc-accept-encoding', 'content-encoding']);
+export function sanitizeGrpcSendHeaders(h: Record<string, string | string[]>): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const [k, v] of Object.entries(sanitizeSendHeaders(h) ?? {})) if (!GRPC_SEND_DROPPED.has(k.toLowerCase())) out[k] = v;
+  return out;
+}
+
+/**
+ * CONTRACTS §18.4: the request messages of a recorded gRPC call, to resend unchanged (base64, what the server got:
+ * messages dropped at a breakpoint are left out). Throws a readable Error when one was cut (64 KB frame cap / size
+ * unknown) or frames were dropped from the record.
+ */
+export function grpcResendMessages(e: Exchange): string[] {
+  if (e.kind !== 'grpc') throw new Error('not a gRPC call');
+  if (e.framesDropped) throw new Error('some of its messages were not kept (too many), so its request is incomplete; edit & resend it with messagesJson or messages');
+  const sent = (e.frames ?? []).filter((f) => f.kind === 'message' && f.dir === 'send' && !f.dropped);
+  if (sent.some((f) => f.truncated || f.sizeUnknown || typeof f.base64 !== 'string')) throw new Error('a request message was too large to record in full (64 KB), so it can only be resent edited (messagesJson or messages)');
+  return sent.map((f) => f.base64 as string);
+}
+
+/**
+ * CONTRACTS §18.4: `send.grpc` ready for the proxy — `messagesJson` encoded with the method's request type (errors name
+ * the message and JSON path). The proxy refuses `messagesJson`.
+ */
+export function resolveSendGrpc(url: string, grpcIn: { messages?: string[]; messagesJson?: unknown[] }, grpc: Pick<GrpcDeps, 'codec' | 'schema' | 'enabled'> | undefined): { messages: string[] } {
+  if (grpcIn.messages) return { messages: grpcIn.messages };
+  const path = grpcMethodPath(url);
+  if (!path) throw new Error('the URL of a gRPC call ends in /<package.Service>/<Method>');
+  if (!grpc) throw new Error('gRPC decoding is not available: pass messages (base64) instead of messagesJson.');
+  const codec = grpcProxyCodec(grpc);
+  return {
+    messages: (grpcIn.messagesJson ?? []).map((json, i) => {
+      try {
+        return Buffer.from(codec.encode(path, 'send', json)).toString('base64');
+      } catch (e) {
+        throw new Error(`messagesJson[${i}] can't be encoded as the request of ${path}: ${(e as Error)?.message ?? String(e)}`);
+      }
+    }),
   };
 }
 
@@ -1538,17 +1684,28 @@ export class InterceptController {
           return;
         }
         case 'send': {
-          const request = validateSendDraft(msg.request);
+          let request = validateSendDraft(msg.request);
           if (msg.resentFrom !== undefined) {
             const fromId = checkId(msg.resentFrom, 'send');
             const from = this.deps.host.getExchanges().find((e) => e.id === fromId);
             const ro = from && readOnlyReason(from);
             if (ro) throw new Error(`Can't resend this request: ${ro}.`);
             if (from?.kind === 'tunnel') throw new Error("Can't resend a passed-through TLS connection: its request was never decrypted.");
-            if (from?.kind === 'grpc') throw new Error("Can't resend a gRPC call from here: it is HTTP/2 with binary messages.");
+            // CONTRACTS §18.4: resending a gRPC call unchanged sends its recorded request messages
+            if (from?.kind === 'grpc' && !request.grpc) {
+              try {
+                request = { ...request, grpc: { messages: grpcResendMessages(from) }, ...(request.headers ? { headers: sanitizeGrpcSendHeaders(request.headers) } : {}) };
+              } catch (e) {
+                throw new Error(`Can't resend this gRPC call: ${(e as Error).message}.`);
+              }
+            }
+          }
+          if (request.grpc) {
+            if (request.body !== undefined) throw new Error('A gRPC call has no body.');
+            request = { ...request, grpc: resolveSendGrpc(request.url, request.grpc, this.deps.grpc) };
           }
           if (!this.deps.host.send) throw new Error('This proxy build cannot send requests.');
-          const { id } = await this.deps.host.send({ ...request, initiator: 'editor', ...(msg.resentFrom ? { resentFrom: msg.resentFrom } : {}) });
+          const { id } = await this.deps.host.send({ ...(request as SendRequest), initiator: 'editor', ...(msg.resentFrom ? { resentFrom: msg.resentFrom } : {}) });
           this.send(reply, { type: 'sent', id });
           return;
         }

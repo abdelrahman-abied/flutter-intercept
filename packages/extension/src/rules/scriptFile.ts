@@ -67,7 +67,8 @@ export function defaultScriptFilePath(rule: Pick<Rule, 'name' | 'match'>): strin
 
 /**
  * Starter content for a new script file: both hooks, `context.log`, adding a request header and editing a JSON
- * response. `rule` (optional) names the rule in the first comment line.
+ * response, plus commented gRPC hooks (`onGrpcMessage` / `onGrpcStatus`, CONTRACTS §18.2). `rule` (optional) names the
+ * rule in the first comment line.
  */
 export function scriptTemplate(rule?: Pick<Rule, 'name'>): string {
   const name = typeof rule?.name === 'string' ? cleanText(rule.name, 80).replace(/\*\//g, '* /') : '';
@@ -106,5 +107,33 @@ function onResponse(response, request, context) {
   context.log('edited the JSON response of', request.url, '- status', response.status);
   return { ...response, body: JSON.stringify(json) };
 }
+
+// gRPC calls (CONTRACTS §18.2) use these two hooks instead (onRequest / onResponse are not called for them).
+// Uncomment to use.
+//
+// /**
+//  * For every message of a matching gRPC call, both directions.
+//  * message: { path, dir ('send' = app → server, 'receive'), index, json?, base64, size } — json is decoded with the
+//  * app's protobuf schema (absent without one, or over 1 MB).
+//  * Return undefined (unchanged), { json } (encoded with the schema), { base64 } or { drop: true }.
+//  */
+// function onGrpcMessage(message, context) {
+//   if (message.dir === 'receive' && message.json) {
+//     context.log('message', message.index, 'of', message.path);
+//     return { json: { ...message.json, editedBy: 'flutter-intercept' } };
+//   }
+//   return undefined;
+// }
+//
+// /**
+//  * Before the call's status and trailers go to the app.
+//  * status: { path, code (0 = OK, 14 = UNAVAILABLE, …), message?, trailers }
+//  * Return undefined, or { code?, message?, trailers? }.
+//  */
+// function onGrpcStatus(status, context) {
+//   if (status.code === 0) return undefined;
+//   context.log('call', status.path, 'ended with', status.code, status.message);
+//   return { code: 0, message: '' }; // pretend it worked
+// }
 `;
 }

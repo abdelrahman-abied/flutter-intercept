@@ -16,7 +16,7 @@ import type { AuthAnalysis } from '../analysis/types';
 import type { RecordingService } from '../recordings/types';
 import type { ExportResult, ToOpenApi, ToPostman } from '../export/types';
 import type { Screenshot, ScreenshotTarget } from '../screenshot/types';
-import { checkMapTarget, expireTokenRule, fixtureApi, isRecordable, readOnlyReason, resolveGrpcEdit, sanitizeSendHeaders, tunnelReason, validateEdit, validateRule } from '../ui/controller';
+import { checkMapTarget, expireTokenRule, fixtureApi, grpcResendMessages, isRecordable, readOnlyReason, resolveGrpcEdit, resolveSendGrpc, sanitizeGrpcSendHeaders, sanitizeSendHeaders, validateSendDraft, tunnelReason, validateEdit, validateRule } from '../ui/controller';
 import type { SessionWarning } from '../ui/protocol';
 import { buildHar, writeExportFile, writeHar } from './har';
 import { pathError, select } from './paths';
@@ -691,21 +691,7 @@ export class AgentApi implements AgentTools {
       }
       return raw;
     }
-    const restore = (v: unknown, orig: unknown, depth: number): unknown => {
-      if (depth > 64) return v;
-      if (v === REDACTED && orig !== undefined) return orig;
-      if (Array.isArray(v)) return v.map((x, i) => restore(x, Array.isArray(orig) ? orig[i] : undefined, depth + 1));
-      if (v && typeof v === 'object') {
-        const o = orig && typeof orig === 'object' && !Array.isArray(orig) ? (orig as Record<string, unknown>) : {};
-        const out: Record<string, unknown> = {};
-        for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
-          Object.defineProperty(out, k, { value: restore(x, Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined, depth + 1), enumerable: true, writable: true, configurable: true });
-        }
-        return out;
-      }
-      return v;
-    };
-    return { ...r, messageJson: restore(r.messageJson, d.json, 0) };
+    return { ...r, messageJson: restoreRedactedJson(r.messageJson, d.json) };
   }
 
   /** One decoded message for get_request. */
@@ -1335,7 +1321,6 @@ export class AgentApi implements AgentTools {
     if (e.kind === 'websocket') return `exchange "${e.id}" is a WebSocket connection; only plain HTTP requests can be resent`;
     if (e.kind === 'sse') return `exchange "${e.id}" is a server-sent event stream; resending it would hold a stream open, so only plain HTTP requests can be resent`;
     if (e.kind === 'tunnel') return `exchange "${e.id}" is a TLS connection passed through without decryption (flutterIntercept.tlsPassthrough); its request was never seen, so it can't be resent`;
-    if (e.kind === 'grpc') return `exchange "${e.id}" is a gRPC call (HTTP/2 with binary messages); only plain HTTP requests can be resent`;
     if (e.initiator) return `exchange "${e.id}" was itself sent by ${e.initiator === 'agent' ? 'an agent' : 'the editor'}; resend the app's original request instead`;
     if (/^(lan|tls)-/.test(e.id)) return `exchange "${e.id}" is a connection-level record (refused LAN or TLS connection), not a request that reached a server`;
     if (e.viaLan) return `exchange "${e.id}" came from a physical device over the LAN; resending it from this computer would bypass the LAN safeguards`;
@@ -1355,12 +1340,14 @@ export class AgentApi implements AgentTools {
     const why = this.resendRefusal(e);
     if (why) throw new AgentToolError(`resend_request refused: ${why}.`, 'invalid');
     if (!this.deps.host.send) throw new AgentToolError('this version of the proxy cannot send requests', 'state');
+    if (i.grpc !== undefined && e.kind !== 'grpc') throw new AgentToolError(`exchange "${e.id}" is not a gRPC call; pass edit (not grpc)`, 'invalid');
     let edit: RequestEdit | undefined;
     try {
       edit = validateEdit(i.edit, 'request') as RequestEdit | undefined;
     } catch (err) {
       throw new AgentToolError((err as Error).message, 'invalid');
     }
+    if (e.kind === 'grpc') return this.resendGrpc(e, edit, i.grpc);
     const original = new URL(e.url);
     let url = e.url;
     if (edit?.url !== undefined) {
@@ -1400,6 +1387,62 @@ export class AgentApi implements AgentTools {
       throw new AgentToolError(`could not send the request: ${(err as Error).message}`, 'state');
     }
     return { id, sinceMs };
+  }
+
+  /**
+   * CONTRACTS §18.4: resend a gRPC call — its recorded request messages, or `grpc.messagesJson` (encoded with the request
+   * type; "[redacted]" values keep the original message's value at the same index and path) / `grpc.messages` (base64).
+   * Same origin and still a gRPC method; method POST; no body; the proxy opens its own HTTP/2 call (LAN-recorded calls
+   * are refused earlier: `resendRefusal`).
+   */
+  private async resendGrpc(e: Exchange, edit: RequestEdit | undefined, g: ToolInput<'resend_request'>['grpc']): Promise<ToolResult> {
+    const bad = (m: string) => new AgentToolError(`resend_request refused: ${m}`, 'invalid');
+    if (edit?.body !== undefined) throw bad('a gRPC call has no body: pass grpc.messagesJson or grpc.messages');
+    if (edit?.method !== undefined && edit.method.toUpperCase() !== 'POST') throw bad('a gRPC call is sent with method POST');
+    const original = new URL(e.url);
+    let url = e.url;
+    if (edit?.url !== undefined) {
+      const target = new URL(edit.url);
+      if (target.origin !== original.origin || target.username || target.password) throw bad(`edit.url must keep the original origin ${original.origin}`);
+      if (!grpcMethodPath(target.href)) throw bad('edit.url must name a gRPC method (…/package.Service/Method)');
+      url = target.href;
+    }
+    let grpcIn: { messages?: string[]; messagesJson?: unknown[] };
+    if (g?.messagesJson !== undefined && g.messages !== undefined) throw bad('pass grpc.messagesJson or grpc.messages, not both');
+    if (g?.messagesJson !== undefined) {
+      const originals = decodeGrpcMessages(e, this.deps.grpc, { filter: (f) => f.kind === 'message' && f.dir === 'send' && !f.dropped }).messages;
+      grpcIn = {
+        messagesJson: g.messagesJson.map((m, n) => {
+          const o = originals[n];
+          if (o?.via === 'schema' && o.json !== undefined && !o.truncated) return restoreRedactedJson(m, o.json);
+          if (JSON.stringify(m)?.includes(REDACTED)) throw bad(`grpc.messagesJson[${n}] contains "[redacted]", but the original message ${n + 1} can't be decoded to restore it; pass the full message`);
+          return m;
+        }),
+      };
+    } else if (g?.messages !== undefined) grpcIn = { messages: g.messages };
+    else {
+      try {
+        grpcIn = { messages: grpcResendMessages(e) };
+      } catch (err) {
+        throw bad((err as Error).message);
+      }
+    }
+    let resolved: { messages: string[] };
+    try {
+      const checked = validateSendDraft({ method: 'POST', url, grpc: grpcIn });
+      resolved = resolveSendGrpc(url, checked.grpc!, this.deps.grpc);
+    } catch (err) {
+      throw bad((err as Error).message);
+    }
+    const headers = sanitizeGrpcSendHeaders(edit?.headers !== undefined ? restoreRedactedHeaders(edit.headers, e.requestHeaders) : e.requestHeaders);
+    const sinceMs = this.now();
+    let id: string;
+    try {
+      ({ id } = await this.deps.host.send!({ method: 'POST', url, headers, grpc: resolved, initiator: 'agent', resentFrom: e.id }));
+    } catch (err) {
+      throw new AgentToolError(`could not send the gRPC call: ${(err as Error).message}`, 'state');
+    }
+    return { id, sinceMs, messages: resolved.messages.length };
   }
 
   // ------------------------------------------------------------------ v0.4.0 (CONTRACTS §10.6)
@@ -2046,7 +2089,9 @@ export class AgentApi implements AgentTools {
     const hasRedacted = (v: string) => v.includes(REDACTED) || v.includes(encodeURIComponent(REDACTED));
     for (const [side, spec] of [['request', i.request], ['response', i.response]] as const) {
       if (!spec) continue;
-      for (const [name, value] of Object.entries(spec.setHeaders ?? {})) {
+      // CONTRACTS §18.1: gRPC trailers follow the response-header rules
+      const trailers = side === 'response' ? (i.response?.setTrailers ?? {}) : {};
+      for (const [name, value] of [...Object.entries(spec.setHeaders ?? {}), ...Object.entries(trailers)]) {
         if (side === 'request' && isSensitiveHeader(name)) {
           throw bad(`request.setHeaders: "${name}" carries credentials, which agents can't set (they only see them redacted); the user can add such a rewrite in the panel`);
         }
@@ -2441,6 +2486,25 @@ export function jsonEqual(a: unknown, b: unknown): boolean {
   const ka = Object.keys(a as object);
   const kb = Object.keys(b as object);
   return ka.length === kb.length && ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && jsonEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+}
+
+/**
+ * An agent's JSON with every "[redacted]" string put back to `orig`'s value at the same path (the secret goes on
+ * unchanged; the agent never learns it). Depth ≤ 64.
+ */
+export function restoreRedactedJson(v: unknown, orig: unknown, depth = 0): unknown {
+  if (depth > 64) return v;
+  if (v === REDACTED && orig !== undefined) return orig;
+  if (Array.isArray(v)) return v.map((x, i) => restoreRedactedJson(x, Array.isArray(orig) ? orig[i] : undefined, depth + 1));
+  if (v && typeof v === 'object') {
+    const o = orig && typeof orig === 'object' && !Array.isArray(orig) ? (orig as Record<string, unknown>) : {};
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+      Object.defineProperty(out, k, { value: restoreRedactedJson(x, Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined, depth + 1), enumerable: true, writable: true, configurable: true });
+    }
+    return out;
+  }
+  return v;
 }
 
 /** Header values the agent only saw as "[redacted]" get their original value back (dropped if there was none). */

@@ -194,14 +194,14 @@ describe('createRuleFromExchange grpcMock (CONTRACTS §16.4)', () => {
     expect(t.host.rules[0].action).toEqual({ kind: 'block', mode: 'status', status: 403 });
   });
 
-  it('gRPC calls are recordable (0.11) but not resendable; tunnels explain the decrypt setting', async () => {
+  it('gRPC calls are recordable (0.11) and resendable (0.12); tunnels explain the decrypt setting', async () => {
     const t = setup();
     const call = grpcCall();
     t.host.exchanges = [call];
     expect(isRecordable(call)).toBe(true);
     expect(isRecordable({ ...call, grpc: { ...call.grpc!, statusCode: undefined } })).toBe(false);
     await t.c.handle({ type: 'send', request: { method: 'POST', url: call.url }, resentFrom: call.id }, t.reply);
-    expect(errors(t.replies)[0]).toMatch(/Can't resend a gRPC call/);
+    expect(errors(t.replies)).toEqual([]); // 0.12 (CONTRACTS §18.4): resent with its recorded request messages
     expect(tunnelReason({ id: 't', kind: 'tunnel', grpcTunnel: true, method: 'CONNECT', url: 'https://grpc.example.com:443/', requestHeaders: {}, startedAt: 1, state: 'completed' })).toMatch(/gRPC over TLS to grpc\.example\.com, not decrypted.*flutterIntercept\.grpc\.decryptHosts/);
   });
 });
