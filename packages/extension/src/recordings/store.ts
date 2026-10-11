@@ -3,7 +3,8 @@
  * `<project>/.dart_tool/flutter_intercept/recordings/<id>.json`, listed, loaded, removed, exported. No `vscode`;
  * the file system is injected (defaults to node's).
  *
- * File format (JSON, version 1 — or 2 when it holds WebSocket / SSE exchanges, see validate.ts). The first line holds the metadata so `list()` reads only the head of each file:
+ * File format (JSON, version 1 — or 2 when it holds WebSocket / SSE exchanges, 3 with gRPC calls, see validate.ts and
+ * grpc.ts). The first line holds the metadata so `list()` reads only the head of each file:
  *
  *     {"version":1,"id":"login-flow","name":"Login flow","createdAt":1760000000000,"exchanges":2,"redacted":false,
  *     "entries":[
@@ -23,8 +24,9 @@ import { redactExchange } from '../agent/samples';
 import { capFrames, copyFrame, redactFrame } from './frames';
 import { diff, diffText } from './diff';
 import { gitIgnoreStatus, type GitignoreFs } from './gitignore';
+import { recordGrpc, toFileEntry, type RecordingGrpc } from './grpc';
 import { replayOptionsFor, toReplay } from './replay';
-import type { Recording, RecordingDiffEntry, RecordingMeta, RecordingService } from './types';
+import type { RecordedExchange, Recording, RecordingDiffEntry, RecordingMeta, RecordingService } from './types';
 import { isValidId, MAX_ENTRIES, recordingVersionFor, RecordingFormatError, SUPPORTED_RECORDING_VERSIONS, validateRecording, validEntry, validName } from './validate';
 
 export const RECORDINGS_DIR = path.join('.dart_tool', 'flutter_intercept', 'recordings');
@@ -77,6 +79,8 @@ export interface RecordingServiceDeps {
   now?: () => number;
   /** Largest recording file written or read (bytes). Default 200 MB. */
   maxBytes?: number;
+  /** CONTRACTS §17.4: the protobuf schema (redacting gRPC messages, diffing their JSON shape). Optional. */
+  grpc?: RecordingGrpc;
 }
 
 /** RecordingService plus `export` (copy to a user-chosen path) and the directory it uses. */
@@ -101,8 +105,10 @@ export class RecordingError extends Error {
  * SSE (CONTRACTS §14.5) — not tunnels, vm-profile captures, browser-internal, unfinished or failed ones.
  */
 export function isRecordable(e: Exchange): boolean {
-  if (e.kind && e.kind !== 'websocket' && e.kind !== 'sse') return false;
+  if (e.kind && e.kind !== 'websocket' && e.kind !== 'sse' && e.kind !== 'grpc') return false;
   if (e.kind === 'websocket' && e.status !== 101) return false;
+  // CONTRACTS §17.4: a gRPC call that ended with a status
+  if (e.kind === 'grpc' && e.grpc?.statusCode === undefined) return false;
   return (
     e.captured !== 'vm-profile' &&
     !e.browserInternal &&
@@ -128,7 +134,8 @@ export function slugify(name: string): string {
  * The fields a recording keeps (no stack traces, pause state, errors, LAN marks); WebSocket / SSE frames within the
  * proxy's caps. `redact`: secrets redacted like agent views, frames included (CONTRACTS §14.5).
  */
-export function recordedExchange(e: Exchange, redact = false): Exchange {
+export function recordedExchange(e: Exchange, redact = false, grpc?: RecordingGrpc): RecordedExchange {
+  if (e.kind === 'grpc') return recordGrpc(e, pick(e), redact, grpc);
   const src = redact ? redactExchange(e) : e;
   const out = pick(src);
   if (e.kind === 'websocket' || e.kind === 'sse') {
@@ -164,22 +171,27 @@ function pick(e: Exchange): Exchange {
   };
 }
 
-/** CONTRACTS §14.5 `RecordingMeta.streams` / `frames`: WebSocket / SSE exchanges and their frames; {} when none. */
-export function streamCounts(entries: readonly Exchange[]): { streams?: number; frames?: number } {
+/**
+ * CONTRACTS §14.5 `RecordingMeta.streams` / `frames`: WebSocket / SSE exchanges and their frames; §17.4 `grpc`: gRPC
+ * calls. {} when none.
+ */
+export function streamCounts(entries: readonly Exchange[]): { streams?: number; frames?: number; grpc?: number } {
   let streams = 0;
   let frames = 0;
+  let grpc = 0;
   for (const e of entries) {
+    if (e.kind === 'grpc') grpc++;
     if (e.kind !== 'websocket' && e.kind !== 'sse') continue;
     streams++;
     frames += e.frames?.length ?? 0;
   }
-  return streams ? { streams, frames } : {};
+  return { ...(streams ? { streams, frames } : {}), ...(grpc ? { grpc } : {}) };
 }
 
 const mb = (n: number) => (n >= 1024 * 1024 ? `${Math.round(n / (1024 * 1024))} MB` : `${Math.ceil(n / 1024)} KB`);
 
 /** The file text (metadata on line 1; `streams` / `frames` only when it holds WebSocket / SSE exchanges). Throws RecordingError beyond `maxBytes`. */
-export function serializeRecording(meta: Omit<RecordingMeta, 'path'>, entries: Exchange[], maxBytes: number): string {
+export function serializeRecording(meta: Omit<RecordingMeta, 'path'>, entries: RecordedExchange[], maxBytes: number): string {
   const head = JSON.stringify({
     version: recordingVersionFor(entries),
     id: meta.id,
@@ -192,7 +204,7 @@ export function serializeRecording(meta: Omit<RecordingMeta, 'path'>, entries: E
   const parts = [`${head.slice(0, -1)},\n"entries":[\n`];
   let size = Buffer.byteLength(parts[0]);
   entries.forEach((e, i) => {
-    const line = JSON.stringify(e) + (i < entries.length - 1 ? ',\n' : '\n');
+    const line = JSON.stringify(toFileEntry(e)) + (i < entries.length - 1 ? ',\n' : '\n');
     size += Buffer.byteLength(line);
     if (size > maxBytes) {
       throw new RecordingError(`Recording too large: more than ${mb(maxBytes)}. Save fewer exchanges (filter by URL or a shorter time range).`);
@@ -229,12 +241,14 @@ export function parseHead(head: string): Omit<RecordingMeta, 'id' | 'path'> | un
   const count = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
   if (d.streams !== undefined && (!count(d.streams) || (d.streams as number) > (d.exchanges as number))) return undefined;
   if (d.frames !== undefined && !count(d.frames)) return undefined;
+  if (d.grpc !== undefined && (!count(d.grpc) || (d.grpc as number) > (d.exchanges as number))) return undefined;
   return {
     name,
     createdAt: d.createdAt,
     exchanges: d.exchanges as number,
     redacted: d.redacted,
     ...(d.streams ? { streams: d.streams as number, frames: (d.frames as number | undefined) ?? 0 } : {}),
+    ...(d.grpc ? { grpc: d.grpc as number } : {}),
   };
 }
 
@@ -434,17 +448,17 @@ export function createRecordingService(deps: RecordingServiceDeps): RecordingSto
         throw new RecordingError(`Recording ${(e as Error).message}.`);
       }
       const redacted = opts?.redact === true;
-      const entries: Exchange[] = [];
+      const entries: RecordedExchange[] = [];
       for (const e of exchanges) {
         if (!isRecordable(e)) continue;
-        const kept = recordedExchange(e, redacted);
+        const kept = recordedExchange(e, redacted, deps.grpc);
         try {
-          entries.push(validEntry(JSON.parse(JSON.stringify(kept)), 'entry'));
+          entries.push(validEntry(JSON.parse(JSON.stringify(toFileEntry(kept))), 'entry'));
         } catch {
           // something load() would refuse (e.g. a non-http URL): left out
         }
       }
-      if (!entries.length) throw new RecordingError('Nothing to save: no finished HTTP, WebSocket or SSE exchanges (open streams, failed requests and native-client traffic are not recorded).');
+      if (!entries.length) throw new RecordingError('Nothing to save: no finished HTTP, WebSocket, SSE or gRPC exchanges (open streams, failed requests and native-client traffic are not recorded).');
       if (entries.length > MAX_ENTRIES) throw new RecordingError(`Too many exchanges (${entries.length}; the limit is ${MAX_ENTRIES}).`);
       entries.sort((a, b) => a.startedAt - b.startedAt);
       const meta: Omit<RecordingMeta, 'path'> = { id: '', name: checkedName, createdAt: now(), exchanges: entries.length, redacted, ...streamCounts(entries) };
@@ -498,7 +512,7 @@ export function createRecordingService(deps: RecordingServiceDeps): RecordingSto
       if (!(rec.redacted || redact) && (await gitIgnoreStatus(target, gitFs)) === 'not-ignored') {
         throw notIgnored(dest, 'Export it redacted, or choose a folder outside the repository.');
       }
-      const entries = redact ? rec.entries.map((e) => recordedExchange(e, true)) : rec.entries;
+      const entries = redact ? rec.entries.map((e) => recordedExchange(e, true, deps.grpc)) : rec.entries;
       const text = serializeRecording({ id: rec.id, name: rec.name, createdAt: rec.createdAt, exchanges: entries.length, redacted: rec.redacted || redact }, entries, maxBytes);
       await atomicWrite(target, text);
       return target;
@@ -510,7 +524,7 @@ export function createRecordingService(deps: RecordingServiceDeps): RecordingSto
       let inner = diffCache.get(a);
       let d = inner?.get(b);
       if (!d) {
-        d = diff(a, b);
+        d = diff(a, b, deps.grpc);
         if (!inner) diffCache.set(a, (inner = new WeakMap()));
         inner.set(b, d);
       }

@@ -14,7 +14,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import type { Exchange } from '@flutter-intercept/proxy';
+import type { Exchange, GrpcProxyCodec } from '@flutter-intercept/proxy';
 import { discoverGrpcFiles, isGrpcSchemaPath, nodeGrpcFs, type GrpcFs } from './discovery';
 import type { GrpcCodec, GrpcMethod, GrpcSchema, RawField } from './types';
 
@@ -458,6 +458,45 @@ export function decodeGrpcMessages(
     }
   });
   return { ...(methodPath ? { path: methodPath } : {}), ...(method ? { method } : {}), messages };
+}
+
+// ------------------------------------------------------------------ CONTRACTS §17.3: the proxy's codec
+
+/** The largest message the proxy's hooks hand to the codec (§17.1). */
+export const MAX_CODEC_BYTES = 4 * 1024 * 1024;
+
+/**
+ * `InterceptProxy.setGrpcCodec`: decode / encode by method path and direction with the CURRENT schema (looked up on
+ * every call, so schema reloads apply at once). `decode` never throws (undefined = unknown method, no schema, too
+ * large, not decodable); `encode` throws an Error naming the JSON path.
+ */
+export function grpcProxyCodec(grpc: Pick<GrpcDeps, 'codec' | 'schema' | 'enabled'>): GrpcProxyCodec {
+  const typeOf = (path: string, dir: 'send' | 'receive'): { schema: GrpcSchema; type: string } | undefined => {
+    if (!grpc.enabled()) return undefined;
+    const schema = grpc.schema();
+    const m = schema?.method(path);
+    return schema && m ? { schema, type: dir === 'send' ? m.requestType : m.responseType } : undefined;
+  };
+  return {
+    decode(path, dir, bytes) {
+      try {
+        if (!(bytes instanceof Uint8Array) || bytes.length > MAX_CODEC_BYTES) return undefined;
+        const t = typeOf(path, dir);
+        if (!t) return undefined;
+        const r = grpc.codec.decodeMessage(t.schema, t.type, bytes);
+        return r.error === undefined ? r.json : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+    encode(path, dir, json) {
+      const t = typeOf(path, dir);
+      if (!t) throw new Error(`no schema for ${path}`);
+      const bytes = grpc.codec.encodeMessage(t.schema, t.type, json);
+      if (bytes.length > MAX_CODEC_BYTES) throw new Error('$: the encoded message is larger than 4 MB');
+      return bytes;
+    },
+  };
 }
 
 // ------------------------------------------------------------------ grpcMock.messagesJson → messages

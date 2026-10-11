@@ -37,7 +37,7 @@
  */
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
-import { parseHostPattern, type ClientCertificate, type Exchange, type InterceptProxyOptions, type ReplayEntry, type ReplayOptions, type Rule, type RuleAction, type SendRequest } from '@flutter-intercept/proxy';
+import { parseHostPattern, type ClientCertificate, type Exchange, type GrpcProxyCodec, type InterceptProxyOptions, type ReplayEntry, type ReplayOptions, type Rule, type RuleAction, type SendRequest } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 import type { GrpcMessageEncoder } from './grpc/service';
 import type { SessionWarning } from './ui/protocol';
@@ -96,6 +96,8 @@ export interface ProxyLike {
   setGrpcDecryptHosts?(hosts: string[]): void | { hosts: string[]; problems: string[] };
   /** The gRPC self-check of the mockttp internals the silent tunnels use. */
   grpcSupport?(): { ok: boolean; problem?: string };
+  /** CONTRACTS §17.3: protobuf decode / encode for gRPC mutate rules and breakpoint edits (undefined = none). */
+  setGrpcCodec?(codec?: GrpcProxyCodec): void;
   /** CONTRACTS §16.8: the entry's breaker sent an app's gRPC connections to an authority direct (`{authority, viaLan}`). */
   on(event: 'grpcBreaker', l: (info: unknown) => void): unknown;
 }
@@ -478,6 +480,8 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private grpcHostsUnsupportedLogged = false;
   private grpcCheck?: { ok: boolean; problem?: string };
   private grpcEncoder?: GrpcMessageEncoder;
+  private grpcCodec?: GrpcProxyCodec;
+  private grpcCodecUnsupportedLogged = false;
   /** §16.8 breaker warnings by authority (insertion order kept). */
   private readonly breakerWarnings = new Map<string, SessionWarning>();
 
@@ -561,6 +565,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         if (problems.length || this.grpcSettingProblems.length) grpcLater = [...this.grpcSettingProblems, ...problems].join(' ');
       }
       this.grpcCheck = this.readGrpcSupport(proxy);
+      if (this.grpcCodec) this.applyGrpcCodec(proxy);
       if (this.clientCerts.length) this.applyClientCertificates(proxy);
       this.applyReplay(proxy);
       if (this.profile.kind !== 'none') this.applyProfile(proxy); // a new proxy starts with none
@@ -728,9 +733,32 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     this.refreshGrpcMocks();
   }
 
-  /** The gRPC schema changed: re-encodes the rules with `grpcMock.messagesJson`. */
+  /** The gRPC schema changed: re-encodes the rules with `grpcMock.messagesJson` and re-applies the codec. */
   refreshGrpcMocks(): void {
+    if (this.grpcCodec && this.proxy) this.applyGrpcCodec(this.proxy);
     if (this.rules.some(hasGrpcJson)) this.applyRules();
+  }
+
+  /**
+   * CONTRACTS §17.3: the codec the proxy uses for gRPC mutate rules (src/grpc/service.ts `grpcProxyCodec`, backed by the
+   * schema service). Kept and re-applied after a restart and on `refreshGrpcMocks`; undefined removes it.
+   */
+  setGrpcCodec(codec: GrpcProxyCodec | undefined): void {
+    this.grpcCodec = codec;
+    if (this.proxy) this.applyGrpcCodec(this.proxy);
+  }
+
+  private applyGrpcCodec(proxy: ProxyLike): void {
+    if (!proxy.setGrpcCodec) {
+      if (this.grpcCodec && !this.grpcCodecUnsupportedLogged) this.opts.log?.('this proxy build cannot mutate gRPC messages (no setGrpcCodec)');
+      this.grpcCodecUnsupportedLogged = true;
+      return;
+    }
+    try {
+      proxy.setGrpcCodec(this.grpcCodec);
+    } catch (e) {
+      this.opts.log?.(`gRPC codec not applied: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   private applyRules(): void {

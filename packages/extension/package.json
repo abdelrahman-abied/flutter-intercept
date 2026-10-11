@@ -443,7 +443,7 @@
         "toolReferenceName": "interceptGetRequest",
         "canBeReferencedInPrompt": true,
         "userDescription": "Show one request with headers and bodies.",
-        "modelDescription": "Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), error, and timings (ms per phase: requestMs = receiving the app's request, pausedMs = held at breakpoints, delayMs = added by a mock delay / throttle, dnsMs / connectMs / tlsMs on a new upstream connection or reused: true, sendMs, waitMs = time to first byte from the server, receiveMs = downloading the response; a missing phase did not happen or is unknown). scriptLog holds the lines a user's script rule logged (redacted). Use after list_requests or wait_for_request. Pass snippet (\"curl\", \"dart_http\" or \"dio\") to also get the request as runnable code (redacted values stay \"[redacted]\"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: \"vm-profile\" (read-only, from a native HTTP client). A tunnel (kind \"tunnel\") has no headers or bodies: tunnel {notDecrypted: why, bytesSent, bytesReceived} explains that the host is passed through without decryption (usually because the app pins its certificate) — remove it from flutterIntercept.tlsPassthrough to inspect it. clientCertificate is the host pattern of the mutual-TLS client certificate the proxy presented upstream. multipart/form-data bodies are shown parsed: secret fields \"[redacted]\", file parts \"[file <name>, N bytes]\". A gRPC call (kind \"grpc\") shows grpc {service, method, code, status, statusMessage, streaming, requestType, responseType, encodings, deadlineMs, messagesSent, messagesReceived}, responseTrailers, and messages: the first 20 each way decoded to JSON with the app's generated protobuf code (via \"schema\"), or as raw field numbers (via \"raw\"), at most 64 KB in all (read every message with get_frames); secret-named fields and credential metadata (authorization, cookies, custom -bin metadata) read \"[redacted]\". Without the app's generated code (via \"raw\": field numbers, no names), gRPC messages are redacted by value only (JWTs, long opaque tokens).",
+        "modelDescription": "Get one recorded HTTP exchange by id: method, URL, status, request/response headers and decoded bodies (long bodies truncated, binary bodies summarised, secrets redacted), error, and timings (ms per phase: requestMs = receiving the app's request, pausedMs = held at breakpoints, delayMs = added by a mock delay / throttle, dnsMs / connectMs / tlsMs on a new upstream connection or reused: true, sendMs, waitMs = time to first byte from the server, receiveMs = downloading the response; a missing phase did not happen or is unknown). scriptLog holds the lines a user's script rule logged (redacted). Use after list_requests or wait_for_request. Pass snippet (\"curl\", \"dart_http\" or \"dio\") to also get the request as runnable code (redacted values stay \"[redacted]\"). For large JSON responses prefer get_body_shape first. Also shows kind (websocket/sse), frameCount (read the frames with get_frames), graphql {operationName, operationType}, cors (a browser preflight / why a browser would block the response, Flutter Web) and captured: \"vm-profile\" (read-only, from a native HTTP client). A tunnel (kind \"tunnel\") has no headers or bodies: tunnel {notDecrypted: why, bytesSent, bytesReceived} explains that the host is passed through without decryption (usually because the app pins its certificate) — remove it from flutterIntercept.tlsPassthrough to inspect it. clientCertificate is the host pattern of the mutual-TLS client certificate the proxy presented upstream. multipart/form-data bodies are shown parsed: secret fields \"[redacted]\", file parts \"[file <name>, N bytes]\". A gRPC call (kind \"grpc\") shows grpc {service, method, code, status, statusMessage, streaming, requestType, responseType, encodings, deadlineMs, messagesSent, messagesReceived}, responseTrailers, and messages: the first 20 each way decoded to JSON with the app's generated protobuf code (via \"schema\"), or as raw field numbers (via \"raw\"), at most 64 KB in all (read every message with get_frames); secret-named fields and credential metadata (authorization, cookies, custom -bin metadata) read \"[redacted]\". Without the app's generated code (via \"raw\": field numbers, no names), gRPC messages are redacted by value only (JWTs, long opaque tokens). A paused gRPC call also shows grpcPause (see list_paused).",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -588,7 +588,7 @@
         "toolReferenceName": "interceptListPaused",
         "canBeReferencedInPrompt": true,
         "userDescription": "List requests paused at a breakpoint.",
-        "modelDescription": "List exchanges currently paused by a breakpoint rule, with their phase (request or response) and the time they auto-resume. Resume or abort them with resume_request / abort_request.",
+        "modelDescription": "List exchanges currently paused by a breakpoint rule, with their phase (request or response) and the time they auto-resume. Resume or abort them with resume_request / abort_request. A paused gRPC call carries grpcPause: {kind: \"message\", dir, index, size, json (the held message decoded with the schema of the app, redacted)} or {kind: \"status\", code, status, message?, trailers?} (the end of the call); resume it with resume_request grpc.",
         "inputSchema": {
           "type": "object",
           "properties": {},
@@ -1175,7 +1175,7 @@
         "toolReferenceName": "interceptDiffRecordings",
         "canBeReferencedInPrompt": true,
         "userDescription": "Compare two traffic recordings.",
-        "modelDescription": "Compare two recordings route by route (method + path template such as GET /users/{id}): routes added or removed, status changes, JSON shape changes (keys added/removed, type changes), how many body values changed (values are never shown), call-count changes and responses more than 2x slower. Use it to see what a backend or app change did to the traffic: save a recording before and after, then diff them (a = before, b = after). Details are redacted.",
+        "modelDescription": "Compare two recordings route by route (method + path template such as GET /users/{id}): routes added or removed, status changes, JSON shape changes (keys added/removed, type changes), how many body values changed (values are never shown), call-count changes and responses more than 2x slower. Use it to see what a backend or app change did to the traffic: save a recording before and after, then diff them (a = before, b = after). Details are redacted. gRPC calls are routes \"gRPC /package.Service/Method\": status changes, message counts per direction, and the JSON shape of the first response message (with the schema of the app).",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1572,7 +1572,7 @@
         "toolReferenceName": "interceptAddBreakpoint",
         "canBeReferencedInPrompt": true,
         "userDescription": "Add a rule that pauses matching requests or responses.",
-        "modelDescription": "Pause matching requests before they are sent (phase \"request\") or their responses before the app gets them (phase \"response\", default). Paused exchanges appear in list_paused; continue them with resume_request (optionally edited) or abort_request. The app may time out if left paused. times: 1 pauses only the next matching request.",
+        "modelDescription": "Pause matching requests before they are sent (phase \"request\") or their responses before the app gets them (phase \"response\", default). Paused exchanges appear in list_paused; continue them with resume_request (optionally edited) or abort_request. The app may time out if left paused. times: 1 pauses only the next matching request. Also for gRPC calls (url ending in /<package.Service>/<Method>): phase \"request\" holds each message the app sends, \"response\" each message the server sends and the end of the call (its status), \"both\" both; each pause has its own deadline. Edit with resume_request grpc.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1668,7 +1668,7 @@
         "toolReferenceName": "interceptResumeRequest",
         "canBeReferencedInPrompt": true,
         "userDescription": "Resume a paused request or response, optionally edited.",
-        "modelDescription": "Resume a paused exchange, optionally editing it first: for a paused request method/url/headers/body, for a paused response status/headers/body. headers replaces the whole header set; omit body to keep it.",
+        "modelDescription": "Resume a paused exchange, optionally editing it first: for a paused request method/url/headers/body, for a paused response status/headers/body. headers replaces the whole header set; omit body to keep it. A paused gRPC call takes grpc instead of edit: for a held message exactly one of messageJson (JSON in the shape get_request / list_paused showed; values you only saw as \"[redacted]\" keep their original value), message (base64 protobuf) or drop: true; for the held end of the call status {code 0-16, message?} and optional custom trailers. A messageJson that does not fit the schema is refused and the call stays paused.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1723,6 +1723,56 @@
               },
               "additionalProperties": false,
               "description": "Changes to apply before resuming. Omit to resume unchanged."
+            },
+            "grpc": {
+              "description": "For a paused gRPC call instead of edit (CONTRACTS §17.2).",
+              "type": "object",
+              "properties": {
+                "messageJson": {
+                  "description": "Held message: the replacement as JSON (proto3 JSON, field names as get_grpc_schema shows). \"[redacted]\" values keep the original."
+                },
+                "message": {
+                  "description": "Held message: the replacement as base64 protobuf bytes (at most 4 MB).",
+                  "type": "string",
+                  "maxLength": 6291456
+                },
+                "drop": {
+                  "description": "Held message: drop it (never delivered).",
+                  "type": "boolean",
+                  "const": true
+                },
+                "status": {
+                  "description": "Held end of the call: the final gRPC status.",
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 16,
+                      "description": "gRPC status code 0-16."
+                    },
+                    "message": {
+                      "type": "string",
+                      "maxLength": 4096
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ],
+                  "additionalProperties": false
+                },
+                "trailers": {
+                  "description": "Held end of the call: custom trailers replacing the ones from the server (not grpc-status / grpc-message / content-type).",
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": false
             }
           },
           "required": [
@@ -2052,7 +2102,7 @@
         "toolReferenceName": "interceptAddMutation",
         "canBeReferencedInPrompt": true,
         "userDescription": "Add a rule that changes fields of real JSON responses.",
-        "modelDescription": "Let matching requests reach the real server, then change its JSON response before the app gets it: ops [{path: \"$.user.avatar_url\", op: \"null\"}, {path: \"$.items[*].price\", op: \"set\", value: \"9.99\"}, {path: \"$.email\", op: \"delete\"}]. For an exact number form use valueJson (JSON text written byte-exact) instead of value: \"1.0\" to send a double (an int-typed Dart field then throws), integers beyond 2^53. Use it to reproduce or test how the app handles a null/missing/mistyped field from the backend (e.g. \"Null is not a subtype of String\") without mocking the whole response. Non-JSON responses pass unchanged. The rule is inserted first; times (e.g. 1) or ttlMs remove it automatically, otherwise use remove_rule. Affected exchanges carry a \"simulated\" label; check_contract shows what the models make of them.",
+        "modelDescription": "Let matching requests reach the real server, then change its JSON response before the app gets it: ops [{path: \"$.user.avatar_url\", op: \"null\"}, {path: \"$.items[*].price\", op: \"set\", value: \"9.99\"}, {path: \"$.email\", op: \"delete\"}]. For an exact number form use valueJson (JSON text written byte-exact) instead of value: \"1.0\" to send a double (an int-typed Dart field then throws), integers beyond 2^53. Use it to reproduce or test how the app handles a null/missing/mistyped field from the backend (e.g. \"Null is not a subtype of String\") without mocking the whole response. Non-JSON responses pass unchanged. The rule is inserted first; times (e.g. 1) or ttlMs remove it automatically, otherwise use remove_rule. Affected exchanges carry a \"simulated\" label; check_contract shows what the models make of them. Also applies to the response messages of gRPC calls (url ending in /<package.Service>/<Method>): each message is decoded with the generated protobuf code of the app, changed (proto3 JSON: int64 as strings, enums by name), re-encoded; without a schema the messages pass unchanged (the exchange notes it).",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -2214,7 +2264,7 @@
         "toolReferenceName": "interceptSaveRecording",
         "canBeReferencedInPrompt": true,
         "userDescription": "Save the recorded traffic as a recording.",
-        "modelDescription": "Save the finished HTTP exchanges and closed WebSocket / SSE streams with their messages (optionally only those matching url / since sinceMs; open connections, TLS tunnels and read-only native-client traffic are not recorded) as a named recording under the project's .dart_tool/flutter_intercept/recordings/. Secrets are saved as \"[redacted]\" unless you pass redact: false. Use recordings to replay a backend state offline (replay_recording: WebSocket / SSE streams replay as a scripted server with the recorded timing) or to compare traffic before and after a change (diff_recordings). Returns {id, name, exchanges, streams?, frames?} (streams = WebSocket / SSE exchanges among them).",
+        "modelDescription": "Save the finished HTTP exchanges and closed WebSocket / SSE streams with their messages (optionally only those matching url / since sinceMs; open connections, TLS tunnels and read-only native-client traffic are not recorded) as a named recording under the project's .dart_tool/flutter_intercept/recordings/. Secrets are saved as \"[redacted]\" unless you pass redact: false. Use recordings to replay a backend state offline (replay_recording: WebSocket / SSE streams replay as a scripted server with the recorded timing) or to compare traffic before and after a change (diff_recordings). Returns {id, name, exchanges, streams?, frames?} (streams = WebSocket / SSE exchanges among them). gRPC calls that ended with a status are saved too (their messages; with redaction, messages are decoded, redacted and re-encoded with the schema of the app, or zeroed without one). A call with a cut response message is saved as incomplete and not replayed.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -2260,7 +2310,7 @@
         "toolReferenceName": "interceptReplayRecording",
         "canBeReferencedInPrompt": true,
         "userDescription": "Answer requests from a saved recording (or stop replaying).",
-        "modelDescription": "Answer the app's requests from a saved recording instead of the real server: the same method + URL (and request body) gets the recorded response; several recorded responses for one request are served in order; requests whose path differs only in ids (/users/42 vs /users/7) match by path template. Rules still win. fallback decides what unmatched requests do: \"passthrough\" (real server, default) or \"fail\" (like offline — a fully offline demo). Recorded WebSocket / SSE streams are replayed too: the proxy answers the upgrade / stream itself and sends the recorded server messages with their timing (WebSocket: in step with the app's messages). Replayed exchanges carry simulated: \"Replayed from <name>\". Call it without id to stop replaying (do this when done); get_status / list_recordings show what is being replayed.",
+        "modelDescription": "Answer the app's requests from a saved recording instead of the real server: the same method + URL (and request body) gets the recorded response; several recorded responses for one request are served in order; requests whose path differs only in ids (/users/42 vs /users/7) match by path template. Rules still win. fallback decides what unmatched requests do: \"passthrough\" (real server, default) or \"fail\" (like offline — a fully offline demo). Recorded WebSocket / SSE streams are replayed too: the proxy answers the upgrade / stream itself and sends the recorded server messages with their timing (WebSocket: in step with the app's messages). Replayed exchanges carry simulated: \"Replayed from <name>\". Call it without id to stop replaying (do this when done); get_status / list_recordings show what is being replayed. Recorded gRPC calls are answered like a gRPC mock (the recorded messages, gaps up to 5 s, status and trailers), matched by method path and, for several calls of one method, by the first request message.",
         "inputSchema": {
           "type": "object",
           "properties": {

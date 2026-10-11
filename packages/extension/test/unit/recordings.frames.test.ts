@@ -153,7 +153,7 @@ describe('RecordingService with WebSocket / SSE', () => {
     expect(streamCounts([http])).toEqual({});
     // a bad count in the head: not trusted, the full file is read instead
     expect(parseHead('{"version":1,"name":"x","createdAt":1,"exchanges":1,"redacted":false,"streams":5,\n')).toBeUndefined();
-    expect(parseHead('{"version":3,"name":"x","createdAt":1,"exchanges":1,"redacted":false,\n')).toBeUndefined();
+    expect(parseHead('{"version":4,"name":"x","createdAt":1,"exchanges":1,"redacted":false,\n')).toBeUndefined();
     expect(parseHead('{"version":2,"name":"x","createdAt":1,"exchanges":2,"redacted":false,"streams":1,"frames":4,\n')).toMatchObject({ streams: 1, frames: 4 });
     expect(parseHead('{"version":1,"name":"x","createdAt":1,"exchanges":1,"redacted":false,"streams":1,"frames":-1,\n')).toBeUndefined();
   });
@@ -222,9 +222,9 @@ describe('validation of WebSocket / SSE entries', () => {
     expect(validateRecording(file([good()], 2), 'x', '/x.json').version).toBe(2);
     expect(validateRecording(file([plain], 2), 'x', '/x.json').version).toBe(2);
     expect(() => validateRecording(file([plain, good()], 1), 'x', '/x.json')).toThrow(/entries\[1\]\.kind is not allowed in a version 1 recording/);
-    expect(() => validateRecording(file([plain], 3), 'x', '/x.json')).toThrow(/version must be 1 or 2 \(this file has 3: it was saved by a newer Flutter Intercept/);
-    expect(() => validateRecording(file([plain], 0), 'x', '/x.json')).toThrow(/version must be 1 or 2 \(this file has 0\)$/);
-    expect(() => validateRecording({ ...file([plain]), version: undefined }, 'x', '/x.json')).toThrow(/version must be 1 or 2/);
+    expect(() => validateRecording(file([plain], 4), 'x', '/x.json')).toThrow(/version must be 1, 2 or 3 \(this file has 4: it was saved by a newer Flutter Intercept/);
+    expect(() => validateRecording(file([plain], 0), 'x', '/x.json')).toThrow(/version must be 1, 2 or 3 \(this file has 0\)$/);
+    expect(() => validateRecording({ ...file([plain]), version: undefined }, 'x', '/x.json')).toThrow(/version must be 1, 2 or 3/);
   });
 
   it('loads valid WebSocket and SSE entries', () => {
@@ -234,7 +234,7 @@ describe('validation of WebSocket / SSE entries', () => {
   });
 
   it.each<[string, (d: any) => void, RegExp]>([
-    ['unknown kind', (d) => (d.kind = 'tunnel'), /kind must be "websocket" or "sse"/],
+    ['unknown kind', (d) => (d.kind = 'tunnel'), /kind must be "websocket", "sse" or "grpc"/],
     ['http URL on a WebSocket', (d) => (d.url = 'https://api.example.com/socket'), /must be a ws\(s\) URL/],
     ['status other than 101', (d) => (d.status = 200), /must be 101/],
     ['POST upgrade', (d) => (d.method = 'POST'), /must be GET/],

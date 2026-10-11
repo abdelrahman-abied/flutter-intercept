@@ -1120,6 +1120,8 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
     // list_requests kind "grpc", get_request (gRPC info, trailers, schema-decoded messages), get_frames,
     // get_grpc_schema (method + skeleton), add_grpc_mock with JSON messages (times 1) and with an error status,
     // assert_traffic expect.grpcStatus, both after hot restarts; get_status grpc.
+    // v0.11.0 (CONTRACTS §17): a response breakpoint edited through resume_request grpc.messageJson (the app prints the
+    // edited id), a mutate rule on the response message, and save_recording → replay_recording (fallback "fail").
     if (process.env.FI_AGENT_GRPC === '1') {
       const GET_ORDER = '/demo.orders.v1.OrderService/GetOrder';
       // The demo's gRPC batch runs only with GRPC_PORT (lib/grpc_demo.dart): the server's h2c port, FI_GRPC_PORT.
@@ -1189,8 +1191,88 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
           const asBad = await mcpCall('assert_traffic', { url: `*${GET_ORDER}`, kind: 'grpc', sinceMs: restartAt, expect: { grpcStatus: 0 } });
           if (asBad.isError || asBad.result.pass !== false) f.push(`assert_traffic grpcStatus 0 should fail: ${asBad.text.slice(0, 300)}`);
           notes.push(`mock → ${wm.result.state}; error mock asserted ${as.result.pass ? 'UNAVAILABLE' : 'FAILED'}`);
-
           for (const id of ruleIds.splice(0)) await mcpCall('remove_rule', { ruleId: id });
+
+          // ---- v0.11.0 (CONTRACTS §17): breakpoint + edit, mutate, record → replay ----
+          const session = sessions.get(sessionId!);
+          const unaryLine = async (from: number, re: RegExp, what: string) => {
+            if (!session) return f.push('session object not seen');
+            await waitFor(() => outputOf(session).slice(from).split(/\r?\n/).find((l) => /DEMO_RESULT grpc_unary /.test(l) && re.test(l)) || undefined, 120_000, 250).catch(() =>
+              f.push(`${what}: the app did not print it: ${outputOf(session).slice(from).split(/\r?\n/).filter((l) => l.includes('grpc_unary')).join(' | ').slice(0, 300)}`),
+            );
+          };
+          // 1. A response breakpoint (once): edit the held Order's id through resume_request grpc.messageJson.
+          const bp = await mcpCall('add_breakpoint', { url: `*${GET_ORDER}`, phase: 'response', times: 1, name: 'grpc bp' });
+          if (bp.isError || !bp.result.ruleId) throw new Error(`add_breakpoint (gRPC): ${bp.text.slice(0, 300)}`);
+          ruleIds.push(bp.result.ruleId);
+          let from = session ? outputOf(session).length : 0;
+          restartAt = Date.now();
+          h = await mcpCall('hot_restart', { sessionId });
+          if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+          let editedId: string | undefined;
+          for (const deadline = Date.now() + 120_000; Date.now() < deadline; ) {
+            const items: any[] = (await mcpCall('list_paused', {})).result.items ?? [];
+            const p = items.find((x) => x.kind === 'grpc' && String(x.url).endsWith(GET_ORDER));
+            if (!p) {
+              if (editedId) break;
+              await sleep(300);
+              continue;
+            }
+            if (p.grpcPause?.kind === 'message' && p.grpcPause.dir === 'receive' && !editedId) {
+              if (p.grpcPause.via !== 'schema' || typeof p.grpcPause.json !== 'object') f.push(`list_paused grpcPause not decoded: ${JSON.stringify(p.grpcPause).slice(0, 300)}`);
+              const r = await mcpCall('resume_request', { id: p.id, grpc: { messageJson: { ...p.grpcPause.json, id: 'fi-bp-edited' } } });
+              if (r.isError) f.push(`resume_request grpc.messageJson: ${r.text.slice(0, 300)}`);
+              editedId = p.id;
+            } else {
+              const r = await mcpCall('resume_request', { id: p.id }); // the end of the call, or another message: unchanged
+              if (r.isError) f.push(`resume_request (unchanged): ${r.text.slice(0, 200)}`);
+            }
+          }
+          if (!editedId) f.push('no gRPC message pause for GetOrder appeared in list_paused');
+          await unaryLine(from, /fi-bp-edited/, 'breakpoint edit');
+          for (const id of ruleIds.splice(0)) await mcpCall('remove_rule', { ruleId: id }).catch(() => undefined);
+
+          // 2. A mutate rule on the response message (once).
+          const mu = await mcpCall('add_mutation', { url: `*${GET_ORDER}`, ops: [{ path: '$.customerEmail', op: 'set', value: 'mutated@example.com' }], times: 1, name: 'grpc mutate' });
+          if (mu.isError || !mu.result.ruleId) throw new Error(`add_mutation (gRPC): ${mu.text.slice(0, 300)}`);
+          ruleIds.push(mu.result.ruleId);
+          from = session ? outputOf(session).length : 0;
+          restartAt = Date.now();
+          h = await mcpCall('hot_restart', { sessionId });
+          if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+          await unaryLine(from, /mutated@example\.com/, 'mutate rule');
+          for (const id of ruleIds.splice(0)) await mcpCall('remove_rule', { ruleId: id }).catch(() => undefined);
+
+          // 3. Record a clean run, replay it with fallback "fail": GetOrder is answered from the recording.
+          from = session ? outputOf(session).length : 0;
+          const cleanAt = Date.now();
+          h = await mcpCall('hot_restart', { sessionId });
+          if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+          const okRun = await mcpCall('assert_traffic', { url: `*${GET_ORDER}`, kind: 'grpc', sinceMs: cleanAt, withinMs: 90_000, expect: { count: { min: 2 } } });
+          if (okRun.isError || okRun.result.pass !== true) f.push(`clean run before recording: ${okRun.text.slice(0, 300)}`);
+          const sv = await mcpCall('save_recording', { name: 'fi grpc suite', url: `*${GET_ORDER}`, sinceMs: cleanAt });
+          if (sv.isError || !(sv.result.grpc >= 2)) throw new Error(`save_recording (gRPC): ${sv.text.slice(0, 300)}`);
+          const rp = await mcpCall('replay_recording', { id: sv.result.id, fallback: 'fail' });
+          if (rp.isError || rp.result.replaying !== true) throw new Error(`replay_recording: ${rp.text.slice(0, 300)}`);
+          try {
+            from = session ? outputOf(session).length : 0;
+            const replayAt = Date.now();
+            h = await mcpCall('hot_restart', { sessionId });
+            if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+            const wr = await mcpCall('wait_for_request', { url: `*${GET_ORDER}`, kind: 'grpc', sinceMs: replayAt, timeoutMs: 90_000 });
+            if (wr.isError || wr.result.timedOut || !/Replayed/.test(String(wr.result.simulated ?? ''))) f.push(`replayed GetOrder: ${wr.text.slice(0, 300)}`);
+            await unaryLine(from, /A-1001/, 'replayed GetOrder');
+            // the NOT_FOUND call is told apart by its request message (requestHash): still code 5
+            const nf = await mcpCall('assert_traffic', { url: `*${GET_ORDER}`, kind: 'grpc', sinceMs: replayAt, withinMs: 30_000, expect: { count: { min: 2 } } });
+            const ids: string[] = nf.result.ids ?? [];
+            const codes: number[] = [];
+            for (const id of ids) codes.push((await mcpCall('get_request', { id, includeBodies: false })).result.grpc?.code);
+            if (!codes.includes(0) || !codes.includes(5)) f.push(`replayed statuses: ${JSON.stringify(codes)}`);
+            notes.push(`breakpoint edit seen, mutate seen, replay → codes ${codes.join('/')}`);
+          } finally {
+            await mcpCall('replay_recording', {}).catch(() => undefined);
+          }
+
           const s2 = await mcpCall('stop_app', { sessionId });
           if (s2.isError || s2.result.stopped !== 1) f.push(`stop_app: ${s2.text.slice(0, 200)}`);
           else sessionId = undefined;

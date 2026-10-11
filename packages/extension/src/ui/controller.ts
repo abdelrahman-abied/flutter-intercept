@@ -49,9 +49,9 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import type { Exchange, ReplayEntry, ReplayOptions, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
+import type { Exchange, GrpcEdit, GrpcPause, ReplayEntry, ReplayOptions, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
-import { ruleFromExchange, ruleProblem } from '@flutter-intercept/proxy/rules';
+import { grpcEditProblem, ruleFromExchange, ruleProblem } from '@flutter-intercept/proxy/rules';
 import { pathError } from '../agent/paths';
 import { decodeJson, decodeSample, defaultFixtureName, FINAL_STATES, defaultModelName, fixtureApiFor, fixtureSamples, isCheckable, modelSamples, redactExchange, routeOf, testPackageFor } from '../agent/samples';
 import { SNIPPET_FORMATS, toSnippet } from '../codegen/snippets';
@@ -63,7 +63,7 @@ import type { SharedRulesService, SharedRulesState } from '../rules/types';
 import type { ToOpenApi, ToPostman } from '../export/types';
 import { scriptFileOf, scriptFileSyntaxError, scriptTemplate } from '../rules/scriptFile';
 import { buildHar, ensureDirInside, EXPORT_DIR, type HarGrpcDecoder } from '../agent/har';
-import { decodeGrpcMessages, grpcMethodPath, hexOf, type GrpcDeps } from '../grpc/service';
+import { decodeGrpcMessages, grpcMethodPath, grpcProxyCodec, hexOf, MAX_CODEC_BYTES, type GrpcDeps } from '../grpc/service';
 import { gitIgnoreStatus, type GitignoreFs } from '../recordings/gitignore';
 import type { AgentStatus, AuthFlowSummary, ContractSummary, ExportFormat, GrpcDecoded, GrpcStatus, HostMsg, RecordingSummary, SendDraft, SessionWarning, SnippetFormat, Status, ViewMsg } from './protocol';
 
@@ -85,7 +85,7 @@ export interface ControllerHost {
   getRules(): Rule[];
   setRules(rules: Rule[]): void;
   clear(): void;
-  resume(id: string, edit?: RequestEdit | ResponseEdit): void;
+  resume(id: string, edit?: RequestEdit | ResponseEdit | GrpcEdit): void;
   abort(id: string): void;
   on(event: 'exchange', l: (e: Exchange) => void): unknown;
   on(event: 'removed', l: (ids: string[]) => void): unknown;
@@ -295,8 +295,9 @@ function checkRuleId(v: unknown, where: string): string | undefined {
 /** CONTRACTS §12.4 / §14.5: finished HTTP, WebSocket and SSE exchanges (not tunnels, native-client or browser traffic). */
 export function isRecordable(e: Exchange): boolean {
   if (e.kind === 'websocket' && e.status !== 101) return false; // an upgrade that never opened (the store agrees)
-  // CONTRACTS §16.4: recordings skip gRPC (later)
-  return FINAL_STATES.has(e.state) && e.kind !== 'tunnel' && e.kind !== 'grpc' && e.captured !== 'vm-profile' && !e.browserInternal;
+  // CONTRACTS §17.4: a gRPC call that ended with a status (the store agrees)
+  if (e.kind === 'grpc' && (e.grpc?.statusCode === undefined || (e.state !== 'completed' && e.state !== 'mocked'))) return false;
+  return FINAL_STATES.has(e.state) && e.kind !== 'tunnel' && e.captured !== 'vm-profile' && !e.browserInternal;
 }
 
 export function recordingSummary(m: RecordingMeta): RecordingSummary {
@@ -309,6 +310,8 @@ export function recordingSummary(m: RecordingMeta): RecordingSummary {
     // CONTRACTS §14.5: WebSocket / SSE exchanges among them and their frames (absent in older recordings)
     ...(typeof m.streams === 'number' && m.streams > 0 ? { streams: m.streams } : {}),
     ...(typeof m.frames === 'number' && m.frames > 0 ? { frames: m.frames } : {}),
+    // CONTRACTS §17.4
+    ...(typeof m.grpc === 'number' && m.grpc > 0 ? { grpc: m.grpc } : {}),
   };
 }
 
@@ -385,6 +388,8 @@ export async function fixtureApi(
 const RULE_KINDS = new Set<RuleAction['kind']>(['mock', 'block', 'breakpoint', 'grpcMock']);
 /** CONTRACTS §16.4: JSON text of one decoded message shown in the panel (longer is cut, `truncated`). */
 export const UI_MAX_GRPC_JSON_CHARS = 256 * 1024;
+/** CONTRACTS §17.6: a held message is shown in full, within reason (a 4 MB message as pretty JSON). */
+export const UI_MAX_PAUSED_JSON_CHARS = 16 * 1024 * 1024;
 const FAULTS = new Set(['reset', 'timeout', 'truncate', 'dns']);
 const PRESET_IDS = new Set(['slow-3g', 'fast-3g', 'flaky']);
 
@@ -806,6 +811,93 @@ function checkGrpcMock(a: Record<string, unknown>, aw: string): void {
     }
   }
   for (const k of ['delayMs', 'gapMs'] as const) if (a[k] !== undefined && !isInt(a[k], 0, 600_000)) fail(aw, `${k} must be an integer 0–600000`);
+}
+
+/** CONTRACTS §17.2 / §17.7: the largest replacement message (decoded bytes) and its base64 length. */
+const MAX_GRPC_EDIT_B64 = 4 * Math.ceil(MAX_CODEC_BYTES / 3);
+
+/**
+ * CONTRACTS §17.2: a `resume` edit for a paused gRPC call. A message pause takes exactly one of `message` (base64, ≤ 4 MB),
+ * `messageJson` (a JSON value, ≤ 4 MB as text; the host encodes it) or `drop: true`; a status pause takes `status`
+ * ({code 0–16, message ≤ 4 KB}) and optional custom `trailers` (no pseudo, content-type, grpc-status / grpc-message or
+ * connection headers). Empty / undefined = resume unchanged. Throws InvalidMessageError.
+ */
+export function validateGrpcEdit(raw: unknown, pause: GrpcPause | undefined): GrpcEdit | undefined {
+  const edit = checkGrpcEdit(raw, pause);
+  // The proxy's own rules (packages/proxy rules.ts), so host and proxy never disagree; messageJson is resolved later.
+  if (edit && pause && edit.messageJson === undefined) {
+    const problem = grpcEditProblem(pause.kind, edit);
+    if (problem) fail('edit', problem);
+  }
+  return edit;
+}
+
+function checkGrpcEdit(raw: unknown, pause: GrpcPause | undefined): GrpcEdit | undefined {
+  const where = 'edit';
+  if (raw === undefined || raw === null) return undefined;
+  if (!isObj(raw)) fail(where, 'must be an object');
+  onlyKeys(raw, ['message', 'messageJson', 'drop', 'status', 'trailers'], where);
+  if (!Object.keys(raw).length) return undefined;
+  if (!pause) fail(where, 'the call is not held at a gRPC breakpoint');
+  if (pause.kind === 'message') {
+    if (raw.status !== undefined || raw.trailers !== undefined) fail(where, 'status and trailers only apply when the call is held at its end (status); this pause holds a message');
+    const given = ['message', 'messageJson', 'drop'].filter((k) => raw[k] !== undefined);
+    if (given.length !== 1) fail(where, 'pass exactly one of message (base64), messageJson or drop');
+    if (raw.drop !== undefined) {
+      if (raw.drop !== true) fail(where, 'drop must be true');
+      return { drop: true };
+    }
+    if (raw.message !== undefined) {
+      if (typeof raw.message !== 'string' || raw.message.length > MAX_GRPC_EDIT_B64 || !BASE64.test(raw.message)) fail(where, 'message must be base64 of a serialized protobuf message (at most 4 MB)');
+      return { message: raw.message };
+    }
+    if (!isJsonValue(raw.messageJson)) fail(where, 'messageJson must be a JSON value');
+    if (JSON.stringify(raw.messageJson).length > MAX_CODEC_BYTES) fail(where, 'messageJson must be at most 4 MB as JSON');
+    return { messageJson: raw.messageJson };
+  }
+  if (raw.message !== undefined || raw.messageJson !== undefined || raw.drop !== undefined) fail(where, 'message, messageJson and drop only apply to a held message; this pause holds the end of the call (edit status / trailers)');
+  if (raw.status === undefined) fail(where, 'pass status {code, message?} (and optionally trailers)');
+  const st = raw.status;
+  if (!isObj(st)) fail(where, 'status must be an object {code, message?}');
+  onlyKeys(st, ['code', 'message'], `${where}.status`);
+  if (!isInt(st.code, 0, 16)) fail(`${where}.status`, 'code must be a gRPC status code (an integer 0–16)');
+  if (st.message !== undefined && (typeof st.message !== 'string' || st.message.length > MAX_GRPC_MESSAGE_TEXT)) fail(`${where}.status`, `message must be text of at most ${MAX_GRPC_MESSAGE_TEXT} characters`);
+  const out: GrpcEdit = { status: { code: st.code as number, ...(st.message !== undefined ? { message: st.message as string } : {}) } };
+  if (raw.trailers !== undefined) {
+    checkHeaders(raw.trailers, `${where}.trailers`, false);
+    const names = Object.keys(raw.trailers as object);
+    if (names.length > 100) fail(`${where}.trailers`, 'at most 100 trailers');
+    for (const name of names) {
+      const n = name.toLowerCase();
+      if (n.startsWith(':') || GRPC_MOCK_FORBIDDEN.has(n)) fail(`${where}.trailers`, `"${name}" can't be set (the proxy sets it; use status for the code and message)`);
+    }
+    out.trailers = { ...(raw.trailers as Record<string, string>) };
+  }
+  return out;
+}
+
+/**
+ * CONTRACTS §17.6: validates a gRPC resume edit for `ex` and encodes `messageJson` with the call's request / response
+ * type (the held message's direction) into `message`. Errors (no schema, a field that doesn't fit) are thrown; the call
+ * then stays paused.
+ */
+export function resolveGrpcEdit(ex: Exchange, raw: unknown, grpc: Pick<GrpcDeps, 'codec' | 'schema' | 'enabled'> | undefined): GrpcEdit | undefined {
+  const edit = validateGrpcEdit(raw, ex.grpcPause);
+  if (!edit || edit.messageJson === undefined) return edit;
+  const pause = ex.grpcPause;
+  const path = grpcMethodPath(ex.url);
+  if (!path || pause?.kind !== 'message') throw new Error("This call's method is unknown, so messageJson can't be encoded; pass message (base64).");
+  if (!grpc) throw new Error('gRPC decoding is not available: pass message (base64) instead of messageJson.');
+  let bytes: Uint8Array;
+  try {
+    bytes = grpcProxyCodec(grpc).encode(path, pause.dir, edit.messageJson);
+  } catch (e) {
+    throw new Error(`messageJson can't be encoded as the ${pause.dir === 'send' ? 'request' : 'response'} of ${path}: ${(e as Error)?.message ?? String(e)}`);
+  }
+  const out: GrpcEdit = { message: Buffer.from(bytes).toString('base64') };
+  const problem = grpcEditProblem('message', out);
+  if (problem) throw new Error(problem);
+  return out;
 }
 
 /** The response messages of a finished gRPC exchange as a grpcMock (JSON when the schema decodes every one). */
@@ -1233,8 +1325,36 @@ export class InterceptController {
         };
       }),
       framesDropped: shown.framesDropped ?? 0,
+      ...this.pausedView(ex, g),
       ...(sk && (sk.request || sk.response) ? { skeletons: { ...(sk.request ? { request: sk.request } : {}), ...(sk.response ? { response: sk.response } : {}) } } : {}),
       ...(problem ? { problem } : {}),
+    };
+  }
+
+  /** CONTRACTS §17.6: the message a gRPC breakpoint holds, decoded in full (≤ 4 MB). */
+  private pausedView(ex: Exchange, g: GrpcDeps | undefined): Pick<GrpcDecoded, 'paused'> {
+    const p = ex.grpcPause;
+    if (p?.kind !== 'message' || typeof p.base64 !== 'string') return {};
+    const d = decodeGrpcMessages({ url: ex.url, frames: [] }, g, { frames: [{ dir: p.dir, at: ex.pausedAt ?? ex.startedAt, kind: 'message', base64: p.base64, size: p.size }] }).messages[0];
+    if (!d) return {};
+    let json: string | undefined;
+    try {
+      json = d.json !== undefined && d.via !== 'none' ? JSON.stringify(d.json, null, 2) : undefined;
+    } catch {
+      json = undefined;
+    }
+    const cut = json !== undefined && json.length > UI_MAX_PAUSED_JSON_CHARS;
+    return {
+      paused: {
+        index: p.index,
+        dir: d.dir,
+        via: json !== undefined ? d.via : 'none',
+        hex: d.bytes ? hexOf(d.bytes) : '',
+        size: p.size,
+        ...(json !== undefined ? { json: cut ? json.slice(0, UI_MAX_PAUSED_JSON_CHARS) : json } : {}),
+        ...(cut ? { truncated: true as const } : {}),
+        ...(d.error ? { error: d.error } : {}),
+      },
     };
   }
 
@@ -1354,6 +1474,12 @@ export class InterceptController {
           return;
         }
         case 'resume': {
+          // CONTRACTS §17.2: a paused gRPC call takes a GrpcEdit
+          const gex = this.deps.host.getExchanges().find((e) => e.id === msg.id);
+          if (gex?.kind === 'grpc' && gex.grpcPause) {
+            this.deps.host.resume(gex.id, resolveGrpcEdit(gex, msg.edit, this.deps.grpc));
+            return;
+          }
           const id = checkId(msg.id, 'resume');
           const ex = this.deps.host.getExchanges().find((e) => e.id === id);
           const phase = ex?.state === 'paused-request' ? 'request' : ex?.state === 'paused-response' ? 'response' : undefined;
@@ -1391,9 +1517,9 @@ export class InterceptController {
                 : `Can't create ${msg.action === 'mock' ? 'a mock' : msg.action === 'grpcMock' ? 'a gRPC mock' : 'a breakpoint'} rule from a passed-through TLS connection: it isn't decrypted, so it can only be blocked (or failed with a fault rule). Remove the host from flutterIntercept.tlsPassthrough to mock it.`,
             );
           }
-          // CONTRACTS §16.2: gRPC calls get gRPC mocks and blocks; breakpoints and HTTP mocks don't apply to them.
-          if (ex.kind === 'grpc' && msg.action !== 'grpcMock' && msg.action !== 'block') {
-            throw new Error(`Can't create ${msg.action === 'mock' ? 'an HTTP mock' : 'a breakpoint'} rule from a gRPC call: use a gRPC mock (or a block rule) instead.`);
+          // CONTRACTS §16.2 / §17.2: gRPC calls get gRPC mocks, blocks and breakpoints; HTTP mocks don't apply to them.
+          if (ex.kind === 'grpc' && msg.action === 'mock') {
+            throw new Error("Can't create an HTTP mock rule from a gRPC call: use a gRPC mock instead.");
           }
           if (msg.action === 'grpcMock' && ex.kind !== 'grpc') throw new Error("Can't create a gRPC mock from this request: it isn't a gRPC call.");
           let rule: Rule;
@@ -2022,7 +2148,8 @@ export class InterceptController {
     const ro = readOnlyReason(ex);
     if (ro) throw new Error(`Can't change the next responses of this request: ${ro}.`);
     if (ex.kind === 'websocket' || ex.kind === 'sse') throw new Error(`Can't change fields of a ${ex.kind === 'sse' ? 'server-sent event stream' : 'WebSocket'}: mutation rules apply to JSON responses.`);
-    if (ex.kind === 'grpc' || ex.kind === 'tunnel') throw new Error(`Can't change fields of a ${ex.kind === 'grpc' ? 'gRPC call' : 'passed-through TLS connection'}: mutation rules apply to JSON responses (use a gRPC mock).`);
+    // CONTRACTS §17.3: gRPC response messages are mutated through the schema (the proxy's codec); tunnels can't be.
+    if (ex.kind === 'tunnel') throw new Error("Can't change fields of a passed-through TLS connection: it isn't decrypted.");
     if (typeof msg.op !== 'string' || !['null', 'delete', 'set'].includes(msg.op)) fail('mutateField', 'op must be "null", "delete" or "set"');
     const bad = pathError(msg.path);
     if (bad) fail('mutateField', bad);

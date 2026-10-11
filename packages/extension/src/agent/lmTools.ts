@@ -322,6 +322,22 @@ export function confirmationText(
     case 'remove_rule':
       return { title: 'Remove a rule', message: `Remove rule ${code(i.ruleId)}${ruleName ? ` (${code(ruleName)})` : ''}.` };
     case 'resume_request': {
+      // CONTRACTS §17.6: a paused gRPC call
+      if (i.grpc !== undefined) {
+        const g = obj(i.grpc);
+        const st = obj(g.status);
+        const what =
+          g.drop === true
+            ? '**drop** the held message (it is never delivered)'
+            : g.messageJson !== undefined
+              ? `replace the held message with JSON (${(JSON.stringify(g.messageJson) ?? '').length} chars)`
+              : typeof g.message === 'string'
+                ? `replace the held message with ${Math.floor((g.message.length * 3) / 4)} bytes of protobuf`
+                : g.status !== undefined
+                  ? `end the call with status ${grpcCodeText(st.code).replace(/^([^`]+)$/, '**$1**')}${str(st.message) ? ` and message ${code(st.message)}` : ''}${g.trailers ? ', custom trailers' : ''}`
+                  : 'continue unchanged';
+        return { title: 'Resume a paused gRPC call', message: `Resume paused gRPC call ${code(i.id)}: ${what}.` };
+      }
       const e = obj(i.edit);
       const parts = [
         e.method && `method ${code(e.method)}`,

@@ -26,7 +26,7 @@ import { LanNetworkWatcher, netFingerprint } from './lanWatch';
 import { LanLifecycle } from './lanLifecycle';
 import { InterceptProxyHost } from './proxyHost';
 import { grpcCodec } from './grpc/index';
-import { createGrpcSchemaService, grpcMockEncoder } from './grpc/service';
+import { createGrpcSchemaService, grpcMockEncoder, grpcProxyCodec } from './grpc/service';
 import { createCodegenService } from './codegen/service';
 import type { GeneratedFile } from './codegen/types';
 import { createContractService, DONT_CHECK } from './contract/service';
@@ -252,7 +252,6 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   proxyHost.setBodyFileResolver((p, id) => shared.resolveBodyFile(p, id));
   proxyHost.setScriptFileResolver((p, id) => shared.resolveScriptFile(p, id));
   context.subscriptions.push(shared.onDidChangeBodyFile((p) => proxyHost.refreshBodyFiles(p)));
-  const recordings = createRecordingService({ root: () => flutterProjectRoot() });
   context.subscriptions.push({ dispose: disposeRecordingDiffs });
   let upstreamProblemShown: string | undefined;
   const applyUpstreamProxy = () => {
@@ -290,7 +289,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     log,
   });
   context.subscriptions.push({ dispose: () => grpc.dispose() });
-  const grpcWatcher = vscode.workspace.createFileSystemWatcher('**/{*.pb.dart,*.pbgrpc.dart,*.pbenum.dart,.dart_tool/package_config.json}');
+  const grpcWatcher = vscode.workspace.createFileSystemWatcher('**/{*.pb.dart,*.pbgrpc.dart,*.pbenum.dart,*.proto,.dart_tool/package_config.json}');
   context.subscriptions.push(
     grpcWatcher,
     grpcWatcher.onDidChange((u) => grpc.fileChanged(u.fsPath)),
@@ -299,6 +298,8 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     vscode.workspace.onDidChangeWorkspaceFolders(() => grpc.rootsChanged()),
   );
   proxyHost.setGrpcMessageEncoder(grpcMockEncoder(grpc));
+  proxyHost.setGrpcCodec(grpcProxyCodec(grpc)); // CONTRACTS §17.3: mutate / breakpoint edits on gRPC messages
+  const recordings = createRecordingService({ root: () => flutterProjectRoot(), grpc });
   context.subscriptions.push(grpc.onDidChange(() => proxyHost.refreshGrpcMocks()));
   void grpc.ready();
   /** Runs a tool with an argument array (no shell), stdout as bytes. */

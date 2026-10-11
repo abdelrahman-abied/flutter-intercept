@@ -12,6 +12,10 @@
  * types that appeared or disappeared (change `shape`: "+message type receive binary", "-SSE event price_update") and
  * close-code changes (change `status`: "close 1000 → 1011").
  *
+ * CONTRACTS §17.4: gRPC calls are routes `gRPC /pkg.Service/Method`: status code changes ("gRPC OK → UNAVAILABLE"),
+ * message count changes per direction, and — when the schema decodes the first response message on both sides — its JSON
+ * shape changes (same shape diff as HTTP bodies).
+ *
  * `diffText(rec)` is a normalised text of one recording for a side-by-side `vscode.diff`: exchanges ordered by route
  * then time, headers sorted with volatile ones (date, request ids, trace ids, …) dropped and cookie values
  * removed, secrets redacted like agent views (tokens change on every run, and the text lands in an editor), JSON
@@ -25,6 +29,8 @@ import { inferShape, mergeShapes, type Shape } from '../codegen/infer';
 import { JsonDouble, parseJsonSample, prettyJson } from '../codegen/json';
 import { isIdSegment, routeTemplate } from '../codegen/route';
 import { frameLines, frameSummary } from './frames';
+import { firstResponseJson, type RecordingGrpc } from './grpc';
+import { grpcCodeName } from '../grpc/service';
 import { requestBodyHash } from './replay';
 import type { Recording, RecordingDiffEntry } from './types';
 
@@ -58,6 +64,7 @@ function routeOf(e: Exchange, withOrigin: boolean): RouteInfo {
   }
   template = redactUrl(template);
   const op = e.graphql?.operationName ? ` (${e.graphql.operationName})` : '';
+  if (e.kind === 'grpc') return { key: `${template}\u0000gRPC`, label: `gRPC ${template}` };
   if (e.kind === 'websocket') return { key: `${template}${op}\u0000WS`, label: `WS ${template}${op}` };
   if (e.kind === 'sse') return { key: `${template}${op}\u0000${method}\u0000SSE`, label: `${method} ${template}${op} (SSE)` };
   return { key: `${template}${op}\u0000${method}`, label: `${method} ${template}${op}` };
@@ -185,6 +192,56 @@ function requestKey(e: Exchange): string {
   return `${e.method.toUpperCase()} ${e.url} ${requestBodyHash(e.requestBody) ?? ''}`;
 }
 
+/** "OK", "UNAVAILABLE/OK" — the gRPC statuses of a route's calls, in first-seen order. */
+function grpcStatuses(items: Exchange[]): string {
+  const seen: string[] = [];
+  for (const e of items) {
+    const n = e.grpc?.statusCode !== undefined ? (grpcCodeName(e.grpc.statusCode) ?? String(e.grpc.statusCode)) : 'no status';
+    if (!seen.includes(n)) seen.push(n);
+  }
+  return seen.join('/');
+}
+
+/** CONTRACTS §17.4: status, message counts and the first response message's JSON shape of a gRPC route. */
+function grpcRouteChanges(route: string, a: Exchange[], b: Exchange[], grpc: RecordingGrpc | undefined): RecordingDiffEntry[] {
+  const out: RecordingDiffEntry[] = [];
+  const sa = grpcStatuses(a);
+  const sb = grpcStatuses(b);
+  if (sa !== sb) out.push({ route, change: 'status', detail: `gRPC ${sa} → ${sb}` });
+  if (a.length !== b.length) out.push({ route, change: 'count', detail: `${a.length} → ${calls(b.length)}` });
+  const per = (items: Exchange[]) => {
+    let sent = 0;
+    let received = 0;
+    for (const e of items) {
+      sent += e.grpc?.messagesSent ?? 0;
+      received += e.grpc?.messagesReceived ?? 0;
+    }
+    return { sent, received };
+  };
+  const x = per(a);
+  const y = per(b);
+  if (x.sent !== y.sent || x.received !== y.received) {
+    const parts = [];
+    if (x.sent !== y.sent) parts.push(`sent ${x.sent} → ${y.sent}`);
+    if (x.received !== y.received) parts.push(`received ${x.received} → ${y.received}`);
+    out.push({ route, change: 'count', detail: `messages: ${parts.join(', ')}` });
+  }
+  const va = a.map((e) => firstResponseJson(e, grpc)).filter((v) => v !== undefined);
+  const vb = b.map((e) => firstResponseJson(e, grpc)).filter((v) => v !== undefined);
+  if (va.length && vb.length) {
+    const lines: string[] = [];
+    compareShapes(inferShape(va), inferShape(vb), '', lines);
+    for (const l of lines.slice(0, MAX_SHAPE_CHANGES)) out.push({ route, change: 'shape', detail: l });
+    if (lines.length > MAX_SHAPE_CHANGES) out.push({ route, change: 'shape', detail: `… and ${lines.length - MAX_SHAPE_CHANGES} more shape changes` });
+  }
+  const ma = median(a.flatMap((e) => (typeof e.durationMs === 'number' ? [e.durationMs] : [])));
+  const mb = median(b.flatMap((e) => (typeof e.durationMs === 'number' ? [e.durationMs] : [])));
+  if (ma !== undefined && mb !== undefined && mb > ma * SLOWER_FACTOR && mb - ma >= MIN_SLOWER_MS) {
+    out.push({ route, change: 'timing', detail: `${Math.round(ma)} ms → ${Math.round(mb)} ms (median, ${(mb / Math.max(ma, 1)).toFixed(1)}× slower)` });
+  }
+  return out;
+}
+
 function routeChanges(route: string, a: Exchange[], b: Exchange[]): RecordingDiffEntry[] {
   const out: RecordingDiffEntry[] = [];
   const sa = statuses(a);
@@ -282,7 +339,7 @@ function frameChanges(route: string, a: Exchange[], b: Exchange[]): RecordingDif
 }
 
 /** Changes from recording `a` to recording `b`, ordered by route, then by kind of change. */
-export function diff(a: Recording, b: Recording): RecordingDiffEntry[] {
+export function diff(a: Recording, b: Recording, grpc?: RecordingGrpc): RecordingDiffEntry[] {
   const withOrigin = needsOrigin(a.entries, b.entries);
   const ga = groupByRoute(a.entries, withOrigin);
   const gb = groupByRoute(b.entries, withOrigin);
@@ -291,10 +348,11 @@ export function diff(a: Recording, b: Recording): RecordingDiffEntry[] {
   for (const k of keys) {
     const x = ga.get(k);
     const y = gb.get(k);
-    if (x && !y) out.push({ route: x.label, change: 'removed', detail: `${calls(x.items.length)}, ${statuses(x.items)}` });
-    else if (!x && y) out.push({ route: y.label, change: 'added', detail: `${calls(y.items.length)}, ${statuses(y.items)}` });
+    const st = (items: Exchange[]) => (items[0]?.kind === 'grpc' ? `gRPC ${grpcStatuses(items)}` : statuses(items));
+    if (x && !y) out.push({ route: x.label, change: 'removed', detail: `${calls(x.items.length)}, ${st(x.items)}` });
+    else if (!x && y) out.push({ route: y.label, change: 'added', detail: `${calls(y.items.length)}, ${st(y.items)}` });
     else if (x && y) {
-      const changes = routeChanges(x.label, x.items, y.items);
+      const changes = x.items[0]?.kind === 'grpc' ? grpcRouteChanges(x.label, x.items, y.items, grpc) : routeChanges(x.label, x.items, y.items);
       changes.sort((p, q) => CHANGE_ORDER.indexOf(p.change) - CHANGE_ORDER.indexOf(q.change));
       out.push(...changes);
     }
@@ -387,7 +445,7 @@ export function diffText(rec: Recording): string {
       out.push(...headerLines(e.requestHeaders).map(indent));
       const rq = bodyLines(e.requestBody, e.requestHeaders);
       if (rq.length) out.push('', ...rq.map(indent));
-      out.push(`→ ${e.status ?? 'no status'}${e.state === 'mocked' ? ' (mocked)' : ''}`);
+      out.push(`→ ${e.status ?? 'no status'}${e.state === 'mocked' ? ' (mocked)' : ''}${e.kind === 'grpc' && e.grpc?.statusCode !== undefined ? `, gRPC ${e.grpc.statusCode} ${grpcCodeName(e.grpc.statusCode)}` : ''}`);
       out.push(...headerLines(e.responseHeaders).map(indent));
       const rs = bodyLines(e.responseBody, e.responseHeaders);
       if (rs.length) out.push('', ...rs.map(indent));

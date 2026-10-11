@@ -35,7 +35,7 @@ import { LanNetworkWatcher, netFingerprint } from '../../extension/src/lanWatch'
 import { registerNotifications, type Notifications } from '../../extension/src/notify';
 import { InterceptProxyHost, type ProxyFactory } from '../../extension/src/proxyHost';
 import { grpcCodec } from '../../extension/src/grpc/index';
-import { createGrpcSchemaService, grpcMockEncoder, type GrpcSchemaService } from '../../extension/src/grpc/service';
+import { createGrpcSchemaService, grpcMockEncoder, grpcProxyCodec, type GrpcSchemaService } from '../../extension/src/grpc/service';
 import { diffText } from '../../extension/src/recordings/diff';
 import { createRecordingService } from '../../extension/src/recordings/store';
 import { takeScreenshot } from '../../extension/src/screenshot';
@@ -440,7 +440,6 @@ export class SidecarHost {
     this.proxyHost.setBodyFileResolver((p, id) => this.shared.resolveBodyFile(p, id));
     this.proxyHost.setScriptFileResolver((p, id) => this.shared.resolveScriptFile(p, id));
     this.shared.onDidChangeBodyFile((p) => this.proxyHost.refreshBodyFiles(p));
-    const recordings = createRecordingService({ root: () => this.projectRoot() });
     this.applyUpstreamProxy();
     this.proxyHost.setTlsPassthrough(this.settings.tlsPassthrough);
     void this.applyClientCertificates();
@@ -454,6 +453,8 @@ export class SidecarHost {
     }));
     this.disposers.push(() => grpc.dispose());
     this.proxyHost.setGrpcMessageEncoder(grpcMockEncoder(grpc));
+    this.proxyHost.setGrpcCodec(grpcProxyCodec(grpc));
+    const recordings = createRecordingService({ root: () => this.projectRoot(), grpc });
     const grpcSub = grpc.onDidChange(() => this.proxyHost.refreshGrpcMocks());
     this.disposers.push(() => grpcSub.dispose());
     void grpc.ready();

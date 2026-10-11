@@ -9,19 +9,26 @@
  * File versions: 1 = HTTP entries only (0.6 / 0.7 files, and HTTP-only files written now, so 0.7 can still read
  * them); 2 = has WebSocket / SSE entries (an older extension then refuses the file by its version, not an entry).
  * A version 1 file with stream entries is refused; unknown versions are refused with a clear message.
+ *
+ * CONTRACTS §17.4: version 3 = has gRPC calls: `kind: "grpc"`, POST, http(s), no bodies, `frames` of kind `message`,
+ * `grpc: {code, message?, trailers?, requestHash?}` and `incomplete`; rebuilt into the in-memory form (grpc.ts).
  */
 import type { Body, Exchange } from '@flutter-intercept/proxy';
 import { FrameFormatError, validFrames, type StreamKind } from './frames';
-import type { Recording } from './types';
+import { grpcInfoFor, MAX_GRPC_STATUS_MESSAGE, MAX_RECORDED_GRPC_CODE } from './grpc';
+import type { RecordedExchange, Recording } from './types';
 
 /** HTTP-only recordings (0.6 / 0.7 format). */
 export const RECORDING_VERSION = 1;
 /** Recordings with WebSocket / SSE entries (CONTRACTS §14.5). */
 export const RECORDING_VERSION_STREAMS = 2;
-export const SUPPORTED_RECORDING_VERSIONS: readonly number[] = [RECORDING_VERSION, RECORDING_VERSION_STREAMS];
+/** Recordings with gRPC calls (CONTRACTS §17.4). */
+export const RECORDING_VERSION_GRPC = 3;
+export const SUPPORTED_RECORDING_VERSIONS: readonly number[] = [RECORDING_VERSION, RECORDING_VERSION_STREAMS, RECORDING_VERSION_GRPC];
 
-/** The version a file holding `entries` is written with: 2 when any entry is a WebSocket / SSE exchange, else 1. */
-export function recordingVersionFor(entries: readonly Pick<Exchange, 'kind'>[]): 1 | 2 {
+/** The version a file holding `entries` is written with: 3 with a gRPC call, 2 with a WebSocket / SSE exchange, else 1. */
+export function recordingVersionFor(entries: readonly Pick<Exchange, 'kind'>[]): 1 | 2 | 3 {
+  if (entries.some((e) => e.kind === 'grpc')) return RECORDING_VERSION_GRPC;
   return entries.some((e) => e.kind === 'websocket' || e.kind === 'sse') ? RECORDING_VERSION_STREAMS : RECORDING_VERSION;
 }
 export const MAX_NAME_CHARS = 200;
@@ -106,13 +113,13 @@ function validUrl(v: unknown, where: string, kind?: StreamKind): string {
 }
 
 /** One recorded exchange, rebuilt from validated fields only. */
-export function validEntry(v: unknown, where: string): Exchange {
+export function validEntry(v: unknown, where: string): RecordedExchange {
   if (!isObj(v)) fail(where, 'must be an object');
   if (typeof v.id !== 'string' || !v.id || v.id.length > 200) fail(`${where}.id`, 'must be a non-empty string');
   if (!finite(v.startedAt) || v.startedAt < 0) fail(`${where}.startedAt`, 'must be a time (epoch ms)');
   if (v.durationMs !== undefined && (!finite(v.durationMs) || v.durationMs < 0)) fail(`${where}.durationMs`, 'must be a non-negative number');
   if (typeof v.method !== 'string' || !METHOD.test(v.method)) fail(`${where}.method`, 'must be an HTTP method');
-  if (v.kind !== undefined && v.kind !== 'websocket' && v.kind !== 'sse') fail(`${where}.kind`, 'must be "websocket" or "sse" (or absent for HTTP)');
+  if (v.kind !== undefined && v.kind !== 'websocket' && v.kind !== 'sse' && v.kind !== 'grpc') fail(`${where}.kind`, 'must be "websocket", "sse" or "grpc" (or absent for HTTP)');
   const kind = v.kind as StreamKind | undefined;
   const url = validUrl(v.url, `${where}.url`, kind);
   if (!Number.isInteger(v.status) || (v.status as number) < 100 || (v.status as number) > 599) fail(`${where}.status`, 'must be an HTTP status (100–599)');
@@ -122,9 +129,14 @@ export function validEntry(v: unknown, where: string): Exchange {
     if (v.status !== 101) fail(`${where}.status`, 'must be 101 for a WebSocket exchange');
     if (v.requestBody !== undefined || v.responseBody !== undefined) fail(where, 'must not have bodies (a WebSocket exchange records frames)');
   }
+  if (kind === 'grpc') {
+    if (v.method.toUpperCase() !== 'POST') fail(`${where}.method`, 'must be POST for a gRPC call');
+    if (v.requestBody !== undefined || v.responseBody !== undefined) fail(where, 'must not have bodies (a gRPC call records message frames)');
+    if (!isObj(v.grpc)) fail(`${where}.grpc`, 'must be an object {code, message?, trailers?, requestHash?}');
+  } else if (v.grpc !== undefined || v.incomplete !== undefined) fail(`${where}.grpc`, 'is only allowed on gRPC calls');
   if (kind === 'sse' && v.responseBody !== undefined) fail(`${where}.responseBody`, 'must be absent for an SSE exchange (the events are its frames)');
   if (!kind && (v.frames !== undefined || v.framesDropped !== undefined)) fail(`${where}.frames`, 'are only allowed on WebSocket and SSE exchanges');
-  const e: Exchange = {
+  const e: RecordedExchange = {
     id: v.id,
     startedAt: v.startedAt,
     ...(v.durationMs !== undefined ? { durationMs: v.durationMs as number } : {}),
@@ -148,6 +160,22 @@ export function validEntry(v: unknown, where: string): Exchange {
     if (v.framesDropped !== undefined) {
       if (!Number.isSafeInteger(v.framesDropped) || (v.framesDropped as number) < 0) fail(`${where}.framesDropped`, 'must be a non-negative integer');
       if (v.framesDropped) e.framesDropped = v.framesDropped as number;
+    }
+  }
+  if (kind === 'grpc') {
+    const g = v.grpc as Record<string, unknown>;
+    const gw = `${where}.grpc`;
+    for (const k of Object.keys(g)) if (!['code', 'message', 'trailers', 'requestHash'].includes(k)) fail(gw, `has an unknown field ${JSON.stringify(k.slice(0, 40))}`);
+    if (!Number.isInteger(g.code) || (g.code as number) < 0 || (g.code as number) > MAX_RECORDED_GRPC_CODE) fail(`${gw}.code`, `must be a gRPC status code (0–${MAX_RECORDED_GRPC_CODE})`);
+    if (g.message !== undefined && (typeof g.message !== 'string' || g.message.length > MAX_GRPC_STATUS_MESSAGE)) fail(`${gw}.message`, `must be a string of at most ${MAX_GRPC_STATUS_MESSAGE} characters`);
+    if (g.requestHash !== undefined && (typeof g.requestHash !== 'string' || !/^[0-9a-f]{64}$/.test(g.requestHash))) fail(`${gw}.requestHash`, 'must be a sha256 hex digest');
+    const trailers = g.trailers !== undefined ? validHeaders(g.trailers, `${gw}.trailers`) : undefined;
+    e.grpc = grpcInfoFor(url, g.code as number, g.message as string | undefined, e.frames ?? []);
+    if (trailers && Object.keys(trailers).length) e.responseTrailers = trailers;
+    if (g.requestHash !== undefined) e.grpcRequestHash = g.requestHash as string;
+    if (v.incomplete !== undefined) {
+      if (v.incomplete !== true) fail(`${where}.incomplete`, 'must be true');
+      e.incomplete = true;
     }
   }
   if (v.matchedRuleId !== undefined) {
@@ -194,10 +222,10 @@ export function validEntry(v: unknown, where: string): Exchange {
 export function validateRecording(data: unknown, id: string, path: string): Recording {
   if (!isObj(data)) fail('recording', 'must be a JSON object');
   if (!SUPPORTED_RECORDING_VERSIONS.includes(data.version as number)) {
-    const newer = typeof data.version === 'number' && Number.isInteger(data.version) && data.version > RECORDING_VERSION_STREAMS;
-    fail('version', `must be 1 or 2 (this file has ${JSON.stringify(data.version)}${newer ? ': it was saved by a newer Flutter Intercept — update the extension to load it' : ''})`);
+    const newer = typeof data.version === 'number' && Number.isInteger(data.version) && data.version > RECORDING_VERSION_GRPC;
+    fail('version', `must be 1, 2 or 3 (this file has ${JSON.stringify(data.version)}${newer ? ': it was saved by a newer Flutter Intercept — update the extension to load it' : ''})`);
   }
-  const version = data.version as 1 | 2;
+  const version = data.version as 1 | 2 | 3;
   const name = validName(data.name);
   if (!finite(data.createdAt) || data.createdAt < 0) fail('createdAt', 'must be a time (epoch ms)');
   if (typeof data.redacted !== 'boolean') fail('redacted', 'must be a boolean');
@@ -206,8 +234,14 @@ export function validateRecording(data: unknown, id: string, path: string): Reco
   const entries = data.entries.map((x, i) => validEntry(x, `entries[${i}]`));
   let streams = 0;
   let frames = 0;
+  let grpc = 0;
   for (const [i, e] of entries.entries()) {
     if (!e.kind) continue;
+    if (e.kind === 'grpc') {
+      if (version < RECORDING_VERSION_GRPC) fail(`entries[${i}].kind`, `is not allowed in a version ${version} recording (gRPC entries need version 3)`);
+      grpc++;
+      continue;
+    }
     if (version === RECORDING_VERSION) fail(`entries[${i}].kind`, 'is not allowed in a version 1 recording (WebSocket / SSE entries need version 2)');
     streams++;
     frames += e.frames?.length ?? 0;
@@ -221,6 +255,7 @@ export function validateRecording(data: unknown, id: string, path: string): Reco
     path,
     redacted: data.redacted,
     ...(streams ? { streams, frames } : {}),
+    ...(grpc ? { grpc } : {}),
     entries,
   };
 }

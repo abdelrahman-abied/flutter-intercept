@@ -6,7 +6,7 @@
 import * as os from 'os';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import type { Body, Exchange, Matcher, ReplayEntry, ReplayOptions, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest, StackFrame } from '@flutter-intercept/proxy';
+import type { Body, Exchange, GrpcEdit, Matcher, ReplayEntry, ReplayOptions, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest, StackFrame } from '@flutter-intercept/proxy';
 import { describeProfile, NETWORK_PRESETS, presetProfile, type NetworkPresetId, type NetworkProfile } from '@flutter-intercept/proxy/network';
 import { compileMatcher } from '@flutter-intercept/proxy/rules';
 import { toSnippet } from '../codegen/snippets';
@@ -16,7 +16,7 @@ import type { AuthAnalysis } from '../analysis/types';
 import type { RecordingService } from '../recordings/types';
 import type { ExportResult, ToOpenApi, ToPostman } from '../export/types';
 import type { Screenshot, ScreenshotTarget } from '../screenshot/types';
-import { checkMapTarget, expireTokenRule, fixtureApi, isRecordable, readOnlyReason, sanitizeSendHeaders, tunnelReason, validateEdit, validateRule } from '../ui/controller';
+import { checkMapTarget, expireTokenRule, fixtureApi, isRecordable, readOnlyReason, resolveGrpcEdit, sanitizeSendHeaders, tunnelReason, validateEdit, validateRule } from '../ui/controller';
 import type { SessionWarning } from '../ui/protocol';
 import { buildHar, writeExportFile, writeHar } from './har';
 import { pathError, select } from './paths';
@@ -79,8 +79,9 @@ function throttleFields(t: { latencyMs?: number; kbps?: number; uploadKbps?: num
 }
 
 /** CONTRACTS §14.5: a recording's WebSocket / SSE stream and frame counts, when it has any. */
-function streamCounts(m: { streams?: number; frames?: number }): { streams?: number; frames?: number } {
+function streamCounts(m: { streams?: number; frames?: number; grpc?: number }): { streams?: number; frames?: number; grpc?: number } {
   return {
+    ...(typeof m.grpc === 'number' && m.grpc > 0 ? { grpc: m.grpc } : {}),
     ...(typeof m.streams === 'number' && m.streams > 0 ? { streams: m.streams } : {}),
     ...(typeof m.frames === 'number' && m.frames > 0 ? { frames: m.frames } : {}),
   };
@@ -99,7 +100,7 @@ export interface AgentApiDeps {
     readonly port: number | undefined;
     getExchanges(): Exchange[];
     getRules(): Rule[];
-    resume(id: string, edit?: RequestEdit | ResponseEdit): void;
+    resume(id: string, edit?: RequestEdit | ResponseEdit | GrpcEdit): void;
     abort(id: string): void;
     on(event: 'exchange', listener: (e: Exchange) => void): unknown;
     off(event: 'exchange', listener: (e: Exchange) => void): unknown;
@@ -568,6 +569,7 @@ export class AgentApi implements AgentTools {
       ...(e.timings ? { timings: { ...e.timings } } : {}),
       ...(e.scriptLog?.length ? { scriptLog: e.scriptLog.map((l) => (this.redact ? redactLogLine(String(l)) : String(l))) } : {}),
       ...(e.kind === 'grpc' ? this.grpcDetail(e, includeBodies) : {}),
+      ...this.grpcPauseView(e),
     };
   }
 
@@ -616,6 +618,83 @@ export class AgentApi implements AgentTools {
   /** A decoded message's JSON as agents see it (secret-named fields and credential-looking values redacted). */
   private grpcJson(v: unknown): unknown {
     return this.redact ? redactJsonValue(v) : v;
+  }
+
+  /**
+   * CONTRACTS §17.6: what a gRPC breakpoint holds, as agents see it — the held message decoded and redacted (never its
+   * bytes), or the held status with redacted message and trailers.
+   */
+  private grpcPauseView(e: Exchange): Record<string, unknown> {
+    const p = e.grpcPause;
+    if (!p) return {};
+    if (p.kind === 'status') {
+      const trailers = this.redact ? redactGrpcMetadata(p.trailers) : p.trailers;
+      return {
+        grpcPause: {
+          kind: 'status',
+          code: p.code,
+          status: grpcCodeName(p.code),
+          ...(p.message !== undefined ? { message: this.text(p.message) } : {}),
+          ...(trailers && Object.keys(trailers).length ? { trailers } : {}),
+        },
+      };
+    }
+    const d = this.decodeHeld(e);
+    let json: unknown;
+    let jsonOmitted = false;
+    if (d?.json !== undefined && d.via !== 'none') {
+      json = this.grpcJson(d.json);
+      if (JSON.stringify(json).length > MAX_GRPC_MESSAGES_JSON) {
+        json = undefined;
+        jsonOmitted = true;
+      }
+    }
+    return {
+      grpcPause: {
+        kind: 'message',
+        dir: p.dir,
+        index: p.index,
+        size: p.size,
+        via: d?.via ?? 'none',
+        ...(json !== undefined ? { json } : {}),
+        ...(jsonOmitted ? { jsonOmitted: true } : {}),
+        ...(d?.error ? { error: this.scrub(d.error) } : {}),
+      },
+    };
+  }
+
+  /** The message a gRPC breakpoint holds, decoded (schema, else raw). */
+  private decodeHeld(e: Exchange): DecodedMessage | undefined {
+    const p = e.grpcPause;
+    if (p?.kind !== 'message' || typeof p.base64 !== 'string') return undefined;
+    return decodeGrpcMessages({ url: e.url, frames: [] }, this.deps.grpc, { frames: [{ dir: p.dir, at: e.pausedAt ?? e.startedAt, kind: 'message', base64: p.base64, size: p.size }] }).messages[0];
+  }
+
+  /**
+   * An agent's `grpc.messageJson` with every "[redacted]" string it only saw redacted put back to the held message's
+   * value at the same path (the secret goes on to the app unchanged; the agent never learns it).
+   */
+  private restoreRedactedGrpc(e: Exchange, raw: unknown): unknown {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+    const r = raw as Record<string, unknown>;
+    if (r.messageJson === undefined) return raw;
+    const d = this.decodeHeld(e);
+    if (d?.via !== 'schema' || d.json === undefined) return raw;
+    const restore = (v: unknown, orig: unknown, depth: number): unknown => {
+      if (depth > 64) return v;
+      if (v === REDACTED && orig !== undefined) return orig;
+      if (Array.isArray(v)) return v.map((x, i) => restore(x, Array.isArray(orig) ? orig[i] : undefined, depth + 1));
+      if (v && typeof v === 'object') {
+        const o = orig && typeof orig === 'object' && !Array.isArray(orig) ? (orig as Record<string, unknown>) : {};
+        const out: Record<string, unknown> = {};
+        for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+          Object.defineProperty(out, k, { value: restore(x, Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined, depth + 1), enumerable: true, writable: true, configurable: true });
+        }
+        return out;
+      }
+      return v;
+    };
+    return { ...r, messageJson: restore(r.messageJson, d.json, 0) };
   }
 
   /** One decoded message for get_request. */
@@ -881,6 +960,7 @@ export class AgentApi implements AgentTools {
         phase: e.state === 'paused-request' ? 'request' : 'response',
         ...(e.pausedAt ? { pausedAt: e.pausedAt } : {}),
         ...(e.pauseDeadline ? { pauseDeadline: e.pauseDeadline } : {}),
+        ...this.grpcPauseView(e),
       }));
     return { items };
   }
@@ -1045,6 +1125,19 @@ export class AgentApi implements AgentTools {
 
   private resume(i: ToolInput<'resume_request'>): ToolResult {
     const e = this.pausedOrThrow(i.id);
+    // CONTRACTS §17.6: a paused gRPC call takes `grpc` (message / messageJson / drop, or status + trailers)
+    if (e.kind === 'grpc' && e.grpcPause) {
+      if (i.edit !== undefined) throw new AgentToolError('this is a paused gRPC call: pass grpc {messageJson | message | drop} (held message) or grpc {status, trailers?} (end of the call), not edit', 'invalid');
+      let g: GrpcEdit | undefined;
+      try {
+        g = resolveGrpcEdit(e, this.restoreRedactedGrpc(e, i.grpc), this.deps.grpc);
+      } catch (err) {
+        throw new AgentToolError(`${(err as Error).message} (the call stays paused)`, 'invalid');
+      }
+      this.deps.host.resume(i.id, g);
+      return { resumed: true, ...(g?.drop ? { dropped: true } : g?.message ? { edited: true } : g?.status ? { status: g.status.code } : {}) };
+    }
+    if (i.grpc !== undefined) throw new AgentToolError(`exchange "${i.id}" is not a paused gRPC call; use edit`, 'invalid');
     let edit: RequestEdit | ResponseEdit | undefined;
     try {
       edit = validateEdit(i.edit, e.state === 'paused-request' ? 'request' : 'response');

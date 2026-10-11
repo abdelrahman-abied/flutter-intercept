@@ -3,6 +3,7 @@
  */
 import { createHash } from 'crypto';
 import type { Body, Exchange, ReplayEntry, ReplayOptions } from '@flutter-intercept/proxy';
+import { grpcReplayEntry, isReplayableGrpc } from './grpc';
 import type { Recording } from './types';
 
 /** Headers that describe the wire framing of the recorded bytes, not the body replay sends. */
@@ -68,6 +69,8 @@ export function requestBodyHash(body: Body | undefined): string | undefined {
  * upgrade (101) or an SSE stream (CONTRACTS §14.5).
  */
 export function isReplayable(e: Exchange): boolean {
+  // CONTRACTS §17.4: incomplete gRPC calls are not replayed (the fallback applies)
+  if (e.kind === 'grpc') return isReplayableGrpc(e);
   if (typeof e.status !== 'number') return false;
   if (e.kind === 'websocket') return e.status === 101;
   if (e.kind === 'sse') return true;
@@ -104,6 +107,9 @@ function copyFrames(e: Exchange): NonNullable<ReplayEntry['frames']> {
  * `-version`, `upgrade`; `sec-websocket-protocol` is kept); an SSE exchange becomes `{kind: 'sse', frames, …}` with
  * its head minus framing and `content-encoding` (the events are decoded text) and the request body hash of a POST
  * stream. Frames are copies in recorded order (`at` epoch ms; the proxy uses the gaps).
+ *
+ * CONTRACTS §17.4: a complete gRPC call becomes `{kind: 'grpc', frames, grpc: {code, message?, trailers?, requestHash?}}`
+ * (grpc.ts `grpcReplayEntry`).
  */
 export function toReplay(rec: Recording): ReplayEntry[] {
   return [...rec.entries]
@@ -111,6 +117,7 @@ export function toReplay(rec: Recording): ReplayEntry[] {
     .sort((x, y) => x.e.startedAt - y.e.startedAt || x.i - y.i)
     .filter(({ e }) => isReplayable(e))
     .map(({ e }) => {
+      if (e.kind === 'grpc') return grpcReplayEntry(e);
       const headers: Record<string, string | string[]> = {};
       const stream = e.kind === 'websocket' || e.kind === 'sse' ? e.kind : undefined;
       const keepEncoding = !stream && isStillEncoded(e.responseBody, e.responseHeaders);

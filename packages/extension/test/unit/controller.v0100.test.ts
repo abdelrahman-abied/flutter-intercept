@@ -177,7 +177,6 @@ describe('createRuleFromExchange grpcMock (CONTRACTS §16.4)', () => {
     expect(t.host.rules[0].action).not.toHaveProperty('code');
     for (const [id, action] of [
       [call.id, 'mock'],
-      [call.id, 'breakpoint'],
       ['open', 'grpcMock'],
       ['big', 'grpcMock'],
       ['h', 'grpcMock'],
@@ -186,7 +185,6 @@ describe('createRuleFromExchange grpcMock (CONTRACTS §16.4)', () => {
     }
     expect(errors(t.replies)).toEqual([
       expect.stringMatching(/an HTTP mock rule from a gRPC call/),
-      expect.stringMatching(/a breakpoint rule from a gRPC call/),
       expect.stringMatching(/has not finished yet/),
       expect.stringMatching(/too large to record/),
       expect.stringMatching(/isn't a gRPC call/),
@@ -196,15 +194,14 @@ describe('createRuleFromExchange grpcMock (CONTRACTS §16.4)', () => {
     expect(t.host.rules[0].action).toEqual({ kind: 'block', mode: 'status', status: 403 });
   });
 
-  it('gRPC calls are neither recordable nor resendable; tunnels explain the decrypt setting', async () => {
+  it('gRPC calls are recordable (0.11) but not resendable; tunnels explain the decrypt setting', async () => {
     const t = setup();
     const call = grpcCall();
     t.host.exchanges = [call];
-    expect(isRecordable(call)).toBe(false);
+    expect(isRecordable(call)).toBe(true);
+    expect(isRecordable({ ...call, grpc: { ...call.grpc!, statusCode: undefined } })).toBe(false);
     await t.c.handle({ type: 'send', request: { method: 'POST', url: call.url }, resentFrom: call.id }, t.reply);
     expect(errors(t.replies)[0]).toMatch(/Can't resend a gRPC call/);
-    await t.c.handle({ type: 'mutateField', id: call.id, path: '$.a', op: 'null' }, t.reply);
-    expect(errors(t.replies)[1]).toMatch(/gRPC call/);
     expect(tunnelReason({ id: 't', kind: 'tunnel', grpcTunnel: true, method: 'CONNECT', url: 'https://grpc.example.com:443/', requestHeaders: {}, startedAt: 1, state: 'completed' })).toMatch(/gRPC over TLS to grpc\.example\.com, not decrypted.*flutterIntercept\.grpc\.decryptHosts/);
   });
 });

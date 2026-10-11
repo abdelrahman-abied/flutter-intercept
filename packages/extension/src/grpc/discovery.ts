@@ -1,5 +1,6 @@
 /**
- * CONTRACTS §16.3: finds the app's protoc-generated Dart (`*.pbgrpc.dart`, `*.pb.dart`, `*.pbenum.dart`). Pure Node
+ * CONTRACTS §16.3 / §17.5: finds the app's protoc-generated Dart (`*.pbgrpc.dart`, `*.pb.dart`, `*.pbenum.dart`) and, in
+ * the workspace folders, its `*.proto` files (same skips, same caps). Pure Node
  * (no vscode): the VS Code extension and the sidecar share it. File access goes through `GrpcFs` (tests use a fake).
  *
  * - Sources: every root (workspace folder) and, from the nearest `.dart_tool/package_config.json` at or above each
@@ -31,6 +32,10 @@ export const SKIP_DIRS = new Set(['.dart_tool', 'build', '.pub-cache', '.pub', '
 
 /** `foo.pbgrpc.dart`, `foo.pb.dart`, `foo.pbenum.dart` (not `.pbjson.dart` / `.pbserver.dart`). */
 export const GRPC_FILE = /\.(pbgrpc|pb|pbenum)\.dart$/;
+/** CONTRACTS §17.5: `.proto` files are a schema source too (workspace folders only). */
+export const PROTO_FILE = /\.proto$/;
+/** What the workspace walk collects: generated Dart and `.proto` files. */
+const WORKSPACE_FILE = /\.(pbgrpc|pb|pbenum)\.dart$|\.proto$/;
 const SERVICE_FILE = /\.pbgrpc\.dart$/;
 
 export interface GrpcDirent {
@@ -254,7 +259,7 @@ export async function discoverGrpcFiles(roots: readonly string[], f: GrpcFs = no
     const real = await realOrUndefined(f, root);
     if (!real) continue;
     realRoots.push(real);
-    const found = await scan.walk(root, GRPC_FILE);
+    const found = await scan.walk(root, WORKSPACE_FILE);
     if (found.length) scan.sources.push(root);
     for (const file of found) {
       await scan.read(file, real, path.relative(root, file).split(path.sep).join('/') || path.basename(file));
@@ -304,5 +309,5 @@ function result(scan: Scan): DiscoveryResult {
 /** Whether a changed path can affect the schema (a generated file or a package_config.json). */
 export function isGrpcSchemaPath(p: string): boolean {
   const base = path.basename(p);
-  return GRPC_FILE.test(base) || (base === 'package_config.json' && path.basename(path.dirname(p)) === '.dart_tool');
+  return GRPC_FILE.test(base) || PROTO_FILE.test(base) || (base === 'package_config.json' && path.basename(path.dirname(p)) === '.dart_tool');
 }

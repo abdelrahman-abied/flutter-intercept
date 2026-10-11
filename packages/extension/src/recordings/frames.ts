@@ -8,6 +8,8 @@
  * - `validFrames`: strict validation of the frames of a loaded file (kinds per exchange kind, sizes, base64, counts,
  *   names without line breaks), rebuilt from the checked fields only.
  * - `frameLines` / `frameSummary`: the normalised frame text for `diffText` and the per-route frame facts for `diff`.
+ * - CONTRACTS §17.4: gRPC calls record their messages as `message` frames (base64 ≤ 64 KB, `compressed`, `sizeUnknown`,
+ *   `edited`); messages dropped at a breakpoint were never delivered and are not recorded.
  */
 import { createHash } from 'crypto';
 import type { Exchange, Frame } from '@flutter-intercept/proxy';
@@ -27,7 +29,7 @@ const BASE64_MAX_CHARS = 4 * Math.ceil(FRAME_PAYLOAD_CAP / 3);
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 const WS_KINDS = new Set<Frame['kind']>(['text', 'binary', 'ping', 'pong', 'close']);
 
-export type StreamKind = 'websocket' | 'sse';
+export type StreamKind = 'websocket' | 'sse' | 'grpc';
 
 /** What a stored frame costs (packages/proxy/src/frames.ts `frameCost`). */
 export function frameCost(f: Frame): number {
@@ -52,6 +54,9 @@ export function copyFrame(f: Frame): Frame {
   if (f.event !== undefined) out.event = f.event;
   if (f.id !== undefined) out.id = f.id;
   if (f.closeCode !== undefined) out.closeCode = f.closeCode;
+  if (f.compressed) out.compressed = true;
+  if (f.sizeUnknown) out.sizeUnknown = true;
+  if (f.edited) out.edited = true;
   return out;
 }
 
@@ -91,18 +96,20 @@ function validFrame(v: unknown, kind: StreamKind, where: string): Frame {
   if (kind === 'websocket' && !WS_KINDS.has(fk)) fail(`${where}.kind`, 'must be text, binary, ping, pong or close in a WebSocket recording');
   if (kind === 'sse' && fk !== 'event') fail(`${where}.kind`, 'must be "event" in an SSE recording');
   if (kind === 'sse' && v.dir !== 'receive') fail(`${where}.dir`, 'must be "receive" for an SSE event');
+  if (kind === 'grpc' && fk !== 'message') fail(`${where}.kind`, 'must be "message" in a gRPC recording');
+  if (kind !== 'grpc' && fk === 'message') fail(`${where}.kind`, 'must not be "message" outside a gRPC recording');
   if (!Number.isSafeInteger(v.size) || (v.size as number) < 0) fail(`${where}.size`, 'must be a non-negative integer');
   const f: Frame = { dir: v.dir, at: v.at, kind: fk, size: v.size as number };
   if (v.text !== undefined) {
     if (typeof v.text !== 'string') fail(`${where}.text`, 'must be a string');
-    if (fk === 'binary') fail(`${where}.text`, 'is not allowed on a binary frame (use base64)');
+    if (fk === 'binary' || fk === 'message') fail(`${where}.text`, `is not allowed on a ${fk} frame (use base64)`);
     // ≤ 64 K characters, with room for "[redacted]" replacing shorter values in a redacted recording
     if (v.text.length > FRAME_PAYLOAD_CAP * 2) fail(`${where}.text`, 'is too long');
     f.text = v.text;
   }
   if (v.base64 !== undefined) {
     if (typeof v.base64 !== 'string') fail(`${where}.base64`, 'must be a string');
-    if (fk !== 'binary' && fk !== 'ping' && fk !== 'pong') fail(`${where}.base64`, 'is only allowed on binary, ping and pong frames');
+    if (fk !== 'binary' && fk !== 'ping' && fk !== 'pong' && fk !== 'message') fail(`${where}.base64`, 'is only allowed on binary, ping, pong and gRPC message frames');
     if (f.text !== undefined) fail(where, 'must not have both text and base64');
     if (v.base64.length > BASE64_MAX_CHARS) fail(`${where}.base64`, 'is too long (more than 64 KB)');
     if (v.base64.length % 4 !== 0 || !BASE64.test(v.base64)) fail(`${where}.base64`, 'is not valid base64');
@@ -125,6 +132,11 @@ function validFrame(v: unknown, kind: StreamKind, where: string): Frame {
       fail(`${where}.id`, `must be a string of at most ${MAX_EVENT_ID_CHARS} characters without CR, LF or NUL`);
     }
     f.id = v.id;
+  }
+  for (const flag of ['compressed', 'sizeUnknown', 'edited'] as const) {
+    if (v[flag] === undefined) continue;
+    if (fk !== 'message' || v[flag] !== true) fail(`${where}.${flag}`, 'must be true, on a gRPC message frame');
+    f[flag] = true;
   }
   if (v.closeCode !== undefined) {
     if (fk !== 'close') fail(`${where}.closeCode`, 'is only allowed on close frames');
@@ -150,6 +162,7 @@ export function validFrames(v: unknown, kind: StreamKind, where: string): Frame[
 /** A frame's message type: `send text`, `receive binary`, `event price_update` (SSE default name: `message`). */
 export function messageType(f: Frame): string {
   if (f.kind === 'event') return `event ${f.event ?? 'message'}`;
+  if (f.kind === 'message') return `${f.dir} message`;
   return `${f.dir} ${f.kind}`;
 }
 

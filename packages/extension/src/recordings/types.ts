@@ -1,5 +1,5 @@
 /**
- * Recordings: save traffic, replay it as mocks, diff two of them (CONTRACTS §12.4–12.5). Lead-owned types.
+ * Recordings: save traffic, replay it as mocks, diff two of them (CONTRACTS §12.4–12.5, §14.5, §17.4).
  */
 import type { Exchange, ReplayEntry } from '@flutter-intercept/proxy';
 
@@ -14,13 +14,27 @@ export interface RecordingMeta {
   /** CONTRACTS §14.5: WebSocket / SSE exchanges among `exchanges`, and their frames in total (absent in 0.6/0.7 files). */
   streams?: number;
   frames?: number;
+  /** CONTRACTS §17.4: gRPC calls among `exchanges` (absent before 0.11). */
+  grpc?: number;
 }
 
+/**
+ * CONTRACTS §17.4: a recorded exchange in memory. gRPC entries keep `grpc` (GrpcInfo: service, method, status, counts),
+ * `responseTrailers` (custom trailers only) and `frames` (message frames), plus these two; the file stores them as
+ * `grpc: {code, message?, trailers?, requestHash?}` and `incomplete` (validate.ts / store.ts convert).
+ */
+export type RecordedExchange = Exchange & {
+  /** sha256 (hex) of the first request message as the app sent it (to tell unary calls apart on replay). */
+  grpcRequestHash?: string;
+  /** A response message was cut (64 KB frame cap, size unknown) or messages were dropped: not replayed. */
+  incomplete?: true;
+};
+
 export interface Recording extends RecordingMeta {
-  /** 1 = HTTP only (0.6/0.7); 2 = may contain WebSocket / SSE entries with frames (CONTRACTS §14.5). Older versions
-   * refuse 2 by its number instead of failing on an entry. */
-  version: 1 | 2;
-  entries: Exchange[];   // finished HTTP, WebSocket and SSE exchanges (no tunnels / vm-profile / browser-internal)
+  /** 1 = HTTP only (0.6/0.7); 2 = may contain WebSocket / SSE entries with frames (CONTRACTS §14.5); 3 = may contain
+   * gRPC calls (CONTRACTS §17.4). Older versions refuse a newer number instead of failing on an entry. */
+  version: 1 | 2 | 3;
+  entries: RecordedExchange[];   // finished HTTP, WebSocket, SSE and gRPC exchanges (no tunnels / vm-profile / browser-internal)
 }
 
 export interface RecordingDiffEntry {

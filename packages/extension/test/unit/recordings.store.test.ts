@@ -195,8 +195,8 @@ describe('RecordingService.list / load / remove / export', () => {
       fs.writeFileSync(meta.path, JSON.stringify(d));
     };
     const bad: [string, (d: any) => void, RegExp][] = [
-      ['version', (d) => (d.version = 3), /version must be 1 or 2 \(this file has 3: it was saved by a newer Flutter Intercept/],
-      ['version type', (d) => (d.version = '1'), /version must be 1 or 2 \(this file has "1"\)/],
+      ['version', (d) => (d.version = 4), /version must be 1, 2 or 3 \(this file has 4: it was saved by a newer Flutter Intercept/],
+      ['version type', (d) => (d.version = '1'), /version must be 1, 2 or 3 \(this file has "1"\)/],
       ['name', (d) => (d.name = 5), /name must be a non-empty string/],
       ['entries', (d) => (d.entries = {}), /entries must be an array/],
       ['status', (d) => (d.entries[0].status = 999), /entries\[0\]\.status/],
