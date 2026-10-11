@@ -56,7 +56,7 @@ import { takeScreenshot, type ScreenshotDeps } from '../../../src/screenshot';
 import { createVmWatcher, vmCallService } from '../../../src/vm';
 import { AndroidGlobalProxy } from '../../../src/adb';
 import type { SessionWarning } from '../../../src/ui/protocol';
-import { activateBoth, freePort, outputOf, registerOutputTracker, RunOutcome, sleep, startSession, stopSession, waitFor } from './helpers';
+import { activateBoth, freePort, freePortPair, outputOf, registerOutputTracker, RunOutcome, sleep, startSession, stopSession, waitFor } from './helpers';
 
 const JP = 'https://jsonplaceholder.typicode.com';
 const URLS = {
@@ -550,7 +550,7 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
   }
 
   async function checkK(dev: string, tag: string) {
-    const grpcPort = Number(process.env.FI_GRPC_PORT) || (await freePort());
+    const grpcPort = Number(process.env.FI_GRPC_PORT) || (await freePortPair());
     const svc = '/demo.orders.v1.OrderService/';
     const defines = [`--dart-define=GRPC_PORT=${grpcPort}`, `--dart-define=GRPC_TLS_PORT=${grpcPort + 1}`, '--dart-define=COVERAGE=false'];
     const waitGrpc = async (s: vscode.DebugSession, from: number) => {

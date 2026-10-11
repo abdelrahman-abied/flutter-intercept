@@ -33,6 +33,25 @@ export function freePort(): Promise<number> {
   });
 }
 
+function canListen(port: number, host: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.once('error', () => resolve(false));
+    s.listen(port, host, () => s.close(() => resolve(true)));
+  });
+}
+
+/** A port `p` with `p` and `p + 1` free on 127.0.0.1 and ::1 (servers that listen on both, e.g. h2c + TLS). */
+export async function freePortPair(): Promise<number> {
+  for (let i = 0; i < 50; i++) {
+    const p = await freePort();
+    if (p >= 65535) continue;
+    const ok = await Promise.all([canListen(p, '::1'), canListen(p + 1, '127.0.0.1'), canListen(p + 1, '::1')]);
+    if (ok.every(Boolean)) return p;
+  }
+  throw new Error('no free port pair');
+}
+
 /** Polls `fn` until it returns a value other than undefined/false. */
 export async function waitFor<T>(fn: () => T | undefined | false, timeoutMs: number, everyMs = 50): Promise<T> {
   const end = Date.now() + timeoutMs;
