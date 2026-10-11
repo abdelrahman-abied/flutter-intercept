@@ -116,6 +116,31 @@ String _grpcProxyAuthorization() {
   return 'Proxy-Authorization: Basic ${base64Encode(utf8.encode(_proxyAddress.substring(0, at)))}\r\n';
 }
 
+// Tells the proxy that the breaker sent this authority direct (CONTRACTS §16.8): one more connection that carries
+// only a `breaker` head, then is closed. Best effort: never awaited by the app's connect, errors swallowed.
+void _grpcBreakerReport(String authority) {
+  Zone.root.run(() {
+    try {
+      final head = 'CONNECT $authority HTTP/1.1\r\n'
+          'Host: $authority\r\n'
+          'Flutter-Intercept-Tunnel: breaker\r\n'
+          '${_grpcProxyAuthorization()}'
+          '\r\n';
+      final proxyHost = _grpcProxyHost();
+      final proxyPort = _grpcProxyPort();
+      IOOverrides.runWithIOOverrides(
+              () => Socket.connect(proxyHost, proxyPort, timeout: _grpcHopTimeout), _ioPlain!)
+          .then((Socket socket) {
+        socket.done.then((Object? v) => null, onError: (Object e) => null);
+        socket.add(utf8.encode(head));
+        return socket.flush().whenComplete(socket.destroy);
+      }).then((Object? v) => null, onError: (Object e) => null);
+    } catch (_) {
+      // Malformed proxy define: nothing to report to.
+    }
+  });
+}
+
 Future<Socket> _grpcTunnel(dynamic host, int port, dynamic sourceAddress, int sourcePort, Duration? timeout) async {
   final target = host is InternetAddress ? host.address : '$host';
   final authority = target.contains(':') && !target.startsWith('[') ? '[$target]:$port' : '$target:$port';
@@ -126,7 +151,9 @@ Future<Socket> _grpcTunnel(dynamic host, int port, dynamic sourceAddress, int so
   if (recent.length >= _grpcBurstTunnels) {
     recent.clear();
     _grpcDirectUntil[authority] = now + _grpcDirectMs;
-    _note('gRPC to $authority goes direct for 30 s ($_grpcBurstTunnels connections through the proxy within 2 s)');
+    _note("gRPC connections to $authority kept closing, so the app connects directly for 30 s — Flutter Intercept "
+        "rules and network simulation don't apply to them meanwhile.");
+    _grpcBreakerReport(authority);
     return _grpcDirect(host, port, sourceAddress, sourcePort, timeout);
   }
   final hop = timeout != null && timeout < _grpcHopTimeout ? timeout : _grpcHopTimeout;
@@ -175,8 +202,17 @@ Notes:
   app's `connectTimeout` after the hop (the demo's 10 s → `9973`–`9999`), absent without one. Proxy authorization is
   the raw `user:token` of the define (same as Dart's `HttpClient` proxy credentials).
 - **Breaker**: a tunnel counts once the hop connected; the 4th connect to an authority with 3 tunnels in the last
-  2 s trips it (that connect and the next 30 s go direct). One console note per authority:
-  `[flutter_intercept] gRPC to <authority> goes direct for 30 s (3 connections through the proxy within 2 s)`.
+  2 s trips it (that connect and the next 30 s go direct). One console note per authority (REVIEW-10 #1):
+  `[flutter_intercept] gRPC connections to <authority> kept closing, so the app connects directly for 30 s — Flutter
+  Intercept rules and network simulation don't apply to them meanwhile.`
+- **Breaker report** (CONTRACTS §16.8, REVIEW-10 #1): on each trip one more connection to the proxy carrying only
+  `CONNECT <authority> HTTP/1.1\r\nHost: <authority>\r\nFlutter-Intercept-Tunnel: breaker\r\n[Proxy-Authorization: …\r\n]\r\n`,
+  flushed and destroyed, in the root zone, never awaited by the app's connect, every error swallowed. Unit-tested:
+  byte-exact head (with and without LAN credentials), the app's direct connects stay < 500 ms, a proxy that stopped
+  listening before the report → no error, no output beyond the note. `mitm_proxy.dart` logs it as `PROXY_BREAKER`.
+  The device runs in the table below predate the report and the new note text (template otherwise unchanged; the
+  Dart 3.0 / 3.3 / 3.13 × language 2.12 / 3.0 matrix was re-run with it). The end-to-end offline check (Android
+  emulator, TLS gRPC + offline profile, held tunnels) needs the proxy change and is the lead's.
 - dart:io / dart:async / dart:convert only, no new import, no records / patterns / `_` wildcards / class modifiers.
 
 ## Language versions and SDKs
@@ -229,7 +265,7 @@ everywhere; bidi round trips 3–12 ms (138–144 ms on the adb-reverse emulator
 
 **Stale adb reverse (proxy down, `adb reverse` left behind)**: adbd accepts the hop and drops it, so grpc-dart sees
 connected-then-lost. h2c: the channel reconnected through 3 tunnels, the breaker tripped
-(`[flutter_intercept] gRPC to 10.0.2.2:<port> goes direct for 30 s …`) and all h2c calls succeeded (unary 189 ms).
+(the then note `[flutter_intercept] gRPC to 10.0.2.2:<port> goes direct for 30 s …`) and all h2c calls succeeded (unary 189 ms).
 TLS (another authority, one connection): `grpc_tls ERR … code: 14 … HandshakeException: Connection terminated during
 handshake` once; fine again after `adb reverse --remove`. The extension removes its adb reverse at session end, so
 this needs a crash; plain HTTP already fails in that state (CONTRACTS §2).
@@ -245,7 +281,7 @@ off by design (§16.1).
 
 1. §1: replace the template with `scripts/e2e/templates/entry_v6.dart.tmpl` (the generator test turns the §1
    comparison on once §1 contains `_installIO`).
-2. §16.1 breaker wording: "a connect to an authority that already had 3 tunnels in the last 2 s goes direct, and so
+2. §16.1 breaker wording (§16.8 adds the report): "a connect to an authority that already had 3 tunnels in the last 2 s goes direct, and so
    does that authority for 30 s" (what is built and tested).
 3. §16.1: the connect-timeout header carries the time left of the app's `connectTimeout` after the hop, not the
    original value.

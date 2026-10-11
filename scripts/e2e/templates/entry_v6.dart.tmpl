@@ -468,6 +468,31 @@ String _grpcProxyAuthorization() {
   return 'Proxy-Authorization: Basic ${base64Encode(utf8.encode(_proxyAddress.substring(0, at)))}\r\n';
 }
 
+// Tells the proxy that the breaker sent this authority direct (CONTRACTS §16.8): one more connection that carries
+// only a `breaker` head, then is closed. Best effort: never awaited by the app's connect, errors swallowed.
+void _grpcBreakerReport(String authority) {
+  Zone.root.run(() {
+    try {
+      final head = 'CONNECT $authority HTTP/1.1\r\n'
+          'Host: $authority\r\n'
+          'Flutter-Intercept-Tunnel: breaker\r\n'
+          '${_grpcProxyAuthorization()}'
+          '\r\n';
+      final proxyHost = _grpcProxyHost();
+      final proxyPort = _grpcProxyPort();
+      IOOverrides.runWithIOOverrides(
+              () => Socket.connect(proxyHost, proxyPort, timeout: _grpcHopTimeout), _ioPlain!)
+          .then((Socket socket) {
+        socket.done.then((Object? v) => null, onError: (Object e) => null);
+        socket.add(utf8.encode(head));
+        return socket.flush().whenComplete(socket.destroy);
+      }).then((Object? v) => null, onError: (Object e) => null);
+    } catch (_) {
+      // Malformed proxy define: nothing to report to.
+    }
+  });
+}
+
 Future<Socket> _grpcTunnel(dynamic host, int port, dynamic sourceAddress, int sourcePort, Duration? timeout) async {
   final target = host is InternetAddress ? host.address : '$host';
   final authority = target.contains(':') && !target.startsWith('[') ? '[$target]:$port' : '$target:$port';
@@ -478,7 +503,9 @@ Future<Socket> _grpcTunnel(dynamic host, int port, dynamic sourceAddress, int so
   if (recent.length >= _grpcBurstTunnels) {
     recent.clear();
     _grpcDirectUntil[authority] = now + _grpcDirectMs;
-    _note('gRPC to $authority goes direct for 30 s ($_grpcBurstTunnels connections through the proxy within 2 s)');
+    _note("gRPC connections to $authority kept closing, so the app connects directly for 30 s — Flutter Intercept "
+        "rules and network simulation don't apply to them meanwhile.");
+    _grpcBreakerReport(authority);
     return _grpcDirect(host, port, sourceAddress, sourcePort, timeout);
   }
   final hop = timeout != null && timeout < _grpcHopTimeout ? timeout : _grpcHopTimeout;

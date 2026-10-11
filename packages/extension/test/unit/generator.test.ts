@@ -537,6 +537,13 @@ describe('template v6: gRPC hook (static)', () => {
     expect(ENTRY_TEMPLATE).toContain('const _grpcBurstTunnels = 3;\nconst _grpcBurstMs = 2000;\nconst _grpcDirectMs = 30000;\n');
   });
 
+  it('breaker report (§16.8): its own head, not awaited by the app connect, errors swallowed', () => {
+    expect(ENTRY_TEMPLATE).toContain("          'Flutter-Intercept-Tunnel: breaker\\r\\n'\n          '${_grpcProxyAuthorization()}'\n");
+    expect(ENTRY_TEMPLATE).toContain('    _grpcBreakerReport(authority);\n    return _grpcDirect(host, port, sourceAddress, sourcePort, timeout);\n');
+    expect(ENTRY_TEMPLATE).not.toMatch(/await _grpcBreakerReport/);
+    expect(ENTRY_TEMPLATE).toContain('}).then((Object? v) => null, onError: (Object e) => null);');
+  });
+
   it('grpcDefines: the define only when the setting is off', () => {
     expect(GRPC_DEFINE).toBe('FLUTTER_INTERCEPT_GRPC');
     expect(grpcDefines(undefined)).toEqual([]);
@@ -750,15 +757,51 @@ describe.skipIf(!hasDart)('template v6: gRPC connects (real dart)', () => {
     expect(out).not.toContain('[flutter_intercept]');
   }, 60_000);
 
-  it('circuit breaker: after 3 tunnels to one authority within 2 s it goes direct (one note)', async () => {
+  const breakerNote = /\[flutter_intercept\] gRPC connections to localhost:\d+ kept closing, so the app connects directly for 30 s — Flutter Intercept rules and network simulation don't apply to them meanwhile\./g;
+
+  it('circuit breaker: after 3 tunnels to one authority within 2 s it goes direct (one note, one breaker report, §16.8)', async () => {
     heads.length = 0;
     const { out } = await runApp([proxyDefine()], 'grpc', 'localhost', String(targetPort), '-', '6');
     expect(routes(out)).toEqual(['proxy', 'proxy', 'proxy', 'target', 'target', 'target']);
-    expect(out.match(/\[flutter_intercept\] gRPC to localhost:\d+ goes direct for 30 s/g)).toHaveLength(1);
+    expect(out.match(breakerNote)).toHaveLength(1);
+    // The breaker report never delays the app's direct connect.
+    for (const m of out.matchAll(/CONNECTED \d+ ms=(\d+)/g)) expect(Number(m[1])).toBeLessThan(500);
+    await sleepMs(200);
+    const tunnel = `CONNECT localhost:${targetPort} HTTP/1.1\r\nHost: localhost:${targetPort}\r\nFlutter-Intercept-Tunnel: silent\r\n\r\n`;
+    const report = `CONNECT localhost:${targetPort} HTTP/1.1\r\nHost: localhost:${targetPort}\r\nFlutter-Intercept-Tunnel: breaker\r\n\r\n`;
+    expect(heads.map((h) => h.head)).toEqual([tunnel, tunnel, tunnel, report]);
+    expect(heads[3].rest.length).toBe(0);
     // Another authority is not affected.
     heads.length = 0;
     const other = await runApp([proxyDefine()], 'grpc', 'v4', String(targetPort), '-', '2');
     expect(routes(other.out)).toEqual(['proxy', 'proxy']);
+  }, 60_000);
+
+  it('breaker report carries Proxy-Authorization in LAN mode (user:token@)', async () => {
+    heads.length = 0;
+    const tok = 'lan-token_XYZ';
+    await runApp([`-DFLUTTER_INTERCEPT_PROXY=flutter-intercept:${tok}@127.0.0.1:${proxyPort}`], 'grpc', 'localhost', String(targetPort), '-', '4');
+    await sleepMs(200);
+    const basic = Buffer.from(`flutter-intercept:${tok}`).toString('base64');
+    expect(heads.map((h) => h.head).filter((h) => h.includes('breaker'))).toEqual([
+      `CONNECT localhost:${targetPort} HTTP/1.1\r\nHost: localhost:${targetPort}\r\nFlutter-Intercept-Tunnel: breaker\r\nProxy-Authorization: Basic ${basic}\r\n\r\n`,
+    ]);
+  }, 60_000);
+
+  it('breaker report with the proxy gone: no error reaches the app, the connect goes direct at once', async () => {
+    // A proxy that stops listening after the third tunnel: the breaker trips, the report is refused.
+    let n = 0;
+    const flaky: net.Server = net.createServer((s) => {
+      s.on('error', () => undefined);
+      s.resume();
+      if (++n === 3) flaky.close();
+    });
+    const flakyPort = await listen(flaky);
+    const { out } = await runApp([`-DFLUTTER_INTERCEPT_PROXY=127.0.0.1:${flakyPort}`], 'grpc', 'localhost', String(targetPort), '-', '5');
+    expect(routes(out)).toEqual([String(flakyPort), String(flakyPort), String(flakyPort), 'target', 'target']);
+    expect(out).toContain('DONE');
+    expect(out).not.toMatch(/Unhandled|SocketException|Error/);
+    expect(out.match(breakerNote)).toHaveLength(1);
   }, 60_000);
 });
 

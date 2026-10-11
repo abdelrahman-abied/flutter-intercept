@@ -40,7 +40,8 @@
 // up=<bytes> down=<bytes>`, `PROXY_SILENT_ERR <authority> <error>`.
 //
 // Greppable log lines: PROXY_READY, PROXY_REQ, PROXY_EDIT, PROXY_PASS,
-// PROXY_MOCK, PROXY_BLOCK, PROXY_ERR, PROXY_TRACE, PROXY_SILENT*.
+// PROXY_MOCK, PROXY_BLOCK, PROXY_ERR, PROXY_TRACE, PROXY_SILENT*, PROXY_BREAKER <authority> (the entry's
+// breaker report, CONTRACTS §16.8: closed without a reply).
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -241,6 +242,12 @@ void _accept(Socket client, int tlsPort, int plainPort) {
       client.add(latin1.encode('HTTP/1.1 407 Proxy Authentication Required\r\n'
           'Proxy-Authenticate: Basic realm="flutter-intercept"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'));
       await client.flush().catchError((_) {});
+      client.destroy();
+      return;
+    }
+    if (isConnect && _header(head.substring(0, end), 'flutter-intercept-tunnel')?.toLowerCase() == 'breaker') {
+      // CONTRACTS §16.8: the entry's breaker report (no reply, nothing relayed).
+      log('PROXY_BREAKER ${head.substring(8, head.indexOf(' ', 8))}');
       client.destroy();
       return;
     }
