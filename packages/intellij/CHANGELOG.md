@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.1 (preview)
+
+- Fixed the plugin icon on the JetBrains Marketplace and in the Plugins settings (it showed as a small square).
+
 ## 0.9.0 (preview)
 
 - First version for Android Studio 2026.2+ and IntelliJ IDEA with the Flutter plugin: the traffic view, rules,
