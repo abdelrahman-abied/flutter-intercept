@@ -45,8 +45,9 @@ export interface Exchange {
   viaLan?: true;
   // CONTRACTS §11 (v0.5.0)
   /** absent = plain HTTP. websocket = an upgraded connection; sse = a text/event-stream response.
-   * tunnel (CONTRACTS §14.2) = a TLS connection passed through undecrypted (`tlsPassthrough` host): no headers/bodies. */
-  kind?: 'websocket' | 'sse' | 'tunnel';
+   * tunnel (CONTRACTS §14.2) = a TLS connection passed through undecrypted (`tlsPassthrough` host): no headers/bodies.
+   * grpc (CONTRACTS §16.2) = one gRPC call over HTTP/2; its messages are `frames` of kind `message`. */
+  kind?: 'websocket' | 'sse' | 'tunnel' | 'grpc';
   /** WebSocket messages / SSE events, oldest first; the newest `maxFramesPerExchange` are kept. */
   frames?: Frame[];
   /** Frames dropped (oldest) beyond the cap. */
@@ -72,6 +73,33 @@ export interface Exchange {
   tunnelBytes?: { sent: number; received: number };
   /** A client certificate was presented upstream (mTLS, CONTRACTS §14.3): the configured host pattern, never the key. */
   clientCertificate?: string;
+  // CONTRACTS §16 (v0.10.0)
+  /** kind `grpc`: service, method, status, message counts. */
+  grpc?: GrpcInfo;
+  /** HTTP/2 trailers (kind `grpc`: `grpc-status`, `grpc-message`, custom metadata). */
+  responseTrailers?: Record<string, string | string[]>;
+  /** kind `tunnel`: a gRPC connection over TLS passed through undecrypted (host not in `grpcDecryptHosts`). */
+  grpcTunnel?: true;
+}
+
+/** CONTRACTS §16.2: one gRPC call. */
+export interface GrpcInfo {
+  service: string;                 // pkg.Service
+  method: string;                  // Method
+  /** `grpc-status` from the trailers (or a trailers-only response); absent while open or after a reset. */
+  statusCode?: number;
+  /** `grpc-message`, percent-decoded. */
+  statusMessage?: string;
+  /** Response had no body and no separate trailers (status in the headers frame). */
+  trailersOnly?: true;
+  /** `grpc-encoding` of the request / response messages (e.g. `gzip`), when not identity. */
+  requestEncoding?: string;
+  responseEncoding?: string;
+  /** Messages each way, counted past the frame cap. */
+  messagesSent: number;
+  messagesReceived: number;
+  /** From `grpc-timeout`, in ms. */
+  deadlineMs?: number;
 }
 
 /**
@@ -101,7 +129,7 @@ export interface Timings {
 export interface Frame {
   dir: 'send' | 'receive';         // send = app → server
   at: number;                      // epoch ms
-  kind: 'text' | 'binary' | 'ping' | 'pong' | 'close' | 'event'; // event = one SSE event
+  kind: 'text' | 'binary' | 'ping' | 'pong' | 'close' | 'event' | 'message'; // event = one SSE event; message = one gRPC message (CONTRACTS §16.2)
   text?: string;                   // text / event data, ≤ 64 KB (then `truncated`)
   base64?: string;                 // binary, ≤ 64 KB
   size: number;                    // full payload bytes
@@ -109,6 +137,7 @@ export interface Frame {
   event?: string;                  // SSE `event:` name
   id?: string;                     // SSE `id:`
   closeCode?: number;              // close frames
+  compressed?: true;               // gRPC message sent compressed (base64/size are the decompressed bytes)
 }
 
 export interface GraphqlInfo {
@@ -178,7 +207,13 @@ export type RuleAction =
    * Run JavaScript hooks (`onRequest` / `onResponse`, see ScriptRequest) on matching traffic. `code` is the
    * source; with `file` (workspace-relative `.js`) the host reads the file into `code`, like `mock.bodyFile`.
    */
-  | { kind: 'script'; code: string; file?: string };
+  | { kind: 'script'; code: string; file?: string }
+  // CONTRACTS §16.2 (v0.10.0)
+  /** Answer a gRPC call locally: headers, `messages` (base64 protobuf payloads) `gapMs` apart, then the status. */
+  | { kind: 'grpcMock'; code?: number; message?: string; messages?: string[];
+      /** Host-only: JSON messages the host encodes into `messages` with the app's schema (like `mock.bodyFile`). */
+      messagesJson?: unknown[];
+      headers?: Record<string, string>; trailers?: Record<string, string>; delayMs?: number; gapMs?: number };
 
 export interface SequenceStep {
   /** Any action except `sequence`, `breakpoint` and `script`; `{kind:'passthrough'}` = the real server. */
@@ -303,6 +338,8 @@ export interface InterceptProxyOptions {
   tlsPassthrough?: string[];
   /** CONTRACTS §14.3: client certificates presented to matching servers (mTLS). */
   clientCertificates?: ClientCertificate[];
+  /** CONTRACTS §16.2: hosts (globs) whose TLS gRPC silent tunnels are decrypted (the app trusts our CA). */
+  grpcDecryptHosts?: string[];
 }
 
 /** CONTRACTS §14.3: one client certificate for upstream mTLS. Key material never leaves the proxy (not in exchanges / events). */

@@ -197,3 +197,16 @@ inside the IDE through the Flutter plugin's embedded browser), `verifyPlugin` Co
 docs/REVIEW-9.md, all findings fixed. Not verified on hardware: the plugin on the Android emulator inside the IDE,
 JCEF in IntelliJ IDEA, physical iPhones.
 
+
+
+## v0.10.0 — gRPC (started 2026-10-11, branch `feature/0.10.0`)
+Contract: CONTRACTS §16. Spike: docs/spikes/grpc.md. Owner decision: TLS gRPC with default credentials = metadata only
+(undecrypted tunnel); full view for h2c and `flutterIntercept.grpc.decryptHosts`.
+| Agent | Owns |
+|---|---|
+| P proxy | silent tunnels, `http2: 'fallback'`, gRPC relay + upstream sessions, framing / gzip, gRPC rules (`grpcMock`, block, faults, throttle, sequence), self-check, `setGrpcDecryptHosts` — `packages/proxy/**` except `types.ts` |
+| D dart entry | template v6 (`IOOverrides` hook, silent CONNECT, breaker), golden tests, demo gRPC screen + test server, device runs — `packages/extension/src/entry/**`, `samples/demo_app/**` (never `ios/Runner.xcodeproj/project.pbxproj`), `scripts/e2e/**`, `test/integration/suite/devices.ts`, docs/spikes/template-v6.md |
+| S schema | `.pbgrpc.dart` / `.pb.dart` / `.pbenum.dart` parser, decode / raw decode / encode / skeleton — `packages/extension/src/grpc/**` except `types.ts` |
+| H host + agent | settings → proxy, schema service, controller `decodeGrpc` / grpcMock from exchange, agent tools + redaction, HAR export, notify policy — `src/agent/**`, `src/ui/controller.ts`, `src/proxyHost.ts`, `src/export/**`, `src/notify/**`, `test/integration/suite/agent.ts` |
+| W webview | gRPC rows, Messages tab, trailers, filter, grpcMock rule form, status banner — `packages/webview/**` except `protocol.ts` |
+| lead | contract, types, `extension.ts`, extension `package.json` (settings, languageModelTools), sidecar / plugin / CLI settings, docs, E2E, review |

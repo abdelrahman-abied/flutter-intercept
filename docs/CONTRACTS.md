@@ -1557,3 +1557,145 @@ exchanges it for an `HttpOnly; SameSite=Strict; Path=/` session cookie and redir
   `rules/createPolicy.ts` in both hosts. A physical iPhone's proxy value is passed with `--dart-define-from-file`
   (0600 file outside the project), not `--dart-define`, in both hosts.
 
+
+
+## 16. v0.10.0 — gRPC (2026-10-11)
+
+Goal: see, mock and fault the app's **gRPC** calls (grpc-dart, plus connectrpc's h2c transport) with zero app code —
+[devtools#2044](https://github.com/flutter/devtools/issues/2044), the last ❌ row of ROADMAP §2. Spike:
+docs/spikes/grpc.md (read it first: measured behaviour, code that worked, risks). Plan and owners: docs/PLAN.md
+"v0.10.0". Types already in code: `packages/proxy/src/types.ts` (`Exchange.kind 'grpc'`, `grpc`, `responseTrailers`,
+`grpcTunnel`, `Frame.kind 'message'` + `compressed`, `RuleAction grpcMock`, `GrpcInfo`, `InterceptProxyOptions.grpcDecryptHosts`),
+`packages/webview/src/protocol.ts` (`decodeGrpc` / `grpcDecoded`, `Status.grpc`, `GrpcDecoded*`),
+`packages/extension/src/grpc/types.ts` (schema registry), `packages/sidecar/src/types.ts` (`SidecarSettings.grpc`).
+
+**Owner decision (2026-10-11): TLS gRPC with the app's default credentials is shown as metadata only** (an
+undecrypted tunnel). Contents are shown for h2c, and for TLS hosts the user lists in `flutterIntercept.grpc.decryptHosts`
+(apps that trust our CA in debug: pinned to it, or `onBadCertificate`). No trust-store changes on any device.
+
+### 16.1 Entry template v6 (amends §1, §13.3)
+v5 plus a `Socket.connect` hook, dart:io / dart:async / dart:convert only:
+- Installed from `_install()` (main isolate and `flutterInterceptInstall()` for background isolates), as
+  **`IOOverrides.global` only — never in the zone** (a zone install shadows the app's own later `IOOverrides.global`).
+  Not a subclass (`IOOverrides` is `abstract base`): the instance is `IOOverrides.runZoned(() => IOOverrides.current!,
+  socketConnect: …)`. The previous global (if any) is kept for direct connects.
+- Redirects **only** connects whose `StackTrace.current` contains `package:grpc/src/client/http2_connection.dart` or
+  `package:connectrpc/src/http2/connection.dart`; Unix-domain addresses and everything else go direct through the
+  previous / plain overrides. `--obfuscate` / `--split-debug-info` builds lose the frame → direct (documented).
+- Off when `--dart-define=FLUTTER_INTERCEPT_GRPC=0` (setting `flutterIntercept.grpc.enabled: false`) and when no
+  proxy define is present (plain Dart sessions keep the `localhost:<port>` default like v5).
+- **Silent CONNECT**: connect to the proxy address from `FLUTTER_INTERCEPT_PROXY` (`[user:token@]host:port`; hop
+  timeout 2 s or the app's `connectTimeout` if shorter), write exactly
+  `CONNECT <authority> HTTP/1.1\r\nHost: <authority>\r\nFlutter-Intercept-Tunnel: silent\r\n`
+  `[Flutter-Intercept-Connect-Timeout: <ms>\r\n][Proxy-Authorization: Basic <b64(user:token)>\r\n]\r\n` and return the
+  socket at once (no reply is ever read). `<authority>` = `host:port`, IPv6 in brackets, `InternetAddress` → its
+  `address`. Proxy unreachable → direct connect with the remaining timeout.
+- **Circuit breaker** (spike: reconnect storms): ≥ 3 tunnels to one authority within 2 s → that authority goes direct
+  for 30 s, per isolate.
+- `docs/spikes/template-v6.md` records device results (Android emulator, iOS simulator, macOS, plain Dart) and Dart
+  SDK range; the generator's golden tests cover v6.
+
+### 16.2 Proxy (amends §3, §14.2)
+- mockttp runs with `http2: 'fallback'` (HTTP/1.1 clients and Chrome unchanged; `[grpc-exp, h2]` gets `h2`).
+- **Silent tunnels** (`onConnect`): a CONNECT carrying `Flutter-Intercept-Tunnel: silent` (case-insensitive) gets **no
+  reply**. Same checks as any CONNECT (LAN gate token / pinned peer, passthrough hosts, block / fault rules on the
+  CONNECT); the marker and connect-timeout headers never go upstream. The head and the first payload may share a chunk
+  (split at `\r\n\r\n`). Then by the first payload byte:
+  - `PRI * HTTP/2.0` preface (h2c) → injected into mockttp like its own CONNECT minus the 200 (`LastTunnelAddress`,
+    `LastHopEncrypted = false`, timing symbol, `unshift`, `emit('connection')`).
+  - `0x16` (TLS) and the host matches `grpcDecryptHosts` (and not `tlsPassthrough`) → injected the same way (MITM).
+  - `0x16` otherwise → the §14.2 passthrough tunnel (no reply written): `Exchange {kind: 'tunnel', grpcTunnel: true}`.
+  - anything else → closed, recorded as an `error` tunnel.
+  - Refusals (bad token, SSRF guard) can't be answered on a silent tunnel: close, record, and rely on the entry's
+    breaker. Caps: silent tunnels count toward the LAN gate's connection caps.
+- **gRPC calls**: an HTTP/2 request with `content-type` `application/grpc`, `application/grpc+…` or
+  `application/grpc;…` (not `grpc-web`) is handled by our own `node:http2` relay inside a mockttp step (spike
+  `grpc-relay.js`), never mockttp's passthrough. Exchange: `kind: 'grpc'`, `method: 'POST'`,
+  `url: http(s)://<authority>/<pkg.Service>/<Method>`, request/response headers, `responseTrailers`, `status` = the HTTP
+  status, `grpc: GrpcInfo`, `frames` = one `{kind: 'message'}` frame per length-prefixed message each way (decompressed
+  for `grpc-encoding: gzip` with `compressed: true`; `base64` ≤ 64 KB, `size` = full decompressed size; counting goes on
+  past the frame cap). `state`: `pending` while open, `completed` when trailers arrive (any grpc-status), `aborted` on a
+  client cancel, `error` on a reset without status. Timings as §13.2 (`waitMs` = request headers sent → response
+  headers).
+- **Upstream**: `http2.connect(origin, {createConnection})` over a socket from the existing tunnel upstream path (LAN
+  SSRF guard, upstream proxy, emulator aliases, `rewriteLocalhost`); `https` → TLS with ALPN `h2`, honouring
+  `ignoreUpstreamCertErrors` and client certificates (§14.3); `http` → h2c prior knowledge. Sessions pooled per origin
+  and per LAN gate; GOAWAY / max-concurrent-streams / idle 30 s handled. `Flutter-Intercept-Connect-Timeout` honoured
+  (default 30 s, max 60 s). Upstream failure → trailers-only `grpc-status: 14` with
+  `grpc-message: Flutter Intercept: <reason>` (never a bare close). Client cancel → `RST_STREAM CANCEL` upstream;
+  `grpc-timeout` forwarded unchanged.
+- **Rules on gRPC calls** match `method` `POST` and the URL above. Applicable actions: `grpcMock`; `block`
+  (`status` → trailers-only `grpc-status 14`, `grpc-message: Blocked by Flutter Intercept`; `reset` → RST_STREAM);
+  `fault` (`reset` → RST_STREAM INTERNAL_ERROR, `timeout` → no answer until the client gives up, `truncate` → headers +
+  first response message then RST_STREAM, `dns` → trailers-only `14` "DNS lookup failed"); `throttle` and the network
+  profile (latency before the first response bytes, `kbps` / `uploadKbps` pacing each direction, `dropRate` → `14`);
+  `sequence` whose steps use those actions. **Rules with any other action never match a gRPC call** (the next rule is
+  tried). Breakpoints, mutate, rewrite, script, cors, mapRemote and replay don't apply to gRPC in 0.10.
+- `grpcMock` answers locally: `delayMs`, then response headers (`content-type: application/grpc`, plus `headers`), then
+  each of `messages` (base64 protobuf payloads, framed uncompressed) `gapMs` apart, then trailers `grpc-status: code`
+  (default 0), `grpc-message` (percent-encoded), plus `trailers`. `code ≠ 0` with no messages → trailers-only. Pseudo
+  headers, `content-type`, `grpc-status`, `grpc-message` in `headers` / `trailers` are refused by `setRules`. A mock
+  doesn't wait for the client to half-close (bidi). `messagesJson` is resolved by the host before `setRules` (like
+  `bodyFile`); the proxy ignores it.
+- `setGrpcDecryptHosts(hosts) → {hosts, problems}` (same host-pattern rules as `setTlsPassthrough`);
+  `grpcSupport() → {ok: boolean; problem?: string}` from a startup self-check of the mockttp internals used (else
+  silent tunnels with h2c / decrypt fall back to passthrough tunnels and the problem is reported).
+- HTTP/2 traffic that isn't gRPC keeps mockttp's passthrough (known: h2c upstream 502, trailers-only lost) — documented.
+
+### 16.3 Extension: protobuf schema from the app's generated code (`src/grpc/**`, pure, no vscode)
+Like §10.3 (`*.g.dart` is the wire contract), the app's **protoc-generated Dart** is the gRPC contract:
+- `*.pbgrpc.dart`: `ClientMethod<Req, Res>('/pkg.Service/Method', …)` → method path → request / response message
+  types; streaming from the `$createUnaryCall` / `$createStreamingCall` call and `$async.Stream<…>` parameters.
+- `*.pb.dart`: each `$pb.BuilderInfo(... 'Name', package: ... 'pkg', ...)` chain (`a`, `aOS`, `aOB`, `aI`, `aInt64`,
+  `aOM`, `aQM`, `p`, `pc`, `pPS`, `e`, `pc<Enum>`, `m`, `oo`, `hasRequiredFields`, `$pb.PbFieldType.*`) → message
+  fields (number, json name, type, repeated / map / oneof, message or enum type); `*.pbenum.dart` → enum values. The
+  name passed in the builder chain (`_omitFieldNames ? '' : 'x'`) is the JSON name. Nested messages (`Outer_Inner`
+  ↔ `Outer.Inner`).
+- Sources: every workspace folder and the path / hosted packages in `.dart_tool/package_config.json` that contain
+  `*.pbgrpc.dart` (caps: 5000 files, 2 MB each, 50 MB total; no symlinks out of roots; regex / tokenizer only, never
+  executing anything).
+- API (`src/grpc/types.ts`): `loadGrpcSchema(files) → GrpcSchema`; `schema.method(path)`, `schema.message(name)`;
+  `decodeMessage(schema, type, bytes) → {json, unknown?}` (proto3 JSON: int64 as strings, bytes base64, enums by name,
+  unknown fields under `"#<n>"`), `decodeRaw(bytes)` (`protoc --decode_raw` style, field numbers, nested-message and
+  UTF-8 guesses, depth ≤ 32), `encodeMessage(schema, type, json) → bytes` (for mocks; errors name the JSON path),
+  `skeleton(schema, type)` (example JSON with every field). All bounded (≤ 4 MB input, ≤ 100k fields).
+
+### 16.4 Host + agents
+- Settings: `flutterIntercept.grpc.enabled` (boolean, default true; false → define `FLUTTER_INTERCEPT_GRPC=0` and no
+  schema loading) and `flutterIntercept.grpc.decryptHosts` (string[] of host globs, default []). Both in the sidecar
+  settings and the plugin settings page.
+- `ProxyHost.setGrpcDecryptHosts`; `Status.grpc` (enabled, decrypt hosts, proxy problem, schema counts / problems).
+- Schema service: loads on activation and on session start, reloads on `**/*.pb*.dart` changes (debounced), exposes
+  `GrpcSchema` to the controller and agents.
+- Webview: `decodeGrpc {id}` → `grpcDecoded` (schema decode, else raw; each message also as hex ≤ 4 KB);
+  `createRuleFromExchange` with `action: 'grpcMock'` → a mock answering with this call's response messages
+  (`messagesJson` when the schema decodes them, else `messages`) and its status.
+- Agents (redacted as §8: secret-named JSON fields and metadata such as `authorization` → `[redacted]`):
+  - `list_requests` / `wait_for_request` / `assert_traffic`: `kind: "grpc"`; `assert_traffic` `expect.grpcStatus`.
+  - `get_request` on a gRPC call: `grpc`, trailers, decoded messages (first 20 each way, ≤ 64 KB JSON);
+    `get_frames` returns decoded messages.
+  - New `flutter_intercept_add_grpc_mock`: `{url | service+method, code?, message?, messages? (JSON objects, encoded
+    with the schema; base64 strings when no schema), delayMs?, gapMs?, times?, ttlMs?}`.
+  - New `flutter_intercept_get_grpc_schema`: `{method? | message?}` → fields, streaming, skeleton JSON, source file.
+  - `add_block` / `add_sequence` / `simulate_network` apply to gRPC per §16.2.
+- Export: HAR includes gRPC calls (`_grpc` with info, trailers and messages base64); OpenAPI / Postman skip them.
+  Recordings skip gRPC (later). Notifications: a gRPC status other than 0 / 1 (CANCELLED) counts as an error.
+
+### 16.5 Webview
+- Rows: `gRPC` badge, `/pkg.Service/Method`, status column = gRPC code name (OK green, others red), streaming
+  marker, message counts. `grpcTunnel` rows: lock + "gRPC over TLS, not decrypted — add the host to
+  flutterIntercept.grpc.decryptHosts if the app trusts the Flutter Intercept CA in debug".
+- Detail: **Messages** tab (both directions, time offsets, decoded JSON / raw fields / hex via `decodeGrpc`),
+  headers + trailers, timings. Filter language `t:grpc`, `grpc:<code name or number>`.
+- Rules: `grpcMock` form (code, message, messages as JSON list with a skeleton button when the schema knows the
+  type, delay, gap). Status banner for `Status.grpc.problem`.
+
+### 16.6 Sidecar, plugin, CLI (lead)
+`SidecarSettings.grpc`; the plugin settings page (enabled + decrypt hosts); CLI `--grpc-decrypt-host <glob>`
+(repeatable) and `--no-grpc`; the entry define passed in every host.
+
+### 16.7 Security review items
+Silent tunnels: no auth bypass versus normal CONNECT (LAN token, pinned peer, caps), the marker never accepted on
+anything but CONNECT, never forwarded; upstream h2 sessions never shared across LAN gates; connect timeout bounded;
+SSRF guard on every upstream session; parsers (gRPC framing, gzip with a decompression cap, raw protobuf, `.pb.dart`
+tokenizer) bounded; redaction of decoded messages and metadata for agents; `grpcMock` header validation.
