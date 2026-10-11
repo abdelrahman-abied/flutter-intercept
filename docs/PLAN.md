@@ -235,3 +235,14 @@ Contract: CONTRACTS §17. Owner instruction: take every decision in the project'
 | H host + agents + recordings | codec injection, `resume` with `GrpcEdit`, `decodeGrpc.paused`, `.proto` discovery, recordings v3 / replay / diff, agent tools — `src/agent/**`, `src/ui/controller.ts`, `src/proxyHost.ts`, `src/recordings/**`, `src/grpc/service.ts` + `discovery.ts`, `test/integration/suite/agent.ts` |
 | W webview | gRPC pause editor, breakpoint / mutate on gRPC, recordings counts — `packages/webview/**` except `protocol.ts` |
 | lead | contract, types, `extension.ts`, sidecar, CLI, docs, E2E, review |
+
+### v0.11.0 status (2026-10-11)
+gRPC parity: breakpoints with message / status edits, mutate on response messages (host codec), recordings v3 with
+gRPC, same-origin replay and diff, `.proto` files as a schema source. Verified: unit tests (proxy 498, webview 506,
+extension 2038, cli 114, sidecar 38, plugin 95), VS Code integration suites on the packaged VSIX — default 42/42, web
+8/8, devices 20/20 (iOS 26.5 simulator and macOS, incl. the gRPC case K), agent 12/12 checks on macOS incl. the gRPC
+case (breakpoint edit seen by the app, mutate seen, record → replay codes 0/5/0; one run ended with the known
+`stop_app: Canceled`), `verifyPlugin` Compatible. Independent review: docs/REVIEW-11.md, all findings fixed. During the
+runs the machine lost its internet connection once and the Android emulator hung (adb unresponsive); its agent and
+device cases were not rerun for 0.11 (0.10 passed them). Not verified: Android emulator for 0.11, physical iPhone,
+connectrpc against a real app, mTLS on gRPC upstreams, IPv6 targets, Edge.
