@@ -256,3 +256,13 @@ Contract: CONTRACTS §18. Owner instruction: take every decision in the project'
 | H host + agents | rule validation + shared-rule approval for gRPC rewrites / scripts / map remote, resend / edit & resend (messagesJson encoding), script template with gRPC hooks, agent tools — `src/agent/**`, `src/ui/controller.ts`, `src/proxyHost.ts`, `src/rules/**`, `src/grpc/service.ts`, their tests, `test/integration/suite/agent.ts` |
 | W webview | rewrite trailers fields, scripts / map remote / resend / edit & resend on gRPC rows, notes removed — `packages/webview/**` except `protocol.ts` |
 | lead | contract, types, wiring, docs, E2E, review |
+
+### v0.12.0 status (2026-10-11)
+gRPC tools complete: rewrite of gRPC metadata and trailers, script hooks `onGrpcMessage` / `onGrpcStatus`, map remote
+for gRPC, resend / edit & resend of gRPC calls (rules, the network profile and replay apply). Verified: unit tests (proxy
+517, webview 519, extension 2056, cli 114, sidecar 38, plugin 95), VS Code integration suites on the packaged VSIX —
+default 42/42, agent 12/12 on macOS incl. the gRPC case (rewrite seen by the app, resend decoded OK), web 8/8, devices
+20/20 (iOS 26.5 simulator and macOS); `verifyPlugin` Compatible. Independent review: docs/REVIEW-12.md, all findings
+fixed (MED: gRPC relay loops — own listeners and resolved addresses refused; no marker reaches real servers; the
+external-forwarder loop stays a documented limit). Not verified: Android emulator for 0.11/0.12, physical iPhone,
+connectrpc against a real app, mTLS on gRPC upstreams, IPv6 targets, Edge.
