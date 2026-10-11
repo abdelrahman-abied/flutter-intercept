@@ -32,7 +32,8 @@ Certificate Passphrase. Settings live in **Settings → Tools → Flutter Interc
 ## gRPC
 
 grpc-dart calls are intercepted like HTTP requests, with each message decoded from your app's generated `*.pb.dart`
-code. Settings are in **Settings → Tools → Flutter Intercept → gRPC**:
+code, or from `.proto` files in the project when the generated code isn't there. Settings are in
+**Settings → Tools → Flutter Intercept → gRPC**:
 
 - **Intercept gRPC calls (grpc-dart, connectrpc)**: on by default. Off, the app's gRPC calls connect directly.
   Applies to the next run.
@@ -45,7 +46,12 @@ To use it:
    counts; **Messages** has every message, decoded.
 2. **Mock this** on a call creates a gRPC mock with its messages and status; Block, faults, throttling and the network
    profiles apply too.
-3. For gRPC over TLS, make debug builds trust the CA (**Tools → Flutter Intercept → Save CA Certificate**, or an
+3. **Break on this** pauses each message and the end of the call: edit the message as JSON (or base64), drop it,
+   change the final status and trailers, or abort the call. Right-click a field of a decoded response message to
+   change it in the next responses (a **Mutate JSON** rule).
+4. **Recordings** save gRPC calls with their messages; replay answers them without the server, and **Diff selected**
+   compares their status, message counts and response shape.
+5. For gRPC over TLS, make debug builds trust the CA (**Tools → Flutter Intercept → Save CA Certificate**, or an
    `onBadCertificate` callback behind `kDebugMode`) and add the host above.
 
 The VS Code tutorials cover it step by step, starting at

@@ -49,7 +49,7 @@ Intercept skips all of that:
 | **Model check** | Each JSON response is checked against your json_serializable / freezed models; fields that would crash `fromJson` are flagged in your model file. |
 | **Break a field** | Make a field null, remove it or change it in real responses to reproduce crashes. |
 | **Generate code** | Dart models and fixture tests from recorded traffic. |
-| **gRPC** | grpc-dart calls with their method, gRPC status, trailers and every message, decoded with your app's own generated `*.pb.dart` code (no `.proto` needed). Mock them, block them, fail them or slow them down. gRPC over TLS is listed undecrypted unless the app trusts the CA in debug builds. |
+| **gRPC** | grpc-dart calls with their method, gRPC status, trailers and every message, decoded with your app's own generated `*.pb.dart` code (no `.proto` needed, but `.proto` files in the workspace are read too). Pause and edit each message and the final status, change fields in responses, mock, block, fail or slow them down, and record, replay and diff them. gRPC over TLS is listed undecrypted unless the app trusts the CA in debug builds. |
 | **Web, WebSockets, SSE, GraphQL** | Flutter Web on Chrome (with CORS help), WebSocket messages, SSE events, GraphQL operation names. |
 | **Native clients** | cupertino_http / cronet_http requests listed read-only; a banner for background isolates. |
 | **Team rules & scenarios** | Rules shared through the repo (with an approval gate), sequences like "500 then 200", expire-token tests, auth-flow timelines. |
@@ -179,7 +179,7 @@ These aren't intercepted:
 - gRPC from obfuscated (`--obfuscate` / `--split-debug-info`) builds, apps that replace `IOOverrides.global`,
   connectrpc over TLS and custom gRPC transport connectors. gRPC-Web is ordinary HTTP.
 - The contents of gRPC over TLS, unless the app trusts the CA in debug builds (listed as an encrypted connection).
-  Breakpoints, rewrites, scripts, replay and recordings don't apply to gRPC yet.
+  Rewrites, scripts and Map Remote don't apply to gRPC calls.
 
 Hosts the app pins itself (Dio's `validateCertificate`) need `flutterIntercept.tlsPassthrough`; servers that
 require a client certificate need `flutterIntercept.clientCertificates`. See the full

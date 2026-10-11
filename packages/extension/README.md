@@ -7,7 +7,8 @@ and the traffic shows up.
 ![Traffic panel: live list of requests with a JSON response open](media/screenshots/traffic-dark.png)
 
 - Works with **Dio**, **package:http** and plain **`HttpClient`**, which covers anything built on `dart:io`.
-- **gRPC** calls from grpc-dart are intercepted too, each message decoded with your app's own generated code.
+- **gRPC** calls from grpc-dart are intercepted too, each message decoded with your app's own generated code (or
+  your `.proto` files). Pause, edit, mock, record and replay them like HTTP requests.
 - HTTPS works too, and you don't install a certificate on the device, simulator or Mac.
 - Your app's code is never changed. Nothing is added to `pubspec.yaml`, and `flutter build` / CI never see the
   tool.
@@ -52,7 +53,8 @@ and the traffic shows up.
 
 **Break a field on purpose**
 - Right-click a field in a response: **Make null in next responses**, **Remove from next responses** or
-  **Change value…**. Or add a **Mutate JSON** rule. The real response reaches your app with that change.
+  **Change value…**. Or add a **Mutate JSON** rule. The real response reaches your app with that change. This works
+  on decoded gRPC response messages too.
 
 **Generate code**
 - **Generate Dart model** (freezed, json_serializable or plain, matching your project) from every recorded
@@ -69,9 +71,14 @@ and the traffic shows up.
   method (`/shop.v1.CartService/AddItem`), the gRPC status (`OK`, `14 UNAVAILABLE`…), trailers, streaming and
   message counts.
 - A **Messages** tab shows every message both ways, decoded to JSON with your app's own generated `*.pb.dart` code
-  (no `.proto` files needed), or as raw field numbers without it.
+  or the `.proto` files in your workspace, or as raw field numbers without either.
 - **gRPC mock** rules answer a method with your messages and status; **Mock this** on a call starts from its real
   response. Block, fault, throttle, network profiles and sequences work on gRPC calls too.
+- **Breakpoints** pause each message both ways and the end of the call (status and trailers): edit the message as
+  JSON, drop it, change the final status, or abort the call. **Mutate JSON** rules change fields in real response
+  messages.
+- **Recordings** save gRPC calls with their messages; replay answers them without the server, and a diff compares
+  their status, message counts and response shape.
 - gRPC over TLS is listed as an undecrypted connection, unless your app trusts Flutter Intercept's CA in debug builds
   and you list the host in `flutterIntercept.grpc.decryptHosts`.
 
@@ -124,6 +131,8 @@ and the traffic shows up.
   **Resume with edits**, **Resume unchanged** or **Abort**.
 - JSON bodies are validated as you type.
 - A countdown shows when an untouched breakpoint auto-resumes (after 5 minutes).
+- On gRPC calls each message pauses on its own, and so does the end of the call
+  ([details](#pause-and-edit-grpc-messages)).
 
 ![Paused response with an editable JSON body and Resume/Abort actions](media/screenshots/paused-response-dark.png)
 
@@ -249,9 +258,9 @@ Cursor, Windsurf, and any client that speaks MCP (Model Context Protocol).
 | List the rules in priority order | `list_rules` |
 | Answer matching requests with a mock (status, headers, body, delay) | `add_mock` |
 | Block matching requests | `add_block` |
-| Pause matching requests or responses | `add_breakpoint` |
+| Pause matching requests or responses (gRPC: each message and the end of the call) | `add_breakpoint` |
 | Remove a rule | `remove_rule` |
-| Resume a paused request, optionally with edits, or abort it | `resume_request`, `abort_request` |
+| Resume a paused request or gRPC message, optionally with edits, or abort it | `resume_request`, `abort_request` |
 | Clear the recorded traffic | `clear_requests` |
 | Save the traffic as a HAR file in `.dart_tool/flutter_intercept/exports/` | `export_har` |
 | Launch the app through Dart-Code, stop it, or hot-restart it | `launch_app`, `stop_app`, `hot_restart` |
@@ -262,7 +271,7 @@ Cursor, Windsurf, and any client that speaks MCP (Model Context Protocol).
 | Check responses against your Dart models | `check_contract` |
 | Generate a Dart model or a fixture test from recorded traffic | `generate_model`, `generate_fixture_test` |
 | Check traffic with pass/fail expectations (status, count, order, JSON paths, duration) | `assert_traffic` |
-| Change fields in real JSON responses (null, remove, set) | `add_mutation` |
+| Change fields in real JSON responses and gRPC response messages (null, remove, set) | `add_mutation` |
 | Read WebSocket messages and SSE events | `get_frames` |
 | Add CORS headers to a real API while developing (Flutter Web) | `add_cors_rule` |
 | Save, list, replay or compare traffic recordings | `save_recording`, `list_recordings`, `replay_recording`, `diff_recordings` |
@@ -284,7 +293,10 @@ Over MCP there are also resources (`intercept://exchange/{id}`, `intercept://pau
 
 gRPC calls are `kind: "grpc"` in `list_requests`, `wait_for_request` and `assert_traffic`; `get_request` and
 `get_frames` return their messages decoded, and `assert_traffic` checks the result with `expect.grpcStatus` (gRPC
-errors arrive with HTTP status 200).
+errors arrive with HTTP status 200). A breakpoint on a gRPC call pauses each message and the end of the call:
+`list_paused` and `get_request` show `grpcPause` (the held message decoded and redacted, or the status and trailers),
+and `resume_request` takes `grpc: {messageJson | message | drop}` for a message or `grpc: {status, trailers}` for the
+end of the call. `add_mutation` changes fields in gRPC response messages, and the recording tools include gRPC calls.
 
 In VS Code the tools are named `flutter_intercept_<tool>`; over MCP they use the names above.
 
@@ -438,26 +450,30 @@ endpoints.
 
 43. [See gRPC calls and their messages](#see-grpc-calls-and-their-messages)
 44. [Mock a gRPC call](#mock-a-grpc-call)
-45. [Fail, slow down or block gRPC calls](#fail-slow-down-or-block-grpc-calls)
-46. [See inside gRPC over TLS](#see-inside-grpc-over-tls)
+45. [Pause and edit gRPC messages](#pause-and-edit-grpc-messages)
+46. [Change fields in gRPC responses](#change-fields-in-grpc-responses)
+47. [Record, replay and compare gRPC calls](#record-replay-and-compare-grpc-calls)
+48. [Read gRPC messages with .proto files](#read-grpc-messages-with-proto-files)
+49. [Fail, slow down or block gRPC calls](#fail-slow-down-or-block-grpc-calls)
+50. [See inside gRPC over TLS](#see-inside-grpc-over-tls)
 
 **Devices**
 
-47. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
-48. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
-49. [Run on a physical iPhone](#run-on-a-physical-iphone)
-50. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
+51. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
+52. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
+53. [Run on a physical iPhone](#run-on-a-physical-iphone)
+54. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
 
 **AI agents**
 
-51. [Connect an AI agent](#connect-an-ai-agent)
-52. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
-53. [Control what agents can see and do](#control-what-agents-can-see-and-do)
-54. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
-55. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
-56. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
-57. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
-58. [Let agents work with gRPC calls](#let-agents-work-with-grpc-calls)
+55. [Connect an AI agent](#connect-an-ai-agent)
+56. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
+57. [Control what agents can see and do](#control-what-agents-can-see-and-do)
+58. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
+59. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
+60. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
+61. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
+62. [Let agents work with gRPC calls](#let-agents-work-with-grpc-calls)
 
 ### Run your app with interception
 
@@ -905,8 +921,9 @@ You'll save a session and later run the app against it, even offline.
 
 **Tip:** recordings live in `.dart_tool/flutter_intercept/recordings/`, which git ignores by default. An
 unredacted recording is refused where git would track it. Finished WebSocket and SSE streams are saved with their
-messages and replayed by a stand-in server in the same order and timing; gRPC calls, native-client traffic and
-tunnels aren't saved. Your rules still apply before the recording.
+messages and replayed by a stand-in server in the same order and timing. Finished gRPC calls are saved and
+replayed too ([details](#record-replay-and-compare-grpc-calls)); native-client traffic and tunnels aren't saved.
+Your rules still apply before the recording.
 
 ### Compare two recordings
 
@@ -919,7 +936,8 @@ You'll see what a backend or app change did to the traffic.
 and responses that got much slower.
 
 **Tip:** **Clear selection** unticks both. To delete a recording, click its delete icon and confirm with
-**Delete**; the file is removed from disk.
+**Delete**; the file is removed from disk. gRPC methods are compared as routes of their own, such as
+`gRPC /shop.v1.CartService/AddItem`.
 
 ### Send requests to another server
 
@@ -1175,7 +1193,9 @@ the app's protoc-generated Dart code is in the workspace or one of its packages;
 numbers.
 
 **Tip:** no `.proto` files are needed. The schema comes from your generated `*.pbgrpc.dart`, `*.pb.dart` and
-`*.pbenum.dart` files and is reloaded when they change; the status line says what was found (`gRPC: 12 methods`).
+`*.pbenum.dart` files (and from `.proto` files in the workspace, see
+[Read gRPC messages with .proto files](#read-grpc-messages-with-proto-files)) and is reloaded when they change; the
+status line says what was found (`gRPC: 12 methods`).
 JSON follows proto3 rules: int64 as strings, enums by name, bytes as base64, unknown fields as `"#<number>"`. Filter
 with `kind:grpc` or `grpc:error` (any status but OK). Compressed messages are shown decompressed (**gz**); each
 message keeps up to 64 KB. gRPC over TLS is listed as "gRPC over TLS — not decrypted" instead: see
@@ -1200,6 +1220,93 @@ messages is sent trailers-only, like a real server error. **Extra headers** and 
 **Mock response** rules never match gRPC calls. A gRPC mock can also be a step of a
 [sequence](#answer-successive-requests-differently), for example `UNAVAILABLE` twice, then the real server.
 
+### Pause and edit gRPC messages
+
+You'll hold a gRPC call's messages and its final status, and change them before they arrive.
+
+1. Select a gRPC call and click **Break on this**. The rule pauses the server's side: each response message, then the
+   end of the call (status and trailers). In **Rules**, **Pause request** pauses each message the app sends instead,
+   and **Both** does both.
+2. Make the app call the method again.
+3. The row shows as paused, and the details open on the held message, for example "Paused on message 1 the server
+   sends — before it reaches the app."
+4. Edit it as **JSON (encoded with the app's schema)**, or as **Base64 protobuf** when the schema doesn't decode it.
+   Then click **Resume with edit**, **Resume unchanged**, **Drop message** (it is never delivered; the call goes on)
+   or **Abort** (the call is cancelled both ways and the app sees `CANCELLED`).
+5. After the last response message, the call pauses once more at its end. Change **Status**, **Message** (the
+   `grpc-message`) or the **Trailers**, then resume.
+
+**You should see:** your app receive the edited message and status. In **Messages**, an edited message has an
+**edited** badge and a dropped one a **dropped** badge.
+
+**Tip:** a call has one pause at a time. Messages behind a held one wait, in order, while the other direction keeps
+flowing. Each pause resumes unchanged after 5 minutes, unless the app's deadline fires first (the call is then marked
+aborted). A trailers-only error (a status with no messages) pauses as the end of the call. An edited message is sent
+uncompressed, an unedited one exactly as it arrived. A message over 4 MB isn't paused, and neither is anything beyond
+64 MB of gRPC data held across calls; a note on the call says so.
+
+### Change fields in gRPC responses
+
+You'll let real gRPC responses through with one field changed, to see how your app copes.
+
+1. Select a gRPC call, open **Messages** and pick a message the server sent, in the **JSON** view.
+2. Right-click a field and pick **Make null in next responses**, **Remove from next responses** or
+   **Change value…**, as for [JSON responses](#break-a-field-on-purpose).
+3. Make the app call the method again.
+
+**You should see:** a "Rule added: …" notice with **Undo**, and every response message of that method arriving with
+the change, marked **edited** in **Messages**.
+
+**Tip:** it's a **Mutate JSON** rule whose paths apply to each response message, decoded with your app's schema. The
+JSON follows proto3 rules: int64 values are strings (`"42"`), enums go by name, and a null or removed field reaches the
+app as its default value. It needs the schema: without one, or when a change doesn't fit the field's type, the
+message goes through unchanged and the call notes why. Messages over 1 MB aren't changed, and a call stops being
+changed after 50 MB or 2 seconds of decoding. Request messages aren't changed; use a breakpoint for those.
+
+### Record, replay and compare gRPC calls
+
+You'll save gRPC calls with the rest of the traffic, answer them from the recording, and compare two runs.
+
+1. Run the flow, then **Recordings** → **Save current traffic**. The count includes the gRPC calls (for example
+   "3 gRPC calls"). Every call that ended with a status is saved with its messages, status and trailers.
+2. **Replay…** the recording as in [Record traffic and replay it](#record-traffic-and-replay-it).
+3. To compare, save another recording after a change, tick both and click **Diff selected**.
+
+**You should see:** replayed gRPC rows marked "Replayed from …": the recorded response messages, with their recorded
+gaps (up to 5 s each), then the recorded status and trailers. The server isn't contacted. In the diff, each method is
+a route such as `gRPC /shop.v1.CartService/AddItem`, with status changes (`gRPC OK → UNAVAILABLE`), call and message
+counts per direction, slower responses and, when your schema decodes it on both sides, JSON shape changes of the
+first response message.
+
+**Tip:** a recorded call answers only calls to the same origin (scheme, host and port) and method. Several calls to
+one method are told apart by their first request message; a redacted recording keeps no hash of that message, so its
+calls are answered in recorded order instead. A call whose response message was cut when it was recorded (over 64 KB)
+is saved as incomplete and isn't replayed: it follows **Requests not in the recording**, like calls that aren't in the
+recording at all (**Fail like offline** answers `14 UNAVAILABLE`). Redacting decodes each message with your schema,
+replaces secrets with `[redacted]` and re-encodes it; without a schema, a message becomes zeros of the same size.
+Fields the schema doesn't know are redacted by value only (JWTs, long tokens). Dropped messages aren't saved; edited
+ones are saved as delivered. Recordings with gRPC calls use file format 3, which versions before 0.11 refuse.
+
+### Read gRPC messages with .proto files
+
+You'll get named fields for gRPC messages when the app's generated Dart code isn't in the workspace or its packages.
+
+1. Put the service's `.proto` files, with the files they import, anywhere in a workspace folder, for example
+   `protos/shop/v1/cart.proto`.
+2. Flutter Intercept reads them with the generated code and reloads them when they change.
+3. Make the app call the service and open **Messages**.
+
+**You should see:** JSON with your field names instead of raw field numbers. **Skeleton** in gRPC mocks, JSON edits
+at breakpoints and **Mutate JSON** rules work as with generated code.
+
+**Tip:** when both the generated Dart and a `.proto` file define a message or method, the generated Dart wins: it's
+what the app runs. Supported: proto2, proto3 and editions files with packages, imports, nested messages and enums,
+maps, oneofs, `json_name` and services with streaming methods; options are ignored, and `extensions` and groups are
+skipped with a problem. Imports resolve among the loaded `.proto` files by path suffix, and `google/protobuf/*` types
+are built in. The search skips `node_modules`, `build`, `.dart_tool`, `Pods` and `.git`, and reads up to 2000 `.proto`
+files of up to 2 MB each, with a time budget per file; a name longer than 512 characters skips its file. Problems are
+reported by `get_status` and `get_grpc_schema`.
+
 ### Fail, slow down or block gRPC calls
 
 You'll check how your app handles gRPC errors, deadlines and slow streams.
@@ -1216,11 +1323,10 @@ You'll check how your app handles gRPC errors, deadlines and slow streams.
 **You should see:** the row with the status your app received, marked blocked or simulated, and your app's error
 handling run.
 
-**Tip:** breakpoints, **Mutate JSON**, **Rewrite**, **Script (JS)**, **CORS** and **Map remote** don't apply to gRPC
-in this version: such a rule never matches a gRPC call (the next rule is tried), and the rule editor says so.
-Replays never answer gRPC calls; with **Fail like offline** they get `14 UNAVAILABLE`. gRPC over TLS that isn't
-decrypted can only be blocked or failed: the connection is then held without an answer, so the app's deadline fires
-and nothing reaches the server.
+**Tip:** **Rewrite**, **Script (JS)**, **CORS** and **Map remote** don't apply to gRPC: such a rule never matches a
+gRPC call (the next rule is tried), and the rule editor says so. gRPC over TLS that isn't decrypted can only be
+blocked or failed: the connection is then held without an answer, so the app's deadline fires and nothing reaches the
+server.
 
 ### See inside gRPC over TLS
 
@@ -1456,7 +1562,7 @@ Exports follow `flutterIntercept.agent.redactSecrets`.
 
 ### Let agents work with gRPC calls
 
-You'll have an agent read, mock and check your app's gRPC calls.
+You'll have an agent read, mock, pause, change, record and check your app's gRPC calls.
 
 1. [Connect your agent](#connect-an-ai-agent), then run **Flutter Intercept: Add AI Agent Instructions** again
    to pick up the new tools.
@@ -1467,14 +1573,23 @@ You'll have an agent read, mock and check your app's gRPC calls.
      `times: 1`)
    - "Mock `ListOrders` with three orders, 500 ms apart." (`get_grpc_schema`, then `add_grpc_mock` with `gapMs`)
    - "Check that checkout ends with gRPC status OK." (`assert_traffic` with `expect.grpcStatus`)
+   - "Pause the next `AddItem` response and set the quantity to 3." (`add_breakpoint` with `times: 1`, `list_paused`,
+     `resume_request` with `grpc.messageJson`)
+   - "End the next `ListOrders` stream with `UNAVAILABLE` after its messages." (`resume_request` with
+     `grpc.status` at the end of the call)
+   - "Make `price` null in every `GetProduct` response." (`add_mutation`)
+   - "Record checkout, including its gRPC calls, and replay it offline." (`save_recording`, `replay_recording`)
 3. Approve the changes when the client asks.
 
-**You should see:** `[agent] …` gRPC mock rules in **Rules**, and decoded messages in the agent's answers with
-secrets redacted.
+**You should see:** `[agent] …` gRPC rules in **Rules**, and decoded messages in the agent's answers with secrets
+redacted.
 
-**Tip:** agents build messages from `get_grpc_schema`'s example JSON, so they need your generated `*.pb.dart` code
-for JSON messages; without it they pass base64 and see raw field numbers, redacted by value only. `add_block`,
-`add_sequence` and `simulate_network` apply to gRPC calls too. Calls over TLS that aren't decrypted can't be mocked.
+**Tip:** agents build messages from `get_grpc_schema`'s example JSON, so they need your generated `*.pb.dart` code (or
+`.proto` files) for JSON messages; without it they pass base64 and see raw field numbers, redacted by value only. A
+held message reaches the agent decoded and redacted, never as bytes. When it resumes with `messageJson`, values it
+only saw as `[redacted]` keep their original value, and JSON that doesn't fit the schema is refused while the call
+stays paused. `add_block`, `add_sequence` and `simulate_network` apply to gRPC calls too. Calls over TLS that aren't
+decrypted can't be mocked, paused or changed.
 
 ## Settings and commands
 
@@ -1495,7 +1610,7 @@ for JSON messages; without it they pass base64 and see raw field numbers, redact
 | `flutterIntercept.agent.mcpPort` | `47823` | Port of the local MCP server for agents. If it's busy, the next free port is used. |
 | `flutterIntercept.upstreamProxy` | empty | Send intercepted traffic on through another HTTP proxy, such as Charles or Burp at `http://127.0.0.1:8888`, or a corporate proxy. Empty = connect to servers directly. Requests to `localhost` and the emulator aliases always go direct. |
 | `flutterIntercept.tlsPassthrough` | `[]` | Hosts (globs, e.g. `*.bank.example`) whose HTTPS is passed through without decryption, for apps that pin certificates. Listed as tunnels. |
-| `flutterIntercept.grpc.enabled` | `true` | Intercept the app's gRPC calls (grpc-dart, connectrpc over h2c). Off: they connect directly, and no protobuf schema is read from the generated `*.pb*.dart` files. Applies at the next launch. |
+| `flutterIntercept.grpc.enabled` | `true` | Intercept the app's gRPC calls (grpc-dart, connectrpc over h2c). Off: they connect directly, and no protobuf schema is read (generated `*.pb*.dart` or `.proto` files). Applies at the next launch. |
 | `flutterIntercept.grpc.decryptHosts` | `[]` | Hosts (globs, e.g. `*.staging.example`) whose gRPC over TLS is decrypted. Only for apps that trust the Flutter Intercept CA in debug builds; other TLS gRPC is listed as an undecrypted tunnel. |
 | `flutterIntercept.clientCertificates` | `[]` | Client certificates for servers that require mTLS: `{host, pfx}` or `{host, cert, key}` (paths). User settings only; passphrases via the command below. |
 | `flutterIntercept.upstreamProxyIgnoreCertErrors` | `false` | Accept any certificate from servers reached through the upstream proxy. Only for a proxy that decrypts HTTPS itself (Charles, Burp). The panel shows "certificate checks OFF" while it's on. |
@@ -1549,8 +1664,13 @@ What isn't intercepted, or behaves differently while intercepting:
     interception; its HTTP traffic is unaffected. Layering `IOOverrides.runZoned(createFile: …)` is fine.
   - Not intercepted: connectrpc over TLS, custom `ClientTransportConnector`s. gRPC-Web (`GrpcWebClientChannel`, and
     Flutter Web) is ordinary HTTP and shows as such, without message decoding.
-  - Breakpoints, mutations, rewrites, scripts, CORS and Map Remote rules, resend, replay and recordings don't apply
-    to gRPC calls in this version. HAR exports include them; OpenAPI and Postman skip them.
+  - Rewrites, scripts, CORS and Map Remote rules and resend don't apply to gRPC calls. HAR exports and recordings
+    include them; OpenAPI and Postman skip them.
+  - Breakpoints and Mutate JSON work on whole messages up to 4 MB, with 64 MB of gRPC data held at most across
+    calls; Mutate JSON changes response messages up to 1 MB and needs the app's schema. Larger messages go through
+    unchanged, with a note.
+  - Replay answers a recorded gRPC call only on the same origin; calls with a response message over 64 KB are saved
+    as incomplete and not replayed.
   - HTTP/2 traffic that isn't gRPC uses the proxy's built-in HTTP/2 passthrough: plain-text (h2c) servers can't be
     reached that way (502), and trailers-only answers lose their trailers.
   - If gRPC connections to a host keep closing (3 within 2 s), the app connects to that host directly for 30 s;
@@ -1559,10 +1679,10 @@ What isn't intercepted, or behaves differently while intercepting:
     address), and `flutterIntercept.grpc.enabled` doesn't apply there.
   - Background isolates: gRPC calls are intercepted in debug sessions like HTTP requests, not in CI runs.
 - **Long breakpoints and client timeouts**: if your app's own timeout fires while a request is paused (for
-  example Dio's `receiveTimeout`), the app gives up. The exchange is then marked "gave up" and can't be resumed.
-  Raise the timeout in debug builds if you need long pauses.
-- **Recordings** hold finished HTTP, WebSocket and SSE exchanges; native-client traffic and tunnels aren't saved.
-  WebSocket replay follows the order of the app's messages, not their content.
+  example Dio's `receiveTimeout`, or a gRPC deadline), the app gives up. The exchange is then marked "gave up" (a
+  gRPC call: aborted) and can't be resumed. Raise the timeout in debug builds if you need long pauses.
+- **Recordings** hold finished HTTP, WebSocket and SSE exchanges and gRPC calls; native-client traffic and tunnels
+  aren't saved. WebSocket replay follows the order of the app's messages, not their content.
 - **Rewrite** body replacements are plain text (no regexes, up to 20 per body); binary bodies are left untouched.
 - **Shared rules** that could redirect or alter your traffic, and every shared script, don't run on a machine until
   they're approved there.
@@ -1608,8 +1728,13 @@ What isn't intercepted, or behaves differently while intercepting:
 - **gRPC over TLS stays encrypted unless your app already trusts the CA.** Nothing is added to any trust store.
   `flutterIntercept.grpc.decryptHosts` (a workspace can set it) only decrypts apps that accept Flutter Intercept's CA
   in debug builds; for any other app, a listed host just fails its TLS handshake.
+- **Held gRPC data is bounded.** Breakpoints and Mutate JSON hold whole messages of up to 4 MB, all held gRPC data
+  shares one 64 MB budget, decoding for Mutate JSON is limited per call, and a pause ends with its call.
+  `.proto` files from the workspace are parsed with size, name-length and time limits.
 - **Recordings stay on your machine.** They're saved in `.dart_tool/flutter_intercept/recordings/`; an
-  unredacted recording is refused where git would track it.
+  unredacted recording is refused where git would track it. Redacted recordings never contain gRPC messages as
+  captured (they're redacted with the schema, or zeroed) nor a hash of them, and gRPC replay answers only the origin
+  a call was recorded from.
 - **Only sessions you launch from VS Code** while interception is on.
   - It doesn't attach to running apps.
   - It leaves test runs alone. Flutter Web is intercepted only on the Chrome and Edge devices, through the

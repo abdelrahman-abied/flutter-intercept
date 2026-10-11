@@ -133,14 +133,28 @@ undecrypted tunnel), with no trust-store changes on any device.
 | **Settings and hosts** | `flutterIntercept.grpc.enabled` / `grpc.decryptHosts` in VS Code, the sidecar / plugin settings page, CLI `--no-grpc` / `--grpc-decrypt-host`, action inputs `grpc` / `grpc-decrypt-hosts`. |
 | **Agents** | `add_grpc_mock`, `get_grpc_schema`, `kind: "grpc"`, `assert_traffic expect.grpcStatus`, decoded and redacted messages in `get_request` / `get_frames`; HAR `_grpc`. |
 
+### 0.11.0 — gRPC parity (built 2026-10-11, CONTRACTS §17, docs/REVIEW-11.md)
+The HTTP tools 0.10 left out for gRPC, plus `.proto` files as a schema source. Owner instruction: take every decision
+in the project's interest. As built: docs/spikes/grpc.md "As built — proxy (0.11.0)".
+
+| Item | Notes |
+|---|---|
+| **Message transform** | Replaces the relay's observer link only for a direction that has a hook; holds or rewrites whole messages (≤ 4 MB) with HTTP/2 flow control pushing back; replaced messages go out uncompressed. The fast path is unchanged. |
+| **Breakpoints** | Each message both ways, plus the end of the call (status, trailers; trailers-only answers too). Edit as JSON (host-encoded with the schema) or base64, drop, change status / trailers, abort (RST_STREAM CANCEL). One pause at a time per call, own deadline per pause, ends with its call. |
+| **Mutate** | `mutate` rules on response messages through the host codec (`setGrpcCodec`): decode → JSON path ops → encode; no schema or an encode error forwards the original with a note. ≤ 1 MB per message, 50 MB / 2 s of codec time per call. |
+| **Recordings, replay, diff** | Format v3 with gRPC entries (frames, status, trailers, `requestHash`, `incomplete`). Replay like a grpcMock, same origin only, matched by path then first-request hash, else in order; redacted recordings keep no hash. Diff route `gRPC /pkg.Service/Method`: status, message counts, first response shape. |
+| **`.proto` schema source** | Hand-written proto2 / proto3 / editions parser (linear, time-budgeted, name caps); imports by path suffix, built-in well-known types; generated Dart wins; workspace discovery with its own 2000-file cap. |
+| **Agents** | `resume_request grpc`, `grpcPause` in `list_paused` / `get_request` (decoded, redacted, cached), `add_breakpoint` / `add_mutation` / recording tools on gRPC. |
+| **Webview** | gRPC pause editor (message / status), Break on this and field mutate on gRPC, edited / dropped badges, gRPC counts in recordings. |
+| **Security (REVIEW-11)** | One 64 MB budget for collected / queued / held gRPC bytes; pauses end with their call; bounded mutate decoding and cached held decodes; same-origin replay and LAN deny first; no request hash in redacted recordings; terminating, linear `.proto` naming and linking. |
+
 **Next / considered (gRPC follow-ups)**
-- Breakpoints, mutate and replay (and recordings) for gRPC calls.
-- `.proto` files as a schema source, for apps whose generated code isn't in the workspace.
 - A gRPC-Web view (today plain HTTP rows without message decoding).
 - connectrpc over TLS (its HTTP/2 transport uses `SecureSocket.connect`, which the hook can't see).
 - Optional "trust the CA on the iOS simulator" (`simctl keychain add-root-cert`, removed at session end) for a full TLS
   view with default credentials: untested, touches the simulator's trust store, needs its own spike and security
   review (docs/spikes/grpc.md "Open decision"). Android needs a writable-system emulator: document only.
+- Rewrite, scripts and Map Remote for gRPC calls (and resend).
 
 ## 5. Spikes and decisions before building
 - Dio's async stack depth for request → source (0.3).

@@ -277,7 +277,11 @@ npx flutter-intercept-cli test -d macos --har build/traffic.har
 - Only `dart:io` traffic goes through the proxy. Native HTTP stacks (cupertino_http, cronet_http) and platform
   views are not seen: the editor's VM-service capture isn't available in a headless run.
 - gRPC calls from grpc-dart are intercepted, listed in the HAR and checked by expectations (`expect.grpcStatus`,
-  `kind: "grpc"`); recordings and replay skip them. gRPC over TLS is an undecrypted tunnel unless the host is passed
+  `kind: "grpc"`). `--record` saves them with their messages and `--replay` answers them (same origin only; calls
+  with a response message over 64 KB aren't replayed). The CLI reads no protobuf schema, so **Mutate JSON** rules leave
+  gRPC messages unchanged (with a note), and the redacted copy of a recording (`upload-recording`) has its gRPC
+  messages replaced by zeros of the same size and no request hashes: replaying that copy answers several calls to one
+  method in recorded order. gRPC over TLS is an undecrypted tunnel unless the host is passed
   with `--grpc-decrypt-host` and the app trusts the run's CA in debug builds (`onBadCertificate`; the CA is new for
   each run, so pinning it isn't practical here). The other gRPC limits of the extension apply (obfuscated builds,
   connectrpc over TLS, apps that replace `IOOverrides.global`).

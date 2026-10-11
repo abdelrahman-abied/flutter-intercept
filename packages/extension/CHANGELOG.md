@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.11.0
+
+### gRPC parity
+
+- **Breakpoints on gRPC calls.** Each message pauses on its own (request: the messages the app sends; response: the
+  messages the server sends, then the end of the call with its status and trailers). Edit a held message as JSON
+  (when the schema decodes it) or base64, drop it, or abort the call; change the final status, `grpc-message` and
+  trailers. One pause at a time per call, each with its own auto-resume deadline; the other direction keeps flowing.
+  Edited and dropped messages are badged in **Messages**.
+- **Mutate JSON on gRPC responses.** Paths apply to each response message decoded with the app's schema (proto3 JSON);
+  right-click a field of a decoded response message to add one. Without a schema, or for messages over 1 MB, messages
+  go through unchanged with a note.
+- **Recordings, replay and diff include gRPC calls** (file format 3). Replay answers a recorded call like a gRPC mock
+  (messages with their gaps, status, trailers), on the same origin only, told apart by the first request message (in
+  recorded order for redacted recordings). Calls with a cut response message are saved as incomplete and not replayed.
+  The diff reports status changes, message counts per direction and the JSON shape of the first response message.
+- **`.proto` files as a schema source**: proto2, proto3 and editions files in the workspace folders are read next to
+  the generated Dart, which wins when both define a message or method. `node_modules`, `build`, `.dart_tool`, `Pods`
+  and `.git` are skipped.
+- CLI: `--record` and `--replay` include gRPC calls. The CLI reads no schema, so Mutate JSON leaves gRPC messages
+  unchanged there, and redacted copies replace their messages with zeros.
+- Still not on gRPC: rewrite, scripts, CORS, Map Remote and resend.
+
+### Agent API
+- `add_breakpoint` and `add_mutation` apply to gRPC calls. `list_paused` and `get_request` show `grpcPause` (the held
+  message decoded and redacted, or the held status and trailers). `resume_request` takes
+  `grpc: {messageJson | message | drop}` or `grpc: {status, trailers}`; `messageJson` values seen as `[redacted]`
+  keep their original value.
+- `save_recording`, `replay_recording`, `diff_recordings` and `list_recordings` include gRPC calls.
+
+### Security
+- Independent review: docs/REVIEW-11.md. All held gRPC data (messages being collected, queued or paused) shares one
+  64 MB budget, and a pause ends with its call. Mutate decoding is bounded per message and per call. gRPC replay
+  answers only the origin a call was recorded from, and LAN clients get the LAN deny rule first. Redacted recordings
+  keep no request hash. `.proto` parsing stays linear and bounded (name length and problem text caps, its own file
+  cap).
+
 ## 0.10.0
 
 ### gRPC

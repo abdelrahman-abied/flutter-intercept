@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.0 (preview)
+
+- **gRPC parity**, the same as in the VS Code extension 0.11.0: breakpoints on gRPC messages and on the end of the
+  call (edit as JSON or base64, drop, change the status and trailers, abort); Mutate JSON on decoded response
+  messages; recordings, replay and diff with gRPC calls; `.proto` files in the project as a schema source (the
+  generated Dart wins). Agents: `resume_request` with `grpc`, `grpcPause` in `list_paused` / `get_request`, and
+  `add_breakpoint`, `add_mutation` and the recording tools on gRPC calls.
+- **Security**: fixes from the independent review docs/REVIEW-11.md (one budget for held gRPC data, pauses end with
+  their call, same-origin gRPC replay, no request hash in redacted recordings, bounded `.proto` parsing).
+
 ## 0.10.0 (preview)
 
 - **gRPC**: grpc-dart calls (and connectrpc over h2c) are intercepted with no app code, the same as in the VS Code
