@@ -138,3 +138,48 @@ How to handle TLS gRPC with default credentials, which is most production-style 
 2. Plus an **opt-in "trust our CA on the iOS simulator"** (`simctl keychain add-root-cert`, removed at session end):
    untested, touches the simulator's trust store → needs its own spike and security review.
 3. Android full TLS view needs a writable-system emulator: document only.
+
+## As built — proxy (0.10.0)
+
+Files: `packages/proxy/src/grpc.ts` (framing, bounded message parser, gzip/deflate decode capped at 16 MB per message,
+`grpc-message` / `grpc-timeout` / connect-timeout parsing, first-byte classification, truncate cutter),
+`grpc-upstream.ts` (HTTP/2 session pool), `silent.ts` (self-check + injection into mockttp), changes in
+`intercept-proxy.ts`, `lan.ts`, `tunnel.ts`, `rules.ts`, `index.ts`. Tests: `test/grpc.test.ts` with node:http2
+client/server helpers in `test/grpc-helpers.ts` (no `@grpc/grpc-js`, no new dependency).
+
+- mockttp runs with `http2: 'fallback'`; measured: `[h2, http/1.1]` and `[http/1.1]` → h1, `[h2]` and
+  `[grpc-exp, h2]` → h2.
+- Silent CONNECT: handled in `onConnect` before the passthrough check, for HTTP/1 CONNECTs only. Nothing is ever
+  written back. The first payload chunk is read with a `data` listener, put back with `unshift`, and
+  `readableFlowing = null` restored (as node does after a CONNECT) before the next reader. h2c preface (a partial
+  prefix counts) → injected; TLS + `grpcDecryptHosts` match and not `tlsPassthrough` → injected; other TLS →
+  `runTunnel` in silent mode (`grpcTunnel: true`, refusals close, connect timeout from the header); anything else →
+  closed, `error` tunnel. Nothing within 30 s or a close before the first byte → closed, not recorded.
+- LAN gate: a silent CONNECT refused for its token, peer or target is closed (no 407/403/400). SSRF refusals are
+  recorded as before; bad-token refusals are not (unauthenticated peers can't write to the exchange list).
+- HTTP/2 socket proxies: h2c sessions over an injected socket sit on a JSStreamSocket whose `.stream` is the raw
+  socket, TLS ones on a TLSSocket whose `_parent` is — both were already found by the LAN guard's socket walk. Added:
+  `SOCKET_SELF` on gate sockets and `session.socket` in the walk (`findOnSocketChain`), so an `Http2Session` (what
+  mockttp hands its agent lookup for non-gRPC h2) resolves to its gate too.
+- Relay: a `CallbackStep` with an own `handle` (route `grpc`, placed before the LAN deny rule). Request bytes are read
+  from mockttp's compat request (piped through an observer, then `PacedStream` for `uploadKbps`) — a `data` listener
+  before the pipe would lose bytes while the upstream session opens. Response: observer → `PacedStream` (kbps) → the
+  raw stream with `waitForTrailers`; trailers-only kept as one HEADERS frame. After the response ends while the app is
+  still sending, the app's stream gets RST_STREAM NO_ERROR (RFC 7540 §8.1; without it a bidi call whose server ended
+  first never closes on the client).
+- Failures: before response headers → trailers-only `14` `Flutter Intercept: <reason>`; an upstream RST mid-response →
+  the same code to the app (state `error`); the server's connection failing mid-response → trailers `14`; the server
+  ending without trailers → empty trailers (the client maps it), state `error`.
+- Upstream sessions key: origin, LAN gate, TLS verify flag, client-certificate pattern, upstream proxy, alias.
+  Connect timeout covers TCP / upstream-proxy CONNECT / TLS / h2 preface; on timeout everything opened is destroyed
+  (also when it completes late). Max concurrent streams from the server's SETTINGS; GOAWAY takes the session out of
+  the pool; idle 30 s.
+- Rules: `matchRule` gets `grpc: true`; non-applicable actions (and GraphQL-scoped rules) are skipped with a note;
+  `grpcMock` never matches non-gRPC requests (a grpcMock sequence step on HTTP passes through with a note).
+  `setRules` "refuses" an invalid grpcMock by disabling it and listing it in `refusedRules` (throwing would drop
+  every rule of a shared file); `ruleProblem` reports the same text for editors and agents.
+- Self-check (`grpcSupport()`): socket-extension Symbols, own-`handle` steps kept by `StepLookup`, the compat
+  `stream` getter, the combo server and our CONNECT hook. Verified inside an esbuild bundle (one module instance).
+- Not done / known: gRPC-Web; breakpoints, mutate, rewrite, script, cors, mapRemote and replay on gRPC; non-gRPC
+  HTTP/2 still uses mockttp's passthrough (h2c upstream 502, trailers-only lost). Replay never answers gRPC, but its
+  `fail` fallback answers gRPC calls no rule matched with `14` "DNS lookup failed" (like the offline profile).

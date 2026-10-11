@@ -101,6 +101,11 @@ export const RESPONSE_407 =
 const RESPONSE_403 = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
 const RESPONSE_400 = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
 
+/** The silent-tunnel marker value (CONTRACTS §16.1): exactly one header, `silent`, case-insensitive. */
+export function isSilentMarker(v: string | string[] | undefined): boolean {
+  return typeof v === 'string' && v.trim().toLowerCase() === 'silent';
+}
+
 export function refuse(socket: net.Socket, response: string): void {
   if (socket.destroyed) return;
   socket.end(response);
@@ -426,13 +431,39 @@ interface LanSocketInfo {
 /** Every socket a LAN gate ever accepted, with its gate. Entries live as long as the socket. */
 const lanSockets = new WeakMap<object, LanSocketInfo>();
 
-function walk(s: any): LanSocketInfo | undefined {
-  for (let i = 0; s && i < 8; i++) {
-    const info = lanSockets.get(s);
-    if (info) return info;
-    s = s._parent ?? s.stream ?? s._handle?._parentWrap?.stream;
+/**
+ * A raw socket's reference to itself. HTTP/2 hands out a Proxy for the session's socket (`req.socket`,
+ * `session.socket`) whose property reads are forwarded to the real socket, so `proxy[SOCKET_SELF]` is that socket:
+ * how the guards keyed on the socket find an h2c connection's LAN gate (CONTRACTS §16.2: HTTP/2 is on).
+ */
+export const SOCKET_SELF = Symbol('flutter-intercept.socket-self');
+
+/**
+ * Walk from a connection-like object (socket, TLS socket, HTTP/2 socket proxy, HTTP/2 session) down to the raw
+ * sockets under it, returning the first value `get` finds. Property reads through HTTP/2 proxies may throw once
+ * the session is gone (then: not found).
+ */
+export function findOnSocketChain<T>(start: unknown, get: (o: object) => T | undefined): T | undefined {
+  let s: any = start;
+  try {
+    for (let i = 0; s && typeof s === 'object' && i < 8; i++) {
+      const v = get(s);
+      if (v !== undefined) return v;
+      const self = s[SOCKET_SELF];
+      if (self && self !== s) {
+        const w = get(self);
+        if (w !== undefined) return w;
+      }
+      s = s._parent ?? s.stream ?? s._handle?._parentWrap?.stream ?? s.socket;
+    }
+  } catch {
+    /* an unbound HTTP/2 socket proxy */
   }
   return undefined;
+}
+
+function walk(s: any): LanSocketInfo | undefined {
+  return findOnSocketChain(s, (o) => lanSockets.get(o));
 }
 
 /** The gate that accepted this downstream connection (or the raw socket under a TLS-in-tunnel socket). */
@@ -625,6 +656,7 @@ export class LanGate {
     }
     const info: LanSocketInfo = { gate: this, state: 'reading', peer: ip };
     lanSockets.set(socket, info);
+    (socket as unknown as Record<symbol, unknown>)[SOCKET_SELF] = socket;
     this.sockets.add(socket);
     this.count(this.perIp, ip, +1);
     this.count(this.pendingPerIp, ip, +1);
@@ -703,21 +735,24 @@ export class LanGate {
       const i = line.indexOf(':');
       if (i > 0) raw.push(line.slice(0, i).trim(), line.slice(i + 1).trim());
     }
-    // Token AND pinned peer: another IP with the right token is refused like a wrong token.
-    if (!this.admits(rawHeaderValue(raw, 'proxy-authorization'), info.peer)) return refuse(socket, RESPONSE_407);
-
     const isConnect = method === 'CONNECT';
+    // CONTRACTS §16.2: a silent CONNECT (the entry's gRPC hook) never reads a reply, so a refusal is a close.
+    const silent = isConnect && isSilentMarker(rawHeaderValue(raw, 'flutter-intercept-tunnel'));
+    const deny = (response: string) => (silent ? void socket.destroy() : refuse(socket, response));
+    // Token AND pinned peer: another IP with the right token is refused like a wrong token.
+    if (!this.admits(rawHeaderValue(raw, 'proxy-authorization'), info.peer)) return deny(RESPONSE_407);
+
     if (isConnect) {
       const t = /^\[?([^\]]+?)\]?:(\d+)$/.exec(target);
-      if (!t) return refuse(socket, RESPONSE_400);
+      if (!t) return deny(RESPONSE_400);
       try {
         await precheckTarget(t[1], Number(t[2]), this.host);
       } catch (e) {
         if (e instanceof SsrfError) {
           this.cb.onBlockedConnect(target, e.message);
-          return refuse(socket, RESPONSE_403);
+          return deny(RESPONSE_403);
         }
-        return refuse(socket, RESPONSE_400);
+        return deny(RESPONSE_400);
       }
     }
     // The gate may have closed during the (async) target check.

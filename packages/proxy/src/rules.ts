@@ -319,6 +319,68 @@ export function ruleProblem(rule: Pick<Rule, 'match' | 'action'>): string | unde
   return undefined;
 }
 
+// ---------------------------------------------------------------- gRPC (CONTRACTS §16.2)
+
+/** Rule actions that apply to gRPC calls (CONTRACTS §16.2); a sequence only when every step is one of them. */
+export const GRPC_ACTIONS: ReadonlySet<RuleAction['kind']> = new Set(['grpcMock', 'block', 'fault', 'throttle']);
+
+export function grpcApplicable(a: RuleAction | undefined): boolean {
+  if (!a || typeof a !== 'object') return false;
+  if (a.kind === 'sequence') {
+    const steps = Array.isArray(a.steps) ? a.steps : [];
+    return steps.length > 0 && steps.every((s) => s?.action && (s.action.kind === 'passthrough' || GRPC_ACTIONS.has(s.action.kind)));
+  }
+  return GRPC_ACTIONS.has(a.kind);
+}
+
+/** Header names a grpcMock may not set: pseudo headers, the gRPC status, the content type, hop-by-hop ones. */
+const MOCK_RESERVED = new Set([
+  'content-type',
+  'grpc-status',
+  'grpc-message',
+  'connection',
+  'keep-alive',
+  'proxy-connection',
+  'transfer-encoding',
+  'upgrade',
+  'host',
+  'http2-settings',
+  'proxy-authorization',
+  'te',
+  'content-length',
+]);
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9a-z-]+$/;
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const BASE64URL = /^[A-Za-z0-9_-]*$/;
+
+/** Why a grpcMock action can't be used (setRules refuses it), or undefined. */
+export function grpcMockProblem(a: Extract<RuleAction, { kind: 'grpcMock' }>): string | undefined {
+  if (a.code !== undefined && (!Number.isInteger(a.code) || a.code < 0 || a.code > 16)) return `gRPC status code must be 0–16, got ${String(a.code)}.`;
+  if (a.message !== undefined && typeof a.message !== 'string') return 'The gRPC status message must be text.';
+  for (const [what, n] of [['delayMs', a.delayMs], ['gapMs', a.gapMs]] as const) {
+    if (n !== undefined && (typeof n !== 'number' || !Number.isFinite(n) || n < 0)) return `${what} must be a number ≥ 0.`;
+  }
+  if (a.messages !== undefined) {
+    if (!Array.isArray(a.messages)) return 'messages must be a list of base64 protobuf payloads.';
+    for (let i = 0; i < a.messages.length; i++) {
+      const m = a.messages[i];
+      if (typeof m !== 'string' || (!BASE64.test(m) && !BASE64URL.test(m))) return `Message ${i + 1} is not base64.`;
+    }
+  }
+  for (const [what, h] of [['headers', a.headers], ['trailers', a.trailers]] as const) {
+    if (h === undefined) continue;
+    if (!h || typeof h !== 'object' || Array.isArray(h)) return `${what} must be an object of name → value.`;
+    for (const [k, v] of Object.entries(h)) {
+      const lk = k.toLowerCase();
+      if (lk.startsWith(':')) return `${what}: pseudo headers such as "${k}" can't be set.`;
+      if (MOCK_RESERVED.has(lk)) return `${what}: "${k}" is set by the proxy (use code / message for the status).`;
+      if (!HEADER_NAME.test(lk)) return `${what}: "${k.slice(0, 60)}" is not a valid header name.`;
+      if (typeof v !== 'string' || /[\r\n\0]/.test(v)) return `${what}: the value of "${k}" must be text on one line.`;
+    }
+  }
+  return undefined;
+}
+
 // Headers that describe the wire framing of the recorded body, not the decoded text a mock
 // sends (the proxy recomputes framing for mock bodies).
 const FRAMING_HEADERS = new Set(['content-length', 'content-encoding', 'transfer-encoding', 'connection', 'keep-alive']);
@@ -394,6 +456,8 @@ export function ruleFromExchange(e: Exchange, kind: RuleAction['kind'], id: stri
     } else {
       action = { kind: 'mock', status: 200, headers: { 'content-type': 'application/json' }, body: '{}' };
     }
+  } else if (kind === 'grpcMock') {
+    action = grpcMockFromExchange(e);
   } else if (kind === 'block') {
     action = { kind: 'block', mode: 'status', status: 403 };
   } else if (kind === 'mutate') {
@@ -413,6 +477,24 @@ export function ruleFromExchange(e: Exchange, kind: RuleAction['kind'], id: stri
     /* keep base */
   }
   return { id, enabled: true, name: `${kind} ${e.method} ${path}`, match, action };
+}
+
+/**
+ * CONTRACTS §16.2: a grpcMock answering like a recorded gRPC call: its response messages (base64, as recorded) and its
+ * status. Throws RuleFromExchangeError('truncated') when some response message was not recorded in full.
+ */
+function grpcMockFromExchange(e: Exchange): Extract<RuleAction, { kind: 'grpcMock' }> {
+  const received = (e.frames ?? []).filter((f) => f.kind === 'message' && f.dir === 'receive');
+  if (e.kind === 'grpc' && ((e.grpc?.messagesReceived ?? received.length) > received.length || received.some((f) => f.truncated))) {
+    throw new RuleFromExchangeError('truncated', 'Cannot mock this call: some of its response messages were not fully recorded.');
+  }
+  const code = e.grpc?.statusCode;
+  return {
+    kind: 'grpcMock',
+    code: code !== undefined && Number.isInteger(code) && code >= 0 && code <= 16 ? code : 0,
+    ...(e.grpc?.statusMessage ? { message: e.grpc.statusMessage } : {}),
+    messages: received.map((f) => f.base64 ?? ''),
+  };
 }
 
 /** A starting point for a script rule (CONTRACTS §13.4): both hooks, changing nothing until edited. */
@@ -575,6 +657,7 @@ function utf8Length(s: string): number {
 /** Problems with an action's own settings (v0.6.0+ actions), for rule editors and agent tools. */
 function actionProblem(a: RuleAction | undefined): string | undefined {
   if (!a || typeof a !== 'object') return undefined;
+  if (a.kind === 'grpcMock') return grpcMockProblem(a);
   if (a.kind === 'script') {
     if (typeof a.code !== 'string' || a.code.trim() === '') return 'A script rule needs code (define onRequest and / or onResponse).';
     if (utf8Length(a.code) > MAX_SCRIPT_BYTES) return `A script can be at most ${MAX_SCRIPT_BYTES / 1024} KB.`;

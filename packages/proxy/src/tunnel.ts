@@ -29,6 +29,14 @@ export interface TunnelUpstream {
   /** Loopback clients: emulator alias → address (rewriteLocalhost). */
   alias?: (host: string) => string | undefined;
   timings: (p: TimingPatch) => void;
+  /** Direct connections: give up after this long (default TUNNEL_CONNECT_TIMEOUT_MS). */
+  timeoutMs?: number;
+}
+
+/** Does this upstream connection go through the upstream proxy (CONTRACTS §12.6)? Same rule as openTunnelUpstream. */
+export function viaUpstreamProxy(o: Pick<TunnelUpstream, 'host' | 'port' | 'lan' | 'upstream' | 'alias'>): boolean {
+  const alias = o.lan ? undefined : o.alias?.(o.host);
+  return !!o.upstream && !alias && (!!o.lan || !isLoopbackHost(o.host)) && !bypassesProxy(o.upstream, o.host, o.port);
 }
 
 /** Open the raw TCP connection to the real server (or through the upstream proxy). Rejects with a readable error. */
@@ -42,7 +50,7 @@ export async function openTunnelUpstream(o: TunnelUpstream): Promise<net.Socket>
     if (o.lan.closed()) throw Object.assign(new Error('LAN mode is off.'), { statusCode: 403 });
   }
   const alias = o.lan ? undefined : o.alias?.(o.host);
-  if (o.upstream && !alias && (o.lan || !isLoopbackHost(o.host)) && !bypassesProxy(o.upstream, o.host, o.port)) {
+  if (o.upstream && viaUpstreamProxy(o)) {
     const spec = o.upstream;
     const from = performance.now();
     return new Promise((resolve, reject) => {
@@ -58,7 +66,8 @@ export async function openTunnelUpstream(o: TunnelUpstream): Promise<net.Socket>
     const socket = net.connect({ host: alias ?? host, port: o.port });
     let attempt: number | undefined;
     let lookedUp: number | undefined;
-    const timer = setTimeout(() => fail(new Error(`no connection to ${o.host}:${o.port} within ${TUNNEL_CONNECT_TIMEOUT_MS / 1000} s`)), TUNNEL_CONNECT_TIMEOUT_MS);
+    const limit = o.timeoutMs && o.timeoutMs > 0 ? o.timeoutMs : TUNNEL_CONNECT_TIMEOUT_MS;
+    const timer = setTimeout(() => fail(new Error(`no connection to ${o.host}:${o.port} within ${limit / 1000} s`)), limit);
     const fail = (e: Error) => {
       clearTimeout(timer);
       socket.destroy();

@@ -19,6 +19,10 @@ export {
   // v0.7.0 (CONTRACTS §13.4)
   MAX_SCRIPT_BYTES,
   SCRIPT_TEMPLATE,
+  // v0.10.0 (CONTRACTS §16.2)
+  GRPC_ACTIONS,
+  grpcApplicable,
+  grpcMockProblem,
 } from './rules';
 export type { PickedStep, StepAction } from './rules';
 export { requestBodyHash } from './replay';
@@ -63,7 +67,21 @@ export type {
   ScriptRequest,
   ScriptResponse,
   ClientCertificate,
+  GrpcInfo,
 } from './types';
+// v0.10.0 (CONTRACTS §16.2)
+export {
+  GRPC_CODE_NAMES,
+  GRPC_CONNECT_TIMEOUT_MS,
+  GRPC_CONNECT_TIMEOUT_MAX_MS,
+  isGrpcContentType,
+  parseGrpcPath,
+  parseGrpcTimeout,
+  encodeGrpcMessage,
+  decodeGrpcMessage,
+  frameMessage,
+} from './grpc';
+export type { GrpcSupport } from './silent';
 export { NETWORK_PRESETS, NO_PROFILE, presetProfile, describeProfile } from './network';
 export type { NetworkProfile, NetworkPreset, NetworkPresetId } from './network';
 export { parseDartStack, pickAppFrame, toSourceInfo, FRAMEWORK_PACKAGES } from './source';

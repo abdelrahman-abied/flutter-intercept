@@ -1,6 +1,8 @@
 import { EventEmitter } from 'events';
 import * as http from 'http';
 import { STATUS_CODES } from 'http';
+import * as http2 from 'http2';
+import type { Readable } from 'stream';
 import { randomUUID } from 'crypto';
 import * as net from 'net';
 import * as tls from 'tls';
@@ -34,6 +36,8 @@ import {
 } from './body';
 import {
   compileRules,
+  grpcApplicable,
+  grpcMockProblem,
   isInvalidMatcher,
   mapRemoteUrl,
   MAX_BODY_REPLACEMENTS,
@@ -45,8 +49,33 @@ import { ReplayStore, requestBodyHash, type BodyKey } from './replay';
 import { framePayload, sseEventText, sseSchedule, wsScript, type TimedStep } from './replay-stream';
 import { createUpstreamAgents, isLoopbackHost, parseUpstreamProxy, retireAgents, type UpstreamAgents, type UpstreamProxyConfig, type UpstreamProxySpec } from './upstream-proxy';
 import { matchesHostPattern, normalizeHostname, parseHostPattern, parseHostPatterns, splitHostPort, type HostPattern } from './hosts';
-import { openTunnelUpstream, relay } from './tunnel';
-import { isShaped, LinkQueue, type LinkShape } from './pace';
+import { openTunnelUpstream, relay, viaUpstreamProxy } from './tunnel';
+import { isShaped, LinkQueue, PacedStream, type LinkShape } from './pace';
+import {
+  classifyFirstBytes,
+  CONNECT_TIMEOUT_HEADER,
+  decodeGrpcMessage,
+  encodeGrpcMessage,
+  FirstMessageCut,
+  forwardableHeaders,
+  frameMessage,
+  GRPC_CONNECT_TIMEOUT_MS,
+  grpcEncodingOf,
+  GrpcMessageParser,
+  h2CodeName,
+  isGrpcContentType,
+  messageFrame,
+  Observer,
+  parseConnectTimeout,
+  parseGrpcPath,
+  parseGrpcStatus,
+  parseGrpcTimeout,
+  recordedHeaders,
+  SILENT_FIRST_BYTE_MS,
+  SILENT_TUNNEL_HEADER,
+} from './grpc';
+import { GrpcSessionPool } from './grpc-upstream';
+import { grpcSelfCheck, injectSilentTunnel, type GrpcSupport } from './silent';
 import { detectGraphql, graphqlOperationNames } from './graphql';
 import {
   allowedOrigin,
@@ -78,6 +107,8 @@ import { refreshRoutes } from './routes';
 import { captured, getTap, installTaps, isComplete, RESPONSE_PAUSE_LIMIT_BYTES, type HeadPatch, type Tap } from './taps';
 import {
   checkLanRequest,
+  findOnSocketChain,
+  isSilentMarker,
   LanGate,
   lanGateOf,
   lanIPv4Addresses,
@@ -89,6 +120,7 @@ import {
   refuse,
   resolveCheckedTarget,
   RESPONSE_407,
+  SOCKET_SELF,
   SsrfError,
   SSRF_MARKER,
 } from './lan';
@@ -116,6 +148,7 @@ import type {
   Exchange,
   FaultKind,
   Frame,
+  GrpcInfo,
   InterceptProxyOptions,
   MutateOp,
   ReplayEntry,
@@ -162,7 +195,7 @@ type Decision =
  * - ws-pass / ws-local: WebSocket upgrades (CONTRACTS §11.1), passed through and recorded frame by frame, or
  *   answered locally (block / fault rules, the offline profile).
  */
-type Route = 'plain' | 'h1' | 'h2' | 'denied' | 'trace' | 'ws-pass' | 'ws-local' | 'replay-stream' | 'ws-replay' | 'tunnel';
+type Route = 'plain' | 'h1' | 'h2' | 'denied' | 'trace' | 'ws-pass' | 'ws-local' | 'replay-stream' | 'ws-replay' | 'tunnel' | 'grpc';
 
 /** A fault applied to a request: a fault rule, the `offline` profile ('dns'), or a throttle drop ('drop' = reset). */
 type FlowFault = FaultKind | 'drop';
@@ -258,6 +291,8 @@ interface MatchOptions {
   ws?: boolean;
   /** A TLS passthrough CONNECT (CONTRACTS §14.2): only block and fault rules apply. */
   tunnel?: boolean;
+  /** A gRPC call (CONTRACTS §16.2): only grpcMock, block, fault, throttle and sequences of those apply. */
+  grpc?: boolean;
 }
 
 interface MatchResult {
@@ -288,6 +323,37 @@ interface Live {
 interface Paused {
   phase: 'request' | 'response';
   settle: (d: Decision) => void;
+}
+
+/** One gRPC call through the relay / a local answer (CONTRACTS §16.2). */
+interface GrpcCall {
+  ex: Exchange;
+  info: GrpcInfo;
+  flow: Flow;
+  req: OngoingRequest;
+  /** The app's stream. */
+  stream: http2.ServerHttp2Stream;
+  /** The server's stream (relay). */
+  up?: http2.ClientHttp2Stream;
+  upError?: Error & { code?: string };
+  /** The server's trailers, once they arrived. */
+  upTrailers?: http2.IncomingHttpHeaders;
+  /** Trailers to end the app's response with when the server's connection failed mid-response. */
+  failTrailers?: Record<string, string>;
+  failReason?: string;
+  /** The last stream piped into the app's stream (unpiped on a failure). */
+  respTail?: Readable;
+  /** The proxy reset / ended the app's stream itself: its close is not the app leaving. */
+  localReset?: boolean;
+  /** Response headers time (receiveMs). */
+  headAt?: number;
+  isLive(): boolean;
+}
+
+/** On a silent tunnel's raw socket: what its CONNECT said (CONTRACTS §16.2). */
+const SILENT_INFO = Symbol('flutter-intercept.silent-tunnel');
+interface SilentInfo {
+  connectTimeoutMs: number;
 }
 
 const DEFAULT_MAX_EXCHANGES = 1000;
@@ -494,6 +560,17 @@ export class InterceptProxy extends EventEmitter {
   /** CONTRACTS §14.5: answers replayed WebSocket upgrades; the subprotocol each recorded connection chose. */
   private wsReplayServer?: WebSocket.Server;
   private readonly wsReplayProtocols = new WeakMap<object, string>();
+  /** CONTRACTS §16.2: TLS silent tunnels to these hosts are decrypted (MITM); the rest are passed through. */
+  private grpcDecrypt: HostPattern[] = [];
+  private grpcDecryptProblems: string[] = [];
+  /** The startup self-check of what the gRPC relay and silent tunnels need (grpcSupport()). */
+  private grpcCheck: GrpcSupport = grpcSelfCheck();
+  /** Upstream HTTP/2 sessions of the gRPC relay (start() → stop()). */
+  private grpcPool?: GrpcSessionPool;
+  /** mockttp's combo server (silent tunnels are handed to it). */
+  private rawServer?: net.Server;
+  /** setRules: grpcMock rules refused for their headers / values (disabled, CONTRACTS §16.2). */
+  private refused: { id: string; problem: string }[] = [];
 
   constructor(private readonly opts: InterceptProxyOptions) {
     super();
@@ -506,6 +583,7 @@ export class InterceptProxy extends EventEmitter {
     if (opts.upstreamProxy) this.upstreamSpec = parseUpstreamProxy(opts.upstreamProxy);
     if (opts.tlsPassthrough) this.setTlsPassthrough(opts.tlsPassthrough);
     if (opts.clientCertificates) this.setClientCertificates(opts.clientCertificates);
+    if (opts.grpcDecryptHosts) this.setGrpcDecryptHosts(opts.grpcDecryptHosts);
   }
 
   /** Actual port after start() (0 before). */
@@ -523,7 +601,9 @@ export class InterceptProxy extends EventEmitter {
     const ca = this.opts.ca ?? (await defaultCa());
     const server: mockttp.Mockttp = new MockttpServer({
       https: { key: ca.key, cert: ca.cert },
-      http2: false, // dart:io HttpClient is HTTP/1.1 only
+      // CONTRACTS §16.2: HTTP/2 only for clients that don't offer HTTP/1.1 (gRPC offers [grpc-exp, h2]; Chrome, which
+      // offers both, and dart:io, which offers none, keep HTTP/1.1), and for the h2c preface on silent tunnels.
+      http2: 'fallback',
       recordTraffic: false, // we keep our own bounded store
       cors: false,
       suggestChanges: false,
@@ -599,6 +679,10 @@ export class InterceptProxy extends EventEmitter {
     const replayStreamStep = Object.assign(new CallbackStep(() => ({ statusCode: 500 })), {
       handle: (req: OngoingRequest, res: http.ServerResponse, options: unknown) => this.onReplayStream(req, res, passthroughImpl, options),
     });
+    // CONTRACTS §16.2: the gRPC relay, same trick (the self-check verifies mockttp keeps an own `handle`).
+    const grpcStep = Object.assign(new CallbackStep(() => ({ statusCode: 500 })), {
+      handle: (req: OngoingRequest, res: http.ServerResponse) => this.onGrpc(req, res),
+    });
     await server.addRequestRules(
       {
         matchers: [unauthorized],
@@ -616,6 +700,13 @@ export class InterceptProxy extends EventEmitter {
         matchers: [route('trace')],
         completionChecker: new Always(),
         steps: [new CallbackStep((req) => this.onTrace(req))],
+      },
+      {
+        // CONTRACTS §16.2: gRPC calls, by our own HTTP/2 relay (never mockttp's passthrough). Before the LAN deny rule:
+        // a refusal is answered in gRPC terms (UNAVAILABLE), and the relay's upstream sockets carry the same guard.
+        matchers: [route('grpc')],
+        completionChecker: new Always(),
+        steps: [grpcStep],
       },
       {
         matchers: [lanDeny],
@@ -731,6 +822,8 @@ export class InterceptProxy extends EventEmitter {
       this.lanHooks = true;
       raw.on('connection', (s: net.Socket) => onComboConnection(s));
       this.installConnectHook(raw);
+      this.rawServer = raw;
+      this.grpcCheck = grpcSelfCheck({ connectHook: this.connectHook, server: raw });
       // LAN sockets get their gate's guarded agents — always, whether or not LAN mode is on now.
       pool.setLan({
         agentFor: (connection, protocol) => {
@@ -757,6 +850,7 @@ export class InterceptProxy extends EventEmitter {
     }
     this.server = server;
     this.pool = pool;
+    this.grpcPool = new GrpcSessionPool();
     this._port = server.port;
     if (this.upstreamSpec) {
       try {
@@ -789,6 +883,9 @@ export class InterceptProxy extends EventEmitter {
     await server.stop();
     this.pool?.destroy();
     this.pool = undefined;
+    this.grpcPool?.destroyAll();
+    this.grpcPool = undefined;
+    this.rawServer = undefined;
     this.sendAgent?.destroy();
     this.sendAgent = undefined;
     this.flows.clear();
@@ -857,6 +954,7 @@ export class InterceptProxy extends EventEmitter {
     const gate = this.lanGate;
     this.lanGate = undefined;
     await gate?.close();
+    if (gate) this.grpcPool?.destroyGate(gate);
     const up = gate && this.lanUpstream.get(gate);
     if (up) {
       this.lanUpstream.delete(gate);
@@ -907,10 +1005,29 @@ export class InterceptProxy extends EventEmitter {
    * (again only if an update revives it and it is spent anew).
    */
   setRules(rules: Rule[]): void {
+    // CONTRACTS §16.2: a grpcMock (also as a sequence step) with headers the proxy owns (pseudo headers, content-type,
+    // grpc-status, grpc-message, hop-by-hop) or invalid values is refused: kept but never matched, listed in refusedRules.
+    const refused: { id: string; problem: string }[] = [];
+    const problemOf = (a: RuleAction | undefined): string | undefined => {
+      if (a?.kind === 'grpcMock') return grpcMockProblem(a);
+      if (a?.kind === 'sequence' && Array.isArray(a.steps)) {
+        for (let i = 0; i < a.steps.length; i++) {
+          const st = a.steps[i]?.action;
+          const p = st?.kind === 'grpcMock' ? grpcMockProblem(st) : undefined;
+          if (p) return `Sequence step ${i + 1}: ${p}`;
+        }
+      }
+      return undefined;
+    };
     // `used` is the host's display copy of our count: ignored, hit counts stay ours (keyed by id).
     this.compiled = compileRules(
-      rules.map(({ used: _used, ...r }) => ({ ...r, match: { ...r.match }, action: { ...r.action } }) as Rule),
+      rules.map(({ used: _used, ...r }) => {
+        const problem = problemOf(r.action);
+        if (problem) refused.push({ id: r.id, problem });
+        return { ...r, ...(problem ? { enabled: false } : {}), match: { ...r.match }, action: { ...r.action } } as Rule;
+      }),
     );
+    this.refused = refused;
     const ids = new Set(rules.map((r) => r.id));
     for (const id of [...this.hits.keys()]) if (!ids.has(id)) this.hits.delete(id);
     for (const id of [...this.spentFired]) if (!ids.has(id)) this.spentFired.delete(id);
@@ -931,6 +1048,11 @@ export class InterceptProxy extends EventEmitter {
         .filter(({ rule }) => rule.enabled && rule.action?.kind === 'script')
         .map(({ rule }) => ({ ruleId: rule.id, code: (rule.action as ScriptAction).code })),
     );
+  }
+
+  /** CONTRACTS §16.2: rules setRules refused (a grpcMock with headers the proxy owns, or invalid values); never matched. */
+  get refusedRules(): { id: string; problem: string }[] {
+    return this.refused.map((r) => ({ ...r }));
   }
 
   /** CONTRACTS §13.4: the script worker thread is running (status / tests). */
@@ -1050,6 +1172,36 @@ export class InterceptProxy extends EventEmitter {
   /** The TLS passthrough patterns in use. */
   get tlsPassthrough(): string[] {
     return this.passthrough.map((p) => p.pattern);
+  }
+
+  /**
+   * CONTRACTS §16.2: TLS gRPC silent tunnels to these hosts (host patterns, same rules as setTlsPassthrough) are
+   * decrypted — for apps that trust the Flutter Intercept CA in debug; other TLS silent tunnels are passed through
+   * undecrypted (`grpcTunnel`). A tlsPassthrough host is never decrypted. Applies to tunnels opened from now on.
+   */
+  setGrpcDecryptHosts(hosts: string[] | undefined): { hosts: string[]; problems: string[] } {
+    const { patterns, problems } = parseHostPatterns(hosts);
+    this.grpcDecrypt = patterns;
+    this.grpcDecryptProblems = problems.map((x) => (x.problem.startsWith('"') ? x.problem : `"${x.host.slice(0, 100)}": ${x.problem}`));
+    return { hosts: patterns.map((p) => p.pattern), problems: this.grpcDecryptProblems.slice() };
+  }
+
+  /** The gRPC decrypt patterns in use. */
+  get grpcDecryptHosts(): string[] {
+    return this.grpcDecrypt.map((p) => p.pattern);
+  }
+
+  /** Why entries of the last setGrpcDecryptHosts were refused. */
+  get grpcDecryptHostsProblems(): string[] {
+    return this.grpcDecryptProblems.slice();
+  }
+
+  /**
+   * CONTRACTS §16.2: whether gRPC interception works with this mockttp (a startup self-check of the internals the
+   * relay and silent tunnels use). Not ok: silent tunnels are passed through undecrypted and `problem` says why.
+   */
+  grpcSupport(): { ok: boolean; problem?: string } {
+    return this.grpcCheck.ok ? { ok: true } : { ok: false, ...(this.grpcCheck.problem ? { problem: this.grpcCheck.problem } : {}) };
   }
 
   /** False only when mockttp's CONNECT handling could not be hooked (then passthrough hosts are intercepted as usual). */
@@ -1503,12 +1655,16 @@ export class InterceptProxy extends EventEmitter {
         sendNonce ??= String(pair[1]).trim();
         return false;
       }
+      // CONTRACTS §16.2: the silent-tunnel headers mean something on a CONNECT only, and never go upstream.
+      if (name === SILENT_TUNNEL_HEADER || name === CONNECT_TIMEOUT_HEADER) return false;
       return true;
     });
     if (kept.length === raw.length) return;
     (req as unknown as { rawHeaders: Array<[string, string]> }).rawHeaders = kept;
     deleteHeader(req.headers as HeaderBag, TRACE_HEADER);
     deleteHeader(req.headers as HeaderBag, SEND_HEADER);
+    deleteHeader(req.headers as HeaderBag, SILENT_TUNNEL_HEADER);
+    deleteHeader(req.headers as HeaderBag, CONNECT_TIMEOUT_HEADER);
     const meta: ReqMeta = {};
     if (traceId && TRACE_ID_RE.test(traceId)) meta.traceId = traceId;
     if (sendNonce) meta.sendNonce = sendNonce;
@@ -1567,6 +1723,16 @@ export class InterceptProxy extends EventEmitter {
     for (let i = 0; i < this.compiled.length; i++) {
       const { rule, base, graphqlOperation: op } = this.compiled[i];
       if (!rule.enabled || this.spentReason(rule, now) || !base(method, url)) continue;
+      if (o.grpc) {
+        // CONTRACTS §16.2: other actions never match a gRPC call; the next rule is tried.
+        if (op !== undefined) continue;
+        if (!grpcApplicable(rule.action)) {
+          const a = rule.action;
+          const what = a?.kind === 'sequence' ? 'Sequence rule (a step that is not grpcMock, block, fault, throttle or passthrough)' : `${capitalize(String(a?.kind ?? 'unknown'))} rule`;
+          note ??= `${what}${rule.name ? ` "${rule.name}"` : ''} does not apply to gRPC calls; the next rule was tried.`;
+          continue;
+        }
+      } else if (rule.action?.kind === 'grpcMock') continue; // gRPC calls only
       if (op !== undefined && !o.ignoreGraphql) {
         if (o.ws || o.tunnel) continue; // the operation of a subscription is inside the frames
         if (o.body) {
@@ -1610,6 +1776,10 @@ export class InterceptProxy extends EventEmitter {
         action = pick.action;
         step = pick.index;
         if (pick.invalid) note ??= pick.invalid;
+        if (!o.grpc && action?.kind === 'grpcMock') {
+          action = undefined;
+          note ??= `Sequence step ${step + 1} (grpcMock) applies to gRPC calls only; the request was passed through.`;
+        }
       } else {
         action = rule.action;
       }
@@ -1715,6 +1885,7 @@ export class InterceptProxy extends EventEmitter {
     if (known) return known;
     if (this.unauthorized.has(req)) return DENIED_FLOW; // never recorded
     if (isTraceUrl(req.url)) return TRACE_FLOW; // answered locally, never recorded, never throttled
+    if (this.grpcCheck.ok && isGrpcCall(req)) return this.decideGrpc(req);
     const meta = this.reqMeta.get(req);
     const send = meta?.sendNonce ? this.sends.get(meta.sendNonce) : undefined;
     const headers = req.headers as HeaderBag;
@@ -2112,6 +2283,7 @@ export class InterceptProxy extends EventEmitter {
     }
     const { ex, flow } = live;
     if (flow.truncated) return; // the truncate fault closed it; recorded by onTruncated
+    if (ex.kind === 'grpc') return; // the relay records its own end (stream close)
     const hold = this.holds.get(id);
     if (hold) return hold(true); // the timeout fault: the app gave up
     this.flows.delete(id);
@@ -3053,6 +3225,610 @@ export class InterceptProxy extends EventEmitter {
     await step.connectUpstream(destination, map.url, req, rawHeaders, socket, head, options);
   }
 
+  // ---------------------------------------------------------------- gRPC (CONTRACTS §16.2)
+
+  /** A gRPC call's flow: the first applicable rule (or sequence step), the network profile. */
+  private decideGrpc(req: OngoingRequest): Flow {
+    const m = this.matchRule(req.method, req.url, { count: true, grpc: true });
+    const flow = this.grpcFlowFor(m.rule, m.action, m.note, m.step);
+    const meta = this.reqMeta.get(req);
+    if (meta?.traceId) flow.traceId = meta.traceId;
+    if (lanGateOf((req as unknown as { socket?: unknown }).socket)) flow.viaLan = true;
+    flow.te = (req as unknown as { timingEvents?: RequestTimingEvents }).timingEvents;
+    this.flows.set(req.id, flow);
+    // Messages are recorded as frames by the relay: the taps keep no body copy.
+    const tap = getTap(req.id);
+    if (tap) {
+      tap.req.skip = true;
+      tap.res.skip = true;
+    }
+    return flow;
+  }
+
+  /** Like flowFor, for the actions that apply to gRPC: faults, throttle (+ the profile and its drop rate), block, grpcMock. */
+  private grpcFlowFor(rule: Rule | undefined, action: Applied, note?: string, step?: number): Flow {
+    let flow: Flow = { route: 'grpc', ...(rule ? { rule } : {}), ...(action ? { action } : {}) };
+    let dropRate: number | undefined;
+    if (action?.kind === 'fault') {
+      flow.fault = action.fault;
+      flow.simulated = FAULT_LABELS[action.fault];
+    } else if (action?.kind === 'throttle') {
+      flow.throttle = { latencyMs: action.latencyMs, kbps: action.kbps, uploadKbps: action.uploadKbps };
+      flow.simulated = throttleLabel(action);
+      dropRate = action.dropRate;
+    }
+    const reachesNetwork = !action || action.kind === 'throttle';
+    const p = this.profile;
+    const store = this.replayStore;
+    if (reachesNetwork && p.kind === 'offline') {
+      flow = { route: 'grpc', ...(rule ? { rule } : {}), fault: 'dns', simulated: describeProfile(p) };
+      dropRate = undefined;
+    } else if (!rule && store?.fallback === 'fail') {
+      // Replay (CONTRACTS §12.4) never answers gRPC, but its "fail" fallback (offline demo) still keeps it off the network.
+      flow = { route: 'grpc', fault: 'dns', simulated: `Not in the recording${store.name ? ` "${store.name}"` : ''} (replay: fail)` };
+      dropRate = undefined;
+    } else if (reachesNetwork && p.kind === 'throttle' && action?.kind !== 'throttle') {
+      flow.throttle = { latencyMs: p.latencyMs, kbps: p.kbps, uploadKbps: p.uploadKbps };
+      flow.simulated = profileLabel(p);
+      dropRate = p.dropRate;
+    }
+    if (dropRate && dropRate > 0 && Math.random() < dropRate) {
+      flow = { route: 'grpc', ...(rule ? { rule } : {}), fault: 'drop', throttle: { latencyMs: flow.throttle?.latencyMs }, simulated: `${flow.simulated ?? 'Throttle'}: dropped` };
+    }
+    if (step !== undefined && rule?.action.kind === 'sequence') {
+      flow.step = step;
+      const n = rule.action.steps?.length ?? 0;
+      const label = step < 0 ? 'Sequence done: passed through' : `Sequence step ${step + 1}/${n}`;
+      flow.simulated = flow.simulated ? `${label} · ${flow.simulated}` : label;
+    }
+    if (note) flow.note = note;
+    return flow;
+  }
+
+  /**
+   * mockttp step for gRPC calls (own `handle`): everything is written on the raw HTTP/2 stream (trailers-only answers,
+   * trailers, RST codes and flow control survive), then mockttp's compatibility response is marked ended.
+   */
+  private async onGrpc(req: OngoingRequest, res: http.ServerResponse): Promise<void> {
+    const compat = res as unknown as { stream?: http2.ServerHttp2Stream; writableEnded?: boolean; end(): unknown };
+    const stream = compat.stream;
+    try {
+      if (!stream) throw new Error('not an HTTP/2 stream');
+      await this.runGrpc(req, stream);
+    } catch (e) {
+      const live = this.live.get(req.id);
+      if (live) this.fail(live.ex, `The gRPC relay failed: ${(e as Error)?.message ?? String(e)}`);
+      try {
+        if (stream && !stream.destroyed) stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR);
+      } catch {
+        /* already gone */
+      }
+    } finally {
+      this.flows.delete(req.id);
+      // Ends mockttp's tracking of the compatibility response (a no-op on the closed stream), then marks it ended
+      // (else mockttp reports "finished without ending the response").
+      try {
+        compat.end();
+      } catch {
+        /* closed */
+      }
+      if (!compat.writableEnded) {
+        try {
+          Object.defineProperty(res, 'writableEnded', { value: true, configurable: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  /** Record the call and answer it per its flow; resolves when the app's stream is closed. */
+  private runGrpc(req: OngoingRequest, stream: http2.ServerHttp2Stream): Promise<void> {
+    const flow = this.flows.get(req.id) ?? { route: 'grpc' as Route };
+    const headers = req.headers as HeaderBag;
+    let path = '/';
+    try {
+      path = new URL(req.url).pathname;
+    } catch {
+      /* keep / */
+    }
+    const { service, method } = parseGrpcPath(path);
+    const ex = this.newExchange({ id: req.id, method: req.method, url: req.url, headers: recordedHeaders(headers), timingEvents: req.timingEvents }, flow);
+    delete ex.graphql;
+    delete ex.browserInternal;
+    ex.kind = 'grpc';
+    ex.frames = [];
+    const reqEncoding = grpcEncodingOf(headers['grpc-encoding']);
+    const deadlineMs = parseGrpcTimeout(headers['grpc-timeout']);
+    const info: GrpcInfo = {
+      service,
+      method,
+      messagesSent: 0,
+      messagesReceived: 0,
+      ...(reqEncoding ? { requestEncoding: reqEncoding } : {}),
+      ...(deadlineMs !== undefined ? { deadlineMs } : {}),
+    };
+    ex.grpc = info;
+    this.track(ex, flow);
+    const call: GrpcCall = { ex, info, flow, req, stream, isLive: () => this.live.get(ex.id)?.ex === ex };
+    stream.on('error', () => undefined);
+    const closed = new Promise<void>((resolve) => {
+      if (stream.closed || stream.destroyed) return resolve();
+      stream.once('close', () => {
+        this.onGrpcClosed(call);
+        resolve();
+      });
+    });
+    if (stream.closed || stream.destroyed) {
+      this.onGrpcClosed(call);
+      return closed;
+    }
+    const a = flow.action;
+    let work: Promise<void>;
+    if (flow.fault === 'truncate') work = this.grpcRelay(call, true);
+    else if (flow.fault) work = this.grpcFault(call, flow.fault);
+    else if (a?.kind === 'block') work = this.grpcBlock(call, a);
+    else if (a?.kind === 'grpcMock') work = this.grpcMock(call, a);
+    else work = this.grpcRelay(call, false);
+    work.catch((e: unknown) => {
+      if (call.isLive()) this.fail(ex, `The gRPC relay failed: ${(e as Error)?.message ?? String(e)}`);
+      this.grpcReset(call, http2.constants.NGHTTP2_INTERNAL_ERROR);
+    });
+    return closed;
+  }
+
+  /** Request messages of a call answered locally: read (and recorded) as they come. */
+  private drainGrpcRequest(call: GrpcCall): void {
+    const parser = this.grpcRequestParser(call);
+    call.req.on('data', (c: Buffer) => parser.push(c));
+    call.req.once('end', () => {
+      if (call.isLive()) this.setRequestMs(call.ex, call.flow.te, performance.now());
+    });
+    call.req.on('error', () => undefined);
+  }
+
+  private grpcRequestParser(call: GrpcCall): GrpcMessageParser {
+    const enc = call.info.requestEncoding;
+    return new GrpcMessageParser((m) => {
+      if (!call.isLive()) return;
+      call.info.messagesSent++;
+      this.addFrame(call.ex, messageFrame('send', m, enc));
+    });
+  }
+
+  /** The app's stream closed. Unless the call already ended, the app cancelled it (or its connection went away). */
+  private onGrpcClosed(call: GrpcCall): void {
+    const { ex, stream, up } = call;
+    if (up && !up.closed && !up.destroyed) {
+      try {
+        up.close(http2.constants.NGHTTP2_CANCEL); // RST_STREAM CANCEL upstream
+      } catch {
+        /* gone */
+      }
+    }
+    const hold = this.holds.get(ex.id);
+    if (hold) return hold(true); // the timeout fault: the app gave up
+    if (!call.isLive() || call.localReset) return;
+    const code = stream.rstCode;
+    const deadline = call.info.deadlineMs;
+    const elapsedMs = Date.now() - ex.startedAt;
+    ex.error =
+      code === http2.constants.NGHTTP2_CANCEL
+        ? deadline !== undefined && elapsedMs >= deadline - 50
+          ? `The app cancelled the call when its deadline (${deadline} ms) passed.`
+          : 'The app cancelled the call (RST_STREAM CANCEL).'
+        : code
+          ? `The app reset the stream (${h2CodeName(code)}).`
+          : 'The app closed the connection before the call ended.';
+    this.finish(ex, 'aborted');
+  }
+
+  /** Reset the app's stream (RST_STREAM `code`); its close is then ours, not the app's. */
+  private grpcReset(call: GrpcCall, code: number): void {
+    call.localReset = true;
+    try {
+      if (!call.stream.destroyed && !call.stream.closed) call.stream.close(code);
+    } catch {
+      /* gone */
+    }
+  }
+
+  /**
+   * The response is complete but the app is still sending (client / bidi streaming): like gRPC servers, close the
+   * stream with RST_STREAM NO_ERROR once the response is out (RFC 7540 §8.1), so the app's call can finish.
+   */
+  private grpcEndRequestSide(call: GrpcCall): void {
+    const { stream } = call;
+    call.localReset = true;
+    setImmediate(() => {
+      try {
+        if (!stream.closed && !stream.destroyed && !stream.state?.remoteClose) stream.close(http2.constants.NGHTTP2_NO_ERROR);
+      } catch {
+        /* gone */
+      }
+    });
+  }
+
+  /**
+   * Answer with a trailers-only response (the status in the one HEADERS frame) and end the exchange in `state`.
+   * After response headers (relay failures mid-response) the trailers end the response instead.
+   */
+  private grpcStatusOnly(call: GrpcCall, code: number, message: string, state: 'blocked' | 'error' | 'mocked' | 'completed', error?: string): void {
+    const { ex, info, stream } = call;
+    const status: Record<string, string> = { 'grpc-status': String(code), ...(message ? { 'grpc-message': encodeGrpcMessage(message) } : {}) };
+    call.localReset = true;
+    try {
+      if (!stream.destroyed && !stream.closed && !stream.headersSent) {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc', ...status }, { endStream: true });
+        this.grpcEndRequestSide(call);
+        ex.status = 200;
+        ex.responseHeaders = { 'content-type': 'application/grpc', ...status };
+        info.trailersOnly = true;
+      }
+    } catch {
+      /* the app is gone */
+    }
+    info.statusCode = code;
+    if (message) info.statusMessage = message;
+    if (!call.isLive()) return;
+    if (state === 'error') return this.fail(ex, error ?? message);
+    if (error) ex.error = error;
+    this.finish(ex, state);
+  }
+
+  private async grpcBlock(call: GrpcCall, a: Extract<RuleAction, { kind: 'block' }>): Promise<void> {
+    this.drainGrpcRequest(call);
+    if (a.mode === 'reset') {
+      this.grpcReset(call, http2.constants.NGHTTP2_INTERNAL_ERROR);
+      if (call.isLive()) this.finish(call.ex, 'blocked');
+      return;
+    }
+    this.grpcStatusOnly(call, 14, BLOCK_BODY, 'blocked');
+  }
+
+  /**
+   * Faults on a gRPC call (the truncate fault is the relay's): reset → RST_STREAM INTERNAL_ERROR; dns → UNAVAILABLE
+   * "DNS lookup failed"; drop (throttle drop rate) → UNAVAILABLE after the latency; timeout → no answer until the app
+   * gives up (or breakpointTimeoutMs, then RST_STREAM CANCEL). The exchange ends 'blocked'.
+   */
+  private async grpcFault(call: GrpcCall, fault: FlowFault): Promise<void> {
+    const { ex, flow } = call;
+    this.drainGrpcRequest(call);
+    if (fault === 'reset') {
+      this.grpcReset(call, http2.constants.NGHTTP2_INTERNAL_ERROR);
+      if (call.isLive()) this.finish(ex, 'blocked');
+      return;
+    }
+    if (fault === 'dns') return this.grpcStatusOnly(call, 14, 'DNS lookup failed', 'blocked');
+    if (fault === 'drop') {
+      if (!(await this.latency(ex, flow)) || !call.isLive()) return;
+      return this.grpcStatusOnly(call, 14, 'Flutter Intercept: dropped (simulated network)', 'blocked');
+    }
+    if (fault === 'timeout') {
+      const appLeft = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => settle(false), this.breakpointTimeoutMs);
+        timer.unref?.();
+        const settle = (left: boolean) => {
+          clearTimeout(timer);
+          this.holds.delete(ex.id);
+          resolve(left);
+        };
+        this.holds.set(ex.id, settle);
+      });
+      if (!call.isLive()) return;
+      const secs = ((Date.now() - ex.startedAt) / 1000).toFixed(1);
+      ex.simulated = appLeft ? `${FAULT_LABELS.timeout} (the app gave up after ${secs} s)` : `${FAULT_LABELS.timeout} (reset after ${secs} s)`;
+      if (!appLeft) this.grpcReset(call, http2.constants.NGHTTP2_CANCEL);
+      this.finish(ex, 'blocked');
+    }
+  }
+
+  /**
+   * grpcMock: after `delayMs`, response headers (`content-type: application/grpc` + `headers`), each message `gapMs`
+   * apart, then the status trailers. A non-zero code without messages is trailers-only. Never waits for the app to
+   * half-close (bidi).
+   */
+  private async grpcMock(call: GrpcCall, a: Extract<RuleAction, { kind: 'grpcMock' }>): Promise<void> {
+    const { ex, info, stream } = call;
+    this.drainGrpcRequest(call);
+    const open = () => call.isLive() && !stream.closed && !stream.destroyed;
+    if (a.delayMs && a.delayMs > 0) {
+      const from = performance.now();
+      await sleep(a.delayMs);
+      if (call.isLive()) this.addPhase(ex, 'delayMs', performance.now() - from);
+      if (!open()) return;
+    }
+    const code = a.code ?? 0;
+    const messages = (a.messages ?? []).map((m) => Buffer.from(String(m), 'base64'));
+    const lower = (h: Record<string, string> | undefined) => Object.fromEntries(Object.entries(h ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
+    const headers: Record<string, string> = { 'content-type': 'application/grpc', ...lower(a.headers) };
+    const trailers: Record<string, string> = {
+      'grpc-status': String(code),
+      ...(a.message ? { 'grpc-message': encodeGrpcMessage(a.message) } : {}),
+      ...lower(a.trailers),
+    };
+    info.statusCode = code;
+    if (a.message) info.statusMessage = a.message;
+    if (code !== 0 && !messages.length) {
+      call.localReset = true;
+      stream.respond({ ':status': 200, ...headers, ...trailers }, { endStream: true });
+      this.grpcEndRequestSide(call);
+      ex.status = 200;
+      ex.responseHeaders = { ...headers, ...trailers };
+      info.trailersOnly = true;
+      this.finish(ex, 'mocked');
+      return;
+    }
+    stream.removeAllListeners('wantTrailers'); // the compatibility response's own (it would send empty trailers)
+    stream.on('wantTrailers', () => {
+      call.localReset = true;
+      try {
+        stream.sendTrailers(trailers);
+        this.grpcEndRequestSide(call);
+      } catch {
+        /* gone */
+      }
+      if (!call.isLive()) return;
+      ex.responseTrailers = { ...trailers };
+      this.finish(ex, 'mocked');
+    });
+    stream.respond({ ':status': 200, ...headers }, { waitForTrailers: true });
+    ex.status = 200;
+    ex.responseHeaders = { ...headers };
+    this.emitChange(ex);
+    const gap = a.gapMs && a.gapMs > 0 ? a.gapMs : 0;
+    for (let i = 0; i < messages.length; i++) {
+      if (!open()) return;
+      const m = messages[i];
+      const ok = stream.write(frameMessage(m));
+      info.messagesReceived++;
+      this.addFrame(ex, messageFrame('receive', { compressed: false, size: m.length, kept: m, complete: true }, undefined));
+      if (!ok) await new Promise<void>((r) => (stream.once('drain', r), stream.once('close', r)));
+      if (gap && i < messages.length - 1) await sleep(gap);
+    }
+    if (open()) stream.end();
+  }
+
+  /** Does upstream TLS to this server skip verification (ignoreUpstreamCertErrors, or a MITM upstream proxy's flag)? */
+  private grpcInsecure(host: string, port: number, gate: LanGate | undefined): boolean {
+    const ig = this.opts.ignoreUpstreamCertErrors;
+    if (ig === true) return true;
+    if (Array.isArray(ig) && (ig.includes(host) || ig.includes(`${host}:${port}`))) return true;
+    const up = this.upstreamSpec;
+    const alias = (this.opts.rewriteLocalhost ?? true) && !gate ? (h: string) => HOST_ALIASES[h] : undefined;
+    return !!up?.ignoreCertErrors && viaUpstreamProxy({ host, port, upstream: up, alias, ...(gate ? { lan: { listenerHost: gate.host, closed: () => gate.closed } } : {}) });
+  }
+
+  /**
+   * The relay (spike grpc-relay.js): our own HTTP/2 stream to the server, raw stream API both ways, pipes for flow
+   * control, a side parser recording every message. `truncate`: forward the response headers and first message,
+   * then RST_STREAM INTERNAL_ERROR.
+   */
+  private async grpcRelay(call: GrpcCall, truncate: boolean): Promise<void> {
+    const { ex, info, flow, req, stream } = call;
+    const C = http2.constants;
+    const latency = flow.throttle?.latencyMs;
+    if (latency && latency > 0) {
+      if (!(await this.latency(ex, flow)) || !call.isLive() || stream.closed) return;
+    }
+    let target: URL;
+    try {
+      target = new URL(req.url);
+    } catch {
+      return this.grpcStatusOnly(call, 14, 'Flutter Intercept: invalid request URL', 'error', 'Invalid request URL');
+    }
+    const protocol = target.protocol === 'https:' ? 'https:' : 'http:';
+    const host = target.hostname.replace(/^\[|\]$/g, '');
+    const port = Number(target.port) || (protocol === 'https:' ? 443 : 80);
+    const socket = (req as unknown as { socket?: unknown }).socket;
+    const gate = lanGateOf(socket);
+    const connectTimeoutMs = findOnSocketChain(socket, (o) => (o as Record<symbol, SilentInfo | undefined>)[SILENT_INFO]?.connectTimeoutMs) ?? GRPC_CONNECT_TIMEOUT_MS;
+    const cert = protocol === 'https:' ? this.certFor(host, port) : undefined;
+    if (cert) ex.clientCertificate = cert.host;
+    const pool = this.grpcPool;
+    let lease: Awaited<ReturnType<GrpcSessionPool['acquire']>>;
+    try {
+      if (!pool) throw new Error('the proxy is stopping');
+      if (gate?.closed) throw new SsrfError(host, host, 'LAN mode is off');
+      lease = await pool.acquire(
+        {
+          protocol,
+          host,
+          port,
+          ...(gate ? { gate } : {}),
+          upstream: this.upstreamSpec,
+          ...(!gate && (this.opts.rewriteLocalhost ?? true) ? { alias: (h: string) => HOST_ALIASES[h] } : {}),
+          rejectUnauthorized: !this.grpcInsecure(host, port, gate),
+          ...(cert ? { cert: { pattern: cert.host, options: cert.options } } : {}),
+          connectTimeoutMs,
+        },
+        (p) => this.addTimings(ex.id, p),
+      );
+    } catch (e) {
+      if (!call.isLive()) return;
+      const err = e as Error & { statusCode?: number };
+      const forbidden = e instanceof SsrfError || err.statusCode === 403;
+      const label = net.isIPv6(host) ? `[${host}]` : host;
+      const reason = forbidden
+        ? e instanceof SsrfError
+          ? err.message
+          : `${SSRF_MARKER}: ${err.message}`
+        : `Could not connect to ${label}:${port}: ${err.message}`;
+      return this.grpcStatusOnly(call, 14, `Flutter Intercept: ${reason}`, 'error', reason);
+    }
+    if (!call.isLive() || stream.closed || stream.destroyed) {
+      lease.release();
+      return;
+    }
+    const headers = req.headers as HeaderBag;
+    const authority = typeof headers[':authority'] === 'string' ? (headers[':authority'] as string) : target.host;
+    const upHeaders: http2.OutgoingHttpHeaders = {
+      ...forwardableHeaders(headers),
+      ':method': req.method,
+      ':path': `${target.pathname}${target.search}`,
+      ':authority': authority,
+      ':scheme': protocol.slice(0, -1),
+    };
+    let up: http2.ClientHttp2Stream;
+    const sentAt = performance.now();
+    try {
+      up = lease.session.request(upHeaders);
+    } catch (e) {
+      lease.release();
+      const reason = `Could not start the call on the server connection: ${(e as Error).message}`;
+      return this.grpcStatusOnly(call, 14, `Flutter Intercept: ${reason}`, 'error', reason);
+    }
+    lease.track(up);
+    call.up = up;
+    up.on('error', (e: Error & { code?: string }) => {
+      call.upError ??= e;
+    });
+
+    // app → (record) → (upload pacing) → server; pipes carry HTTP/2 flow control both ways.
+    const reqParser = this.grpcRequestParser(call);
+    let upSrc: Readable = req.pipe(new Observer((c) => reqParser.push(c)));
+    const upload = flow.throttle?.uploadKbps;
+    if (upload && upload > 0) upSrc = upSrc.pipe(new PacedStream({ kbps: upload }));
+    upSrc.pipe(up);
+    req.once('end', () => {
+      if (call.isLive()) this.setRequestMs(ex, flow.te, performance.now());
+    });
+    req.on('error', () => undefined);
+
+    up.on('response', (h, flags) => {
+      if (!call.isLive() || stream.closed || stream.destroyed) return;
+      call.headAt = performance.now();
+      this.addTimings(ex.id, { waitMs: elapsed(sentAt, call.headAt) });
+      const status = Number(h[':status']) || 0;
+      ex.status = status;
+      ex.responseHeaders = recordedHeaders(h as HeaderBag);
+      const enc = grpcEncodingOf(h['grpc-encoding']);
+      if (enc) info.responseEncoding = enc;
+      const fwd: http2.OutgoingHttpHeaders = { ':status': status, ...forwardableHeaders(h as HeaderBag) };
+      if (flags & C.NGHTTP2_FLAG_END_STREAM) {
+        // Trailers-only: the status stays in the one HEADERS frame (mockttp's passthrough loses END_STREAM here).
+        info.trailersOnly = true;
+        const code = parseGrpcStatus(h['grpc-status']);
+        if (code !== undefined) info.statusCode = code;
+        const msg = decodeGrpcMessage(h['grpc-message']);
+        if (msg !== undefined) info.statusMessage = msg;
+        call.localReset = true;
+        try {
+          stream.respond(fwd, { endStream: true });
+          this.grpcEndRequestSide(call);
+        } catch {
+          /* the app left */
+        }
+        this.addTimings(ex.id, { receiveMs: 0 });
+        this.finish(ex, truncate ? 'blocked' : 'completed');
+        return;
+      }
+      stream.removeAllListeners('wantTrailers'); // the compatibility response's own (ERR_HTTP2_TRAILERS_ALREADY_SENT)
+      stream.on('wantTrailers', () => this.sendGrpcTrailers(call));
+      try {
+        stream.respond(fwd, { waitForTrailers: true });
+      } catch {
+        return;
+      }
+      this.emitChange(ex);
+      const resParser = new GrpcMessageParser((m) => {
+        if (!call.isLive()) return;
+        info.messagesReceived++;
+        this.addFrame(ex, messageFrame('receive', m, info.responseEncoding));
+      });
+      if (truncate) {
+        const cut = new FirstMessageCut();
+        up.on('data', (c: Buffer) => {
+          if (cut.done) return;
+          const r = cut.push(c);
+          resParser.push(r.forward);
+          if (!r.cut) {
+            if (r.forward.length) stream.write(r.forward);
+            return;
+          }
+          call.localReset = true;
+          try {
+            up.close(C.NGHTTP2_CANCEL);
+          } catch {
+            /* gone */
+          }
+          stream.write(r.forward, () => this.grpcReset(call, C.NGHTTP2_INTERNAL_ERROR));
+          if (call.isLive()) this.finish(ex, 'blocked');
+        });
+        up.once('end', () => {
+          if (!cut.done && !stream.closed) stream.end();
+        });
+        return;
+      }
+      let tail: Readable = up.pipe(new Observer((c) => resParser.push(c)));
+      const kbps = flow.throttle?.kbps;
+      if (kbps && kbps > 0) tail = tail.pipe(new PacedStream({ kbps }));
+      call.respTail = tail;
+      tail.pipe(stream);
+    });
+    up.on('trailers', (t) => {
+      call.upTrailers = t;
+      ex.responseTrailers = recordedHeaders(t as HeaderBag);
+      const code = parseGrpcStatus(t['grpc-status']);
+      if (code !== undefined) info.statusCode = code;
+      const msg = decodeGrpcMessage(t['grpc-message']);
+      if (msg !== undefined) info.statusMessage = msg;
+      if (call.headAt !== undefined) this.addTimings(ex.id, { receiveMs: elapsed(call.headAt) });
+    });
+    up.once('close', () => this.onGrpcUpstreamClosed(call));
+  }
+
+  /** The app's response body ended: the server's trailers (or a failure status, or none) end it. */
+  private sendGrpcTrailers(call: GrpcCall): void {
+    const { ex, stream } = call;
+    const t: http2.OutgoingHttpHeaders = call.upTrailers ? forwardableHeaders(call.upTrailers as HeaderBag) : (call.failTrailers ?? {});
+    call.localReset = true;
+    try {
+      stream.sendTrailers(t);
+      this.grpcEndRequestSide(call);
+    } catch {
+      /* gone */
+    }
+    if (!call.isLive()) return;
+    if (call.upTrailers) return this.finish(ex, 'completed');
+    if (call.failTrailers) {
+      ex.responseTrailers = { ...call.failTrailers };
+      call.info.statusCode = 14;
+      call.info.statusMessage = decodeGrpcMessage(call.failTrailers['grpc-message']);
+      return this.fail(ex, call.failReason ?? 'The connection to the server failed.');
+    }
+    this.fail(ex, 'The server ended the response without trailers (no gRPC status).');
+  }
+
+  /** The server's stream closed: unless its trailers came, map the failure for the app (UNAVAILABLE or its reset). */
+  private onGrpcUpstreamClosed(call: GrpcCall): void {
+    const { ex, stream, up } = call;
+    if (!up || !call.isLive() || call.upTrailers || call.localReset || stream.closed || stream.destroyed) return;
+    const err = call.upError;
+    const code = up.rstCode;
+    const peerReset = !!code && code !== http2.constants.NGHTTP2_NO_ERROR && (!err || err.code === 'ERR_HTTP2_STREAM_ERROR');
+    if (!err && !peerReset) return; // ended without trailers: the pipe ends the app's response (sendGrpcTrailers)
+    const reason = peerReset ? `the server reset the stream (${h2CodeName(code)})` : `the connection to the server failed (${err?.message ?? 'closed'})`;
+    if (!stream.headersSent) {
+      return this.grpcStatusOnly(call, 14, `Flutter Intercept: ${reason}`, 'error', `${capitalize(reason)}.`);
+    }
+    if (peerReset) {
+      // Mid-response: the same reset for the app (code preserved).
+      this.grpcReset(call, code!);
+      return this.fail(ex, `${capitalize(reason)}.`);
+    }
+    // The server's connection failed mid-response: end the app's response with UNAVAILABLE.
+    call.failTrailers = { 'grpc-status': '14', 'grpc-message': encodeGrpcMessage(`Flutter Intercept: ${reason}`) };
+    call.failReason = `${capitalize(reason)}.`;
+    try {
+      call.respTail?.unpipe(stream);
+      stream.end();
+    } catch {
+      this.grpcReset(call, http2.constants.NGHTTP2_INTERNAL_ERROR);
+      this.fail(ex, call.failReason);
+    }
+  }
+
   // ---------------------------------------------------------------- client certificates (CONTRACTS §14.3)
 
   /** The first usable certificate for a server. */
@@ -3144,8 +3920,15 @@ export class InterceptProxy extends EventEmitter {
     this.connectHook = true;
   }
 
-  /** A CONNECT to a passthrough host: tunnel it (true), else mockttp handles it (false). */
+  /**
+   * A silent CONNECT (CONTRACTS §16.2) or a CONNECT to a passthrough host: handled here (true), else mockttp answers
+   * it (false). The marker counts on HTTP/1 CONNECTs only (an HTTP/2 CONNECT arrives with a response object).
+   */
   private onConnect(req: http.IncomingMessage, socket: unknown, head: Buffer | undefined): boolean {
+    if (socket instanceof net.Socket && isSilentMarker(req.headers[SILENT_TUNNEL_HEADER])) {
+      void this.runSilent(req, socket, head ?? Buffer.alloc(0)).catch(() => socket.destroy());
+      return true;
+    }
     if (!this.passthrough.length || !(socket instanceof net.Socket) || socket instanceof tls.TLSSocket) return false;
     const t = splitHostPort(req.url ?? '');
     if (!t) return false;
@@ -3155,7 +3938,108 @@ export class InterceptProxy extends EventEmitter {
     return true;
   }
 
-  private async runTunnel(req: http.IncomingMessage, socket: net.Socket, head: Buffer, host: string, port: number): Promise<void> {
+  /**
+   * CONTRACTS §16.2: a silent CONNECT from the entry's gRPC hook. Nothing is ever written back; the first payload byte
+   * decides: the h2c preface (and TLS to a grpcDecryptHosts host) → mockttp, as if it had answered the CONNECT; other
+   * TLS → a passthrough tunnel (`grpcTunnel`); anything else → closed and recorded. LAN sockets were checked by
+   * their gate (token, pinned peer, SSRF pre-check; refusals there are closes too).
+   */
+  private async runSilent(req: http.IncomingMessage, socket: net.Socket, head: Buffer): Promise<void> {
+    socket.on('error', () => undefined);
+    if (!lanConnectAllowed(socket)) {
+      socket.destroy();
+      return;
+    }
+    const target = req.url ?? '';
+    const t = splitHostPort(target);
+    const host = t ? normalizeHostname(t.host) : '';
+    if (!t || !host) {
+      this.recordSilentFailure(target, 'The silent tunnel named no valid host:port; it was closed.', socket);
+      socket.destroy();
+      return;
+    }
+    const info: SilentInfo = { connectTimeoutMs: parseConnectTimeout(req.headers[CONNECT_TIMEOUT_HEADER]) };
+    const marks = socket as unknown as Record<symbol, unknown>;
+    marks[SILENT_INFO] = info;
+    marks[SOCKET_SELF] ??= socket;
+    const first = head.length ? head : await this.firstBytes(socket);
+    if (!first) {
+      socket.destroy(); // closed (or silent) before the first byte: nothing happened
+      return;
+    }
+    const kind = classifyFirstBytes(first);
+    if (kind === 'other') {
+      this.recordSilentFailure(target, 'Not HTTP/2 or TLS inside the silent tunnel; it was closed.', socket);
+      socket.destroy();
+      return;
+    }
+    const decrypt =
+      kind === 'h2c' ||
+      (this.grpcDecrypt.some((p) => matchesHostPattern(p, host, t.port)) && !this.passthrough.some((p) => matchesHostPattern(p, host, t.port)));
+    const raw = this.rawServer;
+    if (decrypt && this.grpcCheck.ok && raw && this.server) {
+      if (injectSilentTunnel(raw, socket, target, head.length ? head : undefined)) return;
+    }
+    const note = decrypt && !this.grpcCheck.ok ? (this.grpcCheck.problem ?? 'gRPC interception is unavailable; passed through undecrypted.') : undefined;
+    await this.runTunnel(req, socket, head, host, t.port, { silent: true, plain: kind === 'h2c', connectTimeoutMs: info.connectTimeoutMs, ...(note ? { note } : {}) });
+  }
+
+  /** The first payload chunk of a silent tunnel, put back into the socket (undefined: closed or nothing in time). */
+  private firstBytes(socket: net.Socket): Promise<Buffer | undefined> {
+    return new Promise((resolve) => {
+      let timer: NodeJS.Timeout | undefined;
+      const done = (b?: Buffer) => {
+        clearTimeout(timer);
+        socket.off('data', onData);
+        socket.off('end', onGone);
+        socket.off('close', onGone);
+        resolve(b);
+      };
+      const onData = (d: Buffer) => {
+        socket.pause();
+        socket.unshift(d);
+        // Like node's http server after a CONNECT: no flowing mode until the next reader attaches.
+        (socket as unknown as { readableFlowing: boolean | null }).readableFlowing = null;
+        done(d);
+      };
+      const onGone = () => done(undefined);
+      timer = setTimeout(onGone, SILENT_FIRST_BYTE_MS);
+      timer.unref?.();
+      socket.on('data', onData);
+      socket.once('end', onGone);
+      socket.once('close', onGone);
+    });
+  }
+
+  /** A silent tunnel that could not be used: one 'error' tunnel exchange (CONTRACTS §16.2). */
+  private recordSilentFailure(target: string, error: string, socket: net.Socket): void {
+    const t = splitHostPort(target);
+    const label = t ? (net.isIPv6(t.host) ? `[${t.host}]` : t.host) : 'unknown-host';
+    const ex: Exchange = {
+      id: `tunnel-${randomUUID()}`,
+      startedAt: Date.now(),
+      durationMs: 0,
+      method: 'CONNECT',
+      url: `https://${label}${t ? `:${t.port}` : ''}/`,
+      requestHeaders: {},
+      state: 'error',
+      error,
+      kind: 'tunnel',
+      grpcTunnel: true,
+      ...(lanGateOf(socket) ? { viaLan: true as const } : {}),
+    };
+    this.store.set(ex.id, ex);
+    this.emitChange(ex);
+  }
+
+  private async runTunnel(
+    req: http.IncomingMessage,
+    socket: net.Socket,
+    head: Buffer,
+    host: string,
+    port: number,
+    silent?: { silent: true; plain: boolean; connectTimeoutMs: number; note?: string },
+  ): Promise<void> {
     socket.on('error', () => undefined);
     if (!lanConnectAllowed(socket)) {
       socket.destroy();
@@ -3163,7 +4047,7 @@ export class InterceptProxy extends EventEmitter {
     }
     const gate = lanGateOf(socket);
     const label = net.isIPv6(host) ? `[${host}]` : host;
-    const url = `https://${label}:${port}/`;
+    const url = `${silent?.plain ? 'http' : 'https'}://${label}:${port}/`;
     // Rules: block and fault only. Matched as method CONNECT on the tunnel's own URL (a rule made from a tunnel,
     // `https://host:port/*`), and on `https://host/` for port 443 so a rule written for the site applies too.
     let m: MatchResult = {};
@@ -3207,8 +4091,11 @@ export class InterceptProxy extends EventEmitter {
       }
     }
     if (cut) flow.fault = cut;
+    if (silent?.note) note = note ? `${silent.note} ${note}` : silent.note;
     const requestHeaders = cleanHeaders(req.headers as HeaderBag);
     delete requestHeaders['proxy-authorization']; // the LAN token
+    delete requestHeaders[SILENT_TUNNEL_HEADER];
+    delete requestHeaders[CONNECT_TIMEOUT_HEADER];
     const ex: Exchange = {
       id: `tunnel-${randomUUID()}`,
       startedAt: Date.now(),
@@ -3218,6 +4105,7 @@ export class InterceptProxy extends EventEmitter {
       state: 'pending',
       kind: 'tunnel',
       tunnelBytes: { sent: 0, received: 0 },
+      ...(silent ? { grpcTunnel: true as const } : {}),
       ...(m.rule ? { matchedRuleId: m.rule.id } : {}),
       ...(note ? { error: note } : {}),
       ...(simulated ? { simulated } : {}),
@@ -3244,6 +4132,7 @@ export class InterceptProxy extends EventEmitter {
         upstream: this.upstreamSpec,
         ...((this.opts.rewriteLocalhost ?? true) ? { alias: (h: string) => HOST_ALIASES[h] } : {}),
         timings: (t) => this.addTimings(ex.id, t),
+        ...(silent ? { timeoutMs: silent.connectTimeoutMs } : {}),
       });
     } catch (e) {
       if (!isLive()) return;
@@ -3251,7 +4140,9 @@ export class InterceptProxy extends EventEmitter {
       const message = e instanceof SsrfError ? e.message : forbidden ? `${SSRF_MARKER}: ${(e as Error).message}` : `Could not open the tunnel to ${label}:${port}: ${(e as Error).message}`;
       ex.status = forbidden ? 403 : 502;
       this.fail(ex, message);
-      refuse(socket, `HTTP/1.1 ${ex.status} ${STATUS_CODES[ex.status]}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+      // A silent tunnel's app never reads a reply: close (the entry's breaker handles a storm).
+      if (silent) socket.destroy();
+      else refuse(socket, `HTTP/1.1 ${ex.status} ${STATUS_CODES[ex.status]}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
       return;
     }
     if (socket.destroyed || !isLive()) {
@@ -3261,7 +4152,7 @@ export class InterceptProxy extends EventEmitter {
     this.tunnelSockets.add(server);
     server.once('close', () => this.tunnelSockets.delete(server));
     relaying = true;
-    socket.write('HTTP/1.1 200 Connection established\r\n\r\n');
+    if (!silent) socket.write('HTTP/1.1 200 Connection established\r\n\r\n');
     this.emitChange(ex);
     relay({
       app: socket,
@@ -3526,6 +4417,11 @@ export class InterceptProxy extends EventEmitter {
 }
 
 export { RESPONSE_PAUSE_LIMIT_BYTES };
+
+/** An HTTP/2 request with a gRPC content type (CONTRACTS §16.2; not gRPC-Web). */
+function isGrpcCall(req: OngoingRequest): boolean {
+  return (req as unknown as { httpVersion?: string }).httpVersion === '2.0' && isGrpcContentType((req.headers as HeaderBag)['content-type']);
+}
 
 /** A copy for listeners / getExchanges (frames is the only array the proxy keeps appending to). */
 function snapshot(ex: Exchange): Exchange {
