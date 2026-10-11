@@ -237,3 +237,68 @@ describe('bad .proto input', () => {
     }
   });
 });
+
+describe('REVIEW-11 regressions', () => {
+  it('#1: a message named only with underscores terminates', () => {
+    const t = Date.now();
+    const s = one('syntax = "proto3"; message _ { int32 a = 1; } enum __ { A = 0; } message _B {}');
+    expect(Date.now() - t).toBeLessThan(50);
+    expect(s.message('_')?.dartClass).toBe('x_');
+    expect(s.enumType('__')?.dartClass).toBe('x__');
+    expect(s.message('_B')?.dartClass).toBe('B_');
+  });
+
+  it('#1: 32k duplicate names load in under 300 ms, duplicates reported once each (capped) and skipped', () => {
+    const text = `syntax = "proto3"; ${'message X{}'.repeat(32_000)}`;
+    const t = Date.now();
+    const s = one(text);
+    expect(Date.now() - t).toBeLessThan(300);
+    expect(s.messages.filter((m) => m.name === 'X')).toHaveLength(1);
+    expect(s.problems[0]).toMatch(/^protos\/x\.proto: X is defined twice; the second one is skipped/);
+    // distinct names that collide in Dart stay linear too
+    // top-level A_B<i> first, then A.B<i>: every nested class collides and takes a suffix
+    const flat = Array.from({ length: 16_000 }, (_, i) => `message A_B${i} {}`).join('');
+    const nested = Array.from({ length: 16_000 }, (_, i) => `message B${i} {}`).join('');
+    const collide = `syntax = "proto3"; ${flat} message A { ${nested} }`;
+    const t2 = Date.now();
+    const c = one(collide);
+    expect(Date.now() - t2).toBeLessThan(300);
+    expect(c.message('A.B15999')?.dartClass).toBe('A_B15999_');
+  });
+
+  it('#3: a 2 MB file with a 64 KB name loads in under 300 ms with one short problem', () => {
+    const name = 'N'.repeat(64 * 1024);
+    let body = '';
+    for (let i = 1; body.length < 2 * 1024 * 1024 - name.length - 100; i++) body += `Y a${i}=${i};`;
+    const text = `message ${name} {${body}}`;
+    const t = Date.now();
+    const s = one(text);
+    expect(Date.now() - t).toBeLessThan(300);
+    expect(s.problems).toHaveLength(1);
+    expect(s.problems[0].length).toBeLessThanOrEqual(300);
+    expect(s.problems[0]).toMatch(/longer than 512 characters/);
+  });
+
+  it('#3: deep scopes with long names and many unresolved fields stay within the budget', () => {
+    const seg = 'S'.repeat(500);
+    let text = 'syntax = "proto3"; package p;';
+    for (let d = 0; d < 2; d++) text += `message ${seg}${d} {`;
+    for (let i = 1; text.length < 1_900_000; i++) text += `U${i} f${i} = ${i};`;
+    text += '}}';
+    const t = Date.now();
+    const s = loadGrpcSchema([{ path: 'deep.proto', text }]);
+    expect(Date.now() - t).toBeLessThan(600);
+    expect(s.problems.length).toBeLessThanOrEqual(50);
+    expect(s.problems.every((p) => p.length <= 300)).toBe(true);
+  });
+
+  it('caps every problem text at 300 characters', () => {
+    const long = 'L'.repeat(500);
+    const s = one(`syntax = "proto3"; package ${'q'.repeat(400)}; message M { ${long} f = 1; }`);
+    expect(s.problems.length).toBeGreaterThan(0);
+    for (const p of s.problems) {
+      expect(p.length).toBeLessThanOrEqual(300);
+      expect(p.startsWith('protos/x.proto: ')).toBe(true);
+    }
+  });
+});

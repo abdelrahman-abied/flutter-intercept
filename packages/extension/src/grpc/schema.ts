@@ -129,7 +129,8 @@ class Schema implements GrpcSchema {
     return typeof name === 'string' ? this.enumByName.get(cleanName(name)) : undefined;
   }
 
-  addProblem(p: string): void {
+  addProblem(text: string): void {
+    const p = capProblem(text);
     if (this.problems.length < MAX_PROBLEMS && !this.problems.includes(p)) this.problems.push(p);
   }
 
@@ -152,6 +153,15 @@ class Schema implements GrpcSchema {
     this.methodByPath.set(m.path, m);
     this.methods.push(m);
   }
+}
+
+const MAX_PROBLEM_CHARS = 300;
+
+/** Problem texts stay short (REVIEW-11): long names are elided in the middle, then the text is cut at 300 characters. */
+export function capProblem(text: string): string {
+  if (text.length <= MAX_PROBLEM_CHARS) return text;
+  const elided = text.replace(/\S{61,}/g, (w) => `${w.slice(0, 28)}…${w.slice(-28)}`);
+  return elided.length <= MAX_PROBLEM_CHARS ? elided : `${elided.slice(0, MAX_PROBLEM_CHARS - 1)}…`;
 }
 
 /** `.pkg.Msg` / `type.googleapis.com/pkg.Msg` → `pkg.Msg`. */
@@ -450,81 +460,101 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
     return w?.kind;
   };
   const unresolvedProto = new Set<string>();
-  /** protoc's scoping: the innermost enclosing scope that has the name wins; `.a.B` is absolute. */
+  /** Linking shares each file's time budget with its parsing (REVIEW-11 #3). */
+  class LinkBudget extends Error {}
+  let linkDeadline = Infinity;
+  let linkTicks = 0;
+  const resolved = new Map<string, ProtoFieldType>();
+  /** protoc's scoping: the innermost enclosing scope that has the name wins; `.a.B` is absolute. Memoized per (scope, name). */
   const resolveProto = (pp: ParsedProto, name: string, scope: string, where: string): ProtoFieldType => {
-    const candidates: string[] = [];
-    if (name.startsWith('.')) candidates.push(name.slice(1));
-    else {
+    if ((++linkTicks & 255) === 0 && Date.now() > linkDeadline) throw new LinkBudget();
+    const memo = `${scope}\u0000${name}`;
+    const hit = resolved.get(memo);
+    if (hit) return hit;
+    let found: ProtoFieldType | undefined;
+    if (name.startsWith('.')) {
+      const c = name.slice(1);
+      const k = kindOf(c);
+      if (k) found = k === 'enum' ? { kind: 'enum', type: c } : { kind: 'message', type: c };
+    } else {
       for (let sc = scope; ; ) {
-        candidates.push(sc ? `${sc}.${name}` : name);
+        const c = sc ? `${sc}.${name}` : name;
+        const k = kindOf(c);
+        if (k) {
+          found = k === 'enum' ? { kind: 'enum', type: c } : { kind: 'message', type: c };
+          break;
+        }
         if (!sc) break;
         const dot = sc.lastIndexOf('.');
         sc = dot < 0 ? '' : sc.slice(0, dot);
       }
     }
-    for (const c of candidates) {
-      const k = kindOf(c);
-      if (k) return k === 'enum' ? { kind: 'enum', type: c } : { kind: 'message', type: c };
+    if (!found) {
+      const bare = name.replace(/^\./, '');
+      const key = `${pp.path}|${bare}`;
+      if (!unresolvedProto.has(key)) {
+        unresolvedProto.add(key);
+        schema.addProblem(`${pp.label}: ${where} uses ${bare}, which isn't among the loaded files; its contents are shown raw`);
+      }
+      found = { kind: 'message', type: bare };
     }
-    const bare = name.replace(/^\./, '');
-    const key = `${pp.path}|${bare}`;
-    if (!unresolvedProto.has(key)) {
-      unresolvedProto.add(key);
-      schema.addProblem(`${pp.label}: ${where} uses ${bare}, which isn't among the loaded files; its contents are shown raw`);
-    }
-    return { kind: 'message', type: bare };
+    resolved.set(memo, found);
+    return found;
   };
   const protoType = (pp: ParsedProto, t: ProtoTypeRef, scope: string, where: string): ProtoFieldType =>
     t.scalar ? { kind: 'scalar', scalar: t.scalar } : resolveProto(pp, t.name ?? '', scope, where);
   const packable = (t: ProtoFieldType) => t.kind === 'enum' || (t.kind === 'scalar' && t.scalar !== 'string' && t.scalar !== 'bytes');
   for (const pp of protos) {
-    for (const e of pp.enums) {
-      if (!dartKinds.has(e.fq)) schema.addEnum({ name: e.fq, dartClass: e.dartClass, values: e.values, file: pp.path });
-    }
-  }
-  for (const pp of protos) {
-    for (const m of pp.messages) {
-      if (dartKinds.has(m.fq) || schema.message(m.fq)) continue;
-      const fields: ProtoField[] = [];
-      for (const fd of m.fields) {
-        const where = `${m.fq.slice(m.fq.lastIndexOf('.') + 1)}.${fd.name}`;
-        let type: ProtoFieldType;
-        if (fd.map) {
-          const value = protoType(pp, fd.map.value, m.fq, where);
-          type = { kind: 'map', key: fd.map.key, value };
-        } else type = protoType(pp, fd.type, m.fq, where);
-        const field: ProtoField = { number: fd.number, name: fd.name, type };
-        if (fd.repeated) field.repeated = true;
-        if (fd.repeated && packable(type) && (fd.packed ?? pp.packedByDefault)) field.packed = true;
-        if (fd.oneof) field.oneof = fd.oneof;
-        if (fd.required) field.required = true;
-        fields.push(field);
+    linkDeadline = pp.deadline ?? Infinity;
+    const messages: ProtoMessage[] = [];
+    const methods: GrpcMethod[] = [];
+    try {
+      for (const m of pp.messages) {
+        if (dartKinds.has(m.fq) || schema.message(m.fq)) continue;
+        const fields: ProtoField[] = [];
+        const short = m.fq.slice(m.fq.lastIndexOf('.') + 1);
+        for (const fd of m.fields) {
+          const where = `${short}.${fd.name}`;
+          let type: ProtoFieldType;
+          if (fd.map) type = { kind: 'map', key: fd.map.key, value: protoType(pp, fd.map.value, m.fq, where) };
+          else type = protoType(pp, fd.type, m.fq, where);
+          const field: ProtoField = { number: fd.number, name: fd.name, type };
+          if (fd.repeated) field.repeated = true;
+          if (fd.repeated && packable(type) && (fd.packed ?? pp.packedByDefault)) field.packed = true;
+          if (fd.oneof) field.oneof = fd.oneof;
+          if (fd.required) field.required = true;
+          fields.push(field);
+        }
+        messages.push({ name: m.fq, dartClass: m.dartClass, fields, file: pp.path, line: m.line, source: 'proto' });
       }
-      schema.addMessage({ name: m.fq, dartClass: m.dartClass, fields, file: pp.path, line: m.line, source: 'proto' });
-    }
-  }
-  for (const pp of protos) {
-    for (const r of pp.methods) {
-      if (schema.method(r.path)) continue;
-      const scope = pp.pkg;
-      const where = `method ${r.path}`;
-      const req = resolveProto(pp, r.req, scope, where);
-      const res = resolveProto(pp, r.res, scope, where);
-      if (req.kind !== 'message' || res.kind !== 'message') {
-        schema.addProblem(`${pp.label}: ${where} uses an enum as its request or response`);
-        continue;
+      for (const r of pp.methods) {
+        if (schema.method(r.path)) continue;
+        const where = `method ${r.path}`;
+        const req = resolveProto(pp, r.req, pp.pkg, where);
+        const res = resolveProto(pp, r.res, pp.pkg, where);
+        if (req.kind !== 'message' || res.kind !== 'message') {
+          schema.addProblem(`${pp.label}: ${where} uses an enum as its request or response`);
+          continue;
+        }
+        methods.push({
+          path: r.path,
+          requestType: req.type,
+          responseType: res.type,
+          clientStreaming: r.clientStreaming,
+          serverStreaming: r.serverStreaming,
+          file: pp.path,
+          line: r.line,
+          source: 'proto',
+        });
       }
-      schema.addMethod({
-        path: r.path,
-        requestType: req.type,
-        responseType: res.type,
-        clientStreaming: r.clientStreaming,
-        serverStreaming: r.serverStreaming,
-        file: pp.path,
-        line: r.line,
-        source: 'proto',
-      });
+    } catch (e) {
+      if (!(e instanceof LinkBudget)) throw e;
+      schema.addProblem(`${pp.label}: too complex to read`);
+      continue;
     }
+    for (const e of pp.enums) if (!dartKinds.has(e.fq)) schema.addEnum({ name: e.fq, dartClass: e.dartClass, values: e.values, file: pp.path });
+    for (const m of messages) schema.addMessage(m);
+    for (const m of methods) schema.addMethod(m);
   }
 
   // 7. well-known types referenced but not loaded

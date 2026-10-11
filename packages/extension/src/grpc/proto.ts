@@ -59,6 +59,8 @@ export interface ParsedProto {
   methods: ProtoMethodDecl[];
   /** Whether repeated scalars are packed when the field doesn't say (proto3 / editions default, or a file feature). */
   packedByDefault: boolean;
+  /** End of this file's time budget (parsing and linking share it). */
+  deadline?: number;
   problems: string[];
 }
 
@@ -66,6 +68,9 @@ export const MAX_PROTO_TOKENS = 2_000_000;
 export const MAX_PROTO_MS = 200;
 const MAX_FILE_PROBLEMS = 20;
 const MAX_NESTING = 64;
+/** Longest identifier, dotted type name, `json_name` and fully-qualified name read (REVIEW-11 #3). */
+export const MAX_NAME = 512;
+const MAX_FQ = 1024;
 
 const SCALARS = new Set<string>([
   'double', 'float', 'int32', 'int64', 'uint32', 'uint64', 'sint32', 'sint64',
@@ -164,6 +169,7 @@ function tokenizeProto(src: string, deadline: number): T[] | 'too complex' | { e
         if ((d >= 65 && d <= 90) || (d >= 97 && d <= 122) || d === 95 || (d >= 48 && d <= 57)) i++;
         else break;
       }
+      if (i - s > MAX_NAME) return { error: `a name is longer than ${MAX_NAME} characters; the file is skipped`, line };
       out.push({ k: 'id', v: src.slice(s, i), line });
       continue;
     }
@@ -298,6 +304,10 @@ class ProtoParser {
     while (this.isP('.') && this.isId(undefined, 1)) {
       this.i++;
       s += `.${this.ident()}`;
+      if (s.length > MAX_FQ) {
+        this.problem(`a type name is longer than ${MAX_FQ} characters`);
+        throw new Bail();
+      }
     }
     return s;
   }
@@ -386,7 +396,13 @@ class ProtoParser {
       }
       const value = this.t.slice(valueStart, this.i);
       const v0 = value[0];
-      if (name === 'json_name' && v0?.k === 'str') res.jsonName = value.filter((x) => x.k === 'str').map((x) => x.v).join('');
+      if (name === 'json_name' && v0?.k === 'str') {
+        res.jsonName = value.filter((x) => x.k === 'str').map((x) => x.v).join('');
+        if (res.jsonName.length > MAX_NAME) {
+          this.problem(`a json_name is longer than ${MAX_NAME} characters`);
+          throw new Bail();
+        }
+      }
       else if (name === 'packed' && v0?.k === 'id') res.packed = v0.v === 'true';
       else if (name === 'features.repeated_field_encoding' && v0?.k === 'id') res.packed = v0.v !== 'EXPANDED';
       else if (name === 'features.field_presence' && v0?.k === 'id' && v0.v === 'LEGACY_REQUIRED') res.required = true;
@@ -466,7 +482,10 @@ class ProtoParser {
       }
       case 'message':
         this.i++;
-        this.topMessages.push(this.message(this.out.pkg, 0));
+        {
+          const m = this.message(this.out.pkg, 0);
+          if (m) this.topMessages.push(m);
+        }
         return;
       case 'enum':
         this.i++;
@@ -487,15 +506,16 @@ class ProtoParser {
     }
   }
 
-  private message(scope: string, depth: number): MsgNode {
+  /** A message; undefined when it is skipped (nested too deep, or its full name is too long). */
+  private message(scope: string, depth: number): MsgNode | undefined {
     const line = this.tok.line;
     const name = this.ident();
     const fq = scope ? `${scope}.${name}` : name;
     const node: MsgNode = { name, fq, line, fields: [], enums: [], messages: [] };
-    if (depth > MAX_NESTING) {
-      this.problem(`messages nested deeper than ${MAX_NESTING}; the rest is skipped`, line);
+    if (depth > MAX_NESTING || fq.length > MAX_FQ) {
+      this.problem(depth > MAX_NESTING ? `messages nested deeper than ${MAX_NESTING}; the rest is skipped` : `a message's full name is longer than ${MAX_FQ} characters; it is skipped`, line);
       this.skipStatement();
-      return node;
+      return undefined;
     }
     this.expect('{');
     this.messageBody(node, depth, undefined);
@@ -529,7 +549,8 @@ class ProtoParser {
         case 'message':
           if (this.isId(undefined, 1)) {
             this.i++;
-            node.messages.push(this.message(node.fq, depth + 1));
+            const m = this.message(node.fq, depth + 1);
+            if (m) node.messages.push(m);
             return;
           }
           break;
@@ -632,6 +653,10 @@ class ProtoParser {
     const name = this.ident();
     const fq = scope ? `${scope}.${name}` : name;
     const node: EnumNode = { name, fq, line, values: [] };
+    if (fq.length > MAX_FQ) {
+      this.problem(`an enum's full name is longer than ${MAX_FQ} characters`, line);
+      throw new Bail();
+    }
     const seen = new Set<number>();
     this.expect('{');
     while (!this.eat('}')) {
@@ -712,25 +737,47 @@ class ProtoParser {
 }
 
 /** protoc_plugin's class names: top-level enums, then messages depth-first (each message, its enums, its messages). */
-function assignDartNames(p: ProtoParser, out: ParsedProto): void {
+function assignDartNames(p: ProtoParser, out: ParsedProto, deadline: number): void {
   const used = new Set<string>(FORBIDDEN_DART);
+  /** Next `_<n>` suffix to try per base name: each suffix is probed once, so duplicates stay linear. */
+  const nextSuffix = new Map<string, number>();
+  let ticks = 0;
   const take = (name: string, parent: string): string => {
+    if ((++ticks & 1023) === 0 && Date.now() > deadline) throw new TooComplex();
     let base = parent ? `${parent}_${name}` : name;
-    while (base.startsWith('_')) base = `${base.slice(1)}_`;
+    // protoc_plugin moves leading underscores to the end (`_a` → `a_`); a name of only underscores gets an `x`.
+    const lead = /^_+/.exec(base)?.[0] ?? '';
+    base = (base.slice(lead.length) || 'x') + lead;
     if (/^[0-9]/.test(base)) base = `x${base}`;
     let chosen = base;
     if (used.has(chosen)) {
       chosen = `${base}_`;
-      for (let i = 0; used.has(chosen); i++) chosen = `${base}_${i}`;
+      if (used.has(chosen)) {
+        let i = nextSuffix.get(base) ?? 0;
+        while (used.has(`${base}_${i}`)) i++;
+        chosen = `${base}_${i}`;
+        nextSuffix.set(base, i + 1);
+      }
     }
     used.add(chosen);
     return chosen;
   };
-  for (const e of p.topEnums) out.enums.push({ fq: e.fq, dartClass: take(e.name, ''), values: e.values, line: e.line });
+  // A fully-qualified name defined twice: the second definition (and what it contains) is skipped.
+  const seen = new Set<string>();
+  const fresh = (fq: string, line: number): boolean => {
+    if (!seen.has(fq)) {
+      seen.add(fq);
+      return true;
+    }
+    if (out.problems.length < MAX_FILE_PROBLEMS) out.problems.push(`${out.label}: ${fq} is defined twice; the second one is skipped (line ${line})`);
+    return false;
+  };
+  for (const e of p.topEnums) if (fresh(e.fq, e.line)) out.enums.push({ fq: e.fq, dartClass: take(e.name, ''), values: e.values, line: e.line });
   const walk = (m: MsgNode, parent: string) => {
+    if (!fresh(m.fq, m.line)) return;
     const cls = take(m.name, parent);
     out.messages.push({ fq: m.fq, dartClass: cls, fields: m.fields, line: m.line });
-    for (const e of m.enums) out.enums.push({ fq: e.fq, dartClass: take(e.name, cls), values: e.values, line: e.line });
+    for (const e of m.enums) if (fresh(e.fq, e.line)) out.enums.push({ fq: e.fq, dartClass: take(e.name, cls), values: e.values, line: e.line });
     for (const n of m.messages) walk(n, cls);
   };
   for (const m of p.topMessages) walk(m, '');
@@ -763,7 +810,8 @@ export function parseProtoFile(path: string, text: string, label: string): Parse
     }
     const p = new ProtoParser(toks, out, deadline);
     p.file();
-    assignDartNames(p, out);
+    assignDartNames(p, out, deadline);
+    out.deadline = deadline;
     return out;
   } catch (e) {
     const skipped: ParsedProto = { ...out, imports: [], messages: [], enums: [], methods: [] };
