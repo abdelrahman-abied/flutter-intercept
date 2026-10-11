@@ -13,15 +13,15 @@ import { useApp } from '../context';
 import { decodedMessages, decodeNote, grpcCodeLabel, grpcPreview, isGrpc, methodTypesText } from '../grpc';
 import { Button } from './bits';
 import { Icon } from './Icon';
-import { copyText } from './Viewers';
-import { GrpcMessageDetail, useDecodeDeadline } from './GrpcViews';
+import { copyText, type TreeFieldActions } from './Viewers';
+import { DROPPED_TITLE, EDITED_TITLE, GrpcMessageDetail, useDecodeDeadline } from './GrpcViews';
 
 export const FRAME_ROW_HEIGHT = 20;
 const OVERSCAN = 10;
 /** Used before the first layout (and in DOM-less tests) where clientHeight is 0. */
 const FALLBACK_VIEWPORT = 300;
 
-export function FramesView({ ex }: { ex: Exchange }) {
+export function FramesView({ ex, fields }: { ex: Exchange; fields?: TreeFieldActions }) {
   const { state } = useApp();
   const frames = ex.frames ?? [];
   const dropped = ex.framesDropped ?? 0;
@@ -188,7 +188,7 @@ export function FramesView({ ex }: { ex: Exchange }) {
       {frames.length > 0 && visible.length === 0 && <div class="muted pad">No {unit}s match the filter.</div>}
       {selected !== undefined && (
         sel ? (grpc
-          ? <GrpcMessageDetail key={selected} f={sel} n={selected} start={ex.startedAt} m={decoded[selected - dropped]} />
+          ? <GrpcMessageDetail key={selected} f={sel} n={selected} start={ex.startedAt} m={decoded[selected - dropped]} fields={fields} />
           : <FrameDetail key={selected} f={sel} n={selected} start={ex.startedAt} />)
           : <div class="muted pad">That {unit} was dropped (only the newest {frames.length} are kept).</div>
       )}
@@ -215,12 +215,14 @@ function FrameRow({ f, n, preview, start, selected, onSelect, id }: {
 }) {
   return (
     <div id={id} role="option" aria-selected={selected} data-n={n}
-      class={`frame-row dir-${f.dir} fk-${f.kind}${selected ? ' selected' : ''}`} onClick={onSelect}>
+      class={`frame-row dir-${f.dir} fk-${f.kind}${f.dropped ? ' fr-dropped' : ''}${selected ? ' selected' : ''}`} onClick={onSelect}>
       <span class="fr-dir" title={dirLabel(f)}>{dirArrow(f)}</span>
       <span class="fr-time" title={formatTime(f.at)}>{formatRelative(f.at, start)}</span>
       <span class="fr-size" title={frameSizeTitle(f)}>{frameSizeText(f)}{f.truncated && !f.sizeUnknown ? '+' : ''}</span>
       <span class="fr-preview">
         {f.compressed && <span class="badge mini gz-badge" title="Sent compressed (grpc-encoding); shown decompressed">gz</span>}
+        {f.dropped && <span class="badge mini dropped-badge" title={DROPPED_TITLE}>dropped</span>}
+        {f.edited && <span class="badge mini edited-badge" title={EDITED_TITLE}>edited</span>}
         {f.event && <span class="badge mini ev-badge">{capText(f.event, 64)}</span>}
         {preview}
       </span>

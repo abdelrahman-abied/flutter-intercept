@@ -1332,3 +1332,11 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
 .grpc-status-item.has-problem { color: var(--vscode-errorForeground); font-weight: 600; }
 .grpc-rule-note { margin: 4px 0; }
 .kind-grpcMock { background: var(--vscode-charts-purple); color: var(--vscode-editor-background); }
+
+/* ------------------------------------------------------------------ v0.11.0 gRPC breakpoints (CONTRACTS §17) */
+.dropped-badge { background: transparent; color: var(--fi-err); border: 1px solid var(--fi-err); font-family: var(--vscode-font-family); margin: 0 4px 0 0; }
+.edited-badge { background: transparent; color: var(--fi-info); border: 1px solid var(--fi-info); font-family: var(--vscode-font-family); margin: 0 4px 0 0; }
+.frame-row.fr-dropped .fr-preview { text-decoration: line-through; color: var(--fi-muted); }
+.grpc-pause-editor textarea { width: 100%; box-sizing: border-box; }
+.grpc-pause-editor textarea.modified { border-color: var(--fi-info); }
+.grpc-pause-what { margin-bottom: 6px; }

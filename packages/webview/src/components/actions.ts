@@ -42,7 +42,6 @@ const WS_NO_RESEND = 'A WebSocket connection can\'t be resent';
 
 /** CONTRACTS §16.2 / §16.5: what doesn't apply to a gRPC call, and why. */
 export const GRPC_OFF = {
-  breakpoint: 'Breakpoints don\'t apply to gRPC calls — use a gRPC mock, Block or Fault rule',
   edit: 'A gRPC call can\'t be resent from the panel',
   generate: 'Dart models and test fixtures are generated from JSON HTTP responses — not gRPC calls',
   copy: 'cURL / Dart http / Dio snippets are for HTTP requests — not gRPC calls',
@@ -59,7 +58,7 @@ export function interceptOff(ex: Exchange): ExchangeActions['off'] {
     const t = GRPC_TUNNEL_NO_ACTION;
     return { mock: t, breakpoint: t, edit: t, generate: t, copy: t, expire: t };
   }
-  // A gRPC call: mock (→ grpcMock) and block apply; breakpoints, resend, snippets, generators and the preset don't.
+  // A gRPC call: mock (→ grpcMock), block and breakpoints (§17.2) apply; resend, snippets, generators and the preset don't.
   if (isGrpc(ex)) return { ...GRPC_OFF };
   // CONTRACTS §14.2: a TLS passthrough tunnel has no request to mock, pause, copy or resend — only Block applies.
   if (isTunnel(ex)) {
@@ -128,7 +127,6 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
     if (isNative(ex) || (requested !== 'block' && isTunnel(ex))) return;
     // CONTRACTS §16.4: "Mock this" on a gRPC call makes a gRPC mock answering with this call's messages and status.
     const kind = isGrpc(ex) && requested === 'mock' ? 'grpcMock' : requested;
-    if (isGrpc(ex) && kind === 'breakpoint') return;
     dispatch({ type: 'awaitRule', kind });
     post({ type: 'createRuleFromExchange', id: ex.id, action: kind });
   };

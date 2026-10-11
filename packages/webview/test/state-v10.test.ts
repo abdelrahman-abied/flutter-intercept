@@ -77,7 +77,7 @@ describe('gRPC rows', () => {
     expect(grpcStatusView(grpcCall({ state: 'pending', grpc: { service: 's.S', method: 'M', messagesSent: 1, messagesReceived: 0 } })))
       .toMatchObject({ text: '…', cls: 'pending' });
     expect(grpcStatusView(grpcCall({ state: 'aborted', grpc: { service: 's.S', method: 'M', messagesSent: 1, messagesReceived: 0 } })).title)
-      .toMatch(/Cancelled by the app/);
+      .toMatch(/Cancelled \(by the app, or aborted at a breakpoint\)/);
     expect(grpcStatusView(grpcCall({ state: 'error', error: 'RST_STREAM', grpc: { service: 's.S', method: 'M', messagesSent: 1, messagesReceived: 0 } })))
       .toMatchObject({ text: '✕', cls: 'err', title: 'No gRPC status: RST_STREAM' });
   });
@@ -116,8 +116,9 @@ describe('gRPC rows', () => {
     expect(off.generate).toMatch(/JSON HTTP responses/);
   });
 
-  it('recordings skip gRPC; HAR export includes it, OpenAPI / Postman don\'t', () => {
-    expect(isRecordable(grpcCall())).toBe(false);
+  it('recordings keep finished gRPC calls; HAR export includes it, OpenAPI / Postman don\'t', () => {
+    expect(isRecordable(grpcCall())).toBe(true); // CONTRACTS §17.4 (0.10 skipped them)
+    expect(isRecordable(grpcCall({ state: "pending" }))).toBe(false);
     const a = ex();
     const g = grpcCall();
     expect(exportScope([a, g], false)).toEqual({ count: 1, filtered: false, grpc: 1 });
@@ -250,13 +251,14 @@ describe('filter: t:grpc, kind:grpc, grpc:<status>', () => {
 
 describe('rules on gRPC calls (CONTRACTS §16.2)', () => {
   const g = grpcCall();
-  it('only grpcMock, block, fault, throttle and sequences of those (+ real server) apply', () => {
+  it('only grpcMock, block, fault, throttle, breakpoint, mutate (0.11) and sequences of those (+ real server) apply', () => {
     const yes: RuleAction[] = [
+      { kind: 'breakpoint', phase: 'both' }, { kind: 'mutate', ops: [] },
       { kind: 'grpcMock' }, { kind: 'block', mode: 'reset' }, { kind: 'fault', fault: 'timeout' }, { kind: 'throttle', latencyMs: 100 },
       { kind: 'sequence', steps: [{ action: { kind: 'grpcMock', code: 14 } }, { action: { kind: 'passthrough' } }] },
     ];
     const no: RuleAction[] = [
-      { kind: 'mock', status: 200, body: '' }, { kind: 'breakpoint', phase: 'both' }, { kind: 'mutate', ops: [] }, { kind: 'script', code: '' },
+      { kind: 'mock', status: 200, body: '' }, { kind: 'script', code: '' }, { kind: 'cors' }, { kind: 'rewrite' },
       { kind: 'mapRemote', to: 'http://localhost' }, { kind: 'sequence', steps: [{ action: { kind: 'mock', status: 500, body: '' } }] },
     ];
     for (const a of yes) expect(appliesToGrpc(a)).toBe(true);
@@ -265,7 +267,7 @@ describe('rules on gRPC calls (CONTRACTS §16.2)', () => {
 
   it('the matcher preview, stats and the winning rule skip rules that don\'t apply', () => {
     const rules: Rule[] = [
-      rule({ id: 'bp', match: { url: '*/demo.Users/*' }, action: { kind: 'breakpoint', phase: 'both' } }),
+      rule({ id: 'bp', match: { url: '*/demo.Users/*' }, action: { kind: 'mock', status: 200, body: '' } }),
       rule({ id: 'gm', match: { url: '*/demo.Users/*' }, action: { kind: 'grpcMock', code: 5 } }),
     ];
     expect(winningRuleIndex(rules, g)).toBe(1);

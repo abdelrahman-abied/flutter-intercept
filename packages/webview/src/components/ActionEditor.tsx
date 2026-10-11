@@ -159,11 +159,17 @@ export function ActionEditor({ kind, f, v, set, uid, compact, bodyFile, scriptFi
 
     case 'breakpoint':
       return (
-        <div class="radios">
-          {radio('phase', 'request', 'Pause request')}
-          {radio('phase', 'response', 'Pause response')}
-          {radio('phase', 'both', 'Both')}
-        </div>
+        <>
+          <div class="radios">
+            {radio('phase', 'request', 'Pause request')}
+            {radio('phase', 'response', 'Pause response')}
+            {radio('phase', 'both', 'Both')}
+          </div>
+          <div class="hint">
+            On gRPC calls each message pauses on its own: request = every message the app sends; response = every message
+            the server sends, and the end of the call (status and trailers).
+          </div>
+        </>
       );
 
     case 'throttle':
@@ -224,7 +230,9 @@ export function ActionEditor({ kind, f, v, set, uid, compact, bodyFile, scriptFi
           <div class="hint">
             Forwards to the real server, then changes the JSON response before the app gets it — e.g. null a field to
             reproduce “Null is not a subtype of String”. Paths: <code>$.user.avatar_url</code>, <code>$.items[0].id</code>,{' '}
-            <code>$.items[*].price</code>, <code>$['odd key']</code>. A non-JSON response is passed through unchanged.
+            <code>$.items[*].price</code>, <code>$['odd key']</code>. A non-JSON response is passed through unchanged. On gRPC
+            calls the paths apply to each response message, decoded with the app's schema (proto3 JSON names, int64 as
+            strings); without a schema the message is forwarded unchanged.
           </div>
           <MutateOpsEditor rows={f.mutateOps} errors={v.opErrors} onChange={(mutateOps) => set({ mutateOps })} />
           {v.errors.mutate && <div class="msg error">{v.errors.mutate}</div>}

@@ -2,14 +2,17 @@
 // one message's decoded / raw / hex view, and the status banner for Status.grpc.problem.
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
-import type { Exchange, Frame, GrpcDecodedMessage } from '../protocol';
+import type { Exchange, Frame, GrpcDecodedMessage, GrpcEdit, GrpcPause } from '../protocol';
 import {
-  DECODE_TIMEOUT_MS, GRPC_DECRYPT_SETTING, grpcCodeLabel, grpcCountsText, grpcFacts, grpcPath, grpcVersion, hexTextDump, isGrpc,
-  needsDecode,
+  DECODE_TIMEOUT_MS, GRPC_CODES, GRPC_DECRYPT_SETTING, grpcCodeLabel, grpcCountsText, grpcFacts, grpcPath, grpcPauseKey, grpcPauseTitle,
+  grpcVersion, hexTextDump, isBase64, isGrpc, needsDecode, pausedDecoded, reservedGrpcHeader,
 } from '../grpc';
+import { grpcHeaderError, grpcMessageError, headersChanged, headersToRows, rowsToFlatRecord, type HeaderRow } from '../state';
+import { HeadersEditor } from './Editors';
+import type { TreeFieldActions } from './Viewers';
 import { dirArrow, dirLabel, formatRelative, frameSizeText, frameSizeTitle, hexDump } from '../frames';
 import { parseJsonLossless } from '../json';
-import { formatTime, type Headers } from '../util';
+import { formatBytes, formatTime, type Headers } from '../util';
 import { Button } from './bits';
 import { Icon } from './Icon';
 import { copyText, HeadersTable, JsonTree } from './Viewers';
@@ -81,8 +84,15 @@ export function TrailersSection({ trailers }: { trailers: Headers | undefined })
 
 type MsgMode = 'tree' | 'text' | 'hex' | 'base64';
 
+export const DROPPED_TITLE = 'Dropped at a breakpoint — never delivered';
+export const EDITED_TITLE = 'Replaced by a breakpoint edit or a Mutate JSON rule — the recorded bytes are what was delivered';
+
 /** One gRPC message: decoded JSON (schema) or raw fields as a tree, the text, hex, and the payload as base64. */
-export function GrpcMessageDetail({ f, n, start, m }: { f: Frame; n: number; start: number; m?: GrpcDecodedMessage }) {
+export function GrpcMessageDetail({ f, n, start, m, fields }: {
+  f: Frame; n: number; start: number; m?: GrpcDecodedMessage;
+  /** CONTRACTS §17.3: "mutate this field" on a response message the schema decodes. */
+  fields?: TreeFieldActions;
+}) {
   const parsed = useMemo(() => (m?.json ? parseJsonLossless(m.json) : undefined), [m?.json]);
   const tree = parsed?.ok ? parsed.value : undefined;
   const hex = useMemo(() => (m?.hex ? hexTextDump(m.hex) : f.base64 !== undefined ? hexDump(f.base64, 4096) : undefined), [m?.hex, n, f.at, f.size]);
@@ -104,6 +114,8 @@ export function GrpcMessageDetail({ f, n, start, m }: { f: Frame; n: number; sta
         <span class="meta-item" title={formatTime(f.at)}>{formatRelative(f.at, start)}</span>
         <span class="meta-item" title={frameSizeTitle(f)}>{frameSizeText(f)}</span>
         {f.compressed && <span class="meta-item" title="Sent compressed (grpc-encoding); shown decompressed">compressed</span>}
+        {f.dropped && <span class="badge mini dropped-badge" title={DROPPED_TITLE}>dropped</span>}
+        {f.edited && <span class="badge mini edited-badge" title={EDITED_TITLE}>edited</span>}
         {m && <span class="meta-item">{m.via === 'schema' ? 'decoded with the app\'s schema' : m.via === 'raw' ? 'raw fields (no schema)' : 'not decoded'}</span>}
         {f.truncated && <span class="badge warn" title="The proxy keeps at most 64 KB of each message">truncated</span>}
         {m?.truncated && <span class="badge warn" title="The decoded view was cut">decode truncated</span>}
@@ -122,7 +134,7 @@ export function GrpcMessageDetail({ f, n, start, m }: { f: Frame; n: number; sta
         )}
       </div>
       {m?.error && <div class="msg warn grpc-decode-error">Couldn't decode this message: {m.error}</div>}
-      {mode === 'tree' && tree ? <JsonTree value={tree} />
+      {mode === 'tree' && tree ? <JsonTree value={tree} fields={m?.via === 'schema' && f.dir === 'receive' ? fields : undefined} />
         : mode === 'text' && m?.json ? <pre class="code">{m.json}</pre>
         : mode === 'hex' && hex ? (
           <>
@@ -179,5 +191,170 @@ export function GrpcTunnelExplanation({ host }: { host: string }) {
         <p class="muted">Decrypted now: {hosts.map((h, i) => <span key={h}>{i ? ', ' : ''}<code>{h}</code></span>)}</p>
       )}
     </>
+  );
+}
+
+// ---------------------------------------------------------------- breakpoints (CONTRACTS §17.2)
+
+/** The editor of a paused gRPC call: the held message (JSON / base64), or the end of the call (status + trailers). */
+export function GrpcPauseEditor({ ex }: { ex: Exchange }) {
+  const p = ex.grpcPause;
+  if (!p) {
+    return <div class="muted pad">Paused at a breakpoint — waiting for the held message…</div>;
+  }
+  return p.kind === 'message'
+    ? <GrpcMessagePause key={grpcPauseKey(ex)} ex={ex} p={p} />
+    : <GrpcStatusPause key={grpcPauseKey(ex)} ex={ex} p={p} />;
+}
+
+function usePauseActions(ex: Exchange) {
+  const { state, dispatch, post } = useApp();
+  const busy = !!state.resolving[ex.id];
+  const resume = (edit?: GrpcEdit) => {
+    post(edit ? { type: 'resume', id: ex.id, edit } : { type: 'resume', id: ex.id });
+    dispatch({ type: 'resolving', id: ex.id });
+  };
+  const abort = () => {
+    post({ type: 'abort', id: ex.id });
+    dispatch({ type: 'resolving', id: ex.id });
+  };
+  return { busy, resume, abort };
+}
+
+const ABORT_TITLE = 'Cancel the call both ways (RST_STREAM CANCEL) — the app sees CANCELLED';
+
+function GrpcMessagePause({ ex, p }: { ex: Exchange; p: Extract<GrpcPause, { kind: 'message' }> }) {
+  const { state } = useApp();
+  const { busy, resume, abort } = usePauseActions(ex);
+  const entry = state.grpcDecoded[ex.id];
+  const dm = pausedDecoded(ex, entry?.decoded);
+  const now = useDecodeDeadline(entry?.requestedAt, !!entry?.decoded);
+  const loading = !dm && !!entry && !entry.decoded && now - entry.requestedAt < DECODE_TIMEOUT_MS;
+  const canJson = dm?.via === 'schema' && dm.json !== undefined;
+  const [picked, setPicked] = useState<'json' | 'base64' | undefined>();
+  /** undefined = untouched (shows the original). */
+  const [jsonText, setJsonText] = useState<string | undefined>();
+  const [b64, setB64] = useState<string | undefined>();
+  const mode = picked ?? (b64 !== undefined || !canJson ? 'base64' : 'json');
+  const json = jsonText ?? dm?.json ?? '';
+  const base64 = b64 ?? p.base64;
+  const changed = mode === 'json'
+    ? jsonText !== undefined && jsonText.trim() !== (dm?.json ?? '').trim()
+    : b64 !== undefined && b64.replace(/\s+/g, '') !== p.base64;
+  const error = !changed ? undefined
+    : mode === 'json' ? grpcMessageError(json, 'json') ?? (json.trim() ? undefined : 'Enter the message as a JSON object, e.g. {}')
+    : isBase64(base64) ? undefined : 'not valid base64 (A–Z, a–z, 0–9, +, /, = padding)';
+  const canEdit = !busy && changed && !error;
+  const edit = (): GrpcEdit => (mode === 'json'
+    ? { messageJson: JSON.parse(json) as unknown }
+    : { message: base64.replace(/\s+/g, '') });
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      if (canEdit) resume(edit());
+      else if (!changed && !busy) resume();
+    }
+  };
+  return (
+    <form class="pause-editor grpc-pause-editor" aria-label="Edit the held gRPC message" onSubmit={(e) => e.preventDefault()} onKeyDown={onKeyDown}>
+      <div class="msg info grpc-pause-what" role="note">
+        {grpcPauseTitle(p)} <span class="muted">({formatBytes(p.size)})</span> Messages behind it wait; the other direction keeps flowing.
+      </div>
+      <div class="radios" role="radiogroup" aria-label="Edit as">
+        <label class="radio" title={canJson ? undefined : loading ? 'Decoding the held message…' : 'The app\'s schema doesn\'t decode this message — edit it as base64'}>
+          <input type="radio" name="grpc-pause-mode" checked={mode === 'json'} disabled={!canJson || busy} onChange={() => setPicked('json')} />
+          JSON (encoded with the app's schema)
+        </label>
+        <label class="radio">
+          <input type="radio" name="grpc-pause-mode" checked={mode === 'base64'} disabled={busy} onChange={() => setPicked('base64')} />
+          Base64 protobuf
+        </label>
+      </div>
+      {loading && <div class="hint grpc-pause-loading" aria-busy="true">Decoding the held message…</div>}
+      {!loading && !canJson && (
+        <div class="hint">
+          {dm?.via === 'raw' ? 'No schema for this message: only base64 edits are possible.' : dm?.error ? `Couldn't decode it: ${dm.error}` : 'No decoded view: edit it as base64.'}
+        </div>
+      )}
+      {mode === 'json' ? (
+        <textarea class={`code-input grpc-pause-json${changed ? ' modified' : ''}`} rows={12} spellcheck={false} aria-label="Held message (JSON)"
+          value={json} disabled={busy} aria-invalid={!!error} onInput={(e) => setJsonText((e.target as HTMLTextAreaElement).value)} />
+      ) : (
+        <textarea class={`code-input grpc-pause-b64${changed ? ' modified' : ''}`} rows={6} spellcheck={false} aria-label="Held message (base64)"
+          value={base64} disabled={busy} aria-invalid={!!error} onInput={(e) => setB64((e.target as HTMLTextAreaElement).value)} />
+      )}
+      {dm?.via === 'raw' && dm.json && (
+        <details class="file-content"><summary>Raw fields (read-only)</summary><pre class="code">{dm.json}</pre></details>
+      )}
+      {error && <div class="msg error" role="alert">{error}</div>}
+      <div class="pe-actions">
+        <Button kind="primary" disabled={!canEdit} onClick={() => resume(edit())}
+          title={!changed ? 'Nothing changed yet' : 'Send the edited message instead (Ctrl/Cmd+Enter)'}>
+          <Icon name="play" /> Resume with edit
+        </Button>
+        <Button onClick={() => resume()} disabled={busy} title="Forward the held message unchanged">Resume unchanged</Button>
+        <Button onClick={() => resume({ drop: true })} disabled={busy}
+          title="Drop this message: it is never delivered (recorded as dropped); the call goes on">
+          Drop message
+        </Button>
+        <Button kind="danger" onClick={abort} disabled={busy} title={ABORT_TITLE}><Icon name="stop" /> Abort</Button>
+        <span class="pe-summary">{busy ? 'Sent — waiting for the proxy…' : changed ? 'Edited' : 'No changes'}</span>
+      </div>
+    </form>
+  );
+}
+
+const visibleTrailers = (t: GrpcPause & { kind: 'status' }): HeaderRow[] =>
+  headersToRows(t.trailers).filter((r) => !reservedGrpcHeader(r.name));
+
+function GrpcStatusPause({ ex, p }: { ex: Exchange; p: Extract<GrpcPause, { kind: 'status' }> }) {
+  const { busy, resume, abort } = usePauseActions(ex);
+  const original = useMemo(() => visibleTrailers(p), [p]);
+  const [code, setCode] = useState(String(p.code));
+  const [message, setMessage] = useState(p.message ?? '');
+  const [rows, setRows] = useState<HeaderRow[]>(original);
+  const trailersChanged = headersChanged(rowsToFlatRecord(original), rows);
+  const statusChanged = code !== String(p.code) || message !== (p.message ?? '');
+  const changed = statusChanged || trailersChanged;
+  const error = grpcHeaderError(rows, 'Trailer');
+  const canEdit = !busy && changed && !error;
+  const edit = (): GrpcEdit => ({
+    status: { code: Number(code), ...(message.trim() ? { message: message.trim() } : {}) },
+    ...(trailersChanged ? { trailers: rowsToFlatRecord(rows) } : {}),
+  });
+  const known = Number(code) < GRPC_CODES.length;
+  return (
+    <form class="pause-editor grpc-pause-editor" aria-label="Edit the end of the gRPC call" onSubmit={(e) => e.preventDefault()}
+      onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); if (canEdit) resume(edit()); else if (!changed && !busy) resume(); } }}>
+      <div class="msg info grpc-pause-what" role="note">{grpcPauseTitle(p)}</div>
+      <div class="field-row">
+        <label class="field">
+          <span>Status</span>
+          <select aria-label="gRPC status" value={code} disabled={busy} class={code !== String(p.code) ? 'modified' : undefined}
+            onChange={(e) => setCode((e.target as HTMLSelectElement).value)}>
+            {GRPC_CODES.map((_, c) => <option key={c} value={String(c)}>{grpcCodeLabel(c)}</option>)}
+            {!known && <option value={code}>{code}</option>}
+          </select>
+        </label>
+        <label class="field grow">
+          <span>Message <span class="muted">(grpc-message)</span></span>
+          <input value={message} disabled={busy} spellcheck={false} class={message !== (p.message ?? '') ? 'modified' : undefined}
+            onInput={(e) => setMessage((e.target as HTMLInputElement).value)} />
+        </label>
+      </div>
+      <h4 class={`section-title${trailersChanged ? ' modified' : ''}`}>Trailers</h4>
+      <HeadersEditor rows={rows} disabled={busy} onChange={setRows} />
+      <div class="hint">grpc-status and grpc-message come from the fields above; :pseudo headers and content-type can't be set.</div>
+      {error && <div class="msg error" role="alert">{error}</div>}
+      <div class="pe-actions">
+        <Button kind="primary" disabled={!canEdit} onClick={() => resume(edit())}
+          title={!changed ? 'Nothing changed yet' : 'End the call with this status and trailers (Ctrl/Cmd+Enter)'}>
+          <Icon name="play" /> Resume with edit
+        </Button>
+        <Button onClick={() => resume()} disabled={busy} title="End the call with the server's status and trailers">Resume unchanged</Button>
+        <Button kind="danger" onClick={abort} disabled={busy} title={ABORT_TITLE}><Icon name="stop" /> Abort</Button>
+        <span class="pe-summary">{busy ? 'Sent — waiting for the proxy…' : changed ? 'Edited' : 'No changes'}</span>
+      </div>
+    </form>
   );
 }

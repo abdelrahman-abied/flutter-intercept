@@ -61,7 +61,7 @@
  * proxy's self-check problem (banner).
  */
 import type {
-  AuthFlowSummary, Body, ContractSummary, CorsInfo, Frame, GraphqlInfo, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit,
+  GrpcEdit, AuthFlowSummary, Body, ContractSummary, CorsInfo, Frame, GraphqlInfo, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit,
   Rule, RuleAction, SendDraft, Status, Timings, ViewMsg,
 } from '../src/protocol';
 import type { MutateOp, SourceInfo, StackFrame } from '@flutter-intercept/proxy/types';
@@ -271,17 +271,25 @@ function onViewMsg(msg: ViewMsg) {
       send({ type: 'authFlows', flows: authFlows });
       break;
     case 'resume': {
+      const g = grpcPaused.get(msg.id);
+      if (g) { g(msg.edit as GrpcEdit | undefined); break; }
       const p = paused.get(msg.id);
       if (!p) break; // not paused (finished, gave up, auto-resumed): no-op, like the proxy
-      const problem = invalidEdit(msg.edit);
+      const edit = msg.edit as RequestEdit | ResponseEdit | undefined;
+      const problem = invalidEdit(edit);
       if (problem) {
         send({ type: 'error', message: `Resume rejected: ${problem}. The exchange is still paused.` });
         break;
       }
-      p.resume(msg.edit);
+      p.resume(edit);
       break;
     }
     case 'abort': {
+      if (grpcPaused.delete(msg.id)) {
+        const g = find(msg.id)!;
+        update(g, { state: 'aborted', durationMs: Date.now() - g.startedAt, pausedAt: undefined, pauseDeadline: undefined, grpcPause: undefined });
+        break;
+      }
       const ex = find(msg.id);
       const p = paused.get(msg.id);
       if (ex && p) {
@@ -455,9 +463,9 @@ function onViewMsg(msg: ViewMsg) {
       break;
     case 'saveRecording': {
       const saved = msg.ids ? exchanges.filter((e) => msg.ids!.includes(e.id) && isRecordable(e)) : exchanges.filter(isRecordable);
-      const { exchanges: count, streams, frames } = recordingCounts(saved);
+      const { exchanges: count, streams, frames, grpc } = recordingCounts(saved);
       const id = `rec_${Date.now().toString(36)}`;
-      recordings = [{ id, name: msg.name, createdAt: Date.now(), exchanges: count, redacted: !!msg.redact, ...(streams ? { streams, frames } : {}) }, ...recordings];
+      recordings = [{ id, name: msg.name, createdAt: Date.now(), exchanges: count, redacted: !!msg.redact, ...(streams ? { streams, frames } : {}), ...(grpc ? { grpc } : {}) }, ...recordings];
       console.info(`[fake-host] saved .dart_tool/flutter_intercept/recordings/${id}.json (${count} exchanges${msg.redact ? ', redacted' : ''})`);
       send({ type: 'recordings', recordings });
       break;
@@ -1490,7 +1498,15 @@ function fakeDecode(ex: Exchange): import('../src/protocol').GrpcDecoded {
   });
   if (!m) return { framesDropped: ex.framesDropped ?? 0, messages, problem: `The app's schema has no method ${path} — showing raw fields.` };
   const skel = (fields: string[]) => JSON.stringify(Object.fromEntries(fields.map((n) => [n, ''])), null, 2);
+  const gp = ex.grpcPause;
+  const paused = gp?.kind === 'message' ? (() => {
+    const values = pbValues(gp.base64);
+    const names = m.fields[gp.dir === 'send' ? 0 : 1];
+    return { index: gp.index, dir: gp.dir, via: 'schema' as const, size: gp.size, hex: '',
+      json: JSON.stringify(Object.fromEntries(values.map((v, i) => [names[i] ?? `#${i + 1}`, v])), null, 2) };
+  })() : undefined;
   return {
+    ...(paused ? { paused } : {}),
     framesDropped: ex.framesDropped ?? 0,
     method: { requestType: m.req, responseType: m.res, clientStreaming: false, serverStreaming: !!m.server, file: 'lib/gen/shop.pbgrpc.dart' },
     messages, skeletons: { request: skel(m.fields[0]), response: skel(m.fields[1]) },
@@ -1557,3 +1573,54 @@ function startV10() {
   send({ type: 'status', status });
 }
 setTimeout(startV10, 0);
+
+/** String field values of a pbStrings() payload. */
+function pbValues(b64: string): string[] {
+  const bin = atob(b64);
+  const out: string[] = [];
+  for (let i = 0; i < bin.length;) { const len = bin.charCodeAt(i + 1); out.push(decodeURIComponent(escape(bin.slice(i + 2, i + 2 + len)))); i += 2 + len; }
+  return out;
+}
+
+/** CONTRACTS §17.2: paused gRPC calls and what resuming does. */
+const grpcPaused = new Map<string, (edit?: GrpcEdit) => void>();
+
+/** A unary call held at a response breakpoint: first its message, then the end of the call. */
+function pausedGrpcCall() {
+  const id = `ex_${++seq}`;
+  const started = Date.now() - 2000;
+  const held = pbStrings('7', 'Flat white', '3.60');
+  const ex: Exchange = {
+    id, startedAt: started, method: 'POST', url: 'http://10.0.2.2:50051/shop.v1.Catalog/GetProduct', kind: 'grpc',
+    requestHeaders: { 'content-type': 'application/grpc', te: 'trailers' }, responseHeaders: { 'content-type': 'application/grpc' },
+    state: 'paused-response', status: 200, pausedAt: Date.now(), pauseDeadline: Date.now() + BP_TIMEOUT,
+    grpc: { service: 'shop.v1.Catalog', method: 'GetProduct', messagesSent: 1, messagesReceived: 0 },
+    frames: [{ dir: 'send', at: started + 2, kind: 'message', base64: pbStrings('7'), size: 3 }],
+    grpcPause: { kind: 'message', dir: 'receive', index: 0, base64: held, size: atob(held).length },
+  };
+  record(ex, true);
+  send({ type: 'exchange', exchange: ex });
+  grpcPaused.set(id, (edit) => {
+    const cur = find(id)!;
+    let b64 = held;
+    if (edit?.messageJson && typeof edit.messageJson === 'object') b64 = pbStrings(...Object.values(edit.messageJson as Record<string, unknown>).map(String));
+    else if (edit?.message) b64 = edit.message;
+    const frame: Frame = { dir: 'receive', at: Date.now(), kind: 'message', base64: b64, size: atob(b64).length,
+      ...(edit?.drop ? { dropped: true as const } : edit ? { edited: true as const } : {}) };
+    update(cur, {
+      frames: [...(cur.frames ?? []), frame], grpc: { ...cur.grpc!, messagesReceived: 1 }, pausedAt: Date.now(), pauseDeadline: Date.now() + BP_TIMEOUT,
+      grpcPause: { kind: 'status', code: 0, trailers: { 'grpc-status': '0', 'x-trace': 'tr-91' } },
+    });
+    grpcPaused.set(id, (end) => {
+      grpcPaused.delete(id);
+      const code = end?.status?.code ?? 0;
+      const c = find(id)!;
+      update(c, {
+        state: 'completed', durationMs: Date.now() - c.startedAt, pausedAt: undefined, pauseDeadline: undefined, grpcPause: undefined,
+        responseTrailers: { 'grpc-status': String(code), ...(end?.status?.message ? { 'grpc-message': end.status.message } : {}), ...(end?.trailers ?? { 'x-trace': 'tr-91' }) },
+        grpc: { ...c.grpc!, statusCode: code, ...(end?.status?.message ? { statusMessage: end.status.message } : {}) },
+      });
+    });
+  });
+}
+if (params.get('grpc') !== '0') setTimeout(pausedGrpcCall, 50);

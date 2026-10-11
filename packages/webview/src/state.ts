@@ -13,7 +13,7 @@ import { matchesFilter, parseFilter } from './filter';
 import { checkPath } from './jsonpath';
 import { corsActionError } from './coverage';
 import { hasMessagesTab } from './frames';
-import { appliesToGrpc, describeGrpcMock, isBase64, isGrpc, reservedGrpcHeader, type GrpcDecodeEntry } from './grpc';
+import { appliesToGrpc, describeGrpcMock, grpcPauseKey, isBase64, isGrpc, reservedGrpcHeader, type GrpcDecodeEntry } from './grpc';
 import { EXPORT_LABEL } from './exporting';
 import { describeScript, scriptCodeError, scriptFileError, scriptMatchError } from './scripts';
 import {
@@ -440,7 +440,9 @@ function applyHostMsg(state: State, msg: HostMsg): State {
       // Drafts / resolving flags only make sense while paused in the same phase.
       const draft = state.drafts[ex.id];
       if (draft && draftKindFor(ex) !== draft.kind) next.drafts = omit(state.drafts, ex.id);
-      if (state.resolving[ex.id] && (!isPaused(ex) || idx < 0 || state.exchanges[idx].state !== ex.state)) {
+      // A gRPC call pauses again in the same phase (the next message): a new pause unlocks the editor too.
+      if (state.resolving[ex.id] && (!isPaused(ex) || idx < 0 || state.exchanges[idx].state !== ex.state
+        || grpcPauseKey(state.exchanges[idx]) !== grpcPauseKey(ex))) {
         next.resolving = omit(state.resolving, ex.id);
       }
 
@@ -1468,7 +1470,7 @@ export function grpcMessageError(text: string, mode: ActionFields['grpcMessagesM
   return undefined;
 }
 
-function grpcHeaderError(rows: HeaderRow[], what: 'Header' | 'Trailer'): string | undefined {
+export function grpcHeaderError(rows: HeaderRow[], what: 'Header' | 'Trailer'): string | undefined {
   for (const r of rows) {
     const n = r.name.trim();
     if (!n) { if (r.value.trim()) return `${what}: a value needs a name`; continue; }

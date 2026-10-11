@@ -292,12 +292,12 @@ export function pendingApprovalText(sr: NonNullable<Status['sharedRules']>): str
 
 /**
  * What a recording keeps: finished HTTP exchanges and (CONTRACTS §14.5) finished WebSocket / SSE streams with their
- * frames — no TLS passthrough tunnels, no gRPC calls (§16.4), no native captures, nothing in flight (an open stream
- * is not saved).
+ * frames, and (§17.4) finished gRPC calls with their messages — no TLS passthrough tunnels, no native captures,
+ * nothing in flight (an open stream or call is not saved).
  */
 export function isRecordable(ex: Pick<Exchange, 'state' | 'kind' | 'captured'>): boolean {
-  // CONTRACTS §16.4: recordings skip gRPC calls (for now).
-  if (ex.kind === 'tunnel' || ex.kind === 'grpc' || ex.captured === 'vm-profile') return false;
+  // CONTRACTS §17.4: finished gRPC calls are recorded too (0.10 skipped them).
+  if (ex.kind === 'tunnel' || ex.captured === 'vm-profile') return false;
   return ex.state !== 'pending' && ex.state !== 'paused-request' && ex.state !== 'paused-response';
 }
 
@@ -306,23 +306,32 @@ export function isStream(ex: Pick<Exchange, 'kind'>): boolean {
   return ex.kind === 'websocket' || ex.kind === 'sse';
 }
 
-/** What "Save" would write: exchanges, of which WebSocket / SSE streams, and their frames (the kept window). */
-export function recordingCounts(list: readonly Pick<Exchange, 'kind' | 'frames'>[]): { exchanges: number; streams: number; frames: number } {
+/**
+ * What "Save" would write: exchanges, of which WebSocket / SSE streams, and their frames (the kept window), and gRPC
+ * calls (CONTRACTS §17.4; `grpc` only when there are any).
+ */
+export function recordingCounts(list: readonly Pick<Exchange, 'kind' | 'frames'>[]): { exchanges: number; streams: number; frames: number; grpc?: number } {
   let streams = 0;
   let frames = 0;
+  let grpc = 0;
   for (const e of list) {
+    if (e.kind === 'grpc') grpc++;
     if (!isStream(e)) continue;
     streams++;
     frames += e.frames?.length ?? 0;
   }
-  return { exchanges: list.length, streams, frames };
+  return grpc ? { exchanges: list.length, streams, frames, grpc } : { exchanges: list.length, streams, frames };
 }
 
-/** "2 WebSocket / SSE · 134 frames" (empty when there are no streams). */
-export function streamCountText(c: { streams?: number; frames?: number }): string {
-  if (!c.streams) return '';
-  const f = c.frames ?? 0;
-  return `${c.streams} WebSocket / SSE${c.frames !== undefined ? ` · ${f} frame${f === 1 ? '' : 's'}` : ''}`;
+/** "2 WebSocket / SSE · 134 frames · 3 gRPC calls" (empty when there are no streams or gRPC calls). */
+export function streamCountText(c: { streams?: number; frames?: number; grpc?: number }): string {
+  const parts: string[] = [];
+  if (c.streams) {
+    const f = c.frames ?? 0;
+    parts.push(`${c.streams} WebSocket / SSE${c.frames !== undefined ? ` · ${f} frame${f === 1 ? '' : 's'}` : ''}`);
+  }
+  if (c.grpc) parts.push(`${c.grpc} gRPC call${c.grpc === 1 ? '' : 's'}`);
+  return parts.join(' · ');
 }
 
 /**
@@ -331,7 +340,7 @@ export function streamCountText(c: { streams?: number; frames?: number }): strin
  */
 export type RecordingRowSummary = RecordingSummary & { streams?: number; frames?: number };
 
-/** "42 exchanges · 2 WebSocket / SSE · 134 frames". */
+/** "42 exchanges · 2 WebSocket / SSE · 134 frames · 3 gRPC calls" (`grpc`: CONTRACTS §17.4). */
 export function recordingCountText(rec: RecordingRowSummary): string {
   const base = `${rec.exchanges} exchange${rec.exchanges === 1 ? '' : 's'}`;
   const streams = streamCountText(rec);

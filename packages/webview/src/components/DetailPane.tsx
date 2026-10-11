@@ -11,7 +11,7 @@ import { AgentBadge, Button, CoverageBadges, MenuButton, PauseTimer, StateBadge,
 import { CORS_DEV_NOTE, isNative, NATIVE_READ_ONLY, requestOrigin, routeGlob, sentCookies } from '../coverage';
 import { frameTotal, hasMessagesTab } from '../frames';
 import { GRPC_TUNNEL_HINT, isGrpc, isGrpcTunnel } from '../grpc';
-import { GrpcStatusSection, GrpcTunnelExplanation, TrailersSection, useGrpcDecode } from './GrpcViews';
+import { GrpcPauseEditor, GrpcStatusSection, GrpcTunnelExplanation, TrailersSection, useGrpcDecode } from './GrpcViews';
 import { FramesView } from './FramesView';
 import { expireTokenError, expireTokenLabel } from '../scenarios';
 import { PauseEditor } from './Editors';
@@ -47,6 +47,10 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
   const sentBy = initiatorLabel(ex);
   const original = ex.resentFrom ? findExchange(state, ex.resentFrom) : undefined;
   const [expiring, setExpiring] = useState(false);
+  // CONTRACTS §17.3: "mutate this field" on decoded gRPC response messages, like an HTTP JSON body.
+  const grpcFields = useMemo<TreeFieldActions | undefined>(() => (grpc
+    ? { mutate: actions.mutateField, disabled: ex.state === 'mocked' ? MOCKED_NOTE : undefined }
+    : undefined), [grpc, ex.id, ex.state]);
 
   return (
     <section class="detail" ref={paneRef} tabIndex={-1} aria-label="Exchange details"
@@ -78,7 +82,9 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
           <Button onClick={() => create('block')} disabled={!!actions.off.block}
             title={actions.off.block ?? 'Create a rule that blocks requests like this one'}>Block this</Button>
           <Button onClick={() => create('breakpoint')} disabled={!!actions.off.breakpoint}
-            title={actions.off.breakpoint ?? 'Create a breakpoint rule that pauses requests like this one'}>Break on this</Button>
+            title={actions.off.breakpoint ?? (grpc
+              ? 'Create a breakpoint rule for this method: each message pauses, and the end of the call (status and trailers)'
+              : 'Create a breakpoint rule that pauses requests like this one')}>Break on this</Button>
           <Button onClick={() => setExpiring(!expiring)} pressed={expiring} disabled={!!actions.off.expire}
             title={actions.off.expire ?? 'Make the next request(s) like this one get 401 token_expired — test how the app refreshes its token'}>
             Expire token…
@@ -196,7 +202,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
 
       <div class="tab-body" role="tabpanel">
         {tab === 'request' ? (tunnel ? <TunnelTab ex={ex} /> : <RequestTab ex={ex} />)
-          : tab === 'messages' ? <FramesView key={ex.id} ex={ex} />
+          : tab === 'messages' ? <FramesView key={ex.id} ex={ex} fields={grpcFields} />
           : tab === 'timing' ? <TimingSection ex={ex} />
           : <ResponseTab ex={ex} actions={actions} />}
       </div>
@@ -331,7 +337,7 @@ export function ScriptLog({ ex }: { ex: Exchange }) {
 }
 
 function RequestTab({ ex }: { ex: Exchange }) {
-  if (ex.state === 'paused-request') return <PauseEditor key={ex.id + ex.state} ex={ex} />;
+  if (ex.state === 'paused-request') return isGrpc(ex) ? <GrpcPauseEditor ex={ex} /> : <PauseEditor key={ex.id + ex.state} ex={ex} />;
   if (isGrpc(ex)) {
     return (
       <>
@@ -365,7 +371,7 @@ function ResponseTab({ ex, actions }: { ex: Exchange; actions: ExchangeActions }
     const disabled = isNative(ex) ? NATIVE_READ_ONLY : ex.state === 'mocked' ? MOCKED_NOTE : undefined;
     return { mutate: actions.mutateField, marks, disabled };
   }, [result, ex.id, ex.state, ex.captured]);
-  if (ex.state === 'paused-response') return <PauseEditor key={ex.id + ex.state} ex={ex} />;
+  if (ex.state === 'paused-response') return isGrpc(ex) ? <GrpcPauseEditor ex={ex} /> : <PauseEditor key={ex.id + ex.state} ex={ex} />;
   if (isGrpc(ex)) return <GrpcResponseTab ex={ex} />;
   if (ex.status === undefined) {
     const why: Record<string, string> = {

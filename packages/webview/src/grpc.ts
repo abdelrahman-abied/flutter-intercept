@@ -81,7 +81,9 @@ export function grpcStatusView(ex: Pick<Exchange, 'state' | 'grpc' | 'error' | '
   }
   switch (ex.state) {
     case 'pending': return { text: '…', cls: 'pending', title: 'Open — waiting for the status (trailers)' };
-    case 'aborted': return { text: '✕', cls: 'err', title: 'Cancelled by the app (RST_STREAM) — no gRPC status' };
+    case 'paused-request':
+    case 'paused-response': return { text: '…', cls: 'pending', title: 'Paused at a breakpoint — no gRPC status yet' };
+    case 'aborted': return { text: '✕', cls: 'err', title: 'Cancelled (by the app, or aborted at a breakpoint) — no gRPC status' };
     case 'error': return { text: '✕', cls: 'err', title: `No gRPC status: ${ex.error ?? 'the stream was reset'}` };
     case 'blocked': return { text: '✕', cls: 'err', title: 'Blocked by a rule (stream reset) — no gRPC status' };
     default: return { text: '—', cls: 'none', title: 'No gRPC status reported' };
@@ -148,10 +150,34 @@ export interface GrpcDecodeEntry {
 }
 
 /** Changes whenever the decode could differ: state, status, message frames. */
-export function grpcVersion(ex: Pick<Exchange, 'state' | 'grpc' | 'frames' | 'framesDropped'>): string {
+export function grpcVersion(ex: Pick<Exchange, 'state' | 'grpc' | 'frames' | 'framesDropped'> & Partial<Pick<Exchange, 'grpcPause' | 'pausedAt'>>): string {
   const frames = ex.frames ?? [];
   const last = frames[frames.length - 1];
-  return [ex.state, ex.grpc?.statusCode ?? '', ex.framesDropped ?? 0, frames.length, last ? `${last.at}:${last.size}` : ''].join('|');
+  // CONTRACTS §17.6: a new (or changed) pause is a new version — the answer then carries the held message (`paused`).
+  return [ex.state, ex.grpc?.statusCode ?? '', ex.framesDropped ?? 0, frames.length, last ? `${last.at}:${last.size}` : '', grpcPauseKey(ex)].join('|');
+}
+
+// ---------------------------------------------------------------- breakpoints (CONTRACTS §17.2)
+
+/** Identity of what a paused gRPC call holds ('' when not paused): a new pause resets the editor. */
+export function grpcPauseKey(ex: Partial<Pick<Exchange, 'grpcPause' | 'pausedAt'>>): string {
+  const p = ex.grpcPause;
+  if (!p) return '';
+  return p.kind === 'message' ? `m:${p.dir}:${p.index}:${p.size}:${ex.pausedAt ?? ''}` : `s:${p.code}:${ex.pausedAt ?? ''}`;
+}
+
+/** The held message decoded in full, when the host's answer is for this pause. */
+export function pausedDecoded(ex: Pick<Exchange, 'grpcPause'>, decoded: GrpcDecoded | undefined): GrpcDecodedMessage | undefined {
+  const p = ex.grpcPause;
+  const m = decoded?.paused;
+  if (!p || p.kind !== 'message' || !m) return undefined;
+  return m.index === p.index && m.dir === p.dir ? m : undefined;
+}
+
+/** "Message 3 the server sent" / "the end of the call". */
+export function grpcPauseTitle(p: NonNullable<Exchange['grpcPause']>): string {
+  if (p.kind === 'status') return 'Paused at the end of the call — before the app gets the status and trailers.';
+  return `Paused on message ${p.index + 1} ${p.dir === 'send' ? 'the app sends — before it reaches the server' : 'the server sends — before it reaches the app'}.`;
 }
 
 /** True when the panel should (re-)post `decodeGrpc` for this exchange. */
@@ -236,7 +262,7 @@ export function methodTypesText(m: NonNullable<GrpcDecoded['method']>): string {
 // ---------------------------------------------------------------- rules (CONTRACTS §16.2)
 
 /** Actions the proxy applies to gRPC calls; a rule with any other action never matches one. */
-const GRPC_KINDS = new Set<string>(['grpcMock', 'block', 'fault', 'throttle', 'passthrough']);
+const GRPC_KINDS = new Set<string>(['grpcMock', 'block', 'fault', 'throttle', 'passthrough', 'breakpoint', 'mutate']);
 
 export function appliesToGrpc(a: RuleAction | SequenceStep['action']): boolean {
   if (a.kind === 'sequence') return a.steps.every((s) => appliesToGrpc(s.action));
@@ -247,10 +273,10 @@ export function appliesToGrpc(a: RuleAction | SequenceStep['action']): boolean {
 export function grpcActionNote(kind: string, stepKinds?: readonly string[]): string | undefined {
   if (kind === 'sequence') {
     const bad = (stepKinds ?? []).find((k) => !GRPC_KINDS.has(k));
-    return bad ? `gRPC calls skip this rule: a sequence applies to them only when every step is a gRPC mock, Block, Fault, Throttle or Real server.` : undefined;
+    return bad ? 'gRPC calls skip this rule: a sequence applies to them only when every step is a gRPC mock, Block, Fault, Throttle, Mutate JSON or Real server.' : undefined;
   }
   if (GRPC_KINDS.has(kind)) return undefined;
-  return 'gRPC calls skip this rule: only gRPC mock, Block, Fault, Throttle and Sequence (of those) apply to them in 0.10.';
+  return 'gRPC calls skip this rule: only gRPC mock, Block, Fault, Throttle, Breakpoint, Mutate JSON and Sequence (of those) apply to them.';
 }
 
 /** `/pkg.Service/Method` (or `/pkg.Service/*`) somewhere in a URL pattern. */
