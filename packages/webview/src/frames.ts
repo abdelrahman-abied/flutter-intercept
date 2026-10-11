@@ -10,7 +10,7 @@
  */
 import type { Exchange, Frame } from './protocol';
 import { formatJson } from './json';
-import { formatBytes } from './util';
+import { frameSizeText } from './util';
 import { tunnelTitle } from './connection';
 import { GRPC_TUNNEL_HINT, grpcTitle, isGrpc } from './grpc';
 
@@ -108,6 +108,8 @@ export function capText(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
+export { FRAME_CAP, frameSizeText, frameSizeTitle } from './util';
+
 /** Stable identity of a frame across re-sends: its number (framesDropped + index), time and size. */
 export function frameKey(n: number, f: Pick<Frame, 'at' | 'size'>): string {
   return `${n}:${f.at}:${f.size}`;
@@ -118,7 +120,7 @@ const PREVIEW_CHARS = 160;
 /** One-line preview for the frame list. */
 export function framePreview(f: Frame): string {
   switch (f.kind) {
-    case 'binary': return `binary · ${formatBytes(f.size)}`;
+    case 'binary': return `binary · ${frameSizeText(f)}`;
     case 'ping': return f.text ? `ping · ${oneLine(f.text)}` : 'ping';
     case 'pong': return f.text ? `pong · ${oneLine(f.text)}` : 'pong';
     case 'close': return `close ${closeCodeText(f.closeCode)}${f.text ? ` · ${oneLine(f.text)}` : ''}`;

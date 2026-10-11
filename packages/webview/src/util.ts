@@ -1,4 +1,5 @@
-import type { Body, Exchange } from './protocol';
+import type { Body, Exchange, Frame } from './protocol';
+
 import type { StackFrame } from '@flutter-intercept/proxy/types';
 import { FRAMEWORK_PACKAGES } from '@flutter-intercept/proxy/source';
 
@@ -261,3 +262,28 @@ export function newId(prefix = 'r'): string {
   if (c?.randomUUID) return `${prefix}_${c.randomUUID().slice(0, 8)}`;
   return `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 }
+
+// ---------------------------------------------------------------- frame sizes (CONTRACTS §16.8)
+
+/** The frame cap (CONTRACTS §16.8): decompression stops past it. */
+export const FRAME_CAP = 64 * 1024;
+
+/**
+ * CONTRACTS §16.8: with `sizeUnknown` the proxy stopped decompressing at the frame cap and `size` is the compressed
+ * (wire) size — the real size is at least what was kept ("≥ 64.0 kB").
+ */
+export function frameSizeText(f: Pick<Frame, 'size' | 'sizeUnknown' | 'base64' | 'text'>): string {
+  if (!f.sizeUnknown) return formatBytes(f.size);
+  return `≥ ${formatBytes(keptBytes(f))}`;
+}
+
+/** Tooltip of a size whose full value wasn't measured (undefined otherwise). */
+export function frameSizeTitle(f: Pick<Frame, 'size' | 'sizeUnknown'>): string | undefined {
+  return f.sizeUnknown ? `compressed size ${f.size.toLocaleString('en-US')} bytes; the full size wasn't measured` : undefined;
+}
+
+function keptBytes(f: Pick<Frame, 'base64' | 'text'>): number {
+  const n = f.base64 ? base64ByteLength(f.base64) : 0;
+  return n > 0 ? n : FRAME_CAP;
+}
+

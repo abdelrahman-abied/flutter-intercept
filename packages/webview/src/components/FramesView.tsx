@@ -5,10 +5,10 @@ import type { JSX } from 'preact';
 import { useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { Exchange } from '../protocol';
 import {
-  capText, closeCodeText, dirArrow, dirLabel, FrameCache, filterFrames, formatRelative, frameCounts, framePrettyJson, frameTotal,
+  capText, closeCodeText, frameSizeText, frameSizeTitle, dirArrow, dirLabel, FrameCache, filterFrames, formatRelative, frameCounts, framePrettyJson, frameTotal,
   hexDump, MAX_EVENT_CHARS, MAX_ID_CHARS, type DirFilter, type Frame,
 } from '../frames';
-import { formatBytes, formatTime } from '../util';
+import { formatTime } from '../util';
 import { useApp } from '../context';
 import { decodedMessages, decodeNote, grpcCodeLabel, grpcPreview, isGrpc, methodTypesText } from '../grpc';
 import { Button } from './bits';
@@ -218,7 +218,7 @@ function FrameRow({ f, n, preview, start, selected, onSelect, id }: {
       class={`frame-row dir-${f.dir} fk-${f.kind}${selected ? ' selected' : ''}`} onClick={onSelect}>
       <span class="fr-dir" title={dirLabel(f)}>{dirArrow(f)}</span>
       <span class="fr-time" title={formatTime(f.at)}>{formatRelative(f.at, start)}</span>
-      <span class="fr-size">{formatBytes(f.size)}{f.truncated ? '+' : ''}</span>
+      <span class="fr-size" title={frameSizeTitle(f)}>{frameSizeText(f)}{f.truncated && !f.sizeUnknown ? '+' : ''}</span>
       <span class="fr-preview">
         {f.compressed && <span class="badge mini gz-badge" title="Sent compressed (grpc-encoding); shown decompressed">gz</span>}
         {f.event && <span class="badge mini ev-badge">{capText(f.event, 64)}</span>}
@@ -241,7 +241,7 @@ function FrameDetail({ f, n, start }: { f: Frame; n: number; start: number }) {
         <span class="meta-item">{dirArrow(f)} {dirLabel(f)}</span>
         <span class="meta-item">{f.kind}</span>
         <span class="meta-item" title={formatTime(f.at)}>{formatRelative(f.at, start)}</span>
-        <span class="meta-item">{formatBytes(f.size)}</span>
+        <span class="meta-item" title={frameSizeTitle(f)}>{frameSizeText(f)}</span>
         {f.event && <span class="meta-item">event: <code>{capText(f.event, MAX_EVENT_CHARS)}</code></span>}
         {f.id && <span class="meta-item">id: <code>{capText(f.id, MAX_ID_CHARS)}</code></span>}
         {f.kind === 'close' && <span class="meta-item">code {closeCodeText(f.closeCode)}</span>}
@@ -260,7 +260,7 @@ function FrameDetail({ f, n, start }: { f: Frame; n: number; start: number }) {
       </div>
       {hex ? (
         <>
-          <div class="binary">binary ({f.size.toLocaleString()} bytes){hex.shown < f.size ? ` — first ${hex.shown} shown` : ''}</div>
+          <div class="binary" title={frameSizeTitle(f)}>binary ({f.sizeUnknown ? frameSizeText(f) : `${f.size.toLocaleString()} bytes`}){hex.shown < f.size || f.sizeUnknown ? ` — first ${hex.shown} shown` : ''}</div>
           <pre class="code hexdump">{hex.text}</pre>
         </>
       ) : f.text !== undefined && f.text !== '' ? (

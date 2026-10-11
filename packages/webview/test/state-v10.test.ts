@@ -8,7 +8,7 @@ import {
   isBase64, isGrpcStreaming, looksLikeGrpcUrl, methodTypesText, needsDecode, reservedGrpcHeader,
 } from '../src/grpc';
 import { contentClassOf, parseFilter } from '../src/filter';
-import { hasMessagesTab, KIND_BADGE, kindTitle } from '../src/frames';
+import { frameSizeText, frameSizeTitle, hasMessagesTab, KIND_BADGE, kindTitle } from '../src/frames';
 import { exportScope } from '../src/exporting';
 import { interceptOff, GRPC_OFF } from '../src/components/actions';
 import { isRecordable, STEP_KIND_LABEL, STEP_KINDS, stepLabel } from '../src/scenarios';
@@ -370,5 +370,18 @@ describe('Status.grpc summary', () => {
     expect(p.problems).toBe(2);
     expect(p.text).toBe('gRPC: 1 method · 2 problems');
     expect(p.title).toContain('✕ a.pb.dart: parse error');
+  });
+});
+
+describe('unmeasured sizes (CONTRACTS §16.8 sizeUnknown)', () => {
+  it('shows "≥ kept bytes" with the compressed size in the tooltip', () => {
+    const kept = btoa('x'.repeat(65_536));
+    const f = msg('receive', 1, 30_000, { sizeUnknown: true, compressed: true, base64: kept });
+    expect(frameSizeText(f)).toBe('≥ 64.0 kB');
+    expect(frameSizeTitle(f)).toBe('compressed size 30,000 bytes; the full size wasn\'t measured');
+    expect(frameSizeText({ ...f, base64: undefined })).toBe('≥ 64.0 kB');
+    expect(frameSizeText(msg('send', 1, 12))).toBe('12 B');
+    expect(frameSizeTitle(msg('send', 1, 12))).toBeUndefined();
+    expect(grpcPreview(f, undefined)).toBe('≥ 64.0 kB (size not measured) (protobuf)');
   });
 });

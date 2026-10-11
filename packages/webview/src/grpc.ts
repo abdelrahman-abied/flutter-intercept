@@ -4,7 +4,7 @@
  */
 import type { Exchange, Frame, GrpcDecoded, GrpcDecodedMessage, RuleAction, Status } from './protocol';
 import type { SequenceStep } from '@flutter-intercept/proxy/types';
-import { splitUrl } from './util';
+import { frameSizeText, splitUrl } from './util';
 
 // ---------------------------------------------------------------- status codes
 
@@ -187,13 +187,14 @@ export function decodedMessages(entry: GrpcDecodeEntry | undefined, frames: read
 const PREVIEW_CHARS = 160;
 
 /** One-line preview of a decoded message: compact JSON, or the size when there is nothing to show. */
-export function grpcPreview(f: Pick<Frame, 'size' | 'compressed'>, m: GrpcDecodedMessage | undefined): string {
+export function grpcPreview(f: Pick<Frame, 'size' | 'compressed' | 'sizeUnknown' | 'base64'>, m: GrpcDecodedMessage | undefined): string {
   if (m?.json) {
     const s = m.json.replace(/\s+/g, ' ').trim();
     return s.length > PREVIEW_CHARS ? `${s.slice(0, PREVIEW_CHARS - 1)}…` : s;
   }
-  if (m?.error) return `${f.size} bytes · ${m.error}`;
-  return `${f.size} byte${f.size === 1 ? '' : 's'} (protobuf)`;
+  const size = f.sizeUnknown ? `${frameSizeText(f)} (size not measured)` : `${f.size} byte${f.size === 1 ? '' : 's'}`;
+  if (m?.error) return `${size} · ${m.error}`;
+  return `${size} (protobuf)`;
 }
 
 /**

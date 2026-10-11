@@ -7,9 +7,9 @@ import {
   DECODE_TIMEOUT_MS, GRPC_DECRYPT_SETTING, grpcCodeLabel, grpcCountsText, grpcFacts, grpcPath, grpcVersion, hexTextDump, isGrpc,
   needsDecode,
 } from '../grpc';
-import { dirArrow, dirLabel, formatRelative, hexDump } from '../frames';
+import { dirArrow, dirLabel, formatRelative, frameSizeText, frameSizeTitle, hexDump } from '../frames';
 import { parseJsonLossless } from '../json';
-import { formatBytes, formatTime, type Headers } from '../util';
+import { formatTime, type Headers } from '../util';
 import { Button } from './bits';
 import { Icon } from './Icon';
 import { copyText, HeadersTable, JsonTree } from './Viewers';
@@ -102,7 +102,7 @@ export function GrpcMessageDetail({ f, n, start, m }: { f: Frame; n: number; sta
       <div class="body-meta">
         <span class="meta-item">{dirArrow(f)} {dirLabel(f)}</span>
         <span class="meta-item" title={formatTime(f.at)}>{formatRelative(f.at, start)}</span>
-        <span class="meta-item">{formatBytes(f.size)}</span>
+        <span class="meta-item" title={frameSizeTitle(f)}>{frameSizeText(f)}</span>
         {f.compressed && <span class="meta-item" title="Sent compressed (grpc-encoding); shown decompressed">compressed</span>}
         {m && <span class="meta-item">{m.via === 'schema' ? 'decoded with the app\'s schema' : m.via === 'raw' ? 'raw fields (no schema)' : 'not decoded'}</span>}
         {f.truncated && <span class="badge warn" title="The proxy keeps at most 64 KB of each message">truncated</span>}
@@ -126,7 +126,7 @@ export function GrpcMessageDetail({ f, n, start, m }: { f: Frame; n: number; sta
         : mode === 'text' && m?.json ? <pre class="code">{m.json}</pre>
         : mode === 'hex' && hex ? (
           <>
-            <div class="binary">protobuf ({f.size.toLocaleString()} bytes){hex.shown < f.size ? ` — first ${hex.shown} shown` : ''}</div>
+            <div class="binary" title={frameSizeTitle(f)}>protobuf ({f.sizeUnknown ? frameSizeText(f) : `${f.size.toLocaleString()} bytes`}){hex.shown < f.size || f.sizeUnknown ? ` — first ${hex.shown} shown` : ''}</div>
             <pre class="code hexdump">{hex.text}</pre>
           </>
         )

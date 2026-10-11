@@ -234,6 +234,19 @@ describe('gRPC detail pane', () => {
     expect($('.fr-preview', rows()[0])!.textContent).toContain('Ada');
   });
 
+  it('a message whose decompression stopped at the cap shows "≥ 64.0 kB" with the compressed size', async () => {
+    await mount();
+    const big = msg('receive', 40, { size: 30_000, compressed: true, sizeUnknown: true, base64: btoa('x'.repeat(65_536)), truncated: true });
+    await emit({ type: 'snapshot', exchanges: [call({ frames: [msg('send', 12), big] })], rules: [], status: withGrpc });
+    await click($$('.row')[0]);
+    const size = $('.fr-size', $$('.frame-row')[1])!;
+    expect(size.textContent).toBe('≥ 64.0 kB');
+    expect(size.getAttribute('title')).toBe('compressed size 30,000 bytes; the full size wasn\'t measured');
+    await click($$('.frame-row')[1]);
+    const meta = $$('.grpc-message .meta-item').find((m) => m.textContent === '≥ 64.0 kB')!;
+    expect(meta.getAttribute('title')).toMatch(/compressed size 30,000 bytes/);
+  });
+
   it('raw fields (no schema) and a decode problem', async () => {
     await mount();
     await emit({ type: 'snapshot', exchanges: [call()], rules: [], status: withGrpc });
