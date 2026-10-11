@@ -1201,7 +1201,18 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
               f.push(`${what}: the app did not print it: ${outputOf(session).slice(from).split(/\r?\n/).filter((l) => l.includes('grpc_unary')).join(' | ').slice(0, 300)}`),
             );
           };
+          // Rules with `times` are spent by whichever matching call comes first: let the previous gRPC batch finish
+          // (its last calls — NOT_FOUND, isolate, TLS — would otherwise use them up) before adding the next rule.
+          const batchIdle = async () => {
+            if (!session) return;
+            await waitFor(() => {
+              const o = outputOf(session);
+              const started = (o.match(/DEMO_GRPC start/g) ?? []).length;
+              return started > 0 && started === (o.match(/DEMO_GRPC done/g) ?? []).length ? true : undefined;
+            }, 120_000, 250).catch(() => f.push('the previous gRPC batch never finished'));
+          };
           // 1. A response breakpoint (once): edit the held Order's id through resume_request grpc.messageJson.
+          await batchIdle();
           const bp = await mcpCall('add_breakpoint', { url: `*${GET_ORDER}`, phase: 'response', times: 1, name: 'grpc bp' });
           if (bp.isError || !bp.result.ruleId) throw new Error(`add_breakpoint (gRPC): ${bp.text.slice(0, 300)}`);
           ruleIds.push(bp.result.ruleId);
@@ -1233,6 +1244,7 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
           for (const id of ruleIds.splice(0)) await mcpCall('remove_rule', { ruleId: id }).catch(() => undefined);
 
           // 2. A mutate rule on the response message (once).
+          await batchIdle();
           const mu = await mcpCall('add_mutation', { url: `*${GET_ORDER}`, ops: [{ path: '$.customerEmail', op: 'set', value: 'mutated@example.com' }], times: 1, name: 'grpc mutate' });
           if (mu.isError || !mu.result.ruleId) throw new Error(`add_mutation (gRPC): ${mu.text.slice(0, 300)}`);
           ruleIds.push(mu.result.ruleId);
@@ -1244,12 +1256,14 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
           for (const id of ruleIds.splice(0)) await mcpCall('remove_rule', { ruleId: id }).catch(() => undefined);
 
           // 3. Record a clean run, replay it with fallback "fail": GetOrder is answered from the recording.
+          await batchIdle();
           from = session ? outputOf(session).length : 0;
           const cleanAt = Date.now();
           h = await mcpCall('hot_restart', { sessionId });
           if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
           const okRun = await mcpCall('assert_traffic', { url: `*${GET_ORDER}`, kind: 'grpc', sinceMs: cleanAt, withinMs: 90_000, expect: { count: { min: 2 } } });
           if (okRun.isError || okRun.result.pass !== true) f.push(`clean run before recording: ${okRun.text.slice(0, 300)}`);
+          await batchIdle();
           const sv = await mcpCall('save_recording', { name: 'fi grpc suite', url: `*${GET_ORDER}`, sinceMs: cleanAt });
           if (sv.isError || !(sv.result.grpc >= 2)) throw new Error(`save_recording (gRPC): ${sv.text.slice(0, 300)}`);
           const rp = await mcpCall('replay_recording', { id: sv.result.id, fallback: 'fail' });
