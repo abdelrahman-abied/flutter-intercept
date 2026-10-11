@@ -74,11 +74,12 @@ export function builtinWellKnownTypes(files?: Iterable<string>): (ProtoMessage |
 export function hasSpecialJson(name: string): boolean {
   if (!name.startsWith(P)) return false;
   const cls = name.slice(P.length);
-  return cls in WRAPPERS || ['Any', 'Duration', 'FieldMask', 'ListValue', 'Struct', 'Timestamp', 'Value'].includes(cls);
+  return Object.hasOwn(WRAPPERS, cls) || ['Any', 'Duration', 'FieldMask', 'ListValue', 'Struct', 'Timestamp', 'Value'].includes(cls);
 }
 
 export function wrapperScalar(name: string): ProtoScalar | undefined {
-  return name.startsWith(P) ? WRAPPERS[name.slice(P.length)] : undefined;
+  const cls = name.startsWith(P) ? name.slice(P.length) : '';
+  return Object.hasOwn(WRAPPERS, cls) ? WRAPPERS[cls] : undefined;
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -56,6 +56,8 @@ export interface ParsedServiceMethod {
 
 export interface ParsedFile {
   path: string;
+  /** Display name for problem texts (never an absolute path). */
+  label: string;
   imports: { uri: string; prefix?: string }[];
   exports: string[];
   messages: ParsedMessage[];
@@ -232,13 +234,36 @@ const DEFAULT_CODES: Record<string, string> = {
 /** Methods whose third positional argument is the field type. */
 const POSITIONAL_CODE = new Set(['a', 'e', 'p', 'pc', 'add']);
 
+/** Per-file parsing limits (REVIEW-10 #2): beyond them the file is skipped as "too complex to read". */
+export const MAX_TOKENS_PER_FILE = 2_000_000;
+export const MAX_MS_PER_FILE = 200;
+
+class TooComplex extends Error {}
+
+/** Cheap deadline check: looks at the clock every 1024 ticks. */
+class Budget {
+  private n = 0;
+  private readonly deadline: number;
+
+  constructor(ms: number) {
+    this.deadline = Date.now() + ms;
+  }
+
+  tick(): void {
+    if ((++this.n & 1023) === 0 && Date.now() > this.deadline) throw new TooComplex('too complex');
+  }
+}
+
+let budget = new Budget(MAX_MS_PER_FILE);
+
 function lowerFirst(s: string): string {
   return s ? s[0].toLowerCase() + s.slice(1) : s;
 }
 
-export function parseGeneratedFile(path: string, text: string): ParsedFile {
+export function parseGeneratedFile(path: string, text: string, label = path.slice(path.lastIndexOf('/') + 1)): ParsedFile {
   const file: ParsedFile = {
     path,
+    label,
     imports: [],
     exports: [],
     messages: [],
@@ -247,16 +272,36 @@ export function parseGeneratedFile(path: string, text: string): ParsedFile {
     serviceMethods: [],
     problems: [],
   };
+  const started = Date.now();
   let toks: Tok[];
   try {
     toks = tokenize(text);
   } catch (e) {
-    file.problems.push(`${path}: couldn't read the file (${(e as Error).message})`);
+    file.problems.push(`${label}: couldn't read the file (${(e as Error).message})`);
     return file;
   }
+  if (toks.length > MAX_TOKENS_PER_FILE) {
+    file.problems.push(`${label}: too complex to read`);
+    return file;
+  }
+  budget = new Budget(Math.max(0, MAX_MS_PER_FILE - (Date.now() - started)));
+  try {
+    parseTokens(file, text, toks);
+  } catch (e) {
+    if (!(e instanceof TooComplex)) throw e;
+    const skipped: ParsedFile = { ...file, imports: [], exports: [], messages: [], enums: [], clientMethods: [], serviceMethods: [] };
+    skipped.problems = [`${label}: too complex to read`];
+    return skipped;
+  }
+  return file;
+}
+
+function parseTokens(file: ParsedFile, text: string, toks: Tok[]): void {
+  const label = file.label;
   const lineOf = lineIndex(text);
   const n = toks.length;
   for (let i = 0; i < n; i++) {
+    budget.tick();
     const t = toks[i];
     if (t.k !== 'id') continue;
     try {
@@ -277,7 +322,10 @@ export function parseGeneratedFile(path: string, text: string): ParsedFile {
         const name = toks[i + 1].v;
         let j = i + 2;
         while (j < n && !isP(toks[j], '{') && !isP(toks[j], ';')) j++;
-        if (!isP(toks[j], '{')) continue;
+        if (!isP(toks[j], '{')) {
+          i = j; // never rescan the same header (linear time)
+          continue;
+        }
         const header = toks.slice(i + 2, j).map((x) => x.v);
         const close = matching(toks, j);
         const kind = header.includes('GeneratedMessage')
@@ -295,21 +343,23 @@ export function parseGeneratedFile(path: string, text: string): ParsedFile {
           else if (kind === 'client') parseClientClass(file, toks, j, close, lineOf);
           else if (kind === 'service') parseServiceClass(file, toks, j, close, lineOf);
         } catch (e) {
-          file.problems.push(`${path}: couldn't read class ${name} (${(e as Error).message})`);
+          if (e instanceof TooComplex) throw e;
+          file.problems.push(`${label}: couldn't read class ${name} (${(e as Error).message})`);
         }
         i = close;
       }
     } catch (e) {
-      file.problems.push(`${path}: couldn't read the file near line ${lineOf(t.pos)} (${(e as Error).message})`);
+      if (e instanceof TooComplex) throw e;
+      file.problems.push(`${label}: couldn't read the file near line ${lineOf(t.pos)} (${(e as Error).message})`);
     }
   }
-  return file;
 }
 
 function parseMessageClass(file: ParsedFile, toks: Tok[], dartClass: string, open: number, close: number, line: number): void {
   // Oneof names: `static const $core.Map<$core.int, Order_Payment> _Order_PaymentByTag = {10: Order_Payment.cardToken, …}`.
   const oneofByTag = new Map<number, string>();
   for (let j = open; j < close; j++) {
+    budget.tick();
     const t = toks[j];
     if (t.k === 'id' && t.v.startsWith('_') && t.v.endsWith('ByTag') && isP(toks[j + 1], '=') && isP(toks[j + 2], '{')) {
       const enumCls = t.v.slice(1, -'ByTag'.length);
@@ -341,6 +391,7 @@ function parseMessageClass(file: ParsedFile, toks: Tok[], dartClass: string, ope
   const oneofIndex = new Map<number, number>();
   let j = argsClose + 1;
   while (j < close && isP(toks[j], '..')) {
+    budget.tick();
     const nameTok = toks[j + 1];
     if (!isId(nameTok)) break;
     const method = nameTok.v;
@@ -406,7 +457,7 @@ function parseMessageClass(file: ParsedFile, toks: Tok[], dartClass: string, ope
     }
     let code = fieldTypeCode(toks, a.named.get('fieldType'));
     if (!code && POSITIONAL_CODE.has(method)) code = fieldTypeCode(toks, a.positional[2]);
-    code ??= DEFAULT_CODES[method];
+    code ??= Object.hasOwn(DEFAULT_CODES, method) ? DEFAULT_CODES[method] : undefined;
     if (!code) continue;
     let ref: TypeRef | undefined = typeArgs[0];
     if (isCoreRef(ref)) ref = undefined;
@@ -428,6 +479,7 @@ function parseEnumClass(file: ParsedFile, toks: Tok[], dartClass: string, open: 
   const seen = new Set<string>();
   // static const Color RED = Color._(1, _omitEnumNames ? '' : 'RED');
   for (let j = open; j < close; j++) {
+    budget.tick();
     if (
       isId(toks[j], 'static') &&
       isId(toks[j + 1], 'const') &&
@@ -458,6 +510,7 @@ function* classMethods(toks: Tok[], open: number, close: number): Generator<{ re
   let j = open + 1;
   let stmtStart = j;
   while (j < close) {
+    budget.tick();
     const t = toks[j];
     if (t.k === 'punct' && (t.v === ';' || t.v === '}')) {
       j++;
@@ -487,6 +540,7 @@ function* classMethods(toks: Tok[], open: number, close: number): Generator<{ re
 function parseClientClass(file: ParsedFile, toks: Tok[], open: number, close: number, lineOf: (p: number) => number): void {
   const byVar = new Map<string, ParsedClientMethod>();
   for (let j = open; j < close; j++) {
+    budget.tick();
     if (isId(toks[j], 'ClientMethod') && isP(toks[j + 1], '<')) {
       const angle = matchingAngle(toks, j + 1);
       if (angle < 0 || !isP(toks[angle + 1], '(')) continue;
@@ -496,10 +550,14 @@ function parseClientClass(file: ParsedFile, toks: Tok[], open: number, close: nu
       const a = readArgs(toks, angle + 1, c);
       const pathTok = a.positional[0] ? toks[a.positional[0][0]] : undefined;
       if (!pathTok || pathTok.k !== 'str') continue;
-      // `static final _$getOrder = $grpc.ClientMethod<…>(`
-      let k = j - 1;
-      while (k > open && !isP(toks[k], '=')) k--;
-      const varName = isId(toks[k - 1]) ? toks[k - 1].v : '';
+      // `static final _$getOrder = $grpc.ClientMethod<…>(`: the `=` is 3 tokens back (bounded, never a scan)
+      let varName = '';
+      for (let k = j - 1; k > open && k >= j - 4; k--) {
+        if (isP(toks[k], '=')) {
+          if (isId(toks[k - 1])) varName = toks[k - 1].v;
+          break;
+        }
+      }
       const m: ParsedClientMethod = { path: pathTok.v, req: req?.ref, res: res?.ref, line: lineOf(pathTok.pos) };
       file.clientMethods.push(m);
       if (varName) byVar.set(varName, m);
@@ -509,6 +567,7 @@ function parseClientClass(file: ParsedFile, toks: Tok[], open: number, close: nu
   for (const meth of classMethods(toks, open, close)) {
     let callVar: string | undefined;
     for (let k = meth.body[0]; k < meth.body[1]; k++) {
+      budget.tick();
       const t = toks[k];
       if ((isId(t, '$createUnaryCall') || isId(t, '$createStreamingCall')) && isP(toks[k + 1], '(') && isId(toks[k + 2])) {
         callVar = toks[k + 2].v;
@@ -533,6 +592,7 @@ function parseClientClass(file: ParsedFile, toks: Tok[], open: number, close: nu
 function parseServiceClass(file: ParsedFile, toks: Tok[], open: number, close: number, lineOf: (p: number) => number): void {
   let service: string | undefined;
   for (let j = open; j < close; j++) {
+    budget.tick();
     if (isId(toks[j], 'get') && isId(toks[j + 1], '$name') && isP(toks[j + 2], '=>') && toks[j + 3]?.k === 'str') {
       service = toks[j + 3].v;
       break;
@@ -540,6 +600,7 @@ function parseServiceClass(file: ParsedFile, toks: Tok[], open: number, close: n
   }
   if (!service) return;
   for (let j = open; j < close; j++) {
+    budget.tick();
     if (isId(toks[j], 'ServiceMethod') && isP(toks[j + 1], '<')) {
       const angle = matchingAngle(toks, j + 1);
       if (angle < 0 || !isP(toks[angle + 1], '(')) continue;

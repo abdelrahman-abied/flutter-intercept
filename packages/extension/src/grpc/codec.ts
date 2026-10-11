@@ -39,6 +39,11 @@ type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
 type JsonObject = { [k: string]: Json };
 
 const ANY = 'google.protobuf.Any';
+
+/** Own data property, also for `__proto__` (a plain assignment would set the prototype and drop the entry). */
+function setOwn(o: JsonObject, k: string, v: Json): void {
+  Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
+}
 const VALUE = 'google.protobuf.Value';
 
 // ---------------------------------------------------------------------------------------------
@@ -311,7 +316,7 @@ function decodeMsg(ctx: DecodeCtx, msg: ProtoMessage, buf: Uint8Array, start: nu
     const t = f.type;
     if (chunks.has(f) && t.kind === 'message') {
       const parts = chunks.get(f)!;
-      if (parts.length === 1) out[f.name] = decodeMessageValue(ctx, t.type, buf, parts[0][0], parts[0][1], depth);
+      if (parts.length === 1) setOwn(out, f.name, decodeMessageValue(ctx, t.type, buf, parts[0][0], parts[0][1], depth));
       else {
         // A singular message sent in pieces is merged: decode the concatenation.
         const total = parts.reduce((n, [s, e]) => n + (e - s), 0);
@@ -321,7 +326,7 @@ function decodeMsg(ctx: DecodeCtx, msg: ProtoMessage, buf: Uint8Array, start: nu
           joined.set(buf.subarray(s, e), o);
           o += e - s;
         }
-        out[f.name] = decodeMessageValue(ctx, t.type, joined, 0, joined.length, depth);
+        setOwn(out, f.name, decodeMessageValue(ctx, t.type, joined, 0, joined.length, depth));
       }
       continue;
     }
@@ -329,11 +334,11 @@ function decodeMsg(ctx: DecodeCtx, msg: ProtoMessage, buf: Uint8Array, start: nu
     const v = values.get(f)!;
     if (v instanceof Map) {
       const obj: JsonObject = {};
-      for (const [k, x] of v) obj[k] = x;
-      out[f.name] = obj;
+      for (const [k, x] of v) setOwn(obj, k, x);
+      setOwn(out, f.name, obj);
     } else if (t.kind === 'enum') {
-      out[f.name] = Array.isArray(v) ? v.map((x) => enumJson(ctx.schema, t.type, x)) : enumJson(ctx.schema, t.type, v);
-    } else out[f.name] = v as Json;
+      setOwn(out, f.name, Array.isArray(v) ? v.map((x) => enumJson(ctx.schema, t.type, x)) : enumJson(ctx.schema, t.type, v));
+    } else setOwn(out, f.name, v as Json);
   }
   for (const n of [...unknown.keys()].sort((a, b) => a - b)) {
     const list = unknown.get(n)!;
@@ -914,8 +919,8 @@ function skeletonOf(schema: GrpcSchema, m: ProtoMessage, level: number, path: Se
       oneofs.add(f.oneof);
     }
     const one = valueSkeleton(schema, f.type, level, path);
-    if (f.type.kind === 'map') out[f.name] = { [mapKeySkeleton(f.type.key)]: valueSkeleton(schema, f.type.value, level, path) };
-    else out[f.name] = f.repeated ? [one] : one;
+    if (f.type.kind === 'map') setOwn(out, f.name, { [mapKeySkeleton(f.type.key)]: valueSkeleton(schema, f.type.value, level, path) });
+    else setOwn(out, f.name, f.repeated ? [one] : one);
   }
   path.delete(m.name);
   return out;

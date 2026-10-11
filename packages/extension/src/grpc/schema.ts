@@ -56,7 +56,7 @@ function readCode(code: string): Code | undefined {
   const s = m[2];
   if (s === 'E') return { label, kind: 'enum' };
   if (s === 'M' || s === 'G') return { label, kind: 'message' };
-  const scalar = SCALAR_BY_SUFFIX[s];
+  const scalar = Object.hasOwn(SCALAR_BY_SUFFIX, s) ? SCALAR_BY_SUFFIX[s] : undefined;
   return scalar ? { label, kind: 'scalar', scalar } : undefined;
 }
 
@@ -77,6 +77,14 @@ function joinPath(dir: string, rel: string): string {
   }
   return out.join('/');
 }
+
+const basename = (p: string) => p.slice(p.lastIndexOf('/') + 1);
+
+/** The host's display label, else the file name: problem texts never carry an absolute path (REVIEW-10 #4). */
+const labelOf = (f: GrpcSourceFile, path: string) => (typeof f.label === 'string' && f.label ? f.label : basename(path));
+
+/** An import URI as shown in a problem: relative / package: URIs as written, anything absolute by its file name. */
+const showUri = (uri: string) => (/^(file:|\/|[A-Za-z]:[\\/])/.test(uri) ? basename(uri.replace(/\\/g, '/')) : uri);
 
 const baseOf = (p: string) => p.replace(/\.(pb|pbenum|pbgrpc|pbjson|pbserver)\.dart$/i, '');
 
@@ -175,7 +183,7 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
       break;
     }
     if (f.text.length > MAX_FILE_BYTES) {
-      schema.addProblem(`${f.path}: larger than 2 MB, skipped`);
+      schema.addProblem(`${labelOf(f, norm(f.path))}: larger than 2 MB, skipped`);
       continue;
     }
     total += f.text.length;
@@ -183,7 +191,8 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
       schema.addProblem('more than 50 MB of generated code; the rest was skipped');
       break;
     }
-    const p = parseGeneratedFile(norm(f.path), f.text);
+    const path = norm(f.path);
+    const p = parseGeneratedFile(path, f.text, labelOf(f, path));
     p.problems.forEach((x) => schema.addProblem(x));
     parsed.push(p);
   }
@@ -209,7 +218,9 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
       const fq = m.pkg ? `${m.pkg}.${m.relName}` : m.relName;
       addDecl({ file: f, kind: 'message', msg: m, fq });
       const b = baseOf(f.path);
-      messagesByBase.set(b, [...(messagesByBase.get(b) ?? []), m]);
+      const list = messagesByBase.get(b);
+      if (list) list.push(m);
+      else messagesByBase.set(b, [m]);
     }
   }
   const packageByBase = (b: string): string | undefined => {
@@ -224,13 +235,21 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
     }
     return undefined;
   };
+  // Sibling messages by Dart class, per base name (enum parents are found by prefix lookups, not a scan).
+  const siblingClasses = new Map<string, Map<string, ParsedMessage>>();
+  for (const [b, ms] of messagesByBase) {
+    const m = new Map<string, ParsedMessage>();
+    for (const x of ms) if (!m.has(x.dartClass)) m.set(x.dartClass, x);
+    siblingClasses.set(b, m);
+  }
   for (const f of parsed) {
     for (const en of f.enums) {
       const b = baseOf(f.path);
-      const siblings = messagesByBase.get(b) ?? [];
+      const siblings = siblingClasses.get(b);
       let parent: ParsedMessage | undefined;
-      for (const m of siblings) {
-        if (en.dartClass.startsWith(`${m.dartClass}_`) && (!parent || m.dartClass.length > parent.dartClass.length)) parent = m;
+      // longest `Parent_` prefix of the enum's class that is a message of the same .proto
+      for (let cut = en.dartClass.lastIndexOf('_'); siblings && cut > 0 && !parent; cut = en.dartClass.lastIndexOf('_', cut - 1)) {
+        parent = siblings.get(en.dartClass.slice(0, cut));
       }
       let fq: string;
       if (parent) {
@@ -306,7 +325,7 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
     // A well-known type whose generated file wasn't passed in: the built-in definition.
     for (const uri of uris) {
       const file = wktFileOf(uri) ?? '';
-      if (WKT_FILES[file]?.includes(ref.cls)) {
+      if (Object.hasOwn(WKT_FILES, file) && WKT_FILES[file].includes(ref.cls)) {
         usedWkt.add(file);
         return { fq: `google.protobuf.${ref.cls}` };
       }
@@ -320,8 +339,8 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
     const key = `${from.path}|${ref.prefix ?? ''}.${ref.cls}`;
     if (!unresolved.has(key)) {
       unresolved.add(key);
-      const via = uris.length ? ` (from '${uris[0]}')` : '';
-      schema.addProblem(`${from.path}: ${where} uses ${ref.cls}${via}, which isn't among the loaded generated files; its contents are shown raw`);
+      const via = uris.length ? ` (from '${showUri(uris[0])}')` : '';
+      schema.addProblem(`${from.label}: ${where} uses ${ref.cls}${via}, which isn't among the loaded generated files; its contents are shown raw`);
     }
     return { fq: ref.cls.replace(/_/g, '.') };
   };
@@ -330,7 +349,7 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
     if (!code) return undefined;
     if (code.kind === 'scalar') return { kind: 'scalar', scalar: code.scalar! };
     if (!ref) {
-      schema.addProblem(`${from.path}: ${where} has no ${code.kind} type`);
+      schema.addProblem(`${from.label}: ${where} has no ${code.kind} type`);
       return undefined;
     }
     const r = resolve(from, ref, where);
@@ -353,7 +372,7 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
       for (const pf of m.fields) {
         const field = toField(f, m, pf, typeOf);
         if (field) fields.push(field);
-        else schema.addProblem(`${f.path}: ${m.dartClass} field ${pf.number} (${pf.name}) has a type this version can't read`);
+        else schema.addProblem(`${f.label}: ${m.dartClass} field ${pf.number} (${pf.name}) has a type this version can't read`);
       }
       schema.addMessage({ name: d.fq, dartClass: m.dartClass, fields, file: f.path, line: m.line });
     }
@@ -362,7 +381,7 @@ function link(schema: Schema, input: GrpcSourceFile[]): void {
   // 5. methods: the server base class knows streaming for sure; the client class fills in the rest.
   const methodFrom = (f: ParsedFile, m: { path: string; req?: TypeRef; res?: TypeRef; line: number }, cs: boolean, ss: boolean): GrpcMethod | undefined => {
     if (!m.req || !m.res) {
-      schema.addProblem(`${f.path}: method ${m.path} has no request / response type`);
+      schema.addProblem(`${f.label}: method ${m.path} has no request / response type`);
       return undefined;
     }
     const req = typeOf(f, { label: 'O', kind: 'message' }, m.req, `method ${m.path}`);
