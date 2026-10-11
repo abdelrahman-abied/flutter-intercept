@@ -187,3 +187,13 @@ Contract: CONTRACTS §15. Same rules as before.
 | R run integration | `packages/intellij/src/main/kotlin/dev/flutterintercept/run/**`, docs/spikes/intellij-run.md |
 | W webview | `packages/webview/**` except `protocol.ts` (standalone WebSocket host, IDE theme) |
 | lead | contract, types, `api/SidecarApi.kt`, docs, integration, review |
+
+### v0.9.0 status (2026-10-11)
+Both editors from one code base: VS Code extension 0.9.0 and the Android Studio / IntelliJ plugin 0.9.0 (sidecar +
+Kotlin plugin). Verified: unit tests (proxy 425, webview 442, extension 1723, cli 113, sidecar 38, plugin 95), VS Code
+integration suites on the packaged VSIX (default 42/42, agent 19/19, devices 24/24, web 8/8), the plugin in a real
+Android Studio 2026.2 sandbox installed from the built zip (launch prepared and intercepted on macOS, traffic shown
+inside the IDE through the Flutter plugin's embedded browser), `verifyPlugin` Compatible. Independent review:
+docs/REVIEW-9.md, all findings fixed. Not verified on hardware: the plugin on the Android emulator inside the IDE,
+JCEF in IntelliJ IDEA, physical iPhones.
+
