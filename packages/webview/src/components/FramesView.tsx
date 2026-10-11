@@ -9,9 +9,12 @@ import {
   hexDump, MAX_EVENT_CHARS, MAX_ID_CHARS, type DirFilter, type Frame,
 } from '../frames';
 import { formatBytes, formatTime } from '../util';
+import { useApp } from '../context';
+import { decodedMessages, decodeNote, grpcCodeLabel, grpcPreview, isGrpc, methodTypesText } from '../grpc';
 import { Button } from './bits';
 import { Icon } from './Icon';
 import { copyText } from './Viewers';
+import { GrpcMessageDetail, useDecodeDeadline } from './GrpcViews';
 
 export const FRAME_ROW_HEIGHT = 20;
 const OVERSCAN = 10;
@@ -19,9 +22,16 @@ const OVERSCAN = 10;
 const FALLBACK_VIEWPORT = 300;
 
 export function FramesView({ ex }: { ex: Exchange }) {
+  const { state } = useApp();
   const frames = ex.frames ?? [];
   const dropped = ex.framesDropped ?? 0;
   const sse = ex.kind === 'sse';
+  // CONTRACTS §16.5: a gRPC call's messages, decoded by the host (`grpcDecoded`) when it answers.
+  const grpc = isGrpc(ex);
+  const entry = grpc ? state.grpcDecoded[ex.id] : undefined;
+  const decoded = useMemo(() => (grpc ? decodedMessages(entry, frames, dropped) : []), [grpc, entry, frames, dropped]);
+  const now = useDecodeDeadline(entry?.requestedAt, !!entry?.decoded);
+  const note = grpc ? decodeNote(entry, now) : undefined;
   const unit = sse ? 'event' : 'message';
   const [text, setText] = useState('');
   const [dir, setDir] = useState<DirFilter>('all');
@@ -31,8 +41,10 @@ export function FramesView({ ex }: { ex: Exchange }) {
   const cache = useMemo(() => new FrameCache(), [ex.id]);
   const visible = useMemo(() => {
     cache.prune(frames, dropped);
-    return filterFrames(frames, text, dir, cache, dropped);
-  }, [frames, dropped, text, dir, cache]);
+    // gRPC payloads are protobuf: the filter searches the decoded JSON instead.
+    const hay = grpc ? (_n: number, _f: Frame, i: number) => lowerJson(decoded[i]) : undefined;
+    return filterFrames(frames, text, dir, cache, dropped, hay);
+  }, [frames, dropped, text, dir, cache, grpc, decoded]);
   const counts = useMemo(() => frameCounts(frames), [frames]);
 
   const ref = useRef<HTMLDivElement>(null);
@@ -103,7 +115,7 @@ export function FramesView({ ex }: { ex: Exchange }) {
     const f = frames[i];
     const n = dropped + i;
     rows.push(
-      <FrameRow key={n} id={`fr-${ex.id}-${n}`} f={f} n={n} preview={cache.preview(n, f)} start={ex.startedAt}
+      <FrameRow key={n} id={`fr-${ex.id}-${n}`} f={f} n={n} preview={grpc ? grpcPreview(f, decoded[i]) : cache.preview(n, f)} start={ex.startedAt}
         selected={n === selected} onSelect={() => select(n)} />,
     );
   }
@@ -126,7 +138,16 @@ export function FramesView({ ex }: { ex: Exchange }) {
           </span>
         )}
         {!close && !live && ex.state === 'error' && <span class="warn-text">Ended abnormally{ex.error ? `: ${ex.error}` : ''}</span>}
+        {grpc && ex.grpc?.statusCode !== undefined && (
+          <span class={ex.grpc.statusCode === 0 ? 'grpc-ok-text' : 'warn-text'}>Status {grpcCodeLabel(ex.grpc.statusCode)}</span>
+        )}
+        {grpc && entry?.decoded?.method && <span class="muted grpc-types mono">{methodTypesText(entry.decoded.method)}</span>}
       </div>
+      {note && (
+        <div class={`msg ${note.kind === 'problem' ? 'warn' : 'info'} grpc-decode-note`} role="note" aria-busy={note.kind === 'loading'}>
+          {note.text}
+        </div>
+      )}
       {dropped > 0 && (
         <div class="msg info frames-dropped" role="note">
           {dropped} earlier {unit}{dropped === 1 ? ' was' : 's were'} dropped — the proxy keeps the newest {frames.length}.
@@ -166,11 +187,22 @@ export function FramesView({ ex }: { ex: Exchange }) {
       )}
       {frames.length > 0 && visible.length === 0 && <div class="muted pad">No {unit}s match the filter.</div>}
       {selected !== undefined && (
-        sel ? <FrameDetail key={selected} f={sel} n={selected} start={ex.startedAt} />
+        sel ? (grpc
+          ? <GrpcMessageDetail key={selected} f={sel} n={selected} start={ex.startedAt} m={decoded[selected - dropped]} />
+          : <FrameDetail key={selected} f={sel} n={selected} start={ex.startedAt} />)
           : <div class="muted pad">That {unit} was dropped (only the newest {frames.length} are kept).</div>
       )}
     </div>
   );
+}
+
+const lowerCache = new WeakMap<object, string>();
+/** Lowercased decoded JSON of a gRPC message (cached per answer object). */
+function lowerJson(m: { json?: string } | undefined): string {
+  if (!m?.json) return '';
+  let s = lowerCache.get(m);
+  if (s === undefined) { s = m.json.toLowerCase(); lowerCache.set(m, s); }
+  return s;
 }
 
 function lastClose(frames: readonly Frame[]): Frame | undefined {
@@ -188,6 +220,7 @@ function FrameRow({ f, n, preview, start, selected, onSelect, id }: {
       <span class="fr-time" title={formatTime(f.at)}>{formatRelative(f.at, start)}</span>
       <span class="fr-size">{formatBytes(f.size)}{f.truncated ? '+' : ''}</span>
       <span class="fr-preview">
+        {f.compressed && <span class="badge mini gz-badge" title="Sent compressed (grpc-encoding); shown decompressed">gz</span>}
         {f.event && <span class="badge mini ev-badge">{capText(f.event, 64)}</span>}
         {preview}
       </span>

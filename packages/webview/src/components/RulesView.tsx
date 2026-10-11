@@ -9,7 +9,8 @@ import {
   ruleHits, ruleLabel, ruleStats, ruleToForm, toggleRule, upsertRule, validateRuleForm, type RuleForm,
 } from '../state';
 import { formatTime } from '../util';
-import { ActionEditor, SequenceEditor } from './ActionEditor';
+import { ActionEditor, SequenceEditor, type GrpcHooks } from './ActionEditor';
+import { DECODE_TIMEOUT_MS, grpcActionNote, isGrpc, looksLikeGrpcUrl } from '../grpc';
 import { suggestScriptFile } from '../scripts';
 import { AgentBadge, Button, useNow } from './bits';
 import { Icon } from './Icon';
@@ -202,13 +203,13 @@ function ordinal(n: number): string {
 const KIND_RADIOS: readonly [RuleForm['kind'], string][] = [
   ['mock', 'Mock response'], ['block', 'Block'], ['breakpoint', 'Breakpoint'], ['throttle', 'Throttle'], ['fault', 'Fault'],
   ['mutate', 'Mutate JSON'], ['cors', 'CORS (dev only)'], ['sequence', 'Sequence'], ['mapRemote', 'Map remote'], ['rewrite', 'Rewrite'],
-  ['script', 'Script (JS)'],
+  ['script', 'Script (JS)'], ['grpcMock', 'gRPC mock'],
 ];
 
 export function RuleEditor({ rule, sharedFile, onSave, onCancel }: {
   rule?: Rule; sharedFile?: string; onSave: (r: Rule, isNew: boolean) => void; onCancel: () => void;
 }) {
-  const { state, post } = useApp();
+  const { state, dispatch, post } = useApp();
   const [form, setForm] = useState<RuleForm>(() => ruleToForm(rule));
   const [confirmJson, setConfirmJson] = useState(false);
   const readOnly = !!rule && isShared(rule);
@@ -219,12 +220,54 @@ export function RuleEditor({ rule, sharedFile, onSave, onCancel }: {
   const v = validateRuleForm(form);
   const hasErrors = Object.keys(v.errors).length > 0;
   const jsonBad = form.kind === 'mock' && !form.mockUseFile && v.json && !v.json.ok ? v.json : undefined;
+  // CONTRACTS §16.2: rules whose action doesn't apply to gRPC never match a gRPC call.
+  const grpcNote = grpcActionNote(form.kind, form.steps.map((s) => s.kind));
   const preview = useMemo(() => {
     if (v.errors.url) return undefined;
     return countMatches({
       url: form.url.trim(), method: form.method.trim() || undefined, graphqlOperation: form.graphqlOperation.trim() || undefined,
-    }, state.exchanges);
-  }, [form.url, form.method, form.graphqlOperation, state.exchanges, v.errors.url]);
+    }, state.exchanges, !!grpcNote);
+  }, [form.url, form.method, form.graphqlOperation, state.exchanges, v.errors.url, !!grpcNote]);
+  // gRPC calls listed that the matcher matches (newest first): the gRPC note and the mock's "Skeleton" button.
+  const grpcMatches = useMemo(() => {
+    if (v.errors.url || !form.url.trim()) return [];
+    const test = compileExchangeMatcher({ url: form.url.trim(), method: form.method.trim() || undefined });
+    return state.exchanges.filter((e) => isGrpc(e) && test(e)).reverse();
+  }, [form.url, form.method, state.exchanges, v.errors.url]);
+  const showGrpcNote = !!grpcNote && (grpcMatches.length > 0 || looksLikeGrpcUrl(form.url));
+  const usesGrpcMock = form.kind === 'grpcMock' || (form.kind === 'sequence' && form.steps.some((s) => s.kind === 'grpcMock'));
+  const [skeletonFor, setSkeletonFor] = useState<{ id: string; at: number } | undefined>();
+  const grpcHooks = useMemo<GrpcHooks | undefined>(() => {
+    if (!usesGrpcMock) return undefined;
+    let skeleton: string | undefined;
+    for (const e of grpcMatches) {
+      skeleton = state.grpcDecoded[e.id]?.decoded?.skeletons?.response;
+      if (skeleton) break;
+    }
+    // Calls whose decode hasn't been asked for (or answered) yet may bring one.
+    const undecoded = grpcMatches.find((e) => !state.grpcDecoded[e.id]?.decoded);
+    const loading = !!skeletonFor && !state.grpcDecoded[skeletonFor.id]?.decoded && Date.now() - skeletonFor.at < DECODE_TIMEOUT_MS;
+    const g = state.status.grpc;
+    return {
+      skeleton,
+      canLoad: !skeleton && !!undecoded,
+      loading,
+      load: () => {
+        if (!undecoded) return;
+        const at = Date.now();
+        setSkeletonFor({ id: undecoded.id, at });
+        dispatch({ type: 'grpcRequested', id: undecoded.id, key: '', base: undecoded.framesDropped ?? 0, at });
+        post({ type: 'decodeGrpc', id: undecoded.id });
+      },
+      schema: g && g.enabled ? !!g.schema && g.schema.messages > 0 : undefined,
+    };
+  }, [usesGrpcMock, grpcMatches, state.grpcDecoded, state.status.grpc, skeletonFor]);
+  // Stop showing "Loading…" when the host never answers.
+  useEffect(() => {
+    if (!skeletonFor) return;
+    const t = setTimeout(() => setSkeletonFor(undefined), DECODE_TIMEOUT_MS + 50);
+    return () => clearTimeout(t);
+  }, [skeletonFor]);
   // GraphQL operations seen on the matched route: offered as suggestions, and the reason the field is shown.
   const knownOps = useMemo(() => {
     if (v.errors.url || !form.url.trim()) return [];
@@ -339,10 +382,11 @@ export function RuleEditor({ rule, sharedFile, onSave, onCancel }: {
               </label>
             ))}
           </div>
+          {showGrpcNote && <div class="msg info grpc-rule-note" role="note">{grpcNote}</div>}
           {form.kind === 'sequence' ? (
             <div class="hint">Different answers for successive requests — set the steps below.</div>
           ) : (
-            <ActionEditor kind={form.kind} f={form} v={v} uid="rule" set={set}
+            <ActionEditor kind={form.kind} f={form} v={v} uid="rule" set={set} grpc={grpcHooks}
               bodyFile={{ suggest: () => suggestBodyFile(form.name, form.url), knownContent: !!savedFile && savedFile === form.mockBodyFile.trim(),
                 open: openBodyFile, error: fileError?.message,
               }}
@@ -353,7 +397,7 @@ export function RuleEditor({ rule, sharedFile, onSave, onCancel }: {
         </fieldset>
 
         {form.kind === 'sequence' && (
-          <SequenceEditor steps={form.steps} then={form.seqThen} checks={v.stepChecks} error={v.errors.sequence} onChange={set} />
+          <SequenceEditor steps={form.steps} then={form.seqThen} checks={v.stepChecks} error={v.errors.sequence} onChange={set} grpc={grpcHooks} />
         )}
 
         <fieldset>

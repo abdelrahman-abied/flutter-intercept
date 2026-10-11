@@ -5,6 +5,7 @@
 import type { AuthFlowSummary, Exchange, RecordingSummary, Rule, RuleAction, Status } from './protocol';
 import type { RewriteSpec, SequenceStep } from '@flutter-intercept/proxy/types';
 import { splitUrl } from './util';
+import { grpcCodeName } from './grpc';
 
 const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -16,10 +17,10 @@ export type StepKind = StepAction['kind'];
 export type SequenceThen = 'last' | 'passthrough' | 'loop';
 
 /** Step kinds offered in the editor, in menu order (no breakpoint / nested sequence: the proxy rejects them). */
-export const STEP_KINDS: readonly StepKind[] = ['mock', 'passthrough', 'block', 'fault', 'throttle', 'mutate', 'rewrite', 'mapRemote', 'cors'];
+export const STEP_KINDS: readonly StepKind[] = ['mock', 'passthrough', 'block', 'fault', 'throttle', 'mutate', 'rewrite', 'mapRemote', 'cors', 'grpcMock'];
 export const STEP_KIND_LABEL: Record<StepKind, string> = {
   mock: 'Mock response', passthrough: 'Real server', block: 'Block', fault: 'Fault', throttle: 'Throttle',
-  mutate: 'Mutate JSON', rewrite: 'Rewrite', mapRemote: 'Map remote', cors: 'CORS (dev only)',
+  mutate: 'Mutate JSON', rewrite: 'Rewrite', mapRemote: 'Map remote', cors: 'CORS (dev only)', grpcMock: 'gRPC mock',
 };
 export const THEN_LABEL: Record<SequenceThen, string> = {
   last: 'Keep answering with the last step',
@@ -41,6 +42,7 @@ export function stepLabel(a: StepAction): string {
     case 'rewrite': return a.response?.status !== undefined ? `rewritten ${a.response.status}` : 'rewritten';
     case 'mapRemote': return `→ ${hostOf(a.to)}`;
     case 'cors': return 'CORS';
+    case 'grpcMock': return `gRPC ${grpcCodeName(a.code ?? 0)}`;
   }
 }
 
@@ -290,10 +292,12 @@ export function pendingApprovalText(sr: NonNullable<Status['sharedRules']>): str
 
 /**
  * What a recording keeps: finished HTTP exchanges and (CONTRACTS §14.5) finished WebSocket / SSE streams with their
- * frames — no TLS passthrough tunnels, no native captures, nothing in flight (an open stream is not saved).
+ * frames — no TLS passthrough tunnels, no gRPC calls (§16.4), no native captures, nothing in flight (an open stream
+ * is not saved).
  */
 export function isRecordable(ex: Pick<Exchange, 'state' | 'kind' | 'captured'>): boolean {
-  if (ex.kind === 'tunnel' || ex.captured === 'vm-profile') return false;
+  // CONTRACTS §16.4: recordings skip gRPC calls (for now).
+  if (ex.kind === 'tunnel' || ex.kind === 'grpc' || ex.captured === 'vm-profile') return false;
   return ex.state !== 'pending' && ex.state !== 'paused-request' && ex.state !== 'paused-response';
 }
 

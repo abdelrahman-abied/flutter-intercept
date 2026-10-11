@@ -53,6 +53,12 @@
  * with one load problem, a `bypass` session warning, a recording with WebSocket / SSE streams (`streams` / `frames`,
  * also counted on save), and `uploadKbps` in custom profiles. ?upstream=…&upstreamSource=vscode shows "via VS Code
  * proxy"; ?v8=0 turns the v0.8.0 data off; the dev bar's "+tunnel" opens another tunnel.
+ *
+ * v0.10.0 (CONTRACTS §16): gRPC calls (`kind: 'grpc'`: a unary OK, a trailers-only UNAVAILABLE, a gzip-compressed one
+ * and a live server stream that keeps adding messages), an undecrypted gRPC tunnel (`grpcTunnel`), `Status.grpc`
+ * (schema counts, one decrypt host), `decodeGrpc` answered with fake schema JSON (raw fields for an unknown method,
+ * plus skeletons), and `createRuleFromExchange` with `grpcMock`. ?grpc=0 turns it off; ?grpcProblem=1 adds the
+ * proxy's self-check problem (banner).
  */
 import type {
   AuthFlowSummary, Body, ContractSummary, CorsInfo, Frame, GraphqlInfo, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit,
@@ -308,9 +314,24 @@ function onViewMsg(msg: ViewMsg) {
       status = { ...status, interceptEnabled: msg.enabled };
       send({ type: 'status', status });
       break;
+    case 'decodeGrpc': {
+      const ex = find(msg.id);
+      if (ex?.kind === 'grpc') setTimeout(() => send({ type: 'grpcDecoded', id: ex.id, decoded: fakeDecode(ex) }), 120);
+      break;
+    }
     case 'createRuleFromExchange': {
       const ex = find(msg.id);
       if (!ex) break;
+      if (msg.action === 'grpcMock') {
+        const d = fakeDecode(ex);
+        const json = d.messages.filter((m) => m.dir === 'receive' && m.via === 'schema').map((m) => JSON.parse(m.json!) as unknown);
+        rules = [{
+          id: `rule_${Date.now().toString(36)}`, enabled: true, match: { method: 'POST', url: ex.url },
+          action: { kind: 'grpcMock', code: ex.grpc?.statusCode ?? 0, ...(json.length ? { messagesJson: json } : {}) },
+        }, ...rules];
+        send({ type: 'rules', rules });
+        break;
+      }
       rules = [ruleFromExchange(ex, msg.action, `rule_${Date.now().toString(36)}`), ...rules]; // first, so it wins
       send({ type: 'rules', rules });
       break;
@@ -1435,3 +1456,104 @@ function startV8() {
 }
 setTimeout(startV8, 0);
 document.getElementById('dev-tunnel')?.addEventListener('click', () => openTunnel(pick(['pay.bank.example', 'cards.bank.example', 'pinned.example.com']), { live: true }));
+
+// ---------------------------------------------------------------- v0.10.0 (CONTRACTS §16)
+
+/** A protobuf message of string fields 1, 2, … (enough for fake payloads), as base64. */
+function pbStrings(...values: string[]): string {
+  let bin = '';
+  values.forEach((v, i) => {
+    const bytes = unescape(encodeURIComponent(v));
+    bin += String.fromCharCode(((i + 1) << 3) | 2) + String.fromCharCode(bytes.length) + bytes;
+  });
+  return btoa(bin);
+}
+
+const GRPC_SCHEMA: Record<string, { req: string; res: string; server?: boolean; fields: [string[], string[]] }> = {
+  '/shop.v1.Catalog/GetProduct': { req: 'shop.v1.GetProductRequest', res: 'shop.v1.Product', fields: [['id'], ['id', 'name', 'price']] },
+  '/shop.v1.Catalog/ListProducts': { req: 'shop.v1.ListProductsRequest', res: 'shop.v1.Product', server: true, fields: [['query'], ['id', 'name', 'price']] },
+  '/shop.v1.Orders/Track': { req: 'shop.v1.TrackRequest', res: 'shop.v1.OrderEvent', server: true, fields: [['order_id'], ['order_id', 'status']] },
+};
+
+function fakeDecode(ex: Exchange): import('../src/protocol').GrpcDecoded {
+  const path = `/${ex.grpc?.service}/${ex.grpc?.method}`;
+  const m = GRPC_SCHEMA[path];
+  const messages = (ex.frames ?? []).filter((f) => f.kind === 'message').map((f) => {
+    const bin = atob(f.base64 ?? '');
+    const values: string[] = [];
+    for (let i = 0; i < bin.length;) { const len = bin.charCodeAt(i + 1); values.push(decodeURIComponent(escape(bin.slice(i + 2, i + 2 + len)))); i += 2 + len; }
+    const hex = Array.from(bin.slice(0, 4096), (c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join(' ');
+    const names = m ? m.fields[f.dir === 'send' ? 0 : 1] : [];
+    const obj: Record<string, string> = {};
+    values.forEach((v, i) => { obj[m ? names[i] ?? `#${i + 1}` : String(i + 1)] = v; });
+    return { dir: f.dir, via: m ? 'schema' as const : 'raw' as const, json: JSON.stringify(obj, null, 2), hex, size: f.size };
+  });
+  if (!m) return { framesDropped: ex.framesDropped ?? 0, messages, problem: `The app's schema has no method ${path} — showing raw fields.` };
+  const skel = (fields: string[]) => JSON.stringify(Object.fromEntries(fields.map((n) => [n, ''])), null, 2);
+  return {
+    framesDropped: ex.framesDropped ?? 0,
+    method: { requestType: m.req, responseType: m.res, clientStreaming: false, serverStreaming: !!m.server, file: 'lib/gen/shop.pbgrpc.dart' },
+    messages, skeletons: { request: skel(m.fields[0]), response: skel(m.fields[1]) },
+  };
+}
+
+function grpcCall(path: string, sentMsgs: string[][], received: string[][], opts: { code?: number; message?: string; live?: boolean; gzip?: boolean } = {}): string {
+  const id = `ex_${++seq}`;
+  const started = Date.now() - (opts.live ? 6000 : rnd(9000, 30_000));
+  const [, service, method] = path.split('/');
+  const frame = (dir: Frame['dir'], values: string[], at: number): Frame => {
+    const b64 = pbStrings(...values);
+    return { dir, at, kind: 'message', base64: b64, size: atob(b64).length, ...(opts.gzip && dir === 'receive' ? { compressed: true as const } : {}) };
+  };
+  const frames = [...sentMsgs.map((v, i) => frame('send', v, started + 3 + i)), ...received.map((v, i) => frame('receive', v, started + 40 + i * 300))];
+  const done = !opts.live;
+  const ex: Exchange = {
+    id, startedAt: started, method: 'POST', url: `http://10.0.2.2:50051${path}`, kind: 'grpc',
+    requestHeaders: { 'content-type': 'application/grpc', te: 'trailers', 'grpc-timeout': '5S', 'user-agent': 'grpc-dart/4.0.1' },
+    responseHeaders: { 'content-type': 'application/grpc', ...(opts.gzip ? { 'grpc-encoding': 'gzip' } : {}) },
+    ...(done ? { responseTrailers: { 'grpc-status': String(opts.code ?? 0), ...(opts.message ? { 'grpc-message': opts.message } : {}) } } : {}),
+    state: done ? 'completed' : 'pending', status: 200, ...(done ? { durationMs: 40 + received.length * 300 } : {}),
+    grpc: {
+      service, method, messagesSent: sentMsgs.length, messagesReceived: received.length, deadlineMs: 5000,
+      ...(done ? { statusCode: opts.code ?? 0 } : {}), ...(opts.message ? { statusMessage: opts.message } : {}),
+      ...(done && !received.length && opts.code ? { trailersOnly: true as const } : {}),
+      ...(opts.gzip ? { responseEncoding: 'gzip' } : {}),
+    },
+    frames,
+    timings: { requestMs: 3, connectMs: 4, sendMs: 0, waitMs: 30, receiveMs: received.length * 300 },
+  };
+  record(ex, true);
+  send({ type: 'exchange', exchange: ex });
+  if (opts.live) {
+    let n = received.length;
+    const timer = setInterval(() => {
+      const cur = find(id);
+      if (!cur || cur.state !== 'pending') { clearInterval(timer); return; }
+      if (!streaming) return;
+      n++;
+      const f = frame('receive', [`ORD-${n}`, pick(['packed', 'shipped', 'in transit', 'out for delivery'])], Date.now());
+      update(cur, { frames: [...(cur.frames ?? []), f], grpc: { ...cur.grpc!, messagesReceived: n } });
+    }, 2500);
+  }
+  return id;
+}
+
+function startV10() {
+  if (params.get('grpc') === '0') return;
+  status = {
+    ...status,
+    grpc: {
+      enabled: true, decryptHosts: ['grpc.internal.example'],
+      schema: { methods: Object.keys(GRPC_SCHEMA).length, messages: 6, problems: [] },
+      ...(params.get('grpcProblem') === '1' ? { problem: 'The proxy\'s HTTP/2 self-check failed (mockttp internals changed).' } : {}),
+    },
+  };
+  grpcCall('/shop.v1.Catalog/GetProduct', [['42']], [['42', 'Coffee beans', '12.90']]);
+  grpcCall('/shop.v1.Catalog/ListProducts', [['coffee']], [['1', 'Espresso', '2.10'], ['2', 'Latte', '3.40'], ['3', 'Mocha', '3.80']], { gzip: true });
+  grpcCall('/shop.v1.Payments/Charge', [['ORD-7', '12.90']], [], { code: 14, message: 'Flutter Intercept: connect ECONNREFUSED 10.0.2.2:50052' });
+  grpcCall('/shop.v1.Orders/Track', [['ORD-1']], [['ORD-1', 'packed']], { live: true });
+  const tun = openTunnel('grpc.payments.example');
+  update(find(tun)!, { grpcTunnel: true });
+  send({ type: 'status', status });
+}
+setTimeout(startV10, 0);

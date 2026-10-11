@@ -9,7 +9,9 @@ import { useExchangeActions, type ExchangeActions } from './actions';
 import { ContractSection } from './ContractSection';
 import { AgentBadge, Button, CoverageBadges, MenuButton, PauseTimer, StateBadge, StatusText } from './bits';
 import { CORS_DEV_NOTE, isNative, NATIVE_READ_ONLY, requestOrigin, routeGlob, sentCookies } from '../coverage';
-import { frameTotal, hasFrames } from '../frames';
+import { frameTotal, hasMessagesTab } from '../frames';
+import { GRPC_TUNNEL_HINT, isGrpc, isGrpcTunnel } from '../grpc';
+import { GrpcStatusSection, GrpcTunnelExplanation, TrailersSection, useGrpcDecode } from './GrpcViews';
 import { FramesView } from './FramesView';
 import { expireTokenError, expireTokenLabel } from '../scenarios';
 import { PauseEditor } from './Editors';
@@ -28,8 +30,10 @@ const PAUSE_TEXT = {
 
 export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLElement> }) {
   const { state, dispatch } = useApp();
-  const framed = hasFrames(ex);
+  const framed = hasMessagesTab(ex);
   const tunnel = isTunnel(ex);
+  const grpc = isGrpc(ex);
+  useGrpcDecode(ex);
   // CONTRACTS §14.2: a tunnel has no request / response to show — one "Tunnel" tab (on the `request` slot) + Timing.
   const tab = tunnel ? (state.detailTab === 'timing' ? 'timing' : 'request')
     : state.detailTab === 'messages' && !framed ? 'response' : state.detailTab;
@@ -68,7 +72,9 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
         </div>
         <div class="detail-actions">
           <Button onClick={() => create('mock')} disabled={!!actions.off.mock}
-            title={actions.off.mock ?? 'Create a mock rule from this exchange (the response becomes the mock)'}>Mock this</Button>
+            title={actions.off.mock ?? (grpc
+              ? 'Create a gRPC mock from this call (its response messages and status become the mock)'
+              : 'Create a mock rule from this exchange (the response becomes the mock)')}>Mock this</Button>
           <Button onClick={() => create('block')} disabled={!!actions.off.block}
             title={actions.off.block ?? 'Create a rule that blocks requests like this one'}>Block this</Button>
           <Button onClick={() => create('breakpoint')} disabled={!!actions.off.breakpoint}
@@ -90,8 +96,8 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             title={actions.off.edit ?? 'Edit method, URL, headers or body, then send it through the proxy'}>
             <Icon name="edit" /> Edit and resend
           </Button>
-          <MenuButton label="Generate" title={tunnel ? actions.off.generate : 'Generate a Dart model or a test fixture from this exchange'}
-            items={actions.generateItems} disabled={tunnel}>
+          <MenuButton label="Generate" title={tunnel || grpc ? actions.off.generate : 'Generate a Dart model or a test fixture from this exchange'}
+            items={actions.generateItems} disabled={tunnel || grpc}>
             Generate… <Icon name="chevronDown" />
           </MenuButton>
           <span class="detail-facts">
@@ -132,18 +138,23 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
           <ExpireTokenForm key={ex.id} url={ex.url} onCancel={() => setExpiring(false)}
             onSubmit={(url, count) => { setExpiring(false); actions.expireToken(url, count); }} />
         )}
+        {grpc && <GrpcStatusSection ex={ex} />}
         {ex.source && <SourceSection ex={ex} onOpen={actions.openSource} />}
         {isNative(ex) && (
           <div class="msg info native-note" role="note">
             <span class="badge mini native-badge">native</span> {NATIVE_READ_ONLY}
           </div>
         )}
-        {tunnel && (
+        {tunnel && (ex.grpcTunnel ? (
+          <div class="msg info tunnel-note grpc-tunnel-note" role="note">
+            <Icon name="lock" /> {GRPC_TUNNEL_HINT}.
+          </div>
+        ) : (
           <div class="msg info tunnel-note" role="note">
             <Icon name="lock" /> {TUNNEL_LABEL}: the app's TLS went straight to the server, so there are no headers or bodies
             to show, and no rule applies except Block.
           </div>
-        )}
+        ))}
         {ex.cors && (ex.cors.problem || ex.cors.preflight || ex.cors.patched) && (
           <CorsSection ex={ex} onAddRule={isNative(ex) ? undefined : actions.addCorsRule} />
         )}
@@ -174,7 +185,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
           <button key={t} type="button" role="tab" class="tab" aria-selected={tab === t}
             onClick={() => dispatch({ type: 'setDetailTab', tab: t })}>
             {t === 'request' ? (tunnel ? 'Tunnel' : 'Request') : t === 'response' ? 'Response' : t === 'timing' ? 'Timing'
-              : `${ex.kind === 'sse' ? 'Events' : 'Messages'} (${frameTotal(ex)})`}
+              : `${ex.kind === 'sse' ? 'Events' : 'Messages'} (${grpc && ex.grpc ? ex.grpc.messagesSent + ex.grpc.messagesReceived : frameTotal(ex)})`}
             {t === 'messages' && ex.state === 'pending' && <span class="tab-dot live" title="Open — live" />}
             {((t === 'request' && ex.state === 'paused-request') || (t === 'response' && ex.state === 'paused-response')) && (
               <span class="tab-dot" title="Paused here" />
@@ -268,8 +279,9 @@ export function TunnelTab({ ex }: { ex: Exchange }) {
   const { host, port } = tunnelTarget(ex);
   const pattern = matchingPassthrough(ex, state.status.tlsPassthrough);
   const b = ex.tunnelBytes;
+  const grpcTun = isGrpcTunnel(ex);
   return (
-    <div class="tunnel pad" aria-label="TLS passthrough">
+    <div class="tunnel pad" aria-label={grpcTun ? 'gRPC over TLS' : 'TLS passthrough'}>
       <table class="kv tunnel-facts">
         <tbody>
           <tr><th scope="row">Server</th><td class="mono">{host}:{port}</td></tr>
@@ -279,6 +291,7 @@ export function TunnelTab({ ex }: { ex: Exchange }) {
         </tbody>
       </table>
       <p class="hint">{tunnelBytesText(ex)}.</p>
+      {grpcTun ? <GrpcTunnelExplanation host={host} /> : <>
       <h4 class="section-title">Why it isn't decrypted</h4>
       <p>
         {pattern ? <><code>{host}</code> matches <code>{pattern}</code> in </> : <><code>{host}</code> is listed in </>}
@@ -296,6 +309,7 @@ export function TunnelTab({ ex }: { ex: Exchange }) {
         Flutter Intercept). New connections are then decrypted and listed as normal requests — restart the app if it keeps
         an open connection. The app's own certificate pinning must allow the proxy's CA for that to work.
       </p>
+      </>}
     </div>
   );
 }
@@ -318,6 +332,15 @@ export function ScriptLog({ ex }: { ex: Exchange }) {
 
 function RequestTab({ ex }: { ex: Exchange }) {
   if (ex.state === 'paused-request') return <PauseEditor key={ex.id + ex.state} ex={ex} />;
+  if (isGrpc(ex)) {
+    return (
+      <>
+        <h4 class="section-title">Headers <span class="muted">(metadata)</span></h4>
+        <HeadersTable headers={ex.requestHeaders} />
+        <GrpcMessagesHint ex={ex} dir="send" />
+      </>
+    );
+  }
   return (
     <>
       <h4 class="section-title">Headers</h4>
@@ -343,6 +366,7 @@ function ResponseTab({ ex, actions }: { ex: Exchange; actions: ExchangeActions }
     return { mutate: actions.mutateField, marks, disabled };
   }, [result, ex.id, ex.state, ex.captured]);
   if (ex.state === 'paused-response') return <PauseEditor key={ex.id + ex.state} ex={ex} />;
+  if (isGrpc(ex)) return <GrpcResponseTab ex={ex} />;
   if (ex.status === undefined) {
     const why: Record<string, string> = {
       'pending': 'Waiting for the server…',
@@ -360,6 +384,46 @@ function ResponseTab({ ex, actions }: { ex: Exchange; actions: ExchangeActions }
       <HeadersTable headers={ex.responseHeaders} />
       <h4 class="section-title">Body</h4>
       <BodyView body={ex.responseBody} headers={ex.responseHeaders} fields={fields} />
+      <TrailersSection trailers={ex.responseTrailers} />
+    </>
+  );
+}
+
+/** A gRPC call's response: headers, trailers (grpc-status / grpc-message / metadata); the messages have their own tab. */
+function GrpcResponseTab({ ex }: { ex: Exchange }) {
+  const noHeaders = !ex.responseHeaders || !Object.keys(ex.responseHeaders).length;
+  return (
+    <>
+      <h4 class="section-title">Headers <span class="muted">(metadata)</span></h4>
+      {noHeaders && ex.state === 'pending'
+        ? <div class="muted pad">Waiting for the server…</div>
+        : <HeadersTable headers={ex.responseHeaders} />}
+      {ex.responseTrailers && Object.keys(ex.responseTrailers).length
+        ? <TrailersSection trailers={ex.responseTrailers} />
+        : (
+          <>
+            <h4 class="section-title">Trailers</h4>
+            <div class="muted pad">
+              {ex.grpc?.trailersOnly ? 'Trailers-only response: the status came in the headers above.'
+                : ex.state === 'pending' ? 'Not yet — they end the call.' : 'No trailers.'}
+            </div>
+          </>
+        )}
+      <GrpcMessagesHint ex={ex} dir="receive" />
+    </>
+  );
+}
+
+function GrpcMessagesHint({ ex, dir }: { ex: Exchange; dir: 'send' | 'receive' }) {
+  const { dispatch } = useApp();
+  const n = dir === 'send' ? ex.grpc?.messagesSent ?? 0 : ex.grpc?.messagesReceived ?? 0;
+  return (
+    <>
+      <h4 class="section-title">Messages</h4>
+      <div class="pad">
+        {n} message{n === 1 ? '' : 's'} {dir === 'send' ? 'sent by the app' : 'received from the server'} —{' '}
+        <button type="button" class="link" onClick={() => dispatch({ type: 'setDetailTab', tab: 'messages' })}>see Messages</button>.
+      </div>
     </>
   );
 }

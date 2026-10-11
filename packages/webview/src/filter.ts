@@ -13,8 +13,12 @@
  *   src:api.dart        a source frame's uri contains it
  *   contract:error      model check result (CONTRACTS §10.5): error | warning (worst is a warning) | ok |
  *                       unchecked (no result, or the host could not check it); prefix ok, comma = any of
- *   kind:ws             CONTRACTS §11: ws (websocket) | sse | http (plain) | tunnel (TLS passthrough, §14.2); prefix ok,
- *                       comma = any of
+ *   kind:ws             CONTRACTS §11: ws (websocket) | sse | http (plain) | tunnel (TLS passthrough, §14.2) |
+ *                       grpc (gRPC calls, §16); prefix ok, comma = any of
+ *   t:grpc              gRPC calls and undecrypted gRPC tunnels (CONTRACTS §16.5: `grpc` is a content class)
+ *   grpc:unavailable    gRPC status: a code name (prefix ok, `_` optional) or number 0–16, `error` (any status but OK,
+ *                       or ended without one), `pending` (still open), `stream` (more than one message either way);
+ *                       comma = any of; `-grpc:ok` = everything but successful gRPC calls
  *   op:getUser          GraphQL operation name, case-insensitive prefix; comma = any of
  *   cors:problem        CORS diagnosis: problem | ok | preflight | patched (prefix ok, comma = any of)
  *   captured:native     recorded from the app's HTTP profile (read-only); captured:proxy = the rest
@@ -31,9 +35,10 @@ import type { Body, ContractSummary, Exchange, ExchangeState } from './protocol'
 import { CONTRACT_STATUSES, contractStatus, type ContractStatus } from './contract';
 import { headerValue, isJsonContentType, statusClassOf } from './util';
 import { CORS_STATUSES, corsMatches, type CorsStatus } from './coverage';
+import { grpcCodesMatching, isGrpc, isGrpcStreaming } from './grpc';
 
-export type ContentClass = 'json' | 'html' | 'image' | 'text' | 'xml' | 'binary' | 'other';
-export const CONTENT_CLASSES: readonly ContentClass[] = ['json', 'html', 'image', 'text', 'xml', 'binary', 'other'];
+export type ContentClass = 'json' | 'html' | 'image' | 'text' | 'xml' | 'binary' | 'grpc' | 'other';
+export const CONTENT_CLASSES: readonly ContentClass[] = ['json', 'html', 'image', 'text', 'xml', 'binary', 'grpc', 'other'];
 
 const STATES: readonly ExchangeState[] = [
   'pending', 'paused-request', 'paused-response', 'completed', 'mocked', 'blocked', 'aborted', 'error',
@@ -41,26 +46,27 @@ const STATES: readonly ExchangeState[] = [
 /** Extra `state:` values that are not ExchangeState names. */
 const STATE_EXTRAS = ['simulated', 'resent', 'sent'] as const;
 
-export const FILTER_KEYS = ['m', 's', 't', 'body', 'h', 'state', 'src', 'contract', 'kind', 'op', 'cors', 'captured', 'browser'] as const;
+export const FILTER_KEYS = ['m', 's', 't', 'body', 'h', 'state', 'src', 'contract', 'kind', 'op', 'cors', 'captured', 'browser', 'grpc'] as const;
 type Key = (typeof FILTER_KEYS)[number];
 const ALIASES: Record<string, Key> = {
   m: 'm', method: 'm', s: 's', status: 's', t: 't', type: 't', body: 'body', h: 'h', header: 'h',
   state: 'state', is: 'state', src: 'src', source: 'src', contract: 'contract', model: 'contract',
-  kind: 'kind', op: 'op', operation: 'op', gql: 'op', cors: 'cors', captured: 'captured', browser: 'browser',
+  kind: 'kind', op: 'op', operation: 'op', gql: 'op', cors: 'cors', captured: 'captured', browser: 'browser', grpc: 'grpc',
 };
 
-type KindValue = 'ws' | 'sse' | 'http' | 'tunnel';
+type KindValue = 'ws' | 'sse' | 'http' | 'tunnel' | 'grpc';
 const KIND_VALUES: readonly { name: string; kind: KindValue }[] = [
   { name: 'ws', kind: 'ws' }, { name: 'websocket', kind: 'ws' }, { name: 'sse', kind: 'sse' }, { name: 'http', kind: 'http' },
-  { name: 'tunnel', kind: 'tunnel' }, { name: 'passthrough', kind: 'tunnel' },
+  { name: 'tunnel', kind: 'tunnel' }, { name: 'passthrough', kind: 'tunnel' }, { name: 'grpc', kind: 'grpc' },
 ];
 const kindOf = (e: Exchange): KindValue =>
-  (e.kind === 'websocket' ? 'ws' : e.kind === 'sse' ? 'sse' : e.kind === 'tunnel' ? 'tunnel' : 'http');
+  (e.kind === 'websocket' ? 'ws' : e.kind === 'sse' ? 'sse' : e.kind === 'tunnel' ? 'tunnel' : e.kind === 'grpc' ? 'grpc' : 'http');
 
 export const FILTER_HINT =
   'Filter: words match the URL · m:POST · s:404 s:4xx s:error · t:json|html|image|text|xml|binary|other · ' +
   'body:token body:"a phrase" · h:name h:name=value · state:paused|mocked|blocked|error|simulated|resent · ' +
-  'src:file.dart · contract:error|warning|ok|unchecked · kind:ws|sse|http|tunnel · op:getUser (GraphQL) · ' +
+  'src:file.dart · contract:error|warning|ok|unchecked · kind:ws|sse|http|tunnel|grpc · op:getUser (GraphQL) · ' +
+  't:grpc · grpc:ok|unavailable|14|error|pending|stream · ' +
   'cors:problem|ok|preflight · captured:native · browser:internal|app · -token negates';
 
 /** What a filter can see besides the exchange itself. */
@@ -137,8 +143,8 @@ function urlLower(e: Exchange): string {
 
 const contentClassCache = new WeakMap<Exchange, ContentClass>();
 
-/** Content class of the response (by content-type, else sniffed from the body). */
-export function contentClassOf(e: Pick<Exchange, 'responseHeaders' | 'responseBody'>): ContentClass {
+/** Content class of the response (by content-type, else sniffed from the body); gRPC calls / tunnels are `grpc`. */
+export function contentClassOf(e: Pick<Exchange, 'responseHeaders' | 'responseBody'> & Partial<Pick<Exchange, 'kind' | 'grpcTunnel'>>): ContentClass {
   const cached = contentClassCache.get(e as Exchange);
   if (cached) return cached;
   const c = computeContentClass(e);
@@ -146,11 +152,13 @@ export function contentClassOf(e: Pick<Exchange, 'responseHeaders' | 'responseBo
   return c;
 }
 
-function computeContentClass(e: Pick<Exchange, 'responseHeaders' | 'responseBody'>): ContentClass {
+function computeContentClass(e: Pick<Exchange, 'responseHeaders' | 'responseBody'> & Partial<Pick<Exchange, 'kind' | 'grpcTunnel'>>): ContentClass {
+  if (e.kind === 'grpc' || (e.kind === 'tunnel' && e.grpcTunnel)) return 'grpc';
   const ct = headerValue(e.responseHeaders, 'content-type');
   const mime = (ct ?? '').split(';')[0].trim().toLowerCase();
   const body = e.responseBody;
   if (mime) {
+    if (mime.startsWith('application/grpc')) return 'grpc';
     if (isJsonContentType(mime)) return 'json';
     if (mime === 'text/html' || mime === 'application/xhtml+xml') return 'html';
     if (mime === 'application/xml' || mime === 'text/xml' || mime.endsWith('+xml')) return 'xml';
@@ -242,10 +250,29 @@ function kindPred(raw: string): Pred | string {
   const wanted = new Set<KindValue>();
   for (const v of raw.toLowerCase().split(',').filter(Boolean)) {
     const hits = KIND_VALUES.filter((k) => k.name.startsWith(v));
-    if (!hits.length) return `kind:${raw} — use ws, sse, http or tunnel`;
+    if (!hits.length) return `kind:${raw} — use ws, sse, http, tunnel or grpc`;
     hits.forEach((k) => wanted.add(k.kind));
   }
   return (e) => wanted.has(kindOf(e));
+}
+
+/** CONTRACTS §16.5 `grpc:` — status code names / numbers, error, pending, stream. Only gRPC calls match. */
+function grpcPred(raw: string): Pred | string {
+  const codes = new Set<number>();
+  const preds: Pred[] = [];
+  for (const v of raw.toLowerCase().split(',').filter(Boolean)) {
+    if (v === 'error' || v === 'err' || v === 'fail' || v === 'failed') {
+      preds.push((e) => isGrpc(e) && (e.grpc?.statusCode !== undefined ? e.grpc.statusCode !== 0 : e.state === 'error' || e.state === 'aborted' || e.state === 'blocked'));
+      continue;
+    }
+    if (v === 'pending' || v === 'open') { preds.push((e) => isGrpc(e) && e.state === 'pending'); continue; }
+    if (v === 'stream' || v === 'streaming') { preds.push((e) => isGrpc(e) && isGrpcStreaming(e)); continue; }
+    const hits = grpcCodesMatching(v);
+    if (!hits.length) return `grpc:${raw} — use a status name (ok, unavailable, …), a code (0–16), error, pending or stream`;
+    hits.forEach((c) => codes.add(c));
+  }
+  if (codes.size) preds.push((e) => isGrpc(e) && e.grpc?.statusCode !== undefined && codes.has(e.grpc.statusCode));
+  return preds.length === 1 ? preds[0] : (e, x) => preds.some((p) => p(e, x));
 }
 
 function corsPred(raw: string): Pred | string {
@@ -346,6 +373,10 @@ function compileToken(t: RawToken): { pred: Pred; cost: number } | string | unde
     }
     case 'browser': {
       const p = browserPred(value);
+      return typeof p === 'string' ? p : { pred: p, cost: 0 };
+    }
+    case 'grpc': {
+      const p = grpcPred(value);
       return typeof p === 'string' ? p : { pred: p, cost: 0 };
     }
     case 'body': {

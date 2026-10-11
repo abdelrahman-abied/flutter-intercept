@@ -130,6 +130,8 @@ export interface GrpcDecoded {
   method?: { requestType: string; responseType: string; clientStreaming: boolean; serverStreaming: boolean; file?: string };
   /** One per `message` frame, same order as `exchange.frames` (other frame kinds skipped). */
   messages: GrpcDecodedMessage[];
+  /** `exchange.framesDropped` when decoded (0 = none), so the panel lines messages up with frames exactly. */
+  framesDropped: number;
   /** Example JSON for each type (rule editor "skeleton" button). */
   skeletons?: { request?: string; response?: string };
   problem?: string;

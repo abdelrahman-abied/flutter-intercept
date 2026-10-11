@@ -12,7 +12,8 @@ import { describeProfile, NETWORK_PRESETS, presetProfile, type NetworkPresetId }
 import { matchesFilter, parseFilter } from './filter';
 import { checkPath } from './jsonpath';
 import { corsActionError } from './coverage';
-import { hasFrames } from './frames';
+import { hasMessagesTab } from './frames';
+import { appliesToGrpc, describeGrpcMock, isBase64, isGrpc, reservedGrpcHeader, type GrpcDecodeEntry } from './grpc';
 import { EXPORT_LABEL } from './exporting';
 import { describeScript, scriptCodeError, scriptFileError, scriptMatchError } from './scripts';
 import {
@@ -101,6 +102,8 @@ export interface State {
   showWaterfall: boolean;
   /** Bumped when the host asks to show an exchange (`select`): the list scrolls to it even if already selected. */
   revealSeq: number;
+  /** CONTRACTS §16.4: `decodeGrpc` requests and the host's `grpcDecoded` answers, by exchange id. */
+  grpcDecoded: Record<string, GrpcDecodeEntry>;
 }
 
 export const NEW_RULE = '__new__';
@@ -128,6 +131,7 @@ export function initialState(): State {
     authFlows: [],
     showWaterfall: true,
     revealSeq: 0,
+    grpcDecoded: {},
   };
 }
 
@@ -170,7 +174,9 @@ export type Action =
   | { type: 'dismissWarning'; id: string }
   | { type: 'pickRecording'; id: string }
   | { type: 'clearRecordingPicks' }
-  | { type: 'toggleWaterfall' };
+  | { type: 'toggleWaterfall' }
+  /** CONTRACTS §16.4: the panel posted `decodeGrpc` for this version of the exchange. */
+  | { type: 'grpcRequested'; id: string; key: string; base: number; at: number };
 
 let noticeSeq = 0;
 let errorSeq = 0;
@@ -332,6 +338,15 @@ export function reducer(state: State, action: Action): State {
 
     case 'toggleWaterfall':
       return { ...state, showWaterfall: !state.showWaterfall };
+
+    case 'grpcRequested': {
+      const prev = state.grpcDecoded[action.id];
+      return {
+        ...state,
+        // The previous answer stays on screen until the new one arrives.
+        grpcDecoded: { ...state.grpcDecoded, [action.id]: { ...prev, key: action.key, base: action.base, requestedAt: action.at } },
+      };
+    }
   }
 }
 
@@ -378,6 +393,7 @@ function applyHostMsg(state: State, msg: HostMsg): State {
         resolving: {},
         gaveUp: pick(state.gaveUp, byId),
         contracts: pick(state.contracts, byId),
+        grpcDecoded: pick(state.grpcDecoded, byId),
       };
       if (state.editingRuleId && state.editingRuleId !== NEW_RULE && !msg.rules.some((r) => r.id === state.editingRuleId)) {
         next.editingRuleId = undefined;
@@ -389,7 +405,7 @@ function applyHostMsg(state: State, msg: HostMsg): State {
       }
       if (next.selectedId) {
         next.detailTab = tabFor(byId.get(next.selectedId), state.detailTab);
-        if (next.detailTab === 'messages' && !hasFrames(byId.get(next.selectedId)!)) next.detailTab = 'response';
+        if (next.detailTab === 'messages' && !hasMessagesTab(byId.get(next.selectedId)!)) next.detailTab = 'response';
       } else {
         // Something is waiting at a breakpoint: show it rather than an unselected list.
         const paused = exchanges.find(isPaused);
@@ -464,7 +480,7 @@ function applyHostMsg(state: State, msg: HostMsg): State {
           if (state.awaitingRule.label) {
             // mutateField: the host inserted it first; Undo restores the list without it.
             next.notice = notice(`Rule added: ${state.awaitingRule.label}`, msg.rules.filter((r) => r.id !== created.id));
-          } else if (state.awaitingRule.kind === 'mock') {
+          } else if (state.awaitingRule.kind === 'mock' || state.awaitingRule.kind === 'grpcMock') {
             // A mock is only useful once its body is edited: open it straight away.
             next.view = 'rules';
             next.editingRuleId = created.id;
@@ -504,6 +520,7 @@ function applyHostMsg(state: State, msg: HostMsg): State {
         resolving: drop(state.resolving),
         gaveUp: drop(state.gaveUp),
         contracts: drop(state.contracts),
+        grpcDecoded: drop(state.grpcDecoded),
         selectedId: state.selectedId && gone.has(state.selectedId) ? undefined : state.selectedId,
       };
     }
@@ -518,7 +535,7 @@ function applyHostMsg(state: State, msg: HostMsg): State {
       };
 
     case 'cleared':
-      return { ...state, exchanges: [], drafts: {}, resolving: {}, gaveUp: {}, contracts: {}, authFlows: [], selectedId: undefined };
+      return { ...state, exchanges: [], drafts: {}, resolving: {}, gaveUp: {}, contracts: {}, authFlows: [], grpcDecoded: {}, selectedId: undefined };
 
     case 'recordings': {
       const recordings = sortRecordings(msg.recordings);
@@ -534,6 +551,16 @@ function applyHostMsg(state: State, msg: HostMsg): State {
 
     case 'exported':
       return { ...state, notice: notice(`Exported ${EXPORT_LABEL[msg.format] ?? msg.format} to ${msg.path}`) };
+
+    case 'grpcDecoded': {
+      // Answers are kept only for exchanges still listed; the answer is for the version last asked for.
+      if (!findExchange(state, msg.id)) return state;
+      const prev = state.grpcDecoded[msg.id];
+      const entry: GrpcDecodeEntry = prev
+        ? { ...prev, decoded: msg.decoded, answeredKey: prev.key, answeredBase: prev.base }
+        : { key: '', base: 0, requestedAt: 0, decoded: msg.decoded, answeredKey: '', answeredBase: 0 };
+      return { ...state, grpcDecoded: { ...state.grpcDecoded, [msg.id]: entry } };
+    }
   }
 }
 
@@ -591,14 +618,14 @@ function tabFor(ex: Exchange | undefined, current: DetailTab): DetailTab {
 }
 
 /**
- * Tab when the user selects an exchange: a paused phase wins; a WebSocket / SSE exchange opens on its messages;
+ * Tab when the user selects an exchange: a paused phase wins; a WebSocket / SSE / gRPC exchange opens on its messages;
  * leaving one for a plain exchange goes back to the response.
  */
 function tabForSelect(ex: Exchange | undefined, current: DetailTab): DetailTab {
   const t = tabFor(ex, current);
   if (!ex || t !== current || (ex.state === 'paused-request' || ex.state === 'paused-response')) return t;
   if (current === 'timing') return 'timing'; // every exchange has a Timing tab: stay on it
-  if (hasFrames(ex)) return 'messages';
+  if (hasMessagesTab(ex)) return 'messages';
   return current === 'messages' ? 'response' : current;
 }
 
@@ -1010,9 +1037,14 @@ export function compileExchangeMatcher(m: Rule['match']): ExchangeTest {
   return (ex) => !ex.captured && test(ex.method, ex.url) && (!op || ex.graphql?.operationName === op);
 }
 
+/** CONTRACTS §16.2: a rule whose action doesn't apply to gRPC never matches a gRPC call (the next rule is tried). */
+function actionSkips(a: RuleAction | undefined, ex: Pick<Exchange, 'kind'>): boolean {
+  return !!a && isGrpc(ex) && !appliesToGrpc(a);
+}
+
 /** Index of the rule that would handle `ex` (first enabled match wins), or -1. */
-export function winningRuleIndex(rules: Rule[], ex: Pick<Exchange, 'method' | 'url' | 'graphql' | 'captured'>): number {
-  return rules.findIndex((r) => r.enabled && compileExchangeMatcher(r.match)(ex));
+export function winningRuleIndex(rules: Rule[], ex: Pick<Exchange, 'method' | 'url' | 'graphql' | 'captured'> & Partial<Pick<Exchange, 'kind'>>): number {
+  return rules.findIndex((r) => r.enabled && !actionSkips(r.action, ex) && compileExchangeMatcher(r.match)(ex));
 }
 
 export interface RuleStat { matches: number; wins: number }
@@ -1024,13 +1056,13 @@ export interface RuleStat { matches: number; wins: number }
  */
 export function ruleStats(rules: Rule[], exchanges: Exchange[]): RuleStat[] {
   // compileMatcher is the proxy's own matcher (same module as `matches`), compiled once per rule.
-  const compiled = rules.map((r) => ({ test: compileExchangeMatcher(r.match), enabled: r.enabled }));
+  const compiled = rules.map((r) => ({ test: compileExchangeMatcher(r.match), enabled: r.enabled, action: r.action }));
   const stats = rules.map(() => ({ matches: 0, wins: 0 }));
   for (const ex of exchanges) {
     let won = false;
     for (let i = 0; i < compiled.length; i++) {
       const c = compiled[i];
-      if (!c.test(ex)) continue;
+      if (actionSkips(c.action, ex) || !c.test(ex)) continue;
       stats[i].matches++;
       if (c.enabled && !won) { stats[i].wins++; won = true; }
     }
@@ -1038,11 +1070,11 @@ export function ruleStats(rules: Rule[], exchanges: Exchange[]): RuleStat[] {
   return stats;
 }
 
-/** How many exchanges a matcher matches (rule editor preview). */
-export function countMatches(m: Rule['match'], exchanges: Exchange[]): number {
+/** How many exchanges a matcher matches (rule editor preview); `skipGrpc` = the action doesn't apply to gRPC calls. */
+export function countMatches(m: Rule['match'], exchanges: Exchange[], skipGrpc = false): number {
   const test = compileExchangeMatcher(m);
   let n = 0;
-  for (const e of exchanges) if (test(e)) n++;
+  for (const e of exchanges) if (!(skipGrpc && isGrpc(e)) && test(e)) n++;
   return n;
 }
 
@@ -1066,6 +1098,7 @@ export function describeAction(a: RuleAction): string {
     case 'mapRemote': return `Map to ${a.to}${a.preserveHost ? ' (keep Host)' : ''}`;
     case 'rewrite': return describeRewrite(a);
     case 'script': return describeScript(a);
+    case 'grpcMock': return describeGrpcMock(a);
   }
 }
 
@@ -1174,6 +1207,16 @@ export interface ActionFields {
   scriptCode: string;
   scriptUseFile: boolean;
   scriptFile: string;
+  /** CONTRACTS §16.2 (kind 'grpcMock'). `grpcCode` is the status code as text ('0'–'16'). */
+  grpcCode: string;
+  grpcMessage: string;
+  /** json = each entry is a JSON object the host encodes with the app's schema (`messagesJson`); base64 = raw protobuf. */
+  grpcMessagesMode: 'json' | 'base64';
+  grpcMessages: string[];
+  grpcDelayMs: string;
+  grpcGapMs: string;
+  grpcHeaders: HeaderRow[];
+  grpcTrailers: HeaderRow[];
 }
 
 /** One `sequence` step: an action (or the real server) answering `count` matching requests. */
@@ -1228,6 +1271,14 @@ export function defaultActionFields(): ActionFields {
     scriptCode: '',
     scriptUseFile: false,
     scriptFile: '',
+    grpcCode: '0',
+    grpcMessage: '',
+    grpcMessagesMode: 'json',
+    grpcMessages: ['{}'],
+    grpcDelayMs: '',
+    grpcGapMs: '',
+    grpcHeaders: [],
+    grpcTrailers: [],
   };
 }
 
@@ -1271,8 +1322,23 @@ function fillActionFields<F extends ActionFields>(f: F, a: RuleAction | StepActi
   } else if (a.kind === 'script') {
     f.scriptCode = a.code;
     if (a.file !== undefined) { f.scriptUseFile = true; f.scriptFile = a.file; }
+  } else if (a.kind === 'grpcMock') {
+    f.grpcCode = String(a.code ?? 0);
+    f.grpcMessage = a.message ?? '';
+    // messagesJson (what the user wrote) wins over the host-encoded messages, like mock.bodyFile over body.
+    if (a.messagesJson) { f.grpcMessagesMode = 'json'; f.grpcMessages = a.messagesJson.map((m) => prettyJson(m)); }
+    else if (a.messages) { f.grpcMessagesMode = 'base64'; f.grpcMessages = a.messages.slice(); }
+    else { f.grpcMessagesMode = 'json'; f.grpcMessages = []; }
+    f.grpcHeaders = headersToRows(a.headers);
+    f.grpcTrailers = headersToRows(a.trailers);
+    f.grpcDelayMs = a.delayMs ? String(a.delayMs) : '';
+    f.grpcGapMs = a.gapMs ? String(a.gapMs) : '';
   }
   return f;
+}
+
+function prettyJson(v: unknown): string {
+  try { return JSON.stringify(v, null, 2) ?? ''; } catch { return ''; }
 }
 
 export function ruleToForm(rule?: Rule, now = Date.now()): RuleForm {
@@ -1310,7 +1376,8 @@ export function ruleToForm(rule?: Rule, now = Date.now()): RuleForm {
 export type RuleFormField =
   | 'url' | 'method' | 'mockStatus' | 'mockDelayMs' | 'blockStatus' | 'mockHeaders'
   | 'latencyMs' | 'kbps' | 'uploadKbps' | 'dropPct' | 'throttle' | 'times' | 'expiresIn' | 'mutate' | 'graphqlOperation' | 'cors'
-  | 'mockBodyFile' | 'mapTo' | 'rewrite' | 'sequence' | 'count' | 'scriptCode' | 'scriptFile';
+  | 'mockBodyFile' | 'mapTo' | 'rewrite' | 'sequence' | 'count' | 'scriptCode' | 'scriptFile'
+  | 'grpcCode' | 'grpcMessages' | 'grpcDelayMs' | 'grpcGapMs' | 'grpcHeaders' | 'grpcTrailers';
 
 /** Validation of one action's fields (the rule's, or one sequence step's). */
 export interface ActionValidation {
@@ -1318,6 +1385,8 @@ export interface ActionValidation {
   json?: JsonCheck;
   /** Per mutate row: what is wrong with it (path or value), if anything. */
   opErrors?: (string | undefined)[];
+  /** kind 'grpcMock': per message entry, what is wrong with it, if anything. */
+  grpcErrors?: (string | undefined)[];
 }
 
 export interface RuleFormValidation extends ActionValidation {
@@ -1333,6 +1402,7 @@ export function validateActionFields(kind: RuleAction['kind'] | StepKind, f: Act
   const errors: ActionValidation['errors'] = {};
   let json: JsonCheck | undefined;
   let opErrors: (string | undefined)[] | undefined;
+  let grpcErrors: (string | undefined)[] | undefined;
   if (kind === 'cors') {
     const c = corsActionError(f.corsOrigin, f.corsCredentials);
     if (c) errors.cors = c;
@@ -1372,8 +1442,40 @@ export function validateActionFields(kind: RuleAction['kind'] | StepKind, f: Act
   } else if (kind === 'script') {
     const e = f.scriptUseFile ? scriptFileError(f.scriptFile) : scriptCodeError(f.scriptCode);
     if (e) errors[f.scriptUseFile ? 'scriptFile' : 'scriptCode'] = e;
+  } else if (kind === 'grpcMock') {
+    if (!/^\d{1,9}$/.test(f.grpcCode.trim())) errors.grpcCode = 'A gRPC status code, e.g. 0 (OK) or 14 (UNAVAILABLE)';
+    if (f.grpcDelayMs.trim() && !/^\d+$/.test(f.grpcDelayMs.trim())) errors.grpcDelayMs = 'Delay: milliseconds, whole number';
+    if (f.grpcGapMs.trim() && !/^\d+$/.test(f.grpcGapMs.trim())) errors.grpcGapMs = 'Gap: milliseconds, whole number';
+    const h = grpcHeaderError(f.grpcHeaders, 'Header');
+    if (h) errors.grpcHeaders = h;
+    const t = grpcHeaderError(f.grpcTrailers, 'Trailer');
+    if (t) errors.grpcTrailers = t;
+    grpcErrors = f.grpcMessages.map((m) => grpcMessageError(m, f.grpcMessagesMode));
+    const first = grpcErrors.findIndex(Boolean);
+    if (first >= 0) errors.grpcMessages = `Message ${first + 1}: ${grpcErrors[first]}`;
   }
-  return { errors, json, opErrors };
+  return { errors, json, opErrors, grpcErrors };
+}
+
+/** Why a grpcMock message entry can't be saved, if it can't (empty entries are skipped). */
+export function grpcMessageError(text: string, mode: ActionFields['grpcMessagesMode']): string | undefined {
+  const t = text.trim();
+  if (!t) return undefined;
+  if (mode === 'base64') return isBase64(t) ? undefined : 'not valid base64 (A–Z, a–z, 0–9, +, /, = padding)';
+  const j = validateJson(t);
+  if (!j.ok) return `not valid JSON (line ${j.line}, column ${j.column}): ${j.message}`;
+  if (!t.startsWith('{')) return 'a JSON object (one protobuf message), e.g. {"id": "42"}';
+  return undefined;
+}
+
+function grpcHeaderError(rows: HeaderRow[], what: 'Header' | 'Trailer'): string | undefined {
+  for (const r of rows) {
+    const n = r.name.trim();
+    if (!n) { if (r.value.trim()) return `${what}: a value needs a name`; continue; }
+    if (reservedGrpcHeader(n)) return `${what} “${n}” is set by the proxy (content-type, grpc-status, grpc-message and :pseudo headers can't be set)`;
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(n)) return `${what} name “${n}” is not valid`;
+  }
+  return undefined;
 }
 
 /** The first error of an action, as one line ("Status: 100–599"). */
@@ -1500,6 +1602,23 @@ export function fieldsToAction(kind: Exclude<RuleAction['kind'], 'sequence'> | S
       return { kind: 'passthrough' };
     case 'breakpoint':
       return { kind: 'breakpoint', phase: f.phase };
+    case 'grpcMock': {
+      const action: Extract<RuleAction, { kind: 'grpcMock' }> = { kind: 'grpcMock', code: Number(f.grpcCode.trim() || '0') };
+      if (f.grpcMessage.trim()) action.message = f.grpcMessage.trim();
+      const entries = f.grpcMessages.map((m) => m.trim()).filter(Boolean);
+      // JSON entries are encoded by the host (`messagesJson`, like mock.bodyFile); base64 entries go as they are.
+      if (entries.length) {
+        if (f.grpcMessagesMode === 'json') action.messagesJson = entries.map((m) => JSON.parse(m) as unknown);
+        else action.messages = entries.map((m) => m.replace(/\s+/g, ''));
+      }
+      const headers = rowsToFlatRecord(f.grpcHeaders);
+      if (Object.keys(headers).length) action.headers = headers;
+      const trailers = rowsToFlatRecord(f.grpcTrailers);
+      if (Object.keys(trailers).length) action.trailers = trailers;
+      if (f.grpcDelayMs.trim() && Number(f.grpcDelayMs) > 0) action.delayMs = Number(f.grpcDelayMs);
+      if (f.grpcGapMs.trim() && Number(f.grpcGapMs) > 0) action.gapMs = Number(f.grpcGapMs);
+      return action;
+    }
   }
 }
 
@@ -1509,6 +1628,8 @@ export function stepsPreview(steps: StepForm[], then: SequenceThen): string {
     const count = /^\d+$/.test(s.count.trim()) && +s.count > 0 ? +s.count : 1;
     if (s.kind === 'mock') return { action: { kind: 'passthrough' }, count, label: isStatus(s.mockStatus) ? s.mockStatus.trim() : '?' };
     if (s.kind === 'mutate') return { action: { kind: 'mutate', ops: [] }, count };
+    // Only the code matters for the label: the messages may not parse yet.
+    if (s.kind === 'grpcMock') return { action: { kind: 'grpcMock', code: /^\d+$/.test(s.grpcCode.trim()) ? +s.grpcCode : 0 }, count };
     return { action: fieldsToAction(s.kind, s), count };
   }), then);
 }

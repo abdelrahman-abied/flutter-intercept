@@ -12,6 +12,7 @@ import type { Exchange, Frame } from './protocol';
 import { formatJson } from './json';
 import { formatBytes } from './util';
 import { tunnelTitle } from './connection';
+import { GRPC_TUNNEL_HINT, grpcTitle, isGrpc } from './grpc';
 
 export type { Frame } from './protocol';
 
@@ -20,16 +21,31 @@ export function hasFrames(ex: Pick<Exchange, 'kind'>): boolean {
   return ex.kind === 'websocket' || ex.kind === 'sse';
 }
 
+/** Exchanges with a Messages tab: WebSocket / SSE frames, and gRPC messages (CONTRACTS §16.5). */
+export function hasMessagesTab(ex: Pick<Exchange, 'kind'>): boolean {
+  return hasFrames(ex) || isGrpc(ex);
+}
+
 /** Total frames seen, including the dropped ones. */
 export function frameTotal(ex: Pick<Exchange, 'frames' | 'framesDropped'>): number {
   return (ex.framesDropped ?? 0) + (ex.frames?.length ?? 0);
 }
 
-export const KIND_BADGE: Record<NonNullable<Exchange['kind']>, string> = { websocket: 'WS', sse: 'SSE', tunnel: 'TLS' };
+export const KIND_BADGE: Record<NonNullable<Exchange['kind']>, string> = { websocket: 'WS', sse: 'SSE', tunnel: 'TLS', grpc: 'gRPC' };
 
-/** Tooltip of a WS / SSE list badge: "WebSocket · 12 messages (3 dropped) · open" (tunnels: CONTRACTS §14.2). */
-export function kindTitle(ex: Pick<Exchange, 'kind' | 'frames' | 'framesDropped' | 'state'> & Partial<Pick<Exchange, 'url' | 'tunnelBytes'>>): string {
-  if (ex.kind === 'tunnel') return tunnelTitle({ url: ex.url ?? '', state: ex.state, tunnelBytes: ex.tunnelBytes });
+/**
+ * Tooltip of a WS / SSE list badge: "WebSocket · 12 messages (3 dropped) · open" (tunnels: CONTRACTS §14.2; gRPC calls
+ * and undecrypted gRPC tunnels: §16.5).
+ */
+export function kindTitle(
+  ex: Pick<Exchange, 'kind' | 'frames' | 'framesDropped' | 'state'> & Partial<Pick<Exchange, 'url' | 'tunnelBytes' | 'grpc' | 'grpcTunnel'>>,
+): string {
+  if (ex.kind === 'tunnel') {
+    const t = tunnelTitle({ url: ex.url ?? '', state: ex.state, tunnelBytes: ex.tunnelBytes });
+    // A gRPC tunnel isn't a tlsPassthrough host: replace the first line (which names that setting).
+    return ex.grpcTunnel ? `${GRPC_TUNNEL_HINT}\n${t.split('\n').slice(1).join('\n')}`.trim() : t;
+  }
+  if (isGrpc(ex)) return grpcTitle({ grpc: ex.grpc, url: ex.url ?? '', state: ex.state });
   const what = ex.kind === 'websocket' ? 'WebSocket' : 'Server-sent events';
   const n = frameTotal(ex);
   const unit = ex.kind === 'sse' ? 'event' : 'message';
@@ -201,6 +217,8 @@ export type DirFilter = 'all' | 'send' | 'receive';
  */
 export function filterFrames(
   frames: readonly Frame[], text: string, dir: DirFilter = 'all', cache: FrameCache = new FrameCache(), dropped = 0,
+  /** gRPC: the searchable text comes from the decoded messages (lowercased), not the frame. */
+  haystackOf?: (n: number, f: Frame, i: number) => string,
 ): number[] {
   const words = text.toLowerCase().split(/\s+/).filter((w) => w && w !== '-');
   const out: number[] = [];
@@ -208,7 +226,7 @@ export function filterFrames(
     const f = frames[i];
     if (dir !== 'all' && f.dir !== dir) continue;
     if (words.length) {
-      const h = cache.haystack(dropped + i, f);
+      const h = haystackOf ? haystackOf(dropped + i, f, i) : cache.haystack(dropped + i, f);
       let ok = true;
       for (const w of words) {
         const neg = w.startsWith('-');

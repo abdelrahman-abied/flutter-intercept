@@ -182,12 +182,19 @@ export function ExportMenu() {
   const what = scope.filtered
     ? `the ${scope.count} HTTP exchange${scope.count === 1 ? '' : 's'} the filter shows`
     : `all ${scope.count} HTTP exchange${scope.count === 1 ? '' : 's'}`;
-  const items: MenuItem[] = EXPORT_FORMATS.map((format) => ({
-    label: `${EXPORT_LABEL[format]}…`,
-    title: none ? 'No HTTP exchanges to export' : `${EXPORT_TITLE[format]}. Exports ${what}.`,
-    disabled: none,
-    onSelect: () => post(scope.ids ? { type: 'export', format, ids: scope.ids } : { type: 'export', format }),
-  }));
+  const items: MenuItem[] = EXPORT_FORMATS.map((format) => {
+    // CONTRACTS §16.4: HAR also carries the gRPC calls; OpenAPI / Postman skip them.
+    const har = format === 'har' && !!scope.grpc;
+    const ids = har && scope.harIds ? scope.harIds : scope.ids;
+    const off = none && !har;
+    const grpcNote = scope.grpc ? (har ? ` and ${scope.grpc} gRPC call${scope.grpc === 1 ? '' : 's'}` : ' (gRPC calls are skipped)') : '';
+    return {
+      label: `${EXPORT_LABEL[format]}…`,
+      title: off ? 'No HTTP exchanges to export' : `${EXPORT_TITLE[format]}. Exports ${what}${grpcNote}.`,
+      disabled: off,
+      onSelect: () => post(ids ? { type: 'export', format, ids } : { type: 'export', format }),
+    };
+  });
   return (
     <MenuButton label="Export" class="export-menu" items={items}
       title={none ? 'Export traffic as OpenAPI, Postman or HAR — no HTTP exchanges yet' : `Export ${what} as OpenAPI, Postman or HAR`}>

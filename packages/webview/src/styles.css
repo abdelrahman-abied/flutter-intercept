@@ -1295,3 +1295,40 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
 }
 @keyframes fi-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .connection-spinner { animation: none; } }
+
+/* ------------------------------------------------------------------ v0.10.0 gRPC (CONTRACTS §16.5) */
+
+.kind-badge.kb-grpc { color: var(--vscode-charts-purple); border-color: var(--vscode-charts-purple); }
+.stream-badge { background: transparent; color: var(--fi-info); border: 1px solid var(--fi-info); font-weight: normal; }
+.grpc-status { font-variant-numeric: tabular-nums; font-weight: 600; }
+.c-status .grpc-status { font-size: 10px; letter-spacing: -0.01em; }
+.gs-ok, .grpc-ok-text { color: var(--fi-ok); }
+.gs-err { color: var(--fi-err); }
+.gs-pending, .gs-none { color: var(--fi-muted); }
+.list-scroll:focus .row.selected .grpc-status { color: inherit; }
+.c-size.grpc-counts { font-size: 11px; }
+.gz-badge { margin: 0 4px 0 0; font-family: var(--vscode-font-family); color: var(--fi-muted); }
+.grpc-status-block {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin-top: 6px;
+  padding: 4px 8px;
+  border-left: 3px solid var(--fi-border);
+}
+.grpc-status-block.gsb-ok { border-left-color: var(--fi-ok); }
+.grpc-status-block.gsb-err { border-left-color: var(--fi-err); }
+.grpc-status-block .grpc-status { font-size: 13px; }
+.grpc-method { font-family: var(--fi-mono); font-size: var(--fi-mono-size); overflow-wrap: anywhere; }
+.grpc-status-msg { overflow-wrap: anywhere; }
+.grpc-types { font-size: 11px; }
+.grpc-decode-note { margin: 4px 0; }
+.grpc-base64 { overflow-wrap: anywhere; white-space: pre-wrap; }
+.grpc-mock-editor .grpc-messages { list-style: none; margin: 4px 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.grpc-msg-row { display: flex; gap: 4px; align-items: flex-start; }
+.grpc-msg-row textarea { flex: 1; min-width: 0; }
+.grpc-status-item { overflow: hidden; text-overflow: ellipsis; }
+.grpc-status-item.has-problem { color: var(--vscode-errorForeground); font-weight: 600; }
+.grpc-rule-note { margin: 4px 0; }
+.kind-grpcMock { background: var(--vscode-charts-purple); color: var(--vscode-editor-background); }

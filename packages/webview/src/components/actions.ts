@@ -8,6 +8,7 @@ import { corsRuleFor, isNative, NATIVE_READ_ONLY, routeGlob } from '../coverage'
 import { splitUrl } from '../util';
 import { isTunnel, TUNNEL_NO_ACTION } from '../connection';
 import { expireTokenLabel } from '../scenarios';
+import { GRPC_TUNNEL_NO_ACTION, isGrpc, isGrpcTunnel } from '../grpc';
 import type { MenuItem } from './bits';
 
 export interface ExchangeActions {
@@ -39,11 +40,27 @@ export interface ExchangeActions {
 const WS_NO_MOCK = 'Mock rules don\'t apply to WebSocket upgrades — block it or add a fault instead';
 const WS_NO_RESEND = 'A WebSocket connection can\'t be resent';
 
+/** CONTRACTS §16.2 / §16.5: what doesn't apply to a gRPC call, and why. */
+export const GRPC_OFF = {
+  breakpoint: 'Breakpoints don\'t apply to gRPC calls — use a gRPC mock, Block or Fault rule',
+  edit: 'A gRPC call can\'t be resent from the panel',
+  generate: 'Dart models and test fixtures are generated from JSON HTTP responses — not gRPC calls',
+  copy: 'cURL / Dart http / Dio snippets are for HTTP requests — not gRPC calls',
+  expire: 'The Expire token preset answers HTTP 401 — for gRPC, mock the call with UNAUTHENTICATED instead',
+} as const;
+
 /** Why "Mock this" / "Block this" / … can't be used for `ex` (native exchanges are read-only). */
 export function interceptOff(ex: Exchange): ExchangeActions['off'] {
   if (isNative(ex)) {
     return { mock: NATIVE_READ_ONLY, block: NATIVE_READ_ONLY, breakpoint: NATIVE_READ_ONLY, edit: NATIVE_READ_ONLY, generate: NATIVE_READ_ONLY, expire: NATIVE_READ_ONLY };
   }
+  // CONTRACTS §16.5: an undecrypted gRPC tunnel, like any tunnel — only Block applies.
+  if (isGrpcTunnel(ex)) {
+    const t = GRPC_TUNNEL_NO_ACTION;
+    return { mock: t, breakpoint: t, edit: t, generate: t, copy: t, expire: t };
+  }
+  // A gRPC call: mock (→ grpcMock) and block apply; breakpoints, resend, snippets, generators and the preset don't.
+  if (isGrpc(ex)) return { ...GRPC_OFF };
   // CONTRACTS §14.2: a TLS passthrough tunnel has no request to mock, pause, copy or resend — only Block applies.
   if (isTunnel(ex)) {
     return { mock: TUNNEL_NO_ACTION, breakpoint: TUNNEL_NO_ACTION, edit: TUNNEL_NO_ACTION, generate: TUNNEL_NO_ACTION, copy: TUNNEL_NO_ACTION, expire: TUNNEL_NO_ACTION };
@@ -85,6 +102,10 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
   };
   const resendDisabled = isNative(ex)
     ? NATIVE_READ_ONLY
+    : isGrpcTunnel(ex)
+      ? GRPC_TUNNEL_NO_ACTION
+    : isGrpc(ex)
+      ? GRPC_OFF.edit
     : isTunnel(ex)
       ? TUNNEL_NO_ACTION
     : ex.kind === 'websocket'
@@ -103,8 +124,11 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
     const f = frame ?? ex.source?.appFrame;
     post(f === undefined ? { type: 'openSource', id: ex.id } : { type: 'openSource', id: ex.id, frame: f });
   };
-  const createRule = (kind: RuleAction['kind']) => {
-    if (isNative(ex) || (kind !== 'block' && isTunnel(ex))) return;
+  const createRule = (requested: RuleAction['kind']) => {
+    if (isNative(ex) || (requested !== 'block' && isTunnel(ex))) return;
+    // CONTRACTS §16.4: "Mock this" on a gRPC call makes a gRPC mock answering with this call's messages and status.
+    const kind = isGrpc(ex) && requested === 'mock' ? 'grpcMock' : requested;
+    if (isGrpc(ex) && kind === 'breakpoint') return;
     dispatch({ type: 'awaitRule', kind });
     post({ type: 'createRuleFromExchange', id: ex.id, action: kind });
   };

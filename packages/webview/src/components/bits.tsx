@@ -5,6 +5,7 @@ import { isPaused, pauseClock, statusClassOf } from '../util';
 import { gqlLabel, gqlTitle, isNative, NATIVE_READ_ONLY } from '../coverage';
 import { KIND_BADGE, kindTitle } from '../frames';
 import { TUNNEL_LABEL } from '../connection';
+import { GRPC_TUNNEL_HINT, grpcStatusView, isGrpcStreaming } from '../grpc';
 import { Icon } from './Icon';
 
 const STATE_LABEL: Record<ExchangeState, string> = {
@@ -48,14 +49,27 @@ export function StateBadge({ ex, gaveUp }: { ex: Pick<Exchange, 'state' | 'error
  * problem marker. `mini` = the list row's compact form.
  */
 export function CoverageBadges({ ex, mini }: {
-  ex: Pick<Exchange, 'kind' | 'frames' | 'framesDropped' | 'state' | 'graphql' | 'captured' | 'cors'> & Partial<Pick<Exchange, 'url' | 'tunnelBytes'>>;
+  ex: Pick<Exchange, 'kind' | 'frames' | 'framesDropped' | 'state' | 'graphql' | 'captured' | 'cors'>
+    & Partial<Pick<Exchange, 'url' | 'tunnelBytes' | 'grpc' | 'grpcTunnel'>>;
   mini?: boolean;
 }) {
   const m = mini ? ' mini' : '';
   const gql = gqlLabel(ex);
   return (
     <>
-      {ex.kind === 'tunnel' ? (
+      {ex.kind === 'tunnel' && ex.grpcTunnel ? (
+        // CONTRACTS §16.5: gRPC over TLS that wasn't decrypted — a lock and the decryptHosts hint.
+        <span class={`badge${m} kind-badge kb-tunnel kb-grpc-tunnel`} title={kindTitle(ex)} aria-label={GRPC_TUNNEL_HINT}>
+          <Icon name="lock" />{mini ? 'gRPC' : 'gRPC over TLS — not decrypted'}
+        </span>
+      ) : ex.kind === 'grpc' ? (
+        <>
+          <span class={`badge${m} kind-badge kb-grpc`} title={kindTitle(ex)}>{KIND_BADGE.grpc}</span>
+          {isGrpcStreaming(ex) && (
+            <span class={`badge${m} stream-badge`} title="Streaming: more than one message in a direction">stream</span>
+          )}
+        </>
+      ) : ex.kind === 'tunnel' ? (
         // CONTRACTS §14.2: a lock — the connection was passed through, not decrypted.
         <span class={`badge${m} kind-badge kb-tunnel`} title={kindTitle(ex)} aria-label={TUNNEL_LABEL}>
           <Icon name="lock" />{mini ? KIND_BADGE.tunnel : TUNNEL_LABEL}
@@ -68,7 +82,12 @@ export function CoverageBadges({ ex, mini }: {
   );
 }
 
-export function StatusText({ ex }: { ex: Pick<Exchange, 'state' | 'status'> & Partial<Pick<Exchange, 'kind'>> }) {
+export function StatusText({ ex }: { ex: Pick<Exchange, 'state' | 'status'> & Partial<Pick<Exchange, 'kind' | 'grpc' | 'error'>> }) {
+  if (ex.kind === 'grpc') {
+    // CONTRACTS §16.5: the gRPC status code name (the HTTP status is nearly always 200).
+    const g = grpcStatusView(ex);
+    return <span class={`status grpc-status gs-${g.cls}`} title={g.title}>{g.text}</span>;
+  }
   const cls = statusClassOf(ex) ?? 'none';
   if (ex.kind === 'tunnel' && ex.status === undefined && ex.state !== 'error' && ex.state !== 'blocked' && ex.state !== 'aborted') {
     return <span class="status sc-none" title="No HTTP status: the TLS connection was tunnelled, not decrypted">{ex.state === 'pending' ? '…' : '—'}</span>;

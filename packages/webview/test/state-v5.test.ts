@@ -265,7 +265,7 @@ describe('filter tokens: kind, op, cors, captured', () => {
     expect(ids('kind:ws,sse')).toEqual(['ws', 'sse']);
     expect(ids('-kind:http')).toEqual(['ws', 'sse']);
     expect(ids('kind:http').length).toBe(7);
-    expect(parseFilter('kind:grpc').errors[0]).toMatch(/ws, sse, http or tunnel/);
+    expect(parseFilter('kind:mqtt').errors[0]).toMatch(/ws, sse, http, tunnel or grpc/);
   });
 
   it('op: (case-insensitive prefix, comma, negation)', () => {

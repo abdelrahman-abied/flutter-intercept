@@ -18,6 +18,8 @@ import { RecordingsView } from './RecordingsView';
 import { RulesView } from './RulesView';
 import { inIde, Toolbar } from './Toolbar';
 import { TrafficList } from './TrafficList';
+import { GrpcProblemBanner } from './GrpcViews';
+import { grpcStatusSummary } from '../grpc';
 
 const NOTICE_MS = 8000;
 const SHORT_NOTICE_MS = 2500;
@@ -75,6 +77,7 @@ export function App({ host }: { host: Host }) {
         <NoticeBar />
         <ReplayBar />
         <SharedRulesBanner />
+        <GrpcProblemBanner />
         <WarningsBar />
         <main class="content">
           {state.view === 'traffic' ? <TrafficView />
@@ -195,6 +198,7 @@ function StatusLine() {
   const paused = pausedCount(exchanges);
   const passthrough = passthroughSummary(status.tlsPassthrough);
   const certs = clientCertSummary(status.clientCertificates);
+  const grpc = grpcStatusSummary(status.grpc);
   return (
     <footer class="statusline" role="status" aria-live="polite">
       <span class={`dot ${status.proxyRunning ? 'running' : 'stopped'}`} aria-hidden="true" />
@@ -223,6 +227,7 @@ function StatusLine() {
         </span>
       )}
       {passthrough && <span class="passthrough-status" title={passthrough.title}>{passthrough.text}</span>}
+      {grpc && <span class={`grpc-status-item${grpc.problems ? ' has-problem' : ''}`} title={grpc.title}>{grpc.text}</span>}
       {certs && <ClientCertStatus certs={status.clientCertificates!} summary={certs} />}
       {status.replay && (
         <span class="replay-status" title={`Answering requests from the recording “${status.replay.recording}”; unmatched requests ${FALLBACK_LABEL[status.replay.fallback]}.`}>

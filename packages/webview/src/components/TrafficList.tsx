@@ -8,8 +8,9 @@ import { contractBadgeTitle, contractStatus } from '../contract';
 import { bodyByteLength, formatBytes, formatDuration, isPaused, shortFrameLocation, splitUrl } from '../util';
 import { useExchangeActions } from './actions';
 import { AgentBadge, CoverageBadges, MenuList, PauseTimer, StateBadge, StatusText } from './bits';
-import { frameTotal, hasFrames } from '../frames';
+import { frameTotal, hasFrames, kindTitle } from '../frames';
 import { isTunnel, tunnelBytesShort, tunnelBytesText, tunnelTitle } from '../connection';
+import { grpcCountsShort, grpcCountsText, grpcPath, isGrpc } from '../grpc';
 import { barGeometry, phaseClass, timeRange, timingTooltip, type TimeRange } from '../timing';
 
 export const ROW_HEIGHT = 22;
@@ -178,7 +179,9 @@ function Row({ ex, selected, gaveUp, agentRule, contract, range, now, onSelect, 
 }) {
   const sentBy = initiatorLabel(ex);
   const app = ex.source?.appFrame !== undefined ? ex.source.frames[ex.source.appFrame] : undefined;
-  const { host, path } = splitUrl(ex.url);
+  const { host, path: urlPath } = splitUrl(ex.url);
+  const grpc = isGrpc(ex);
+  const path = grpc ? grpcPath(ex) : urlPath;
   const size = bodyByteLength(ex.responseBody);
   const cs = contractStatus(contract);
   return (
@@ -186,7 +189,7 @@ function Row({ ex, selected, gaveUp, agentRule, contract, range, now, onSelect, 
       id={`ex-${ex.id}`}
       role="option"
       aria-selected={selected}
-      class={`row cols st-${ex.state}${selected ? ' selected' : ''}${isTunnel(ex) ? ' tunnel-row' : ''}`}
+      class={`row cols st-${ex.state}${selected ? ' selected' : ''}${isTunnel(ex) ? ' tunnel-row' : ''}${grpc ? ' grpc-row' : ''}`}
       onClick={onSelect}
       onDblClick={onOpen}
       onContextMenu={(e) => { e.preventDefault(); onMenu(e.clientX, e.clientY); }}
@@ -194,12 +197,14 @@ function Row({ ex, selected, gaveUp, agentRule, contract, range, now, onSelect, 
       <span class="c-method">{ex.method}</span>
       <span class="c-status"><StatusText ex={ex} /></span>
       <span class="c-host" title={host}>{host}</span>
-      <span class="c-path" title={isTunnel(ex) ? tunnelTitle(ex) : app ? `${ex.url}\nCalled from ${app.fn} (${shortFrameLocation(app)})` : ex.url}>
+      <span class="c-path" title={isTunnel(ex) ? (ex.grpcTunnel ? kindTitle(ex) : tunnelTitle(ex)) : app ? `${ex.url}\nCalled from ${app.fn} (${shortFrameLocation(app)})` : ex.url}>
         <CoverageBadges ex={ex} mini />{path}
       </span>
       <span class="c-dur">{isPaused(ex) ? <PauseTimer ex={ex} /> : formatDuration(ex.durationMs)}</span>
       {isTunnel(ex)
         ? <span class="c-size tunnel-bytes" title={tunnelBytesText(ex)}>{tunnelBytesShort(ex)}</span>
+        : grpc
+        ? <span class="c-size grpc-counts" title={grpcCountsText(ex)}>{grpcCountsShort(ex)}</span>
         : hasFrames(ex)
         ? <span class="c-size" title={`${frameTotal(ex)} ${ex.kind === 'sse' ? 'events' : 'messages'}`}>{frameTotal(ex)} msg</span>
         : <span class="c-size">{formatBytes(size)}{ex.responseBody?.truncated ? '+' : ''}</span>}

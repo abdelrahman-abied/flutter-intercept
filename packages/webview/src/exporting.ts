@@ -14,12 +14,19 @@ export const EXPORT_TITLE: Record<ExportFormat, string> = {
 /** WebSocket and SSE exchanges are not part of an export. */
 export const isExportable = (e: Pick<Exchange, 'kind'>): boolean => !e.kind;
 
+/** CONTRACTS §16.4: HAR also carries gRPC calls (`_grpc`); OpenAPI / Postman skip them. */
+export const isHarExportable = (e: Pick<Exchange, 'kind'>): boolean => !e.kind || e.kind === 'grpc';
+
 export interface ExportScope {
   /** Ids to send with `export` (the filtered HTTP exchanges); undefined = everything shown (host default). */
   ids?: string[];
   /** How many exchanges the export covers. */
   count: number;
   filtered: boolean;
+  /** gRPC calls a HAR export adds (CONTRACTS §16.4); absent when there are none. */
+  grpc?: number;
+  /** Filtered: the ids a HAR export sends (HTTP + gRPC, in list order); absent when there are no gRPC calls. */
+  harIds?: string[];
 }
 
 /**
@@ -27,11 +34,14 @@ export interface ExportScope {
  * ids — the host exports every HTTP exchange shown.
  */
 export function exportScope(shown: readonly Exchange[], filtered: boolean): ExportScope {
+  let grpc = 0;
+  for (const e of shown) if (e.kind === 'grpc') grpc++;
   if (!filtered) {
     let count = 0;
     for (const e of shown) if (isExportable(e)) count++;
-    return { count, filtered: false };
+    return grpc ? { count, filtered: false, grpc } : { count, filtered: false };
   }
   const ids = shown.filter(isExportable).map((e) => e.id);
-  return { ids, count: ids.length, filtered: true };
+  if (!grpc) return { ids, count: ids.length, filtered: true };
+  return { ids, count: ids.length, filtered: true, grpc, harIds: shown.filter(isHarExportable).map((e) => e.id) };
 }
