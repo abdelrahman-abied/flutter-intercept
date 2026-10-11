@@ -1,11 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 256 256">
+<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="-12 -12 280 280">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0E2A47"/>
       <stop offset="1" stop-color="#1B5FA8"/>
     </linearGradient>
   </defs>
-  <rect width="40" height="40" rx="56" fill="url(#bg)"/>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
   <!-- request flowing in from the app -->
   <path d="M40 128 H92" stroke="#FFFFFF" stroke-width="16" stroke-linecap="round"/>
   <!-- and continuing to the server -->
