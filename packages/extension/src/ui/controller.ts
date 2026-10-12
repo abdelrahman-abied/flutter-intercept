@@ -131,6 +131,8 @@ export interface ControllerHost {
   on(event: 'grpc', l: (info: unknown) => void): unknown;
   /** CONTRACTS §16.8: drop the gRPC breaker warnings (called when the last debug session ends). */
   clearGrpcBreakerWarnings?(): void;
+  /** CONTRACTS §19.3 (InterceptProxyHost.simulatorTrust): simulators that trust our CA, and decrypt-all. */
+  readonly simulatorTrust?: NonNullable<Status['grpc']>['simulatorTrust'];
   /** REVIEW-12 #1 (InterceptProxyHost.ownListeners): the proxy's own ports / LAN address — Map Remote may not target them. */
   readonly ownListeners?: { ports: number[]; hosts: string[] };
 }
@@ -1432,12 +1434,15 @@ export class InterceptController {
       this.deps.log?.(`gRPC status failed: ${e instanceof Error ? e.message : String(e)}`);
     }
     const problem = this.deps.host.grpcProblem;
+    const sim = this.deps.host.simulatorTrust;
     return {
       grpc: {
         enabled,
         decryptHosts: [...(this.deps.host.grpcDecryptHosts ?? [])],
         ...(problem ? { problem } : {}),
         ...(schema ? { schema } : {}),
+        // CONTRACTS §19.3
+        ...(sim ? { simulatorTrust: { devices: sim.devices.map((d) => ({ ...d })), decryptAll: sim.decryptAll === true } } : {}),
       },
     };
   }

@@ -127,6 +127,8 @@ export interface AgentApiDeps {
     // CONTRACTS §16.4 (InterceptProxyHost). Optional on older builds.
     readonly grpcDecryptHosts?: string[];
     readonly grpcProblem?: string;
+    /** CONTRACTS §19.3 (InterceptProxyHost.simulatorTrust). */
+    readonly simulatorTrust?: { devices: { udid: string; name?: string; state: string; problem?: string }[]; decryptAll: boolean };
     /** REVIEW-12 #1 (InterceptProxyHost.ownListeners). */
     readonly ownListeners?: { ports: number[]; hosts: string[] };
   };
@@ -836,7 +838,7 @@ export class AgentApi implements AgentTools {
     const g = this.deps.grpc;
     const hosts = this.deps.host.grpcDecryptHosts ?? [];
     const problem = this.deps.host.grpcProblem;
-    if (!g && !hosts.length && !problem) return {};
+    if (!g && !hosts.length && !problem && !this.deps.host.simulatorTrust) return {};
     let enabled = true;
     let schema: Record<string, unknown> | undefined;
     try {
@@ -846,7 +848,11 @@ export class AgentApi implements AgentTools {
     } catch {
       // reported as unknown
     }
-    return { grpc: { enabled, decryptHosts: [...hosts], ...(problem ? { problem } : {}), ...(schema ? { schema } : {}) } };
+    const sim = this.deps.host.simulatorTrust;
+    const simulatorTrust = sim
+      ? { devices: sim.devices.map((d) => ({ udid: d.udid, ...(d.name ? { name: d.name } : {}), state: d.state, ...(d.problem ? { problem: this.scrub(d.problem) } : {}) })), decryptAll: sim.decryptAll }
+      : undefined;
+    return { grpc: { enabled, decryptHosts: [...hosts], ...(problem ? { problem } : {}), ...(schema ? { schema } : {}), ...(simulatorTrust ? { simulatorTrust } : {}) } };
   }
 
   /** CONTRACTS §14.2 / §14.3: passthrough hosts and client certificates — host patterns and problems only. */

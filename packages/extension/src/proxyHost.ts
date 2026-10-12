@@ -97,6 +97,8 @@ export interface ProxyLike {
   setGrpcDecryptHosts?(hosts: string[]): void | { hosts: string[]; problems: string[] };
   /** The gRPC self-check of the mockttp internals the silent tunnels use. */
   grpcSupport?(): { ok: boolean; problem?: string };
+  /** CONTRACTS §19.3: decrypt every TLS silent gRPC tunnel (but tlsPassthrough hosts): the app's simulator trusts our CA. */
+  setGrpcDecryptAll?(on: boolean): void;
   /** CONTRACTS §17.3: protobuf decode / encode for gRPC mutate rules and breakpoint edits (undefined = none). */
   setGrpcCodec?(codec?: GrpcProxyCodec): void;
   /** CONTRACTS §16.8: the entry's breaker sent an app's gRPC connections to an authority direct (`{authority, viaLan}`). */
@@ -119,6 +121,14 @@ export function upstreamDisplay(url: string | undefined): string | undefined {
  * through the upstream proxy (from VS Code's `http.noProxy`; see `normalizeNoProxy` for the accepted forms).
  */
 export type UpstreamProxy = NonNullable<InterceptProxyOptions['upstreamProxy']> & { noProxy?: string[] };
+
+/** CONTRACTS §19.3: one simulator in `Status.grpc.simulatorTrust`. */
+export interface SimulatorTrustDevice {
+  udid: string;
+  name?: string;
+  state: 'trusted' | 'pre-existing' | 'failed';
+  problem?: string;
+}
 
 /** CONTRACTS §14.6: where the upstream proxy came from (`Status.upstreamProxySource`). */
 export type UpstreamSource = 'flutterIntercept' | 'http.proxy';
@@ -514,6 +524,10 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private grpcEncoder?: GrpcMessageEncoder;
   private grpcCodec?: GrpcProxyCodec;
   private grpcCodecUnsupportedLogged = false;
+  // CONTRACTS §19.3
+  private decryptAll = false;
+  private decryptAllUnsupportedLogged = false;
+  private simDevices: SimulatorTrustDevice[] = [];
   /** §16.8 breaker warnings by authority (insertion order kept). */
   private readonly breakerWarnings = new Map<string, SessionWarning>();
 
@@ -565,6 +579,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         ...(this.tlsHosts.length ? { tlsPassthrough: [...this.tlsHosts] } : {}),
         ...(this.clientCerts.length ? { clientCertificates: [...this.clientCerts] } : {}),
         ...(this.grpcHosts.length ? { grpcDecryptHosts: [...this.grpcHosts] } : {}),
+        ...(this.decryptAll ? { grpcDecryptAll: true } : {}),
       });
       try {
         await proxy.start();
@@ -597,6 +612,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         if (problems.length || this.grpcSettingProblems.length) grpcLater = [...this.grpcSettingProblems, ...problems].join(' ');
       }
       this.grpcCheck = this.readGrpcSupport(proxy);
+      if (this.decryptAll) this.applyGrpcDecryptAll(proxy);
       if (this.grpcCodec) this.applyGrpcCodec(proxy);
       if (this.clientCerts.length) this.applyClientCertificates(proxy);
       // REVIEW-12 #1: the port is known now — re-check Map Remote targets against it
@@ -1102,6 +1118,66 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     this.setConfigWarning('grpcDecryptHosts', problems.length ? problems.join(' ') : undefined);
     if (JSON.stringify(this.grpcDecryptHosts) !== before) this.emit('grpc', this.grpcInfo);
     return { hosts: this.grpcDecryptHosts, problems };
+  }
+
+  /**
+   * CONTRACTS §19.3: decrypt every TLS silent gRPC tunnel (except tlsPassthrough hosts) — the lead's wiring turns it on
+   * while every running intercepted session is on a simulator that trusts our CA. Kept across restarts (also a
+   * constructor option). Emits 'grpc' when it changes.
+   */
+  setGrpcDecryptAll(on: boolean): void {
+    const next = on === true;
+    if (next === this.decryptAll) return;
+    this.decryptAll = next;
+    if (this.proxy) this.applyGrpcDecryptAll(this.proxy);
+    this.opts.log?.(`gRPC: ${next ? 'decrypting TLS gRPC for every host (the simulator trusts the Flutter Intercept CA)' : 'decrypting TLS gRPC only for flutterIntercept.grpc.decryptHosts'}`);
+    this.emit('grpc', this.grpcInfo);
+  }
+
+  get grpcDecryptAll(): boolean {
+    return this.decryptAll;
+  }
+
+  private applyGrpcDecryptAll(proxy: ProxyLike): void {
+    if (!proxy.setGrpcDecryptAll) {
+      if (this.decryptAll && !this.decryptAllUnsupportedLogged) this.opts.log?.('this proxy build cannot decrypt TLS gRPC for every host: only flutterIntercept.grpc.decryptHosts are decrypted');
+      this.decryptAllUnsupportedLogged = true;
+      return;
+    }
+    try {
+      proxy.setGrpcDecryptAll(this.decryptAll);
+    } catch (e) {
+      this.opts.log?.(`gRPC decrypt-all not applied: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /**
+   * CONTRACTS §19.3: the simulators src/iosSimTrust.ts reports (`state().devices`), for `Status.grpc.simulatorTrust` and
+   * agents. Sanitised (≤ 50, texts capped, no control characters). Emits 'grpc' when it changes.
+   */
+  setSimulatorTrust(state: { devices?: readonly unknown[] } | undefined): void {
+    const clean = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/[\0-\x1f\x7f]+/g, ' ').trim().slice(0, max) : undefined);
+    const devices: SimulatorTrustDevice[] = [];
+    for (const d of Array.isArray(state?.devices) ? state!.devices : []) {
+      if (!d || typeof d !== 'object') continue;
+      const x = d as Record<string, unknown>;
+      const udid = clean(x.udid, 100);
+      const st = x.state;
+      if (!udid || (st !== 'trusted' && st !== 'pre-existing' && st !== 'failed')) continue;
+      const name = clean(x.name, 200);
+      const problem = clean(x.problem, MAX_WARNING_TEXT);
+      devices.push({ udid, ...(name ? { name } : {}), state: st, ...(problem ? { problem } : {}) });
+      if (devices.length >= 50) break;
+    }
+    if (JSON.stringify(devices) === JSON.stringify(this.simDevices)) return;
+    this.simDevices = devices;
+    this.emit('grpc', this.grpcInfo);
+  }
+
+  /** `Status.grpc.simulatorTrust`: undefined when no simulator is involved and decrypt-all is off. */
+  get simulatorTrust(): { devices: SimulatorTrustDevice[]; decryptAll: boolean } | undefined {
+    if (!this.simDevices.length && !this.decryptAll) return undefined;
+    return { devices: this.simDevices.map((d) => ({ ...d })), decryptAll: this.decryptAll };
   }
 
   /** `Status.grpc.decryptHosts`: the hosts in effect (a copy). */
