@@ -14,7 +14,9 @@ import type { Body } from '@flutter-intercept/proxy';
 import type { SnippetFormat } from '../ui/protocol';
 
 export type { SnippetFormat };
-export const SNIPPET_FORMATS: readonly SnippetFormat[] = ['curl', 'dart_http', 'dio'];
+export const SNIPPET_FORMATS: readonly SnippetFormat[] = ['curl', 'dart_http', 'dio', 'grpcurl'];
+/** The HTTP request formats (`toSnippet`); `grpcurl` is built from a gRPC exchange (grpcurl.ts `toGrpcurl`). */
+export const HTTP_SNIPPET_FORMATS: readonly SnippetFormat[] = ['curl', 'dart_http', 'dio'];
 
 export interface SnippetRequest {
   method: string;
@@ -77,6 +79,8 @@ export function toSnippet(req: SnippetRequest, format: SnippetFormat): string {
       return toDartHttp(req);
     case 'dio':
       return toDio(req);
+    case 'grpcurl':
+      throw new Error('grpcurl snippets are built from a gRPC exchange (toGrpcurl)');
     default:
       throw new Error(`unknown snippet format ${JSON.stringify(format)}`);
   }

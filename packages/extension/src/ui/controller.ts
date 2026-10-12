@@ -55,6 +55,7 @@ import { grpcEditProblem, ruleFromExchange, ruleProblem } from '@flutter-interce
 import { pathError } from '../agent/paths';
 import { decodeJson, decodeSample, defaultFixtureName, FINAL_STATES, defaultModelName, fixtureApiFor, fixtureSamples, isCheckable, modelSamples, redactExchange, routeOf, testPackageFor } from '../agent/samples';
 import { SNIPPET_FORMATS, toSnippet } from '../codegen/snippets';
+import { toGrpcurl, type GrpcurlOptions } from '../codegen/grpcurl';
 import type { CodegenService, FixtureApi, GeneratedFile } from '../codegen/types';
 import type { ContractResult, ContractService } from '../contract/types';
 import type { AuthAnalysis } from '../analysis/types';
@@ -1319,7 +1320,10 @@ export function ruleFromExchangeErrorMessage(e: unknown, kind: string): string {
 }
 
 /** The request of `ex` as a code snippet (unredacted: the caller decides what to redact). */
-export function snippetFor(ex: Exchange, format: SnippetFormat): string {
+export function snippetFor(ex: Exchange, format: SnippetFormat, grpcurl?: GrpcurlOptions): string {
+  // CONTRACTS §19.2: gRPC calls (HTTP/2 and gRPC-Web) are copied as grpcurl; grpcurl only for them
+  if (format === 'grpcurl') return toGrpcurl(ex, grpcurl);
+  if (ex.kind === 'grpc') throw new Error(`This is a gRPC call: copy it as grpcurl (a ${format === 'curl' ? 'curl' : 'Dart'} snippet can't replay its protobuf messages).`);
   return toSnippet({ method: ex.method, url: ex.url, headers: ex.requestHeaders, ...(ex.requestBody ? { body: ex.requestBody } : {}) }, format);
 }
 
@@ -1747,7 +1751,7 @@ export class InterceptController {
           const ex = this.exchangeOrThrow(checkId(msg.id, 'copySnippet'));
           if (!this.deps.copyToClipboard) throw new Error('Copying is not available in this editor.');
           // The user's own clipboard: unredacted (CONTRACTS §9.3).
-          await this.deps.copyToClipboard(snippetFor(ex, msg.format));
+          await this.deps.copyToClipboard(snippetFor(ex, msg.format, { grpc: this.deps.grpc, projectRoot: this.deps.projectRoot?.(), decryptHosts: this.deps.host.grpcDecryptHosts }));
           return;
         }
         case 'setNetworkProfile':

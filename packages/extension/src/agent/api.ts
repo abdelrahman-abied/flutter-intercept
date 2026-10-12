@@ -10,6 +10,7 @@ import type { Body, Exchange, GrpcEdit, Matcher, ReplayEntry, ReplayOptions, Req
 import { describeProfile, NETWORK_PRESETS, presetProfile, type NetworkPresetId, type NetworkProfile } from '@flutter-intercept/proxy/network';
 import { compileMatcher } from '@flutter-intercept/proxy/rules';
 import { toSnippet } from '../codegen/snippets';
+import { toGrpcurl } from '../codegen/grpcurl';
 import type { CodegenService } from '../codegen/types';
 import type { ContractResult, ContractService } from '../contract/types';
 import type { AuthAnalysis } from '../analysis/types';
@@ -537,6 +538,7 @@ export class AgentApi implements AgentTools {
         ? {
             grpc: {
               ...(e.grpc.statusCode !== undefined ? { code: e.grpc.statusCode, status: grpcCodeName(e.grpc.statusCode) } : {}),
+              ...(e.grpc.web ? { web: e.grpc.web } : {}),
               messagesSent: e.grpc.messagesSent,
               messagesReceived: e.grpc.messagesReceived,
             },
@@ -721,6 +723,7 @@ export class AgentApi implements AgentTools {
     const out: Record<string, unknown> = {
       grpc: {
         ...(info ? { service: info.service, method: info.method } : {}),
+        ...(info?.web ? { web: info.web } : {}),
         ...(path ? { path } : {}),
         ...(info?.statusCode !== undefined ? { code: info.statusCode, status: grpcCodeName(info.statusCode) } : {}),
         ...(info?.statusMessage !== undefined ? { statusMessage: this.text(info.statusMessage) } : {}),
@@ -941,6 +944,12 @@ export class AgentApi implements AgentTools {
 
   /** CONTRACTS §9.5: the snippet is built from the redacted view (secrets stay "[redacted]"). */
   private redactedSnippet(e: Exchange, format: NonNullable<ToolInput<'get_request'>['snippet']>, maxChars: number): string {
+    // CONTRACTS §19.2: gRPC calls as grpcurl (redacted metadata and request JSON); grpcurl only for gRPC calls
+    if (format === 'grpcurl') {
+      if (e.kind !== 'grpc') throw new AgentToolError(`exchange "${e.id}" is not a gRPC call: use snippet "curl", "dart_http" or "dio"`, 'invalid');
+      return toGrpcurl(e, { grpc: this.deps.grpc, projectRoot: this.deps.projectRoot(), decryptHosts: this.deps.host.grpcDecryptHosts, redact: this.redact });
+    }
+    if (e.kind === 'grpc') throw new AgentToolError(`exchange "${e.id}" is a gRPC call: use snippet "grpcurl"`, 'invalid');
     const headers = (this.redact ? redactHeaders(e.requestHeaders) : e.requestHeaders) ?? {};
     let body: Body | undefined = e.requestBody;
     if (body && body.encoding === 'utf8') {

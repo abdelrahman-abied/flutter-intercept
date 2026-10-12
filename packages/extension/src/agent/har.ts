@@ -164,6 +164,7 @@ function grpcFields(e: Exchange, opts: HarOptions): Record<string, unknown> {
         ? {
             service: info.service,
             method: info.method,
+            ...(info.web ? { web: info.web } : {}),
             ...(info.statusCode !== undefined ? { statusCode: info.statusCode } : {}),
             ...(info.statusMessage !== undefined ? { statusMessage: r ? redactText(info.statusMessage) : info.statusMessage } : {}),
             ...(info.trailersOnly ? { trailersOnly: true } : {}),
