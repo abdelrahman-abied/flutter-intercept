@@ -36,7 +36,7 @@ loop + zero-code on every device.
 | Flutter Web CORS / XMLHttpRequest errors | SO 130K + 101K + 74K views; [flutter#46904](https://github.com/flutter/flutter/issues/46904) +49; DevTools doesn't cover web | ❌ gap |
 | DevTools Network unreliable | [#368](https://github.com/flutter/devtools/issues/368) +125, [#1952](https://github.com/flutter/devtools/issues/1952) +54, regressions [#9203](https://github.com/flutter/devtools/issues/9203) (58 comments); open: body search [#7624](https://github.com/flutter/devtools/issues/7624), request origin [#7807](https://github.com/flutter/devtools/issues/7807) | 🟡 always-on capture beats it; no search / origin |
 | Auth token refresh debugging | [SO 56740793](https://stackoverflow.com/q/56740793) 112K views; [dio#50](https://github.com/cfug/dio/issues/50) +28, [dio#590](https://github.com/cfug/dio/issues/590) +28 | ❌ |
-| WebSocket / SSE / gRPC | [devtools#2044](https://github.com/flutter/devtools/issues/2044) gRPC +26 (most-voted open Network request); web_socket_channel 11.4M/mo | ✅ WebSocket / SSE (0.5); ✅ gRPC (0.10, grpc-dart): full view for h2c and decrypt hosts, TLS by default metadata only |
+| WebSocket / SSE / gRPC | [devtools#2044](https://github.com/flutter/devtools/issues/2044) gRPC +26 (most-voted open Network request); web_socket_channel 11.4M/mo | ✅ WebSocket / SSE (0.5); ✅ gRPC (0.10, grpc-dart): full view for h2c and decrypt hosts, TLS by default metadata only; gRPC-Web and opt-in iOS simulator TLS (0.13) |
 | Emulator → localhost, macOS entitlement, cleartext | SO 263K, 63K, 19K views | ❌ easy win |
 | In-app inspectors that need code | pretty_dio_logger 320K/mo, talker_dio_logger 168K, alice 33K, chucker_flutter 21K… ≈575K/mo | the audience a zero-code tool converts |
 
@@ -161,13 +161,38 @@ and `mock` (gRPC has `grpcMock`). As built: docs/spikes/grpc.md "As built — pr
 | **Agents** | `resend_request` with `grpc.messagesJson` or `grpc.messages` (redacted values restored), `add_rewrite` trailers and gRPC validation, `add_map_remote` on gRPC (loopback only). |
 | **Webview** | **More rules…** (rewrite / script / map remote for a route), trailers fields in the rewrite editor, gRPC notes per action, gRPC edit & resend composer, script templates with gRPC hooks. |
 
-**Next / considered (gRPC follow-ups)**
-- A gRPC-Web view (today plain HTTP rows without message decoding).
+**Next / considered (gRPC follow-ups)** — the gRPC-Web view, the simulator trust and the grpcurl snippet were built in
+0.13.0 (below); connectrpc over TLS is still open.
+
+### 0.13.0 — gRPC-Web, grpcurl, iOS simulator trust, performance and quality (built 2026-10-12, CONTRACTS §19, docs/REVIEW-13.md, docs/PERF-1.md, docs/QUALITY-1.md)
+
+Owner instruction: take every decision in the project's interest. Spike: docs/spikes/ios-sim-trust.md (iOS 26.5). As
+built: docs/spikes/grpc.md "As built — proxy (0.13.0)".
+
+| Item | Notes |
+|---|---|
+| **gRPC-Web as gRPC** | `application/grpc-web(-text)(+proto)` stays an HTTP flow (HTTP rules, CORS, HTTP-level breakpoints) but is shown as `kind: 'grpc'` with `grpc.web`: frames from both bodies (base64 for `-text`), the trailer frame → trailers and status, streamed parsing. Passive, work-bounded reader (≤ 1000 frames kept, 10 000 read, 16 MB decoded, first trailer frame only, ≤ 16 KB). `grpcMock` answers in gRPC-Web format with CORS and a local preflight (`max-age 0`); `block` → trailers-only `14`; `mutate` → passthrough with a note. |
+| **grpcurl snippet** | `SnippetFormat 'grpcurl'` for HTTP/2 and gRPC-Web calls: `-plaintext` for h2c, never `-insecure` (REVIEW-13 #4), `-import-path` / `-proto` for workspace `.proto` methods else a reflection note, `-d` from the schema (client streaming: all messages), protocol and browser headers dropped, redacted for agents. |
+| **iOS simulator CA trust** | Opt-in `grpc.trustOnSimulator` (user settings only; sidecar setting; CLI `--trust-simulator`), Trust / Remove commands. `src/iosSimTrust.ts`: booted simulators only, record first, `simctl keychain add-root-cert`, confirm the row; removal deletes exactly our `TrustStore.sqlite3` row (never `reset`), reference-counted across windows, on session end / setting off / proxy stop / `recover()` after a crash. Decrypt-all only while every session is on a trusting simulator; learned pins (TLS alert, or two rejections in 60 s; 10 min; never `decryptHosts`) pass pinned hosts through. |
+| **Notes** | `Exchange.notes` (≤ 20 × 300 chars) for informational lines; `error` only for failures. Webview, agents, HAR `_notes`, recordings. |
+| **Shared rules module** | `@flutter-intercept/proxy/grpc-meta`: reserved metadata, status names, limits, Map Remote target checks, loopback, script template. Behaviour changes: `?query` targets refused everywhere, sequences ≤ 50 steps everywhere, stricter metadata names. |
+| **Performance (PERF-1)** | Activation no longer evaluates the proxy (require ~124 → ~73 ms), bundle 2.77 → 2.53 MB; O(1) evict, lazy base64 for streamed frames, no duplicate response buffer, per-socket LAN gate cache, frame overhead 150 B. gRPC CPU per call −11%, streaming +14%, HTTPS small −25%. Budgets B2 / B4 / B10 as tests. |
+| **Quality (QUALITY-1)** | Q0 typecheck in package tests and a protocol drift test; Q1 `intercept-proxy.ts` split into modules behind `ProxyContext`; Q2 shared module; Q3 / Q5 controller and agent API split; Q4 stricter `ProxyLike`; Q6 webview state split; Q8 timing-free proxy tests and a `timing.ts` helper; Q9 notes. |
+| **Security (REVIEW-13)** | Part 1: bounded gRPC-Web reader, approval for shared `grpcMock` headers, prototype-safe trailers, no `-insecure`. Part 2: trust ends with its session and with the setting, pins only on real rejections and expiring, CLI records in `~/Library/Caches/flutter-intercept` (symlink-safe), trust-store path only from `simctl`. |
+
+**Next / considered (0.13 follow-ups)**
+
+- Resend and edit & resend for gRPC-Web calls (refused today).
+- Message-level tools for gRPC-Web: breakpoints on single messages, Mutate JSON, gRPC script hooks.
 - connectrpc over TLS (its HTTP/2 transport uses `SecureSocket.connect`, which the hook can't see).
-- Optional "trust the CA on the iOS simulator" (`simctl keychain add-root-cert`, removed at session end) for a full TLS
-  view with default credentials: untested, touches the simulator's trust store, needs its own spike and security
-  review (docs/spikes/grpc.md "Open decision"). Android needs a writable-system emulator: document only.
-- A `grpcurl` snippet for gRPC calls in **Copy as…** and `get_request` (snippets are HTTP-only today).
+- Show learned pinned hosts in `Status.grpc` with a way to forget them (REVIEW-13 #6).
+- PERF-1 #8: keep recorded bodies as Buffers and decode lazily (≈ 11% CPU on 1 MB responses, RSS headroom).
+- PERF-1 #10: ECDSA P-256 CA and leaf keys in mockttp (handshake bursts block the loop for ~1.5 ms each).
+- PERF-1 #5: pipeline script hooks on gRPC streams (9.6 k msg/s under a script).
+- QUALITY-1 Q7: one shared host setup for the extension and the sidecar (`activate()` vs `SidecarHost.compose()`,
+  settings wired once, one `openWorkspaceFile`).
+- QUALITY-1 remaining: the rest of Q8 (fake timers, the slow `lan` / `generator` suites), Q10 `errorMessage()` helper, Q11 dead exports and inert
+  `eslint-disable` comments, Q12 test files named by feature.
 
 ## 5. Spikes and decisions before building
 - Dio's async stack depth for request → source (0.3).

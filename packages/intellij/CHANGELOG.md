@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.13.0 (preview)
+
+- **gRPC-Web, grpcurl and TLS gRPC on the iOS simulator**, the same as in the VS Code extension 0.13.0:
+  - Flutter Web's gRPC-Web calls show as gRPC calls with their messages, status and trailers (filter `grpc:web`).
+    gRPC mock and block rules answer them in gRPC-Web format. Message-level breakpoints, Mutate JSON, gRPC script
+    hooks and resend don't apply to them yet.
+  - **Copy as grpcurl** on gRPC calls (TLS verified, never `-insecure`; `-proto` when the method comes from a
+    `.proto` file in the project).
+  - New checkbox in **Settings → Tools → Flutter Intercept → gRPC**: **Make iOS simulators trust the Flutter Intercept
+    CA during a session (decrypts TLS gRPC)**, off by default. Only that certificate is added, and only it is removed
+    when the run ends, when the setting goes off, or after a crash at the next start. Physical devices, Android and
+    macOS are never changed.
+  - Agents: `get_request` `snippet: "grpcurl"`, `grpc.web` on gRPC-Web calls, `grpc.simulatorTrust` in `get_status`,
+    and `notes` on exchanges.
+- **Behaviour changes**: one set of rule checks everywhere. Map Remote targets with a `?query` are refused, sequences
+  have at most 50 steps, and gRPC metadata names are checked more strictly. Shared gRPC mocks that set cookies or CORS
+  headers need approval.
+- **Performance**: proxy gRPC CPU per call −11%, streaming +14%, HTTPS small responses −25% (docs/PERF-1.md).
+- **Quality**: the proxy is split into modules, and the gRPC metadata rules and limits are shared
+  (docs/QUALITY-1.md).
+- **Security**: independent review docs/REVIEW-13.md.
+
 ## 0.12.0 (preview)
 
 - **gRPC tools complete**, the same as in the VS Code extension 0.12.0: rewrite rules change gRPC metadata and

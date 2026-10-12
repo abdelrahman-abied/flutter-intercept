@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.13.0
+
+### gRPC-Web, grpcurl and TLS gRPC on the iOS simulator
+
+- **gRPC-Web shown as gRPC.** Flutter Web's `GrpcWebClientChannel` calls (`application/grpc-web`, `+proto` and
+  `grpc-web-text`) are listed as gRPC calls with a **gRPC-Web** badge: the method, the gRPC status, the trailers
+  (from the trailer frame or a trailers-only answer) and every message, decoded with the app's schema. Streamed
+  responses are read as they arrive. Filter with `grpc:web`. **gRPC mock** rules answer them in gRPC-Web format, with
+  CORS headers and a local preflight. **Block** answers `14 UNAVAILABLE`. Every other rule treats them as HTTP
+  requests. Not yet for gRPC-Web: message-level breakpoints, Mutate JSON (passed through with a note), gRPC script
+  hooks, and resend (refused).
+- **Copy as grpcurl** on gRPC calls (HTTP/2 and gRPC-Web): `-plaintext` for h2c, the metadata without protocol
+  headers, `-d` with the request message(s) as JSON when the schema decodes them, and `-import-path` / `-proto` when
+  the method comes from a `.proto` file in the workspace (otherwise a note that the server needs reflection). TLS is
+  always verified: never `-insecure`.
+- **TLS gRPC on the iOS simulator, opt-in.** `flutterIntercept.grpc.trustOnSimulator` (user settings only, off by
+  default) makes the session's booted iOS simulator trust the Flutter Intercept CA. TLS gRPC with default credentials
+  is then decrypted with no app change. New commands: **Trust the CA on this iOS Simulator** and **Remove the CA from
+  this iOS Simulator**.
+  - Only that certificate is added (never the key), and only it is removed: at session end, when the setting goes
+    off, when the proxy stops, or after a crash at the next start. A CA you trusted yourself is left in place.
+  - Every TLS gRPC host is decrypted only while every running session is on a trusting simulator.
+  - A host whose app rejects the proxy's certificate (a TLS alert, or two rejected handshakes within a minute) is
+    passed through undecrypted for 10 minutes, with a note.
+  - Physical iPhones, Android and macOS are never changed.
+  - The panel's status line names the trusting simulators.
+- **Notes.** Informational lines (a rule that didn't apply, a message too large to pause) are now notes on the
+  exchange, shown in the details, in HAR exports (`_notes`) and to agents (`notes`). `error` is only set for real
+  failures.
+
+### Agent API
+- `get_request` takes `snippet: "grpcurl"` for gRPC calls, built from the redacted view.
+- gRPC-Web calls are `kind: "grpc"` with `grpc.web` (`"binary"` / `"text"`), also in HAR (`_grpc.web`).
+  `add_grpc_mock` and `add_block` answer them, and `resend_request` refuses them.
+- `get_status` shows `grpc.simulatorTrust` (the simulators and whether every TLS gRPC call is decrypted). No agent
+  tool can add or remove the trust.
+- `get_request` / `list_requests` return `notes`.
+
+### Behaviour changes
+- One set of rule checks for the panel, the rules file, agents and the proxy:
+  - A Map Remote target with a `?query` is refused everywhere. Such a rule in a rules file now shows as invalid.
+  - Sequences have at most 50 steps everywhere (the panel allowed 20).
+  - Reserved gRPC metadata is checked more strictly, with one wording: invalid names, and connection headers in
+    trailers and gRPC mock headers, are refused.
+- A shared gRPC mock that sets cookies or `Access-Control-*` headers now waits for approval, like an HTTP mock.
+- The script templates have one source (with the gRPC hooks), so a rule made from a request starts from the same
+  template as one made in the editor.
+
+### Performance
+- Activation no longer loads the proxy: `require` of the extension ~124 → ~73 ms in the PERF-1 test build, and the
+  bundle 2.77 → 2.53 MB (zod locales trimmed to English).
+- Proxy: gRPC CPU per unary call −11%, server-streaming throughput +14%, HTTPS small responses −25% CPU per request.
+  The exchange store no longer slows down when full, streamed messages are base64-encoded only when shown, and
+  response bodies are no longer buffered twice. Details: docs/PERF-1.md.
+
+### Quality
+- The proxy is split into modules behind one context, and the extension's agent API, controller and webview state
+  into smaller files. Reserved gRPC metadata, status names, limits and Map Remote checks come from one shared module
+  (`@flutter-intercept/proxy/grpc-meta`). Every package type-checks in its tests. Details: docs/QUALITY-1.md.
+
+### Security
+- Independent review: docs/REVIEW-13.md (gRPC-Web, grpcurl and iOS simulator trust). The gRPC-Web reader is bounded
+  by frames, decoded bytes and trailers, and its trailer maps are prototype-safe. Shared gRPC mock headers need
+  approval. grpcurl never uses `-insecure`. Simulator trust ends with its session and when the setting goes off.
+  Learned pins need a real certificate rejection and expire. The CLI's records live outside the project and are
+  written symlink-safely.
+
 ## 0.12.0
 
 ### gRPC tools complete

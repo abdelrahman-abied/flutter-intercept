@@ -57,7 +57,8 @@ node packages/cli/dist/cli.js test -d macos --network-profile slow-3g -- --flavo
 | `--junit <file>` | Write the assertion results as JUnit XML. |
 | `--no-redact` | Keep secrets in the HAR and in assertion messages. |
 | `--grpc-decrypt-host <glob>` | Decrypt gRPC over TLS to this host (repeatable). Only for apps that trust the Flutter Intercept CA in debug builds; other TLS gRPC is listed as an undecrypted tunnel. |
-| `--no-grpc` | Let the app's gRPC calls connect directly (not intercepted). Can't be combined with `--grpc-decrypt-host`. |
+| `--no-grpc` | Let the app's gRPC calls connect directly (not intercepted). Can't be combined with `--grpc-decrypt-host` or `--trust-simulator`. |
+| `--trust-simulator` | iOS simulator only: the simulator trusts this run's CA, so TLS gRPC with default credentials is decrypted (every host, except passthrough hosts and hosts the app pins). Only that certificate is added, and only it is removed when the run ends, or by the next run after a crash. Ignored, with a log line, on other devices. |
 | `--flutter <path>` | Flutter executable (default: `$FLUTTER_ROOT/bin/flutter`, else `flutter` on `PATH`). |
 
 **How each device reaches the proxy:** Android emulators (`emulator-*`) use `10.0.2.2`. Physical Android devices
@@ -283,7 +284,7 @@ npx flutter-intercept-cli test -d macos --har build/traffic.har
   messages replaced by zeros of the same size and no request hashes: replaying that copy answers several calls to one
   method in recorded order. gRPC over TLS is an undecrypted tunnel unless the host is passed
   with `--grpc-decrypt-host` and the app trusts the run's CA in debug builds (`onBadCertificate`; the CA is new for
-  each run, so pinning it isn't practical here). Shared rewrite, script and Map Remote rules apply to gRPC calls too
+  each run, so pinning it isn't practical here), or the run is on an iOS simulator with `--trust-simulator`. Shared rewrite, script and Map Remote rules apply to gRPC calls too
   (those that need approval only with `--approve-shared-rules`); script hooks get each message as `base64` only,
   without `json`. The other gRPC limits of the extension apply (obfuscated builds, connectrpc over TLS, apps that
   replace `IOOverrides.global`).
@@ -292,4 +293,9 @@ npx flutter-intercept-cli test -d macos --har build/traffic.har
 - Run one CLI at a time per project: the generated files under `.dart_tool/flutter_intercept/` and
   `integration_test/.flutter_intercept/` are shared.
 - The run's certificate authority lives in a temporary directory, only the generated entry trusts it, and it is
-  deleted when the run ends. Nothing is installed on the device or the machine.
+  deleted when the run ends. Nothing is installed on the device or the machine, except with `--trust-simulator`: the
+  iOS simulator then trusts that one certificate (never the key) until the run ends. The CLI keeps a record of it in
+  `~/Library/Caches/flutter-intercept/sim-trust.json` (outside the project) so that the next run removes it after a
+  crash. Physical devices, Android and macOS are never changed.
+- Shared rules are checked the same way as in the editor: a Map Remote target with a `?query` is refused and a
+  sequence has at most 50 steps.

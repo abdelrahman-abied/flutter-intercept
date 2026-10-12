@@ -9,7 +9,7 @@ and the traffic shows up.
 - Works with **Dio**, **package:http** and plain **`HttpClient`**, which covers anything built on `dart:io`.
 - **gRPC** calls from grpc-dart are intercepted too, each message decoded with your app's own generated code (or
   your `.proto` files). Pause, edit, mock, rewrite, script, reroute, resend, record and replay them like HTTP
-  requests.
+  requests, or copy one as a `grpcurl` command. gRPC-Web calls from Flutter Web are shown as gRPC calls too.
 - HTTPS works too, and you don't install a certificate on the device, simulator or Mac.
 - Your app's code is never changed. Nothing is added to `pubspec.yaml`, and `flutter build` / CI never see the
   tool.
@@ -84,8 +84,12 @@ and the traffic shows up.
   `onGrpcStatus` on its messages and status, **Map remote** sends it to another server, and **Resend** / **Edit and
   resend** send it again with its recorded or edited messages. **More rules…** on a call starts any of these rules for
   its method.
+- **gRPC-Web** calls from Flutter Web (`GrpcWebClientChannel`) are shown as gRPC calls, with their messages, status
+  and trailers; gRPC mock and block rules answer them in gRPC-Web format.
+- **Copy as grpcurl** turns a gRPC call into a `grpcurl` command that calls the real server.
 - gRPC over TLS is listed as an undecrypted connection, unless your app trusts Flutter Intercept's CA in debug builds
-  and you list the host in `flutterIntercept.grpc.decryptHosts`.
+  and you list the host in `flutterIntercept.grpc.decryptHosts`. On an **iOS simulator**, the opt-in
+  `flutterIntercept.grpc.trustOnSimulator` makes the simulator trust the CA for the session, with no app change.
 
 **Team rules and scenarios**
 - **Share** moves a rule into `.vscode/flutter-intercept.json`, committed with your project, so the whole team
@@ -123,7 +127,8 @@ and the traffic shows up.
 - A banner names hosts whose requests bypass the proxy (an `HttpOverrides` zone or a custom `connectionFactory`).
 
 **Copy and resend**
-- **Copy as cURL**, **Copy as Dart (http)** or **Copy as Dio** from the detail pane or a row's right-click menu.
+- **Copy as cURL**, **Copy as Dart (http)** or **Copy as Dio** from the detail pane or a row's right-click menu;
+  **Copy as grpcurl** for gRPC calls.
 - **Resend** a request unchanged, or **Edit and resend** it. The new request is listed with a link to the original.
   gRPC calls too ([details](#resend-a-grpc-call-or-edit-it-and-resend)).
 
@@ -185,7 +190,7 @@ dark and high contrast.
 |---|---|
 | **Android emulator** | The app reaches the proxy at `10.0.2.2`. No setup. |
 | **Android physical device** (via adb) | Flutter Intercept runs `adb reverse` for the proxy port and removes it when the last session ends. adb is found through `ANDROID_HOME`/`ANDROID_SDK_ROOT`, the default SDK location, or `PATH`. |
-| **iOS simulator** | Uses `localhost`. No setup. |
+| **iOS simulator** | Uses `localhost`. No setup. Optional, for TLS gRPC: [trust the CA on the simulator](#see-tls-grpc-on-the-ios-simulator) for the session. |
 | **macOS desktop** | Uses `localhost`. The app needs the `com.apple.security.network.client` entitlement, which any macOS app that already does networking has. |
 | **Plain Dart programs** (`bin/main.dart`) | Intercepted the same way. |
 | **iPhone** (physical) | Supported, after some one-time setup; see [iPhone](#iphone) below. Verified over Wi-Fi. On Apple Silicon Macs, a USB connection also needs Rosetta. |
@@ -294,7 +299,8 @@ Over MCP there are also resources (`intercept://exchange/{id}`, `intercept://pau
 `intercept://contract/{id}`) and prompts (`debug-failing-request`, `test-error-states`, `verify-change`,
 `build-api-layer-from-traffic`).
 
-`get_request` can also return the request as a cURL, Dart http or Dio snippet. `add_mock`, `add_block` and
+`get_request` can also return the request as a cURL, Dart http or Dio snippet (a gRPC call: `snippet: "grpcurl"`).
+`add_mock`, `add_block` and
 `add_breakpoint` take `times` and `ttlMs`, so rules an agent adds can clean themselves up.
 
 gRPC calls are `kind: "grpc"` in `list_requests`, `wait_for_request` and `assert_traffic`; `get_request` and
@@ -305,7 +311,10 @@ and `resume_request` takes `grpc: {messageJson | message | drop}` for a message 
 end of the call. `add_mutation` changes fields in gRPC response messages, and the recording tools include gRPC calls.
 `resend_request` sends a gRPC call again with its recorded messages, or with `grpc: {messagesJson | messages}`;
 `add_rewrite` changes gRPC metadata and, with `response.setTrailers` / `removeTrailers`, the trailers; and
-`add_map_remote` sends gRPC calls to a local server too.
+`add_map_remote` sends gRPC calls to a local server too. gRPC-Web calls from Flutter Web are gRPC calls with
+`grpc.web` set (`"binary"` or `"text"`); `add_grpc_mock` and `add_block` answer them, `resend_request` refuses them.
+Informational lines from the proxy (a rule that didn't apply, a message too large to pause) are in `notes`; `error`
+is only set for real failures.
 
 In VS Code the tools are named `flutter_intercept_<tool>`; over MCP they use the names above.
 
@@ -373,6 +382,8 @@ Intercept as its proxy and trusts only its CA (pinned by key); your everyday bro
   preflights. **Add CORS rule (dev only)** adds the CORS headers to a real API's responses while you develop —
   your server still needs the right CORS setup for production.
 - Chrome's own background requests are hidden; **Show browser traffic** shows them.
+- gRPC-Web calls (`GrpcWebClientChannel`) are shown as gRPC calls with their decoded messages; see
+  [See gRPC-Web calls from Flutter Web](#see-grpc-web-calls-from-flutter-web).
 - Everything you open in that debug Chrome window goes through the proxy and is recorded (like any site you
   browse there), so keep it to your app. Launches that use your own Chrome profile (`--user-data-dir`) are not
   intercepted.
@@ -470,24 +481,27 @@ endpoints.
 52. [Change gRPC calls with a script](#change-grpc-calls-with-a-script)
 53. [Send gRPC calls to another server](#send-grpc-calls-to-another-server)
 54. [Resend a gRPC call, or edit it and resend](#resend-a-grpc-call-or-edit-it-and-resend)
+55. [See gRPC-Web calls from Flutter Web](#see-grpc-web-calls-from-flutter-web)
+56. [Copy a gRPC call as grpcurl](#copy-a-grpc-call-as-grpcurl)
+57. [See TLS gRPC on the iOS simulator](#see-tls-grpc-on-the-ios-simulator)
 
 **Devices**
 
-55. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
-56. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
-57. [Run on a physical iPhone](#run-on-a-physical-iphone)
-58. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
+58. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
+59. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
+60. [Run on a physical iPhone](#run-on-a-physical-iphone)
+61. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
 
 **AI agents**
 
-59. [Connect an AI agent](#connect-an-ai-agent)
-60. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
-61. [Control what agents can see and do](#control-what-agents-can-see-and-do)
-62. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
-63. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
-64. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
-65. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
-66. [Let agents work with gRPC calls](#let-agents-work-with-grpc-calls)
+62. [Connect an AI agent](#connect-an-ai-agent)
+63. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
+64. [Control what agents can see and do](#control-what-agents-can-see-and-do)
+65. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
+66. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
+67. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
+68. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
+69. [Let agents work with gRPC calls](#let-agents-work-with-grpc-calls)
 
 ### Run your app with interception
 
@@ -640,7 +654,8 @@ You'll reproduce a request outside the app.
 
 **You should see:** a short "Copied as …" notice; paste the snippet into a terminal, a test or a bug report.
 
-**Tip:** the snippet contains real headers, including auth tokens. Check it before sharing.
+**Tip:** the snippet contains real headers, including auth tokens. Check it before sharing. gRPC calls copy as
+`grpcurl` instead: see [Copy a gRPC call as grpcurl](#copy-a-grpc-call-as-grpcurl).
 
 ### Resend a request, or edit it and resend
 
@@ -902,7 +917,8 @@ You'll make the first calls fail and later ones succeed, to test retries and rec
 
 **You should see:** the first two requests get 500 and the third reaches the server.
 
-**Tip:** the count restarts whenever you change the rule. A sequence can't contain breakpoints.
+**Tip:** the count restarts whenever you change the rule. A sequence can't contain breakpoints and has at most 50
+steps.
 
 ### Test token refresh with Expire token
 
@@ -967,7 +983,8 @@ You'll point the app at staging or a local backend without changing its URLs.
 original URL. The target's certificate is checked as usual.
 
 **Tip:** requests keep their headers, tokens included, so map only to servers you trust; the editor warns for
-non-local targets. AI agents can only map to local servers (`localhost`, `127.0.0.1`, `::1`). gRPC calls can be
+non-local targets. The target is an `http(s)://` origin or URL prefix without a `?query`, `#fragment` or
+`user:password@`. AI agents can only map to local servers (`localhost`, `127.0.0.1`, `::1`). gRPC calls can be
 mapped too: see [Send gRPC calls to another server](#send-grpc-calls-to-another-server).
 
 ### Change headers, status or body text
@@ -1236,7 +1253,8 @@ You'll make a gRPC method answer with messages and a status you choose, without 
 click **+ Add message** and then **Skeleton**: it fills in an example of the response type with every field. JSON
 messages are encoded with your app's generated code; without it, use **Base64 protobuf**. A non-OK status with no
 messages is sent trailers-only, like a real server error. **Extra headers** and **Extra trailers** add metadata. HTTP
-**Mock response** rules never match gRPC calls. A gRPC mock can also be a step of a
+**Mock response** rules never match gRPC calls. A gRPC mock also answers Flutter Web's gRPC-Web calls, in gRPC-Web
+format. A gRPC mock can also be a step of a
 [sequence](#answer-successive-requests-differently), for example `UNAVAILABLE` twice, then the real server.
 
 ### Pause and edit gRPC messages
@@ -1353,7 +1371,9 @@ You'll see the calls of a channel that uses TLS (`ChannelCredentials.secure()`).
 
 By default such a channel trusts only the system's root certificates, never Flutter Intercept's CA, and Flutter
 Intercept installs nothing on your devices to change that. So the connection is passed through: listed with a lock
-as "gRPC over TLS — not decrypted", with its timing and encrypted byte counts. If your **debug** builds can trust
+as "gRPC over TLS — not decrypted", with its timing and encrypted byte counts. On an **iOS simulator**, the simplest
+way in is to let the simulator trust the CA for the session: see
+[See TLS gRPC on the iOS simulator](#see-tls-grpc-on-the-ios-simulator). Elsewhere, if your **debug** builds can trust
 Flutter Intercept's CA:
 
 1. Let the channel accept certificates issued by Flutter Intercept, in debug builds only:
@@ -1405,7 +1425,9 @@ request headers, response headers and **Trailers**.
 
 **Tip:** only custom metadata can change. Pseudo headers (`:path`, `:authority` …), `content-type`, `te`,
 `grpc-encoding`, `grpc-accept-encoding`, `grpc-status`, `grpc-message`, `grpc-timeout` and
-`grpc-status-details-bin` are refused, and so are values with line breaks. Binary metadata (names ending in `-bin`)
+`grpc-status-details-bin` are refused, and so are names that aren't valid header names, connection headers in
+trailers (`connection`, `host`, `content-length` …) and values with line breaks. The panel, the rules file and agents
+apply the same checks. Binary metadata (names ending in `-bin`)
 takes base64 values. **Replace in body** and **Status** don't apply to gRPC (the body is protobuf): such a rule still
 changes the metadata, and the editor and the call say so. To change the status, use a
 [breakpoint](#pause-and-edit-grpc-messages) or a [script](#change-grpc-calls-with-a-script); to change fields, use
@@ -1495,6 +1517,95 @@ set by the proxy. Rules, the network profile and replay apply to a resent gRPC c
 call recorded from a physical iPhone is resent only while that session's LAN mode is on, and only to servers it
 allows.
 
+### See gRPC-Web calls from Flutter Web
+
+You'll see the gRPC-Web calls of a Flutter Web app as gRPC calls, with their messages, and mock or block them.
+
+1. Use grpc-dart's `GrpcWebClientChannel` as usual, for example
+   `GrpcWebClientChannel.xhr(Uri.parse('https://api.example.com'))`. Nothing to add to the app.
+2. Pick **Chrome** and press **F5** (see [Run a Flutter Web app in Chrome](#run-a-flutter-web-app-in-chrome)).
+3. Each call is one row with a **gRPC-Web** badge (**gRPC-Web (text)** for `grpc-web-text`), the method as the path,
+   the gRPC status and the message counts. Filter them with `grpc:web`.
+4. Select one. As for any gRPC call, the details show the status, the **Trailers** and, in **Messages**, every message
+   decoded with your app's schema. They also show the HTTP side: the request's CORS preflight and an **HTTP body
+   (gRPC-Web frames)** summary.
+5. **Mock this** creates a gRPC mock from the call; **Block this** makes it fail with `14 UNAVAILABLE`.
+
+**You should see:** the mocked call answered in gRPC-Web format (HTTP 200, the messages, then the trailer frame), and
+your app receive your messages and status. The server isn't contacted.
+
+**Tip:** to the proxy a gRPC-Web call is an ordinary HTTP request, so HTTP rules apply as usual: breakpoints (on
+the whole HTTP request or response), rewrite (headers), Map Remote, throttle, faults, CORS (dev only) and the network
+profile. Not yet for gRPC-Web: breakpoints on single messages, **Mutate JSON** (the call goes through unchanged, with
+a note), the gRPC script hooks, and **Resend** / **Edit and resend**. A gRPC mock's **Gap (ms)** doesn't apply
+(gRPC-Web sends one body). Mock answers carry CORS headers when the browser sent an `Origin` and expose
+`grpc-status` / `grpc-message`; a matching mock also answers the browser's preflight. Long and streamed responses
+are read as they arrive, with the same caps as gRPC (64 KB kept per message).
+
+### Copy a gRPC call as grpcurl
+
+You'll turn a recorded gRPC call into a `grpcurl` command that calls the real server again.
+
+1. Select a gRPC call (HTTP/2 or gRPC-Web) and open **Copy request as** in the detail pane (or right-click the row).
+2. Pick **Copy as grpcurl** and paste it into a terminal:
+
+   ```sh
+   # Without -proto, the server must support gRPC reflection (this method's schema isn't from a .proto file in the workspace).
+   grpcurl \
+     -plaintext \
+     -H 'x-tenant: acme' \
+     -d '{"itemId":"42","quantity":2}' \
+     localhost:50051 shop.v1.CartService/AddItem
+   ```
+
+**You should see:** the server's answer as JSON, printed by grpcurl.
+
+**Tip:** `-plaintext` is added for `http://` (h2c) calls. TLS calls are verified as usual: the snippet never adds
+`-insecure`, because it talks to the real server, not to Flutter Intercept. `-d` is the request message as JSON when
+your schema decodes it (a client-streaming call: every request message, in grpcurl's format); without a schema, or
+for a message cut at 64 KB, a comment says so and you add `-d` yourself. When the method comes from a `.proto` file
+in the workspace, the snippet adds `-import-path` and `-proto` (run it from the workspace folder); otherwise the
+server must offer gRPC reflection. Protocol headers (`content-type`, `te`, `grpc-timeout` …) and the browser's
+headers are left out; the rest, auth tokens included, are kept, so check the command before sharing it. The host is
+the one the app used (for example `10.0.2.2` from an Android emulator). A gRPC-Web call is copied as native gRPC, so
+the server (or its gateway) must accept native gRPC. Agents get the same with `get_request` `snippet: "grpcurl"`,
+redacted.
+
+### See TLS gRPC on the iOS simulator
+
+You'll see the calls of a TLS channel with default credentials (`ChannelCredentials.secure()`) on the iOS simulator,
+without changing the app.
+
+1. Open your **user** settings (**Preferences: Open User Settings**) and turn on
+   `flutterIntercept.grpc.trustOnSimulator`. Workspace, folder and launch.json values are ignored.
+2. Pick an iOS simulator and press **F5** (debug or profile). Before the app is built, Flutter Intercept adds its CA
+   certificate to that simulator's trusted roots.
+3. Make the app call the server.
+
+**You should see:** the status line say "iPhone 17 trusts the Flutter Intercept CA until the session ends ·
+decrypting all TLS gRPC", and the TLS calls listed as normal gRPC rows with their messages instead of
+"gRPC over TLS — not decrypted".
+
+**Tip:** without the setting, **Flutter Intercept: Trust the CA on this iOS Simulator** does the same for the running
+session's simulator (only `flutterIntercept.grpc.decryptHosts` hosts are then decrypted), and **Flutter Intercept:
+Remove the CA from this iOS Simulator** takes it away early. What changes and how it's undone:
+
+- Only one certificate is added: Flutter Intercept's CA (never its key), to that simulator only. While it's there,
+  every app and Safari on that simulator trust it.
+- Only that certificate is removed, never the simulator's other certificates (the keychain is never reset). That
+  happens when the last session on that simulator ends, when you turn the setting off, or when the proxy stops.
+  After a crash, it happens at the next start. A CA you had already trusted yourself is left in place.
+- TLS gRPC to every host (except `flutterIntercept.tlsPassthrough` hosts) is decrypted only while every running
+  intercepted session is on a trusting simulator. If one runs elsewhere, only the `grpc.decryptHosts` hosts are.
+- An app that pins its own certificate rejects the proxy's. After a TLS alert, or two rejected handshakes within a
+  minute, that host is passed through undecrypted for 10 minutes, with a note "… pins its certificate; passed
+  through undecrypted". The app sees one or two failed connects and retries as usual. `grpc.decryptHosts` hosts
+  are never passed through this way.
+- Physical iPhones, Android emulators and phones, and macOS desktop are never changed. The simulator must be booted.
+  If its trust store doesn't look as expected, nothing is added and the panel says why.
+- Android Studio / IntelliJ: tick **Make iOS simulators trust the Flutter Intercept CA during a session** under
+  **Settings → Tools → Flutter Intercept → gRPC**. CLI: `--trust-simulator`.
+
 ### Run on an Android emulator or phone
 
 You'll intercept an Android build.
@@ -1519,7 +1630,9 @@ You'll intercept an Apple build that runs on your Mac.
 **You should see:** traffic in the panel, including HTTPS, with no certificate installed anywhere.
 
 **Tip:** a macOS app needs the `com.apple.security.network.client` entitlement (in
-`macos/Runner/DebugProfile.entitlements`). Any macOS app that already makes network calls has it.
+`macos/Runner/DebugProfile.entitlements`). Any macOS app that already makes network calls has it. For gRPC over TLS
+on the simulator, see [See TLS gRPC on the iOS simulator](#see-tls-grpc-on-the-ios-simulator) (macOS desktop is
+never changed).
 
 ### Run on a physical iPhone
 
@@ -1709,6 +1822,9 @@ You'll have an agent read, mock, pause, change, reroute, resend, record and chec
    - "Send `x-feature-flags: new-cart` with every `CartService` call and drop the `x-debug-info` trailer."
      (`add_rewrite` with `request.setHeaders` and `response.removeTrailers`)
    - "Point `CartService` at my local server on port 9090." (`add_map_remote` to `http://localhost:9090`)
+   - "Give me a grpcurl command for the last `AddItem` call." (`get_request` with `snippet: "grpcurl"`)
+   - "Which gRPC-Web calls does the web build make, and which failed?" (`list_requests` with `kind: "grpc"`, items
+     with `grpc.web`)
 3. Approve the changes when the client asks.
 
 **You should see:** `[agent] …` gRPC rules in **Rules**, and decoded messages in the agent's answers with secrets
@@ -1728,6 +1844,11 @@ is refused when a recorded request message was cut (64 KB) and no replacements a
 protocol metadata (`grpc-status`, `grpc-timeout`, `content-type` …) and needs base64 for `-bin` values; its
 `replaceBody` and `response.status` don't apply to gRPC (use `add_mutation` or a breakpoint). Agents can't add
 scripts, and `add_map_remote` only maps to local servers.
+
+gRPC-Web calls (`grpc.web`) take `add_grpc_mock`, `add_block` and the HTTP-level tools; `resend_request` and
+message-level breakpoints, mutations and edits don't apply to them yet. The grpcurl snippet is built from the
+redacted view and never has `-insecure`. `get_status` shows `grpc.simulatorTrust` (the simulators that trust the CA,
+and whether every TLS gRPC call is decrypted); no agent tool can add or remove that trust or change the setting.
 
 ## Settings and commands
 
@@ -1750,11 +1871,13 @@ scripts, and `add_map_remote` only maps to local servers.
 | `flutterIntercept.tlsPassthrough` | `[]` | Hosts (globs, e.g. `*.bank.example`) whose HTTPS is passed through without decryption, for apps that pin certificates. Listed as tunnels. |
 | `flutterIntercept.grpc.enabled` | `true` | Intercept the app's gRPC calls (grpc-dart, connectrpc over h2c). Off: they connect directly, and no protobuf schema is read (generated `*.pb*.dart` or `.proto` files). Applies at the next launch. |
 | `flutterIntercept.grpc.decryptHosts` | `[]` | Hosts (globs, e.g. `*.staging.example`) whose gRPC over TLS is decrypted. Only for apps that trust the Flutter Intercept CA in debug builds; other TLS gRPC is listed as an undecrypted tunnel. |
+| `flutterIntercept.grpc.trustOnSimulator` | `false` | Make an **iOS simulator** trust the Flutter Intercept CA while an intercepted session runs on it, so TLS gRPC with default credentials is decrypted. Only that certificate is added and later removed; physical devices are never changed. User settings only. See [See TLS gRPC on the iOS simulator](#see-tls-grpc-on-the-ios-simulator). |
 | `flutterIntercept.clientCertificates` | `[]` | Client certificates for servers that require mTLS: `{host, pfx}` or `{host, cert, key}` (paths). User settings only; passphrases via the command below. |
 | `flutterIntercept.upstreamProxyIgnoreCertErrors` | `false` | Accept any certificate from servers reached through the upstream proxy. Only for a proxy that decrypts HTTPS itself (Charles, Burp). The panel shows "certificate checks OFF" while it's on. |
 
-`flutterIntercept.upstreamProxy`, `flutterIntercept.upstreamProxyIgnoreCertErrors` and the `flutterIntercept.agent.*`
-settings are read from your **user** settings only. A workspace's `.vscode/settings.json` can't set them, so a
+`flutterIntercept.upstreamProxy`, `flutterIntercept.upstreamProxyIgnoreCertErrors`,
+`flutterIntercept.grpc.trustOnSimulator` and the `flutterIntercept.agent.*` settings are read from your **user**
+settings only. A workspace's `.vscode/settings.json` can't set them, so a
 cloned project can't reroute your traffic or widen agent access.
 
 | Command | What it does |
@@ -1765,6 +1888,7 @@ cloned project can't reroute your traffic or widen agent access.
 | **Flutter Intercept: Export Traffic as OpenAPI** / **as Postman Collection** | Writes the recorded traffic to an OpenAPI 3.1 file or a Postman collection. |
 | **Flutter Intercept: Set Client Certificate Passphrase…** | Stores (or clears) the passphrase of a client certificate in VS Code's secret storage. |
 | **Flutter Intercept: Save CA Certificate…** | Saves the public CA certificate, for example to trust it in an app's debug network security config. |
+| **Flutter Intercept: Trust the CA on this iOS Simulator** / **Remove the CA from this iOS Simulator** | Adds Flutter Intercept's CA to the trusted roots of the running session's iOS simulator until the session ends, or removes it now (only the certificate Flutter Intercept added). |
 | **Flutter Intercept: Toggle Interception** | Same as clicking `Intercept: on/off` in the status bar. |
 | **Flutter Intercept: Clear Traffic** | Clears the list. Requests still in flight stay. |
 | **Flutter Intercept: Debug with Intercept** | Starts an intercepted debug session directly. A fallback if F5 isn't picked up. |
@@ -1794,17 +1918,23 @@ What isn't intercepted, or behaves differently while intercepting:
 - **A custom `connectionFactory`** that ignores the proxy host and port bypasses the proxy (a banner names the host).
 - **WebSockets**: block, fault and throttle rules apply; mocks, breakpoints and mutations pass sockets through.
 - **gRPC**:
-  - Contents are shown for plain-text (h2c) channels and for `flutterIntercept.grpc.decryptHosts`. Other gRPC over
-    TLS is listed as an undecrypted tunnel (timing and byte counts) that can only be blocked or failed.
+  - Contents are shown for plain-text (h2c) channels, for `flutterIntercept.grpc.decryptHosts`, and on an iOS
+    simulator that trusts the CA (`flutterIntercept.grpc.trustOnSimulator`). Other gRPC over TLS is listed as an
+    undecrypted tunnel (timing and byte counts) that can only be blocked or failed. Physical iPhones, Android and
+    macOS have no simulator-trust option. A host whose app pins its certificate is passed through for 10 minutes
+    after it rejects the proxy's certificate.
   - Recognised by grpc-dart's (and connectrpc's) code on the call stack, so builds with `--obfuscate` or
     `--split-debug-info` connect directly.
   - An app that replaces `IOOverrides.global` (or runs its code in its own `IOOverrides` zone) loses gRPC
     interception; its HTTP traffic is unaffected. Layering `IOOverrides.runZoned(createFile: …)` is fine.
-  - Not intercepted: connectrpc over TLS, custom `ClientTransportConnector`s. gRPC-Web (`GrpcWebClientChannel`, and
-    Flutter Web) is ordinary HTTP and shows as such, without message decoding.
+  - Not intercepted: connectrpc over TLS, custom `ClientTransportConnector`s.
+  - gRPC-Web (Flutter Web's `GrpcWebClientChannel`) is shown as gRPC and answered by gRPC mock and block rules, but
+    otherwise handled as HTTP: no breakpoints on single messages, Mutate JSON, gRPC script hooks or resend yet.
+  - **Copy as grpcurl** renders gRPC-Web calls as native gRPC, and verifies TLS (no `-insecure`).
   - CORS rules and HTTP **Mock response** rules don't apply to gRPC calls (use a gRPC mock); every other rule does.
     Rewrites change metadata and trailers only, not the body or the status. HAR exports and recordings include
-    gRPC calls; OpenAPI, Postman, the cURL / Dart / Dio snippets and the model and fixture generators skip them.
+    gRPC calls; OpenAPI, Postman, the cURL / Dart / Dio snippets (gRPC calls copy as grpcurl) and the model and
+    fixture generators skip them.
   - Script hooks see messages up to 1 MB, at most 1000 per call; the rest go through unchanged.
   - Client-streaming and bidi calls are resent with all their
     messages first, then a half-close; up to 100 messages (16 MB) and a 60 s deadline by default.
@@ -1828,6 +1958,9 @@ What isn't intercepted, or behaves differently while intercepting:
 - **Rewrite** body replacements are plain text (no regexes, up to 20 per body); binary bodies are left untouched.
 - **Shared rules** that could redirect or alter your traffic, and every shared script, don't run on a machine until
   they're approved there.
+- **Rule checks are the same everywhere** (panel, rules file, agents, proxy) since 0.13.0. A Map Remote target with a
+  `?query` is refused (an earlier rules file may now show it as invalid), sequences have at most 50 steps, and gRPC
+  metadata names are checked more strictly.
 - **Scripts** are synchronous, get 200 ms per call and no timers, network, files or modules. Bodies over 1 MB or
   binary bodies reach them as omitted. They don't apply to WebSockets.
 - **Screenshots** capture Flutter's own content (not the status bar or native dialogs) when taken through the debug
@@ -1867,9 +2000,23 @@ What isn't intercepted, or behaves differently while intercepting:
   never answered (a "silent" tunnel). It gets the same checks as any other connection (in iPhone sessions, the token
   and the phone lock), and its marker header never reaches a server. Every other socket the app opens goes direct,
   as without Flutter Intercept.
-- **gRPC over TLS stays encrypted unless your app already trusts the CA.** Nothing is added to any trust store.
+- **gRPC over TLS stays encrypted unless your app already trusts the CA, or you opt in on a simulator.**
   `flutterIntercept.grpc.decryptHosts` (a workspace can set it) only decrypts apps that accept Flutter Intercept's CA
   in debug builds; for any other app, a listed host just fails its TLS handshake.
+- **iOS simulator trust is opt-in, scoped and undone.** Only `flutterIntercept.grpc.trustOnSimulator` in your user
+  settings, or the **Trust** command, adds the CA, and agents can't do either.
+  - Only booted iOS simulators listed by `simctl` are touched. Physical devices, Android and macOS never are.
+  - Exactly one certificate is added (never the key). Exactly that one is removed: at session end, when the setting is
+    turned off, when the proxy stops, or after a crash at the next start. Other certificates stay, and the keychain
+    is never reset. A CA you trusted yourself before is left alone.
+  - While it's there, every app on that simulator trusts the CA.
+  - Records live in VS Code's storage (the CLI's in `~/Library/Caches/flutter-intercept`, never in the project). The
+    trust store's path always comes from `simctl`, never from a record.
+- **The gRPC-Web reader is bounded.** Bodies a server or web page chooses are read with limits on frames, decoded
+  bytes and trailers, so a hostile response can't stall or exhaust the extension. A shared gRPC mock that sets
+  cookies or CORS headers waits for your approval, like an HTTP mock.
+- **grpcurl snippets never disable certificate checks** (`-insecure`): they call the real server with real
+  credentials. Agents get them redacted.
 - **Held gRPC data is bounded.** Breakpoints and Mutate JSON hold whole messages of up to 4 MB, all held gRPC data
   shares one 64 MB budget, decoding for Mutate JSON is limited per call, and a pause ends with its call.
   `.proto` files from the workspace are parsed with size, name-length and time limits.
@@ -1893,7 +2040,7 @@ What isn't intercepted, or behaves differently while intercepting:
   - On first use the extension creates a CA unique to your installation. It's stored in VS Code's extension
     storage on your Mac, readable only by your user.
   - The generated launcher makes the app trust that CA in intercepted sessions. Nothing is installed in any
-    system trust store.
+    system trust store, except an iOS simulator's while you opt in (above).
   - If the proxy isn't reachable, the `DIRECT` fallback keeps normal TLS verification.
 - **Your own pinning:**
   - While the proxy is up, pinning via `badCertificateCallback` or `SecurityContext(withTrustedRoots: false)`

@@ -39,6 +39,11 @@ code, or from `.proto` files in the project when the generated code isn't there.
   Applies to the next run.
 - **Decrypt TLS gRPC for hosts**: one host or glob per line (for example `*.staging.example`). Only for apps that
   trust the Flutter Intercept CA in debug builds; other gRPC over TLS is listed as an undecrypted tunnel.
+- **Make iOS simulators trust the Flutter Intercept CA during a session (decrypts TLS gRPC)**: off by default. While
+  a run is on a booted iOS simulator, that simulator trusts the CA, so TLS gRPC with default credentials is decrypted
+  with no change to the app. Only that certificate is added, and only it is removed when the run ends, when you turn
+  the setting off, or after a crash at the next start. Physical devices, Android and macOS are never changed. Details:
+  [See TLS gRPC on the iOS simulator](../extension/README.md#see-tls-grpc-on-the-ios-simulator).
 
 To use it:
 
@@ -55,7 +60,12 @@ To use it:
    `onGrpcStatus`) or **Map remote** rule for its method. **Resend** sends the call again with its recorded messages;
    **Edit and resend** lets you change the metadata and the messages (JSON or base64) first.
 6. For gRPC over TLS, make debug builds trust the CA (**Tools → Flutter Intercept → Save CA Certificate**, or an
-   `onBadCertificate` callback behind `kDebugMode`) and add the host above.
+   `onBadCertificate` callback behind `kDebugMode`) and add the host above. On an iOS simulator, tick the simulator
+   setting above instead.
+7. **Copy request as → Copy as grpcurl** gives a `grpcurl` command for the call (TLS verified, `-proto` when the
+   method comes from a `.proto` file in the project).
+8. Flutter Web's gRPC-Web calls show as gRPC calls with their messages; gRPC mock and block rules answer them.
+   Message-level breakpoints, Mutate JSON, gRPC script hooks and resend don't apply to them yet.
 
 The VS Code tutorials cover it step by step, starting at
 [See gRPC calls and their messages](../extension/README.md#see-grpc-calls-and-their-messages); the
@@ -67,6 +77,7 @@ The VS Code tutorials cover it step by step, starting at
 - No editor diagnostics for the model check (the results show in the traffic view).
 - Agents can't start or stop the app (`launch_app`, `stop_app`, `hot_restart`): use the IDE's Run and Stop.
 - GitHub Copilot's VS Code tools aren't available; MCP clients (Claude Code, Cursor, Windsurf, Gemini CLI) work.
+- iOS simulator trust is a setting only: there are no **Trust** / **Remove** actions.
 
 ## Build from source
 
