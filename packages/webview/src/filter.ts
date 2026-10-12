@@ -17,7 +17,8 @@
  *                       grpc (gRPC calls, §16); prefix ok, comma = any of
  *   t:grpc              gRPC calls and undecrypted gRPC tunnels (CONTRACTS §16.5: `grpc` is a content class)
  *   grpc:unavailable    gRPC status: a code name (prefix ok, `_` optional) or number 0–16, `error` (any status but OK,
- *                       or ended without one), `pending` (still open), `stream` (more than one message either way);
+ *                       or ended without one), `pending` (still open), `stream` (more than one message either way),
+ *                       `web` (gRPC-Web calls, CONTRACTS §19.1);
  *                       comma = any of; `-grpc:ok` = everything but successful gRPC calls
  *   op:getUser          GraphQL operation name, case-insensitive prefix; comma = any of
  *   cors:problem        CORS diagnosis: problem | ok | preflight | patched (prefix ok, comma = any of)
@@ -66,7 +67,7 @@ export const FILTER_HINT =
   'Filter: words match the URL · m:POST · s:404 s:4xx s:error · t:json|html|image|text|xml|binary|other · ' +
   'body:token body:"a phrase" · h:name h:name=value · state:paused|mocked|blocked|error|simulated|resent · ' +
   'src:file.dart · contract:error|warning|ok|unchecked · kind:ws|sse|http|tunnel|grpc · op:getUser (GraphQL) · ' +
-  't:grpc · grpc:ok|unavailable|14|error|pending|stream · ' +
+  't:grpc · grpc:ok|unavailable|14|error|pending|stream|web · ' +
   'cors:problem|ok|preflight · captured:native · browser:internal|app · -token negates';
 
 /** What a filter can see besides the exchange itself. */
@@ -267,8 +268,9 @@ function grpcPred(raw: string): Pred | string {
     }
     if (v === 'pending' || v === 'open') { preds.push((e) => isGrpc(e) && e.state === 'pending'); continue; }
     if (v === 'stream' || v === 'streaming') { preds.push((e) => isGrpc(e) && isGrpcStreaming(e)); continue; }
+    if (v === 'web') { preds.push((e) => isGrpc(e) && !!e.grpc?.web); continue; } // CONTRACTS §19.1
     const hits = grpcCodesMatching(v);
-    if (!hits.length) return `grpc:${raw} — use a status name (ok, unavailable, …), a code (0–16), error, pending or stream`;
+    if (!hits.length) return `grpc:${raw} — use a status name (ok, unavailable, …), a code (0–16), error, pending, stream or web`;
     hits.forEach((c) => codes.add(c));
   }
   if (codes.size) preds.push((e) => isGrpc(e) && e.grpc?.statusCode !== undefined && codes.has(e.grpc.statusCode));

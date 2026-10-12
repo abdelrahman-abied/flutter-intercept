@@ -64,7 +64,12 @@ export function CoverageBadges({ ex, mini }: {
         </span>
       ) : ex.kind === 'grpc' ? (
         <>
-          <span class={`badge${m} kind-badge kb-grpc`} title={kindTitle(ex)}>{KIND_BADGE.grpc}</span>
+          <span class={`badge${m} kind-badge kb-grpc${ex.grpc?.web ? ' kb-grpc-web' : ''}`} title={kindTitle(ex)}>
+            {ex.grpc?.web ? 'gRPC-Web' : KIND_BADGE.grpc}
+          </span>
+          {ex.grpc?.web === 'text' && (
+            <span class={`badge${m} grpc-text-badge`} title="grpc-web-text: the body is base64">text</span>
+          )}
           {isGrpcStreaming(ex) && (
             <span class={`badge${m} stream-badge`} title="Streaming: more than one message in a direction">stream</span>
           )}

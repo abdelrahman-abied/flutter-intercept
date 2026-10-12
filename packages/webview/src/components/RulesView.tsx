@@ -10,7 +10,7 @@ import {
 } from '../state';
 import { formatTime } from '../util';
 import { ActionEditor, SequenceEditor, type GrpcHooks } from './ActionEditor';
-import { DECODE_TIMEOUT_MS, grpcActionNote, grpcRewriteNote, isGrpc, looksLikeGrpcUrl } from '../grpc';
+import { DECODE_TIMEOUT_MS, grpcActionNote, grpcRewriteNote, isGrpc, isNativeGrpc, looksLikeGrpcUrl } from '../grpc';
 import { suggestScriptFile } from '../scripts';
 import { AgentBadge, Button, useNow } from './bits';
 import { Icon } from './Icon';
@@ -238,7 +238,9 @@ export function RuleEditor({ rule, template, sharedFile, onSave, onCancel }: {
     const test = compileExchangeMatcher({ url: form.url.trim(), method: form.method.trim() || undefined });
     return state.exchanges.filter((e) => isGrpc(e) && test(e)).reverse();
   }, [form.url, form.method, state.exchanges, v.errors.url]);
-  const grpcRoute = grpcMatches.length > 0 || looksLikeGrpcUrl(form.url);
+  // gRPC-Web calls are HTTP requests for every rule (CONTRACTS §19.1): only HTTP/2 gRPC calls make it a gRPC route.
+  const nativeMatches = grpcMatches.filter(isNativeGrpc).length;
+  const grpcRoute = nativeMatches > 0 || (grpcMatches.length === 0 && looksLikeGrpcUrl(form.url));
   const showGrpcNote = !!grpcNote && grpcRoute;
   // CONTRACTS §18.1: body replacements / the status of a rewrite don't apply to gRPC calls.
   const rewriteNote = grpcRoute && form.kind === 'rewrite' && !v.errors.rewrite ? grpcRewriteNote(rewriteFromForm(form.rewrite)) : undefined;

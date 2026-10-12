@@ -1343,3 +1343,10 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
 
 /* v0.12.0 (CONTRACTS §18) */
 .grpc-only-badge { background: transparent; color: var(--vscode-charts-purple); border: 1px solid var(--vscode-charts-purple); font-weight: normal; text-transform: none; }
+
+/* v0.13.0 gRPC-Web (CONTRACTS §19) */
+.kind-badge.kb-grpc-web { white-space: nowrap; }
+.grpc-text-badge { background: transparent; color: var(--fi-muted); border: 1px solid var(--fi-muted); font-weight: normal; }
+.grpc-web-http { display: inline-flex; align-items: center; gap: 4px; }
+.grpc-web-note { flex-basis: 100%; margin: 0; }
+.grpc-web-body { margin-top: 8px; }

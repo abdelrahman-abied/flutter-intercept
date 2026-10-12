@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Exchange, Frame, GrpcDecodedMessage, GrpcEdit, GrpcPause } from '../protocol';
 import {
-  DECODE_TIMEOUT_MS, GRPC_CODES, GRPC_DECRYPT_SETTING, grpcCodeLabel, grpcCountsText, grpcFacts, grpcPath, grpcPauseKey, grpcPauseTitle,
+  DECODE_TIMEOUT_MS, findPreflight, GRPC_CODES, GRPC_DECRYPT_SETTING, GRPC_WEB_NOTE, grpcCodeLabel, grpcCountsText, grpcFacts, grpcPath, grpcPauseKey, grpcPauseTitle,
   grpcVersion, hexTextDump, isBase64, isGrpc, needsDecode, pausedDecoded, reservedGrpcHeader,
 } from '../grpc';
 import { grpcHeaderError, grpcMessageError, headersChanged, headersToRows, rowsToFlatRecord, type HeaderRow } from '../state';
@@ -47,7 +47,10 @@ export function useDecodeDeadline(requestedAt: number | undefined, answered: boo
 
 /** The gRPC status, prominently: "14 UNAVAILABLE — Flutter Intercept: connect ECONNREFUSED", plus the call's facts. */
 export function GrpcStatusSection({ ex }: { ex: Exchange }) {
+  const { state, dispatch } = useApp();
   const g = ex.grpc;
+  // CONTRACTS §19.1: gRPC-Web is an HTTP/1.1 request — show the HTTP side and its CORS preflight too.
+  const preflight = g?.web ? findPreflight(state.exchanges, ex) : undefined;
   const code = g?.statusCode;
   const cls = code === undefined ? (ex.state === 'pending' ? 'pending' : 'none') : code === 0 ? 'ok' : 'err';
   const facts = grpcFacts(ex);
@@ -67,6 +70,20 @@ export function GrpcStatusSection({ ex }: { ex: Exchange }) {
         )}
       </span>
       <span class="muted grpc-facts">{[grpcCountsText(ex), ...facts].join(' · ')}</span>
+      {g?.web && (
+        <span class="grpc-web-http">
+          <span class="badge mini grpc-web-badge">gRPC-Web{g.web === 'text' ? ' (text)' : ''}</span>
+          {' '}HTTP {ex.status ?? '—'}
+          {preflight && (
+            <>
+              {' · '}
+              <button type="button" class="link" onClick={() => dispatch({ type: 'select', id: preflight.id })}
+                title="The browser's CORS preflight for this call">preflight OPTIONS {preflight.status ?? '…'}</button>
+            </>
+          )}
+        </span>
+      )}
+      {g?.web && <div class="hint grpc-web-note">{GRPC_WEB_NOTE}</div>}
     </div>
   );
 }

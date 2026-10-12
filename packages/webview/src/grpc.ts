@@ -45,6 +45,31 @@ export function isGrpc(ex: Pick<Exchange, 'kind'>): boolean {
   return ex.kind === 'grpc';
 }
 
+/** CONTRACTS §19.1: a gRPC-Web call (Flutter Web through the browser) — an HTTP/1.1 request shown as gRPC. */
+export function isGrpcWeb(ex: Pick<Exchange, 'kind'> & Partial<Pick<Exchange, 'grpc'>>): boolean {
+  return ex.kind === 'grpc' && !!ex.grpc?.web;
+}
+
+/** A gRPC call over HTTP/2 (not gRPC-Web): the message-level tools apply. */
+export function isNativeGrpc(ex: Pick<Exchange, 'kind'> & Partial<Pick<Exchange, 'grpc'>>): boolean {
+  return ex.kind === 'grpc' && !ex.grpc?.web;
+}
+
+/** The browser's CORS preflight (OPTIONS) for a gRPC-Web call: the latest one for its URL, started no later. */
+export function findPreflight(all: readonly Exchange[], ex: Pick<Exchange, 'url' | 'startedAt' | 'id'>): Exchange | undefined {
+  for (let i = all.length - 1; i >= 0; i--) {
+    const e = all[i];
+    if (e.id !== ex.id && e.method === 'OPTIONS' && e.cors?.preflight && e.url === ex.url && e.startedAt <= ex.startedAt) return e;
+  }
+  return undefined;
+}
+
+/** Shown on gRPC-Web calls: what works there today. */
+export const GRPC_WEB_NOTE =
+  'gRPC-Web (through the browser): HTTP rules, CORS and HTTP-level breakpoints apply; message-level tools for gRPC-Web ' +
+  '(message breakpoints, Mutate JSON, scripts, resend) come later.';
+export const GRPC_WEB_LATER = 'Message-level tools for gRPC-Web come later';
+
 /** A gRPC connection over TLS that was passed through undecrypted (CONTRACTS §16.2). */
 export function isGrpcTunnel(ex: Pick<Exchange, 'kind' | 'grpcTunnel'>): boolean {
   return ex.kind === 'tunnel' && ex.grpcTunnel === true;
@@ -112,7 +137,7 @@ export function grpcCountsText(ex: Pick<Exchange, 'grpc'>): string {
 
 /** List badge tooltip: "gRPC · pkg.Service/Method · streaming · 1 sent · 3 received · open". */
 export function grpcTitle(ex: Pick<Exchange, 'grpc' | 'url' | 'state'>): string {
-  const parts = ['gRPC', grpcPath(ex).slice(1)];
+  const parts = [ex.grpc?.web ? `gRPC-Web${ex.grpc.web === 'text' ? ' (text)' : ''}` : 'gRPC', grpcPath(ex).slice(1)];
   if (isGrpcStreaming(ex)) parts.push('streaming');
   parts.push(grpcCountsText(ex));
   if (ex.state === 'pending') parts.push('open');

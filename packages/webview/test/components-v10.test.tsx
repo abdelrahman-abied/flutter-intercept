@@ -188,8 +188,9 @@ describe('gRPC detail pane', () => {
     expect(button('Expire token…', bar).disabled).toBe(true);
     expect(button('Resend', bar).disabled).toBe(false); // CONTRACTS §18.4
     expect(button('Break on this', bar).disabled).toBe(false); // CONTRACTS §17.2
-    expect(button(/Copy as/, bar).disabled).toBe(true);
-    expect(button(/Copy as/, bar).title).toMatch(/not gRPC calls/);
+    // CONTRACTS §19.2: gRPC calls copy as grpcurl.
+    expect(button(/Copy as/, bar).disabled).toBe(false);
+    expect(button(/Copy as/, bar).title).toBe('Copy this call as a grpcurl command');
     expect(button(/Edit and resend/, bar).disabled).toBe(false);
     expect(button(/Generate/, bar).disabled).toBe(true);
     expect(button('Block this', bar).disabled).toBe(false);

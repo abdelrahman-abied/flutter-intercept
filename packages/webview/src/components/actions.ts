@@ -3,12 +3,12 @@ import { useApp } from '../context';
 import { contentClassOf } from '../filter';
 import type { Exchange, Rule, RuleAction, SnippetFormat } from '../protocol';
 import type { MutateOp } from '@flutter-intercept/proxy/types';
-import { canResend, describeMutateOp, grpcUnsendable, resendRequest, SNIPPET_FORMATS, SNIPPET_LABEL, unsendableBody } from '../state';
+import { canResend, describeMutateOp, grpcUnsendable, resendRequest, SNIPPET_LABEL, snippetFormatsFor, unsendableBody } from '../state';
 import { corsRuleFor, isNative, NATIVE_READ_ONLY, routeGlob } from '../coverage';
 import { newId, splitUrl } from '../util';
 import { isTunnel, TUNNEL_NO_ACTION } from '../connection';
 import { expireTokenLabel } from '../scenarios';
-import { GRPC_TUNNEL_NO_ACTION, grpcPath, isGrpc, isGrpcTunnel } from '../grpc';
+import { GRPC_TUNNEL_NO_ACTION, GRPC_WEB_LATER, grpcPath, isGrpc, isGrpcTunnel, isGrpcWeb } from '../grpc';
 import type { MenuItem } from './bits';
 
 export interface ExchangeActions {
@@ -30,7 +30,7 @@ export interface ExchangeActions {
   menuItems: MenuItem[];
   resendDisabled?: string; // reason when "Resend" can't be used
   /** Why each intercept action can't be used for this exchange (absent = it can). */
-  off: { mock?: string; block?: string; breakpoint?: string; edit?: string; generate?: string; copy?: string; expire?: string; rules?: string };
+  off: { mock?: string; block?: string; breakpoint?: string; edit?: string; generate?: string; copy?: string; expire?: string; rules?: string; script?: string };
   /** CONTRACTS §18: open the rule editor on a new rewrite / script / map remote rule for this route (unsaved). */
   newRule: (kind: TemplateKind) => void;
   /** The "Rewrite / Script / Map remote for this…" menu items. */
@@ -47,7 +47,6 @@ const WS_NO_RESEND = 'A WebSocket connection can\'t be resent';
 /** CONTRACTS §16.2 / §16.5 / §18: what doesn't apply to a gRPC call, and why. */
 export const GRPC_OFF = {
   generate: 'Dart models and test fixtures are generated from JSON HTTP responses — not gRPC calls',
-  copy: 'cURL / Dart http / Dio snippets are for HTTP requests — not gRPC calls',
   expire: 'The Expire token preset answers HTTP 401 — for gRPC, mock the call with UNAUTHENTICATED instead',
 } as const;
 
@@ -62,6 +61,9 @@ export function interceptOff(ex: Exchange): ExchangeActions['off'] {
     return { mock: t, breakpoint: t, edit: t, generate: t, copy: t, expire: t, rules: t };
   }
   // A gRPC call: every rule (mock → grpcMock) and resend apply (§18); snippets, generators and the preset don't.
+  // CONTRACTS §19.1: gRPC-Web is an HTTP request (mock → grpcMock, block, HTTP-level breakpoints, rewrite, map remote,
+  // CORS); the message-level tools (and resend) come later.
+  if (isGrpcWeb(ex)) return { ...GRPC_OFF, edit: GRPC_WEB_LATER, script: GRPC_WEB_LATER };
   if (isGrpc(ex)) return canResend(ex) ? { ...GRPC_OFF } : { ...GRPC_OFF, edit: 'Wait until the call has finished' };
   // CONTRACTS §14.2: a TLS passthrough tunnel has no request to mock, pause, copy or resend — only Block applies.
   if (isTunnel(ex)) {
@@ -107,6 +109,8 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
     ? NATIVE_READ_ONLY
     : isGrpcTunnel(ex)
       ? GRPC_TUNNEL_NO_ACTION
+    : isGrpcWeb(ex)
+      ? GRPC_WEB_LATER
     : isGrpc(ex)
       ? (!canResend(ex) ? 'Wait until the call has finished'
         : grpcUnsendable(ex) ? `${grpcUnsendable(ex)} Use “Edit and resend”.` : undefined)
@@ -172,7 +176,7 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
   };
   const modelOff = off.generate ?? generateModelDisabled(ex);
   const fixtureOff = off.generate ?? generateFixtureDisabled(ex);
-  const copyItems: MenuItem[] = SNIPPET_FORMATS.map((f) => ({
+  const copyItems: MenuItem[] = snippetFormatsFor(ex).map((f) => ({
     label: `Copy as ${SNIPPET_LABEL[f]}`, onSelect: () => copy(f), ...(off.copy ? { disabled: true, title: off.copy } : {}),
   }));
   const generateItems: MenuItem[] = [
@@ -180,12 +184,13 @@ export function useExchangeActions(ex: Exchange): ExchangeActions {
     { label: 'Generate test fixture', onSelect: generateFixture, disabled: !!fixtureOff, title: fixtureOff ?? 'A JSON fixture and a test that mocks this request' },
   ];
   const newRule = (kind: TemplateKind) => {
-    if (off.rules) return;
+    if (off.rules || (kind === 'script' && off.script)) return;
     dispatch({ type: 'newRuleFrom', rule: ruleTemplateFor(ex, kind) });
   };
-  const ruleItems: MenuItem[] = (Object.keys(TEMPLATE_LABEL) as TemplateKind[]).map((k) => ({
-    label: TEMPLATE_LABEL[k], onSelect: () => newRule(k), ...(off.rules ? { disabled: true, title: off.rules } : { title: TEMPLATE_TITLE[k] }),
-  }));
+  const ruleItems: MenuItem[] = (Object.keys(TEMPLATE_LABEL) as TemplateKind[]).map((k) => {
+    const why = off.rules ?? (k === 'script' ? off.script : undefined);
+    return { label: TEMPLATE_LABEL[k], onSelect: () => newRule(k), ...(why ? { disabled: true, title: why } : { title: TEMPLATE_TITLE[k] }) };
+  });
   const menuItems: MenuItem[] = [
     ...copyItems,
     { label: 'Resend', onSelect: resend, disabled: !!resendDisabled, title: resendDisabled, separatorBefore: true },

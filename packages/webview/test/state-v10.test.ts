@@ -112,7 +112,7 @@ describe('gRPC rows', () => {
     expect(off).toEqual(GRPC_OFF);
     expect(off.mock).toBeUndefined();
     expect(off.block).toBeUndefined();
-    expect(off.copy).toMatch(/not gRPC/);
+    expect(off.copy).toBeUndefined(); // CONTRACTS §19.2: Copy as grpcurl
     expect(off.generate).toMatch(/JSON HTTP responses/);
   });
 

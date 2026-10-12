@@ -10,7 +10,7 @@ import { ContractSection } from './ContractSection';
 import { AgentBadge, Button, CoverageBadges, MenuButton, PauseTimer, StateBadge, StatusText } from './bits';
 import { CORS_DEV_NOTE, isNative, NATIVE_READ_ONLY, requestOrigin, routeGlob, sentCookies } from '../coverage';
 import { frameTotal, hasMessagesTab } from '../frames';
-import { GRPC_TUNNEL_HINT, isGrpc, isGrpcTunnel } from '../grpc';
+import { GRPC_TUNNEL_HINT, GRPC_WEB_LATER, isGrpc, isGrpcTunnel, isGrpcWeb } from '../grpc';
 import { GrpcPauseEditor, GrpcStatusSection, GrpcTunnelExplanation, TrailersSection, useGrpcDecode } from './GrpcViews';
 import { FramesView } from './FramesView';
 import { expireTokenError, expireTokenLabel } from '../scenarios';
@@ -49,7 +49,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
   const [expiring, setExpiring] = useState(false);
   // CONTRACTS §17.3: "mutate this field" on decoded gRPC response messages, like an HTTP JSON body.
   const grpcFields = useMemo<TreeFieldActions | undefined>(() => (grpc
-    ? { mutate: actions.mutateField, disabled: ex.state === 'mocked' ? MOCKED_NOTE : undefined }
+    ? { mutate: actions.mutateField, disabled: isGrpcWeb(ex) ? GRPC_WEB_LATER : ex.state === 'mocked' ? MOCKED_NOTE : undefined }
     : undefined), [grpc, ex.id, ex.state]);
 
   return (
@@ -94,7 +94,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             Expire token…
           </Button>
           <span class="sep" aria-hidden="true" />
-          <MenuButton label="Copy request as" title={actions.off.copy ?? 'Copy this request as code (cURL, Dart http, Dio)'} items={actions.copyItems}
+          <MenuButton label="Copy request as" title={actions.off.copy ?? (grpc ? 'Copy this call as a grpcurl command' : 'Copy this request as code (cURL, Dart http, Dio)')} items={actions.copyItems}
             disabled={!!actions.off.copy}>
             <Icon name="copy" /> Copy as… <Icon name="chevronDown" />
           </MenuButton>
@@ -341,13 +341,14 @@ export function ScriptLog({ ex }: { ex: Exchange }) {
 }
 
 function RequestTab({ ex }: { ex: Exchange }) {
-  if (ex.state === 'paused-request') return isGrpc(ex) ? <GrpcPauseEditor ex={ex} /> : <PauseEditor key={ex.id + ex.state} ex={ex} />;
+  if (ex.state === 'paused-request') return grpcPaused(ex) ? <GrpcPauseEditor ex={ex} /> : <PauseEditor key={ex.id + ex.state} ex={ex} />;
   if (isGrpc(ex)) {
     return (
       <>
         <h4 class="section-title">Headers <span class="muted">(metadata)</span></h4>
         <HeadersTable headers={ex.requestHeaders} />
         <GrpcMessagesHint ex={ex} dir="send" />
+        {isGrpcWeb(ex) && <GrpcWebBody body={ex.requestBody} headers={ex.requestHeaders} />}
       </>
     );
   }
@@ -375,7 +376,7 @@ function ResponseTab({ ex, actions }: { ex: Exchange; actions: ExchangeActions }
     const disabled = isNative(ex) ? NATIVE_READ_ONLY : ex.state === 'mocked' ? MOCKED_NOTE : undefined;
     return { mutate: actions.mutateField, marks, disabled };
   }, [result, ex.id, ex.state, ex.captured]);
-  if (ex.state === 'paused-response') return isGrpc(ex) ? <GrpcPauseEditor ex={ex} /> : <PauseEditor key={ex.id + ex.state} ex={ex} />;
+  if (ex.state === 'paused-response') return grpcPaused(ex) ? <GrpcPauseEditor ex={ex} /> : <PauseEditor key={ex.id + ex.state} ex={ex} />;
   if (isGrpc(ex)) return <GrpcResponseTab ex={ex} />;
   if (ex.status === undefined) {
     const why: Record<string, string> = {
@@ -420,7 +421,27 @@ function GrpcResponseTab({ ex }: { ex: Exchange }) {
           </>
         )}
       <GrpcMessagesHint ex={ex} dir="receive" />
+      {isGrpcWeb(ex) && <GrpcWebBody body={ex.responseBody} headers={ex.responseHeaders} />}
     </>
+  );
+}
+
+/**
+ * A gRPC call paused in the gRPC editor: HTTP/2 calls, and a gRPC-Web call held on a message. gRPC-Web breakpoints are
+ * HTTP-level (CONTRACTS §19.1): its request / response pause in the HTTP editor.
+ */
+function grpcPaused(ex: Exchange): boolean {
+  return isGrpc(ex) && (!!ex.grpcPause || !isGrpcWeb(ex));
+}
+
+/** gRPC-Web: the HTTP body as sent (length-prefixed frames, base64 for -text), collapsed. */
+function GrpcWebBody({ body, headers }: { body: Exchange['requestBody']; headers: Exchange['requestHeaders'] | undefined }) {
+  if (!body) return null;
+  return (
+    <details class="grpc-web-body">
+      <summary>HTTP body <span class="muted">(gRPC-Web frames as sent)</span></summary>
+      <BodyView body={body} headers={headers} />
+    </details>
   );
 }
 

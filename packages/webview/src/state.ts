@@ -14,7 +14,7 @@ import { checkPath } from './jsonpath';
 import { corsActionError } from './coverage';
 import { hasMessagesTab } from './frames';
 import {
-  appliesToGrpc, decodedMessages, describeGrpcMock, grpcPauseKey, isBase64, isGrpc, looksLikeGrpcUrl, reservedGrpcHeader,
+  appliesToGrpc, decodedMessages, describeGrpcMock, grpcPauseKey, isBase64, isGrpc, isNativeGrpc, looksLikeGrpcUrl, reservedGrpcHeader,
   type GrpcDecodeEntry,
 } from './grpc';
 import { EXPORT_LABEL } from './exporting';
@@ -1000,8 +1000,13 @@ export function initiatorLabel(ex: Pick<Exchange, 'initiator' | 'resentFrom'>): 
   return ex.resentFrom ? `Resent by ${who}` : `Sent by ${who}`;
 }
 
-export const SNIPPET_LABEL: Record<SnippetFormat, string> = { curl: 'cURL', dart_http: 'Dart (http)', dio: 'Dio' };
+export const SNIPPET_LABEL: Record<SnippetFormat, string> = { curl: 'cURL', dart_http: 'Dart (http)', dio: 'Dio', grpcurl: 'grpcurl' };
 export const SNIPPET_FORMATS: readonly SnippetFormat[] = ['curl', 'dart_http', 'dio'];
+/** CONTRACTS §19.2: gRPC calls (HTTP/2 and gRPC-Web) copy as grpcurl only. */
+export const GRPC_SNIPPET_FORMATS: readonly SnippetFormat[] = ['grpcurl'];
+export function snippetFormatsFor(ex: Pick<Exchange, 'kind'>): readonly SnippetFormat[] {
+  return isGrpc(ex) ? GRPC_SNIPPET_FORMATS : SNIPPET_FORMATS;
+}
 
 // ---------------------------------------------------------------- network profile (CONTRACTS §9.3)
 
@@ -1148,12 +1153,13 @@ export function compileExchangeMatcher(m: Rule['match']): ExchangeTest {
 }
 
 /** CONTRACTS §16.2: a rule whose action doesn't apply to gRPC never matches a gRPC call (the next rule is tried). */
-function actionSkips(a: RuleAction | undefined, ex: Pick<Exchange, 'kind'>): boolean {
-  return !!a && isGrpc(ex) && !appliesToGrpc(a);
+function actionSkips(a: RuleAction | undefined, ex: Pick<Exchange, 'kind'> & Partial<Pick<Exchange, 'grpc'>>): boolean {
+  // gRPC-Web is an HTTP request for every rule but grpcMock (CONTRACTS §19.1): nothing is skipped.
+  return !!a && isNativeGrpc(ex) && !appliesToGrpc(a);
 }
 
 /** Index of the rule that would handle `ex` (first enabled match wins), or -1. */
-export function winningRuleIndex(rules: Rule[], ex: Pick<Exchange, 'method' | 'url' | 'graphql' | 'captured'> & Partial<Pick<Exchange, 'kind'>>): number {
+export function winningRuleIndex(rules: Rule[], ex: Pick<Exchange, 'method' | 'url' | 'graphql' | 'captured'> & Partial<Pick<Exchange, 'kind' | 'grpc'>>): number {
   return rules.findIndex((r) => r.enabled && !actionSkips(r.action, ex) && compileExchangeMatcher(r.match)(ex));
 }
 
@@ -1184,7 +1190,7 @@ export function ruleStats(rules: Rule[], exchanges: Exchange[]): RuleStat[] {
 export function countMatches(m: Rule['match'], exchanges: Exchange[], skipGrpc = false): number {
   const test = compileExchangeMatcher(m);
   let n = 0;
-  for (const e of exchanges) if (!(skipGrpc && isGrpc(e)) && test(e)) n++;
+  for (const e of exchanges) if (!(skipGrpc && isNativeGrpc(e)) && test(e)) n++;
   return n;
 }
 
