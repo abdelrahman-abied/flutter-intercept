@@ -130,6 +130,8 @@ export interface GrpcInfo {
   messagesReceived: number;
   /** From `grpc-timeout`, in ms. */
   deadlineMs?: number;
+  /** CONTRACTS §19.1: a gRPC-Web call (browser, HTTP/1.1 flow): `binary` (+proto) or `text` (base64 bodies). */
+  web?: 'binary' | 'text';
 }
 
 /**

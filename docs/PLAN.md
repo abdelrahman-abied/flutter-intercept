@@ -266,3 +266,14 @@ default 42/42, agent 12/12 on macOS incl. the gRPC case (rewrite seen by the app
 fixed (MED: gRPC relay loops — own listeners and resolved addresses refused; no marker reaches real servers; the
 external-forwarder loop stays a documented limit). Not verified: Android emulator for 0.11/0.12, physical iPhone,
 connectrpc against a real app, mTLS on gRPC upstreams, IPv6 targets, Edge.
+
+
+## v0.13.0 — gRPC-Web, grpcurl, iOS simulator trust (started 2026-10-12, branch `feature/0.13.0`)
+Contract: CONTRACTS §19. Owner instruction: take every decision in the project's interest; multi-agent.
+| Agent | Owns |
+|---|---|
+| P proxy | gRPC-Web detection, frame / trailer-frame parsing (binary + text), grpcMock / block in gRPC-Web format — `packages/proxy/**` except `types.ts` |
+| H host + agents | grpcurl snippet (`src/codegen/**`), agents (`snippet: "grpcurl"`, gRPC-Web in get_request / list / HAR), controller — `src/agent/**`, `src/codegen/**`, `src/ui/controller.ts`, `src/export/**` |
+| W webview | gRPC-Web badge, Copy as grpcurl, CORS hints for gRPC-Web — `packages/webview/**` except `protocol.ts` |
+| T trust spike | iOS simulator CA trust feasibility — docs/spikes/ios-sim-trust.md (then design + owner) |
+| lead | contract, types, wiring, docs, E2E, review |

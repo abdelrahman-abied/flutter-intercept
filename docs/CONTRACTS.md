@@ -2040,3 +2040,37 @@ LAN-recorded exchanges only to the same targets the LAN guard allows, agents' `r
   restore only when the edit targets the same method; a total `messagesJson` cap (16 MB encoded); `grpc-timeout` clamped
   to 1 h; `onGrpcStatus` message ≤ 1 KB; the hook-name check ignores comments; a resend whose original record is gone
   can't skip the LAN check (refused).
+
+
+## 19. v0.13.0 — gRPC-Web, grpcurl, iOS simulator trust (2026-10-12)
+
+Owner instruction: take every decision in the project's interest; multi-agent. Plan and owners: docs/PLAN.md "v0.13.0".
+Types already in code: `GrpcInfo.web`, `SnippetFormat 'grpcurl'` (both protocol files).
+
+### 19.1 gRPC-Web shown as gRPC (proxy)
+- A request with `content-type` `application/grpc-web`, `application/grpc-web+proto` or `application/grpc-web-text`
+  (`+proto`) — Flutter Web's `GrpcWebClientChannel` through the browser — stays an ordinary HTTP flow (HTTP rules, CORS
+  diagnosis and breakpoints work as today), but its exchange is shown as a gRPC call: `kind: 'grpc'`, `grpc.web:
+  'binary' | 'text'`, `grpc.service / method` from the path, message `frames` parsed from the request and response bodies
+  (5-byte prefix; `-text` bodies are base64, decoded first, possibly in several base64 chunks), the **trailer frame**
+  (flag `0x80`, HTTP/1-style `name: value` lines) → `responseTrailers` and `grpc.statusCode / statusMessage`; a
+  `grpc-status` in the response headers (trailers-only) also counts. Same caps as §16 (64 KB per frame, counting past
+  the cap, decompression bounds). Streaming responses (server streaming over chunked bodies) are parsed as they arrive.
+- Rules: `grpcMock` applies to gRPC-Web calls and answers in gRPC-Web format (HTTP 200, `content-type` matching the
+  request's variant, message frames then a trailer frame; `-text` → base64 body; CORS headers when the request carried
+  an `Origin`, like other mocks); `block` with `mode: 'status'` answers trailers-only `grpc-status: 14`. Every other rule
+  action behaves as for any HTTP request (mutate edits JSON bodies only, so it has no effect on gRPC-Web — the exchange
+  gets a note). Message-level breakpoints / mutate / scripts for gRPC-Web are a later item.
+
+### 19.2 grpcurl snippet (host, webview, agents)
+- `SnippetFormat 'grpcurl'` for gRPC calls (HTTP/2 and gRPC-Web are both rendered as native gRPC):
+  `grpcurl [-plaintext | -insecure] [-proto <file> -import-path <dir>] -H 'name: value' … -d '<json>' host:port
+  pkg.Service/Method`. `-plaintext` for `http`, `-insecure` only when the host is in `grpcDecryptHosts` or the call went
+  through the proxy's CA — otherwise plain TLS. `-d` = the first request message as JSON when the schema decodes it (a
+  client-streaming call: all request messages concatenated, grpcurl's format); without a schema, the snippet says so and
+  omits `-d`. `-proto` when the method came from a `.proto` source (`GrpcMethod.source === 'proto'`), relative to the
+  workspace; otherwise a comment that the server needs reflection. Shell-quoted; redacted for agents like other
+  snippets. Webview: "Copy as grpcurl" on gRPC rows; agents: `get_request snippet: "grpcurl"`.
+
+### 19.3 iOS simulator CA trust (opt-in; spike first: docs/spikes/ios-sim-trust.md)
+Ships only if the spike proves a clean add **and** single-certificate removal. Design is filled in after the spike.
