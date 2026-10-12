@@ -632,6 +632,12 @@ export class InterceptProxy extends EventEmitter {
   private grpcCodec?: GrpcProxyCodec;
   /** CONTRACTS §17.7: bytes of gRPC messages held at breakpoints right now, across calls. */
   private grpcHeld = 0;
+  /** CONTRACTS §19.3: decrypt every TLS silent gRPC tunnel (but tlsPassthrough / learned pinned hosts). */
+  private grpcDecryptAllOn = false;
+  /** CONTRACTS §19.3: `host:port`s whose app rejected our certificate on a decrypted silent tunnel (until stop()). */
+  private readonly pinnedHosts = new Set<string>();
+  /** Decrypted (MITM) silent TLS tunnels in their handshake: client `address:port` → the CONNECT target. */
+  private readonly decrypting = new Map<string, { host: string; port: number }>();
   /** CONTRACTS §19.1: gRPC-Web calls being read (by request id). */
   private readonly grpcWebCalls = new Map<string, GrpcWebState>();
   /** CONTRACTS §18.6: this instance's hop marker (on every relayed / sent gRPC call; one arriving with it is a loop). */
@@ -651,6 +657,7 @@ export class InterceptProxy extends EventEmitter {
     if (opts.tlsPassthrough) this.setTlsPassthrough(opts.tlsPassthrough);
     if (opts.clientCertificates) this.setClientCertificates(opts.clientCertificates);
     if (opts.grpcDecryptHosts) this.setGrpcDecryptHosts(opts.grpcDecryptHosts);
+    if (opts.grpcDecryptAll) this.grpcDecryptAllOn = true;
   }
 
   /** Actual port after start() (0 before). */
@@ -952,6 +959,8 @@ export class InterceptProxy extends EventEmitter {
     this.pool = undefined;
     this.grpcPool?.destroyAll();
     this.grpcPool = undefined;
+    this.pinnedHosts.clear();
+    this.decrypting.clear();
     this.rawServer = undefined;
     this.sendAgent?.destroy();
     this.sendAgent = undefined;
@@ -1251,6 +1260,23 @@ export class InterceptProxy extends EventEmitter {
     this.grpcDecrypt = patterns;
     this.grpcDecryptProblems = problems.map((x) => (x.problem.startsWith('"') ? x.problem : `"${x.host.slice(0, 100)}": ${x.problem}`));
     return { hosts: patterns.map((p) => p.pattern), problems: this.grpcDecryptProblems.slice() };
+  }
+
+  /**
+   * CONTRACTS §19.3: while an iOS simulator trusts the Flutter Intercept CA, decrypt TLS silent gRPC tunnels for every
+   * host (except tlsPassthrough hosts and hosts learned to pin their certificate). Off = only grpcDecryptHosts.
+   */
+  setGrpcDecryptAll(on: boolean): void {
+    this.grpcDecryptAllOn = !!on;
+  }
+
+  get grpcDecryptAll(): boolean {
+    return this.grpcDecryptAllOn;
+  }
+
+  /** CONTRACTS §19.3: hosts learned to pin their certificate (passed through undecrypted until the proxy stops). */
+  get grpcPinnedHosts(): string[] {
+    return [...this.pinnedHosts];
   }
 
   /** The gRPC decrypt patterns in use. */
@@ -5114,15 +5140,24 @@ export class InterceptProxy extends EventEmitter {
       socket.destroy();
       return;
     }
+    const pinKey = `${host}:${t.port}`;
+    const pinned = kind === 'tls' && !forceDecrypt && this.pinnedHosts.has(pinKey);
     const decrypt =
       forceDecrypt ||
       kind === 'h2c' ||
-      (this.grpcDecrypt.some((p) => matchesHostPattern(p, host, t.port)) && !this.passthrough.some((p) => matchesHostPattern(p, host, t.port)));
+      (!pinned &&
+        (this.grpcDecryptAllOn || this.grpcDecrypt.some((p) => matchesHostPattern(p, host, t.port))) &&
+        !this.passthrough.some((p) => matchesHostPattern(p, host, t.port)));
     const raw = this.rawServer;
     if (decrypt && this.grpcCheck.ok && raw && this.server) {
+      if (kind === 'tls' && !forceDecrypt) this.watchDecryptHandshake(socket, host, t.port);
       if (injectSilentTunnel(raw, socket, target, head.length ? head : undefined)) return;
     }
-    const note = decrypt && !this.grpcCheck.ok ? (this.grpcCheck.problem ?? 'gRPC interception is unavailable; passed through undecrypted.') : undefined;
+    const note = pinned
+      ? `${host} pins its certificate; passed through undecrypted.`
+      : decrypt && !this.grpcCheck.ok
+        ? (this.grpcCheck.problem ?? 'gRPC interception is unavailable; passed through undecrypted.')
+        : undefined;
     await this.runTunnel(req, socket, head, host, t.port, { silent: true, plain: kind === 'h2c', connectTimeoutMs: info.connectTimeoutMs, ...(note ? { note } : {}) });
   }
 
@@ -5151,6 +5186,22 @@ export class InterceptProxy extends EventEmitter {
     this.breakerSeen.set(authority, now);
     const event: GrpcBreakerEvent = { authority, viaLan };
     process.nextTick(() => this.emit(GRPC_BREAKER_EVENT, event));
+  }
+
+  /**
+   * CONTRACTS §19.3: remember a decrypted silent TLS tunnel until its handshake is done, so a handshake the app fails
+   * (it pins its own certificate) teaches the proxy to pass that host through from then on (one failed connection).
+   */
+  private watchDecryptHandshake(socket: net.Socket, host: string, port: number): void {
+    const key = `${normalizeIp(socket.remoteAddress ?? '')}:${socket.remotePort}`;
+    if (this.decrypting.size >= 1000) return;
+    this.decrypting.set(key, { host, port });
+    const forget = () => {
+      if (this.decrypting.get(key)?.host === host) this.decrypting.delete(key);
+    };
+    // mockttp reports a failed handshake after the socket closed: keep the entry a little longer than that.
+    socket.once('close', () => setTimeout(forget, 5000).unref?.());
+    setTimeout(forget, 60_000).unref?.();
   }
 
   /** The first payload chunk of a silent tunnel, put back into the socket (undefined: closed or nothing in time). */
@@ -5596,6 +5647,29 @@ export class InterceptProxy extends EventEmitter {
   }
 
   private onTlsError(f: TlsHandshakeFailure): void {
+    // CONTRACTS §19.3: the app failed our certificate on a decrypted silent gRPC tunnel: it pins; pass it through now.
+    const key = `${normalizeIp(String(f.remoteIpAddress ?? ''))}:${f.remotePort}`;
+    const silent = this.decrypting.get(key);
+    if (silent) {
+      this.decrypting.delete(key);
+      const pinKey = `${silent.host}:${silent.port}`;
+      if (this.pinnedHosts.size < 1000) this.pinnedHosts.add(pinKey);
+      const label = net.isIPv6(silent.host) ? `[${silent.host}]` : silent.host;
+      const ex: Exchange = {
+        id: `tls-${randomUUID()}`,
+        startedAt: f.timingEvents?.startTime ?? Date.now(),
+        method: 'CONNECT',
+        url: `https://${label}:${silent.port}/`,
+        requestHeaders: {},
+        state: 'error',
+        kind: 'tunnel',
+        grpcTunnel: true,
+        error: `${silent.host} pins its certificate; passed through undecrypted from now on (the app rejected the Flutter Intercept certificate: ${f.failureCause}).`,
+      };
+      this.store.set(ex.id, ex);
+      this.emitChange(ex);
+      return;
+    }
     const host = f.tlsMetadata?.sniHostname ?? f.destination?.hostname ?? 'unknown-host';
     const port = f.destination?.port;
     const ex: Exchange = {

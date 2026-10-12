@@ -322,3 +322,12 @@ integration in `intercept-proxy.ts`. Tests: `packages/proxy/test/grpc-web.test.t
   - `mutate` falls back to plain passthrough with a note.
 - **Not done:** message-level breakpoints, mutate and scripts for gRPC-Web (a later item).
 
+- **Decryption for trusted iOS simulators (CONTRACTS §19.3):**
+  - `grpcDecryptAll` (option) / `setGrpcDecryptAll(on)`: TLS silent gRPC tunnels are decrypted for every host except
+    `tlsPassthrough` hosts and learned pinned hosts.
+  - Learned pins: while a decrypted silent tunnel is in its handshake, its client `address:port` is remembered. A
+    `tls-client-error` for it adds `host:port` to an in-memory set (≤ 1000, cleared on `stop()`), recorded once as an
+    error tunnel "<host> pins its certificate; passed through undecrypted from now on". Later tunnels to that host are
+    passed through, noted "<host> pins its certificate; passed through undecrypted.".
+  - The app sees one failed TLS handshake, which is a connect failure (normal backoff), not a lost connection.
+  - Getter `grpcPinnedHosts`.
