@@ -22,9 +22,9 @@ import {
   XCRUN,
 } from '../../src/iosSimTrust';
 
-const UDID = '0F0F0F0F-1111-4222-8333-444455556666';
+const UDID = '0F0F0F0F-1111-4222-8333-444455556666'; // made up (never a real device id)
 const OTHER = '11111111-2222-3333-4444-555555555555';
-const PHYSICAL = '00008110-0000000000000000';
+const PHYSICAL = '00008110-0000000000000000'; // made up, physical-iPhone shaped
 const HOME = path.join(path.sep, 'Users', 'dev');
 const devicesRoot = path.join(HOME, 'Library', 'Developer', 'CoreSimulator', 'Devices');
 const dataPathOf = (udid: string) => path.join(devicesRoot, udid, 'data');
