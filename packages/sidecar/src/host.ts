@@ -16,6 +16,7 @@ import * as os from 'os';
 import * as path from 'path';
 import type { Exchange, InterceptProxy, Rule } from '@flutter-intercept/proxy';
 import { AndroidGlobalProxy, ReverseTracker, type Exec as AdbExec } from '../../extension/src/adb';
+import { IosSimTrust } from '../../extension/src/iosSimTrust';
 import { createAgentApi } from '../../extension/src/agent/api';
 import { connectSnippet, type AgentClient } from '../../extension/src/agent/mcp/connect';
 import { DEFAULT_MCP_PORT, generateToken, startMcpServer, type RunningMcpServer } from '../../extension/src/agent/mcp/server';
@@ -59,6 +60,7 @@ import { createSidecarVm, type SidecarVm } from './vm';
 export const RULES_KEY = 'rules';
 export const LAN_NOTICE_KEY = 'lanNoticeDismissed';
 export const EMULATOR_PROXIES_KEY = 'emulatorProxies';
+export const SIM_TRUST_KEY = 'simulatorTrust';
 export const MCP_TOKEN_FILE = 'mcp-token';
 export const PASSPHRASE_METHOD = 'secrets.clientCertPassphrase';
 
@@ -246,6 +248,9 @@ export class SidecarHost {
   private ui!: UiServer;
   private reverses!: ReverseTracker;
   private nativeRoutes!: AndroidGlobalProxy;
+  private simTrust!: IosSimTrust;
+  /** Intercepted dart:io sessions → device id (web sessions left out): decides decrypt-all (CONTRACTS §19.3). */
+  private readonly sessionDevices = new Map<string, string | undefined>();
   private lanLife!: LanLifecycle;
   private lanWatcher!: LanNetworkWatcher;
   private webPac!: PacServer;
@@ -379,6 +384,13 @@ export class SidecarHost {
     });
     void this.nativeRoutes.recover().catch((e: unknown) => log(`emulator proxy recovery failed: ${String(e)}`));
     this.disposers.push(() => this.nativeRoutes.releaseAll());
+    // CONTRACTS §19.3: opt-in CA trust on booted iOS simulators; exactly our certificate is removed again.
+    this.simTrust = new IosSimTrust({
+      caCertPem: async () => (await this.ca.get()).cert,
+      log,
+      store: { get: () => this.state.get(SIM_TRUST_KEY, []), set: (r) => this.state.update(SIM_TRUST_KEY, r) },
+    });
+    this.disposers.push(() => this.simTrust.releaseAll());
 
     this.proxyHost = new InterceptProxyHost({
       getPort: () => this.settings.port,
@@ -392,6 +404,7 @@ export class SidecarHost {
         }),
       onStop: async () => {
         await this.nativeRoutes.releaseAll().catch((e: unknown) => log(`emulator proxy release failed: ${String(e)}`));
+        await this.simTrust.releaseAll().catch((e: unknown) => log(`simulator trust release failed: ${String(e)}`));
         await this.reverses.removeAll();
       },
       // CONTRACTS §14.6: the IDE's own HTTP proxy is the default upstream when ours is empty.
@@ -445,6 +458,7 @@ export class SidecarHost {
     void this.applyClientCertificates();
     // CONTRACTS §16.4: gRPC decrypt hosts and the schema from the app's generated `*.pb*.dart`.
     this.proxyHost.setGrpcDecryptHosts(this.settings.grpc?.decryptHosts ?? []);
+    void this.simTrust.recover().then(() => this.publishSimTrust(), (e: unknown) => log(`simulator trust recovery failed: ${String(e)}`)); // repairs a crashed run
     const grpc = (this.grpc = createGrpcSchemaService({
       codec: grpcCodec,
       roots: () => this.folders,
@@ -758,6 +772,8 @@ export class SidecarHost {
     if (changed('grpc')) {
       this.proxyHost.setGrpcDecryptHosts(next.grpc?.decryptHosts ?? []);
       if (prev.grpc?.enabled !== next.grpc?.enabled) this.grpc.enabledChanged();
+      if (prev.grpc?.trustOnSimulator === true && !this.simTrustOn()) await this.simTrust.releaseAll().catch((e: unknown) => this.log(`simulator trust release failed: ${String(e)}`));
+      this.publishSimTrust();
     }
     // Always re-load: a passphrase changed in the IDE's password store arrives as a `settings` call (REVIEW-9 #7).
     await this.applyClientCertificates();
@@ -1035,6 +1051,18 @@ export class SidecarHost {
     if (vmServiceUri) void this.vm.attach({ sessionId: p.sessionId, vmServiceUri }).catch((e: unknown) => this.log(`vm attach failed: ${String(e)}`));
     else this.log('session started without a VM service URI: background isolates, native clients and screenshots via the VM are off for it');
     this.log(`session started: ${record.deviceKind} device=${deviceId ?? '-'} proxyHost=${record.lan ? 'LAN' : record.host}`);
+    this.sessionDevices.set(p.sessionId, deviceId);
+    this.publishSimTrust();
+    if (this.simTrustOn() && record.deviceKind === 'ios-simulator' && deviceId) {
+      // Decrypt-all switches on only after the trust is confirmed, so the app never meets an untrusted certificate.
+      void this.simTrust
+        .ensure(deviceId, { sessionId: p.sessionId })
+        .then((r) => {
+          if (r.state === 'failed' || r.state === 'not-simulator') this.log(`simulator trust: ${r.problem ?? r.state}`);
+          this.publishSimTrust();
+        })
+        .catch((e: unknown) => this.log(`simulator trust failed: ${String(e)}`));
+    }
     if (this.settings.nativeClients === 'proxy' && record.deviceKind === 'android-emulator' && deviceId && record.flutterMode === 'debug') {
       void this.nativeRoutes.apply(p.sessionId, deviceId, record.port).catch((e: unknown) => this.log(`emulator proxy failed: ${String(e)}`));
     }
@@ -1051,10 +1079,27 @@ export class SidecarHost {
     return { intercepted: true };
   }
 
+  private simTrustOn(): boolean {
+    return this.settings.grpc?.trustOnSimulator === true && this.settings.grpc?.enabled !== false;
+  }
+
+  /** Status + decrypt-all: every TLS gRPC call is decrypted only while every intercepted dart:io session runs on a trusting simulator. */
+  private publishSimTrust(): void {
+    const devices = this.simTrust.state();
+    const trusted = new Set(devices.filter((d) => d.state === 'trusted' || d.state === 'pre-existing').map((d) => d.udid));
+    const all = this.sessionDevices.size > 0 && [...this.sessionDevices.values()].every((d) => d !== undefined && trusted.has(d));
+    this.proxyHost.setGrpcDecryptAll(this.simTrustOn() && all);
+    this.proxyHost.setSimulatorTrust(devices.length ? { devices } : undefined);
+  }
+
   private sessionEnded(p: SessionEndedParams): void {
     const id = p.sessionId;
     if (typeof id !== 'string') return;
     void this.nativeRoutes.release(id).catch((e: unknown) => this.log(`emulator proxy release failed: ${String(e)}`));
+    if (this.sessionDevices.delete(id)) {
+      this.publishSimTrust();
+      void this.simTrust.releaseSession(id).then(() => this.publishSimTrust(), (e: unknown) => this.log(`simulator trust release failed: ${String(e)}`));
+    }
     this.lanLife.ended(id);
     void removeLanDefines(this.sessions.get(id)?.record.lanDefinesFile);
     if (this.webSessions.delete(id) && this.webSessions.size === 0) this.proxyHost.setWebSessionActive(false);

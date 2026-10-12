@@ -46,6 +46,8 @@ class InterceptSettingsState {
 
     /** CONTRACTS §16.4: gRPC interception and the TLS gRPC hosts to decrypt. */
     var grpcEnabled: Boolean = true
+    /** CONTRACTS §19.3: make booted iOS simulators trust the CA while an intercepted session runs on them. */
+    var grpcTrustOnSimulator: Boolean = false
 
     @XCollection(style = XCollection.Style.v2, elementName = "grpcHost")
     var grpcDecryptHosts: MutableList<String> = mutableListOf()
@@ -97,6 +99,7 @@ class InterceptSettingsState {
         out["grpc"] = linkedMapOf(
             "enabled" to grpcEnabled,
             "decryptHosts" to grpcDecryptHosts.map { it.trim() }.filter { it.isNotEmpty() }.distinct(),
+            "trustOnSimulator" to grpcTrustOnSimulator,
         )
         out["agent"] = linkedMapOf(
             "access" to oneOf(agentAccess, AGENT_ACCESS, "readWrite"),

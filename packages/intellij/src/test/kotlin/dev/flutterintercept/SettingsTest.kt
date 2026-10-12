@@ -53,7 +53,7 @@ class SettingsTest {
         assertEquals(mapOf("access" to "readWrite", "redactSecrets" to true, "screenshots" to true, "mcpPort" to 47823), m["agent"])
         assertFalse(m.containsKey("upstreamProxy"))
         assertFalse(m.containsKey("ideHttpProxy"))
-        assertEquals(mapOf("enabled" to true, "decryptHosts" to emptyList<String>()), m["grpc"])
+        assertEquals(mapOf("enabled" to true, "decryptHosts" to emptyList<String>(), "trustOnSimulator" to false), m["grpc"])
     }
 
     @Test

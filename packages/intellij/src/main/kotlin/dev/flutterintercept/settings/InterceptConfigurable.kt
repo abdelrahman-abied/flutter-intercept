@@ -63,6 +63,10 @@ class InterceptConfigurable : BoundConfigurable("Flutter Intercept") {
             }
             group("gRPC") {
                 row { checkBox("Intercept gRPC calls (grpc-dart, connectrpc)").bindSelected(working::grpcEnabled) }
+                row {
+                    checkBox("Make iOS simulators trust the Flutter Intercept CA during a session (decrypts TLS gRPC)").bindSelected(working::grpcTrustOnSimulator)
+                        .comment("Simulators only, never a physical device. Only the certificate Flutter Intercept added is removed when the session ends.")
+                }
                 row("Decrypt TLS gRPC for hosts:") {}
                 row {
                     textArea().bindText(::grpcText).rows(2).align(AlignX.FILL)

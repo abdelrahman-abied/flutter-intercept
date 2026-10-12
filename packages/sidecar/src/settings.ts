@@ -21,7 +21,7 @@ export const DEFAULT_SETTINGS: SidecarSettings = {
   tlsPassthrough: [],
   clientCertificates: [],
   agent: { access: 'readWrite', redactSecrets: true, screenshots: true, mcpPort: DEFAULT_MCP_PORT },
-  grpc: { enabled: true, decryptHosts: [] },
+  grpc: { enabled: true, decryptHosts: [], trustOnSimulator: false },
 };
 
 const bool = (v: unknown, d: boolean): boolean => (typeof v === 'boolean' ? v : d);
@@ -72,7 +72,7 @@ export function normalizeSettings(raw: unknown): SidecarSettings {
       screenshots: bool(a.screenshots, d.agent.screenshots),
       mcpPort: port(a.mcpPort, d.agent.mcpPort),
     },
-    grpc: { enabled: bool(g.enabled, true), decryptHosts: strList(g.decryptHosts) },
+    grpc: { enabled: bool(g.enabled, true), decryptHosts: strList(g.decryptHosts), trustOnSimulator: bool(g.trustOnSimulator, false) },
     ...(ideUrl || ideNoProxy.length ? { ideHttpProxy: { ...(ideUrl ? { url: ideUrl } : {}), ...(ideNoProxy.length ? { noProxy: ideNoProxy } : {}) } } : {}),
   };
 }
