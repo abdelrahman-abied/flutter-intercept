@@ -8,7 +8,7 @@
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc -p . --noEmit",
-    "test": "vitest run"
+    "test": "npm run typecheck && vitest run"
   },
   "devDependencies": {
     "@flutter-intercept/proxy": "*"

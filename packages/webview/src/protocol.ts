@@ -31,7 +31,7 @@ export type HostMsg =
   | { type: 'grpcDecoded'; id: string; decoded: GrpcDecoded };         // answer to 'decodeGrpc'
 export interface Status {
   proxyRunning: boolean; port?: number; interceptEnabled: boolean; sessions: number;
-  lan?: { host: string; port: number }; // present while the LAN listener is open (never the token)
+  lan?: { host: string; port: number; peer?: string }; // present while the LAN listener is open (never the token); peer = the pinned iPhone address
   agent?: AgentStatus;                  // CONTRACTS §8 (never the MCP token)
   networkProfile?: NetworkProfile;      // CONTRACTS §9.3; absent = none
   warnings?: SessionWarning[];          // CONTRACTS §11

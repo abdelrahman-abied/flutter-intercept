@@ -3052,7 +3052,7 @@
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc -p . --noEmit",
-    "test": "vitest run",
+    "test": "npm run typecheck && vitest run",
     "test:integration": "node build.mjs --tests && node dist-test/runTest.js",
     "package": "vsce package --no-dependencies --baseContentUrl https://github.com/abdelrahman-abied/flutter-intercept/blob/HEAD/packages/extension --baseImagesUrl https://github.com/abdelrahman-abied/flutter-intercept/raw/HEAD/packages/extension -o flutter-intercept.vsix",
     "test:vsix": "npm run build && npm run package && node build.mjs --tests && FI_VSIX=flutter-intercept.vsix node dist-test/runTest.js",
