@@ -193,6 +193,7 @@ export async function stopSession(session: vscode.DebugSession, timeoutMs = 30_0
       }
     });
   });
-  await vscode.debug.stopDebugging(session);
+  // VS Code rejects with "Canceled" when the adapter is already shutting the session down; what counts is that it ends.
+  await vscode.debug.stopDebugging(session).then(undefined, (e: unknown) => console.log(`[suite] stopDebugging(${session.name}): ${String(e)}`));
   return Promise.race([ended.then(() => true), sleep(timeoutMs).then(() => false)]);
 }
