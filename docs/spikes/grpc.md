@@ -342,3 +342,14 @@ integration in `intercept-proxy.ts`. Tests: `packages/proxy/test/grpc-web.test.t
   - Trailer and metadata maps skip `__proto__` / `constructor` / `prototype` (also `recordedHeaders` /
     `forwardableHeaders` for HTTP/2). Control characters are stripped from gRPC-Web trailer values.
   - The deferred rule match passes `grpcWeb`. Locally answered grpcMock preflights send `Access-Control-Max-Age: 0`.
+- **REVIEW-13 #6 (learned pins):**
+  - Measured: dart:io (BoringSSL) sends **no TLS alert** when it rejects a certificate. It sends its ClientHello,
+    then closes cleanly right after our certificate, and Node / mockttp report that as `reset` ("socket hang up").
+  - So a pin is learned from a TLS alert (`cert-rejected`) at once, or from **two** handshakes the app closes without
+    an alert (`reset` / `closed`) for the same `host:port` within 60 s. One drop or kill never pins (note: "If it
+    happens again within a minute…"). A Dart app that pins costs two failed connections.
+  - Other failures (no shared cipher, handshake timeout) never pin.
+  - Pins expire after 10 min. `grpcDecryptHosts` hosts are never auto-pinned (noted instead).
+    `clearGrpcPinnedHosts()` exists, and turning decrypt-all on again clears pins and strikes.
+  - Test fixture: `test/fixtures/tls_reject_client.dart` (silent CONNECT + `SecureSocket.secure`, compiled once;
+    skipped without Dart).
