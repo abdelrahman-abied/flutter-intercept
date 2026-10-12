@@ -11,7 +11,8 @@ import { once } from 'events';
 import type { AddressInfo } from 'net';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { presetProfile, ruleFromExchange, type Exchange, type InterceptProxy, type MutateOp, type Rule } from '../src';
-import { inState, nextExchange, selfSignedCert, settled, sleep, startProxy, viaProxy } from './helpers';
+import { inState, nextExchange, selfSignedCert, settled, sleep, startProxy, viaProxy, notesOf } from './helpers';
+import { budget } from './timing';
 
 // 9007199254740993 = 2^53 + 1: JavaScript can't hold it, Dart's int can. 1.0 must stay a double for Dart.
 const USER = '{"login":"octo","id":9007199254740993,"avatar_url":"https://avatars.example/u/1.png","price":1.0,"items":[{"id":1,"price":2.50},{"id":2,"price":3.0}]}';
@@ -255,7 +256,7 @@ describe('mutate rule', () => {
     expect(all.map((e) => e.state)).toEqual(['completed', 'completed', 'completed']);
     expect(all[0].simulated).toBe('Mutated: $.avatar_url → null'); // only the ops that changed something
     expect(all[1].simulated).toBe('Mutated: $.error.field → null');
-    expect(all.map((e) => e.error)).toEqual([
+    expect(all.map((e) => notesOf(e))).toEqual([
       'Mutate rule: nothing matched $.error.field, $.a (the other changes were applied).',
       'Mutate rule: nothing matched $.avatar_url, $.a (the other changes were applied).',
       'Mutate rule: nothing matched $.avatar_url, $.error.field (the other changes were applied).',
@@ -276,8 +277,8 @@ describe('mutate rule', () => {
     expect(ex.state).toBe('completed');
     expect(ex.matchedRuleId).toBe('mut');
     expect(ex.simulated).toBeUndefined();
-    expect(ex.error).toMatch(note);
-    expect(ex.error).toMatch(/^Mutate rule not applied: .*; the response was forwarded unchanged\.$/);
+    expect(notesOf(ex)).toMatch(note);
+    expect(notesOf(ex)).toMatch(/^Mutate rule not applied: .*; the response was forwarded unchanged\.$/);
   });
 
   it('corrupt gzip is forwarded byte for byte (the app sees what it would have seen)', async () => {
@@ -319,7 +320,7 @@ describe('mutate rule', () => {
       const ex = await lastCompleted();
       expect(ex.state).toBe('completed');
       expect(ex.simulated).toBeUndefined();
-      expect(ex.error).toMatch(note);
+      expect(notesOf(ex)).toMatch(note);
     }
   });
 
@@ -330,7 +331,7 @@ describe('mutate rule', () => {
     expect(zlib.gunzipSync(r.body).length).toBe(33 * MB + 8);
     const ex = await lastCompleted();
     expect(ex.state).toBe('completed');
-    expect(ex.error).toMatch(/larger than 32 MB decoded/);
+    expect(notesOf(ex)).toMatch(/larger than 32 MB decoded/);
   });
 
   it('upstream body over 32 MB: 502 that says why (like a response breakpoint), never buffered', async () => {
@@ -361,8 +362,8 @@ describe('mutate rule', () => {
     }
     const ex = await lastCompleted();
     expect(ex.state).toBe('completed');
-    expect(ex.error).toMatch(/too large to change \(more than 2000000 JSON values\)/);
-    expect(maxGap).toBeLessThan(500); // was 1.9 s synchronous
+    expect(notesOf(ex)).toMatch(/too large to change \(more than 2000000 JSON values\)/);
+    expect(maxGap).toBeLessThan(budget(500)); // was 1.9 s synchronous
     expect(process.memoryUsage().rss - rss0).toBeLessThan(1024 * MB); // was +3.1 GB
   });
 
@@ -372,7 +373,7 @@ describe('mutate rule', () => {
     expect(JSON.parse(r.text)[0]).toEqual({ id: 0, d: 'x' });
     const ex = await lastCompleted();
     expect(ex.state).toBe('completed');
-    expect(ex.error).toMatch(/^Mutate rule not applied: applyOps: op 0 \(\$\[\*\]\.d\) is too large: 100000 places × 1026 bytes would exceed 64 MB/);
+    expect(notesOf(ex)).toMatch(/^Mutate rule not applied: applyOps: op 0 \(\$\[\*\]\.d\) is too large: 100000 places × 1026 bytes would exceed 64 MB/);
     // within budget it applies
     proxy.setRules([mutate([{ path: '$[*].d', op: 'set', value: 'y' }])]);
     expect(JSON.parse((await viaProxy(proxy.port, `${up.httpUrl}/list`)).text)[99_999]).toEqual({ id: 99_999, d: 'y' });
@@ -406,7 +407,7 @@ describe('mutate rule', () => {
     expect(JSON.parse(text)).toEqual({ method: 'POST', body: 'part1,part2', secret: 's' });
     const ex = await lastCompleted();
     expect(ex).toMatchObject({ state: 'completed', matchedRuleId: 'mut' });
-    expect(ex.error).toMatch(/^Mutate rule skipped: the request body is streamed/);
+    expect(notesOf(ex)).toMatch(/^Mutate rule skipped: the request body is streamed/);
   });
 
   it('times: counts toward times (rule-hit / rule-spent), then the real response again', async () => {

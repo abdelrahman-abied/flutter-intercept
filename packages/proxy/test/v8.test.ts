@@ -21,7 +21,7 @@ import { lanIPv4Addresses, lanTesting } from '../src/lan';
 import { MAX_REPLAY_GAP_MS, sseSchedule, wsScript } from '../src/replay-stream';
 import { AppDataFinder, offersEarlyData } from '../src/tls-records';
 import { bypassesProxy, createUpstreamAgents, parseNoProxy, parseUpstreamProxy } from '../src/upstream-proxy';
-import { nextExchange, selfSignedCert, settled, sleep, startProxy, startTinyProxy, startUpstream, viaProxy, type Upstream } from './helpers';
+import { nextExchange, selfSignedCert, settled, sleep, startProxy, startTinyProxy, startUpstream, viaProxy, type Upstream, notesOf } from './helpers';
 
 const rule = (id: string, url: string, action: Rule['action'], extra: Partial<Rule> = {}): Rule => ({ id, enabled: true, match: { url }, action, ...extra });
 const KEEP_ALIVE = { connection: 'keep-alive' };
@@ -242,7 +242,7 @@ describe('TLS passthrough (CONTRACTS §14.2)', () => {
     expect(r.error).toBeDefined();
     const ex = await waitFor(proxy, finishedTunnel);
     expect(ex).toMatchObject({ state: 'blocked', matchedRuleId: 'b' });
-    expect(ex.error).toMatch(/can't be answered inside an undecrypted tunnel/);
+    expect(notesOf(ex)).toMatch(/can't be answered inside an undecrypted tunnel/);
     expect(srv.hits).toEqual([]);
   });
 
@@ -257,7 +257,7 @@ describe('TLS passthrough (CONTRACTS §14.2)', () => {
     t2.tls!.destroy();
     const ex = await waitFor(proxy, (e) => finishedTunnel(e) && e.matchedRuleId !== 'f');
     expect(ex.matchedRuleId).toBeUndefined();
-    expect(ex.error).toMatch(/does not apply to TLS passthrough tunnels/);
+    expect(notesOf(ex)).toMatch(/does not apply to TLS passthrough tunnels/);
   });
 
   it('an unreachable server: 502 on the CONNECT, exchange error', async () => {

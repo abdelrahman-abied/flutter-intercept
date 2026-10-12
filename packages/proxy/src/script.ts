@@ -22,13 +22,12 @@ import type { Body, ScriptRequest, ScriptResponse } from './types';
  */
 
 /** Per call (and per script load): the vm timeout. */
-export const SCRIPT_CALL_TIMEOUT_MS = 200;
+export { SCRIPT_CALL_TIMEOUT_MS } from './grpc-meta';
 /** No answer from the worker within this → terminate it (restarted on the next call). */
 export const SCRIPT_WATCHDOG_MS = 1000;
 /** Bodies larger than this (or binary) reach a script as `bodyOmitted`. */
-export const SCRIPT_BODY_MAX_BYTES = 1024 * 1024;
-export const SCRIPT_LOG_MAX_LINES = 20;
-export const SCRIPT_LOG_MAX_CHARS = 500;
+export { SCRIPT_BODY_MAX_BYTES, SCRIPT_LOG_MAX_LINES, SCRIPT_LOG_MAX_CHARS } from './grpc-meta';
+import { SCRIPT_BODY_MAX_BYTES, SCRIPT_CALL_TIMEOUT_MS, SCRIPT_LOG_MAX_CHARS, SCRIPT_LOG_MAX_LINES } from './grpc-meta';
 const SCRIPT_OLD_SPACE_MB = 64;
 /** Memory outside the V8 heap (ArrayBuffer / typed-array backing stores) a worker may hold above its start. */
 export const SCRIPT_EXTERNAL_MAX_BYTES = 64 * 1024 * 1024;

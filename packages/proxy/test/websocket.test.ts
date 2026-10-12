@@ -16,7 +16,7 @@ import { generateCACertificate } from 'mockttp';
 import WebSocket, { WebSocketServer } from 'ws';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Exchange, InterceptProxy, InterceptProxyOptions } from '../src';
-import { nextExchange, selfSignedCert, sleep, startProxy } from './helpers';
+import { nextExchange, selfSignedCert, sleep, startProxy, notesOf } from './helpers';
 
 interface WsUpstream {
   wsUrl: string;
@@ -358,7 +358,7 @@ describe('rules on WebSocket upgrades', () => {
       const ex = await done;
       expect(ex.state).toBe('completed');
       expect(ex.matchedRuleId).toBeUndefined();
-      expect(ex.error).toMatch(/does not apply to WebSocket connections; passed through/);
+      expect(notesOf(ex)).toMatch(/does not apply to WebSocket connections; passed through/);
     }
   });
 

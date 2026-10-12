@@ -3,7 +3,8 @@
 import * as zlib from 'zlib';
 import { Transform, type TransformCallback } from 'stream';
 import type { Frame } from './types';
-import { FRAME_PAYLOAD_CAP } from './frames';
+import { FRAME_PAYLOAD_CAP, lazyPayloadFrame } from './frames';
+import { HOP_BY_HOP_HEADERS } from './grpc-meta';
 
 /** The marker header of a silent CONNECT (CONTRACTS §16.1), and the entry's connect timeout header. */
 export const SILENT_TUNNEL_HEADER = 'flutter-intercept-tunnel';
@@ -30,26 +31,8 @@ export const GRPC_COMPRESSED_KEEP_BYTES = 256 * 1024;
 /** Idle upstream HTTP/2 sessions are closed after this long (CONTRACTS §16.2, like the HTTP pool). */
 export const GRPC_SESSION_IDLE_MS = 30_000;
 
-/** gRPC status code names (for messages and labels). */
-export const GRPC_CODE_NAMES = [
-  'OK',
-  'CANCELLED',
-  'UNKNOWN',
-  'INVALID_ARGUMENT',
-  'DEADLINE_EXCEEDED',
-  'NOT_FOUND',
-  'ALREADY_EXISTS',
-  'PERMISSION_DENIED',
-  'RESOURCE_EXHAUSTED',
-  'FAILED_PRECONDITION',
-  'ABORTED',
-  'OUT_OF_RANGE',
-  'UNIMPLEMENTED',
-  'INTERNAL',
-  'UNAVAILABLE',
-  'DATA_LOSS',
-  'UNAUTHENTICATED',
-] as const;
+/** gRPC status code names (index = code): the shared copy (CONTRACTS §19.4). */
+export { GRPC_CODE_NAMES } from './grpc-meta';
 
 /** `application/grpc`, `application/grpc+proto`, `application/grpc;…` — not `application/grpc-web…`. */
 export function isGrpcContentType(ct: string | string[] | undefined): boolean {
@@ -221,7 +204,7 @@ export class GrpcMessageParser {
  * full (wire) size. Compressed messages get no payload here (see GrpcFrameRecorder, which decompresses gzip / deflate
  * prefixes off the event loop); unknown encodings stay that way: `compressed`, `truncated`, no payload.
  */
-export function messageFrame(dir: Frame['dir'], m: GrpcWireMessage, at = Date.now()): Frame {
+export function messageFrame(dir: Frame['dir'], m: GrpcWireMessage, at = Date.now(), lazy = false): Frame {
   const f: Frame = { dir, at, kind: 'message', size: m.size };
   if (m.compressed) {
     f.compressed = true;
@@ -229,8 +212,11 @@ export function messageFrame(dir: Frame['dir'], m: GrpcWireMessage, at = Date.no
     return f;
   }
   const data = m.kept.subarray(0, FRAME_PAYLOAD_CAP);
-  if (data.length) f.base64 = data.toString('base64');
   if (m.size > data.length) f.truncated = true;
+  if (!data.length) return f;
+  // PERF-1 #3: lazily (raw bytes, encoded when first shown) unless the caller reads `base64` right away.
+  if (lazy) return lazyPayloadFrame(f, data.length === m.kept.length ? m.kept : Buffer.from(data));
+  f.base64 = data.toString('base64');
   return f;
 }
 
@@ -278,6 +264,8 @@ export class GrpcFrameRecorder {
     private readonly dir: Frame['dir'],
     private readonly encoding: () => string | undefined,
     private readonly sink: (f: Frame) => void,
+    /** PERF-1 #3: frames keep raw bytes, base64-encoded only when first shown (the proxy's store). */
+    private readonly lazy = false,
   ) {}
 
   /** `extra`: flags for the frame (CONTRACTS §17.2: `dropped`, `edited`). */
@@ -285,7 +273,7 @@ export class GrpcFrameRecorder {
     const at = Date.now();
     const enc = this.encoding();
     if (!m.compressed || (enc !== 'gzip' && enc !== 'deflate') || !m.kept.length) {
-      const f = { ...messageFrame(this.dir, m, at), ...extra };
+      const f = Object.assign(messageFrame(this.dir, m, at, this.lazy), extra);
       if (!this.pending) return this.deliver(f);
       this.tail = this.tail.then(() => this.deliver(f));
       return;
@@ -296,7 +284,10 @@ export class GrpcFrameRecorder {
       const r = await work;
       this.pending--;
       const f: Frame = { dir: this.dir, at, kind: 'message', size: m.size, compressed: true, ...extra };
-      if (r?.data.length) f.base64 = r.data.toString('base64');
+      if (r?.data.length) {
+        if (this.lazy) lazyPayloadFrame(f, r.data);
+        else f.base64 = r.data.toString('base64');
+      }
       if (r?.complete && m.complete) f.size = r.data.length;
       else {
         f.sizeUnknown = true;
@@ -321,7 +312,7 @@ export class GrpcFrameRecorder {
 }
 
 /** Hop-by-hop / connection-specific headers HTTP/2 must not carry (node refuses them). */
-const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'host', 'http2-settings', 'proxy-authorization']);
+const HOP_BY_HOP = HOP_BY_HOP_HEADERS;
 
 /** Headers to forward on HTTP/2: no pseudo headers, no hop-by-hop ones, nothing internal to Flutter Intercept. */
 export function forwardableHeaders(h: Record<string, string | string[] | undefined>): Record<string, string | string[]> {
@@ -429,10 +420,8 @@ export function h2CodeName(code: number | undefined): string {
 
 // ---------------------------------------------------------------- CONTRACTS §17.1: the message transform
 
-/** Messages larger than this (decompressed) are never held or rewritten: forwarded unchanged with a note. */
-export const GRPC_HOOK_CAP_BYTES = 4 * 1024 * 1024;
-/** Held (paused) message bytes across all calls; beyond it new pauses are skipped with a note. */
-export const GRPC_HELD_TOTAL_CAP_BYTES = 64 * 1024 * 1024;
+/** Hook caps (shared, CONTRACTS §19.4): larger messages are never held or rewritten; held bytes across calls. */
+export { GRPC_HOOK_CAP_BYTES, GRPC_HELD_TOTAL_CAP_BYTES } from './grpc-meta';
 /** Test seams. Never set outside tests. */
 export const grpcHookTesting: { hookCap?: number; heldTotalCap?: number } = {};
 /** How many hooked transforms were created (tests: the fast path creates none). */

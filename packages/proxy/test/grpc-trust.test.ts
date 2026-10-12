@@ -11,9 +11,9 @@ import { X509Certificate } from 'crypto';
 import { generateCACertificate } from 'mockttp';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Exchange, InterceptProxy } from '../src';
-import { nextExchange, selfSignedCert, sleep, startProxy } from './helpers';
-import { grpcPinTesting } from '../src/intercept-proxy';
+import { nextExchange, selfSignedCert, sleep, startProxy, notesOf } from './helpers';
 import { grpcCall, silentSocket, startGrpcServer, tlsSession, type GrpcServer } from './grpc-helpers';
+import { grpcPinTesting, TEST_INTERNALS } from '../src/intercept-proxy';
 
 function waitFor(proxy: InterceptProxy, pred: (e: Exchange) => boolean, timeoutMs = 10_000): Promise<Exchange> {
   const have = [...proxy.getExchanges()].reverse().find(pred);
@@ -103,12 +103,12 @@ describe('grpcDecryptAll', () => {
       const t = tls.connect({ socket: again, servername: 'localhost', ALPNProtocols: ['h2'], ca: upCert.cert });
       await once(t, 'secureConnect');
       t.destroy();
-      const tunnel = await waitFor(proxy, (e) => e.kind === 'tunnel' && e.state !== 'pending' && /passed through undecrypted\.$/.test(e.error ?? ''));
-      expect(tunnel.error).toMatch(/127\.0\.0\.1 pins its certificate; passed through undecrypted\./);
+      const tunnel = await waitFor(proxy, (e) => e.kind === 'tunnel' && e.state !== 'pending' && /passed through undecrypted\.$/.test(notesOf(e)));
+      expect(notesOf(tunnel)).toMatch(/127\.0\.0\.1 pins its certificate; passed through undecrypted\./);
       // clearGrpcPinnedHosts, and decrypt-all turned on again, start over
       proxy.clearGrpcPinnedHosts();
       expect(proxy.grpcPinnedHosts).toEqual([]);
-      (proxy as unknown as { pinnedHosts: Map<string, number> }).pinnedHosts.set(target, Date.now() + 60_000);
+      proxy[TEST_INTERNALS]().pinnedHosts.set(target, Date.now() + 60_000);
       proxy.setGrpcDecryptAll(false);
       proxy.setGrpcDecryptAll(true);
       expect(proxy.grpcPinnedHosts).toEqual([]);
@@ -127,7 +127,7 @@ describe('grpcDecryptAll', () => {
       await waitFor(proxy, (e) => e.kind === 'tunnel' && /If it happens again within a minute/.test(e.error ?? ''));
       expect(proxy.grpcPinnedHosts).toEqual([]);
       // A client that sends a TLS alert (OpenSSL / browsers): the failure event mockttp reports, for a tunnel in its handshake.
-      const p = proxy as unknown as { decrypting: Map<string, { host: string; port: number }>; onTlsError(f: unknown): void };
+      const p = proxy[TEST_INTERNALS]();
       p.decrypting.set('127.0.0.1:40001', { host: 'api.example.test', port: 443 });
       p.onTlsError({ failureCause: 'cert-rejected', remoteIpAddress: '127.0.0.1', remotePort: 40001, timingEvents: {} });
       expect(proxy.grpcPinnedHosts).toEqual(['api.example.test:443']);

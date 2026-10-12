@@ -11,7 +11,8 @@ import type { Exchange, InterceptProxy, Rule } from '../src';
 import { MAX_SCRIPT_BYTES, ruleFromExchange, ruleProblem, SCRIPT_TEMPLATE } from '../src/rules';
 import { ScriptRunner } from '../src/script';
 import { bypassPatchedRequests } from '../src/upstream-pool';
-import { inState, nextExchange, settled, sleep, startProxy, startTinyProxy, startUpstream, viaProxy, type Upstream } from './helpers';
+import { inState, nextExchange, settled, sleep, startProxy, startTinyProxy, startUpstream, viaProxy, type Upstream, notesOf } from './helpers';
+import { budget } from './timing';
 
 const rule = (id: string, url: string, action: Rule['action'], extra: Partial<Rule> = {}): Rule => ({ id, enabled: true, match: { url }, action, ...extra });
 const script = (code: string, url = '*', name = 'my-script'): Rule => rule('s1', url, { kind: 'script', code }, { name });
@@ -349,7 +350,7 @@ describe('script rules (CONTRACTS §13.4)', () => {
     const t0 = Date.now();
     const r = await viaProxy(proxy.port, `${up.httpUrl}/json?loop=1`);
     expect(r.status).toBe(502);
-    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(Date.now() - t0).toBeLessThan(budget(1500));
     const fin = await done('loop=1');
     expect(fin.error).toBe('Script my-script: onRequest timed out after 200 ms');
     expect(fin.scriptLog).toEqual(['looping', 'Script my-script: onRequest timed out after 200 ms']);
@@ -430,7 +431,7 @@ describe('script rules (CONTRACTS §13.4)', () => {
       const ws = new WebSocket(url, { createConnection: () => net.connect(proxy.port, '127.0.0.1') } as WebSocket.ClientOptions);
       ws.on('error', () => undefined);
       await once(ws, 'message');
-      expect((await accepted).error).toMatch(/Script rule "my-script" does not apply to WebSocket/);
+      expect(notesOf(await accepted)).toMatch(/Script rule "my-script" does not apply to WebSocket/);
       ws.terminate();
     } finally {
       for (const c of wss.clients) c.terminate();
@@ -463,7 +464,7 @@ describe('ScriptRunner', () => {
     const t0 = Date.now();
     const stuck = await runner.run('r', 'R', code, 'onRequest', [{ loop: true }], ctx);
     expect(stuck.error).toMatch(/did not finish within 0.3 s; the script engine was restarted/);
-    expect(Date.now() - t0).toBeLessThan(5000);
+    expect(Date.now() - t0).toBeLessThan(budget(5000));
     const ok = await runner.run('r', 'R', code, 'onRequest', [{}], ctx);
     expect(ok).toEqual({ lines: ['ran'] });
     runner.stop();

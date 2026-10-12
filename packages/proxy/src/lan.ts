@@ -472,8 +472,20 @@ export function findOnSocketChain<T>(start: unknown, get: (o: object) => T | und
   return undefined;
 }
 
+/**
+ * PERF-1 #6: the walk's answer per queried object (a socket, a TLS socket, an HTTP/2 socket proxy or session). A gate
+ * registers a socket when it accepts it, before anything can look it up; the one later registration
+ * (adoptAsLanSocket) clears the entry. Values are the live info objects, so state / closed are always current.
+ */
+const walkCache = new WeakMap<object, LanSocketInfo | null>();
+
 function walk(s: any): LanSocketInfo | undefined {
-  return findOnSocketChain(s, (o) => lanSockets.get(o));
+  if (!s || typeof s !== 'object') return undefined;
+  const hit = walkCache.get(s);
+  if (hit !== undefined) return hit ?? undefined;
+  const info = findOnSocketChain(s, (o) => lanSockets.get(o));
+  walkCache.set(s, info ?? null);
+  return info;
 }
 
 /** The gate that accepted this downstream connection (or the raw socket under a TLS-in-tunnel socket). */
@@ -521,6 +533,7 @@ export function onComboConnection(socket: net.Socket): void {
  * CONNECT socket of `gate` gives it every LAN guard (target checks, guarded upstream, viaLan) like the original.
  */
 export function adoptAsLanSocket(socket: net.Socket, gate: LanGate): void {
+  walkCache.delete(socket);
   lanSockets.set(socket, { gate, state: 'connect', peer: 'resend' });
   (socket as unknown as Record<symbol, unknown>)[SOCKET_SELF] = socket;
 }

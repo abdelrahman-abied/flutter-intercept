@@ -14,6 +14,7 @@ import type { InterceptProxy } from '../src';
 import { forbiddenReason, LAN_MAX_CONNECTIONS, LAN_MAX_PENDING_PER_IP, lanIPv4Addresses, lanTesting } from '../src/lan';
 import { currentRoutes, parseNetstatRoutes, refreshRoutes, routesTesting } from '../src/routes';
 import { startProxy, startUpstream, type Upstream } from './helpers';
+import { TEST_INTERNALS } from '../src/intercept-proxy';
 
 const LAN_IP = lanIPv4Addresses()[0];
 // A fresh token per test (beforeEach): a stray connection from an earlier test that lands on a
@@ -276,7 +277,7 @@ describe.skipIf(!LAN_IP)(`LAN hardening on ${LAN_IP ?? '(no LAN IPv4)'}`, () => 
       }
     }, 1);
     await sleep(400);
-    const gate = (proxy as unknown as { lanGate: { sockets: Set<net.Socket>; closed: boolean } }).lanGate;
+    const gate = proxy[TEST_INTERNALS]().lanGate as unknown as { sockets: Set<net.Socket>; closed: boolean };
     await proxy.closeLan();
     expect(gate.closed).toBe(true);
     expect(gate.sockets.size).toBe(0); // (1) server side: nothing accepted survives
@@ -398,7 +399,10 @@ describe.skipIf(!LAN_IP)(`LAN hardening on ${LAN_IP ?? '(no LAN IPv4)'}`, () => 
     }
   });
 
-  it('a client paused right after connecting (debugger on a cold start) is still served after 15 s; a wrong token after the wait gets 407', async () => {
+  it('a client paused right after connecting (debugger on a cold start) outlives the head deadline and is still served; a wrong token after the wait gets 407', async () => {
+    // QUALITY-1 Q8: scaled deadlines instead of a real 15 s wait (same shape: the silent wait is 5x the head deadline).
+    lanTesting.headDeadlineMs = 300;
+    lanTesting.silentDeadlineMs = 10_000;
     const open = (): Promise<net.Socket> =>
       new Promise((resolve) => {
         const s = net.connect(lanPort, LAN_IP!);
@@ -415,7 +419,7 @@ describe.skipIf(!LAN_IP)(`LAN hardening on ${LAN_IP ?? '(no LAN IPv4)'}`, () => 
     };
     const g = read(good);
     const b = read(bad);
-    await sleep(15_000); // silent: the isolate is paused before it writes the request head
+    await sleep(1500); // silent: the isolate is paused before it writes the request head
     expect(g().closed).toBe(false);
     good.write(plainGet(`${up.httpUrl}/json`));
     bad.write(`GET ${up.httpUrl}/json HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic ${Buffer.from('flutter-intercept:wrong-wrong-wrong').toString('base64')}\r\n\r\n`);
@@ -424,7 +428,7 @@ describe.skipIf(!LAN_IP)(`LAN hardening on ${LAN_IP ?? '(no LAN IPv4)'}`, () => 
     expect(b().t).toMatch(/^HTTP\/1\.1 407/);
     good.destroy();
     bad.destroy();
-  }, 30_000);
+  }, 15_000);
 
   it('#3 slowloris: the head deadline is absolute (trickling bytes does not extend it)', async () => {
     lanTesting.headDeadlineMs = 500;
@@ -475,7 +479,7 @@ describe.skipIf(!LAN_IP)(`LAN hardening on ${LAN_IP ?? '(no LAN IPv4)'}`, () => 
       return s;
     });
     // wait until every socket is settled (connected, or connected and then dropped by the gate)
-    const gate = () => (proxy as unknown as { lanGate: { pendingPerIp: Map<string, number> } }).lanGate;
+    const gate = () => proxy[TEST_INTERNALS]().lanGate as unknown as { pendingPerIp: Map<string, number> };
     await until(() => socks.filter((s) => s.closed).length >= 8 && socks.every((s) => s.closed || s.readyState === 'open'), 10_000);
     await until(() => [...gate().pendingPerIp.values()].reduce((a, b) => a + b, 0) === LAN_MAX_PENDING_PER_IP, 5000);
     await sleep(100);
@@ -515,7 +519,7 @@ describe.skipIf(!LAN_IP)(`LAN hardening on ${LAN_IP ?? '(no LAN IPv4)'}`, () => 
     const rss0 = process.memoryUsage().rss;
     let maxLag = 0;
     let last = process.hrtime.bigint();
-    const gate = (proxy as unknown as { lanGate: { sockets: Set<unknown>; pendingPerIp: Map<string, number> } }).lanGate;
+    const gate = proxy[TEST_INTERNALS]().lanGate as unknown as { sockets: Set<unknown>; pendingPerIp: Map<string, number> };
     let maxSockets = 0;
     let maxPending = 0;
     const lagTimer = setInterval(() => {

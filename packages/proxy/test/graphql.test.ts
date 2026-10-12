@@ -3,7 +3,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Exchange, InterceptProxy, Rule } from '../src';
 import { detectGraphql, matches, ruleFromExchange, scanOperations } from '../src/rules';
-import { inState, nextExchange, settled, startProxy, startUpstream, viaProxy, type Upstream } from './helpers';
+import { inState, nextExchange, settled, startProxy, startUpstream, viaProxy, type Upstream, notesOf } from './helpers';
 
 const json = (o: unknown) => JSON.stringify(o);
 const post = (body: string, ct = 'application/json') => ({ method: 'POST', url: 'https://api.test/graphql', contentType: ct, body });
@@ -227,6 +227,6 @@ describe('GraphQL in the proxy', () => {
     expect(r.text).toBe(String(Buffer.byteLength(big)));
     const [ex] = await settled(proxy);
     expect(ex.state).toBe('completed');
-    expect(ex.error).toMatch(/GraphQL rule skipped: the request body \(6\.0 MB\) is over the 5 MB pause limit/);
+    expect(notesOf(ex)).toMatch(/GraphQL rule skipped: the request body \(6\.0 MB\) is over the 5 MB pause limit/);
   });
 });

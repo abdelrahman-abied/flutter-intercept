@@ -292,3 +292,6 @@ export async function startTinyProxy(auth?: string): Promise<TinyProxy> {
     },
   };
 }
+
+/** CONTRACTS §19.4: an exchange's informational notes as one text (empty when none). */
+export const notesOf = (e: Exchange | undefined): string => (e?.notes ?? []).join('\n');

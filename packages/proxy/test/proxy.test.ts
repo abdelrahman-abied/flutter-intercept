@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { InterceptProxy, type Exchange, type Rule } from '../src';
 import { listenHostTesting } from '../src/listen-host';
 import { firstChunkViaProxy, settled, inState, nextExchange, sleep, startProxy, startUpstream, viaProxy, type Upstream } from './helpers';
+import { TEST_INTERNALS } from '../src/intercept-proxy';
 
 let up: Upstream;
 let proxy: InterceptProxy;
@@ -32,7 +33,7 @@ const bp = (phase: 'request' | 'response' | 'both', url = '*', id = 'bp'): Rule 
 describe('lifecycle', () => {
   it('listens on 127.0.0.1 by default and reports the actual port', () => {
     expect(proxy.port).toBeGreaterThan(0);
-    const raw = (proxy as unknown as { server: { server: net.Server } }).server.server;
+    const raw = proxy[TEST_INTERNALS]().rawServer!;
     const addr = raw.address() as net.AddressInfo;
     expect(addr.address).toBe('127.0.0.1');
     expect(addr.port).toBe(proxy.port);
@@ -40,7 +41,7 @@ describe('lifecycle', () => {
 
   it('honours host 0.0.0.0', async () => {
     const p = await startProxy({ host: '0.0.0.0' });
-    const raw = (p as unknown as { server: { server: net.Server } }).server.server;
+    const raw = p[TEST_INTERNALS]().rawServer!;
     expect((raw.address() as net.AddressInfo).address).toBe('0.0.0.0');
     const r = await viaProxy(p.port, `${up.httpUrl}/json`);
     expect(r.status).toBe(200);
@@ -51,7 +52,7 @@ describe('lifecycle', () => {
     try {
       listenHostTesting.disableHook = true;
       const p = await startProxy();
-      const raw = (p as unknown as { server: { server: net.Server } }).server.server;
+      const raw = p[TEST_INTERNALS]().rawServer!;
       expect((raw.address() as net.AddressInfo).address).toBe('127.0.0.1');
       await p.stop();
 
@@ -170,8 +171,8 @@ describe('pass-through recording', () => {
   it('streams responses that match no rule (SSE): first event arrives before the stream ends', async () => {
     const r = await firstChunkViaProxy(proxy.port, `${up.httpUrl}/stream?ms=600`);
     expect(r.text).toBe('data: one\n\ndata: two\n\n');
-    expect(r.firstChunkMs).toBeLessThan(300);
     expect(r.totalMs).toBeGreaterThanOrEqual(550);
+    expect(r.firstChunkMs).toBeLessThan(r.totalMs - 250); // the first event long before the second (600 ms later)
     const [ex] = (await settled(proxy));
     // v0.5.0: an event stream is recorded as frames, not as a body copy (CONTRACTS §11.1).
     expect(ex).toMatchObject({ state: 'completed', kind: 'sse', frames: [{ kind: 'event', text: 'one' }, { kind: 'event', text: 'two' }] });

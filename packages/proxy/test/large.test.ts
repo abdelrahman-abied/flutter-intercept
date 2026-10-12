@@ -3,7 +3,7 @@
 import * as http from 'http';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { InterceptProxy, Rule } from '../src';
-import { inState, nextExchange, settled, startProxy, startUpstream, viaProxy, type Upstream } from './helpers';
+import { inState, nextExchange, settled, startProxy, startUpstream, viaProxy, type Upstream, notesOf } from './helpers';
 
 const MB = 1024 * 1024;
 const BIG = 40 * MB;
@@ -54,7 +54,7 @@ describe('large bodies', () => {
     expect(r.text).toBe(String(BIG));
     const [ex] = (await settled(proxy)).slice(-1);
     expect(ex).toMatchObject({ state: 'completed', matchedRuleId: 'bp-request' });
-    expect(ex.error).toMatch(/Breakpoint skipped.*over the 5 MB pause limit/);
+    expect(notesOf(ex)).toMatch(/Breakpoint skipped.*over the 5 MB pause limit/);
   });
 
   it('request breakpoint + streamed (chunked) body: skipped with a note', async () => {
@@ -72,7 +72,7 @@ describe('large bodies', () => {
     });
     expect(text).toBe('6');
     const [ex] = (await settled(proxy)).slice(-1);
-    expect(ex.error).toMatch(/streamed \(unknown length\)/);
+    expect(notesOf(ex)).toMatch(/streamed \(unknown length\)/);
   });
 
   it('response breakpoint + 10 MB response: pauses, body edit refused, header edit delivers every byte', async () => {

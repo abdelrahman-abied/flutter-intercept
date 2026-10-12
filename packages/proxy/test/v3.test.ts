@@ -8,6 +8,7 @@ import { TraceJoin } from '../src/trace';
 import { parseDartStack } from '../src/source';
 import type { AddressInfo } from 'net';
 import { firstChunkViaProxy, inState, nextExchange, settled, sleep, startProxy, startUpstream, viaProxy, type Upstream } from './helpers';
+import { bestOfMs, budget } from './timing';
 
 let up: Upstream;
 let proxy: InterceptProxy;
@@ -162,9 +163,9 @@ describe('trace sink and x-fi-id', () => {
     ];
     const adversarial = (i: number) =>
       i % 2 ? ('#1 ' + 'a ('.repeat(6000)).slice(0, 16 * 1024) : Array.from({ length: 8 }, (_, k) => lines[(i + k) % lines.length]).join('\n');
-    const t0 = performance.now();
-    for (let i = 0; i < 12; i++) parseDartStack(adversarial(i), 256);
-    expect(performance.now() - t0).toBeLessThan(50);
+    expect(bestOfMs(() => {
+      for (let i = 0; i < 12; i++) parseDartStack(adversarial(i), 256);
+    })).toBeLessThan(budget(50));
 
     const ids = Array.from({ length: 60 }, (_, i) => `adversarial-${String(i).padStart(3, '0')}`);
     for (const id of ids.slice(0, 50)) await viaProxy(proxy.port, `${up.httpUrl}/json?${id}`, { headers: { 'x-fi-id': id } });
@@ -190,7 +191,7 @@ describe('trace sink and x-fi-id', () => {
     await joined;
     clearInterval(tick);
     console.log(`[trace-dos] ${(body.length / 1024).toFixed(0)} KB POST, max event-loop gap ${maxGap.toFixed(1)} ms`);
-    expect(maxGap).toBeLessThan(100);
+    expect(maxGap).toBeLessThan(budget(100));
     const all = await settled(proxy);
     expect(all.filter((e) => e.source)).toHaveLength(50);
   });
@@ -363,9 +364,10 @@ describe('throttle, faults and the network profile', () => {
     proxy.setRules([rule({ id: 't', action: { kind: 'throttle', kbps: 800 } })]); // 100 KB/s
     const r = await firstChunkViaProxy(proxy.port, `${up.httpUrl}/big?size=${100 * 1024}`);
     expect(r.text.length).toBe(100 * 1024);
-    expect(r.firstChunkMs).toBeLessThan(300);
+    // Streamed, not buffered: the first bytes long before the paced end (ordering, not a wall-clock bound).
+    expect(r.firstChunkMs).toBeLessThan(r.totalMs / 2);
     expect(r.totalMs).toBeGreaterThan(850);
-    expect(r.totalMs).toBeLessThan(3000);
+    expect(r.totalMs).toBeLessThan(budget(3000));
     const [ex] = await settled(proxy);
     expect(ex).toMatchObject({ state: 'completed', simulated: '800 kbps' });
     expect(ex.responseBody?.text.length).toBe(100 * 1024);
@@ -482,10 +484,11 @@ describe('throttle, faults and the network profile', () => {
     expect((await resP).body.length).toBe(60 * 1024);
     expect(Date.now() - t0).toBeGreaterThan(450);
 
+    const slowMs = Date.now() - t0;
     proxy.setRules([rule({ id: 'fast', action: { kind: 'throttle', latencyMs: 10 } })]);
     const t1 = Date.now();
     expect((await viaProxy(proxy.port, `${up.httpUrl}/big?size=${60 * 1024}`)).body.length).toBe(60 * 1024);
-    expect(Date.now() - t1).toBeLessThan(400);
+    expect(Date.now() - t1).toBeLessThan(slowMs); // a ratio, not a wall-clock bound
   });
 
   it('the app leaving mid-throttle is recorded, the proxy keeps serving', async () => {

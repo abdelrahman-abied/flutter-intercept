@@ -1,38 +1,30 @@
 import { EventEmitter } from 'events';
+import { callbackMatcher, requestInternals, serverInternals } from './mockttp-internals';
 import * as http from 'http';
 import { STATUS_CODES } from 'http';
-import * as http2 from 'http2';
-import type { Readable } from 'stream';
 import { randomBytes, randomUUID } from 'crypto';
 import * as net from 'net';
 import * as os from 'os';
-import * as tls from 'tls';
 // Deep imports on purpose: mockttp's index also loads its admin server and remote client
 // (express, GraphQL, body-parser, …), ~2 MB of bundle and ~100 ms of module init we never use.
 import type * as mockttp from 'mockttp';
 import { MockttpServer } from 'mockttp/dist/server/mockttp-server';
-import { generateCACertificate } from 'mockttp/dist/util/certificates';
 import { CallbackStep, PassThroughStep } from 'mockttp/dist/rules/requests/request-step-definitions';
 import { StepLookup } from 'mockttp/dist/rules/requests/request-step-impls';
-import WebSocket from 'ws';
-import { PassThroughWebSocketStep, RejectWebSocketStep } from 'mockttp/dist/rules/websockets/websocket-step-definitions';
+import {
+  PassThroughWebSocketStep,
+  RejectWebSocketStep,
+} from 'mockttp/dist/rules/websockets/websocket-step-definitions';
 import { Always } from 'mockttp/dist/rules/completion-checkers';
-import { resetOrDestroy } from 'mockttp/dist/util/socket-util';
 import type { RequestMatcher } from 'mockttp/dist/rules/matchers';
-import type { CompletedBody, CompletedRequest, OngoingRequest, TlsHandshakeFailure } from 'mockttp';
-
-import { isUtf8 } from 'buffer';
+import type { CompletedRequest, OngoingRequest, TlsHandshakeFailure } from 'mockttp';
 import {
   BODY_CAP_BYTES,
   cleanHeaders,
   decodeForDisplay,
-  decodeStrict,
   deleteHeader,
   frameBody,
-  frameBodyAsync,
   getHeader,
-  normalizedEncoding,
-  setHeader,
   type HeaderBag,
 } from './body';
 import {
@@ -40,104 +32,45 @@ import {
   grpcApplicable,
   grpcEditProblem,
   grpcMockProblem,
-  GRPC_REWRITE_RESERVED,
-  GRPC_TRAILER_RESERVED,
-  targetsProxy,
   isInvalidMatcher,
   mapRemoteUrl,
-  MAX_BODY_REPLACEMENTS,
   pickSequenceStep,
   WEBSOCKET_ACTIONS,
   type CompiledRule,
 } from './rules';
-import { grpcMessageHash, ReplayStore, requestBodyHash, type BodyKey } from './replay';
-import { framePayload, MAX_REPLAY_GAP_MS, sseEventText, sseSchedule, wsScript, type TimedStep } from './replay-stream';
-import { applyOps } from './jsonpath';
-import { MUTATE_MAX_TARGETS } from './mutate';
-import { createUpstreamAgents, isLoopbackHost, parseUpstreamProxy, retireAgents, type UpstreamAgents, type UpstreamProxyConfig, type UpstreamProxySpec } from './upstream-proxy';
-import { matchesHostPattern, normalizeHostname, parseHostPattern, parseHostPatterns, splitHostPort, type HostPattern } from './hosts';
-import { openTunnelUpstream, relay, viaUpstreamProxy } from './tunnel';
-import { isShaped, LinkQueue, PacedStream, type LinkShape } from './pace';
+import { ReplayStore, requestBodyHash, type BodyKey } from './replay';
 import {
-  classifyFirstBytes,
+  createUpstreamAgents,
+  isLoopbackHost,
+  parseUpstreamProxy,
+  retireAgents,
+  type UpstreamAgents,
+  type UpstreamProxyConfig,
+  type UpstreamProxySpec,
+} from './upstream-proxy';
+import { matchesHostPattern, parseHostPatterns, type HostPattern } from './hosts';
+import {
   CONNECT_TIMEOUT_HEADER,
-  decodeGrpcMessage,
   encodeGrpcMessage,
-  FirstMessageCut,
-  forwardableHeaders,
-  frameMessage,
-  GRPC_CONNECT_TIMEOUT_MS,
-  grpcEncodingOf,
-  GrpcMessageParser,
-  h2CodeName,
-  isGrpcContentType,
-  GRPC_BREAKER_EVENT,
-  GRPC_BREAKER_WINDOW_MS,
-  GrpcFrameRecorder,
   type GrpcBreakerEvent,
-  decompressPrefix,
-  GRPC_COMPRESSED_KEEP_BYTES,
-  GRPC_HELD_TOTAL_CAP_BYTES,
   GRPC_HOOK_CAP_BYTES,
   grpcHookTesting,
-  GrpcMessageTransform,
-  type HookedMessage,
-  type HookOutcome,
-  messageFrame,
-  Observer,
-  parseConnectTimeout,
-  parseGrpcPath,
-  parseGrpcStatus,
-  parseGrpcTimeout,
-  recordedHeaders,
-  SILENT_FIRST_BYTE_MS,
   SILENT_TUNNEL_HEADER,
 } from './grpc';
 import { GrpcSessionPool } from './grpc-upstream';
-import {
-  GRPC_WEB_EXPOSE_HEADERS,
-  grpcStatusOf,
-  grpcWebBody,
-  grpcWebContentType,
-  GrpcWebRecorder,
-  grpcWebVariant,
-  type GrpcWebVariant,
-} from './grpc-web';
-import { grpcSelfCheck, injectSilentTunnel, type GrpcSupport } from './silent';
-import { detectGraphql, graphqlOperationNames } from './graphql';
-import {
-  allowedOrigin,
-  CORS_RESPONSE_HEADERS,
-  corsResponseHeaders,
-  diagnoseCors,
-  hasAllowOrigin,
-  isCorsRequest,
-  preflightMethod,
-  preflightResponseHeaders,
-  type CorsOptions,
-} from './cors';
-import {
-  closeFrame,
-  DEFAULT_MAX_FRAMES,
-  frameCost,
-  LIVE_FRAME_FLOOR,
-  MAX_FRAME_BYTES_PER_EXCHANGE,
-  payloadFrame,
-  sseFrame,
-} from './frames';
-import { SseParser, SseRecorder } from './sse';
-import { isBrowserInternal } from './browser';
-import { installWsLimit, markProxySocket, WS_MAX_MESSAGE_BYTES } from './ws-limit';
+import { grpcWebContentType, grpcWebVariant } from './grpc-web';
+import { grpcSelfCheck, type GrpcSupport } from './silent';
+import { graphqlOperationNames } from './graphql';
+import { allowedOrigin, CORS_RESPONSE_HEADERS, corsResponseHeaders, isCorsRequest, preflightMethod } from './cors';
+import { DEFAULT_MAX_FRAMES } from './frames';
+import { installWsLimit } from './ws-limit';
 import { boundAddressMatches, rebindIfNeeded, runWithListenHost } from './listen-host';
 import { createUpstreamPool, HOST_ALIASES, type UpstreamPool } from './upstream-pool';
 import type { RequestPlan } from './upstream-request';
 import { refreshRoutes } from './routes';
-import { captured, getTap, installTaps, isComplete, RESPONSE_PAUSE_LIMIT_BYTES, type HeadPatch, type Tap } from './taps';
+import { captured, getTap, installTaps, isComplete, RESPONSE_PAUSE_LIMIT_BYTES } from './taps';
 import {
-  adoptAsLanSocket,
   checkLanRequest,
-  findOnSocketChain,
-  tunnelMarker,
   LanGate,
   lanGateOf,
   lanIPv4Addresses,
@@ -145,382 +78,122 @@ import {
   lanTesting,
   normalizeIp,
   onComboConnection,
-  lanConnectAllowed,
   refuse,
   resolveCheckedTarget,
   RESPONSE_407,
-  SOCKET_SELF,
-  SsrfError,
   SSRF_MARKER,
 } from './lan';
 import { describeProfile, NO_PROFILE, type NetworkProfile } from './network';
-import { mutateBody } from './mutate';
-import { isTraceHost, isTraceUrl, parseTraceBody, TraceJoin, TRACE_BODY_MAX, TRACE_HEADER, TRACE_ID_RE, TRACE_PATH } from './trace';
-import type { Shaping } from './shaper';
-import { elapsed, type TimingPatch, type TimingSink } from './timing';
 import {
-  mentionsOnResponse,
-  readRequestResult,
-  readResponseResult,
-  sameHeaders,
-  scriptRequestOf,
-  scriptResponseOf,
-  ScriptRunner,
-  mentionsGrpcHooks,
-  SCRIPT_BODY_MAX_BYTES,
-  type ScriptHook,
-  SCRIPT_LOG_MAX_CHARS,
-  SCRIPT_LOG_MAX_LINES,
-  type RequestOutcome,
-  type ScriptOutcome,
-} from './script';
+  isTraceHost,
+  isTraceUrl,
+  parseTraceBody,
+  TraceJoin,
+  TRACE_BODY_MAX,
+  TRACE_HEADER,
+  TRACE_ID_RE,
+  TRACE_PATH,
+} from './trace';
+import { mentionsOnResponse, ScriptRunner } from './script';
 import type {
-  Body,
   ClientCertificate,
   Exchange,
-  FaultKind,
-  Frame,
   GrpcEdit,
-  GrpcInfo,
   GrpcProxyCodec,
-  GrpcScriptMessage,
-  GrpcScriptStatus,
   InterceptProxyOptions,
-  MutateOp,
   ReplayEntry,
   ReplayOptions,
   RequestEdit,
   ResponseEdit,
-  RewriteSpec,
   Rule,
   RuleAction,
   SendRequest,
 } from './types';
-
-/** The action a request gets: the rule's, or the current sequence step's (undefined = pass through). */
-type Applied = Exclude<RuleAction, { kind: 'sequence' }> | undefined;
-type RewriteAction = Extract<RuleAction, { kind: 'rewrite' }>;
-type ScriptAction = Extract<RuleAction, { kind: 'script' }>;
-
-interface RewriteFlow {
-  request?: RewriteSpec;
-  response?: RewriteSpec & { status?: number };
-  /** Body replacements to apply (false when the body can't be held: streamed / too large). */
-  reqBody: boolean;
-  resBody: boolean;
-}
-
-type CallbackRequestResult = mockttp.requestSteps.CallbackRequestResult;
-type CallbackResponseResult = mockttp.requestSteps.CallbackResponseResult;
-type CallbackResponseMessageResult = mockttp.requestSteps.CallbackResponseMessageResult;
-type PassThroughResponse = mockttp.requestSteps.PassThroughResponse;
-
-type Decision =
-  | { kind: 'resume'; edit?: RequestEdit | ResponseEdit }
-  | { kind: 'abort' }
-  | { kind: 'gone' }; // client disconnected or proxy stopped; exchange state already set
-
-/**
- * Where a request goes inside mockttp, decided from method + URL + headers only (never the body):
- * - plain: streaming passthrough; recorded passively from the taps (bounded). Throttle latency is
- *   applied by the route matcher (before forwarding, nothing read); kbps / truncate by the taps.
- * - h1: beforeRequest only (mock, block, request breakpoint, and the reset / dns / timeout faults).
- *   The response, if forwarded, streams.
- * - h2: beforeRequest + beforeResponse (response / both breakpoints, mutate rules); response buffered ≤ 32 MB.
- * - trace: the trace sink (CONTRACTS §9.2), answered 204 locally, never recorded.
- * - ws-pass / ws-local: WebSocket upgrades (CONTRACTS §11.1), passed through and recorded frame by frame, or
- *   answered locally (block / fault rules, the offline profile).
- */
-type Route = 'plain' | 'h1' | 'h2' | 'denied' | 'trace' | 'ws-pass' | 'ws-local' | 'replay-stream' | 'ws-replay' | 'tunnel' | 'grpc';
-
-/** A fault applied to a request: a fault rule, the `offline` profile ('dns'), or a throttle drop ('drop' = reset). */
-type FlowFault = FaultKind | 'drop';
-
-interface SendMeta {
-  initiator: 'editor' | 'agent';
-  resentFrom?: string;
-  /** Resolves send() once the exchange is recorded. */
-  recorded(id: string): void;
-  done: boolean;
-}
-
-interface Flow {
-  route: Route;
-  rule?: Rule;
-  /** Why a matching breakpoint / mutate rule was not applied (shown in Exchange.error on a non-error state). */
-  note?: string;
-  /** `x-fi-id` of the request (CONTRACTS §9.1), stripped from the headers. */
-  traceId?: string;
-  /** Set for requests made by send(). */
-  send?: SendMeta;
-  fault?: FlowFault;
-  /** Throttle (a throttle rule, or the network profile) for a request that reaches the network. */
-  throttle?: { latencyMs?: number; kbps?: number; uploadKbps?: number };
-  /** Exchange.simulated. */
-  simulated?: string;
-  /** Plain route with latency: resolves when the request may be forwarded (false = the app left). */
-  delay?: Promise<boolean>;
-  /** The truncate fault cut the response; the exchange is finished by that path. */
-  truncated?: boolean;
-  /** The client came through the LAN listener (Exchange.viaLan). */
-  viaLan?: boolean;
-  /**
-   * A rule with `graphqlOperation` needs the request body (CONTRACTS §11.2): routed like a request breakpoint
-   * (h1, or h2 when a candidate rule needs the response hook) and the rule is chosen in beforeRequest.
-   */
-  deferred?: boolean;
-  /** A CORS preflight answered locally because a mock / block / cors rule matches the request it asks about. */
-  preflight?: boolean;
-  /** A cors rule: add CORS headers to the real response (CONTRACTS §11.3). */
-  corsPatch?: CorsOptions;
-  // CONTRACTS §12 (v0.6.0)
-  /** The action applied: the rule's, or the current sequence step's; undefined = pass through. */
-  action?: Applied;
-  /** Sequence rules: the step that answers (0-based; -1 = after the steps, passed through). */
-  step?: number;
-  /** The URL the app asked for, when Map Remote sends the request elsewhere (recorded as the exchange URL). */
-  originalUrl?: string;
-  /** Map Remote: the URL the request goes to and the Host header it carries. */
-  map?: { url: string; host: string };
-  rewrite?: RewriteFlow;
-  /** Map / request-header rewrites were applied to the request in decide() (else onRequest applies them). */
-  reqApplied?: boolean;
-  /** Replay: the recorded response to answer with, or 'deferred' (the request body hash is needed first). */
-  replay?: ReplayEntry | 'deferred';
-  /** Answer 502 with this text (e.g. an unusable Map Remote target). */
-  localError?: string;
-  /** CONTRACTS §18.6: a gRPC call that came back from our own relay: answered 14, never recorded. */
-  loop?: boolean;
-  /** CONTRACTS §19.1: a gRPC-Web call (an HTTP flow shown as gRPC). */
-  grpcWeb?: GrpcWebVariant;
-  /** REVIEW-8 #1: answer 403 with this text — a web page's request to a client-certificate host. */
-  refused?: string;
-  /** Hooked routes: the Host header to send when it isn't the URL's (preserveHost, a rewritten Host). */
-  wantHost?: string;
-  /** mockttp's timing events of the request (CONTRACTS §13.2 `requestMs`). */
-  te?: RequestTimingEvents;
-}
-
-/** The part of mockttp's TimingEvents we read (high-resolution `performance.now()` timestamps). */
-interface RequestTimingEvents {
-  startTimestamp?: number;
-  bodyReceivedTimestamp?: number;
-}
-
-/** Recording state of a WebSocket / event stream. */
-interface StreamState {
-  sse?: SseRecorder;
-  /** The 'ws-upgrade' hook attached to the connection (frames are recorded). */
-  wsDirect?: boolean;
-  /** The server's side closed first: its close code / reason. */
-  serverClose?: { code: number; reason: Buffer };
-  /** A message over WS_MAX_MESSAGE_BYTES (REVIEW-5 #1): from the server (receive) or the app (send). */
-  tooBig?: Frame['dir'];
-}
-
-interface MatchOptions {
-  /** Count the hit (rules with `times`). */
-  count: boolean;
-  /** Request headers (for the GraphQL body limits). */
-  headers?: HeaderBag;
-  /** The decoded request body, when known: GraphQL-scoped rules are decided with it. */
-  body?: () => string | undefined;
-  /** Treat GraphQL-scoped rules as matching on method + URL alone (preflights). */
-  ignoreGraphql?: boolean;
-  /** A WebSocket upgrade: only block / fault / throttle / mapRemote rules apply, GraphQL-scoped rules never do. */
-  ws?: boolean;
-  /** A TLS passthrough CONNECT (CONTRACTS §14.2): only block and fault rules apply. */
-  tunnel?: boolean;
-  /** A gRPC call (CONTRACTS §16.2): only grpcMock, block, fault, throttle and sequences of those apply. */
-  grpc?: boolean;
-  /** A gRPC-Web call (CONTRACTS §19.1): an HTTP request for which grpcMock rules apply too. */
-  grpcWeb?: boolean;
-}
-
-interface MatchResult {
-  rule?: Rule;
-  /** The action for this request (a sequence rule's current step); undefined = pass through. */
-  action?: Applied;
-  /** Sequence rules: the step (see Flow.step). */
-  step?: number;
-  /** A GraphQL-scoped rule needs the body to decide. */
-  deferred?: boolean;
-  /** …and some candidate from there on needs the response hook (response breakpoint / mutate). */
-  needsResponseHook?: boolean;
-  /** Why a matching rule was skipped (shown in Exchange.error on a non-error state). */
-  note?: string;
-}
-
-interface ReqMeta {
-  traceId?: string;
-  sendNonce?: string;
-  /** CONTRACTS §18.6: the hop marker a gRPC call arrived with (one of ours = a loop). */
-  hop?: string;
-}
-
-interface Live {
-  ex: Exchange;
-  flow: Flow;
-  stream?: StreamState;
-}
-
-interface Paused {
-  phase: 'request' | 'response';
-  settle: (d: Decision) => void;
-}
-
-/** One gRPC call through the relay / a local answer (CONTRACTS §16.2). */
-interface GrpcCall {
-  ex: Exchange;
-  info: GrpcInfo;
-  flow: Flow;
-  req: OngoingRequest;
-  /** The app's stream. */
-  stream: http2.ServerHttp2Stream;
-  /** The server's stream (relay). */
-  up?: http2.ClientHttp2Stream;
-  upError?: Error & { code?: string };
-  /** The server's trailers, once they arrived. */
-  upTrailers?: http2.IncomingHttpHeaders;
-  /** Trailers to end the app's response with when the server's connection failed mid-response. */
-  failTrailers?: Record<string, string>;
-  failReason?: string;
-  /** The last stream piped into the app's stream (unpiped on a failure). */
-  respTail?: Readable;
-  /** The proxy reset / ended the app's stream itself: its close is not the app leaving. */
-  localReset?: boolean;
-  /** Response headers time (receiveMs). */
-  headAt?: number;
-  /** CONTRACTS §17.2: pauses of this call, one at a time (a message per direction, then the end). */
-  pauseChain?: Promise<unknown>;
-  /** A response-phase breakpoint: the end of the call (its status) is paused too. */
-  statusPause?: boolean;
-  /** Hooked links (destroyed with the call, releasing their budget). */
-  transforms?: GrpcMessageTransform[];
-  /** CONTRACTS §18.2: the script's gRPC hooks for this call, and how many messages it has seen. */
-  scriptStatus?: boolean;
-  scriptCalls?: number;
-  /** REVIEW-11 #6: codec work spent on this call by mutate (bytes decoded, ms). */
-  mutateBytes?: number;
-  mutateMs?: number;
-  mutateStopped?: boolean;
-  isLive(): boolean;
-}
-
-/** On a silent tunnel's raw socket: what its CONNECT said (CONTRACTS §16.2). */
-const SILENT_INFO = Symbol('flutter-intercept.silent-tunnel');
-interface SilentInfo {
-  connectTimeoutMs: number;
-}
-
-const DEFAULT_MAX_EXCHANGES = 1000;
-const DEFAULT_BREAKPOINT_TIMEOUT_MS = 5 * 60 * 1000;
-const DEFAULT_MAX_STORED_BODY_BYTES = 256 * 1024 * 1024;
-const BLOCK_BODY = 'Blocked by Flutter Intercept';
-const MB = 1024 * 1024;
-/** Marks requests made by send(): `x-fi-send: <nonce>`, stripped like `x-fi-id`. */
-const SEND_HEADER = 'x-fi-send';
-/** Hop-by-hop / framing / internal headers a send() caller can't set (the proxy derives them). */
-const SEND_DROPPED_HEADERS = new Set([
-  'host',
-  'connection',
-  'keep-alive',
-  'proxy-connection',
-  'proxy-authorization',
-  'transfer-encoding',
-  'content-length',
-  'te',
-  'trailer',
-  'upgrade',
-  TRACE_HEADER,
+import { ExchangeStore } from './exchange-store';
+import { GrpcRelay } from './grpc-relay';
+import { GrpcLocal } from './grpc-local';
+import { GrpcHooks } from './grpc-hooks';
+import { GrpcWebFlow } from './grpc-web-flow';
+import { ConnectFlow } from './connect-flow';
+import { WsFlow } from './ws-flow';
+import { ReplayFlow } from './replay-flow';
+import { HttpEdits } from './http-edits';
+import { HttpTaps } from './http-taps';
+import type {
+  Applied,
+  ScriptAction,
+  CallbackRequestResult,
+  CallbackResponseResult,
+  CallbackResponseMessageResult,
+  PassThroughResponse,
+  Decision,
+  Route,
+  SendMeta,
+  Flow,
+  MatchOptions,
+  MatchResult,
+  ReqMeta,
+  Paused,
+  LoadedCert,
+} from './flow-types';
+import {
+  DEFAULT_MAX_EXCHANGES,
+  DEFAULT_BREAKPOINT_TIMEOUT_MS,
+  DEFAULT_MAX_STORED_BODY_BYTES,
+  BLOCK_BODY,
   SEND_HEADER,
-]);
-const HTTP_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
-/** Node's setTimeout limit; longer rule expiries are re-armed. */
-const MAX_TIMER_MS = 2 ** 31 - 1;
-const TRACE_FLOW: Flow = { route: 'trace' };
-const DENIED_FLOW: Flow = { route: 'denied' };
+  SEND_DROPPED_HEADERS,
+  HTTP_TOKEN,
+  MAX_TIMER_MS,
+  TRACE_FLOW,
+  DENIED_FLOW,
+  FAULT_LABELS,
+  throttleLabel,
+  profileLabel,
+  defaultCa,
+  decodeFull,
+  sleep,
+  isEventStream,
+  capitalize,
+  isGrpcCall,
+  hasRequestBody,
+  bodyLimitReason,
+  corsOptions,
+  validateEdit,
+  validateProfile,
+  sequenceSig,
+  needsResponseHook,
+  HOP_HEADER,
+  INTERNAL_TUNNEL_HEADER,
+} from './proxy-util';
+import {
+  rewriteSets,
+  rewriteHostOf,
+  rewritePairs,
+  pairValue,
+  pairsToObject,
+  rewriteFlow,
+  rewriteLabel,
+} from './rewrite-flow';
+import { loadClientCertificate, isLoopbackOrigin, certRefusalText } from './client-certs';
+import type { ProxyContext } from './proxy-context';
 
-const FAULT_LABELS: Record<FlowFault, string> = {
-  reset: 'Fault: connection reset',
-  timeout: 'Fault: timeout',
-  truncate: 'Fault: truncated response',
-  dns: 'Fault: DNS failure',
-  drop: 'Dropped',
-};
+/** QUALITY-1 Q1: key of InterceptProxy's test-only accessor. @internal */
+export const TEST_INTERNALS = Symbol.for('flutter-intercept.test-internals');
 
-type ThrottleProfile = Extract<NetworkProfile, { kind: 'throttle' }>;
-
-function throttleLabel(t: { latencyMs?: number; kbps?: number; dropRate?: number; uploadKbps?: number }): string {
-  const label = withUpload(describeProfile({ kind: 'throttle', latencyMs: t.latencyMs, kbps: t.kbps, dropRate: t.dropRate }), t.uploadKbps);
-  return label === describeProfile(NO_PROFILE) ? 'Throttle' : label;
+/** What `proxy[TEST_INTERNALS]()` exposes to tests. @internal */
+export interface ProxyTestInternals {
+  readonly grpcPool: GrpcSessionPool | undefined;
+  readonly grpcWebCalls: Map<string, unknown>;
+  readonly grpcHeld: number;
+  readonly paused: Map<string, unknown>;
+  readonly lanGate: LanGate | undefined;
+  readonly rawServer: net.Server | undefined;
+  readonly pinnedHosts: Map<string, number>;
+  readonly decrypting: Map<string, { host: string; port: number }>;
+  onTlsError(f: unknown): void;
 }
 
-/** describeProfile, plus the upload rate for custom profiles ("+300 ms, 800 kbps, 200 kbps up"). */
-function profileLabel(p: ThrottleProfile): string {
-  return p.preset ? describeProfile(p) : withUpload(describeProfile(p), p.uploadKbps);
-}
-
-function withUpload(label: string, uploadKbps: number | undefined): string {
-  if (!uploadKbps || uploadKbps <= 0) return label;
-  const up = `${uploadKbps} kbps up`;
-  return label === describeProfile(NO_PROFILE) ? up : `${label}, ${up}`;
-}
-
-/** Request bodies a request breakpoint may hold (and that can be edited). Same as the display cap. */
-export const REQUEST_PAUSE_LIMIT_BYTES = BODY_CAP_BYTES;
-
-let defaultCaPromise: Promise<{ key: string; cert: string }> | undefined;
-function defaultCa(): Promise<{ key: string; cert: string }> {
-  defaultCaPromise ??= generateCACertificate({
-    subject: { commonName: 'Flutter Intercept CA (in-memory, do not trust)', organizationName: 'Flutter Intercept' },
-  }).then((c) => ({ key: c.key, cert: c.cert }));
-  return defaultCaPromise;
-}
-
-/** Full decode, for edits that must re-encode the original body (bounded by the pause limits). */
-async function decodeFull(body: CompletedBody): Promise<Buffer> {
-  try {
-    return (await body.getDecodedBuffer()) ?? body.buffer;
-  } catch {
-    return body.buffer;
-  }
-}
-
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
-const bodySize = (e: Exchange) => (e.requestBody?.text.length ?? 0) + (e.responseBody?.text.length ?? 0);
-
-/** 'exchange' events for frames: at most one per exchange per this many ms (CONTRACTS §11.1). */
-const FRAME_EMIT_INTERVAL_MS = 100;
-
-const isEventStream = (contentType: string | undefined) =>
-  (contentType ?? '').split(';')[0].trim().toLowerCase() === 'text/event-stream';
-
-/** WebSocket upgrades are recorded (and matched) as ws:// / wss:// URLs. */
-const toWsUrl = (url: string) => url.replace(/^http(s?):\/\//i, (_m, s: string) => `ws${s.toLowerCase()}://`);
-
-const capitalize = (s: string) => `${s[0]?.toUpperCase() ?? ''}${s.slice(1)}`;
-
-function toBuffer(data: unknown): Buffer {
-  if (Buffer.isBuffer(data)) return data;
-  if (Array.isArray(data)) return Buffer.concat(data.map(toBuffer));
-  if (data instanceof ArrayBuffer) return Buffer.from(data);
-  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-  return Buffer.from(String(data ?? ''), 'utf8');
-}
-
-/** Minimal shape of the `ws` WebSocket objects mockttp hands over in its 'ws-upgrade' socket event. */
-interface WsLike {
-  on(event: 'message', l: (data: unknown, isBinary: boolean) => void): unknown;
-  on(event: 'ping' | 'pong', l: (data: Buffer) => void): unknown;
-  on(event: 'error', l: (e: Error & { code?: string }) => void): unknown;
-  once(event: 'close', l: (code: number, reason: Buffer) => void): unknown;
-  close(code?: number, reason?: string): void;
-  upstreamWebSocket?: WsLike;
-}
-
-const isTooBig = (e: { code?: string } | undefined) => e?.code === 'WS_ERR_UNSUPPORTED_MESSAGE_LENGTH';
 /**
  * HTTP(S) MITM proxy that records every exchange and applies rules (CONTRACTS §3).
  *
@@ -535,22 +208,12 @@ const isTooBig = (e: { code?: string } | undefined) => e?.code === 'WS_ERR_UNSUP
  */
 export class InterceptProxy extends EventEmitter {
   private readonly host: string;
-  private readonly maxExchanges: number;
-  private readonly maxStoredBodyBytes: number;
   private readonly breakpointTimeoutMs: number;
   private server?: mockttp.Mockttp;
   private pool?: UpstreamPool;
   private _port = 0;
   private compiled: CompiledRule[] = [];
-  /** Ring buffer, insertion order = oldest first. */
-  private readonly store = new Map<string, Exchange>();
-  private readonly sizes = new Map<string, number>();
-  private storedBytes = 0;
-  /** In-flight exchanges (survive ring eviction and clear()). */
-  private readonly live = new Map<string, Live>();
   private readonly paused = new Map<string, Paused>();
-  /** Routing decision per request id, made once by the first matcher that asks. */
-  private readonly flows = new Map<string, Flow>();
   /** LAN mode (CONTRACTS §7): token-gated second listener, only while a physical iOS session runs. */
   private lanGate?: LanGate;
   private lanOpening?: Promise<unknown>;
@@ -575,13 +238,6 @@ export class InterceptProxy extends EventEmitter {
   private profile: NetworkProfile = NO_PROFILE;
   /** Faulted requests held unanswered ('timeout'): settle = the app left (true) or the hold ran out (false). */
   private readonly holds = new Map<string, (appLeft: boolean) => void>();
-  private readonly maxFrames: number;
-  /** Stored frame payload bytes per exchange (part of the body byte budget). */
-  private readonly frameBytes = new Map<string, number>();
-  /** Coalesced 'exchange' emits for frames: last emit time and the pending timer, per exchange. */
-  private readonly emitState = new Map<string, { last: number; timer?: NodeJS.Timeout }>();
-  /** Ids of read-only records added with record() (CONTRACTS §11.4). */
-  private readonly records = new Set<string>();
   /** A Flutter Web session is running: tag the browser's own requests (CONTRACTS §11.3). */
   private webSession = false;
   /** Sequence position per rule id, with the rule content it belongs to (CONTRACTS §12.3). */
@@ -601,8 +257,6 @@ export class InterceptProxy extends EventEmitter {
   private passthroughProblems: string[] = [];
   /** The CONNECT hook is installed (start()). */
   private connectHook = false;
-  /** Upstream sockets of open passthrough tunnels (destroyed by stop()). */
-  private readonly tunnelSockets = new Set<net.Socket>();
   /** CONTRACTS §14.3: usable client certificates (first match wins) and every configured one's status. */
   private certs: LoadedCert[] = [];
   private certStatus: { host: string; problem?: string }[] = [];
@@ -614,9 +268,6 @@ export class InterceptProxy extends EventEmitter {
   private readonly certMap: Record<string, unknown> = new Proxy({} as Record<string, unknown>, {
     get: (_t, key) => (typeof key === 'string' ? this.certOptions(key) : undefined),
   });
-  /** CONTRACTS §14.5: answers replayed WebSocket upgrades; the subprotocol each recorded connection chose. */
-  private wsReplayServer?: WebSocket.Server;
-  private readonly wsReplayProtocols = new WeakMap<object, string>();
   /** CONTRACTS §16.2: TLS silent tunnels to these hosts are decrypted (MITM); the rest are passed through. */
   private grpcDecrypt: HostPattern[] = [];
   private grpcDecryptProblems: string[] = [];
@@ -628,38 +279,202 @@ export class InterceptProxy extends EventEmitter {
   private rawServer?: net.Server;
   /** setRules: grpcMock rules refused for their headers / values (disabled, CONTRACTS §16.2). */
   private refused: { id: string; problem: string }[] = [];
-  /** CONTRACTS §17.3: protobuf codec the host injects for mutate rules (setGrpcCodec). */
-  private grpcCodec?: GrpcProxyCodec;
-  /** CONTRACTS §17.7: bytes of gRPC messages held at breakpoints right now, across calls. */
-  private grpcHeld = 0;
   /** CONTRACTS §19.3: decrypt every TLS silent gRPC tunnel (but tlsPassthrough / learned pinned hosts). */
   private grpcDecryptAllOn = false;
-  /** CONTRACTS §19.3: `host:port`s whose app rejected our certificate on a decrypted silent tunnel (until stop()). */
-  private readonly pinnedHosts = new Map<string, number>(); // host:port → expiry (epoch ms)
-  /** Handshakes the app closed without an alert, per host:port (dart:io rejects that way): count + first time. */
-  private readonly pinStrikes = new Map<string, { n: number; first: number }>();
-  /** Decrypted (MITM) silent TLS tunnels in their handshake: client `address:port` → the CONNECT target. */
-  private readonly decrypting = new Map<string, { host: string; port: number }>();
-  /** CONTRACTS §19.1: gRPC-Web calls being read (by request id). */
-  private readonly grpcWebCalls = new Map<string, GrpcWebState>();
   /** CONTRACTS §18.6: this instance's hop marker (on every relayed / sent gRPC call; one arriving with it is a loop). */
   private readonly hopNonce = randomBytes(18).toString('base64url');
-  /** CONTRACTS §16.8: when each authority's breaker report was last emitted. */
-  private readonly breakerSeen = new Map<string, number>();
+  /** QUALITY-1 Q1: the flow modules' view of this proxy (proxy-context.ts). */
+  private readonly ctx: ProxyContext;
+  private readonly book: ExchangeStore;
+  private readonly grpc: GrpcRelay;
+  private readonly grpcLocal: GrpcLocal;
+  private readonly hooks: GrpcHooks;
+  private readonly grpcWeb: GrpcWebFlow;
+  private readonly connect: ConnectFlow;
+  private readonly ws: WsFlow;
+  private readonly replays: ReplayFlow;
+  private readonly edits: HttpEdits;
+  private readonly taps: HttpTaps;
 
   constructor(private readonly opts: InterceptProxyOptions) {
     super();
-    this.host = opts.host ?? '127.0.0.1';
-    this.maxExchanges = Math.max(1, Math.floor(opts.maxExchanges ?? DEFAULT_MAX_EXCHANGES));
-    this.maxStoredBodyBytes = opts.maxStoredBodyBytes ?? DEFAULT_MAX_STORED_BODY_BYTES;
-    this.breakpointTimeoutMs = opts.breakpointTimeoutMs ?? DEFAULT_BREAKPOINT_TIMEOUT_MS;
+    this.ctx = this.makeContext();
     const mf = opts.maxFramesPerExchange ?? DEFAULT_MAX_FRAMES;
-    this.maxFrames = Number.isFinite(mf) ? Math.max(0, Math.floor(mf)) : DEFAULT_MAX_FRAMES;
+    this.book = new ExchangeStore(this.ctx, {
+      maxExchanges: Math.max(1, Math.floor(opts.maxExchanges ?? DEFAULT_MAX_EXCHANGES)),
+      maxStoredBodyBytes: opts.maxStoredBodyBytes ?? DEFAULT_MAX_STORED_BODY_BYTES,
+      maxFrames: Number.isFinite(mf) ? Math.max(0, Math.floor(mf)) : DEFAULT_MAX_FRAMES,
+    });
+    this.grpc = new GrpcRelay(this.ctx);
+    this.grpcLocal = new GrpcLocal(this.ctx);
+    this.hooks = new GrpcHooks(this.ctx);
+    this.grpcWeb = new GrpcWebFlow(this.ctx);
+    this.connect = new ConnectFlow(this.ctx);
+    this.ws = new WsFlow(this.ctx);
+    this.replays = new ReplayFlow(this.ctx);
+    this.edits = new HttpEdits(this.ctx);
+    this.taps = new HttpTaps(this.ctx);
+    this.host = opts.host ?? '127.0.0.1';
+    this.breakpointTimeoutMs = opts.breakpointTimeoutMs ?? DEFAULT_BREAKPOINT_TIMEOUT_MS;
     if (opts.upstreamProxy) this.upstreamSpec = parseUpstreamProxy(opts.upstreamProxy);
     if (opts.tlsPassthrough) this.setTlsPassthrough(opts.tlsPassthrough);
     if (opts.clientCertificates) this.setClientCertificates(opts.clientCertificates);
     if (opts.grpcDecryptHosts) this.setGrpcDecryptHosts(opts.grpcDecryptHosts);
     if (opts.grpcDecryptAll) this.grpcDecryptAllOn = true;
+  }
+  /** QUALITY-1 Q1: getters and delegates over the members the flow modules use. */
+  private makeContext(): ProxyContext {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const self = this;
+    return {
+      addressIsSelf: (...a) => self.addressIsSelf(...a),
+      get appPackages() {
+        return self.appPackages;
+      },
+      get book() {
+        return self.book;
+      },
+      get breakpointTimeoutMs() {
+        return self.breakpointTimeoutMs;
+      },
+      certFor: (...a) => self.certFor(...a),
+      certRefusal: (...a) => self.certRefusal(...a),
+      get connectHook() {
+        return self.connectHook;
+      },
+      set connectHook(v) {
+        self.connectHook = v;
+      },
+      get connRequest() {
+        return self.connRequest;
+      },
+      get edits() {
+        return self.edits;
+      },
+      emit: (event, ...args) => self.emit(event, ...args),
+      get grpc() {
+        return self.grpc;
+      },
+      get grpcCheck() {
+        return self.grpcCheck;
+      },
+      get grpcDecrypt() {
+        return self.grpcDecrypt;
+      },
+      get grpcDecryptAllOn() {
+        return self.grpcDecryptAllOn;
+      },
+      get grpcLocal() {
+        return self.grpcLocal;
+      },
+      get grpcPool() {
+        return self.grpcPool;
+      },
+      get grpcWeb() {
+        return self.grpcWeb;
+      },
+      get holds() {
+        return self.holds;
+      },
+      get hooks() {
+        return self.hooks;
+      },
+      get hopNonce() {
+        return self.hopNonce;
+      },
+      get host() {
+        return self.host;
+      },
+      get lanGate() {
+        return self.lanGate;
+      },
+      matchRule: (...a) => self.matchRule(...a),
+      get opts() {
+        return self.opts;
+      },
+      get passthrough() {
+        return self.passthrough;
+      },
+      pause: (...a) => self.pause(...a),
+      get paused() {
+        return self.paused;
+      },
+      get port() {
+        return self._port;
+      },
+      get profile() {
+        return self.profile;
+      },
+      get rawServer() {
+        return self.rawServer;
+      },
+      replayFlow: (...a) => self.replayFlow(...a),
+      get replayStore() {
+        return self.replayStore;
+      },
+      get reqMeta() {
+        return self.reqMeta;
+      },
+      get scripts() {
+        return self.scripts;
+      },
+      get sends() {
+        return self.sends;
+      },
+      get server() {
+        return self.server;
+      },
+      get taps() {
+        return self.taps;
+      },
+      targetsSelf: (...a) => self.targetsSelf(...a),
+      get traceJoin() {
+        return self.traceJoin;
+      },
+      get upstreamSpec() {
+        return self.upstreamSpec;
+      },
+      get webSession() {
+        return self.webSession;
+      },
+    };
+  }
+
+  /**
+   * QUALITY-1 Q1: the one supported way for tests to look inside (so moving internals between modules never breaks
+   * them). Not part of the API.
+   * @internal
+   */
+  [TEST_INTERNALS](): ProxyTestInternals {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const self = this;
+    return {
+      get grpcPool() {
+        return self.grpcPool;
+      },
+      get grpcWebCalls() {
+        return self.grpcWeb.grpcWebCalls as Map<string, unknown>;
+      },
+      get grpcHeld() {
+        return self.hooks.grpcHeld;
+      },
+      get paused() {
+        return self.paused as Map<string, unknown>;
+      },
+      get lanGate() {
+        return self.lanGate;
+      },
+      get rawServer() {
+        return self.rawServer;
+      },
+      get pinnedHosts() {
+        return self.connect.pinnedHosts;
+      },
+      get decrypting() {
+        return self.connect.decrypting;
+      },
+      onTlsError: (f: unknown) => self.connect.onTlsError(f as TlsHandshakeFailure),
+    };
   }
 
   /** Actual port after start() (0 before). */
@@ -698,32 +513,28 @@ export class InterceptProxy extends EventEmitter {
       simulateConnectionErrors: false,
     };
     const route = (r: Route): RequestMatcher =>
-      ({
-        type: 'flutter-intercept-route',
+      callbackMatcher(
+        'flutter-intercept-route',
         // Headers only: never waits for (or reads) the request body. Synchronous, except that a
         // throttled plain request resolves after its latency (the body waits, unread, meanwhile).
-        matches: (req: OngoingRequest) => {
+        (req: OngoingRequest) => {
           const flow = this.decide(req);
           if (flow.route !== r) return false;
           return flow.delay ?? true;
         },
-        explain: () => `routed to "${r}" by Flutter Intercept`,
-        dispose: () => undefined,
-        serialize: () => {
-          throw new Error('not serializable');
-        },
-      }) as unknown as RequestMatcher;
+        () => `routed to "${r}" by Flutter Intercept`,
+      );
     // `Always` matters: without a completion checker mockttp prefers the LAST matching rule once a
     // rule has been used.
     // LAN mode, first rule: refuse LAN requests to this machine's own services (403). Async
     // matcher (DNS); for loopback clients it answers false synchronously.
-    const lanDeny = {
-      type: 'flutter-intercept-lan-deny',
-      matches: (req: OngoingRequest) => {
+    const lanDeny = callbackMatcher(
+      'flutter-intercept-lan-deny',
+      (req: OngoingRequest) => {
         if (this.unauthorized.has(req)) return false;
         if (isTraceUrl(req.url)) return false; // the trace sink: answered locally, nothing is contacted
         // Keyed on the socket: a socket some LAN gate accepted is guarded even after closeLan.
-        const gate = lanGateOf((req as unknown as { socket?: unknown }).socket);
+        const gate = lanGateOf(requestInternals(req).socket);
         if (!gate) return false;
         if (gate.closed) {
           this.lanDenials.set(req.id, `${SSRF_MARKER}: LAN mode is off.`);
@@ -734,30 +545,22 @@ export class InterceptProxy extends EventEmitter {
           return !!reason;
         });
       },
-      explain: () => 'LAN request to a local target (Flutter Intercept)',
-      dispose: () => undefined,
-      serialize: () => {
-        throw new Error('not serializable');
-      },
-    } as unknown as RequestMatcher;
-    const unauthorized = {
-      type: 'flutter-intercept-lan-unauthorized',
-      matches: (req: OngoingRequest) => this.unauthorized.has(req),
-      explain: () => 'LAN request without valid proxy credentials (Flutter Intercept)',
-      dispose: () => undefined,
-      serialize: () => {
-        throw new Error('not serializable');
-      },
-    } as unknown as RequestMatcher;
+      () => 'LAN request to a local target (Flutter Intercept)',
+    );
+    const unauthorized = callbackMatcher(
+      'flutter-intercept-lan-unauthorized',
+      (req: OngoingRequest) => this.unauthorized.has(req),
+      () => 'LAN request without valid proxy credentials (Flutter Intercept)',
+    );
     // CONTRACTS §14.5: a replayed event stream is written by us, event by event (a beforeRequest answer is one body).
     // Same trick as the WebSocket steps below: an own `handle` replaces the step implementation's.
     const passthroughImpl = StepLookup.passthrough.fromDefinition(new PassThroughStep(connection));
     const replayStreamStep = Object.assign(new CallbackStep(() => ({ statusCode: 500 })), {
-      handle: (req: OngoingRequest, res: http.ServerResponse, options: unknown) => this.onReplayStream(req, res, passthroughImpl, options),
+      handle: (req: OngoingRequest, res: http.ServerResponse, options: unknown) => this.replays.onReplayStream(req, res, passthroughImpl, options),
     });
     // CONTRACTS §16.2: the gRPC relay, same trick (the self-check verifies mockttp keeps an own `handle`).
     const grpcStep = Object.assign(new CallbackStep(() => ({ statusCode: 500 })), {
-      handle: (req: OngoingRequest, res: http.ServerResponse) => this.onGrpc(req, res),
+      handle: (req: OngoingRequest, res: http.ServerResponse) => this.grpc.onGrpc(req, res),
     });
     await server.addRequestRules(
       {
@@ -819,19 +622,15 @@ export class InterceptProxy extends EventEmitter {
     // WebSocket upgrades (CONTRACTS §11.1): recorded; block / fault rules and the offline profile answer
     // locally, everything else passes through (frames recorded from the connection, see watchWebSocket).
     const wsRoute = (r: Route): RequestMatcher =>
-      ({
-        type: 'flutter-intercept-ws-route',
-        matches: (req: OngoingRequest) => this.decideWs(req).route === r,
-        explain: () => `websocket routed to "${r}" by Flutter Intercept`,
-        dispose: () => undefined,
-        serialize: () => {
-          throw new Error('not serializable');
-        },
-      }) as unknown as RequestMatcher;
+      callbackMatcher(
+        'flutter-intercept-ws-route',
+        (req: OngoingRequest) => this.ws.decideWs(req).route === r,
+        () => `websocket routed to "${r}" by Flutter Intercept`,
+      );
     // A ws step whose handler is ours: mockttp builds the step from the definition's own properties
     // (Object.assign onto the impl prototype), so an own `handle` replaces the reject implementation.
     const localWsStep = Object.assign(new RejectWebSocketStep(500), {
-      handle: (req: OngoingRequest, socket: net.Socket) => this.onWsLocal(req, socket),
+      handle: (req: OngoingRequest, socket: net.Socket) => this.ws.onWsLocal(req, socket),
     });
     // Map Remote on an upgrade (CONTRACTS §12.6): mockttp makes req.url read-only for websockets, so the mapped
     // target is handed to the step's own connectUpstream (same agents, TLS options and recording hook).
@@ -840,30 +639,29 @@ export class InterceptProxy extends EventEmitter {
     const passWsStep = Object.assign(new PassThroughWebSocketStep(connection), {
       handle: function (this: any, req: OngoingRequest, socket: net.Socket, head: Buffer, options: unknown) {
         const impl = Object.getPrototypeOf(this);
-        const map = proxy.flows.get(req.id)?.map;
+        const map = proxy.book.flows.get(req.id)?.map;
         if (!map) return impl.handle.call(this, req, socket, head, options);
-        return proxy.connectWsMapped(this, req, socket, head, options, map);
+        return proxy.ws.connectWsMapped(this, req, socket, head, options, map);
       },
     });
     const replayWsStep = Object.assign(new RejectWebSocketStep(500), {
-      handle: (req: OngoingRequest, socket: net.Socket, head: Buffer) => this.onWsReplay(req, socket, head),
+      handle: (req: OngoingRequest, socket: net.Socket, head: Buffer) => this.replays.onWsReplay(req, socket, head),
     });
-    await (server as unknown as { addWebSocketRules: (...r: unknown[]) => Promise<unknown> }).addWebSocketRules(
+    await serverInternals(server).addWebSocketRules(
       { matchers: [wsRoute('ws-local')], completionChecker: new Always(), steps: [localWsStep] },
       { matchers: [wsRoute('ws-replay')], completionChecker: new Always(), steps: [replayWsStep] },
       { matchers: [wsRoute('ws-pass')], completionChecker: new Always(), steps: [passWsStep] },
     );
-    // A 'response' listener makes mockttp consume (and, past maxBodySize, discard) its internal
-    // copy of each response; without a consumer that copy would grow without bound. We record
-    // from the taps instead; the listener only handles refused WebSocket upgrades.
-    await server.on('response', (res) => this.onWsRefused(res));
-    await server.on('websocket-accepted', (res) => this.onWsAccepted(res));
-    await server.on('abort', (req) => this.onAbort(req.id, req.error?.message));
-    await server.on('tls-client-error', (f) => this.onTlsError(f));
+    // PERF-1 #4: no 'response' listener — it made mockttp buffer a second copy of every response body. The taps
+    // write past mockttp's tracking stream (taps.ts), and refused WebSocket upgrades are read from the socket
+    // (watchWebSocket).
+    await server.on('websocket-accepted', (res) => this.ws.onWsAccepted(res));
+    await server.on('abort', (req) => this.taps.onAbort(req.id, req.error?.message));
+    await server.on('tls-client-error', (f) => this.connect.onTlsError(f));
 
     try {
       await runWithListenHost(this.host, () => server.start(this.opts.port));
-      const raw = (server as unknown as { server?: net.Server }).server;
+      const raw = serverInternals(server).server;
       if (!raw) throw new Error('Flutter Intercept: cannot verify the proxy bind address (mockttp internals changed)');
       await rebindIfNeeded(raw, this.host);
       const addr = raw.address();
@@ -876,7 +674,7 @@ export class InterceptProxy extends EventEmitter {
       // keep-alive LAN connections: mockttp strips the header during preprocessing, so check first.
       // The same hook takes the internal headers (x-fi-id, x-fi-send) off every request, before any
       // rule, recording or upstream sees them.
-      const ms = server as unknown as { preprocessRequest?: (req: any, type: string, emitter: unknown) => unknown };
+      const ms = serverInternals(server);
       const preprocess = ms.preprocessRequest;
       if (typeof preprocess !== 'function') {
         // Without it x-fi-id would reach real servers: fail closed.
@@ -897,7 +695,7 @@ export class InterceptProxy extends EventEmitter {
       };
       this.lanHooks = true;
       raw.on('connection', (s: net.Socket) => onComboConnection(s));
-      this.installConnectHook(raw);
+      this.connect.installConnectHook(raw);
       this.rawServer = raw;
       this.grpcCheck = grpcSelfCheck({ connectHook: this.connectHook, server: raw });
       // LAN sockets get their gate's guarded agents — always, whether or not LAN mode is on now.
@@ -928,6 +726,12 @@ export class InterceptProxy extends EventEmitter {
     this.pool = pool;
     this.grpcPool = new GrpcSessionPool();
     this._port = server.port;
+    // PERF-1 #6: mockttp reads `this.port` (getsockname) in preprocessRequest for every request; the port is fixed now.
+    try {
+      Object.defineProperty(server, 'port', { value: this._port, configurable: true });
+    } catch {
+      /* keep mockttp's getter */
+    }
     if (this.upstreamSpec) {
       try {
         this.checkUpstreamLoop(this.upstreamSpec);
@@ -946,32 +750,32 @@ export class InterceptProxy extends EventEmitter {
     await this.closeLan();
     this.server = undefined;
     const paused = [...this.paused.values()];
-    for (const { ex } of [...this.live.values()]) this.fail(ex, 'Proxy stopped');
+    for (const { ex } of [...this.book.live.values()]) this.book.fail(ex, 'Proxy stopped');
     for (const p of paused) p.settle({ kind: 'gone' });
     for (const settle of [...this.holds.values()]) settle(false);
     for (const c of this.sendClients) c.destroy();
     this.sendClients.clear();
-    for (const t of this.tunnelSockets) t.destroy();
-    this.tunnelSockets.clear();
+    for (const t of this.connect.tunnelSockets) t.destroy();
+    this.connect.tunnelSockets.clear();
     this.scripts.stop();
-    this.wsReplayServer?.close();
-    this.wsReplayServer = undefined;
+    this.replays.wsReplayServer?.close();
+    this.replays.wsReplayServer = undefined;
     await server.stop();
     this.pool?.destroy();
     this.pool = undefined;
     this.grpcPool?.destroyAll();
     this.grpcPool = undefined;
-    this.pinnedHosts.clear();
-    this.pinStrikes.clear();
-    this.decrypting.clear();
+    this.connect.pinnedHosts.clear();
+    this.connect.pinStrikes.clear();
+    this.connect.decrypting.clear();
     this.rawServer = undefined;
     this.sendAgent?.destroy();
     this.sendAgent = undefined;
-    this.flows.clear();
+    this.book.flows.clear();
     this.clearExpiryTimers();
     this.traceJoin.clear();
-    for (const st of this.emitState.values()) clearTimeout(st.timer);
-    this.emitState.clear();
+    for (const st of this.book.emitState.values()) clearTimeout(st.timer);
+    this.book.emitState.clear();
     this._port = 0;
   }
 
@@ -1012,7 +816,7 @@ export class InterceptProxy extends EventEmitter {
         throw new Error('Flutter Intercept: incompatible mockttp version (LAN guards unavailable)');
       }
       await this.closeLan();
-      const raw = (server as unknown as { server: net.Server }).server;
+      const raw = serverInternals(server).server!;
       const gate = new LanGate(token, host, {
         handoff: (socket) => raw.emit('connection', socket),
         onBlockedConnect: (target, reason) => this.recordBlocked('CONNECT', `https://${target}/`, reason),
@@ -1047,9 +851,9 @@ export class InterceptProxy extends EventEmitter {
     this.lanDenials.delete(req.id);
     // A plain-route exchange already exists (its tap records the 403 as 'error'); hooked routes
     // never reached their hooks, so record those here.
-    if (!this.live.has(req.id)) {
-      const url = this.flows.get(req.id)?.originalUrl ?? req.url;
-      this.flows.delete(req.id);
+    if (!this.book.live.has(req.id)) {
+      const url = this.book.flows.get(req.id)?.originalUrl ?? req.url;
+      this.book.flows.delete(req.id);
       this.recordBlocked(req.method, url, reason);
     }
     return {
@@ -1073,8 +877,8 @@ export class InterceptProxy extends EventEmitter {
       error: reason,
       viaLan: true, // only LAN clients are ever refused this way
     };
-    this.store.set(ex.id, ex);
-    this.emitChange(ex);
+    this.book.store.set(ex.id, ex);
+    this.book.emitChange(ex);
   }
 
   /**
@@ -1272,25 +1076,16 @@ export class InterceptProxy extends EventEmitter {
   setGrpcDecryptAll(on: boolean): void {
     // Turning decrypt-all on again starts over: hosts learned earlier get another chance (REVIEW-13 #6).
     if (on && !this.grpcDecryptAllOn) {
-      this.pinnedHosts.clear();
-      this.pinStrikes.clear();
+      this.connect.pinnedHosts.clear();
+      this.connect.pinStrikes.clear();
     }
     this.grpcDecryptAllOn = !!on;
   }
 
   /** CONTRACTS §19.3: forget every learned pinned host (they are decrypted again under decrypt-all). */
   clearGrpcPinnedHosts(): void {
-    this.pinnedHosts.clear();
-    this.pinStrikes.clear();
-  }
-
-  /** Is `host:port` a learned pinned host right now (pins expire after GRPC_PIN_TTL_MS)? */
-  private isPinned(key: string): boolean {
-    const until = this.pinnedHosts.get(key);
-    if (until === undefined) return false;
-    if (Date.now() < until) return true;
-    this.pinnedHosts.delete(key);
-    return false;
+    this.connect.pinnedHosts.clear();
+    this.connect.pinStrikes.clear();
   }
 
   get grpcDecryptAll(): boolean {
@@ -1299,7 +1094,7 @@ export class InterceptProxy extends EventEmitter {
 
   /** CONTRACTS §19.3: hosts learned to pin their certificate (passed through undecrypted until the proxy stops). */
   get grpcPinnedHosts(): string[] {
-    return [...this.pinnedHosts.keys()].filter((k) => this.isPinned(k));
+    return [...this.connect.pinnedHosts.keys()].filter((k) => this.connect.isPinned(k));
   }
 
   /** The gRPC decrypt patterns in use. */
@@ -1350,7 +1145,7 @@ export class InterceptProxy extends EventEmitter {
    * forward messages unchanged with a note). Synchronous; called only for messages a mutate rule changes.
    */
   setGrpcCodec(codec?: GrpcProxyCodec): void {
-    this.grpcCodec = codec && typeof codec.decode === 'function' && typeof codec.encode === 'function' ? codec : undefined;
+    this.hooks.grpcCodec = codec && typeof codec.decode === 'function' && typeof codec.encode === 'function' ? codec : undefined;
   }
 
   /**
@@ -1458,7 +1253,7 @@ export class InterceptProxy extends EventEmitter {
       if (SEND_DROPPED_HEADERS.has(k.toLowerCase())) continue;
       headers[k] = Array.isArray(v) ? v.slice() : v;
     }
-    if (r.grpc !== undefined) return this.sendGrpc(r, method, u, headers);
+    if (r.grpc !== undefined) return this.grpc.sendGrpc(r, method, u, headers);
     headers.host = u.host;
     const body = r.body !== undefined ? frameBody(Buffer.from(String(r.body), 'utf8'), headers) : undefined;
     const nonce = randomUUID();
@@ -1503,130 +1298,6 @@ export class InterceptProxy extends EventEmitter {
     });
   }
 
-  /**
-   * CONTRACTS §18.4 / §18.6: send a gRPC call (resend / edit & resend) exactly like the app would: through a silent
-   * tunnel into this proxy's own listener (h2c, or TLS to our own MITM for https targets), so rules, breakpoints, the
-   * network profile, replay, Map Remote and the LAN guard all apply, and the call is recorded with `initiator` /
-   * `resentFrom`. Messages go uncompressed, then a half-close. A resend of a LAN client's call runs with that client's
-   * LAN guards (LAN mode must be on); one whose original record is gone is refused. Resolves once recorded.
-   */
-  private async sendGrpc(r: SendRequest, method: string, u: URL, headers: HeaderBag): Promise<{ id: string }> {
-    const g = r.grpc as { messages?: unknown; messagesJson?: unknown };
-    if (!g || typeof g !== 'object') throw new Error('grpc must be {messages}');
-    if (g.messagesJson !== undefined) throw new Error('grpc.messagesJson must be encoded by the host (schema) into messages before send()');
-    if (method !== 'POST') throw new Error('A gRPC call is sent with POST');
-    const { method: rpc } = parseGrpcPath(u.pathname);
-    if (!rpc || u.search) throw new Error(`Not a gRPC method URL (/package.Service/Method): ${u.pathname}`);
-    if (!Array.isArray(g.messages)) throw new Error('grpc.messages must be a list of base64 messages');
-    if (g.messages.length > GRPC_SEND_MAX_MESSAGES) throw new Error(`At most ${GRPC_SEND_MAX_MESSAGES} messages per call`);
-    if (!this.grpcCheck.ok || !this.rawServer) throw new Error(`gRPC calls can't be sent: ${this.grpcCheck.problem ?? 'the proxy is not running'}`);
-    const messages: Buffer[] = [];
-    let total = 0;
-    for (const [i, m] of g.messages.entries()) {
-      if (typeof m !== 'string' || !/^[A-Za-z0-9+/_-]*={0,2}$/.test(m)) throw new Error(`Message ${i + 1} is not base64`);
-      const b = Buffer.from(m, 'base64');
-      if (b.length > GRPC_HOOK_CAP_BYTES) throw new Error(`Message ${i + 1} is over ${GRPC_HOOK_CAP_BYTES / 1024 / 1024} MB`);
-      total += b.length;
-      if (total > GRPC_SEND_MAX_BYTES) throw new Error(`The messages are over ${GRPC_SEND_MAX_BYTES / 1024 / 1024} MB in total`);
-      messages.push(b);
-    }
-    // A resend of a LAN client's call: only targets the LAN guard allows (CONTRACTS §18.5 / §18.6).
-    let fromLan = false;
-    if (r.resentFrom !== undefined) {
-      const orig = this.store.get(r.resentFrom);
-      if (!orig) throw new Error('The original call is no longer recorded, so it can\'t be resent (its LAN origin is unknown)');
-      fromLan = orig.viaLan === true;
-    }
-    if (fromLan) {
-      const gate = this.lanGate;
-      if (!gate || gate.closed) throw new Error('This call came from a LAN client and LAN mode is off: it can only be resent while LAN mode is on');
-      const denial = await lanTargetDenial(u.href, gate.host);
-      if (denial) throw new Error(denial);
-    }
-    const meta: Record<string, string | string[]> = {};
-    for (const [k, v] of Object.entries(headers)) {
-      const lk = k.toLowerCase();
-      if (v === undefined || lk.startsWith(':') || GRPC_SEND_DROPPED.has(lk)) continue;
-      meta[lk] = v;
-    }
-    const given = parseGrpcTimeout(meta['grpc-timeout']);
-    const deadlineMs = Math.min(given ?? GRPC_SEND_DEADLINE_MS, GRPC_SEND_MAX_DEADLINE_MS);
-    meta['grpc-timeout'] = given !== undefined && given <= GRPC_SEND_MAX_DEADLINE_MS ? String(meta['grpc-timeout']) : given === undefined ? '60S' : '1H';
-    const tlsTarget = u.protocol === 'https:';
-    const target = `${u.hostname.includes(':') ? `[${u.hostname.replace(/^\[|\]$/g, '')}]` : u.hostname}:${Number(u.port) || (tlsTarget ? 443 : 80)}`;
-    const nonce = randomUUID();
-    const ca = tlsTarget ? (this.opts.ca ?? (await defaultCa())).cert : undefined;
-    return new Promise<{ id: string }>((resolve, reject) => {
-      const sendMeta: SendMeta = {
-        initiator: r.initiator,
-        ...(r.resentFrom !== undefined ? { resentFrom: r.resentFrom } : {}),
-        done: false,
-        recorded: (id) => {
-          sendMeta.done = true;
-          this.sends.delete(nonce);
-          resolve({ id });
-        },
-      };
-      let session: http2.ClientHttp2Session | undefined;
-      let sock: net.Socket | undefined;
-      const cleanup = () => {
-        clearTimeout(timer);
-        session?.destroy();
-        sock?.destroy();
-      };
-      const failed = (why: string) => {
-        if (!sendMeta.done) {
-          sendMeta.done = true;
-          this.sends.delete(nonce);
-          reject(new Error(`Flutter Intercept: send failed (${why})`));
-        }
-        cleanup();
-      };
-      // The app-side deadline: the call is cancelled then (the exchange records it), plus a margin for the answer.
-      const timer = setTimeout(() => failed('deadline'), deadlineMs + 5000);
-      timer.unref?.();
-      this.sends.set(nonce, sendMeta);
-      const host = this.host === '0.0.0.0' || this.host === '' ? '127.0.0.1' : this.host === '::' ? '::1' : this.host;
-      sock = net.connect(this._port, host);
-      sock.on('error', (e) => failed(e.message));
-      sock.once('connect', () => {
-        const flags = [this.hopNonce, ...(tlsTarget ? ['tls'] : []), ...(fromLan ? ['lan'] : [])].join('; ');
-        sock!.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nFlutter-Intercept-Tunnel: silent\r\n${INTERNAL_TUNNEL_HEADER}: ${flags}\r\n\r\n`);
-        let conn: net.Socket = sock!;
-        if (tlsTarget) {
-          // To our own MITM over loopback: the hop is authenticated by the nonce, the real server is verified upstream.
-          conn = tls.connect({ socket: sock!, ...(net.isIP(u.hostname.replace(/^\[|\]$/g, '')) ? {} : { servername: u.hostname }), ALPNProtocols: ['h2'], ca, rejectUnauthorized: false });
-          conn.on('error', (e) => failed(e.message));
-        }
-        const s = http2.connect(`${u.protocol}//${target}`, { createConnection: () => conn });
-        session = s;
-        s.on('error', (e) => failed(e.message));
-        const call = s.request({
-          ...meta,
-          ':method': 'POST',
-          ':path': u.pathname,
-          ':authority': u.host,
-          'content-type': 'application/grpc',
-          te: 'trailers',
-          [SEND_HEADER]: nonce,
-        });
-        call.on('error', () => undefined);
-        call.on('data', () => undefined); // the exchange records the answer
-        call.once('close', () => {
-          if (!sendMeta.done) failed('the call was not recorded');
-          else cleanup();
-        });
-        const cancel = setTimeout(() => {
-          if (!call.closed) call.close(http2.constants.NGHTTP2_CANCEL); // the deadline, like the app's own
-        }, deadlineMs);
-        cancel.unref?.();
-        call.once('close', () => clearTimeout(cancel));
-        for (const m of messages) call.write(frameMessage(m));
-        call.end();
-      });
-    });
-  }
-
   /** Utility for UIs: does this rule's matcher fail to compile? */
   static isInvalidRule(rule: Rule): boolean {
     return isInvalidMatcher(rule.match);
@@ -1634,7 +1305,7 @@ export class InterceptProxy extends EventEmitter {
 
   /** Oldest first. In-flight exchanges are always included. */
   getExchanges(): Exchange[] {
-    return [...this.store.values()].map(snapshot);
+    return this.book.getExchanges();
   }
 
   /**
@@ -1645,24 +1316,7 @@ export class InterceptProxy extends EventEmitter {
    * Returns its id. Throws on a missing method / URL.
    */
   record(input: Omit<Exchange, 'id'>): string {
-    if (!input || typeof input !== 'object') throw new Error('Invalid exchange');
-    if (typeof input.method !== 'string' || !input.method || typeof input.url !== 'string' || !input.url) {
-      throw new Error('Invalid exchange: method and url are required');
-    }
-    const id = `rec-${randomUUID()}`;
-    const ex = {
-      startedAt: Date.now(),
-      requestHeaders: {},
-      state: 'completed',
-      ...sanitizeRecord(input as Partial<Exchange>, this.maxFrames),
-      id,
-    } as Exchange;
-    ex.captured ??= 'vm-profile';
-    this.records.add(id);
-    this.store.set(id, ex);
-    if (ex.frames) this.frameBytes.set(id, ex.frames.reduce((n, f) => n + frameCost(f), 0));
-    this.emitChange(ex);
-    return id;
+    return this.book.record(input);
   }
 
   /**
@@ -1671,23 +1325,7 @@ export class InterceptProxy extends EventEmitter {
    * does nothing) for an id that is not a record or was evicted / cleared.
    */
   update(id: string, patch: Partial<Omit<Exchange, 'id'>>): boolean {
-    const ex = this.records.has(id) ? this.store.get(id) : undefined;
-    if (!ex) {
-      this.records.delete(id);
-      return false;
-    }
-    if (!patch || typeof patch !== 'object') return false;
-    const clean = sanitizeRecord(patch as Partial<Exchange>, this.maxFrames);
-    for (const k of Object.keys(patch)) {
-      if (k === 'id') continue;
-      const v = (clean as Record<string, unknown>)[k];
-      if (v === undefined) delete (ex as unknown as Record<string, unknown>)[k];
-      else (ex as unknown as Record<string, unknown>)[k] = v;
-    }
-    ex.captured ??= 'vm-profile';
-    if ('frames' in patch) this.frameBytes.set(id, (ex.frames ?? []).reduce((n, f) => n + frameCost(f), 0));
-    this.emitChange(ex);
-    return true;
+    return this.book.update(id, patch);
   }
 
   /**
@@ -1696,7 +1334,7 @@ export class InterceptProxy extends EventEmitter {
    * so the host should send a fresh snapshot (getExchanges()) after clearing.
    */
   clear(): void {
-    for (const id of [...this.store.keys()]) if (!this.live.has(id)) this.drop(id);
+    this.book.clear();
   }
 
   /**
@@ -1708,7 +1346,7 @@ export class InterceptProxy extends EventEmitter {
   resume(id: string, edit?: RequestEdit | ResponseEdit | GrpcEdit): void {
     const p = this.paused.get(id);
     if (!p) return;
-    const ex = this.live.get(id)?.ex;
+    const ex = this.book.live.get(id)?.ex;
     if (ex?.kind === 'grpc') {
       // CONTRACTS §17.2: a held message takes {message} / {drop}; the end of the call {status, trailers}.
       const kind = ex.grpcPause?.kind ?? 'message';
@@ -1740,214 +1378,11 @@ export class InterceptProxy extends EventEmitter {
     return super.on(event, listener);
   }
 
-  // ---------------------------------------------------------------- store
-
-  private emitChange(ex: Exchange): void {
-    if (ex.grpc?.web) {
-      // CONTRACTS §19.1: a gRPC-Web call shows messages as frames, never its raw (binary / base64) bodies.
-      delete ex.requestBody;
-      delete ex.responseBody;
-    }
-    if (!ex.captured) {
-      // CONTRACTS §11.3: browser requests (Origin) get a CORS diagnosis; `patched` is kept.
-      const cors = diagnoseCors(ex);
-      if (cors) ex.cors = cors;
-      else delete ex.cors;
-    }
-    if (this.store.get(ex.id) === ex) {
-      const size = bodySize(ex) + (this.frameBytes.get(ex.id) ?? 0);
-      this.storedBytes += size - (this.sizes.get(ex.id) ?? 0);
-      this.sizes.set(ex.id, size);
-    }
-    const st = this.emitState.get(ex.id);
-    if (st) {
-      clearTimeout(st.timer);
-      st.timer = undefined;
-      st.last = Date.now();
-    }
-    this.emit('exchange', snapshot(ex));
-    this.evict();
-  }
-
-  /** Coalesced emit for frame updates: at most one 'exchange' per exchange per FRAME_EMIT_INTERVAL_MS. */
-  private touch(ex: Exchange): void {
-    let st = this.emitState.get(ex.id);
-    if (!st) {
-      st = { last: 0 };
-      this.emitState.set(ex.id, st);
-    }
-    if (st.timer) return;
-    const wait = st.last + FRAME_EMIT_INTERVAL_MS - Date.now();
-    if (wait <= 0) return this.emitChange(ex);
-    const state = st;
-    state.timer = setTimeout(() => {
-      state.timer = undefined;
-      if (this.store.get(ex.id) === ex || this.live.get(ex.id)?.ex === ex) this.emitChange(ex);
-    }, wait);
-    state.timer.unref?.();
-  }
-
-  /**
-   * Append a frame (WebSocket message / SSE event / gRPC message), keeping the newest maxFrames. `late`: a gRPC
-   * message decompressed after its call ended (CONTRACTS §16.8) still joins the stored exchange, in time order.
-   */
-  private addFrame(ex: Exchange, f: Frame, late = false): void {
-    const live = this.live.get(ex.id)?.ex === ex;
-    if (!live && !(late && this.store.get(ex.id) === ex)) return; // finished: late frames are ignored
-    const frames = (ex.frames ??= []);
-    let i = frames.length;
-    while (late && i > 0 && frames[i - 1].at > f.at) i--;
-    frames.splice(i, 0, f);
-    let bytes = (this.frameBytes.get(ex.id) ?? 0) + frameCost(f);
-    // Newest maxFrames, and at most MAX_FRAME_BYTES_PER_EXCHANGE of them (REVIEW-5 #4); always the newest one.
-    while (frames.length > this.maxFrames || (bytes > MAX_FRAME_BYTES_PER_EXCHANGE && frames.length > 1)) {
-      bytes -= frameCost(frames.shift()!);
-      ex.framesDropped = (ex.framesDropped ?? 0) + 1;
-    }
-    this.frameBytes.set(ex.id, bytes);
-    this.touch(ex); // coalesced, also for late frames of a finished exchange
-  }
-
-  /**
-   * Over the store's byte budget: drop the oldest frames of open streams first (down to LIVE_FRAME_FLOOR each),
-   * so heavy live WebSockets / SSE streams can't push every finished exchange out (REVIEW-5 #4).
-   */
-  private trimLiveFrames(): void {
-    for (const { ex } of this.live.values()) {
-      if (this.storedBytes <= this.maxStoredBodyBytes) return;
-      const frames = ex.frames;
-      if (!frames || frames.length <= LIVE_FRAME_FLOOR) continue;
-      let freed = 0;
-      let dropped = 0;
-      while (frames.length > LIVE_FRAME_FLOOR && this.storedBytes - freed > this.maxStoredBodyBytes) {
-        freed += frameCost(frames.shift()!);
-        dropped++;
-      }
-      if (!dropped) continue;
-      ex.framesDropped = (ex.framesDropped ?? 0) + dropped;
-      this.frameBytes.set(ex.id, (this.frameBytes.get(ex.id) ?? 0) - freed);
-      if (this.sizes.has(ex.id)) {
-        this.sizes.set(ex.id, this.sizes.get(ex.id)! - freed);
-        this.storedBytes -= freed;
-      }
-      // Not synchronously: evict() runs inside emitChange.
-      queueMicrotask(() => {
-        if (this.live.get(ex.id)?.ex === ex) this.touch(ex);
-      });
-    }
-  }
-
-  private drop(id: string): void {
-    this.storedBytes -= this.sizes.get(id) ?? 0;
-    this.sizes.delete(id);
-    this.store.delete(id);
-    this.frameBytes.delete(id);
-    this.records.delete(id);
-    const st = this.emitState.get(id);
-    if (st) {
-      clearTimeout(st.timer);
-      this.emitState.delete(id);
-    }
-  }
-
-  /** Evict oldest finished exchanges beyond maxExchanges / maxStoredBodyBytes; never in-flight ones. */
-  private evict(): void {
-    if (this.store.size <= this.maxExchanges && this.storedBytes <= this.maxStoredBodyBytes) return;
-    if (this.storedBytes > this.maxStoredBodyBytes) this.trimLiveFrames();
-    if (this.store.size <= this.maxExchanges && this.storedBytes <= this.maxStoredBodyBytes) return;
-    const removed: string[] = [];
-    for (const id of [...this.store.keys()]) {
-      if (this.store.size <= this.maxExchanges && this.storedBytes <= this.maxStoredBodyBytes) break;
-      if (this.live.has(id)) continue;
-      this.drop(id);
-      removed.push(id);
-    }
-    if (removed.length) this.emit('removed', removed);
-  }
-
-  private track(ex: Exchange, flow: Flow): void {
-    this.live.set(ex.id, { ex, flow });
-    this.store.set(ex.id, ex);
-    if (this.grpcWebCalls.has(ex.id)) queueMicrotask(() => this.syncGrpcWeb(ex.id));
-    if (flow.traceId && !ex.source) {
-      const info = this.traceJoin.exchange(flow.traceId, ex.id, this.appPackages);
-      if (info) ex.source = info;
-    }
-    this.emitChange(ex);
-    if (flow.send && !flow.send.done) flow.send.recorded(ex.id);
-  }
-
-  /** A new exchange for a request, with what the flow knows (rule, simulation, initiator). */
-  private newExchange(req: { id: string; method: string; url: string; headers: HeaderBag; timingEvents?: { startTime?: number } }, flow: Flow): Exchange {
-    // Map Remote: the exchange keeps the URL the app asked for (CONTRACTS §12.6); `simulated` names the target.
-    const url = flow.originalUrl ?? req.url;
-    return {
-      id: req.id,
-      startedAt: req.timingEvents?.startTime ?? Date.now(),
-      method: req.method,
-      url,
-      requestHeaders: cleanHeaders(req.headers),
-      state: 'pending',
-      ...(flow.rule ? { matchedRuleId: flow.rule.id } : {}),
-      ...(flow.note ? { error: flow.note } : {}),
-      ...(flow.simulated ? { simulated: flow.simulated } : {}),
-      ...(flow.send ? { initiator: flow.send.initiator } : {}),
-      ...(flow.send?.resentFrom !== undefined ? { resentFrom: flow.send.resentFrom } : {}),
-      ...(flow.viaLan ? { viaLan: true as const } : {}),
-      ...(flow.grpcWeb ? grpcWebExchangeFields(url, req.headers, flow.grpcWeb) : graphqlOf(req.method, url, req.headers)),
-      ...(this.webSession && !flow.send && !flow.viaLan && !flow.traceId && isBrowserInternal(url, req.headers)
-        ? { browserInternal: true as const }
-        : {}),
-    };
-  }
-
-  /** Set the request body (and, once it is known, `graphql`: CONTRACTS §11.2). */
-  private setRequestBody(ex: Exchange, body: Body | undefined): void {
-    ex.requestBody = body;
-    const g = graphqlOf(ex.method, ex.url, ex.requestHeaders, body);
-    if (g.graphql) ex.graphql = g.graphql;
-    else delete ex.graphql;
-  }
-
-  // ---------------------------------------------------------------- timings (CONTRACTS §13.2)
-
-  /**
-   * Upstream phases from the pooled agents (src/timing.ts). A live exchange carries them with its next 'exchange'
-   * event (no event per phase); one that already finished gets an event of its own.
-   */
-  private addTimings(id: string, patch: TimingPatch): void {
-    const live = this.live.get(id);
-    const ex = live?.ex ?? this.store.get(id);
-    if (!ex || ex.captured || !Object.keys(patch).length) return;
-    ex.timings = { ...ex.timings, ...patch };
-    if (!live) this.emitChange(ex);
-  }
-
-  /** Add to an accumulated phase (breakpoint holds, delays). Integer ms ≥ 0. */
-  private addPhase(ex: Exchange, key: 'pausedMs' | 'delayMs', ms: number): void {
-    const add = Math.max(0, Math.round(ms));
-    ex.timings = { ...ex.timings, [key]: (ex.timings?.[key] ?? 0) + add };
-  }
-
-  /** `requestMs` (start → the whole request received), once known; never overwritten. */
-  private setRequestMs(ex: Exchange, te: RequestTimingEvents | undefined, end?: number): void {
-    if (ex.timings?.requestMs !== undefined || te?.startTimestamp === undefined) return;
-    const at = end ?? te.bodyReceivedTimestamp;
-    if (at === undefined) return;
-    ex.timings = { ...ex.timings, requestMs: elapsed(te.startTimestamp, at) };
-  }
-
-  /** The timing sink for the request a downstream connection is serving (upstream-pool.ts). */
-  private timingSink(connection: unknown): TimingSink | undefined {
-    const id = connection && typeof connection === 'object' ? this.connRequest.get(connection) : undefined;
-    return id ? (p) => this.addTimings(id, p) : undefined;
-  }
-
   // ---------------------------------------------------------------- request → source
 
   /** Preprocessing: take x-fi-id / x-fi-send off the request (headers and raw headers) and remember them. */
   private takeInternalHeaders(req: OngoingRequest): void {
-    const raw = (req as unknown as { rawHeaders?: unknown }).rawHeaders;
+    const raw = requestInternals(req).rawHeaders;
     if (!Array.isArray(raw)) return;
     let traceId: string | undefined;
     let sendNonce: string | undefined;
@@ -1971,7 +1406,7 @@ export class InterceptProxy extends EventEmitter {
       return true;
     });
     if (kept.length === raw.length) return;
-    (req as unknown as { rawHeaders: Array<[string, string]> }).rawHeaders = kept;
+    requestInternals(req).rawHeaders = kept;
     deleteHeader(req.headers as HeaderBag, TRACE_HEADER);
     deleteHeader(req.headers as HeaderBag, SEND_HEADER);
     deleteHeader(req.headers as HeaderBag, SILENT_TUNNEL_HEADER);
@@ -1995,10 +1430,10 @@ export class InterceptProxy extends EventEmitter {
         for (const t of parseTraceBody(buf)) {
           const { info, exchangeIds } = this.traceJoin.trace(t.id, t.stack, this.appPackages);
           for (const id of exchangeIds) {
-            const ex = this.store.get(id);
+            const ex = this.book.store.get(id);
             if (info && ex && !ex.source) {
               ex.source = info;
-              this.emitChange(ex);
+              this.book.emitChange(ex);
             }
           }
         }
@@ -2147,33 +1582,6 @@ export class InterceptProxy extends EventEmitter {
     }
   }
 
-  private finish(ex: Exchange, state: Exchange['state']): void {
-    const live = this.live.get(ex.id);
-    if (live?.ex === ex) this.setRequestMs(ex, live.flow.te);
-    if (ex.kind === 'grpc') {
-      // REVIEW-11 #5: a pause ends with its call (its timer cleared, its held bytes freed by the pauser).
-      delete ex.grpcPause;
-      const p = this.paused.get(ex.id);
-      if (p && live?.ex === ex) {
-        this.live.delete(ex.id); // the pauser sees the call as gone
-        p.settle({ kind: 'gone' });
-      }
-    }
-    ex.state = state;
-    ex.durationMs = Date.now() - ex.startedAt;
-    delete ex.pausedAt;
-    delete ex.pauseDeadline;
-    this.live.delete(ex.id);
-    this.flows.delete(ex.id);
-    this.emitChange(ex);
-    this.emitState.delete(ex.id); // emitChange cleared its timer
-  }
-
-  private fail(ex: Exchange, error: string): void {
-    ex.error = error;
-    this.finish(ex, 'error');
-  }
-
   /** Mark ex paused (caller emits) and wait for resume/abort/timeout/client-gone. */
   private pause(ex: Exchange, phase: 'request' | 'response'): Promise<Decision> {
     ex.state = phase === 'request' ? 'paused-request' : 'paused-response';
@@ -2195,7 +1603,7 @@ export class InterceptProxy extends EventEmitter {
     return decision.then((d) => {
       delete ex.pausedAt;
       delete ex.pauseDeadline;
-      this.addPhase(ex, 'pausedMs', Date.now() - since);
+      this.book.addPhase(ex, 'pausedMs', Date.now() - since);
       return d;
     });
   }
@@ -2204,11 +1612,11 @@ export class InterceptProxy extends EventEmitter {
 
   /** Called (synchronously) by the route matchers of every rule; decided once per request. */
   private decide(req: OngoingRequest): Flow {
-    const known = this.flows.get(req.id);
+    const known = this.book.flows.get(req.id);
     if (known) return known;
     if (this.unauthorized.has(req)) return DENIED_FLOW; // never recorded
     if (isTraceUrl(req.url)) return TRACE_FLOW; // answered locally, never recorded, never throttled
-    if (this.grpcCheck.ok && isGrpcCall(req)) return this.decideGrpc(req);
+    if (this.grpcCheck.ok && isGrpcCall(req)) return this.grpc.decideGrpc(req);
     const meta = this.reqMeta.get(req);
     const send = meta?.sendNonce ? this.sends.get(meta.sendNonce) : undefined;
     const headers = req.headers as HeaderBag;
@@ -2247,17 +1655,17 @@ export class InterceptProxy extends EventEmitter {
     if (meta?.traceId) flow.traceId = meta.traceId;
     if (send) flow.send = send;
     // Keyed on the socket, like every LAN guard (also for requests inside a LAN CONNECT tunnel).
-    const socket = (req as unknown as { socket?: unknown }).socket;
+    const socket = requestInternals(req).socket;
     if (lanGateOf(socket)) flow.viaLan = true;
     if (socket && typeof socket === 'object') this.connRequest.set(socket, req.id);
-    flow.te = (req as unknown as { timingEvents?: RequestTimingEvents }).timingEvents;
+    flow.te = requestInternals(req).timingEvents;
     const latency = flow.throttle?.latencyMs;
     if (flow.route === 'plain' && latency && latency > 0) {
       // Before forwarding, without reading the body: the route matcher waits on this.
       const from = performance.now();
       flow.delay = sleep(latency).then(() => {
-        const live = this.live.get(req.id);
-        if (live) this.addPhase(live.ex, 'delayMs', performance.now() - from);
+        const live = this.book.live.get(req.id);
+        if (live) this.book.addPhase(live.ex, 'delayMs', performance.now() - from);
         return !!live;
       });
     }
@@ -2272,12 +1680,12 @@ export class InterceptProxy extends EventEmitter {
         if (meta?.traceId) flow.traceId = meta.traceId;
         if (send) flow.send = send;
         if (lanGateOf(socket)) flow.viaLan = true;
-        flow.te = (req as unknown as { timingEvents?: RequestTimingEvents }).timingEvents;
+        flow.te = requestInternals(req).timingEvents;
       }
     }
-    this.flows.set(req.id, flow);
-    this.wireTap(req, flow);
-    if (flow.grpcWeb) this.watchGrpcWeb(req, flow.grpcWeb);
+    this.book.flows.set(req.id, flow);
+    this.taps.wireTap(req, flow);
+    if (flow.grpcWeb) this.grpcWeb.watchGrpcWeb(req, flow.grpcWeb);
     return flow;
   }
 
@@ -2390,14 +1798,7 @@ export class InterceptProxy extends EventEmitter {
    * the Host header is left to mockttp (it derives it from the URL) and onRequest returns a different one if needed.
    */
   private applyRequestSide(req: OngoingRequest, flow: Flow): void {
-    const r = req as unknown as {
-      url: string;
-      protocol: string;
-      path: string;
-      destination: { hostname: string; port: number };
-      rawHeaders: Array<[string, string]>;
-      headers: HeaderBag;
-    };
+    const r = requestInternals(req);
     if (flow.map) {
       const t = new URL(flow.map.url);
       try {
@@ -2430,234 +1831,10 @@ export class InterceptProxy extends EventEmitter {
     flow.reqApplied = true;
   }
 
-  /** Record from the passive taps: request body, response completion (except finished h1/h2 hooks). */
-  private wireTap(req: OngoingRequest, flow: Flow): void {
-    const tap = getTap(req.id);
-    if (flow.route === 'plain') this.track(this.newExchange(req, flow), flow);
-    if (!tap) return;
-    this.applyShaping(tap, flow);
-    tap.onRequestEnd = () => {
-      const live = this.live.get(req.id);
-      if (live) this.setRequestMs(live.ex, live.flow.te, performance.now());
-      if (live && live.ex.state === 'pending' && live.flow.route === 'plain') {
-        void this.requestBodyFromTap(tap, live.ex).then((b) => {
-          if (!this.live.has(req.id)) return;
-          this.setRequestBody(live.ex, b);
-          this.emitChange(live.ex);
-        });
-      }
-    };
-    tap.onResponseHead = (status, headers) => this.onResponseHead(tap, status, headers);
-    tap.onResponseDone = (finished) => void this.onResponseDone(tap, finished);
-  }
-
-  /** kbps pacing / the truncate fault, applied by the taps to the response on its way to the app. */
-  private applyShaping(tap: Tap, flow: Flow): void {
-    const kbps = flow.throttle?.kbps;
-    if ((kbps && kbps > 0) || flow.fault === 'truncate') {
-      const shaping: Shaping = {};
-      if (kbps && kbps > 0) shaping.kbps = kbps;
-      if (flow.fault === 'truncate') {
-        shaping.truncate = true;
-        shaping.onTruncated = () => this.onTruncated(tap, flow);
-      }
-      tap.shaping = shaping;
-    }
-  }
-
-  /**
-   * The response head is about to go to the app (streaming routes; hooked routes are finished by then).
-   * A cors rule patches it (CONTRACTS §11.3); an event stream starts SSE recording and is flushed at once.
-   */
-  private onResponseHead(tap: Tap, status: number, headers: Record<string, string | string[]>): HeadPatch | void {
-    const live = this.live.get(tap.id);
-    if (!live || live.ex.state !== 'pending') return;
-    const { ex, flow } = live;
-    let patch: HeadPatch | undefined;
-    let shown = headers;
-    if (flow.corsPatch && isCorsRequest(ex.method, ex.url, ex.requestHeaders)) {
-      const vary = getHeader(headers, 'vary');
-      const set = corsResponseHeaders(ex.requestHeaders, Object.keys(headers), vary, flow.corsPatch);
-      if (set) {
-        patch = { remove: CORS_RESPONSE_HEADERS, set };
-        shown = { ...headers };
-        for (const h of CORS_RESPONSE_HEADERS) delete shown[h];
-        Object.assign(shown, set);
-        ex.cors = { ...ex.cors, patched: true };
-      }
-    }
-    // A rewrite rule's response status / headers on a streaming route (CONTRACTS §12.6; buffered ones: onResponse).
-    const rr = flow.rewrite?.response;
-    if (rr && !flow.rewrite!.resBody) {
-      const sets = rewriteSets(rr, true);
-      if (sets.remove.length || sets.set.length) {
-        const set: Record<string, string> = {};
-        for (const [k, v] of Object.entries(patch?.set ?? {})) if (!sets.remove.includes(k.toLowerCase())) set[k] = v;
-        for (const [k, v] of sets.set) set[k] = v;
-        patch = { ...patch, remove: [...(patch?.remove ?? []), ...sets.remove], set };
-        shown = Object.fromEntries(Object.entries(shown).filter(([k]) => !sets.remove.includes(k.toLowerCase())));
-        Object.assign(shown, Object.fromEntries(sets.set.map(([k, v]) => [k.toLowerCase(), v])));
-      }
-      if (rr.status !== undefined && validRewriteStatus(rr.status)) {
-        patch = { ...patch, status: rr.status };
-        status = rr.status;
-      }
-    }
-    if (isEventStream(getHeader(shown, 'content-type')) && status >= 200 && status < 300) {
-      this.startSse(live, tap, status, shown);
-      patch = { ...patch, flush: true };
-    }
-    return patch;
-  }
-
-  /** CONTRACTS §11.1: events are parsed from the bytes going to the app; no body copy is kept. */
-  private startSse(live: Live, tap: Tap, status: number, headers: Record<string, string | string[]>): void {
-    const { ex } = live;
-    ex.kind = 'sse';
-    ex.frames ??= [];
-    ex.status = status;
-    ex.responseHeaders = cleanHeaders(headers);
-    tap.res.skip = true;
-    tap.res.chunks = [];
-    tap.res.captured = 0;
-    const rec = new SseRecorder(
-      getHeader(headers, 'content-encoding'),
-      (e) => this.addFrame(ex, sseFrame(e)),
-      (message) => {
-        if (this.live.get(ex.id)?.ex !== ex) return;
-        ex.error = message;
-        this.touch(ex);
-      },
-    );
-    live.stream = { ...live.stream, sse: rec };
-    tap.onResponseData = (buf) => rec.push(buf);
-    // CONTRACTS §14.4: every event arrives `latencyMs` late (the shaper starts with the first body byte).
-    const latency = live.flow.throttle?.latencyMs;
-    if (latency && latency > 0) tap.shaping = { ...tap.shaping, latencyMs: latency };
-    this.emitChange(ex);
-  }
-
-  /** The truncate fault cut the response: record what the app got, as 'blocked'. */
-  private onTruncated(tap: Tap, flow: Flow): void {
-    const live = this.live.get(tap.id);
-    if (!live) return;
-    flow.truncated = true;
-    const { ex } = live;
-    const headers = tap.response.getHeaders() as HeaderBag;
-    ex.status = tap.response.statusCode;
-    ex.responseHeaders = cleanHeaders(headers);
-    // Taken synchronously (the tap is dropped once the connection closes).
-    const reqRaw = captured(tap.req);
-    const reqComplete = isComplete(tap.req);
-    const resRaw = captured(tap.res);
-    void Promise.all([
-      ex.requestBody ? Promise.resolve(ex.requestBody) : decodeForDisplay(reqRaw, getHeader(ex.requestHeaders, 'content-encoding'), reqComplete),
-      live.stream?.sse ? Promise.resolve(undefined) : decodeForDisplay(resRaw, getHeader(headers, 'content-encoding'), false),
-      live.stream?.sse?.end(),
-    ]).then(([reqBody, resBody]) => {
-      if (!this.live.has(ex.id)) return;
-      this.setRequestBody(ex, reqBody);
-      ex.responseBody = resBody;
-      this.finish(ex, 'blocked');
-    });
-  }
-
-  private requestBodyFromTap(tap: Tap, ex: Exchange): Promise<Body | undefined> {
-    return decodeForDisplay(captured(tap.req), getHeader(ex.requestHeaders, 'content-encoding'), isComplete(tap.req));
-  }
-
-  /** The response to the app was fully written (or the connection closed first). */
-  private async onResponseDone(tap: Tap, finished: boolean): Promise<void> {
-    const live = this.live.get(tap.id);
-    if (!finished) {
-      // Usually the 'abort' event records it. A throttled response may still be trickling out after
-      // mockttp considers the request handled, and then no 'abort' comes: record it here.
-      if (live && tap.shaping && !live.flow.truncated && live.ex.state === 'pending') {
-        this.fail(live.ex, 'The app closed the connection before the throttled response was complete');
-      }
-      return;
-    }
-    if (!live || live.ex.state !== 'pending' || live.flow.truncated) return; // hooks already finished it
-    const { ex, flow } = live;
-    const res = tap.response;
-    const headers = res.getHeaders() as HeaderBag;
-    ex.status = res.statusCode;
-    if (!live.stream?.sse) ex.responseHeaders = cleanHeaders(headers); // SSE: recorded (maybe CORS-patched) at the head
-    const sse = live.stream?.sse;
-    const [reqBody, resBody] = await Promise.all([
-      ex.requestBody ? Promise.resolve(ex.requestBody) : this.requestBodyFromTap(tap, ex),
-      sse ? Promise.resolve(undefined) : decodeForDisplay(captured(tap.res), getHeader(headers, 'content-encoding'), isComplete(tap.res)),
-      sse?.end(),
-    ]);
-    if (!this.live.has(ex.id)) return; // finished meanwhile (e.g. proxy stopped)
-    this.setRequestBody(ex, reqBody);
-    ex.responseBody = resBody;
-    const upstreamError = res.tags?.find((t) => t.startsWith('passthrough-error:'));
-    const ssrf = res.statusCode === 403 && resBody?.encoding === 'utf8' && resBody.text.includes(SSRF_MARKER);
-    const certRefused = res.statusCode === 403 && resBody?.encoding === 'utf8' && resBody.text.includes(CERT_REFUSAL_MARKER);
-    if (ssrf) {
-      this.fail(ex, resBody!.text.replace(/^Error: /, ''));
-    } else if (certRefused) {
-      // REVIEW-8 #1 backstop (requestPlan): refused before any upstream connection.
-      ex.error = resBody!.text.replace(/^Error: /, '');
-      delete ex.clientCertificate;
-      this.finish(ex, 'blocked');
-    } else if (upstreamError || (flow.route === 'h2' && flow.fault !== 'truncate')) {
-      // h2 still pending here = beforeResponse never ran: upstream failure or response too large.
-      const cause = upstreamError?.slice('passthrough-error:'.length);
-      this.fail(
-        ex,
-        (resBody?.encoding === 'utf8' && resBody.text) ||
-          (cause ? `The connection to the server failed${live.stream?.sse ? ' mid-stream' : ''} (${cause}).` : `Failed with status ${res.statusCode}`),
-      );
-    } else {
-      this.finish(ex, flow.route === 'replay-stream' ? 'mocked' : 'completed');
-    }
-  }
-
-  private onAbort(id: string, message: string | undefined): void {
-    const live = this.live.get(id);
-    if (!live) {
-      this.flows.delete(id);
-      return; // finished (incl. our own block/abort resets) or unknown
-    }
-    const { ex, flow } = live;
-    if (flow.truncated) return; // the truncate fault closed it; recorded by onTruncated
-    if (ex.kind === 'grpc') return; // the relay records its own end (stream close)
-    const hold = this.holds.get(id);
-    if (hold) return hold(true); // the timeout fault: the app gave up
-    this.flows.delete(id);
-    if (ex.kind === 'websocket') {
-      // Before the upgrade (after it, the connection's own close events finish the exchange).
-      return this.fail(ex, message || 'No WebSocket connection: the upgrade got no answer (server unreachable, a TLS error, or the app gave up).');
-    }
-    const sse = live.stream?.sse;
-    if (sse) {
-      // An event stream usually ends when the app stops listening: that is not an error.
-      void sse.end().then(() => {
-        if (this.live.get(id)?.ex !== ex) return;
-        if (message && live.flow.route !== 'replay-stream') this.fail(ex, message);
-        else {
-          ex.error ??= 'The app closed the event stream.';
-          this.finish(ex, live.flow.route === 'replay-stream' ? 'mocked' : 'completed');
-        }
-      });
-      return;
-    }
-    const paused = this.paused.get(id);
-    this.fail(
-      ex,
-      paused
-        ? `Client closed the connection while ${paused.phase === 'request' ? 'the request' : 'the response'} was paused (client timeout?)`
-        : message || 'Connection aborted',
-    );
-    paused?.settle({ kind: 'gone' });
-  }
-
   // ---------------------------------------------------------------- hooked paths (h1 / h2)
 
   private async onRequest(req: CompletedRequest): Promise<CallbackRequestResult | void> {
-    let flow = this.flows.get(req.id);
+    let flow = this.book.flows.get(req.id);
     if (!flow) {
       const m = this.matchRule(req.method, req.url, { count: false });
       flow = { route: 'h1', rule: m.rule, action: m.action };
@@ -2699,412 +1876,116 @@ export class InterceptProxy extends EventEmitter {
         replay: resolved.replay === 'deferred' ? undefined : resolved.replay,
         localError: resolved.localError,
       });
-      if (tap) this.applyShaping(tap, flow);
+      if (tap) this.taps.applyShaping(tap, flow);
       if (this.forwards(flow)) flow.refused = this.certRefusal(flow.map?.url ?? req.url, req.headers as HeaderBag);
     }
-    const ex = this.newExchange(req, flow);
-    this.setRequestBody(ex, body);
+    const ex = this.book.newExchange(req, flow);
+    this.book.setRequestBody(ex, body);
     flow.te ??= req.timingEvents;
-    this.setRequestMs(ex, flow.te, flow.te?.bodyReceivedTimestamp ?? performance.now());
+    this.book.setRequestMs(ex, flow.te, flow.te?.bodyReceivedTimestamp ?? performance.now());
     const action = flow.action;
 
-    if (flow.preflight) return this.answerPreflight(req, ex, flow);
+    if (flow.preflight) return this.edits.answerPreflight(req, ex, flow);
 
     if (flow.refused) {
-      this.track(ex, flow);
+      this.book.track(ex, flow);
       const headers: HeaderBag = { 'content-type': 'text/plain; charset=utf-8' };
       const text = `Flutter Intercept: ${flow.refused}`;
       ex.status = 403;
       ex.responseHeaders = cleanHeaders(headers);
       ex.responseBody = { text, encoding: 'utf8' };
       ex.error = flow.refused;
-      this.finish(ex, 'blocked');
+      this.book.finish(ex, 'blocked');
       return { response: { statusCode: 403, statusMessage: STATUS_CODES[403], headers, rawBody: frameBody(Buffer.from(text, 'utf8'), headers) } };
     }
 
-    if (flow.fault && flow.fault !== 'truncate') return this.applyFault(ex, flow);
+    if (flow.fault && flow.fault !== 'truncate') return this.edits.applyFault(ex, flow);
 
     if (flow.localError) {
-      this.track(ex, flow);
-      return { response: this.localFailure(ex, flow.localError) };
+      this.book.track(ex, flow);
+      return { response: this.edits.localFailure(ex, flow.localError) };
     }
 
-    if (flow.replay && flow.replay !== 'deferred') return this.answerReplay(ex, flow, flow.replay);
+    if (flow.replay && flow.replay !== 'deferred') return this.replays.answerReplay(ex, flow, flow.replay);
 
-    if (action?.kind === 'grpcMock' && flow.grpcWeb) return this.answerGrpcWeb(ex, flow, action);
+    if (action?.kind === 'grpcMock' && flow.grpcWeb) return this.grpcWeb.answerGrpcWeb(ex, flow, action);
 
     if (action?.kind === 'mock') {
-      this.track(ex, flow);
+      this.book.track(ex, flow);
       if (action.delayMs && action.delayMs > 0) {
         const from = performance.now();
         await sleep(action.delayMs);
-        this.addPhase(ex, 'delayMs', performance.now() - from);
+        this.book.addPhase(ex, 'delayMs', performance.now() - from);
         if (ex.state !== 'pending') return { response: 'close' }; // client left during the delay
       }
       const headers: HeaderBag = { ...(action.headers ?? {}) };
-      this.addCorsToLocalResponse(ex, headers);
+      this.edits.addCorsToLocalResponse(ex, headers);
       const decoded = Buffer.from(action.body ?? '', 'utf8');
       const rawBody = frameBody(decoded, headers);
       ex.status = action.status;
       ex.responseHeaders = cleanHeaders(headers);
       ex.responseBody = await decodeForDisplay(decoded, undefined, true);
-      if (isEventStream(getHeader(headers, 'content-type'))) this.setSseFrames(ex, decoded);
-      this.finish(ex, 'mocked');
+      if (isEventStream(getHeader(headers, 'content-type'))) this.taps.setSseFrames(ex, decoded);
+      this.book.finish(ex, 'mocked');
       return {
         response: { statusCode: action.status, statusMessage: STATUS_CODES[action.status], headers, rawBody },
       };
     }
 
     if (action?.kind === 'block') {
-      this.track(ex, flow);
+      this.book.track(ex, flow);
       if (action.mode === 'reset') {
-        this.finish(ex, 'blocked');
+        this.book.finish(ex, 'blocked');
         return { response: 'reset' };
       }
       if (flow.grpcWeb) {
         // CONTRACTS §19.1: a gRPC-Web block answers trailers-only UNAVAILABLE (the browser client reads the status).
         const h: HeaderBag = { 'content-type': grpcWebContentType(flow.grpcWeb), 'grpc-status': '14', 'grpc-message': encodeGrpcMessage(BLOCK_BODY), 'content-length': '0' };
-        this.addGrpcWebCors(ex, h);
+        this.grpcWeb.addGrpcWebCors(ex, h);
         ex.status = 200;
         ex.responseHeaders = cleanHeaders(h);
         if (ex.grpc) Object.assign(ex.grpc, { statusCode: 14, statusMessage: BLOCK_BODY, trailersOnly: true as const });
-        this.finish(ex, 'blocked');
+        this.book.finish(ex, 'blocked');
         return { response: { statusCode: 200, statusMessage: STATUS_CODES[200], headers: h, rawBody: Buffer.alloc(0) } };
       }
       const status = action.status ?? 403;
       const headers: HeaderBag = { 'content-type': 'text/plain; charset=utf-8' };
-      this.addCorsToLocalResponse(ex, headers);
+      this.edits.addCorsToLocalResponse(ex, headers);
       const decoded = Buffer.from(BLOCK_BODY, 'utf8');
       const rawBody = frameBody(decoded, headers);
       ex.status = status;
       ex.responseHeaders = cleanHeaders(headers);
       ex.responseBody = { text: BLOCK_BODY, encoding: 'utf8' };
-      this.finish(ex, 'blocked');
+      this.book.finish(ex, 'blocked');
       return { response: { statusCode: status, statusMessage: STATUS_CODES[status], headers, rawBody } };
     }
 
-    if (action?.kind === 'script') return this.scriptRequest(req, ex, flow, action, body);
+    if (action?.kind === 'script') return this.edits.scriptRequest(req, ex, flow, action, body);
 
     if (action?.kind === 'breakpoint' && action.phase !== 'response') {
       const decision = this.pause(ex, 'request');
-      this.track(ex, flow);
+      this.book.track(ex, flow);
       const d = await decision;
       if (d.kind === 'abort') {
-        this.finish(ex, 'aborted');
+        this.book.finish(ex, 'aborted');
         return { response: 'reset' };
       }
       if (d.kind === 'gone') return { response: 'close' };
-      const result = await this.applyRequestEdit(req, ex, d.edit as RequestEdit | undefined);
+      const result = await this.edits.applyRequestEdit(req, ex, d.edit as RequestEdit | undefined);
       ex.state = 'pending';
-      this.emitChange(ex);
-      if (!(await this.latency(ex, flow))) return { response: 'close' };
+      this.book.emitChange(ex);
+      if (!(await this.edits.latency(ex, flow))) return { response: 'close' };
       return result;
     }
 
-    this.track(ex, flow);
-    if (!(await this.latency(ex, flow))) return { response: 'close' };
-    if (flow.map || flow.rewrite?.request || flow.wantHost) return this.forwardChanges(req, ex, flow, body);
+    this.book.track(ex, flow);
+    if (!(await this.edits.latency(ex, flow))) return { response: 'close' };
+    if (flow.map || flow.rewrite?.request || flow.wantHost) return this.edits.forwardChanges(req, ex, flow);
     return undefined;
   }
 
-  /** A 502 answered by the proxy (`Flutter Intercept: <error>`); the exchange ends 'error' with `error`. */
-  private localFailure(ex: Exchange, error: string): CallbackResponseMessageResult & { statusCode: number } {
-    const text = `Flutter Intercept: ${error}`;
-    const headers: HeaderBag = { 'content-type': 'text/plain; charset=utf-8' };
-    const rawBody = frameBody(Buffer.from(text, 'utf8'), headers);
-    ex.status = 502;
-    ex.responseHeaders = cleanHeaders(headers);
-    ex.responseBody = { text, encoding: 'utf8' };
-    this.fail(ex, error);
-    return { statusCode: 502, statusMessage: STATUS_CODES[502], headers, rawBody };
-  }
-
-  // ---------------------------------------------------------------- script rules (CONTRACTS §13.4)
-
-  /** Run a hook of the flow's script rule; its log lines go to `scriptLog`. */
-  private async runScript(ex: Exchange, flow: Flow, action: ScriptAction, hook: ScriptHook, args: unknown[]): Promise<ScriptOutcome> {
-    const rule = flow.rule;
-    const id = rule?.id ?? '';
-    const out = await this.scripts.run(id, rule?.name || id, action.code, hook, args, { ruleId: id, exchangeId: ex.id });
-    if (out.lines.length) ex.scriptLog = [...(ex.scriptLog ?? []), ...out.lines].slice(0, SCRIPT_LOG_MAX_LINES);
-    return out;
-  }
-
-  /** "Script <rule name>: <message>", also added as the last scriptLog line (room is made for it). */
-  private scriptError(ex: Exchange, flow: Flow, message: string): string {
-    const text = `Script ${flow.rule?.name || flow.rule?.id || ''}: ${message}`.slice(0, 2 * SCRIPT_LOG_MAX_CHARS);
-    ex.scriptLog = [...(ex.scriptLog ?? []).slice(0, SCRIPT_LOG_MAX_LINES - 1), text.slice(0, SCRIPT_LOG_MAX_CHARS)];
-    return text;
-  }
-
-  /**
-   * onRequest: forward unchanged (undefined), forward the edited request (re-framed like a request edit), or answer
-   * locally (`{response}`, like a mock: state 'mocked'). A throw, timeout or invalid result → 502, state 'error'.
-   */
-  private async scriptRequest(
-    req: CompletedRequest,
-    ex: Exchange,
-    flow: Flow,
-    action: ScriptAction,
-    body: Body | undefined,
-  ): Promise<CallbackRequestResult | undefined> {
-    this.track(ex, flow);
-    const input = scriptRequestOf(ex.method, ex.url, ex.requestHeaders, body);
-    const out = await this.runScript(ex, flow, action, 'onRequest', [input]);
-    if (this.live.get(ex.id)?.ex !== ex || ex.state !== 'pending') return { response: 'close' }; // the app left
-    let plan: RequestOutcome | undefined;
-    let error = out.error;
-    if (error === undefined && out.value !== undefined) {
-      try {
-        plan = readRequestResult(out.value);
-      } catch (e) {
-        error = (e as Error).message;
-      }
-    }
-    if (error !== undefined) return { response: this.localFailure(ex, this.scriptError(ex, flow, error)) };
-    if (plan?.kind === 'respond') {
-      const headers: HeaderBag = { ...plan.headers };
-      this.addCorsToLocalResponse(ex, headers);
-      const decoded = Buffer.from(plan.body, 'utf8');
-      const rawBody = frameBody(decoded, headers);
-      ex.status = plan.status;
-      ex.responseHeaders = cleanHeaders(headers);
-      ex.responseBody = await decodeForDisplay(decoded, undefined, true);
-      if (isEventStream(getHeader(headers, 'content-type'))) this.setSseFrames(ex, decoded);
-      this.finish(ex, 'mocked');
-      return { response: { statusCode: plan.status, statusMessage: STATUS_CODES[plan.status] ?? 'Unknown', headers, rawBody } };
-    }
-    let result: CallbackRequestResult | undefined;
-    if (plan) {
-      const edit: RequestEdit = {};
-      if (plan.method !== undefined && plan.method !== ex.method) edit.method = plan.method;
-      if (plan.url !== undefined && plan.url !== ex.url) edit.url = plan.url;
-      if (plan.headers && !sameHeaders(plan.headers, input.headers)) edit.headers = plan.headers;
-      if (plan.body !== undefined && plan.body !== input.body) edit.body = plan.body;
-      result = await this.applyRequestEdit(req, ex, edit);
-    }
-    if (!(await this.latency(ex, flow))) return { response: 'close' };
-    return result;
-  }
-
-  /** onResponse: the response unchanged or edited (re-framed like a response edit); failures → 502. */
-  private async scriptResponse(
-    res: PassThroughResponse,
-    ex: Exchange,
-    flow: Flow,
-    action: ScriptAction,
-  ): Promise<CallbackResponseResult | undefined> {
-    const input = scriptResponseOf(res.statusCode, ex.responseHeaders ?? {}, ex.responseBody);
-    const request = scriptRequestOf(ex.method, ex.url, ex.requestHeaders, ex.requestBody);
-    const out = await this.runScript(ex, flow, action, 'onResponse', [input, request]);
-    if (this.live.get(ex.id)?.ex !== ex || ex.state !== 'pending') return 'close';
-    let edit: ResponseEdit | undefined;
-    let error = out.error;
-    if (error === undefined && out.value !== undefined) {
-      try {
-        const r = readResponseResult(out.value);
-        edit = {};
-        if (r.status !== undefined && r.status !== res.statusCode) edit.status = r.status;
-        if (r.headers && !sameHeaders(r.headers, input.headers)) edit.headers = r.headers;
-        if (r.body !== undefined && r.body !== input.body) edit.body = r.body;
-      } catch (e) {
-        error = (e as Error).message;
-      }
-    }
-    if (error !== undefined) return this.localFailure(ex, this.scriptError(ex, flow, error));
-    return this.applyResponseEdit(res, ex, edit);
-  }
-
-  /**
-   * Map Remote / rewrite on a hooked route (CONTRACTS §12.6): what decide() couldn't do — a rule chosen only now
-   * (GraphQL scope), a Host header other than the URL's, request body replacements.
-   */
-  private async forwardChanges(req: CompletedRequest, ex: Exchange, flow: Flow, body: Body | undefined): Promise<CallbackRequestResult | undefined> {
-    const result: CallbackRequestResult = {};
-    let headers: HeaderBag | undefined;
-    let urlHost = new URL(req.url).host;
-    if (!flow.reqApplied) {
-      // Decided in beforeRequest: nothing was applied to the request yet.
-      if (flow.map) {
-        if (flow.viaLan) {
-          // The LAN deny rule saw the original URL: check the mapped target now (CONTRACTS §7).
-          const gate = lanGateOf((req as unknown as { socket?: unknown }).socket);
-          const reason = await lanTargetDenial(flow.map.url, gate?.host);
-          if (reason || !gate || gate.closed) {
-            const text = reason ?? `${SSRF_MARKER}: LAN mode is off.`;
-            ex.status = 403;
-            ex.responseBody = { text, encoding: 'utf8' };
-            this.fail(ex, text);
-            return { response: { statusCode: 403, statusMessage: 'Forbidden', headers: { 'content-type': 'text/plain; charset=utf-8', connection: 'close' }, body: text } };
-          }
-        }
-        result.url = flow.map.url;
-        urlHost = new URL(flow.map.url).host;
-      }
-      let pairs = Object.entries(req.headers as HeaderBag).flatMap(([k, v]) =>
-        v === undefined ? [] : (Array.isArray(v) ? v : [v]).map((x) => [k, x] as [string, string]),
-      );
-      if (flow.rewrite?.request) pairs = rewritePairs(pairs, rewriteSets(flow.rewrite.request));
-      headers = pairsToObject(pairs);
-      const want = rewriteHostOf(flow.rewrite?.request) ?? flow.map?.host ?? urlHost;
-      if (want !== urlHost) flow.wantHost = want;
-    }
-    if (flow.wantHost) {
-      headers ??= { ...(req.headers as HeaderBag) };
-      setHeader(headers, 'host', flow.wantHost);
-    }
-    const replace = flow.rewrite?.reqBody ? flow.rewrite.request?.replaceBody : undefined;
-    if (replace?.length) {
-      headers ??= { ...(req.headers as HeaderBag) };
-      const out = await replaceInBody(req.body.buffer, getHeader(headers, 'content-encoding'), replace);
-      if (out.kind === 'skipped') ex.error = `Rewrite rule: request body not changed: ${out.reason}; it was forwarded unchanged.`;
-      else {
-        result.rawBody = frameBody(out.decoded, headers);
-        this.setRequestBody(ex, await decodeForDisplay(out.decoded, undefined, true));
-        if (out.unmatched) ex.error = `Rewrite rule: ${out.unmatched} request body replacement(s) found nothing.`;
-      }
-    }
-    if (headers) {
-      if (getHeader(headers, 'host') === urlHost) deleteHeader(headers, 'host'); // mockttp derives it from the URL
-      result.headers = headers;
-      const recorded: HeaderBag = { ...headers };
-      if (!getHeader(recorded, 'host')) recorded.host = urlHost;
-      ex.requestHeaders = cleanHeaders(recorded);
-      this.emitChange(ex);
-    }
-    return Object.keys(result).length ? result : undefined;
-  }
-
-  /** A replayed response (CONTRACTS §12.4): re-framed for the recorded headers, state 'mocked'. */
-  private async answerReplay(ex: Exchange, flow: Flow, entry: ReplayEntry): Promise<CallbackRequestResult> {
-    this.track(ex, flow);
-    const headers: HeaderBag = {};
-    for (const [k, v] of Object.entries(entry.headers ?? {})) {
-      if (!HTTP_TOKEN.test(k) || REPLAY_DROPPED_HEADERS.has(k.toLowerCase())) continue;
-      const vals = (Array.isArray(v) ? v : [v]).filter((x) => typeof x === 'string' && !/[\r\n\0]/.test(x));
-      if (vals.length) headers[k] = vals.length === 1 ? vals[0] : vals;
-    }
-    this.addCorsToLocalResponse(ex, headers);
-    const b = entry.body;
-    const bytes = !b ? Buffer.alloc(0) : b.encoding === 'base64' ? Buffer.from(b.text, 'base64') : Buffer.from(b.text, 'utf8');
-    let rawBody: Buffer;
-    let decoded: Buffer = bytes;
-    const enc = getHeader(headers, 'content-encoding');
-    if (enc && bytes.length) {
-      // A recorded body is normally decoded text, but encodings the recorder can't decode (zstd, stacked) were kept
-      // as the wire bytes: send those as they are, encode the others.
-      let wire = false;
-      try {
-        decoded = await decodeStrict(bytes, enc, RESPONSE_PAUSE_LIMIT_BYTES);
-        wire = true;
-      } catch {
-        decoded = bytes;
-      }
-      if (wire) {
-        rawBody = bytes;
-        deleteHeader(headers, 'transfer-encoding');
-        setHeader(headers, 'content-length', String(bytes.length));
-      } else rawBody = await frameBodyAsync(bytes, headers);
-    } else rawBody = frameBody(bytes, headers);
-    ex.status = entry.status;
-    ex.responseHeaders = cleanHeaders(headers);
-    ex.responseBody = await decodeForDisplay(decoded, undefined, true);
-    if (b?.truncated) ex.error = 'The recorded response body was cut at 5 MB; the app got that part only.';
-    if (isEventStream(getHeader(headers, 'content-type'))) this.setSseFrames(ex, decoded);
-    this.finish(ex, 'mocked');
-    return { response: { statusCode: entry.status, statusMessage: STATUS_CODES[entry.status], headers, rawBody } };
-  }
-
-  /** A CORS preflight answered locally for a mock / block / cors rule (CONTRACTS §11.3). */
-  private answerPreflight(req: CompletedRequest, ex: Exchange, flow: Flow): CallbackRequestResult {
-    this.track(ex, flow);
-    const headers: HeaderBag = preflightResponseHeaders(req.headers as HeaderBag, flow.corsPatch ?? {}) ?? { 'content-length': '0' };
-    // REVIEW-13: a grpcMock's answer depends on the call, not just its URL: the browser must not cache this preflight.
-    if (flow.action?.kind === 'grpcMock') setHeader(headers, 'access-control-max-age', '0');
-    ex.status = 204;
-    ex.responseHeaders = cleanHeaders(headers);
-    ex.cors = { preflight: true, patched: true };
-    this.finish(ex, 'mocked');
-    return { response: { statusCode: 204, statusMessage: STATUS_CODES[204], headers, rawBody: Buffer.alloc(0) } };
-  }
-
-  /** Mock / block answers to browser requests get Access-Control-Allow-Origin when they lack it. */
-  private addCorsToLocalResponse(ex: Exchange, headers: HeaderBag): void {
-    if (hasAllowOrigin(headers) || !isCorsRequest(ex.method, ex.url, ex.requestHeaders)) return;
-    const vary = getHeader(headers, 'vary');
-    const set = corsResponseHeaders(ex.requestHeaders, Object.keys(headers), vary); // loopback origins only
-    if (!set) return;
-    deleteHeader(headers, 'vary');
-    Object.assign(headers, set);
-    ex.cors = { ...ex.cors, patched: true };
-  }
-
-  /** A complete event-stream body (mock, buffered response) → frames. */
-  private setSseFrames(ex: Exchange, decoded: Buffer): void {
-    ex.kind = 'sse';
-    const frames: Frame[] = [];
-    let dropped = 0;
-    const at = Date.now();
-    let bytes = 0;
-    const parser = new SseParser((e) => {
-      const f = sseFrame(e, at);
-      frames.push(f);
-      bytes += frameCost(f);
-      while (frames.length > this.maxFrames || (bytes > MAX_FRAME_BYTES_PER_EXCHANGE && frames.length > 1)) {
-        bytes -= frameCost(frames.shift()!);
-        dropped++;
-      }
-    });
-    parser.pushBytes(decoded);
-    parser.end();
-    ex.frames = frames;
-    if (dropped) ex.framesDropped = dropped;
-    this.frameBytes.set(ex.id, bytes);
-  }
-
-  /** Throttle latency before forwarding on a hooked route. false = the exchange ended meanwhile. */
-  private async latency(ex: Exchange, flow: Flow): Promise<boolean> {
-    const ms = flow.throttle?.latencyMs;
-    if (ms && ms > 0) {
-      const from = performance.now();
-      await sleep(ms);
-      if (this.live.get(ex.id)?.ex === ex) this.addPhase(ex, 'delayMs', performance.now() - from);
-    }
-    return this.live.has(ex.id);
-  }
-
-  /**
-   * reset / drop: RST after the tunnel is up; dns: close without a response (FIN); timeout: hold until
-   * the app gives up (or breakpointTimeoutMs, then RST). Never at the CONNECT/TLS level, where dart:io
-   * would fall back to DIRECT (docs/spikes/faults.md). The exchange ends 'blocked'.
-   */
-  private async applyFault(ex: Exchange, flow: Flow): Promise<CallbackRequestResult> {
-    this.track(ex, flow);
-    if (flow.fault === 'drop' && !(await this.latency(ex, flow))) return { response: 'close' };
-    if (flow.fault === 'timeout') {
-      const appLeft = await new Promise<boolean>((resolve) => {
-        const timer = setTimeout(() => settle(false), this.breakpointTimeoutMs);
-        timer.unref?.();
-        const settle = (left: boolean) => {
-          clearTimeout(timer);
-          this.holds.delete(ex.id);
-          resolve(left);
-        };
-        this.holds.set(ex.id, settle);
-      });
-      if (!this.live.has(ex.id)) return { response: 'close' }; // proxy stopped
-      const s = ((Date.now() - ex.startedAt) / 1000).toFixed(1);
-      ex.simulated = appLeft ? `${FAULT_LABELS.timeout} (the app gave up after ${s} s)` : `${FAULT_LABELS.timeout} (reset after ${s} s)`;
-      this.finish(ex, 'blocked');
-      return appLeft ? { response: 'close' } : { response: 'reset' };
-    }
-    if (!this.live.has(ex.id)) return { response: 'close' };
-    this.finish(ex, 'blocked');
-    return flow.fault === 'dns' ? { response: 'close' } : { response: 'reset' };
-  }
-
   private async onResponse(res: PassThroughResponse, req: CompletedRequest): Promise<CallbackResponseResult | void> {
-    const live = this.live.get(res.id ?? req.id);
+    const live = this.book.live.get(res.id ?? req.id);
     if (!live) return undefined;
     const { ex, flow } = live;
     if (ex.state !== 'pending') return 'close'; // client already gone
@@ -3118,25 +1999,25 @@ export class InterceptProxy extends EventEmitter {
     const action = flow.action;
     if (action?.kind === 'breakpoint' && action.phase !== 'request') {
       const decision = this.pause(ex, 'response');
-      this.emitChange(ex);
+      this.book.emitChange(ex);
       const d = await decision;
       if (d.kind === 'abort') {
-        this.finish(ex, 'aborted');
+        this.book.finish(ex, 'aborted');
         return 'reset';
       }
       if (d.kind === 'gone') return 'close';
-      result = await this.applyResponseEdit(res, ex, d.edit as ResponseEdit | undefined);
+      result = await this.edits.applyResponseEdit(res, ex, d.edit as ResponseEdit | undefined);
     } else if (action?.kind === 'script') {
-      const r = await this.scriptResponse(res, ex, flow, action);
+      const r = await this.edits.scriptResponse(res, ex, flow, action);
       if (r === 'close' || r === 'reset') return r;
-      if (!this.live.has(ex.id)) return r; // failed: the 502 replaces the response
+      if (!this.book.live.has(ex.id)) return r; // failed: the 502 replaces the response
       result = r;
     } else if (action?.kind === 'mutate') {
-      result = await this.applyMutation(res, ex, action.ops);
-      if (!this.live.has(ex.id) || ex.state !== 'pending') return 'close'; // the app left meanwhile
+      result = await this.edits.applyMutation(res, ex, action.ops);
+      if (!this.book.live.has(ex.id) || ex.state !== 'pending') return 'close'; // the app left meanwhile
     } else if (flow.rewrite?.response) {
-      result = await this.applyRewriteResponse(res, ex, flow.rewrite);
-      if (!this.live.has(ex.id) || ex.state !== 'pending') return 'close';
+      result = await this.edits.applyRewriteResponse(res, ex, flow.rewrite);
+      if (!this.book.live.has(ex.id) || ex.state !== 'pending') return 'close';
     } else if (flow.corsPatch && isCorsRequest(ex.method, ex.url, ex.requestHeaders)) {
       // A GraphQL-scoped cors rule resolved on the buffered route: patch the head here.
       const set = corsResponseHeaders(ex.requestHeaders, Object.keys(res.headers), getHeader(res.headers, 'vary'), flow.corsPatch);
@@ -3151,1889 +2032,11 @@ export class InterceptProxy extends EventEmitter {
     }
     if (isEventStream(getHeader(ex.responseHeaders ?? {}, 'content-type')) && ex.responseBody && !ex.responseBody.truncated) {
       // Buffered (h2) event stream: frames from the whole body.
-      this.setSseFrames(ex, (await decodeFull(res.body)) ?? Buffer.alloc(0));
+      this.taps.setSseFrames(ex, (await decodeFull(res.body)) ?? Buffer.alloc(0));
     }
     if (flow.fault === 'truncate') return result; // onTruncated finishes it once the cut happens
-    this.finish(ex, 'completed');
+    this.book.finish(ex, 'completed');
     return result;
-  }
-
-  /**
-   * The mutate rule (CONTRACTS §10.2): JSON ops on the complete upstream body, re-encoded and re-framed
-   * like a body edit. Anything that can't be mutated is forwarded unchanged with a note in `error`.
-   */
-  private async applyMutation(res: PassThroughResponse, ex: Exchange, ops: MutateOp[]): Promise<CallbackResponseMessageResult | undefined> {
-    const outcome = await mutateBody(res.body.buffer, getHeader(res.headers, 'content-encoding'), ops);
-    if (outcome.kind === 'skipped') {
-      ex.error = outcome.note;
-      return undefined;
-    }
-    const headers: HeaderBag = { ...res.headers };
-    // Integrity headers would no longer describe the body.
-    for (const h of ['content-md5', 'digest', 'content-digest', 'repr-digest']) deleteHeader(headers, h);
-    const rawBody = await frameBodyAsync(outcome.decoded, headers); // off the event loop (REVIEW-4 #4)
-    ex.responseHeaders = cleanHeaders(headers);
-    ex.responseBody = await decodeForDisplay(outcome.decoded, undefined, true);
-    ex.simulated = ex.simulated ? `${ex.simulated} · ${outcome.label}` : outcome.label;
-    if (outcome.unmatched.length) ex.error = `Mutate rule: nothing matched ${outcome.unmatched.join(', ')} (the other changes were applied).`;
-    return { headers, rawBody };
-  }
-
-  /** A rewrite rule on a buffered response (CONTRACTS §12.6): status, headers, literal body replacements. */
-  private async applyRewriteResponse(res: PassThroughResponse, ex: Exchange, rw: RewriteFlow): Promise<CallbackResponseMessageResult | undefined> {
-    const spec = rw.response!;
-    const result: CallbackResponseMessageResult = {};
-    if (spec.status !== undefined && validRewriteStatus(spec.status) && spec.status !== res.statusCode) {
-      result.statusCode = spec.status;
-      result.statusMessage = STATUS_CODES[spec.status] ?? 'Unknown';
-      ex.status = spec.status;
-    }
-    const sets = rewriteSets(spec, true);
-    const replace = rw.resBody ? spec.replaceBody : undefined;
-    if (!sets.remove.length && !sets.set.length && !replace?.length) return Object.keys(result).length ? result : undefined;
-    const headers = pairsToObject(rewritePairs(headerPairs(res.headers as HeaderBag), sets));
-    let rawBody: Buffer = res.body.buffer;
-    if (replace?.length) {
-      const out = await replaceInBody(res.body.buffer, getHeader(res.headers as HeaderBag, 'content-encoding'), replace);
-      if (out.kind === 'skipped') ex.error = `Rewrite rule: response body not changed: ${out.reason}; it was forwarded unchanged.`;
-      else {
-        for (const h of ['content-md5', 'digest', 'content-digest', 'repr-digest']) deleteHeader(headers, h);
-        rawBody = await frameBodyAsync(out.decoded, headers);
-        ex.responseBody = await decodeForDisplay(out.decoded, undefined, true);
-        if (out.unmatched) ex.error = `Rewrite rule: ${out.unmatched} response body replacement(s) found nothing.`;
-      }
-    }
-    if (rawBody === res.body.buffer) {
-      deleteHeader(headers, 'transfer-encoding');
-      setHeader(headers, 'content-length', String(rawBody.length));
-    }
-    result.headers = headers;
-    result.rawBody = rawBody;
-    ex.responseHeaders = cleanHeaders(headers);
-    return result;
-  }
-
-  private async applyRequestEdit(
-    req: CompletedRequest,
-    ex: Exchange,
-    edit: RequestEdit | undefined,
-  ): Promise<CallbackRequestResult | undefined> {
-    if (!edit || isEmptyEdit(edit)) return undefined;
-    const result: CallbackRequestResult = {};
-
-    if (edit.method) {
-      result.method = edit.method.toUpperCase();
-      ex.method = result.method;
-    }
-    if (edit.url) {
-      result.url = edit.url;
-      ex.url = edit.url;
-    }
-
-    const originalHeaders: HeaderBag = { ...req.headers };
-    const headers: HeaderBag = edit.headers ? copyHeaders(edit.headers) : { ...originalHeaders };
-    deleteHeader(headers, TRACE_HEADER); // never upstream, even if an edit adds it back
-    deleteHeader(headers, SEND_HEADER);
-    // A Host header left over from the original request would pin the old virtual host when the
-    // URL changes; drop it unless the user deliberately changed it, so mockttp derives it.
-    const originalHost = getHeader(originalHeaders, 'host');
-    if (getHeader(headers, 'host') === originalHost) deleteHeader(headers, 'host');
-
-    const encodingChanged =
-      normalizedEncoding(getHeader(headers, 'content-encoding')) !==
-      normalizedEncoding(getHeader(originalHeaders, 'content-encoding'));
-
-    let decodedBody: Buffer | undefined;
-    if (edit.body !== undefined || encodingChanged) {
-      // The request body here is complete and ≤ REQUEST_PAUSE_LIMIT_BYTES (see decide()).
-      decodedBody = edit.body !== undefined ? Buffer.from(edit.body, 'utf8') : await decodeFull(req.body);
-      result.rawBody = frameBody(decodedBody, headers);
-    }
-    if (edit.headers || decodedBody) result.headers = headers;
-
-    if (result.headers) {
-      const recorded: HeaderBag = { ...headers };
-      if (!getHeader(recorded, 'host')) recorded.host = new URL(ex.url).host;
-      ex.requestHeaders = cleanHeaders(recorded);
-    }
-    if (decodedBody) this.setRequestBody(ex, await decodeForDisplay(decodedBody, undefined, true));
-    return result;
-  }
-
-  private async applyResponseEdit(
-    res: PassThroughResponse,
-    ex: Exchange,
-    edit: ResponseEdit | undefined,
-  ): Promise<CallbackResponseMessageResult | undefined> {
-    if (!edit || isEmptyEdit(edit)) return undefined;
-    const result: CallbackResponseMessageResult = {};
-
-    if (edit.status !== undefined && edit.status !== res.statusCode) {
-      result.statusCode = edit.status;
-      result.statusMessage = STATUS_CODES[edit.status] ?? 'Unknown';
-      ex.status = edit.status;
-    }
-
-    if (edit.body !== undefined || edit.headers) {
-      // Re-frame whenever headers are replaced too: an edited header set can't be trusted to
-      // still describe the original bytes (content-encoding, content-length, transfer-encoding).
-      const headers: HeaderBag = edit.headers ? copyHeaders(edit.headers) : { ...res.headers };
-      const sameEncoding =
-        normalizedEncoding(getHeader(headers, 'content-encoding')) ===
-        normalizedEncoding(getHeader(res.headers, 'content-encoding'));
-      if (edit.body === undefined && sameEncoding) {
-        // Headers only, same encoding: forward the original wire bytes, just fix the framing.
-        result.rawBody = res.body.buffer;
-        deleteHeader(headers, 'transfer-encoding');
-        deleteHeader(headers, 'content-length');
-        headers['content-length'] = String(res.body.buffer.length);
-      } else {
-        const decodedBody = edit.body !== undefined ? Buffer.from(edit.body, 'utf8') : await decodeFull(res.body);
-        result.rawBody = frameBody(decodedBody, headers);
-        if (edit.body !== undefined) ex.responseBody = await decodeForDisplay(decodedBody, undefined, true);
-      }
-      result.headers = headers;
-      ex.responseHeaders = cleanHeaders(headers);
-    }
-    return result;
-  }
-
-  // ---------------------------------------------------------------- WebSockets (CONTRACTS §11.1)
-
-  /** Called by the WebSocket route matchers; decided (and recorded) once per upgrade. */
-  private decideWs(req: OngoingRequest): Flow {
-    const known = this.flows.get(req.id);
-    if (known) return known;
-    const url = toWsUrl(req.url);
-    const meta = this.reqMeta.get(req);
-    const m = this.matchRule(req.method, url, { count: true, ws: true });
-    const action = m.action;
-    let flow: Flow = { route: 'ws-pass' };
-    if (action?.kind === 'block') flow = { route: 'ws-local', rule: m.rule, action };
-    else if (action?.kind === 'fault') flow = { route: 'ws-local', rule: m.rule, action, fault: action.fault, simulated: FAULT_LABELS[action.fault] };
-    else if (this.profile.kind === 'offline') flow = { route: 'ws-local', rule: m.rule, fault: 'dns', simulated: describeProfile(this.profile) };
-    else if (action?.kind === 'mapRemote') {
-      // CONTRACTS §12.6: the upgrade goes to the mapped server (connectWsMapped); LAN clients keep the connect-time guard.
-      try {
-        const target = mapRemoteUrl(url, m.rule?.match.url ?? '', action.to);
-        const t = new URL(target);
-        const host = action.preserveHost ? (getHeader(req.headers as HeaderBag, 'host') ?? new URL(url).host) : t.host;
-        flow = { route: 'ws-pass', rule: m.rule, action, map: { url: target, host }, originalUrl: url, simulated: `Mapped to ${t.origin}` };
-      } catch (e) {
-        flow = { route: 'ws-local', rule: m.rule, action, localError: `Map Remote rule: ${(e as Error).message}` };
-      }
-    } else if (!m.rule && this.replayStore) {
-      // CONTRACTS §14.5: a recorded WebSocket for this URL answers as a scripted server.
-      const store = this.replayStore;
-      const hit = store.lookup('GET', url, {}, true);
-      if (hit && hit !== 'needs-body' && hit.entry.kind === 'websocket') {
-        flow = { route: 'ws-replay', replay: hit.entry, simulated: `Replayed from ${store.name ?? 'a recording'}` };
-      } else if (store.fallback === 'fail') {
-        flow = { route: 'ws-local', fault: 'dns', simulated: 'Not in the recording (replay: fail)' };
-      }
-    } else if (m.rule) flow.rule = m.rule;
-    if (flow.route === 'ws-pass') {
-      const refused = this.certRefusal(flow.map?.url ?? url, req.headers as HeaderBag);
-      if (refused) flow = { route: 'ws-local', ...(m.rule ? { rule: m.rule } : {}), refused };
-    }
-    if (flow.route === 'ws-pass') {
-      // CONTRACTS §14.4: a throttle rule (or the throttle profile) paces the frames, each direction (watchWebSocket).
-      const t = action?.kind === 'throttle' ? action : this.profile.kind === 'throttle' ? this.profile : undefined;
-      if (t) {
-        const label = action?.kind === 'throttle' ? throttleLabel(action) : profileLabel(this.profile as ThrottleProfile);
-        if ((t.latencyMs ?? 0) > 0 || (t.kbps ?? 0) > 0 || (t.uploadKbps ?? 0) > 0) {
-          flow.throttle = { latencyMs: t.latencyMs, kbps: t.kbps, uploadKbps: t.uploadKbps };
-          flow.simulated = flow.simulated ? `${label} · ${flow.simulated}` : label;
-        }
-        if (t.dropRate && t.dropRate > 0 && Math.random() < t.dropRate) {
-          flow = { route: 'ws-local', rule: m.rule, fault: 'drop', simulated: `${label}: dropped` };
-        }
-      }
-    }
-    if (m.note) flow.note = m.note;
-    if (meta?.traceId) flow.traceId = meta.traceId;
-    const socket = (req as unknown as { socket?: unknown }).socket;
-    if (lanGateOf(socket)) flow.viaLan = true;
-    if (socket && typeof socket === 'object') this.connRequest.set(socket, req.id);
-    this.flows.set(req.id, flow);
-    const ex = this.newExchange({ id: req.id, method: req.method, url, headers: req.headers as HeaderBag, timingEvents: req.timingEvents }, flow);
-    delete ex.graphql;
-    ex.kind = 'websocket';
-    ex.frames = [];
-    // An upgrade request is its head: complete now (CONTRACTS §13.2, phases up to the 101).
-    flow.te = req.timingEvents;
-    this.setRequestMs(ex, flow.te, performance.now());
-    this.track(ex, flow);
-    if (flow.route === 'ws-pass') {
-      markProxySocket((req as unknown as { socket?: object }).socket); // app side gets the message size limit
-      this.watchWebSocket(req, ex);
-    }
-    return flow;
-  }
-
-  /**
-   * Frames straight from the two `ws` connections mockttp pipes together (its 'ws-upgrade' socket event,
-   * which hands over the app-side WebSocket with `upstreamWebSocket` attached). Unlike mockttp's
-   * websocket-message events this sees pings / pongs and which side closed first (and how), and records in
-   * order without a setImmediate per message.
-   */
-  private watchWebSocket(req: OngoingRequest, ex: Exchange): void {
-    const socket = (req as unknown as { socket?: net.Socket }).socket;
-    socket?.once('ws-upgrade', (ws: WsLike) => {
-      const live = this.live.get(ex.id);
-      if (!live || live.ex !== ex) return;
-      const st: StreamState = (live.stream = { ...live.stream, wsDirect: true });
-      const up = ws.upstreamWebSocket;
-      const th = live.flow.throttle;
-      if (th && up) {
-        // Before mockttp's pipe starts (it is attached after this event): what the pipe sends to the app is paced
-        // like a download, what it sends to the server like an upload.
-        const note = (text: string) => {
-          if (this.live.get(ex.id)?.ex === ex) ex.error = text;
-        };
-        paceWebSocket(ws, { latencyMs: th.latencyMs, kbps: th.kbps }, up, note);
-        paceWebSocket(up, { latencyMs: th.latencyMs, kbps: th.uploadKbps }, ws, note);
-      }
-      ws.on('message', (data, isBinary) => this.addFrame(ex, payloadFrame('send', isBinary ? 'binary' : 'text', toBuffer(data))));
-      ws.on('ping', (d) => this.addFrame(ex, payloadFrame('send', 'ping', toBuffer(d))));
-      ws.on('pong', (d) => this.addFrame(ex, payloadFrame('send', 'pong', toBuffer(d))));
-      // Over the size limit (ws-limit.ts): ws closes that side with 1009; close the other side with 1009 too
-      // (mockttp's pipe would otherwise just drop it). Our listeners run before the pipe's.
-      ws.on('error', (e) => {
-        if (!isTooBig(e)) return;
-        st.tooBig ??= 'send';
-        try {
-          up?.close(1009, 'Message too big');
-        } catch {
-          /* already closing */
-        }
-      });
-      if (up) {
-        up.on('error', (e) => {
-          if (!isTooBig(e)) return;
-          st.tooBig ??= 'receive';
-          try {
-            ws.close(1009, 'Message too big');
-          } catch {
-            /* already closing */
-          }
-        });
-        up.on('message', (data, isBinary) => this.addFrame(ex, payloadFrame('receive', isBinary ? 'binary' : 'text', toBuffer(data))));
-        up.on('ping', (d) => this.addFrame(ex, payloadFrame('receive', 'ping', toBuffer(d))));
-        up.on('pong', (d) => this.addFrame(ex, payloadFrame('receive', 'pong', toBuffer(d))));
-        up.once('close', (code, reason) => {
-          st.serverClose ??= { code, reason: toBuffer(reason) };
-        });
-      }
-      ws.once('close', (code, reason) => this.onWsClosed(ex, code, toBuffer(reason)));
-    });
-  }
-
-  /** The app's side of the WebSocket closed: the exchange ends (the side that closed first decides how). */
-  private onWsClosed(ex: Exchange, appCode: number, appReason: Buffer): void {
-    const live = this.live.get(ex.id);
-    if (!live || live.ex !== ex) return;
-    const tooBig = live.stream?.tooBig;
-    if (tooBig) {
-      return this.fail(
-        ex,
-        `A message from the ${tooBig === 'receive' ? 'server' : 'app'} was over the ${WS_MAX_MESSAGE_BYTES / 1024 / 1024} MB limit; ` +
-          'the connection was closed (1009, message too big).',
-      );
-    }
-    const server = live.stream?.serverClose;
-    const [dir, code, reason] = server ? (['receive', server.code, server.reason] as const) : (['send', appCode, appReason] as const);
-    if (code === 1006) {
-      return this.fail(
-        ex,
-        dir === 'receive'
-          ? "The server's connection ended without a close frame (abnormal closure, 1006)."
-          : "The app's connection ended without a close frame (abnormal closure, 1006).",
-      );
-    }
-    this.addFrame(ex, closeFrame(dir, code === 1005 ? undefined : code, reason));
-    this.finish(ex, 'completed');
-  }
-
-  /** mockttp's 'websocket-accepted': the 101 and its headers. */
-  private onWsAccepted(res: { id?: string; statusCode?: number; headers?: Record<string, unknown> }): void {
-    const live = res.id ? this.live.get(res.id) : undefined;
-    if (!live || live.ex.kind !== 'websocket') return;
-    const { ex } = live;
-    ex.status = res.statusCode ?? 101;
-    ex.responseHeaders = cleanHeaders((res.headers ?? {}) as HeaderBag);
-    if (!live.stream?.wsDirect) ex.error = 'Frames are not recorded (incompatible mockttp version).';
-    this.emitChange(ex);
-  }
-
-  /** A response other than 101 to a passed-through upgrade (the server refused it, or mockttp failed). */
-  private onWsRefused(res: { id?: string; statusCode?: number; statusMessage?: string; headers?: Record<string, unknown> }): void {
-    const live = res.id ? this.live.get(res.id) : undefined;
-    if (!live || live.ex.kind !== 'websocket' || live.flow.route !== 'ws-pass') return;
-    const { ex } = live;
-    ex.status = res.statusCode;
-    ex.responseHeaders = cleanHeaders((res.headers ?? {}) as HeaderBag);
-    this.fail(ex, `The WebSocket upgrade was refused: ${res.statusCode ?? '?'} ${res.statusMessage ?? ''}`.trim());
-  }
-
-  /** Block / fault rules and the offline profile on an upgrade: answered here, never forwarded. */
-  private async onWsLocal(req: OngoingRequest, socket: net.Socket): Promise<void> {
-    const live = this.live.get(req.id);
-    if (!live) {
-      socket.destroy();
-      return;
-    }
-    const { ex, flow } = live;
-    const action = flow.action;
-    const reset = () => resetOrDestroy(req as unknown as Parameters<typeof resetOrDestroy>[0]);
-    if (flow.refused) {
-      const body = Buffer.from(`Flutter Intercept: ${flow.refused}`, 'utf8');
-      ex.status = 403;
-      ex.error = flow.refused;
-      this.finish(ex, 'blocked');
-      socket.on('error', () => undefined);
-      socket.end(
-        Buffer.concat([
-          Buffer.from(`HTTP/1.1 403 Forbidden\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: ${body.length}\r\nconnection: close\r\n\r\n`, 'latin1'),
-          body,
-        ]),
-      );
-      return;
-    }
-    if (flow.localError) {
-      const body = Buffer.from(`Flutter Intercept: ${flow.localError}`, 'utf8');
-      ex.status = 502;
-      this.fail(ex, flow.localError);
-      socket.on('error', () => undefined);
-      socket.end(
-        Buffer.concat([
-          Buffer.from(`HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: ${body.length}\r\nconnection: close\r\n\r\n`, 'latin1'),
-          body,
-        ]),
-      );
-      return;
-    }
-    if (flow.fault === 'timeout') {
-      const appLeft = await new Promise<boolean>((resolve) => {
-        const timer = setTimeout(() => settle(false), this.breakpointTimeoutMs);
-        timer.unref?.();
-        const settle = (left: boolean) => {
-          clearTimeout(timer);
-          this.holds.delete(ex.id);
-          resolve(left);
-        };
-        this.holds.set(ex.id, settle);
-      });
-      if (!this.live.has(ex.id)) {
-        socket.destroy(); // proxy stopped
-        return;
-      }
-      const s = ((Date.now() - ex.startedAt) / 1000).toFixed(1);
-      ex.simulated = appLeft ? `${FAULT_LABELS.timeout} (the app gave up after ${s} s)` : `${FAULT_LABELS.timeout} (reset after ${s} s)`;
-      this.finish(ex, 'blocked');
-      if (!appLeft) reset();
-      return;
-    }
-    if (flow.fault) {
-      this.finish(ex, 'blocked');
-      if (flow.fault === 'dns') {
-        socket.end();
-        socket.destroy();
-      } else reset();
-      return;
-    }
-    if (action?.kind === 'block' && action.mode === 'reset') {
-      this.finish(ex, 'blocked');
-      return reset();
-    }
-    const status = action?.kind === 'block' ? (action.status ?? 403) : 403;
-    const body = Buffer.from(BLOCK_BODY, 'utf8');
-    const headers = { 'content-type': 'text/plain; charset=utf-8', 'content-length': String(body.length), connection: 'close' };
-    ex.status = status;
-    ex.responseHeaders = { ...headers };
-    ex.responseBody = { text: BLOCK_BODY, encoding: 'utf8' };
-    this.finish(ex, 'blocked');
-    const head = `HTTP/1.1 ${status} ${STATUS_CODES[status] ?? 'Blocked'}\r\n${Object.entries(headers)
-      .map(([k, v]) => `${k}: ${v}`)
-      .join('\r\n')}\r\n\r\n`;
-    socket.on('error', () => undefined);
-    socket.end(Buffer.concat([Buffer.from(head, 'latin1'), body]));
-  }
-
-  /**
-   * Map Remote for a WebSocket upgrade: mockttp's PassThroughWebSocketStep, but connected to the mapped target
-   * (its connectUpstream takes the destination and URL explicitly; req.url is read-only for upgrades).
-   */
-  private async connectWsMapped(step: any, req: OngoingRequest, socket: net.Socket, head: Buffer, options: unknown, map: { url: string; host: string }): Promise<void> {
-    if (typeof step?.connectUpstream !== 'function' || typeof step?.initializeWsServer !== 'function') {
-      const live = this.live.get(req.id);
-      if (live) this.fail(live.ex, 'Map Remote could not be applied to this WebSocket (incompatible mockttp version).');
-      socket.destroy();
-      return;
-    }
-    step.initializeWsServer();
-    const t = new URL(map.url);
-    const destination = { hostname: t.hostname.replace(/^\[|\]$/g, ''), port: Number(t.port) || (t.protocol === 'wss:' ? 443 : 80) };
-    const raw = (req as unknown as { rawHeaders: Array<[string, string]> }).rawHeaders;
-    const rawHeaders = rewritePairs(Array.isArray(raw) ? raw.slice() : [], { remove: ['host'], set: [['Host', map.host]] });
-    await step.connectUpstream(destination, map.url, req, rawHeaders, socket, head, options);
-  }
-
-  // ---------------------------------------------------------------- gRPC-Web (CONTRACTS §19.1)
-
-  /**
-   * Read a gRPC-Web call's bodies from the taps as they pass (any route), into frames / trailers on its exchange.
-   * Bounded by work (REVIEW-13 #1): ≤ GRPC_WEB_RECORD_FRAMES recorded frames and ≤ GRPC_WEB_DECOMPRESS_MESSAGES
-   * decompressed messages per direction, the rest counted from frame headers; the reader stops at its frame / decode
-   * caps and is stopped (decoders destroyed, nothing queued) once the call is forgotten.
-   */
-  private watchGrpcWeb(req: OngoingRequest, variant: GrpcWebVariant): void {
-    const tap = getTap(req.id);
-    if (!tap) return;
-    const id = req.id;
-    tap.req.skip = true; // frames instead of a raw body copy
-    tap.res.skip = true;
-    const st: GrpcWebState = {
-      sent: 0,
-      received: 0,
-      recorded: { send: 0, receive: 0 },
-      compressed: { send: 0, receive: 0 },
-      queue: [],
-      notes: [],
-      reqEnc: grpcEncodingOf((req.headers as HeaderBag)['grpc-encoding']),
-    } as unknown as GrpcWebState;
-    const sink = (f: Frame) => {
-      if (st.forgotten) return; // never queue for a call that is gone
-      st.queue.push(f);
-      this.scheduleGrpcWebSync(id, st);
-    };
-    const recs = {
-      send: new GrpcFrameRecorder('send', () => st.reqEnc, sink),
-      receive: new GrpcFrameRecorder('receive', () => st.resEnc, sink),
-    };
-    const note = (text: string) => {
-      if (!st.notes.includes(text) && st.notes.length < 10) st.notes.push(text);
-      this.scheduleGrpcWebSync(id, st);
-    };
-    st.rec = new GrpcWebRecorder(variant, {
-      onMessage: (dir, m) => {
-        if (st.forgotten) return;
-        if (dir === 'send') st.sent++;
-        else st.received++;
-        if (st.recorded[dir] >= GRPC_WEB_RECORD_FRAMES) {
-          if (st.recorded[dir] === GRPC_WEB_RECORD_FRAMES) note(`Only the first ${GRPC_WEB_RECORD_FRAMES} messages each way were recorded; later ones were counted.`);
-          st.recorded[dir]++;
-          return this.scheduleGrpcWebSync(id, st);
-        }
-        st.recorded[dir]++;
-        // Decompression work is bounded per call too: later compressed messages are recorded without a payload.
-        const decompress = !m.compressed || st.compressed[dir]++ < GRPC_WEB_DECOMPRESS_MESSAGES;
-        recs[dir].push(decompress ? m : { ...m, kept: Buffer.alloc(0), complete: false });
-      },
-      onTrailers: (t) => {
-        if (st.forgotten) return;
-        st.trailers = t;
-        this.scheduleGrpcWebSync(id, st);
-      },
-      onProblem: note,
-      compressedKeep: GRPC_COMPRESSED_KEEP_BYTES,
-    });
-    this.grpcWebCalls.set(id, st);
-    tap.onRequestData = (b) => st.rec.requestData(b);
-    const reqEnd = tap.onRequestEnd;
-    tap.onRequestEnd = () => {
-      st.rec.requestEnd();
-      reqEnd?.();
-    };
-    tap.onHeadSeen = (_status, h) => {
-      st.resEnc = grpcEncodingOf(h['grpc-encoding']);
-      const s = grpcStatusOf(h);
-      if (s.code !== undefined) st.headStatus = s; // trailers-only (status in the headers)
-      st.rec.responseHead(h);
-      this.scheduleGrpcWebSync(id, st);
-    };
-    tap.onResponseData = (b) => st.rec.responseData(b);
-    const done = tap.onResponseDone;
-    tap.onResponseDone = (finished) => {
-      done?.(finished);
-      st.rec.requestEnd();
-      if (finished) st.rec.responseEnd();
-      else st.rec.stop(); // aborted: release the decoders and buffers now
-      // The rest of the body is read (bounded, at most GRPC_WEB_FORGET_MS), late frames join the stored exchange,
-      // then the call is forgotten and its reader stopped.
-      const deadline = sleep(GRPC_WEB_FORGET_MS);
-      void Promise.race([st.rec.done, deadline])
-        .then(() => Promise.race([Promise.all([recs.send.idle(), recs.receive.idle()]), deadline]))
-        .then(() => {
-          st.rec.stop();
-          this.syncGrpcWeb(id);
-          st.forgotten = true;
-          st.queue.length = 0;
-          this.grpcWebCalls.delete(id);
-        });
-    };
-  }
-
-  /** One sync per tick for a call (REVIEW-13 #1: never one exchange event per frame). */
-  private scheduleGrpcWebSync(id: string, st: GrpcWebState): void {
-    if (st.syncScheduled || st.forgotten) return;
-    st.syncScheduled = true;
-    setImmediate(() => {
-      st.syncScheduled = false;
-      this.syncGrpcWeb(id);
-    });
-  }
-
-  /** Move what the reader found onto the exchange (once it exists: hooked routes create it after the body). */
-  private syncGrpcWeb(id: string): void {
-    const st = this.grpcWebCalls.get(id);
-    const live = this.live.get(id);
-    const ex = live?.ex ?? this.store.get(id);
-    if (!st) return;
-    if (!ex || !ex.grpc) {
-      if (st.forgotten) st.queue.length = 0;
-      return;
-    }
-    const frames = st.queue.splice(0);
-    for (const f of frames) this.addFrame(ex, f, true);
-    const g = ex.grpc;
-    g.messagesSent = Math.max(g.messagesSent, st.sent);
-    g.messagesReceived = Math.max(g.messagesReceived, st.received);
-    if (st.reqEnc) g.requestEncoding = st.reqEnc;
-    if (st.resEnc) g.responseEncoding = st.resEnc;
-    const status = st.trailers ? grpcStatusOf(st.trailers) : st.headStatus;
-    if (st.trailers) ex.responseTrailers = { ...st.trailers };
-    if (status?.code !== undefined) {
-      g.statusCode = status.code;
-      if (status.message !== undefined) g.statusMessage = status.message;
-      if (!st.trailers && st.headStatus) g.trailersOnly = true;
-    }
-    for (const n of st.notes) if (!(ex.error ?? '').includes(n)) ex.error = ex.error ? `${ex.error} ${n}` : n;
-    st.notes.length = 0;
-    this.touch(ex);
-  }
-
-  /** CORS for a local gRPC-Web answer (like other mocks), plus the gRPC status headers exposed to the page. */
-  private addGrpcWebCors(ex: Exchange, headers: HeaderBag): void {
-    this.addCorsToLocalResponse(ex, headers);
-    if (getHeader(headers, 'access-control-allow-origin') && !getHeader(headers, 'access-control-expose-headers')) {
-      headers['access-control-expose-headers'] = GRPC_WEB_EXPOSE_HEADERS;
-    }
-  }
-
-  /** CONTRACTS §19.1: grpcMock for a gRPC-Web call: HTTP 200, the request's variant, frames, then the trailer frame. */
-  private async answerGrpcWeb(ex: Exchange, flow: Flow, a: Extract<RuleAction, { kind: 'grpcMock' }>): Promise<CallbackRequestResult> {
-    this.track(ex, flow);
-    if (a.delayMs && a.delayMs > 0) {
-      const from = performance.now();
-      await sleep(a.delayMs);
-      this.addPhase(ex, 'delayMs', performance.now() - from);
-      if (ex.state !== 'pending') return { response: 'close' };
-    }
-    const variant = flow.grpcWeb!;
-    const code = a.code ?? 0;
-    const messages = (a.messages ?? []).map((m) => Buffer.from(String(m), 'base64'));
-    const custom = Object.fromEntries(Object.entries(a.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
-    const trailers = Object.fromEntries(Object.entries(a.trailers ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
-    const headers: HeaderBag = { ...custom, 'content-type': grpcWebContentType(variant) };
-    let body: Buffer;
-    if (code !== 0 && !messages.length) {
-      // Trailers-only: the status in the headers, no body.
-      Object.assign(headers, trailers, { 'grpc-status': String(code), ...(a.message ? { 'grpc-message': encodeGrpcMessage(a.message) } : {}) });
-      body = Buffer.alloc(0);
-    } else body = grpcWebBody(variant, messages, code, a.message, trailers);
-    if (a.gapMs) ex.error = 'gapMs doesn\'t apply to gRPC-Web mocks (one response body); the messages were sent together.';
-    this.addGrpcWebCors(ex, headers);
-    headers['content-length'] = String(body.length);
-    ex.status = 200;
-    ex.responseHeaders = cleanHeaders(headers);
-    if (ex.grpc) {
-      ex.grpc.statusCode = code;
-      if (a.message) ex.grpc.statusMessage = a.message;
-    }
-    this.finish(ex, 'mocked');
-    return { response: { statusCode: 200, statusMessage: STATUS_CODES[200], headers, rawBody: body } };
-  }
-
-  // ---------------------------------------------------------------- gRPC (CONTRACTS §16.2)
-
-  /** A gRPC call's flow: the first applicable rule (or sequence step), the network profile. */
-  private decideGrpc(req: OngoingRequest): Flow {
-    const meta0 = this.reqMeta.get(req);
-    if (meta0?.hop !== undefined && meta0.hop === this.hopNonce) {
-      // CONTRACTS §18.6: our own relayed call came back — refused, not recorded (the sending side records it).
-      const loop: Flow = { route: 'grpc', loop: true };
-      this.flows.set(req.id, loop);
-      return loop;
-    }
-    const m = this.matchRule(req.method, req.url, { count: true, grpc: true });
-    let flow = this.grpcFlowFor(req.url, m.rule, m.action, m.note, m.step);
-    // REVIEW-10 #6 (REVIEW-8 #1): a web page's call to a client-certificate host is refused before any connection.
-    const k = flow.action?.kind;
-    const forwards =
-      !flow.fault && !flow.replay && !flow.localError && (!k || k === 'throttle' || k === 'breakpoint' || k === 'mutate' || k === 'rewrite' || k === 'script' || k === 'mapRemote');
-    const refused = forwards ? this.certRefusal(flow.map?.url ?? req.url, req.headers as HeaderBag) : undefined;
-    if (refused) flow = { route: 'grpc', ...(m.rule ? { rule: m.rule } : {}), refused };
-    const meta = this.reqMeta.get(req);
-    if (meta?.traceId) flow.traceId = meta.traceId;
-    // CONTRACTS §18.6: a call made by send() (its own silent tunnel into this listener): initiator / resentFrom.
-    const send = meta?.sendNonce ? this.sends.get(meta.sendNonce) : undefined;
-    if (send) flow.send = send;
-    if (lanGateOf((req as unknown as { socket?: unknown }).socket)) flow.viaLan = true;
-    flow.te = (req as unknown as { timingEvents?: RequestTimingEvents }).timingEvents;
-    this.flows.set(req.id, flow);
-    // Messages are recorded as frames by the relay: the taps keep no body copy.
-    const tap = getTap(req.id);
-    if (tap) {
-      tap.req.skip = true;
-      tap.res.skip = true;
-    }
-    return flow;
-  }
-
-  /** Like flowFor, for the actions that apply to gRPC: faults, throttle (+ the profile and its drop rate), block, grpcMock. */
-  private grpcFlowFor(url: string, rule: Rule | undefined, action: Applied, note?: string, step?: number): Flow {
-    const store = this.replayStore;
-    if (!rule && store?.lookupGrpc(url, 'unknown', false)) {
-      // CONTRACTS §17.4: answered from the recording (like a grpcMock); the entry is chosen once the call starts.
-      return { route: 'grpc', replay: 'deferred', simulated: `Replayed from ${store.name ?? 'a recording'}`, ...(note ? { note } : {}) };
-    }
-    let flow: Flow = { route: 'grpc', ...(rule ? { rule } : {}), ...(action ? { action } : {}) };
-    let dropRate: number | undefined;
-    if (action?.kind === 'fault') {
-      flow.fault = action.fault;
-      flow.simulated = FAULT_LABELS[action.fault];
-    } else if (action?.kind === 'throttle') {
-      flow.throttle = { latencyMs: action.latencyMs, kbps: action.kbps, uploadKbps: action.uploadKbps };
-      flow.simulated = throttleLabel(action);
-      dropRate = action.dropRate;
-    } else if (action?.kind === 'rewrite') {
-      // CONTRACTS §18.1: metadata only (bodies and status don't apply to protobuf calls; noted when set).
-      flow.rewrite = rewriteFlow(action);
-      flow.simulated = 'Rewritten: metadata';
-      const r = action;
-      if (flow.rewrite.reqBody || flow.rewrite.resBody || r.response?.status !== undefined) {
-        flow.note = 'Rewrite rule: body replacements and the status don\'t apply to gRPC calls (use mutate or a script); its metadata changes were applied.';
-      }
-    } else if (action?.kind === 'mapRemote') {
-      // CONTRACTS §18.3: the call goes to another server; the exchange keeps the app's URL.
-      try {
-        const target = mapRemoteUrl(url, rule?.match.url ?? '', action.to);
-        const t = new URL(target);
-        if (t.protocol !== 'http:' && t.protocol !== 'https:') throw new Error(`a gRPC call can only be mapped to http(s)://, got ${t.protocol}`);
-        flow.map = { url: target, host: action.preserveHost ? '' : t.host };
-        flow.originalUrl = url;
-        flow.simulated = `Mapped to ${t.origin}`;
-      } catch (e) {
-        flow.localError = `Map Remote rule${rule?.name ? ` "${rule.name}"` : ''}: ${(e as Error).message}`;
-      }
-    }
-    const k = action?.kind;
-    const reachesNetwork = !action || k === 'throttle' || k === 'breakpoint' || k === 'mutate' || k === 'rewrite' || k === 'script' || k === 'mapRemote';
-    const p = this.profile;
-    if (flow.localError) {
-      dropRate = undefined;
-    } else if (reachesNetwork && p.kind === 'offline') {
-      flow = { route: 'grpc', ...(rule ? { rule } : {}), fault: 'dns', simulated: describeProfile(p) };
-      dropRate = undefined;
-    } else if (!rule && store?.fallback === 'fail') {
-      // Not in the recording (CONTRACTS §17.4): the "fail" fallback (offline demo) keeps it off the network.
-      flow = { route: 'grpc', fault: 'dns', simulated: `Not in the recording${store.name ? ` "${store.name}"` : ''} (replay: fail)` };
-      dropRate = undefined;
-    } else if (reachesNetwork && p.kind === 'throttle' && action?.kind !== 'throttle') {
-      flow.throttle = { latencyMs: p.latencyMs, kbps: p.kbps, uploadKbps: p.uploadKbps };
-      flow.simulated = flow.simulated ? `${profileLabel(p)} · ${flow.simulated}` : profileLabel(p);
-      dropRate = p.dropRate;
-    }
-    if (dropRate && dropRate > 0 && Math.random() < dropRate) {
-      flow = { route: 'grpc', ...(rule ? { rule } : {}), fault: 'drop', throttle: { latencyMs: flow.throttle?.latencyMs }, simulated: `${flow.simulated ?? 'Throttle'}: dropped` };
-    }
-    if (step !== undefined && rule?.action.kind === 'sequence') {
-      flow.step = step;
-      const n = rule.action.steps?.length ?? 0;
-      const label = step < 0 ? 'Sequence done: passed through' : `Sequence step ${step + 1}/${n}`;
-      flow.simulated = flow.simulated ? `${label} · ${flow.simulated}` : label;
-    }
-    if (note && !flow.note) flow.note = note;
-    return flow;
-  }
-
-  /**
-   * mockttp step for gRPC calls (own `handle`): everything is written on the raw HTTP/2 stream (trailers-only answers,
-   * trailers, RST codes and flow control survive), then mockttp's compatibility response is marked ended.
-   */
-  private async onGrpc(req: OngoingRequest, res: http.ServerResponse): Promise<void> {
-    const compat = res as unknown as { stream?: http2.ServerHttp2Stream; writableEnded?: boolean; end(): unknown };
-    const stream = compat.stream;
-    try {
-      if (!stream) throw new Error('not an HTTP/2 stream');
-      await this.runGrpc(req, stream);
-    } catch (e) {
-      const live = this.live.get(req.id);
-      if (live) this.fail(live.ex, `The gRPC relay failed: ${(e as Error)?.message ?? String(e)}`);
-      try {
-        if (stream && !stream.destroyed) stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR);
-      } catch {
-        /* already gone */
-      }
-    } finally {
-      this.flows.delete(req.id);
-      // Ends mockttp's tracking of the compatibility response (a no-op on the closed stream), then marks it ended
-      // (else mockttp reports "finished without ending the response").
-      try {
-        compat.end();
-      } catch {
-        /* closed */
-      }
-      if (!compat.writableEnded) {
-        try {
-          Object.defineProperty(res, 'writableEnded', { value: true, configurable: true });
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-  }
-
-  /** Record the call and answer it per its flow; resolves when the app's stream is closed. */
-  private runGrpc(req: OngoingRequest, stream: http2.ServerHttp2Stream): Promise<void> {
-    const flow = this.flows.get(req.id) ?? { route: 'grpc' as Route };
-    if (flow.loop) {
-      stream.on('error', () => undefined);
-      req.on('error', () => undefined);
-      req.resume();
-      const done = new Promise<void>((resolve) => (stream.closed || stream.destroyed ? resolve() : stream.once('close', () => resolve())));
-      try {
-        stream.respond({ ':status': 200, 'content-type': 'application/grpc', 'grpc-status': '14', 'grpc-message': encodeGrpcMessage(GRPC_LOOP_TEXT) }, { endStream: true });
-        setImmediate(() => {
-          if (!stream.closed && !stream.destroyed) stream.close(http2.constants.NGHTTP2_NO_ERROR);
-        });
-      } catch {
-        /* gone */
-      }
-      return done;
-    }
-    const headers = req.headers as HeaderBag;
-    let path = '/';
-    try {
-      path = new URL(req.url).pathname;
-    } catch {
-      /* keep / */
-    }
-    const { service, method } = parseGrpcPath(path);
-    const ex = this.newExchange({ id: req.id, method: req.method, url: req.url, headers: recordedHeaders(headers), timingEvents: req.timingEvents }, flow);
-    delete ex.graphql;
-    delete ex.browserInternal;
-    ex.kind = 'grpc';
-    ex.frames = [];
-    const reqEncoding = grpcEncodingOf(headers['grpc-encoding']);
-    const deadlineMs = parseGrpcTimeout(headers['grpc-timeout']);
-    const info: GrpcInfo = {
-      service,
-      method,
-      messagesSent: 0,
-      messagesReceived: 0,
-      ...(reqEncoding ? { requestEncoding: reqEncoding } : {}),
-      ...(deadlineMs !== undefined ? { deadlineMs } : {}),
-    };
-    ex.grpc = info;
-    this.track(ex, flow);
-    const call: GrpcCall = { ex, info, flow, req, stream, isLive: () => this.live.get(ex.id)?.ex === ex };
-    stream.on('error', () => undefined);
-    const closed = new Promise<void>((resolve) => {
-      if (stream.closed || stream.destroyed) return resolve();
-      stream.once('close', () => {
-        this.onGrpcClosed(call);
-        resolve();
-      });
-    });
-    if (stream.closed || stream.destroyed) {
-      this.onGrpcClosed(call);
-      return closed;
-    }
-    const a = flow.action;
-    let work: Promise<void>;
-    const gate = lanGateOf((req as unknown as { socket?: unknown }).socket);
-    if (gate) {
-      // REVIEW-11 #7: like HTTP's LAN deny rule, before any local answer (mock, replay, block…): a LAN client's call to
-      // this machine or its other networks is refused, in gRPC terms (UNAVAILABLE).
-      // Map Remote (CONTRACTS §18.3): the mapped target is what gets checked.
-      work = (gate.closed ? Promise.resolve(`${SSRF_MARKER}: LAN mode is off.`) : lanTargetDenial(flow.map?.url ?? req.url, gate.host)).then((reason) => {
-        if (reason) {
-          this.drainGrpcRequest(call);
-          return this.grpcStatusOnly(call, 14, fiText(reason), 'error', reason);
-        }
-        return this.grpcDispatch(call);
-      });
-    } else work = this.grpcDispatch(call);
-    work.catch((e: unknown) => {
-      if (call.isLive()) this.fail(ex, `The gRPC relay failed: ${(e as Error)?.message ?? String(e)}`);
-      this.grpcReset(call, http2.constants.NGHTTP2_INTERNAL_ERROR);
-    });
-    return closed;
-  }
-
-  /** The answer per the call's flow: refusal, fault, block, mock, replay, or the relay. */
-  private grpcDispatch(call: GrpcCall): Promise<void> {
-    const { flow } = call;
-    const a = flow.action;
-    if (!call.isLive()) return Promise.resolve();
-    let work: Promise<void>;
-    if (flow.refused) {
-      this.drainGrpcRequest(call);
-      this.grpcStatusOnly(call, 14, fiText(flow.refused), 'blocked', flow.refused);
-      work = Promise.resolve();
-    } else if (flow.localError) {
-      this.drainGrpcRequest(call);
-      this.grpcStatusOnly(call, 14, fiText(flow.localError), 'error', flow.localError);
-      work = Promise.resolve();
-    } else if (flow.fault === 'truncate') work = this.grpcRelay(call, true);
-    else if (flow.fault) work = this.grpcFault(call, flow.fault);
-    else if (a?.kind === 'block') work = this.grpcBlock(call, a);
-    else if (a?.kind === 'grpcMock') work = this.grpcMock(call, a);
-    else if (flow.replay) work = this.grpcReplay(call);
-    else work = this.grpcRelay(call, false);
-    return work;
-  }
-
-  /** Request messages of a call answered locally: read (and recorded) as they come. */
-  private drainGrpcRequest(call: GrpcCall, onFrame?: (f: Frame) => void): void {
-    const parser = this.grpcRequestParser(call, onFrame).parser;
-    call.req.on('data', (c: Buffer) => parser.push(c));
-    call.req.once('end', () => {
-      if (call.isLive()) this.setRequestMs(call.ex, call.flow.te, performance.now());
-    });
-    call.req.on('error', () => undefined);
-  }
-
-  /** Records one direction: a parser (counts + frames) and its recorder (also used by the hooks). */
-  private grpcRequestParser(call: GrpcCall, onFrame?: (f: Frame) => void): { parser: GrpcMessageParser; rec: GrpcFrameRecorder } {
-    return this.grpcRecording(call, 'send', onFrame);
-  }
-
-  private grpcRecording(call: GrpcCall, dir: Frame['dir'], onFrame?: (f: Frame) => void): { parser: GrpcMessageParser; rec: GrpcFrameRecorder } {
-    const { info } = call;
-    const rec = new GrpcFrameRecorder(
-      dir,
-      () => (dir === 'send' ? info.requestEncoding : info.responseEncoding),
-      (f) => {
-        this.addFrame(call.ex, f, true);
-        onFrame?.(f);
-      },
-    );
-    const parser = new GrpcMessageParser((m) => {
-      if (!call.isLive()) return;
-      if (dir === 'send') info.messagesSent++;
-      else info.messagesReceived++;
-      rec.push(m);
-    });
-    return { parser, rec };
-  }
-
-  /** The app's stream closed. Unless the call already ended, the app cancelled it (or its connection went away). */
-  private onGrpcClosed(call: GrpcCall): void {
-    const { ex, stream, up } = call;
-    if (up && !up.closed && !up.destroyed) {
-      try {
-        up.close(http2.constants.NGHTTP2_CANCEL); // RST_STREAM CANCEL upstream
-      } catch {
-        /* gone */
-      }
-    }
-    for (const t of call.transforms ?? []) t.destroy();
-    const hold = this.holds.get(ex.id);
-    if (hold) return hold(true); // the timeout fault: the app gave up
-    const paused = this.paused.get(ex.id);
-    if (!call.isLive() || (call.localReset && !paused)) return;
-    const code = stream.rstCode;
-    const deadline = call.info.deadlineMs;
-    const elapsedMs = Date.now() - ex.startedAt;
-    ex.error =
-      code === http2.constants.NGHTTP2_CANCEL
-        ? deadline !== undefined && elapsedMs >= deadline - 50
-          ? `The app cancelled the call when its deadline (${deadline} ms) passed.`
-          : 'The app cancelled the call (RST_STREAM CANCEL).'
-        : code
-          ? `The app reset the stream (${h2CodeName(code)}).`
-          : 'The app closed the connection before the call ended.';
-    if (paused) ex.error = `${ex.error} (it was paused at a breakpoint)`;
-    delete ex.grpcPause;
-    this.finish(ex, 'aborted');
-    paused?.settle({ kind: 'gone' });
-  }
-
-  /** Reset the app's stream (RST_STREAM `code`); its close is then ours, not the app's. */
-  private grpcReset(call: GrpcCall, code: number): void {
-    call.localReset = true;
-    try {
-      if (!call.stream.destroyed && !call.stream.closed) call.stream.close(code);
-    } catch {
-      /* gone */
-    }
-  }
-
-  /**
-   * The response is complete but the app is still sending (client / bidi streaming): like gRPC servers, close the
-   * stream with RST_STREAM NO_ERROR once the response is out (RFC 7540 §8.1), so the app's call can finish.
-   */
-  private grpcEndRequestSide(call: GrpcCall): void {
-    const { stream } = call;
-    call.localReset = true;
-    setImmediate(() => {
-      try {
-        if (!stream.closed && !stream.destroyed && !stream.state?.remoteClose) stream.close(http2.constants.NGHTTP2_NO_ERROR);
-      } catch {
-        /* gone */
-      }
-    });
-  }
-
-  /**
-   * Answer with a trailers-only response (the status in the one HEADERS frame) and end the exchange in `state`.
-   * After response headers (relay failures mid-response) the trailers end the response instead.
-   */
-  private grpcStatusOnly(call: GrpcCall, code: number, message: string, state: 'blocked' | 'error' | 'mocked' | 'completed', error?: string): void {
-    const { ex, info, stream } = call;
-    const status: Record<string, string> = { 'grpc-status': String(code), ...(message ? { 'grpc-message': encodeGrpcMessage(message) } : {}) };
-    call.localReset = true;
-    try {
-      if (!stream.destroyed && !stream.closed && !stream.headersSent) {
-        stream.respond({ ':status': 200, 'content-type': 'application/grpc', ...status }, { endStream: true });
-        this.grpcEndRequestSide(call);
-        ex.status = 200;
-        ex.responseHeaders = { 'content-type': 'application/grpc', ...status };
-        info.trailersOnly = true;
-      }
-    } catch {
-      /* the app is gone */
-    }
-    info.statusCode = code;
-    if (message) info.statusMessage = message;
-    if (!call.isLive()) return;
-    if (state === 'error') return this.fail(ex, error ?? message);
-    if (error) ex.error = error;
-    this.finish(ex, state);
-  }
-
-  private async grpcBlock(call: GrpcCall, a: Extract<RuleAction, { kind: 'block' }>): Promise<void> {
-    this.drainGrpcRequest(call);
-    if (a.mode === 'reset') {
-      this.grpcReset(call, http2.constants.NGHTTP2_INTERNAL_ERROR);
-      if (call.isLive()) this.finish(call.ex, 'blocked');
-      return;
-    }
-    this.grpcStatusOnly(call, 14, BLOCK_BODY, 'blocked');
-  }
-
-  /**
-   * Faults on a gRPC call (the truncate fault is the relay's): reset → RST_STREAM INTERNAL_ERROR; dns → UNAVAILABLE
-   * "DNS lookup failed"; drop (throttle drop rate) → UNAVAILABLE after the latency; timeout → no answer until the app
-   * gives up (or breakpointTimeoutMs, then RST_STREAM CANCEL). The exchange ends 'blocked'.
-   */
-  private async grpcFault(call: GrpcCall, fault: FlowFault): Promise<void> {
-    const { ex, flow } = call;
-    this.drainGrpcRequest(call);
-    if (fault === 'reset') {
-      this.grpcReset(call, http2.constants.NGHTTP2_INTERNAL_ERROR);
-      if (call.isLive()) this.finish(ex, 'blocked');
-      return;
-    }
-    if (fault === 'dns') return this.grpcStatusOnly(call, 14, 'DNS lookup failed', 'blocked');
-    if (fault === 'drop') {
-      if (!(await this.latency(ex, flow)) || !call.isLive()) return;
-      return this.grpcStatusOnly(call, 14, 'Flutter Intercept: dropped (simulated network)', 'blocked');
-    }
-    if (fault === 'timeout') {
-      const appLeft = await new Promise<boolean>((resolve) => {
-        const timer = setTimeout(() => settle(false), this.breakpointTimeoutMs);
-        timer.unref?.();
-        const settle = (left: boolean) => {
-          clearTimeout(timer);
-          this.holds.delete(ex.id);
-          resolve(left);
-        };
-        this.holds.set(ex.id, settle);
-      });
-      if (!call.isLive()) return;
-      const secs = ((Date.now() - ex.startedAt) / 1000).toFixed(1);
-      ex.simulated = appLeft ? `${FAULT_LABELS.timeout} (the app gave up after ${secs} s)` : `${FAULT_LABELS.timeout} (reset after ${secs} s)`;
-      if (!appLeft) this.grpcReset(call, http2.constants.NGHTTP2_CANCEL);
-      this.finish(ex, 'blocked');
-    }
-  }
-
-  /** grpcMock: after `delayMs`, `headers`, each message `gapMs` apart, then the status (CONTRACTS §16.2). */
-  private async grpcMock(call: GrpcCall, a: Extract<RuleAction, { kind: 'grpcMock' }>): Promise<void> {
-    const messages = (a.messages ?? []).map((m) => Buffer.from(String(m), 'base64'));
-    const gap = a.gapMs && a.gapMs > 0 ? a.gapMs : 0;
-    this.drainGrpcRequest(call);
-    await this.grpcAnswer(call, {
-      code: a.code ?? 0,
-      message: a.message,
-      messages,
-      gaps: messages.map((_, i) => (i === 0 ? 0 : gap)),
-      headers: a.headers,
-      trailers: a.trailers,
-      delayMs: a.delayMs,
-    });
-  }
-
-  /**
-   * CONTRACTS §17.4: a recorded call answers like a grpcMock — its response headers (minus pseudo / content-type /
-   * status / encoding), its response messages (sent uncompressed, recorded gaps capped at 5 s), its status and
-   * trailers. When several recorded calls share the path and carry a requestHash, the first request message picks one.
-   */
-  private async grpcReplay(call: GrpcCall): Promise<void> {
-    const store = this.replayStore;
-    let firstFrame: ((f: Frame | undefined) => void) | undefined;
-    const first = new Promise<Frame | undefined>((r) => (firstFrame = r));
-    let seen = false;
-    this.drainGrpcRequest(call, (f) => {
-      if (f.dir === 'send' && !seen) {
-        seen = true;
-        firstFrame?.(f);
-      }
-    });
-    call.req.once('end', () => setTimeout(() => firstFrame?.(undefined), 50)); // the last frame may still be decompressing
-    call.stream.once('close', () => firstFrame?.(undefined));
-    let hit = store?.lookupGrpc(call.req.url, 'unknown', false);
-    if (hit === 'needs-body') {
-      const f = await first;
-      if (!call.isLive()) return;
-      const hash = f ? grpcMessageHash(Buffer.from(f.base64 ?? '', 'base64')) : undefined;
-      hit = store?.lookupGrpc(call.req.url, { hash }, true);
-    } else if (hit) hit = store?.lookupGrpc(call.req.url, 'unknown', true);
-    if (!hit || hit === 'needs-body') return this.grpcStatusOnly(call, 14, 'Flutter Intercept: not in the recording', 'error', 'Not in the recording.');
-    const e = hit.entry;
-    const frames = (e.frames ?? []).filter((f) => f.kind === 'message' && f.dir === 'receive' && !f.dropped);
-    const clean = (h: Record<string, string | string[]> | undefined): Record<string, string> => {
-      const out: Record<string, string> = {};
-      for (const [k, v] of Object.entries(h ?? {})) {
-        const lk = k.toLowerCase();
-        const val = Array.isArray(v) ? v.join(', ') : v;
-        if (!HTTP_TOKEN.test(lk) || lk.startsWith(':') || REPLAY_GRPC_DROPPED.has(lk) || typeof val !== 'string' || /[\r\n\0]/.test(val)) continue;
-        out[lk] = val;
-      }
-      return out;
-    };
-    await this.grpcAnswer(call, {
-      code: e.grpc?.code ?? 0,
-      message: e.grpc?.message,
-      messages: frames.map((f) => Buffer.from(f.base64 ?? '', 'base64')),
-      gaps: frames.map((f, i) => (i === 0 ? 0 : Math.min(MAX_REPLAY_GAP_MS, Math.max(0, f.at - frames[i - 1].at)))),
-      headers: clean(e.headers),
-      trailers: clean(e.grpc?.trailers),
-    });
-  }
-
-  /**
-   * A local answer (grpcMock, replay): after `delayMs`, response headers (`content-type: application/grpc` +
-   * `headers`), each message after its gap, then the status trailers. A non-zero code without messages is
-   * trailers-only. Never waits for the app to half-close (bidi).
-   */
-  private async grpcAnswer(
-    call: GrpcCall,
-    a: { code: number; message?: string; messages: Buffer[]; gaps: number[]; headers?: Record<string, string>; trailers?: Record<string, string>; delayMs?: number },
-  ): Promise<void> {
-    const { ex, info, stream } = call;
-    const open = () => call.isLive() && !stream.closed && !stream.destroyed;
-    if (a.delayMs && a.delayMs > 0) {
-      const from = performance.now();
-      await sleep(a.delayMs);
-      if (call.isLive()) this.addPhase(ex, 'delayMs', performance.now() - from);
-      if (!open()) return;
-    }
-    const code = a.code;
-    const messages = a.messages;
-    const lower = (h: Record<string, string> | undefined) => Object.fromEntries(Object.entries(h ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
-    const headers: Record<string, string> = { 'content-type': 'application/grpc', ...lower(a.headers) };
-    const trailers: Record<string, string> = {
-      'grpc-status': String(code),
-      ...(a.message ? { 'grpc-message': encodeGrpcMessage(a.message) } : {}),
-      ...lower(a.trailers),
-    };
-    info.statusCode = code;
-    if (a.message) info.statusMessage = a.message;
-    if (code !== 0 && !messages.length) {
-      call.localReset = true;
-      stream.respond({ ':status': 200, ...headers, ...trailers }, { endStream: true });
-      this.grpcEndRequestSide(call);
-      ex.status = 200;
-      ex.responseHeaders = { ...headers, ...trailers };
-      info.trailersOnly = true;
-      this.finish(ex, 'mocked');
-      return;
-    }
-    stream.removeAllListeners('wantTrailers'); // the compatibility response's own (it would send empty trailers)
-    stream.on('wantTrailers', () => {
-      call.localReset = true;
-      try {
-        stream.sendTrailers(trailers);
-        this.grpcEndRequestSide(call);
-      } catch {
-        /* gone */
-      }
-      if (!call.isLive()) return;
-      ex.responseTrailers = { ...trailers };
-      this.finish(ex, 'mocked');
-    });
-    stream.respond({ ':status': 200, ...headers }, { waitForTrailers: true });
-    ex.status = 200;
-    ex.responseHeaders = { ...headers };
-    this.emitChange(ex);
-    for (let i = 0; i < messages.length; i++) {
-      if (a.gaps[i] > 0) await sleep(a.gaps[i]);
-      if (!open()) return;
-      const m = messages[i];
-      const ok = stream.write(frameMessage(m));
-      info.messagesReceived++;
-      this.addFrame(ex, messageFrame('receive', { compressed: false, size: m.length, kept: m, complete: true }));
-      if (!ok) await new Promise<void>((r) => (stream.once('drain', r), stream.once('close', r)));
-    }
-    if (open()) stream.end();
-  }
-
-  // ---------------------------------------------------------------- gRPC breakpoints and mutate (CONTRACTS §17.1–17.3)
-
-  /** A non-error note on the exchange (shown with it), once per text. */
-  private grpcNote(call: GrpcCall, text: string): void {
-    const ex = call.ex;
-    if (ex.error?.includes(text)) return;
-    ex.error = ex.error ? `${ex.error} ${text}` : text;
-  }
-
-  /** The hooked link of one direction: whole messages through grpcHook; oversized ones recorded and passed on. */
-  private grpcTransform(call: GrpcCall, dir: Frame['dir'], recording: { parser: GrpcMessageParser; rec: GrpcFrameRecorder }): GrpcMessageTransform {
-    const cap = () => grpcHookTesting.hookCap ?? GRPC_HOOK_CAP_BYTES;
-    const t = new GrpcMessageTransform({
-      cap,
-      reserve: (n) => this.grpcReserve(n),
-      release: (n) => this.grpcRelease(n),
-      onMessage: (m) => this.grpcHook(call, dir, m, recording.rec),
-      onOversize: (bytes, start) => {
-        if (start?.reason === 'cap') this.grpcNote(call, `A message over ${Math.round(cap() / 1024 / 1024)} MB was forwarded unchanged (not paused / not mutated).`);
-        else if (start) this.grpcNote(call, 'A message was forwarded unchanged (not paused / not mutated): too much gRPC data is held right now.');
-        recording.parser.push(bytes);
-      },
-    });
-    (call.transforms ??= []).push(t);
-    return t;
-  }
-
-  /** REVIEW-11 #4: one budget for gRPC message bytes being collected, queued or held by hooks, across calls. */
-  private grpcReserve(n: number): boolean {
-    if (this.grpcHeld + n > (grpcHookTesting.heldTotalCap ?? GRPC_HELD_TOTAL_CAP_BYTES)) return false;
-    this.grpcHeld += n;
-    return true;
-  }
-
-  private grpcRelease(n: number): void {
-    this.grpcHeld = Math.max(0, this.grpcHeld - n);
-  }
-
-  /** One whole message of a hooked direction: mutate (response) or pause it; record what was delivered. */
-  private async grpcHook(call: GrpcCall, dir: Frame['dir'], m: HookedMessage, rec: GrpcFrameRecorder): Promise<HookOutcome> {
-    const { info, flow } = call;
-    const cap = grpcHookTesting.hookCap ?? GRPC_HOOK_CAP_BYTES;
-    const count = () => {
-      if (dir === 'send') info.messagesSent++;
-      else info.messagesReceived++;
-    };
-    const record = (payload: Buffer, compressed: boolean, extra?: Pick<Frame, 'dropped' | 'edited'>) => {
-      if (!call.isLive()) return;
-      count();
-      const kept = compressed ? payload.subarray(0, GRPC_COMPRESSED_KEEP_BYTES) : payload;
-      rec.push({ compressed, size: payload.length, kept, complete: kept.length === payload.length }, extra);
-    };
-    const forward = (): HookOutcome => {
-      record(m.payload, m.compressed);
-      return { kind: 'forward' };
-    };
-    if (!call.isLive()) return { kind: 'forward' };
-    let plain = m.payload;
-    if (m.compressed) {
-      const enc = dir === 'send' ? info.requestEncoding : info.responseEncoding;
-      if (enc !== 'gzip' && enc !== 'deflate') {
-        this.grpcNote(call, `A message compressed with ${enc ?? 'an unknown encoding'} can't be read; it was forwarded unchanged (not paused / not mutated).`);
-        return forward();
-      }
-      const r = await decompressPrefix(m.payload, enc, cap);
-      if (!r || !r.complete) {
-        this.grpcNote(call, `A compressed message over ${Math.round(cap / 1024 / 1024)} MB (or unreadable) was forwarded unchanged (not paused / not mutated).`);
-        return forward();
-      }
-      plain = r.data;
-    }
-    const a = flow.action;
-    if (a?.kind === 'script') return this.grpcScriptMessage(call, a, dir, m, plain, forward, record);
-    if (a?.kind === 'mutate') return dir === 'receive' ? this.grpcMutate(call, a.ops, plain, forward, record) : forward();
-    // The decompressed copy counts too (the wire bytes were reserved by the transform).
-    const extra = m.compressed ? plain.length : 0;
-    if (extra && !this.grpcReserve(extra)) {
-      this.grpcNote(call, 'A message was forwarded unchanged (not paused / not mutated): too much gRPC data is held right now.');
-      return forward();
-    }
-    try {
-      return await this.grpcPauseMessage(call, dir, m, plain, forward, record);
-    } finally {
-      if (extra) this.grpcRelease(extra);
-    }
-  }
-
-  /** CONTRACTS §17.3: decode with the injected codec, applyOps, encode; any failure forwards the original with a note. */
-  private grpcMutate(
-    call: GrpcCall,
-    ops: MutateOp[],
-    plain: Buffer,
-    forward: () => HookOutcome,
-    record: (p: Buffer, c: boolean, extra?: Pick<Frame, 'dropped' | 'edited'>) => void,
-  ): HookOutcome {
-    let path = '/';
-    try {
-      path = new URL(call.ex.url).pathname;
-    } catch {
-      /* keep / */
-    }
-    const codec = this.grpcCodec;
-    // REVIEW-11 #6: the codec runs on the event loop — small messages only, and a budget per call.
-    if (plain.length > GRPC_MUTATE_MAX_BYTES) {
-      this.grpcNote(call, `mutate: messages over ${GRPC_MUTATE_MAX_BYTES / 1024 / 1024} MB are forwarded unchanged.`);
-      return forward();
-    }
-    if (call.mutateStopped) return forward();
-    if ((call.mutateBytes ?? 0) + plain.length > GRPC_MUTATE_CALL_BYTES || (call.mutateMs ?? 0) > GRPC_MUTATE_CALL_MS) {
-      call.mutateStopped = true;
-      this.grpcNote(call, `mutate: stopped for this call after ${GRPC_MUTATE_CALL_BYTES / 1024 / 1024} MB or ${GRPC_MUTATE_CALL_MS / 1000} s of decoding; later messages were forwarded unchanged.`);
-      return forward();
-    }
-    call.mutateBytes = (call.mutateBytes ?? 0) + plain.length;
-    const t0 = performance.now();
-    const spent = () => (call.mutateMs = (call.mutateMs ?? 0) + (performance.now() - t0));
-    let json: unknown;
-    try {
-      json = codec?.decode(path, 'receive', plain);
-    } catch {
-      json = undefined;
-    }
-    if (json === undefined) spent();
-    if (json === undefined) {
-      this.grpcNote(call, `mutate: no schema for ${path}; messages were forwarded unchanged.`);
-      return forward();
-    }
-    let out: Uint8Array;
-    try {
-      const changed = applyOps(json, ops, { maxTargets: MUTATE_MAX_TARGETS }).value;
-      out = codec!.encode(path, 'receive', changed);
-    } catch (e) {
-      spent();
-      this.grpcNote(call, `mutate: ${(e as Error)?.message ?? String(e)}; the original message was forwarded.`);
-      return forward();
-    }
-    spent();
-    const payload = Buffer.from(out.buffer, out.byteOffset, out.byteLength);
-    record(payload, false, { edited: true });
-    call.ex.simulated = `Mutated: ${ops.map((o) => o.path).join(', ')}`.slice(0, 200);
-    return { kind: 'replace', payload };
-  }
-
-  /**
-   * CONTRACTS §18.1: set / remove gRPC metadata. Reserved names (pseudo, the status, framing, deadline, encoding —
-   * plus content-type / te for trailers and headers alike on a gRPC call), invalid names and values, and `-bin` values
-   * that aren't base64 are skipped with a note (ruleProblem refuses them up front).
-   */
-  private grpcRewriteMeta(
-    call: GrpcCall,
-    h: Record<string, string | string[]>,
-    set: Record<string, string> | undefined,
-    remove: string[] | undefined,
-    what: 'request' | 'response' | 'trailers',
-  ): Record<string, string | string[]> {
-    const out = { ...h };
-    const skipped: string[] = [];
-    const ok = (l: string) => HTTP_TOKEN.test(l) && !l.startsWith(':') && !GRPC_TRAILER_RESERVED.has(l) && !GRPC_REWRITE_RESERVED.has(l);
-    for (const n of Array.isArray(remove) ? remove : []) {
-      const l = String(n).trim().toLowerCase();
-      if (!ok(l)) skipped.push(l);
-      else delete out[l];
-    }
-    for (const [k, v] of Object.entries(set && typeof set === 'object' ? set : {})) {
-      const l = k.trim().toLowerCase();
-      if (!ok(l) || !validHeaderValue(v) || (l.endsWith('-bin') && !/^[A-Za-z0-9+/_-]*={0,2}$/.test(v))) skipped.push(l);
-      else out[l] = v;
-    }
-    if (skipped.length) this.grpcNote(call, `Rewrite rule: ${what} metadata ${skipped.map((x) => `"${x.slice(0, 40)}"`).join(', ')} can't be changed on a gRPC call; skipped.`);
-    return out;
-  }
-
-  /**
-   * CONTRACTS §18.2: `onGrpcMessage(message, context)` for one message (≤ 1 MB; at most GRPC_SCRIPT_MAX_MESSAGES per
-   * call). `{json}` is encoded with the host codec, `{base64}` replaces, `{drop: true}` drops; anything invalid, a
-   * throw or a timeout logs to scriptLog and sends the original.
-   */
-  private async grpcScriptMessage(
-    call: GrpcCall,
-    action: ScriptAction,
-    dir: Frame['dir'],
-    m: HookedMessage,
-    plain: Buffer,
-    forward: () => HookOutcome,
-    record: (p: Buffer, c: boolean, extra?: Pick<Frame, 'dropped' | 'edited'>) => void,
-  ): Promise<HookOutcome> {
-    const { ex, flow } = call;
-    if (plain.length > SCRIPT_BODY_MAX_BYTES) {
-      this.grpcNote(call, `script: messages over ${SCRIPT_BODY_MAX_BYTES / 1024 / 1024} MB are not passed to onGrpcMessage; forwarded unchanged.`);
-      return forward();
-    }
-    call.scriptCalls = (call.scriptCalls ?? 0) + 1;
-    if (call.scriptCalls > GRPC_SCRIPT_MAX_MESSAGES) {
-      this.grpcNote(call, `script: onGrpcMessage ran for the first ${GRPC_SCRIPT_MAX_MESSAGES} messages of this call; later ones were forwarded unchanged.`);
-      return forward();
-    }
-    const path = grpcPathOf(ex.url);
-    const json = this.grpcDecodeBounded(call, path, dir, plain);
-    const input: GrpcScriptMessage = { path, dir, index: m.index, ...(json !== undefined ? { json } : {}), base64: plain.toString('base64'), size: plain.length };
-    const out = await this.runScript(ex, flow, action, 'onGrpcMessage', [input]);
-    if (!call.isLive()) return { kind: 'drop' };
-    if (out.error !== undefined) {
-      this.scriptError(ex, flow, `onGrpcMessage: ${out.error}; the original message was sent`);
-      return forward();
-    }
-    const v = out.value as { json?: unknown; base64?: unknown; drop?: unknown } | undefined;
-    if (v === undefined || v === null) return forward();
-    const keys = typeof v === 'object' && !Array.isArray(v) ? Object.keys(v) : [];
-    const bad = (why: string) => {
-      this.scriptError(ex, flow, `onGrpcMessage: ${why}; the original message was sent`);
-      return forward();
-    };
-    if (keys.length !== 1) return bad('return undefined, {json}, {base64} or {drop: true}');
-    if (keys[0] === 'drop') {
-      if (v.drop !== true) return bad('drop must be true');
-      record(m.payload, m.compressed, { dropped: true });
-      return { kind: 'drop' };
-    }
-    let payload: Buffer;
-    if (keys[0] === 'base64') {
-      if (typeof v.base64 !== 'string' || !/^[A-Za-z0-9+/_-]*={0,2}$/.test(v.base64)) return bad('base64 is not base64');
-      payload = Buffer.from(v.base64, 'base64');
-    } else if (keys[0] === 'json') {
-      const codec = this.grpcCodec;
-      if (!codec) return bad(`no schema to encode json for ${path}`);
-      try {
-        const bytes = codec.encode(path, dir, v.json);
-        payload = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      } catch (e) {
-        return bad((e as Error)?.message ?? String(e));
-      }
-    } else return bad(`unknown field "${keys[0].slice(0, 40)}"`);
-    if (payload.length > (grpcHookTesting.hookCap ?? GRPC_HOOK_CAP_BYTES)) return bad('the new message is over 4 MB');
-    record(payload, false, { edited: true });
-    return { kind: 'replace', payload };
-  }
-
-  /** Decode for a hook with the host codec (≤ 1 MB, the per-call codec budget of REVIEW-11 #6); undefined = unknown. */
-  private grpcDecodeBounded(call: GrpcCall, path: string, dir: Frame['dir'], plain: Buffer): unknown {
-    const codec = this.grpcCodec;
-    if (!codec || plain.length > GRPC_MUTATE_MAX_BYTES || call.mutateStopped) return undefined;
-    if ((call.mutateBytes ?? 0) + plain.length > GRPC_MUTATE_CALL_BYTES || (call.mutateMs ?? 0) > GRPC_MUTATE_CALL_MS) {
-      call.mutateStopped = true;
-      this.grpcNote(call, 'script: messages are no longer decoded for this call (codec budget used up); json is absent.');
-      return undefined;
-    }
-    call.mutateBytes = (call.mutateBytes ?? 0) + plain.length;
-    const t0 = performance.now();
-    try {
-      return codec.decode(path, dir, plain);
-    } catch {
-      return undefined;
-    } finally {
-      call.mutateMs = (call.mutateMs ?? 0) + (performance.now() - t0);
-    }
-  }
-
-  /**
-   * CONTRACTS §18.2: `onGrpcStatus(status, context)` before the trailers go to the app. Returns the headers to set /
-   * remove (like a breakpoint status edit), or undefined when the call ended meanwhile.
-   */
-  private async grpcStatusScript(call: GrpcCall, t: HeaderBag): Promise<{ headers: Record<string, string>; removed: string[] } | undefined> {
-    const { ex, flow, info } = call;
-    const action = flow.action as ScriptAction;
-    const custom = recordedHeaders(t);
-    for (const k of ['grpc-status', 'grpc-message', 'content-type']) delete custom[k];
-    const code = parseGrpcStatus(t['grpc-status']) ?? 0;
-    const message = decodeGrpcMessage(t['grpc-message']);
-    const input: GrpcScriptStatus = { path: grpcPathOf(ex.url), code, ...(message !== undefined ? { message } : {}), trailers: custom };
-    const out = await this.runScript(ex, flow, action, 'onGrpcStatus', [input]);
-    if (!call.isLive()) return undefined;
-    const none = { headers: {}, removed: [] };
-    if (out.error !== undefined) {
-      this.scriptError(ex, flow, `onGrpcStatus: ${out.error}; the original status was sent`);
-      return none;
-    }
-    const v = out.value as { code?: unknown; message?: unknown; trailers?: unknown } | undefined;
-    if (v === undefined || v === null) return none;
-    if (typeof v !== 'object' || Array.isArray(v) || Object.keys(v).some((k) => k !== 'code' && k !== 'message' && k !== 'trailers')) {
-      this.scriptError(ex, flow, 'onGrpcStatus: return undefined or {code?, message?, trailers?}; the original status was sent');
-      return none;
-    }
-    const newCode = v.code === undefined ? code : v.code;
-    const edit = {
-      ...(v.code !== undefined || v.message !== undefined ? { status: { code: newCode as number, ...(v.message !== undefined ? { message: v.message as string } : {}) } } : {}),
-      ...(v.trailers !== undefined ? { trailers: v.trailers as Record<string, string> } : {}),
-    };
-    const why = grpcEditProblem('status', edit);
-    if (why) {
-      this.scriptError(ex, flow, `onGrpcStatus: ${why}; the original status was sent`);
-      return none;
-    }
-    const headers: Record<string, string> = {};
-    const removed: string[] = [];
-    if (edit.status) {
-      headers['grpc-status'] = String(edit.status.code);
-      info.statusCode = edit.status.code;
-      const msg = 'message' in edit.status ? edit.status.message : message;
-      if (msg) {
-        headers['grpc-message'] = encodeGrpcMessage(msg);
-        info.statusMessage = msg;
-      } else {
-        removed.push('grpc-message');
-        delete info.statusMessage;
-      }
-    }
-    if (edit.trailers) {
-      for (const k of Object.keys(custom)) removed.push(k);
-      for (const [k, val] of Object.entries(edit.trailers)) {
-        const lk = k.toLowerCase();
-        headers[lk] = val;
-        const i = removed.indexOf(lk);
-        if (i >= 0) removed.splice(i, 1);
-      }
-    }
-    return { headers, removed };
-  }
-
-  /** Run `fn` as this call's next pause (one pause at a time per call; each has its own deadline). */
-  private grpcSerialPause<T>(call: GrpcCall, fn: () => Promise<T>): Promise<T> {
-    const p = (call.pauseChain ?? Promise.resolve()).then(fn);
-    call.pauseChain = p.catch(() => undefined);
-    return p;
-  }
-
-  /** CONTRACTS §17.2: hold one message until resume (edit / drop), abort, the app leaving or the timeout. */
-  private grpcPauseMessage(
-    call: GrpcCall,
-    dir: Frame['dir'],
-    m: HookedMessage,
-    plain: Buffer,
-    forward: () => HookOutcome,
-    record: (p: Buffer, c: boolean, extra?: Pick<Frame, 'dropped' | 'edited'>) => void,
-  ): Promise<HookOutcome> {
-    return this.grpcSerialPause(call, async (): Promise<HookOutcome> => {
-      const { ex } = call;
-      if (!call.isLive()) return { kind: 'drop' };
-      // The pause's base64 copy (shown to the host) counts on top of the reserved wire bytes.
-      const copy = Math.ceil(plain.length / 3) * 4;
-      if (!this.grpcReserve(copy)) {
-        this.grpcNote(call, 'Breakpoint skipped for a message: 64 MB of gRPC messages are already held.');
-        return forward();
-      }
-      let d: Decision;
-      try {
-        ex.grpcPause = { kind: 'message', dir, index: m.index, base64: plain.toString('base64'), size: plain.length };
-        const decision = this.pause(ex, dir === 'send' ? 'request' : 'response');
-        this.emitChange(ex);
-        d = await decision;
-      } finally {
-        this.grpcRelease(copy);
-        delete ex.grpcPause;
-      }
-      if (d.kind === 'gone' || !call.isLive()) return { kind: 'drop' };
-      if (d.kind === 'abort') {
-        this.grpcAbort(call);
-        return { kind: 'drop' };
-      }
-      ex.state = 'pending';
-      const e = d.edit as GrpcEdit | undefined;
-      let out: HookOutcome;
-      if (e?.drop) {
-        record(m.payload, m.compressed, { dropped: true });
-        out = { kind: 'drop' };
-      } else if (e?.message !== undefined) {
-        const payload = Buffer.from(e.message, 'base64');
-        record(payload, false, { edited: true });
-        out = { kind: 'replace', payload };
-      } else out = forward();
-      this.emitChange(ex);
-      return out;
-    });
-  }
-
-  /**
-   * CONTRACTS §17.2: hold the end of the call (its trailers, or a trailers-only answer). Resolves with the headers
-   * to set / remove on the status frame, or undefined when the call ended meanwhile (aborted, the app left).
-   */
-  private grpcStatusBreakpoint(call: GrpcCall, t: HeaderBag): Promise<{ headers: Record<string, string>; removed: string[] } | undefined> {
-    return this.grpcSerialPause(call, async () => {
-      const { ex, info } = call;
-      if (!call.isLive()) return undefined;
-      const custom = recordedHeaders(t);
-      for (const k of ['grpc-status', 'grpc-message', 'content-type']) delete custom[k];
-      const code = parseGrpcStatus(t['grpc-status']) ?? 0;
-      const message = decodeGrpcMessage(t['grpc-message']);
-      ex.grpcPause = { kind: 'status', code, ...(message !== undefined ? { message } : {}), trailers: custom };
-      const decision = this.pause(ex, 'response');
-      this.emitChange(ex);
-      const d = await decision;
-      delete ex.grpcPause;
-      if (d.kind === 'gone' || !call.isLive()) return undefined;
-      if (d.kind === 'abort') {
-        this.grpcAbort(call);
-        return undefined;
-      }
-      ex.state = 'pending';
-      const e = d.edit as GrpcEdit | undefined;
-      const headers: Record<string, string> = {};
-      const removed: string[] = [];
-      if (e?.status) {
-        headers['grpc-status'] = String(e.status.code);
-        info.statusCode = e.status.code;
-        if (e.status.message) {
-          headers['grpc-message'] = encodeGrpcMessage(e.status.message);
-          info.statusMessage = e.status.message;
-        } else {
-          removed.push('grpc-message');
-          delete info.statusMessage;
-        }
-      }
-      if (e?.trailers) {
-        for (const k of Object.keys(custom)) removed.push(k);
-        for (const [k, v] of Object.entries(e.trailers)) {
-          const lk = k.toLowerCase();
-          headers[lk] = v;
-          const i = removed.indexOf(lk);
-          if (i >= 0) removed.splice(i, 1);
-        }
-      }
-      if (e?.status || e?.trailers) ex.simulated = ex.simulated ? `${ex.simulated} · Status edited at a breakpoint` : 'Status edited at a breakpoint';
-      this.emitChange(ex);
-      return { headers, removed };
-    });
-  }
-
-  /** abort(id) on a paused gRPC call: RST_STREAM CANCEL both ways. */
-  private grpcAbort(call: GrpcCall): void {
-    const { ex, up } = call;
-    call.localReset = true;
-    try {
-      if (up && !up.closed && !up.destroyed) up.close(http2.constants.NGHTTP2_CANCEL);
-    } catch {
-      /* gone */
-    }
-    this.grpcReset(call, http2.constants.NGHTTP2_CANCEL);
-    if (call.isLive()) {
-      ex.error = 'Aborted at a breakpoint.';
-      this.finish(ex, 'aborted');
-    }
-  }
-
-  /** Does upstream TLS to this server skip verification (ignoreUpstreamCertErrors, or a MITM upstream proxy's flag)? */
-  private grpcInsecure(host: string, port: number, gate: LanGate | undefined): boolean {
-    const ig = this.opts.ignoreUpstreamCertErrors;
-    if (ig === true) return true;
-    if (Array.isArray(ig) && (ig.includes(host) || ig.includes(`${host}:${port}`))) return true;
-    const up = this.upstreamSpec;
-    const alias = (this.opts.rewriteLocalhost ?? true) && !gate ? (h: string) => HOST_ALIASES[h] : undefined;
-    return !!up?.ignoreCertErrors && viaUpstreamProxy({ host, port, upstream: up, alias, ...(gate ? { lan: { listenerHost: gate.host, closed: () => gate.closed } } : {}) });
-  }
-
-  /**
-   * The relay (spike grpc-relay.js): our own HTTP/2 stream to the server, raw stream API both ways, pipes for flow
-   * control, a side parser recording every message. `truncate`: forward the response headers and first message,
-   * then RST_STREAM INTERNAL_ERROR.
-   */
-  private async grpcRelay(call: GrpcCall, truncate: boolean): Promise<void> {
-    const { ex, info, flow, req, stream } = call;
-    const C = http2.constants;
-    const latency = flow.throttle?.latencyMs;
-    if (latency && latency > 0) {
-      if (!(await this.latency(ex, flow)) || !call.isLive() || stream.closed) return;
-    }
-    let target: URL;
-    try {
-      target = new URL(flow.map?.url ?? req.url); // CONTRACTS §18.3: Map Remote's target
-    } catch {
-      return this.grpcStatusOnly(call, 14, 'Flutter Intercept: invalid request URL', 'error', 'Invalid request URL');
-    }
-    const protocol = target.protocol === 'https:' ? 'https:' : 'http:';
-    const host = target.hostname.replace(/^\[|\]$/g, '');
-    const port = Number(target.port) || (protocol === 'https:' ? 443 : 80);
-    const socket = (req as unknown as { socket?: unknown }).socket;
-    const gate = lanGateOf(socket);
-    const connectTimeoutMs = findOnSocketChain(socket, (o) => (o as Record<symbol, SilentInfo | undefined>)[SILENT_INFO]?.connectTimeoutMs) ?? GRPC_CONNECT_TIMEOUT_MS;
-    if (this.targetsSelf(host, port)) {
-      // CONTRACTS §18.6: the proxy's own listener (directly, a tunnel or Map Remote): it would relay to itself.
-      return this.grpcStatusOnly(call, 14, GRPC_LOOP_TEXT, 'error', GRPC_LOOP_TEXT);
-    }
-    const cert = protocol === 'https:' ? this.certFor(host, port) : undefined;
-    if (cert) ex.clientCertificate = cert.host;
-    const pool = this.grpcPool;
-    let lease: Awaited<ReturnType<GrpcSessionPool['acquire']>>;
-    try {
-      if (!pool) throw new Error('the proxy is stopping');
-      if (gate?.closed) throw new SsrfError(host, host, 'LAN mode is off');
-      lease = await pool.acquire(
-        {
-          protocol,
-          host,
-          port,
-          ...(gate ? { gate } : {}),
-          upstream: this.upstreamSpec,
-          ...(!gate && (this.opts.rewriteLocalhost ?? true) ? { alias: (h: string) => HOST_ALIASES[h] } : {}),
-          rejectUnauthorized: !this.grpcInsecure(host, port, gate),
-          ...(cert ? { cert: { pattern: cert.host, options: cert.options } } : {}),
-          connectTimeoutMs,
-          connectsToSelf: (ip, p) => this.addressIsSelf(ip, p),
-        },
-        (p) => this.addTimings(ex.id, p),
-      );
-    } catch (e) {
-      if (!call.isLive()) return;
-      const err = e as Error & { statusCode?: number; code?: string };
-      if (err.code === 'E_FI_LOOP') return this.grpcStatusOnly(call, 14, GRPC_LOOP_TEXT, 'error', GRPC_LOOP_TEXT);
-      const forbidden = e instanceof SsrfError || err.statusCode === 403;
-      const label = net.isIPv6(host) ? `[${host}]` : host;
-      const reason = forbidden
-        ? e instanceof SsrfError
-          ? err.message
-          : `${SSRF_MARKER}: ${err.message}`
-        : `Could not connect to ${label}:${port}: ${err.message}`;
-      return this.grpcStatusOnly(call, 14, fiText(reason), 'error', reason);
-    }
-    if (!call.isLive() || stream.closed || stream.destroyed) {
-      lease.release();
-      return;
-    }
-    const headers = req.headers as HeaderBag;
-    const appAuthority = typeof headers[':authority'] === 'string' ? (headers[':authority'] as string) : target.host;
-    // Map Remote: the new host unless preserveHost (CONTRACTS §18.3).
-    const authority = flow.map ? flow.map.host || appAuthority : appAuthority;
-    let sendHeaders = forwardableHeaders(headers);
-    const rw = flow.action?.kind === 'rewrite' ? flow.action : undefined;
-    if (rw?.request) {
-      // CONTRACTS §18.1: request metadata.
-      sendHeaders = this.grpcRewriteMeta(call, sendHeaders, rw.request.setHeaders, rw.request.removeHeaders, 'request');
-      ex.requestHeaders = recordedHeaders(sendHeaders);
-    }
-    const upHeaders: http2.OutgoingHttpHeaders = {
-      ...sendHeaders, // no marker of ours: real servers see only the app's metadata (CONTRACTS §18.6)
-      ':method': req.method,
-      ':path': `${target.pathname}${target.search}`,
-      ':authority': authority,
-      ':scheme': protocol.slice(0, -1),
-    };
-    let up: http2.ClientHttp2Stream;
-    const sentAt = performance.now();
-    try {
-      up = lease.session.request(upHeaders);
-    } catch (e) {
-      lease.release();
-      const reason = `Could not start the call on the server connection: ${(e as Error).message}`;
-      return this.grpcStatusOnly(call, 14, fiText(reason), 'error', reason);
-    }
-    lease.track(up);
-    call.up = up;
-    up.on('error', (e: Error & { code?: string }) => {
-      call.upError ??= e;
-    });
-
-    // app → (record / hooks) → (upload pacing) → server; pipes carry HTTP/2 flow control both ways. Without a
-    // breakpoint / mutate hook for a direction its link is the 0.10 observer (no per-message copies).
-    const a = flow.action;
-    const phase = a?.kind === 'breakpoint' ? a.phase : undefined;
-    call.statusPause = phase === 'response' || phase === 'both';
-    // CONTRACTS §18.2: a script's gRPC hooks (the hook path only when the code defines them).
-    const scriptHooks = a?.kind === 'script' ? mentionsGrpcHooks(a.code) : { message: false, status: false };
-    call.scriptStatus = scriptHooks.status;
-    const hookSend = phase === 'request' || phase === 'both' || scriptHooks.message;
-    const hookReceive = call.statusPause || a?.kind === 'mutate' || scriptHooks.message;
-    const sendRec = this.grpcRecording(call, 'send');
-    let upSrc: Readable = req.pipe(hookSend ? this.grpcTransform(call, 'send', sendRec) : new Observer((c) => sendRec.parser.push(c)));
-    const upload = flow.throttle?.uploadKbps;
-    if (upload && upload > 0) upSrc = upSrc.pipe(new PacedStream({ kbps: upload }));
-    upSrc.pipe(up);
-    req.once('end', () => {
-      if (call.isLive()) this.setRequestMs(ex, flow.te, performance.now());
-    });
-    req.on('error', () => undefined);
-
-    up.on('response', (h, flags) => {
-      if (!call.isLive() || stream.closed || stream.destroyed) return;
-      call.headAt = performance.now();
-      this.addTimings(ex.id, { waitMs: elapsed(sentAt, call.headAt) });
-      const status = Number(h[':status']) || 0;
-      ex.status = status;
-      ex.responseHeaders = recordedHeaders(h as HeaderBag);
-      const enc = grpcEncodingOf(h['grpc-encoding']);
-      if (enc) info.responseEncoding = enc;
-      let resHeaders = forwardableHeaders(h as HeaderBag);
-      if (rw?.response) {
-        resHeaders = this.grpcRewriteMeta(call, resHeaders, rw.response.setHeaders, rw.response.removeHeaders, 'response');
-        // A trailers-only answer carries the trailers in this one frame.
-        if (flags & C.NGHTTP2_FLAG_END_STREAM) resHeaders = this.grpcRewriteMeta(call, resHeaders, rw.response.setTrailers, rw.response.removeTrailers, 'trailers');
-        ex.responseHeaders = recordedHeaders(resHeaders);
-      }
-      const fwd: http2.OutgoingHttpHeaders = { ':status': status, ...resHeaders };
-      if (flags & C.NGHTTP2_FLAG_END_STREAM) {
-        // Trailers-only: the status stays in the one HEADERS frame (mockttp's passthrough loses END_STREAM here).
-        info.trailersOnly = true;
-        const code = parseGrpcStatus(h['grpc-status']);
-        if (code !== undefined) info.statusCode = code;
-        const msg = decodeGrpcMessage(h['grpc-message']);
-        if (msg !== undefined) info.statusMessage = msg;
-        const statusHook = call.statusPause || call.scriptStatus;
-        if (!statusHook) call.localReset = true; // held: the app may still cancel meanwhile (REVIEW-11 #5)
-        this.addTimings(ex.id, { receiveMs: 0 });
-        void (async () => {
-          let out = fwd;
-          if (statusHook) {
-            // CONTRACTS §17.2 / §18.2: a trailers-only answer is held / scripted as the end of the call too.
-            const edited = call.statusPause ? await this.grpcStatusBreakpoint(call, resHeaders) : await this.grpcStatusScript(call, resHeaders);
-            if (!edited) return;
-            out = { ':status': status, ...resHeaders, ...edited.headers };
-            for (const k of edited.removed) delete out[k];
-            ex.responseHeaders = recordedHeaders(out as HeaderBag);
-          }
-          if (!call.isLive() || stream.closed || stream.destroyed) return;
-          call.localReset = true;
-          try {
-            stream.respond(out, { endStream: true });
-            this.grpcEndRequestSide(call);
-          } catch {
-            /* the app left */
-          }
-          if (!call.isLive()) return;
-          // Our own relay answered (a name that resolves to this machine): the loop, recorded on this one exchange.
-          if (msg === GRPC_LOOP_TEXT) return this.fail(ex, GRPC_LOOP_TEXT);
-          this.finish(ex, truncate ? 'blocked' : 'completed');
-        })();
-        return;
-      }
-      stream.removeAllListeners('wantTrailers'); // the compatibility response's own (ERR_HTTP2_TRAILERS_ALREADY_SENT)
-      stream.on('wantTrailers', () => void this.sendGrpcTrailers(call));
-      try {
-        stream.respond(fwd, { waitForTrailers: true });
-      } catch {
-        return;
-      }
-      this.emitChange(ex);
-      const recvRec = this.grpcRecording(call, 'receive');
-      const resParser = recvRec.parser;
-      if (truncate) {
-        const cut = new FirstMessageCut();
-        up.on('data', (c: Buffer) => {
-          if (cut.done) return;
-          const r = cut.push(c);
-          resParser.push(r.forward);
-          if (!r.cut) {
-            if (r.forward.length) stream.write(r.forward);
-            return;
-          }
-          call.localReset = true;
-          try {
-            up.close(C.NGHTTP2_CANCEL);
-          } catch {
-            /* gone */
-          }
-          stream.write(r.forward, () => this.grpcReset(call, C.NGHTTP2_INTERNAL_ERROR));
-          if (call.isLive()) this.finish(ex, 'blocked');
-        });
-        up.once('end', () => {
-          if (!cut.done && !stream.closed) stream.end();
-        });
-        return;
-      }
-      let tail: Readable = up.pipe(hookReceive ? this.grpcTransform(call, 'receive', recvRec) : new Observer((c) => resParser.push(c)));
-      const kbps = flow.throttle?.kbps;
-      if (kbps && kbps > 0) tail = tail.pipe(new PacedStream({ kbps }));
-      call.respTail = tail;
-      tail.pipe(stream);
-    });
-    up.on('trailers', (t) => {
-      call.upTrailers = t;
-      ex.responseTrailers = recordedHeaders(t as HeaderBag);
-      const code = parseGrpcStatus(t['grpc-status']);
-      if (code !== undefined) info.statusCode = code;
-      const msg = decodeGrpcMessage(t['grpc-message']);
-      if (msg !== undefined) info.statusMessage = msg;
-      if (call.headAt !== undefined) this.addTimings(ex.id, { receiveMs: elapsed(call.headAt) });
-    });
-    up.once('close', () => this.onGrpcUpstreamClosed(call));
-  }
-
-  /** The app's response body ended: the server's trailers (or a failure status, or none) end it. */
-  private async sendGrpcTrailers(call: GrpcCall): Promise<void> {
-    const { ex, stream } = call;
-    const rwr = call.flow.action?.kind === 'rewrite' ? call.flow.action.response : undefined;
-    if (call.upTrailers && (rwr?.setTrailers || rwr?.removeTrailers)) {
-      // CONTRACTS §18.1: custom trailers.
-      const next = this.grpcRewriteMeta(call, forwardableHeaders(call.upTrailers as HeaderBag), rwr.setTrailers, rwr.removeTrailers, 'trailers');
-      call.upTrailers = next as http2.IncomingHttpHeaders;
-      ex.responseTrailers = recordedHeaders(next);
-    }
-    if (call.upTrailers && (call.statusPause || call.scriptStatus)) {
-      // CONTRACTS §17.2 / §18.2: the end of the call is held / scripted after the last response message.
-      const edited = call.statusPause ? await this.grpcStatusBreakpoint(call, call.upTrailers as HeaderBag) : await this.grpcStatusScript(call, call.upTrailers as HeaderBag);
-      if (!edited) return;
-      const next: Record<string, string | string[]> = { ...forwardableHeaders(call.upTrailers as HeaderBag), ...edited.headers };
-      for (const k of edited.removed) delete next[k];
-      call.upTrailers = next as http2.IncomingHttpHeaders;
-      ex.responseTrailers = recordedHeaders(next);
-    }
-    const t: http2.OutgoingHttpHeaders = call.upTrailers ? forwardableHeaders(call.upTrailers as HeaderBag) : (call.failTrailers ?? {});
-    call.localReset = true;
-    try {
-      stream.sendTrailers(t);
-      this.grpcEndRequestSide(call);
-    } catch {
-      /* gone */
-    }
-    if (!call.isLive()) return;
-    if (call.upTrailers) return this.finish(ex, 'completed');
-    if (call.failTrailers) {
-      ex.responseTrailers = { ...call.failTrailers };
-      call.info.statusCode = 14;
-      call.info.statusMessage = decodeGrpcMessage(call.failTrailers['grpc-message']);
-      return this.fail(ex, call.failReason ?? 'The connection to the server failed.');
-    }
-    this.fail(ex, 'The server ended the response without trailers (no gRPC status).');
-  }
-
-  /** The server's stream closed: unless its trailers came, map the failure for the app (UNAVAILABLE or its reset). */
-  private onGrpcUpstreamClosed(call: GrpcCall): void {
-    const { ex, stream, up } = call;
-    if (!up || !call.isLive() || call.upTrailers || call.localReset || stream.closed || stream.destroyed) return;
-    const err = call.upError;
-    const code = up.rstCode;
-    const peerReset = !!code && code !== http2.constants.NGHTTP2_NO_ERROR && (!err || err.code === 'ERR_HTTP2_STREAM_ERROR');
-    if (!err && !peerReset) return; // ended without trailers: the pipe ends the app's response (sendGrpcTrailers)
-    const reason = peerReset ? `the server reset the stream (${h2CodeName(code)})` : `the connection to the server failed (${err?.message ?? 'closed'})`;
-    if (!stream.headersSent) {
-      return this.grpcStatusOnly(call, 14, fiText(reason), 'error', `${capitalize(reason)}.`);
-    }
-    if (peerReset) {
-      // Mid-response: the same reset for the app (code preserved).
-      this.grpcReset(call, code!);
-      return this.fail(ex, `${capitalize(reason)}.`);
-    }
-    // The server's connection failed mid-response: end the app's response with UNAVAILABLE.
-    call.failTrailers = { 'grpc-status': '14', 'grpc-message': encodeGrpcMessage(fiText(reason)) };
-    call.failReason = `${capitalize(reason)}.`;
-    try {
-      call.respTail?.unpipe(stream);
-      stream.end();
-    } catch {
-      this.grpcReset(call, http2.constants.NGHTTP2_INTERNAL_ERROR);
-      this.fail(ex, call.failReason);
-    }
   }
 
   // ---------------------------------------------------------------- client certificates (CONTRACTS §14.3)
@@ -5086,8 +2089,8 @@ export class InterceptProxy extends EventEmitter {
   private requestPlan(connection: unknown, target: { protocol?: string; hostname?: string; port?: number }): RequestPlan | undefined {
     const id = connection && typeof connection === 'object' ? this.connRequest.get(connection) : undefined;
     if (!id) return undefined;
-    const live = this.live.get(id);
-    const flow = live?.flow ?? this.flows.get(id);
+    const live = this.book.live.get(id);
+    const flow = live?.flow ?? this.book.flows.get(id);
     if (live && (target.protocol === 'https:' || target.protocol === 'wss:') && target.hostname) {
       const c = this.certFor(target.hostname, Number(target.port) || 443);
       const origin = getHeader(live.ex.requestHeaders, 'origin');
@@ -5099,1310 +2102,14 @@ export class InterceptProxy extends EventEmitter {
       else delete live.ex.clientCertificate;
     }
     const up = flow?.throttle?.uploadKbps;
-    return { timings: (p) => this.addTimings(id, p), ...(up && up > 0 ? { uploadKbps: up } : {}) };
-  }
-
-  // ---------------------------------------------------------------- TLS passthrough (CONTRACTS §14.2)
-
-  /**
-   * Take over CONNECT handling: mockttp's combo server answers every CONNECT itself ('connect' listener in
-   * http-combo-server.js: "200", then the socket goes back in as a new connection to be MITM'd). We remove its
-   * listener(s) from the server (httpolyglot mirrors listeners onto its sub-servers, so removing from the outer server
-   * removes them everywhere) and install one that tunnels passthrough hosts and hands everything else to mockttp's.
-   * LAN clients reach this too: the LAN gate hands authenticated sockets to the same server.
-   */
-  private installConnectHook(raw: net.Server): void {
-    const original = raw.listeners('connect') as Array<(...a: unknown[]) => void>;
-    if (!original.length) return;
-    for (const l of original) raw.removeListener('connect', l);
-    raw.on('connect', (req: http.IncomingMessage, socket: unknown, head: Buffer) => {
-      let handled = false;
-      try {
-        handled = this.onConnect(req, socket, head);
-      } catch {
-        handled = false;
-      }
-      if (!handled) for (const l of original) l.call(raw, req, socket, head);
-    });
-    this.connectHook = true;
-  }
-
-  /**
-   * A silent CONNECT (CONTRACTS §16.2) or a CONNECT to a passthrough host: handled here (true), else mockttp answers
-   * it (false). The marker counts on HTTP/1 CONNECTs only (an HTTP/2 CONNECT arrives with a response object).
-   */
-  private onConnect(req: http.IncomingMessage, socket: unknown, head: Buffer | undefined): boolean {
-    const marker = socket instanceof net.Socket ? tunnelMarker(req.headers[SILENT_TUNNEL_HEADER]) : undefined;
-    if (marker === 'breaker') {
-      this.onBreakerReport(req, socket as net.Socket);
-      return true;
-    }
-    if (marker === 'silent') {
-      void this.runSilent(req, socket as net.Socket, head ?? Buffer.alloc(0)).catch(() => (socket as net.Socket).destroy());
-      return true;
-    }
-    if (!this.passthrough.length || !(socket instanceof net.Socket) || socket instanceof tls.TLSSocket) return false;
-    const t = splitHostPort(req.url ?? '');
-    if (!t) return false;
-    const host = normalizeHostname(t.host);
-    if (!host || !this.passthrough.some((p) => matchesHostPattern(p, host, t.port))) return false;
-    void this.runTunnel(req, socket, head ?? Buffer.alloc(0), host, t.port).catch(() => socket.destroy());
-    return true;
-  }
-
-  /**
-   * CONTRACTS §16.2: a silent CONNECT from the entry's gRPC hook. Nothing is ever written back; the first payload byte
-   * decides: the h2c preface (and TLS to a grpcDecryptHosts host) → mockttp, as if it had answered the CONNECT; other
-   * TLS → a passthrough tunnel (`grpcTunnel`); anything else → closed and recorded. LAN sockets were checked by
-   * their gate (token, pinned peer, SSRF pre-check; refusals there are closes too).
-   */
-  private async runSilent(req: http.IncomingMessage, socket: net.Socket, head: Buffer): Promise<void> {
-    socket.on('error', () => undefined);
-    if (!lanConnectAllowed(socket)) {
-      socket.destroy();
-      return;
-    }
-    const target = req.url ?? '';
-    const t = splitHostPort(target);
-    const host = t ? normalizeHostname(t.host) : '';
-    if (!t || !host) {
-      this.recordSilentFailure(target, 'The silent tunnel named no valid host:port; it was closed.', socket);
-      socket.destroy();
-      return;
-    }
-    const info: SilentInfo = { connectTimeoutMs: parseConnectTimeout(req.headers[CONNECT_TIMEOUT_HEADER]) };
-    const marks = socket as unknown as Record<symbol, unknown>;
-    marks[SILENT_INFO] = info;
-    marks[SOCKET_SELF] ??= socket;
-    const first = head.length ? head : await this.firstBytes(socket);
-    if (!first) {
-      socket.destroy(); // closed (or silent) before the first byte: nothing happened
-      return;
-    }
-    // CONTRACTS §18.6: send()'s own tunnel (this instance's nonce, from loopback only): always decrypted, and a resend of a
-    // LAN client's call gets that client's LAN guards.
-    const internal = String(req.headers[INTERNAL_TUNNEL_HEADER] ?? '').split(';').map((x) => x.trim());
-    let forceDecrypt = false;
-    if (internal[0]) {
-      const ok = internal[0] === this.hopNonce && !lanGateOf(socket) && isLoopbackHost(normalizeIp(socket.remoteAddress ?? ''));
-      if (!ok) {
-        socket.destroy();
-        return;
-      }
-      if (internal.includes('lan')) {
-        const g = this.lanGate;
-        if (!g || g.closed) {
-          socket.destroy();
-          return;
-        }
-        adoptAsLanSocket(socket, g);
-      }
-      forceDecrypt = true;
-    }
-    const kind = classifyFirstBytes(first);
-    if (kind === 'other') {
-      this.recordSilentFailure(target, 'Not HTTP/2 or TLS inside the silent tunnel; it was closed.', socket);
-      socket.destroy();
-      return;
-    }
-    const pinKey = `${host}:${t.port}`;
-    const pinned = kind === 'tls' && !forceDecrypt && this.isPinned(pinKey);
-    const decrypt =
-      forceDecrypt ||
-      kind === 'h2c' ||
-      (!pinned &&
-        (this.grpcDecryptAllOn || this.grpcDecrypt.some((p) => matchesHostPattern(p, host, t.port))) &&
-        !this.passthrough.some((p) => matchesHostPattern(p, host, t.port)));
-    const raw = this.rawServer;
-    if (decrypt && this.grpcCheck.ok && raw && this.server) {
-      if (kind === 'tls' && !forceDecrypt) this.watchDecryptHandshake(socket, host, t.port);
-      if (injectSilentTunnel(raw, socket, target, head.length ? head : undefined)) return;
-    }
-    const note = pinned
-      ? `${host} pins its certificate; passed through undecrypted.`
-      : decrypt && !this.grpcCheck.ok
-        ? (this.grpcCheck.problem ?? 'gRPC interception is unavailable; passed through undecrypted.')
-        : undefined;
-    await this.runTunnel(req, socket, head, host, t.port, { silent: true, plain: kind === 'h2c', connectTimeoutMs: info.connectTimeoutMs, ...(note ? { note } : {}) });
-  }
-
-  /**
-   * CONTRACTS §16.8: the entry's breaker sent an authority direct for 30 s. Never answered, no exchange; the
-   * 'grpcBreaker' event at most once per authority per GRPC_BREAKER_WINDOW_MS. LAN sockets passed their gate (token,
-   * pinned peer, target check; refusals there are silent).
-   */
-  private onBreakerReport(req: http.IncomingMessage, socket: net.Socket): void {
-    socket.on('error', () => undefined);
-    const allowed = lanConnectAllowed(socket);
-    const viaLan = !!lanGateOf(socket);
-    socket.destroy();
-    if (!allowed) return;
-    const t = splitHostPort(req.url ?? '');
-    const host = t ? normalizeHostname(t.host) : '';
-    if (!t || !host || host.length > 253) return;
-    const authority = `${net.isIPv6(host) ? `[${host}]` : host}:${t.port}`;
-    const now = Date.now();
-    const last = this.breakerSeen.get(authority);
-    if (last !== undefined && now - last < GRPC_BREAKER_WINDOW_MS) return;
-    if (this.breakerSeen.size >= 1000) {
-      for (const [k, at] of this.breakerSeen) if (now - at >= GRPC_BREAKER_WINDOW_MS) this.breakerSeen.delete(k);
-      if (this.breakerSeen.size >= 1000) return; // a flood of distinct authorities: drop
-    }
-    this.breakerSeen.set(authority, now);
-    const event: GrpcBreakerEvent = { authority, viaLan };
-    process.nextTick(() => this.emit(GRPC_BREAKER_EVENT, event));
-  }
-
-  /**
-   * CONTRACTS §19.3: remember a decrypted silent TLS tunnel until its handshake is done, so a handshake the app fails
-   * (it pins its own certificate) teaches the proxy to pass that host through from then on (one failed connection).
-   */
-  private watchDecryptHandshake(socket: net.Socket, host: string, port: number): void {
-    const key = `${normalizeIp(socket.remoteAddress ?? '')}:${socket.remotePort}`;
-    if (this.decrypting.size >= 1000) return;
-    this.decrypting.set(key, { host, port });
-    const forget = () => {
-      if (this.decrypting.get(key)?.host === host) this.decrypting.delete(key);
-    };
-    // mockttp reports a failed handshake after the socket closed: keep the entry a little longer than that.
-    socket.once('close', () => setTimeout(forget, 5000).unref?.());
-    setTimeout(forget, 60_000).unref?.();
-  }
-
-  /** The first payload chunk of a silent tunnel, put back into the socket (undefined: closed or nothing in time). */
-  private firstBytes(socket: net.Socket): Promise<Buffer | undefined> {
-    return new Promise((resolve) => {
-      let timer: NodeJS.Timeout | undefined;
-      const done = (b?: Buffer) => {
-        clearTimeout(timer);
-        socket.off('data', onData);
-        socket.off('end', onGone);
-        socket.off('close', onGone);
-        resolve(b);
-      };
-      const onData = (d: Buffer) => {
-        socket.pause();
-        socket.unshift(d);
-        // Like node's http server after a CONNECT: no flowing mode until the next reader attaches.
-        (socket as unknown as { readableFlowing: boolean | null }).readableFlowing = null;
-        done(d);
-      };
-      const onGone = () => done(undefined);
-      timer = setTimeout(onGone, SILENT_FIRST_BYTE_MS);
-      timer.unref?.();
-      socket.on('data', onData);
-      socket.once('end', onGone);
-      socket.once('close', onGone);
-    });
-  }
-
-  /** A silent tunnel that could not be used: one 'error' tunnel exchange (CONTRACTS §16.2). */
-  private recordSilentFailure(target: string, error: string, socket: net.Socket): void {
-    const t = splitHostPort(target);
-    const label = t ? (net.isIPv6(t.host) ? `[${t.host}]` : t.host) : 'unknown-host';
-    const ex: Exchange = {
-      id: `tunnel-${randomUUID()}`,
-      startedAt: Date.now(),
-      durationMs: 0,
-      method: 'CONNECT',
-      url: `https://${label}${t ? `:${t.port}` : ''}/`,
-      requestHeaders: {},
-      state: 'error',
-      error,
-      kind: 'tunnel',
-      grpcTunnel: true,
-      ...(lanGateOf(socket) ? { viaLan: true as const } : {}),
-    };
-    this.store.set(ex.id, ex);
-    this.emitChange(ex);
-  }
-
-  private async runTunnel(
-    req: http.IncomingMessage,
-    socket: net.Socket,
-    head: Buffer,
-    host: string,
-    port: number,
-    silent?: { silent: true; plain: boolean; connectTimeoutMs: number; note?: string },
-  ): Promise<void> {
-    socket.on('error', () => undefined);
-    if (!lanConnectAllowed(socket)) {
-      socket.destroy();
-      return;
-    }
-    const gate = lanGateOf(socket);
-    const label = net.isIPv6(host) ? `[${host}]` : host;
-    const url = `${silent?.plain ? 'http' : 'https'}://${label}:${port}/`;
-    // Rules: block and fault only. Matched as method CONNECT on the tunnel's own URL (a rule made from a tunnel,
-    // `https://host:port/*`), and on `https://host/` for port 443 so a rule written for the site applies too.
-    let m: MatchResult = {};
-    let note: string | undefined;
-    for (const u of port === 443 ? [url, `https://${label}/`] : [url]) {
-      const probe = this.matchRule('CONNECT', u, { count: false, tunnel: true });
-      note ??= probe.note;
-      if (probe.rule) {
-        m = this.matchRule('CONNECT', u, { count: true, tunnel: true });
-        break;
-      }
-    }
-    const flow: Flow = { route: 'tunnel', ...(m.rule ? { rule: m.rule } : {}), ...(gate ? { viaLan: true } : {}) };
-    const a = m.action;
-    let cut: FlowFault | undefined;
-    let simulated: string | undefined;
-    let up: LinkShape | undefined;
-    let down: LinkShape | undefined;
-    let latency = 0;
-    const p = this.profile;
-    if (a?.kind === 'block') {
-      cut = 'reset';
-      if (silent) simulated = 'Blocked';
-      else if (a.mode === 'status') note ??= "A block with a status can't be answered inside an undecrypted tunnel; the connection was reset after the TLS handshake instead.";
-    } else if (a?.kind === 'fault') {
-      cut = a.fault;
-      simulated = FAULT_LABELS[a.fault];
-    } else if (p.kind === 'offline') {
-      cut = 'dns';
-      simulated = describeProfile(p);
-    } else if (!m.rule && this.replayStore?.fallback === 'fail') {
-      cut = 'dns';
-      simulated = `Not in the recording${this.replayStore.name ? ` "${this.replayStore.name}"` : ''} (replay: fail)`;
-    } else if (p.kind === 'throttle') {
-      simulated = profileLabel(p);
-      latency = p.latencyMs ?? 0;
-      down = { latencyMs: p.latencyMs, kbps: p.kbps };
-      up = { latencyMs: p.latencyMs, kbps: p.uploadKbps };
-      if (p.dropRate && p.dropRate > 0 && Math.random() < p.dropRate) {
-        cut = 'drop';
-        simulated = `${simulated}: dropped`;
-      }
-    }
-    if (cut) flow.fault = cut;
-    if (silent?.note) note = note ? `${silent.note} ${note}` : silent.note;
-    const requestHeaders = cleanHeaders(req.headers as HeaderBag);
-    delete requestHeaders['proxy-authorization']; // the LAN token
-    delete requestHeaders[SILENT_TUNNEL_HEADER];
-    delete requestHeaders[CONNECT_TIMEOUT_HEADER];
-    const ex: Exchange = {
-      id: `tunnel-${randomUUID()}`,
-      startedAt: Date.now(),
-      method: 'CONNECT',
-      url,
-      requestHeaders,
-      state: 'pending',
-      kind: 'tunnel',
-      tunnelBytes: { sent: 0, received: 0 },
-      ...(silent ? { grpcTunnel: true as const } : {}),
-      ...(m.rule ? { matchedRuleId: m.rule.id } : {}),
-      ...(note ? { error: note } : {}),
-      ...(simulated ? { simulated } : {}),
-      ...(gate ? { viaLan: true as const } : {}),
-    };
-    this.track(ex, flow);
-    // CONTRACTS §16.8 (REVIEW-10 #1): a cut silent tunnel is held, never closed — a close looks like a lost connection
-    // to grpc-dart, which reconnects at once until the entry's breaker sends it direct (around every rule).
-    if (silent && cut) return this.holdSilentTunnel(ex, socket);
-    const isLive = () => this.live.get(ex.id)?.ex === ex;
-    let relaying = false;
-    socket.once('close', () => {
-      if (!relaying && isLive()) this.fail(ex, 'The app closed the connection before the tunnel was open.');
-    });
-    if (latency > 0) {
-      const from = performance.now();
-      await sleep(latency);
-      if (!isLive()) return;
-      this.addPhase(ex, 'delayMs', performance.now() - from);
-    }
-    let server: net.Socket;
-    try {
-      server = await openTunnelUpstream({
-        host,
-        port,
-        ...(gate ? { lan: { listenerHost: gate.host, closed: () => gate.closed } } : {}),
-        upstream: this.upstreamSpec,
-        ...((this.opts.rewriteLocalhost ?? true) ? { alias: (h: string) => HOST_ALIASES[h] } : {}),
-        timings: (t) => this.addTimings(ex.id, t),
-        ...(silent ? { timeoutMs: silent.connectTimeoutMs } : {}),
-      });
-    } catch (e) {
-      if (!isLive()) return;
-      const forbidden = e instanceof SsrfError || (e as { statusCode?: number }).statusCode === 403;
-      const message = e instanceof SsrfError ? e.message : forbidden ? `${SSRF_MARKER}: ${(e as Error).message}` : `Could not open the tunnel to ${label}:${port}: ${(e as Error).message}`;
-      ex.status = forbidden ? 403 : 502;
-      this.fail(ex, message);
-      // A silent tunnel's app never reads a reply: close (the entry's breaker handles a storm).
-      if (silent) socket.destroy();
-      else refuse(socket, `HTTP/1.1 ${ex.status} ${STATUS_CODES[ex.status]}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
-      return;
-    }
-    if (socket.destroyed || !isLive()) {
-      server.destroy();
-      return;
-    }
-    this.tunnelSockets.add(server);
-    server.once('close', () => this.tunnelSockets.delete(server));
-    relaying = true;
-    if (!silent) socket.write('HTTP/1.1 200 Connection established\r\n\r\n');
-    this.emitChange(ex);
-    relay({
-      app: socket,
-      server,
-      head,
-      up,
-      down,
-      ...(cut ? { onAppData: () => this.cutTunnel(ex, socket, server, cut!) } : {}),
-      onBytes: (sent, received) => {
-        if (!isLive()) return;
-        ex.tunnelBytes = { sent, received };
-        this.touch(ex);
-      },
-      onClose: (error) => {
-        if (!isLive()) return;
-        if (error) this.fail(ex, error);
-        else this.finish(ex, 'completed');
-      },
-    });
-  }
-
-  /**
-   * CONTRACTS §16.8: a silent passthrough tunnel that a block, a fault, the offline profile, `replay: fail` or a drop
-   * cuts: nothing is relayed and the server is never contacted; the app's socket stays open (its bytes are read and
-   * dropped) until the app closes it or breakpointTimeoutMs passes (then reset). To the app: an unreachable network.
-   */
-  private holdSilentTunnel(ex: Exchange, socket: net.Socket): void {
-    socket.on('data', () => undefined);
-    const label = ex.simulated ?? 'Held';
-    const settle = (appLeft: boolean) => {
-      if (this.holds.get(ex.id) !== settle) return;
-      clearTimeout(timer);
-      this.holds.delete(ex.id);
-      if (this.live.get(ex.id)?.ex !== ex) return void socket.destroy(); // proxy stopped
-      const secs = ((Date.now() - ex.startedAt) / 1000).toFixed(1);
-      ex.simulated = `${label} (held without an answer; ${appLeft ? `the app gave up after ${secs} s` : `reset after ${secs} s`})`;
-      this.finish(ex, 'blocked');
-      if (!appLeft) resetOrDestroy(socket as never);
-    };
-    const timer = setTimeout(() => settle(false), this.breakpointTimeoutMs);
-    timer.unref?.();
-    this.holds.set(ex.id, settle);
-    socket.once('close', () => settle(true));
-    if (socket.destroyed) settle(true);
-  }
-
-  /** A block / fault on a passthrough tunnel, at the app's first request record (after the TLS handshake). */
-  private cutTunnel(ex: Exchange, socket: net.Socket, server: net.Socket, fault: FlowFault): void {
-    server.destroy();
-    if (this.live.get(ex.id)?.ex !== ex) return void socket.destroy();
-    if (fault === 'timeout') {
-      const settle = (appLeft: boolean) => {
-        if (this.holds.get(ex.id) !== settle) return;
-        clearTimeout(timer);
-        this.holds.delete(ex.id);
-        if (this.live.get(ex.id)?.ex !== ex) return void socket.destroy();
-        const secs = ((Date.now() - ex.startedAt) / 1000).toFixed(1);
-        ex.simulated = appLeft ? `${FAULT_LABELS.timeout} (the app gave up after ${secs} s)` : `${FAULT_LABELS.timeout} (reset after ${secs} s)`;
-        this.finish(ex, 'blocked');
-        if (!appLeft) resetOrDestroy(socket as never);
-      };
-      const timer = setTimeout(() => settle(false), this.breakpointTimeoutMs);
-      timer.unref?.();
-      this.holds.set(ex.id, settle);
-      socket.once('close', () => settle(true));
-      return;
-    }
-    this.finish(ex, 'blocked');
-    if (fault === 'dns') socket.end();
-    else resetOrDestroy(socket as never);
-  }
-
-  // ---------------------------------------------------------------- stream replay (CONTRACTS §14.5)
-
-  /**
-   * A recorded event stream, answered event by event at the recorded gaps (≤ 5 s). Entries whose request body
-   * matters (POST streams) are chosen here, once the body is read; a non-stream answer is written whole, and a miss
-   * follows the replay fallback (the real server, or closed like offline).
-   */
-  private async onReplayStream(req: OngoingRequest, res: http.ServerResponse, passthrough: { handle(...a: unknown[]): Promise<unknown> }, options: unknown): Promise<void> {
-    const flow = this.flows.get(req.id);
-    if (!flow) {
-      res.writeHead(502).end();
-      return;
-    }
-    let entry = flow.replay;
-    if (entry === 'deferred') {
-      let key: BodyKey = 'unreadable';
-      try {
-        const buf: Buffer = await (req as unknown as { body: { asDecodedBuffer(): Promise<Buffer> } }).body.asDecodedBuffer();
-        const b = await decodeForDisplay(buf, undefined, true);
-        key = b?.truncated ? 'unreadable' : { hash: requestBodyHash(b) };
-      } catch {
-        key = 'unreadable';
-      }
-      const r = this.replayFlow(req.method, req.url, req.headers as HeaderBag, key, flow.note);
-      Object.assign(flow, { route: r.route, replay: r.replay, fault: r.fault, simulated: r.simulated, throttle: r.throttle, note: r.note });
-      entry = r.replay === 'deferred' ? undefined : r.replay;
-      if (!entry) {
-        if (r.fault) {
-          // replay fallback "fail": closed without a response, like the offline profile.
-          const ex = this.newExchange(req, flow);
-          this.track(ex, flow);
-          this.finish(ex, 'blocked');
-          res.socket?.end();
-          return;
-        }
-        // Not in the recording: the real server, recorded like any pass-through.
-        flow.route = 'plain';
-        this.track(this.newExchange(req, flow), flow);
-        const tap = getTap(req.id);
-        if (tap) this.applyShaping(tap, flow);
-        await passthrough.handle(req, res, options);
-        return;
-      }
-      if (entry.kind !== 'sse') {
-        const ex = this.newExchange(req, flow);
-        const out = await this.answerReplay(ex, flow, entry);
-        const r2 = out.response as { statusCode: number; statusMessage?: string; headers: HeaderBag; rawBody: Buffer };
-        res.writeHead(r2.statusCode, r2.statusMessage ?? '', r2.headers as http.OutgoingHttpHeaders);
-        res.end(r2.rawBody);
-        return;
-      }
-    }
-    if (!entry) {
-      res.writeHead(502).end();
-      return;
-    }
-    const ex = this.newExchange(req, flow);
-    this.setRequestMs(ex, (req as unknown as { timingEvents?: RequestTimingEvents }).timingEvents, performance.now());
-    this.track(ex, flow);
-    const headers: HeaderBag = {};
-    for (const [k, v] of Object.entries(entry.headers ?? {})) {
-      const lk = k.toLowerCase();
-      if (!HTTP_TOKEN.test(k) || REPLAY_DROPPED_HEADERS.has(lk) || lk === 'content-encoding') continue;
-      const vals = (Array.isArray(v) ? v : [v]).filter((x) => typeof x === 'string' && !/[\r\n\0]/.test(x));
-      if (vals.length) headers[k] = vals.length === 1 ? vals[0] : vals;
-    }
-    if (!getHeader(headers, 'content-type')) headers['content-type'] = 'text/event-stream';
-    if (!getHeader(headers, 'cache-control')) headers['cache-control'] = 'no-cache';
-    this.addCorsToLocalResponse(ex, headers);
-    const steps = sseSchedule(entry.frames);
-    await new Promise<void>((resolve) => {
-      let timer: NodeJS.Timeout | undefined;
-      let i = 0;
-      res.once('close', () => {
-        clearTimeout(timer);
-        resolve();
-      });
-      // The taps see the head (an event stream: SSE recording, flushed at once) and every event written.
-      res.writeHead(entry.status, STATUS_CODES[entry.status] ?? '', headers as http.OutgoingHttpHeaders);
-      const next = () => {
-        if (res.destroyed || res.writableEnded) return resolve();
-        if (i >= steps.length) {
-          res.end();
-          return resolve();
-        }
-        const step = steps[i++];
-        timer = setTimeout(() => {
-          if (res.destroyed) return resolve();
-          res.write(sseEventText(step.frame));
-          next();
-        }, step.delayMs);
-      };
-      next();
-    });
-  }
-
-  /** A recorded WebSocket: accept the upgrade here and play the server's side (src/replay-stream.ts). */
-  private async onWsReplay(req: OngoingRequest, socket: net.Socket, head: Buffer): Promise<void> {
-    const live = this.live.get(req.id);
-    const entry = live?.flow.replay;
-    if (!live || !entry || entry === 'deferred') {
-      socket.destroy();
-      return;
-    }
-    const { ex } = live;
-    socket.on('error', () => undefined);
-    let upgraded = false;
-    socket.once('close', () => {
-      if (!upgraded && this.live.get(ex.id)?.ex === ex) this.fail(ex, 'The replayed WebSocket upgrade was refused (an invalid upgrade request?).');
-    });
-    const protocol = getHeader((entry.headers ?? {}) as HeaderBag, 'sec-websocket-protocol')?.split(',')[0]?.trim();
-    const wss = (this.wsReplayServer ??= new WebSocket.Server({
-      noServer: true,
-      perMessageDeflate: false,
-      maxPayload: WS_MAX_MESSAGE_BYTES,
-      handleProtocols: (offered: Set<string>, request: unknown) => {
-        const want = this.wsReplayProtocols.get(request as object);
-        if (want && offered.has(want)) return want;
-        return offered.values().next().value ?? false;
-      },
-    }));
-    if (protocol) this.wsReplayProtocols.set(req as unknown as object, protocol);
-    wss.handleUpgrade(req as unknown as http.IncomingMessage, socket, head, (ws) => {
-      upgraded = true;
-      this.runWsReplay(ex, entry, ws);
-    });
-  }
-
-  private runWsReplay(ex: Exchange, entry: ReplayEntry, ws: WebSocket): void {
-    const isLive = () => this.live.get(ex.id)?.ex === ex;
-    ex.status = 101;
-    ex.responseHeaders = { upgrade: 'websocket', connection: 'Upgrade', ...(ws.protocol ? { 'sec-websocket-protocol': ws.protocol } : {}) };
-    this.emitChange(ex);
-    const script = wsScript(entry.frames);
-    const timers = new Set<NodeJS.Timeout>();
-    let closed = false;
-    let closeSent = false;
-    let chain = Promise.resolve();
-    const wait = (ms: number) =>
-      new Promise<void>((r) => {
-        const t = setTimeout(() => {
-          timers.delete(t);
-          r();
-        }, ms);
-        timers.add(t);
-      });
-    const send = (f: Frame) => {
-      if (f.kind === 'close') {
-        closeSent = true;
-        const code = f.closeCode !== undefined && f.closeCode !== 1005 && f.closeCode !== 1006 ? f.closeCode : undefined;
-        if (isLive()) this.addFrame(ex, closeFrame('receive', code, f.text));
-        try {
-          if (code !== undefined) ws.close(code, (f.text ?? '').slice(0, 120));
-          else ws.close();
-        } catch {
-          ws.close();
-        }
-        return;
-      }
-      const { data, binary } = framePayload(f);
-      const buf = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
-      if (f.kind === 'ping') ws.ping(buf);
-      else if (f.kind === 'pong') ws.pong(buf);
-      else if (f.kind === 'text' || f.kind === 'binary') ws.send(data, { binary });
-      else return;
-      if (isLive()) this.addFrame(ex, payloadFrame('receive', f.kind, buf));
-    };
-    const play = (steps: TimedStep[]) => {
-      chain = chain.then(async () => {
-        for (const s of steps) {
-          if (closed || closeSent) return;
-          if (s.delayMs > 0) await wait(s.delayMs);
-          if (closed || closeSent || ws.readyState !== WebSocket.OPEN) return;
-          send(s.frame);
-        }
-      });
-    };
-    let messages = 0;
-    ws.on('message', (data, isBinary) => {
-      if (isLive()) this.addFrame(ex, payloadFrame('send', isBinary ? 'binary' : 'text', toBuffer(data)));
-      const reply = script.replies[messages++];
-      if (reply) play(reply);
-    });
-    ws.on('ping', (d) => isLive() && this.addFrame(ex, payloadFrame('send', 'ping', toBuffer(d))));
-    ws.on('pong', (d) => isLive() && this.addFrame(ex, payloadFrame('send', 'pong', toBuffer(d))));
-    ws.on('error', () => undefined);
-    ws.once('close', (code, reason) => {
-      closed = true;
-      for (const t of timers) clearTimeout(t);
-      timers.clear();
-      if (!isLive()) return;
-      if (!closeSent) this.addFrame(ex, closeFrame('send', code === 1005 ? undefined : code, toBuffer(reason)));
-      this.finish(ex, 'mocked');
-    });
-    play(script.opening);
-  }
-
-  private onTlsError(f: TlsHandshakeFailure): void {
-    // CONTRACTS §19.3: the app failed our certificate on a decrypted silent gRPC tunnel: it pins; pass it through now.
-    const key = `${normalizeIp(String(f.remoteIpAddress ?? ''))}:${f.remotePort}`;
-    const silent = this.decrypting.get(key);
-    if (silent) {
-      this.decrypting.delete(key);
-      const pinKey = `${silent.host}:${silent.port}`;
-      const label = net.isIPv6(silent.host) ? `[${silent.host}]` : silent.host;
-      // REVIEW-13 #6: a pin needs the app's rejection of our certificate. A TLS alert (cert-rejected) is one at once.
-      // dart:io (BoringSSL) sends no alert: it closes right after our certificate (mockttp: reset / closed), which a
-      // kill mid-handshake can look like — so that counts only when it happens twice for the host within 60 s.
-      // A host the user listed in grpcDecryptHosts is never auto-pinned.
-      const alert = f.failureCause === 'cert-rejected';
-      const closedEarly = f.failureCause === 'reset' || f.failureCause === 'closed';
-      let strikes = 0;
-      if (closedEarly) {
-        const now = Date.now();
-        const prev = this.pinStrikes.get(pinKey);
-        const st = prev && now - prev.first < PIN_STRIKE_WINDOW_MS ? { n: prev.n + 1, first: prev.first } : { n: 1, first: now };
-        if (this.pinStrikes.size < 1000 || prev) this.pinStrikes.set(pinKey, st);
-        strikes = st.n;
-      }
-      const rejected = alert || strikes >= 2;
-      const explicit = this.grpcDecrypt.some((p) => matchesHostPattern(p, silent.host, silent.port));
-      let error: string;
-      if (explicit && (alert || closedEarly)) {
-        error = `The app ended the TLS handshake for ${silent.host} (${f.failureCause}); it may pin its own certificate. The host is in grpcDecryptHosts, so it stays decrypted — remove it there if the app pins.`;
-      } else if (!rejected) {
-        error = closedEarly
-          ? `The app closed the TLS handshake for ${silent.host} (${f.failureCause}). If it happens again within a minute, the host is passed through undecrypted (it probably pins its certificate).`
-          : `TLS handshake with the app failed (${f.failureCause}) for ${silent.host}; not a certificate rejection, so the host stays decrypted.`;
-      } else {
-        this.pinStrikes.delete(pinKey);
-        if (this.pinnedHosts.size >= 1000) for (const k of [...this.pinnedHosts.keys()]) this.isPinned(k); // drop expired
-        if (this.pinnedHosts.size < 1000) this.pinnedHosts.set(pinKey, Date.now() + (grpcPinTesting.ttlMs ?? GRPC_PIN_TTL_MS));
-        error = `${silent.host} pins its certificate; passed through undecrypted from now on (the app rejected the Flutter Intercept certificate).`;
-      }
-      const ex: Exchange = {
-        id: `tls-${randomUUID()}`,
-        startedAt: f.timingEvents?.startTime ?? Date.now(),
-        method: 'CONNECT',
-        url: `https://${label}:${silent.port}/`,
-        requestHeaders: {},
-        state: 'error',
-        kind: 'tunnel',
-        grpcTunnel: true,
-        error,
-      };
-      this.store.set(ex.id, ex);
-      this.emitChange(ex);
-      return;
-    }
-    const host = f.tlsMetadata?.sniHostname ?? f.destination?.hostname ?? 'unknown-host';
-    const port = f.destination?.port;
-    const ex: Exchange = {
-      id: `tls-${randomUUID()}`,
-      startedAt: f.timingEvents?.startTime ?? Date.now(),
-      method: 'CONNECT',
-      url: `https://${host}${port && port !== 443 ? `:${port}` : ''}/`,
-      requestHeaders: {},
-      state: 'error',
-      error:
-        `TLS handshake with the app failed (${f.failureCause}). The app probably rejects the proxy's ` +
-        `certificate (certificate pinning or its own badCertificateCallback).`,
-    };
-    this.store.set(ex.id, ex);
-    this.emitChange(ex);
+    return { timings: (p) => this.book.addTimings(id, p), ...(up && up > 0 ? { uploadKbps: up } : {}) };
   }
 }
 
 export { RESPONSE_PAUSE_LIMIT_BYTES };
 
-/** A `grpc-message` / error text with the "Flutter Intercept:" prefix exactly once (REVIEW-10 #6). */
-function fiText(text: string): string {
-  return /^Flutter Intercept\b/.test(text) ? text : `Flutter Intercept: ${text}`;
-}
-
-/** CONTRACTS §19.1: what the reader of one gRPC-Web call collected (moved onto the exchange by syncGrpcWeb). */
-interface GrpcWebState {
-  rec: GrpcWebRecorder;
-  sent: number;
-  received: number;
-  /** Frames recorded / compressed messages decompressed, per direction. */
-  recorded: Record<Frame['dir'], number>;
-  compressed: Record<Frame['dir'], number>;
-  /** The call is forgotten: nothing more is queued. */
-  forgotten?: boolean;
-  syncScheduled?: boolean;
-  queue: Frame[];
-  notes: string[];
-  reqEnc?: string;
-  resEnc?: string;
-  trailers?: Record<string, string | string[]>;
-  headStatus?: { code?: number; message?: string };
-}
-
-/** REVIEW-13 #6: two handshakes closed without an alert within this window pin a host (dart:io sends no alert). */
-const PIN_STRIKE_WINDOW_MS = 60_000;
-/** REVIEW-13 #6: a learned pin lasts this long (then the host is tried decrypted again). */
-const GRPC_PIN_TTL_MS = 10 * 60 * 1000;
-/** Test seam: a shorter pin lifetime. Never set outside tests. */
-export const grpcPinTesting: { ttlMs?: number } = {};
-/** REVIEW-13 #1: work bounds of the passive gRPC-Web reader (per call and direction). */
-const GRPC_WEB_RECORD_FRAMES = 1000;
-const GRPC_WEB_DECOMPRESS_MESSAGES = 100;
-/** After the response ended: at most this long to finish reading / decompressing before the call is forgotten. */
-const GRPC_WEB_FORGET_MS = 2000;
-
-/** CONTRACTS §19.1: a gRPC-Web exchange is shown as a gRPC call. */
-function grpcWebExchangeFields(url: string, headers: HeaderBag, web: GrpcWebVariant): Partial<Exchange> {
-  let path = '/';
-  try {
-    path = new URL(url).pathname;
-  } catch {
-    /* keep / */
-  }
-  const { service, method } = parseGrpcPath(path);
-  const deadlineMs = parseGrpcTimeout(headers['grpc-timeout']);
-  return {
-    kind: 'grpc',
-    frames: [],
-    grpc: { service, method, messagesSent: 0, messagesReceived: 0, web, ...(deadlineMs !== undefined ? { deadlineMs } : {}) },
-  };
-}
-
-/** An HTTP/2 request with a gRPC content type (CONTRACTS §16.2; not gRPC-Web). */
-function isGrpcCall(req: OngoingRequest): boolean {
-  return (req as unknown as { httpVersion?: string }).httpVersion === '2.0' && isGrpcContentType((req.headers as HeaderBag)['content-type']);
-}
-
-/** A copy for listeners / getExchanges (frames is the only array the proxy keeps appending to). */
-function snapshot(ex: Exchange): Exchange {
-  const copy = { ...ex };
-  if (ex.frames) copy.frames = ex.frames.slice();
-  if (ex.timings) copy.timings = { ...ex.timings };
-  if (ex.scriptLog) copy.scriptLog = ex.scriptLog.slice();
-  return copy;
-}
-
-/** `{graphql}` for a request whose body (if any) is known; strict detection (CONTRACTS §11.2). */
-function graphqlOf(method: string, url: string, headers: HeaderBag, body?: Body): { graphql?: Exchange['graphql'] } {
-  const m = method.toUpperCase();
-  let text: string | undefined;
-  if (m !== 'GET' && m !== 'HEAD') {
-    if (!body || body.encoding !== 'utf8' || body.truncated) return {};
-    text = body.text;
-  }
-  const d = detectGraphql({ method, url, contentType: getHeader(headers, 'content-type') ?? '', body: text });
-  return d ? { graphql: d.info } : {};
-}
-
-function hasRequestBody(headers: HeaderBag): boolean {
-  return !!getHeader(headers, 'transfer-encoding') || Number(getHeader(headers, 'content-length') ?? 0) > 0;
-}
-
-/** Why a request body can't be held for a hooked route (streamed, or over the pause limit). */
-function bodyLimitReason(headers: HeaderBag): string | undefined {
-  if (getHeader(headers, 'transfer-encoding')) return 'the request body is streamed (unknown length)';
-  const cl = Number(getHeader(headers, 'content-length') ?? 0);
-  if (cl > REQUEST_PAUSE_LIMIT_BYTES) {
-    return `the request body (${(cl / MB).toFixed(1)} MB) is over the ${REQUEST_PAUSE_LIMIT_BYTES / MB} MB pause limit`;
-  }
-  return undefined;
-}
-
-function corsOptions(a: { allowOrigin?: string; allowCredentials?: boolean }): CorsOptions {
-  const o: CorsOptions = {};
-  if (typeof a.allowOrigin === 'string' && a.allowOrigin.trim()) o.allowOrigin = a.allowOrigin.trim();
-  if (typeof a.allowCredentials === 'boolean') o.allowCredentials = a.allowCredentials;
-  return o;
-}
-
-function capBody(b: unknown): Body | undefined {
-  if (!b || typeof b !== 'object') return undefined;
-  const { text, encoding, truncated } = b as Body;
-  if (typeof text !== 'string') return undefined;
-  const enc = encoding === 'base64' ? 'base64' : 'utf8';
-  const cap = enc === 'base64' ? Math.ceil((BODY_CAP_BYTES * 4) / 3) : BODY_CAP_BYTES;
-  if (text.length > cap) return { text: text.slice(0, cap), encoding: enc, truncated: true };
-  return truncated ? { text, encoding: enc, truncated: true } : { text, encoding: enc };
-}
-
-/** Copy of a record() / update() input: headers copied, bodies capped, frames capped (newest kept). */
-function sanitizeRecord(input: Partial<Exchange>, maxFrames: number): Partial<Exchange> {
-  const out: Record<string, unknown> = { ...input };
-  delete out.id;
-  if ('requestHeaders' in input) out.requestHeaders = cleanHeaders((input.requestHeaders ?? {}) as HeaderBag);
-  if ('responseHeaders' in input) out.responseHeaders = input.responseHeaders ? cleanHeaders(input.responseHeaders as HeaderBag) : undefined;
-  if ('requestBody' in input) out.requestBody = capBody(input.requestBody);
-  if ('responseBody' in input) out.responseBody = capBody(input.responseBody);
-  if ('timings' in input) out.timings = cleanTimings(input.timings);
-  if ('scriptLog' in input) {
-    out.scriptLog = Array.isArray(input.scriptLog)
-      ? input.scriptLog.slice(0, SCRIPT_LOG_MAX_LINES).map((l) => String(l).slice(0, SCRIPT_LOG_MAX_CHARS))
-      : undefined;
-  }
-  if ('frames' in input) {
-    const frames = Array.isArray(input.frames) ? input.frames.map((f) => ({ ...f })) : undefined;
-    if (frames) {
-      let bytes = frames.reduce((n, f) => n + frameCost(f), 0);
-      let drop = 0;
-      while (frames.length - drop > maxFrames || (bytes > MAX_FRAME_BYTES_PER_EXCHANGE && frames.length - drop > 1)) {
-        bytes -= frameCost(frames[drop++]);
-      }
-      if (drop) {
-        out.framesDropped = (input.framesDropped ?? 0) + drop;
-        frames.splice(0, drop);
-      }
-    }
-    out.frames = frames;
-  }
-  return out as Partial<Exchange>;
-}
-
-const TIMING_FIELDS = ['requestMs', 'pausedMs', 'delayMs', 'dnsMs', 'connectMs', 'tlsMs', 'sendMs', 'waitMs', 'receiveMs'] as const;
-
-/** A record()'s timings (e.g. from the VM HTTP profile): known phases only, integer ms ≥ 0; undefined when none. */
-function cleanTimings(t: unknown): Exchange['timings'] {
-  if (!t || typeof t !== 'object') return undefined;
-  const src = t as Record<string, unknown>;
-  const out: NonNullable<Exchange['timings']> = {};
-  for (const k of TIMING_FIELDS) {
-    const v = src[k];
-    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) out[k] = Math.round(v);
-  }
-  if (src.reused === true) out.reused = true;
-  return Object.keys(out).length ? out : undefined;
-}
-
-function copyHeaders(h: Record<string, string | string[]>): HeaderBag {
-  const out: HeaderBag = {};
-  for (const [k, v] of Object.entries(h)) out[k] = Array.isArray(v) ? v.slice() : v;
-  return out;
-}
-
-function isEmptyEdit(edit: RequestEdit | ResponseEdit): boolean {
-  return Object.values(edit).every((v) => v === undefined);
-}
-
-function validateEdit(phase: 'request' | 'response', edit: RequestEdit | ResponseEdit, ex: Exchange | undefined): void {
-  if (phase === 'request') {
-    const e = edit as RequestEdit;
-    if (e.url !== undefined) {
-      let u: URL;
-      try {
-        u = new URL(e.url);
-      } catch {
-        throw new Error(`Invalid URL: ${e.url}`);
-      }
-      if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`Unsupported URL scheme: ${u.protocol}`);
-    }
-    if (e.method !== undefined && !/^[A-Za-z]+$/.test(e.method)) throw new Error(`Invalid method: ${e.method}`);
-    if (e.body !== undefined && ex?.requestBody?.truncated) {
-      throw new Error('The request body is larger than 5 MB and was only shown in part; it cannot be edited (method, URL and headers can).');
-    }
-  } else {
-    const e = edit as ResponseEdit;
-    if (e.status !== undefined && (!Number.isInteger(e.status) || e.status < 100 || e.status > 999)) {
-      throw new Error(`Invalid status: ${e.status}`);
-    }
-    if (e.body !== undefined && ex?.responseBody?.truncated) {
-      throw new Error('The response body is larger than 5 MB and was only shown in part; it cannot be edited (status and headers can).');
-    }
-  }
-}
-
-/** Validate and copy a NetworkProfile; throws on nonsense (negative latency, dropRate outside 0–1, …). */
-function validateProfile(p: NetworkProfile): NetworkProfile {
-  if (!p || typeof p !== 'object') throw new Error('Invalid network profile');
-  if (p.kind === 'none' || p.kind === 'offline') return { kind: p.kind };
-  if (p.kind !== 'throttle') throw new Error(`Invalid network profile kind: ${(p as { kind?: unknown }).kind}`);
-  const num = (v: unknown, name: string, max: number): number | undefined => {
-    if (v === undefined) return undefined;
-    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > max) throw new Error(`Invalid network profile ${name}: ${v}`);
-    return v;
-  };
-  const latencyMs = num(p.latencyMs, 'latencyMs', 10 * 60 * 1000);
-  const kbps = num(p.kbps, 'kbps', 10_000_000);
-  const dropRate = num(p.dropRate, 'dropRate', 1);
-  const uploadKbps = num(p.uploadKbps, 'uploadKbps', 10_000_000);
-  return {
-    kind: 'throttle',
-    ...(p.preset ? { preset: p.preset } : {}),
-    ...(latencyMs !== undefined ? { latencyMs } : {}),
-    ...(kbps ? { kbps } : {}),
-    ...(dropRate !== undefined ? { dropRate } : {}),
-    ...(uploadKbps ? { uploadKbps } : {}),
-  };
-}
-
-// ---------------------------------------------------------------- v0.6.0 helpers (CONTRACTS §12)
-
-/** Identity of a sequence rule's content: its position resets when this changes. */
-function sequenceSig(rule: Rule): string {
-  try {
-    return JSON.stringify([rule.match, rule.action]);
-  } catch {
-    return String(Math.random());
-  }
-}
-
-/** Could this action need the buffered response hook (h2)? */
-function needsResponseHook(a: RuleAction | undefined): boolean {
-  if (!a) return false;
-  if (a.kind === 'mutate' || (a.kind === 'breakpoint' && a.phase !== 'request')) return true;
-  if (a.kind === 'rewrite') return !!a.response?.replaceBody?.length;
-  if (a.kind === 'script') return mentionsOnResponse(a.code);
-  if (a.kind === 'sequence') return (a.steps ?? []).some((s) => s?.action?.kind !== 'passthrough' && needsResponseHook(s?.action as RuleAction));
-  return false;
-}
-
-/** Headers a rewrite can't set or remove: framing, hop-by-hop and internal ones (the proxy manages them). */
-const REWRITE_SKIPPED = new Set([
-  'content-length',
-  'transfer-encoding',
-  'content-encoding',
-  'connection',
-  'keep-alive',
-  'proxy-connection',
-  'te',
-  'trailer',
-  'upgrade',
-  'host', // request: handled with Map Remote's Host logic (rewriteHostOf)
-  TRACE_HEADER,
-  SEND_HEADER,
-]);
-
-/** Headers a replayed response doesn't carry over: the proxy frames the body itself. */
-const REPLAY_DROPPED_HEADERS = new Set(['content-length', 'transfer-encoding', 'connection', 'keep-alive', 'proxy-connection', 'trailer', 'upgrade']);
-/** CONTRACTS §18.6: the hop marker header, and what a call that would loop gets. */
-const HOP_HEADER = 'flutter-intercept-hop';
-const GRPC_LOOP_TEXT = 'Flutter Intercept: the call would loop back to the proxy';
-/** CONTRACTS §18.6: on send()'s own silent CONNECT: `<hop nonce>[; tls][; lan]` (only accepted from loopback). */
-const INTERNAL_TUNNEL_HEADER = 'flutter-intercept-internal';
-/** grpc-timeout is clamped to this (no timer overflow, no call held for days). */
-const GRPC_SEND_MAX_DEADLINE_MS = 3_600_000;
-/** CONTRACTS §18.4: send() caps for gRPC calls. */
-const GRPC_SEND_MAX_MESSAGES = 100;
-const GRPC_SEND_MAX_BYTES = 16 * 1024 * 1024;
-const GRPC_SEND_DEADLINE_MS = 60_000;
-/** Headers a gRPC send() doesn't take from the caller (the proxy sets them, or they'd break the call). */
-const GRPC_SEND_DROPPED = new Set([
-  'host',
-  'connection',
-  'keep-alive',
-  'proxy-connection',
-  'proxy-authorization',
-  'transfer-encoding',
-  'content-length',
-  'te',
-  'trailer',
-  'upgrade',
-  'content-type',
-  'grpc-encoding',
-  'http2-settings',
-  'x-fi-id',
-  'x-fi-send',
-  'flutter-intercept-tunnel',
-  'flutter-intercept-connect-timeout',
-]);
-/** CONTRACTS §18.5: onGrpcMessage runs for at most this many messages per call. */
-const GRPC_SCRIPT_MAX_MESSAGES = 1000;
-/** `/pkg.Service/Method` of an exchange URL. */
-function grpcPathOf(url: string): string {
-  try {
-    return new URL(url).pathname;
-  } catch {
-    return '/';
-  }
-}
-/** REVIEW-11 #6: mutate decodes synchronously, so only messages up to this size, and per call at most this much work. */
-const GRPC_MUTATE_MAX_BYTES = 1024 * 1024;
-const GRPC_MUTATE_CALL_BYTES = 50 * 1024 * 1024;
-const GRPC_MUTATE_CALL_MS = 2000;
-/** CONTRACTS §17.4: recorded gRPC headers / trailers a replay doesn't send (the proxy sets them, or they'd be wrong). */
-const REPLAY_GRPC_DROPPED = new Set([
-  ...REPLAY_DROPPED_HEADERS,
-  'content-type',
-  'grpc-status',
-  'grpc-message',
-  'grpc-encoding',
-  'host',
-  'http2-settings',
-  'proxy-authorization',
-  'te',
-  'date',
-]);
-
-interface HeaderSets {
-  /** Lower-case names removed (set names are removed too, before being added). */
-  remove: string[];
-  set: Array<[string, string]>;
-}
-
-const validHeaderValue = (v: unknown): v is string => typeof v === 'string' && !/[\r\n\0]/.test(v);
-
-/** The valid header changes of a RewriteSpec (invalid names / values and managed headers are ignored). */
-function rewriteSets(spec: RewriteSpec | undefined, _response = false): HeaderSets {
-  const remove = new Set<string>();
-  const set: Array<[string, string]> = [];
-  for (const n of spec?.removeHeaders ?? []) {
-    const l = String(n).trim().toLowerCase();
-    if (HTTP_TOKEN.test(l) && !REWRITE_SKIPPED.has(l)) remove.add(l);
-  }
-  for (const [k, v] of Object.entries(spec?.setHeaders ?? {})) {
-    const l = k.trim().toLowerCase();
-    if (!HTTP_TOKEN.test(l) || REWRITE_SKIPPED.has(l) || !validHeaderValue(v)) continue;
-    set.push([k.trim(), v]);
-  }
-  return { remove: [...remove], set };
-}
-
-/** A Host header set by a request rewrite (CONTRACTS §12.6), if valid. */
-function rewriteHostOf(spec: RewriteSpec | undefined): string | undefined {
-  for (const [k, v] of Object.entries(spec?.setHeaders ?? {})) {
-    if (k.trim().toLowerCase() === 'host' && validHeaderValue(v) && v.trim()) return v.trim();
-  }
-  return undefined;
-}
-
-function rewritePairs(pairs: Array<[string, string]>, sets: HeaderSets): Array<[string, string]> {
-  const drop = new Set([...sets.remove, ...sets.set.map(([k]) => k.toLowerCase())]);
-  const out = pairs.filter(([k]) => !drop.has(String(k).toLowerCase()));
-  for (const p of sets.set) out.push([p[0], p[1]]);
-  return out;
-}
-
-function pairValue(pairs: Array<[string, string]>, name: string): string | undefined {
-  return pairs.find(([k]) => String(k).toLowerCase() === name)?.[1];
-}
-
-function pairsToObject(pairs: Array<[string, string]>): HeaderBag {
-  const out: HeaderBag = {};
-  for (const [k, v] of pairs) {
-    const l = String(k).toLowerCase();
-    const prev = out[l];
-    out[l] = prev === undefined ? v : Array.isArray(prev) ? [...prev, v] : [prev, v];
-  }
-  return out;
-}
-
-function headerPairs(h: HeaderBag): Array<[string, string]> {
-  return Object.entries(h).flatMap(([k, v]) => (v === undefined ? [] : (Array.isArray(v) ? v : [v]).map((x) => [k, x] as [string, string])));
-}
-
-const validRewriteStatus = (s: unknown): s is number => Number.isInteger(s) && (s as number) >= 200 && (s as number) <= 599;
-
-function rewriteFlow(a: RewriteAction): RewriteFlow {
-  const ok = (r: RewriteSpec['replaceBody']) => (r ?? []).some((x) => typeof x?.find === 'string' && x.find !== '');
-  return {
-    ...(a.request ? { request: a.request } : {}),
-    ...(a.response ? { response: a.response } : {}),
-    reqBody: ok(a.request?.replaceBody),
-    resBody: ok(a.response?.replaceBody),
-  };
-}
-
-function rewriteLabel(rw: RewriteFlow): string {
-  const parts: string[] = [];
-  const rq = rw.request;
-  const rs = rw.response;
-  if (rq && (rewriteSets(rq).remove.length || rewriteSets(rq).set.length || rewriteHostOf(rq))) parts.push('request headers');
-  if (rw.reqBody) parts.push('request body');
-  if (rs?.status !== undefined && validRewriteStatus(rs.status)) parts.push(`status ${rs.status}`);
-  if (rs && (rewriteSets(rs, true).remove.length || rewriteSets(rs, true).set.length)) parts.push('response headers');
-  if (rw.resBody) parts.push('response body');
-  return parts.length ? `Rewritten: ${parts.join(', ')}` : 'Rewrite (nothing to change)';
-}
-
-type ReplaceOutcome = { kind: 'skipped'; reason: string } | { kind: 'done'; decoded: Buffer; unmatched: number };
-
-/** Most a body replacement may produce (REVIEW-6 #3), whatever the input. */
-export const REWRITE_OUTPUT_MAX_BYTES = 64 * MB;
-
-/** The output budget for a body of `input` bytes: ≤ 64 MB and ≤ max(4 × input, input + 1 MB). */
-export function rewriteOutputBudget(input: number): number {
-  return Math.min(REWRITE_OUTPUT_MAX_BYTES, Math.max(4 * input, input + MB));
-}
-
-const yieldToLoop = () => new Promise<void>((r) => setImmediate(r));
-
-/**
- * Literal find / replace on a complete body's decoded UTF-8 text (≤ MAX_BODY_REPLACEMENTS, in order). Bounded
- * (REVIEW-6 #3): before each replacement the result size is computed from the occurrences (counting stops as soon
- * as it would pass the budget), and a body that would grow past `rewriteOutputBudget` is left unchanged. Yields to
- * the event loop between replacements.
- */
-async function replaceInBody(raw: Buffer, contentEncoding: string | undefined, list: NonNullable<RewriteSpec['replaceBody']>): Promise<ReplaceOutcome> {
-  let decoded: Buffer;
-  try {
-    decoded = await decodeStrict(raw, contentEncoding, RESPONSE_PAUSE_LIMIT_BYTES);
-  } catch (e) {
-    return { kind: 'skipped', reason: `it could not be decoded (${(e as Error).message})` };
-  }
-  if (!isUtf8(decoded)) return { kind: 'skipped', reason: 'it is not UTF-8 text' };
-  const budget = rewriteOutputBudget(decoded.length);
-  const bom = decoded.length >= 3 && decoded[0] === 0xef && decoded[1] === 0xbb && decoded[2] === 0xbf;
-  let text = decoded.subarray(bom ? 3 : 0).toString('utf8');
-  let bytes = decoded.length;
-  let unmatched = 0;
-  for (const r of list.slice(0, MAX_BODY_REPLACEMENTS)) {
-    if (typeof r?.find !== 'string' || r.find === '' || typeof r.replace !== 'string') continue;
-    await yieldToLoop();
-    const growth = Buffer.byteLength(r.replace, 'utf8') - Buffer.byteLength(r.find, 'utf8');
-    let count = 0;
-    for (let at = text.indexOf(r.find); at >= 0; at = text.indexOf(r.find, at + r.find.length)) {
-      count++;
-      if (growth > 0 && bytes + count * growth > budget) {
-        return {
-          kind: 'skipped',
-          reason:
-            `the replacements would make it larger than ${(budget / MB).toFixed(1)} MB ` +
-            `(at most 4 × its size or +1 MB, and never over ${REWRITE_OUTPUT_MAX_BYTES / MB} MB)`,
-        };
-      }
-      if (!r.all) break;
-    }
-    if (!count) {
-      unmatched++;
-      continue;
-    }
-    text = r.all ? text.split(r.find).join(r.replace) : text.replace(r.find, () => r.replace);
-    bytes += count * growth;
-  }
-  const out = Buffer.from(text, 'utf8');
-  return { kind: 'done', decoded: bom ? Buffer.concat([decoded.subarray(0, 3), out]) : out, unmatched };
-}
-
-// ---------------------------------------------------------------- v0.8.0 helpers (CONTRACTS §14)
-
-/** A usable client certificate (CONTRACTS §14.3). `options` go into the upstream TLS options; never logged. */
-interface LoadedCert {
-  pattern: HostPattern;
-  /** The pattern as configured (Exchange.clientCertificate). */
-  host: string;
-  options: { pfx?: Buffer; cert?: string; key?: string; passphrase?: string };
-}
-
-/** Validate one configured certificate by building a TLS context from it. Problems never quote key material. */
-export function loadClientCertificate(c: ClientCertificate): { host: string; cert?: LoadedCert; problem?: string } {
-  const host = c && typeof c === 'object' && typeof c.host === 'string' ? c.host.trim() : '';
-  if (!c || typeof c !== 'object') return { host, problem: 'Not a certificate entry.' };
-  let pattern: HostPattern;
-  try {
-    pattern = parseHostPattern(c.host);
-  } catch (e) {
-    return { host, problem: `Invalid host: ${(e as Error).message}.` };
-  }
-  const hasPfx = c.pfx !== undefined && c.pfx !== null;
-  const hasPem = c.cert !== undefined || c.key !== undefined;
-  if (hasPfx && hasPem) return { host, problem: 'Give either a PKCS#12 file (pfx) or a PEM certificate and key, not both.' };
-  if (!hasPfx && !hasPem) return { host, problem: 'No certificate: give a PKCS#12 file (pfx) or a PEM certificate and key.' };
-  if (c.passphrase !== undefined && typeof c.passphrase !== 'string') return { host, problem: 'The passphrase must be text.' };
-  const options: LoadedCert['options'] = {};
-  if (hasPfx) {
-    if (!(c.pfx instanceof Uint8Array) || !c.pfx.length) return { host, problem: 'The PKCS#12 file is empty or not binary data.' };
-    options.pfx = Buffer.from(c.pfx);
-  } else {
-    if (typeof c.cert !== 'string' || !c.cert.trim()) return { host, problem: 'The PEM certificate is missing.' };
-    if (typeof c.key !== 'string' || !c.key.trim()) return { host, problem: 'The PEM private key is missing.' };
-    options.cert = c.cert;
-    options.key = c.key;
-  }
-  if (c.passphrase) options.passphrase = c.passphrase;
-  try {
-    tls.createSecureContext(options);
-  } catch (e) {
-    return { host, problem: certProblem(e, hasPfx) };
-  }
-  return { host, cert: { pattern, host: pattern.pattern, options } };
-}
-
-/** OpenSSL's error, in words (codes stripped; it never contains the key or passphrase, but is cut short anyway). */
-function certProblem(e: unknown, pfx: boolean): string {
-  const raw = String((e as Error)?.message ?? e);
-  const what = pfx ? 'PKCS#12 file' : 'PEM certificate / key';
-  if (/mac verify failure/i.test(raw)) return `Could not open the ${what}: wrong passphrase (or a damaged file).`;
-  if (/bad decrypt|bad password|interrupted or cancelled/i.test(raw)) return `Could not decrypt the private key: wrong or missing passphrase.`;
-  if (/key values mismatch/i.test(raw)) return 'The private key does not belong to the certificate.';
-  if (/unsupported/i.test(raw) && pfx) {
-    return 'Unsupported PKCS#12 encryption (a legacy algorithm such as RC2-40); export it again with AES (openssl pkcs12 -export -keypbe AES-256-CBC -certpbe AES-256-CBC).';
-  }
-  if (/no start line|PEM routines|bad base64|DECODER routines/i.test(raw)) return `Could not read the ${what}: not valid PEM.`;
-  if (/not enough data|wrong tag|asn1|header too long/i.test(raw)) return `Could not read the ${what}: not a valid file.`;
-  const clean = raw.replace(/error:[0-9A-Fa-f]+:[^:]*:[^:]*:/g, '').trim().slice(0, 200);
-  return `Could not load the ${what}: ${clean || 'unknown error'}.`;
-}
-
-interface PacedWs {
-  readyState: number;
-  send(data: unknown, opts?: unknown, cb?: unknown): void;
-  ping(data?: unknown, mask?: unknown, cb?: unknown): void;
-  pong(data?: unknown, mask?: unknown, cb?: unknown): void;
-  close(code?: number, reason?: unknown): void;
-  pause?(): void;
-  resume?(): void;
-  once(event: 'close', l: () => void): unknown;
-}
-
-/**
- * REVIEW-8 #6: a throttled WebSocket direction may hold this many bytes waiting for the simulated link; beyond it the
- * sending side's socket is paused (TCP pushes back on the peer, as a real slow link would) until half of it drained.
- */
-export const WS_THROTTLE_QUEUE_MAX = 8 * 1024 * 1024;
-
-const byteSize = (d: unknown): number =>
-  typeof d === 'string' ? Buffer.byteLength(d) : Buffer.isBuffer(d) || d instanceof Uint8Array ? d.byteLength : d instanceof ArrayBuffer ? d.byteLength : Array.isArray(d) ? d.reduce((n: number, x) => n + byteSize(x), 0) : 0;
-
-/**
- * CONTRACTS §14.4: deliver what is sent on a `ws` socket (`target`) through a LinkQueue (latency + bandwidth), in
- * order — messages, pings / pongs and the close. Anything due after the socket closed is dropped (its callback still
- * runs). `source` is the socket whose messages the pipe forwards to `target`: it is paused while the queue is over
- * WS_THROTTLE_QUEUE_MAX; without pause support the connection is closed (1013) with `onOverflow`'s note instead.
- */
-function paceWebSocket(target: unknown, shape: LinkShape, source: unknown, onOverflow: (note: string) => void): void {
-  if (!isShaped(shape)) return;
-  const ws = target as PacedWs;
-  const src = source as PacedWs;
-  const q = new LinkQueue(shape, { lowWater: WS_THROTTLE_QUEUE_MAX / 2 });
-  const send = ws.send.bind(ws);
-  const ping = ws.ping.bind(ws);
-  const pong = ws.pong.bind(ws);
-  const close = ws.close.bind(ws);
-  const open = () => ws.readyState === WebSocket.OPEN;
-  const cbOf = (...a: unknown[]) => a.find((x) => typeof x === 'function') as ((e?: Error) => void) | undefined;
-  let paused = false;
-  let overflowed = false;
-  q.onDrain = () => {
-    if (paused) {
-      paused = false;
-      src.resume?.();
-    }
-  };
-  const check = () => {
-    if (paused || overflowed || q.queuedBytes <= WS_THROTTLE_QUEUE_MAX) return;
-    if (typeof src.pause === 'function' && typeof src.resume === 'function') {
-      paused = true;
-      src.pause();
-      return;
-    }
-    overflowed = true;
-    const mb = WS_THROTTLE_QUEUE_MAX / 1024 / 1024;
-    onOverflow(`The throttled WebSocket fell more than ${mb} MB behind; the connection was closed (1013).`);
-    q.close();
-    try {
-      close(1013, 'Throttle queue full');
-      src.close(1013, 'Throttle queue full');
-    } catch {
-      /* already closing */
-    }
-  };
-  ws.send = (data, opts, cb) => {
-    q.push(byteSize(data), () => (open() ? send(data, opts, cb) : cbOf(opts, cb)?.()));
-    check();
-  };
-  ws.ping = (data, mask, cb) => {
-    q.push(byteSize(data), () => (open() ? ping(data, mask, cb) : cbOf(mask, cb)?.()));
-    check();
-  };
-  ws.pong = (data, mask, cb) => {
-    q.push(byteSize(data), () => (open() ? pong(data, mask, cb) : cbOf(mask, cb)?.()));
-    check();
-  };
-  ws.close = (code, reason) =>
-    q.push(2 + byteSize(reason), () => {
-      try {
-        close(code, reason);
-      } catch {
-        close();
-      }
-    });
-  ws.once('close', () => {
-    q.close();
-    if (paused) src.resume?.();
-  });
-}
-
-/** `http(s)://localhost | 127.0.0.1 | [::1]` with any port: the Flutter Web dev server's own origin. */
-export function isLoopbackOrigin(origin: string): boolean {
-  try {
-    const u = new URL(origin);
-    return (u.protocol === 'http:' || u.protocol === 'https:') && (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]');
-  } catch {
-    return false;
-  }
-}
-
-const CERT_REFUSAL_MARKER = 'Refused: a client certificate is configured';
-
-function certRefusalText(host: string, origin: string): string {
-  return (
-    `${CERT_REFUSAL_MARKER} for ${host.replace(/^\[|\]$/g, '')}, and this request comes from a web page ` +
-    `(Origin ${String(origin).slice(0, 200)}), not the app. Client certificates are only presented for the app's own requests.`
-  );
-}
+export { REQUEST_PAUSE_LIMIT_BYTES } from './proxy-util';
+export { grpcPinTesting } from './connect-flow';
+export { REWRITE_OUTPUT_MAX_BYTES, rewriteOutputBudget } from './rewrite-flow';
+export { loadClientCertificate, isLoopbackOrigin } from './client-certs';
+export { WS_THROTTLE_QUEUE_MAX } from './ws-flow';

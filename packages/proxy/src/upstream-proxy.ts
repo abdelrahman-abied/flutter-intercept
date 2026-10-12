@@ -1,6 +1,7 @@
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
+import { isLoopbackHostname } from './grpc-meta';
 import * as tls from 'tls';
 import { keepAliveOptions } from './idle';
 import { normalizeIp } from './lan';
@@ -140,11 +141,8 @@ function safeDecode(s: string): string {
  */
 export function isLoopbackHost(hostIn: string): boolean {
   const h = String(hostIn ?? '').trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
-  if (h === 'localhost' || h.endsWith('.localhost')) return true;
-  if (!net.isIP(h)) return false;
-  const ip = normalizeIp(h);
-  if (net.isIPv4(ip)) return ip.startsWith('127.') || ip === '0.0.0.0';
-  return /^(?:0{0,4}:){1,7}0{0,3}[01]$/.test(ip) || ip === '::';
+  // The shared rule (grpc-meta), after folding every IPv4-mapped / hex form to IPv4.
+  return isLoopbackHostname(net.isIP(h) ? normalizeIp(h) : h);
 }
 
 const bracket = (h: string) => (net.isIPv6(h) ? `[${h}]` : h);

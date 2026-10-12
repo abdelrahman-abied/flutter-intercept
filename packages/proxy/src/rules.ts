@@ -2,6 +2,32 @@
 // (`@flutter-intercept/proxy/rules`) so its preview can never disagree with the proxy.
 import type { Exchange, Matcher, Rule, RuleAction, SequenceStep } from './types';
 import { graphqlOperationNames } from './graphql';
+import {
+  type GrpcMetadataSide,
+  GRPC_STATUS_MESSAGE_MAX_BYTES,
+  GRPC_EDIT_MAX_BYTES,
+  isBase64,
+  mapTargetProblem,
+  MAX_BODY_REPLACEMENTS,
+  MAX_GRPC_CODE,
+  MAX_SCRIPT_BYTES,
+  MAX_SEQUENCE_STEPS,
+  metadataValueProblem,
+  reservedGrpcMetadataProblem,
+  SCRIPT_TEMPLATE,
+} from './grpc-meta';
+// The shared limits / sets / helpers keep their old import path (CONTRACTS §19.4: grpc-meta is the source).
+export {
+  GRPC_REWRITE_RESERVED,
+  GRPC_TRAILER_RESERVED,
+  GRPC_STATUS_MESSAGE_MAX_BYTES,
+  GRPC_EDIT_MAX_BYTES,
+  MAX_BODY_REPLACEMENTS,
+  MAX_SCRIPT_BYTES,
+  MAX_SEQUENCE_STEPS,
+  SCRIPT_TEMPLATE,
+  targetsProxy,
+} from './grpc-meta';
 
 export { detectGraphql, graphqlOperationNames, scanOperations } from './graphql';
 export type { GraphqlDetection, GraphqlOperationRef, GraphqlRequest } from './graphql';
@@ -344,29 +370,9 @@ export function grpcApplicable(a: RuleAction | undefined): boolean {
   return GRPC_ACTIONS.has(a.kind);
 }
 
-/** Header names a grpcMock may not set: pseudo headers, the gRPC status, the content type, hop-by-hop ones. */
-const MOCK_RESERVED = new Set([
-  'content-type',
-  'grpc-status',
-  'grpc-message',
-  'connection',
-  'keep-alive',
-  'proxy-connection',
-  'transfer-encoding',
-  'upgrade',
-  'host',
-  'http2-settings',
-  'proxy-authorization',
-  'te',
-  'content-length',
-]);
-const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9a-z-]+$/;
-const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-const BASE64URL = /^[A-Za-z0-9_-]*$/;
-
 /** Why a grpcMock action can't be used (setRules refuses it), or undefined. */
 export function grpcMockProblem(a: Extract<RuleAction, { kind: 'grpcMock' }>): string | undefined {
-  if (a.code !== undefined && (!Number.isInteger(a.code) || a.code < 0 || a.code > 16)) return `gRPC status code must be 0–16, got ${String(a.code)}.`;
+  if (a.code !== undefined && (!Number.isInteger(a.code) || a.code < 0 || a.code > MAX_GRPC_CODE)) return `gRPC status code must be 0–${MAX_GRPC_CODE}, got ${String(a.code)}.`;
   if (a.message !== undefined && typeof a.message !== 'string') return 'The gRPC status message must be text.';
   for (const [what, n] of [['delayMs', a.delayMs], ['gapMs', a.gapMs]] as const) {
     if (n !== undefined && (typeof n !== 'number' || !Number.isFinite(n) || n < 0)) return `${what} must be a number ≥ 0.`;
@@ -375,96 +381,43 @@ export function grpcMockProblem(a: Extract<RuleAction, { kind: 'grpcMock' }>): s
     if (!Array.isArray(a.messages)) return 'messages must be a list of base64 protobuf payloads.';
     for (let i = 0; i < a.messages.length; i++) {
       const m = a.messages[i];
-      if (typeof m !== 'string' || (!BASE64.test(m) && !BASE64URL.test(m))) return `Message ${i + 1} is not base64.`;
+      if (typeof m !== 'string' || !isBase64(m)) return `Message ${i + 1} is not base64.`;
     }
   }
   for (const [what, h] of [['headers', a.headers], ['trailers', a.trailers]] as const) {
     if (h === undefined) continue;
     if (!h || typeof h !== 'object' || Array.isArray(h)) return `${what} must be an object of name → value.`;
     for (const [k, v] of Object.entries(h)) {
-      const lk = k.toLowerCase();
-      if (lk.startsWith(':')) return `${what}: pseudo headers such as "${k}" can't be set.`;
-      if (MOCK_RESERVED.has(lk)) return `${what}: "${k}" is set by the proxy (use code / message for the status).`;
-      if (!HEADER_NAME.test(lk)) return `${what}: "${k.slice(0, 60)}" is not a valid header name.`;
-      if (typeof v !== 'string' || /[\r\n\0]/.test(v)) return `${what}: the value of "${k}" must be text on one line.`;
+      const why = reservedGrpcMetadataProblem(k, 'mock') ?? metadataValueProblem(k, v);
+      if (why) return `${what}: ${why}`;
     }
   }
   return undefined;
 }
-
-/**
- * CONTRACTS §18.1: gRPC metadata a rewrite rule may not set or remove (status changes use a breakpoint, mutate or a
- * script; framing / deadline headers belong to the call). Pseudo headers (`:…`) are refused too.
- */
-export const GRPC_REWRITE_RESERVED: ReadonlySet<string> = new Set(['grpc-status', 'grpc-message', 'grpc-timeout', 'grpc-encoding', 'grpc-accept-encoding', 'grpc-status-details-bin']);
-/** Also refused in `setTrailers / removeTrailers` (and skipped, with a note, in header rewrites of a gRPC call). */
-export const GRPC_TRAILER_RESERVED: ReadonlySet<string> = new Set([
-  ...GRPC_REWRITE_RESERVED,
-  'content-type',
-  'te',
-  'content-length',
-  'connection',
-  'keep-alive',
-  'proxy-connection',
-  'transfer-encoding',
-  'upgrade',
-  'host',
-  'trailer',
-]);
 
 /** Why a rewrite rule's metadata changes are invalid (CONTRACTS §18.1), or undefined. */
 function rewriteMetadataProblem(a: Extract<RuleAction, { kind: 'rewrite' }>): string | undefined {
-  const sides: Array<[string, Record<string, string> | undefined, string[] | undefined, ReadonlySet<string>]> = [
-    ['request headers', a.request?.setHeaders, a.request?.removeHeaders, GRPC_REWRITE_RESERVED],
-    ['response headers', a.response?.setHeaders, a.response?.removeHeaders, GRPC_REWRITE_RESERVED],
-    ['trailers', a.response?.setTrailers, a.response?.removeTrailers, GRPC_TRAILER_RESERVED],
+  // Header rewrites apply to HTTP too: only the gRPC-wide reserved names are refused up front (content-type / te are
+  // skipped, with a note, on gRPC calls).
+  const sides: Array<[string, Record<string, string> | undefined, string[] | undefined, GrpcMetadataSide]> = [
+    ['request headers', a.request?.setHeaders, a.request?.removeHeaders, 'rewrite'],
+    ['response headers', a.response?.setHeaders, a.response?.removeHeaders, 'rewrite'],
+    ['trailers', a.response?.setTrailers, a.response?.removeTrailers, 'trailers'],
   ];
-  for (const [what, set, remove, reserved] of sides) {
+  for (const [what, set, remove, side] of sides) {
     if (set !== undefined && (typeof set !== 'object' || set === null || Array.isArray(set))) return `Rewrite ${what}: expected an object of name → value.`;
     if (remove !== undefined && !Array.isArray(remove)) return `Rewrite ${what}: expected a list of names to remove.`;
-    const names = [...Object.keys(set ?? {}), ...(remove ?? []).map(String)];
-    for (const n of names) {
-      const l = n.trim().toLowerCase();
-      if (l.startsWith(':')) return `Rewrite ${what}: pseudo headers such as "${n.slice(0, 40)}" can't be changed.`;
-      if (reserved.has(l)) return `Rewrite ${what}: "${n.slice(0, 40)}" can't be changed${GRPC_REWRITE_RESERVED.has(l) ? ' (use a breakpoint, mutate or a script for the gRPC status)' : ''}.`;
-      if (what === 'trailers' && !HEADER_NAME.test(l)) return `Rewrite trailers: "${n.slice(0, 60)}" is not a valid name.`;
+    for (const n of [...Object.keys(set ?? {}), ...(remove ?? []).map(String)]) {
+      const why = reservedGrpcMetadataProblem(n, side);
+      if (why) return `Rewrite ${what}: ${why}`;
     }
     for (const [k, v] of Object.entries(set ?? {})) {
-      if (typeof v !== 'string' || /[\r\n\0]/.test(v)) return `Rewrite ${what}: the value of "${k.slice(0, 40)}" must be text on one line.`;
-      if (k.trim().toLowerCase().endsWith('-bin') && !BASE64.test(v) && !BASE64URL.test(v.replace(/=+$/, ''))) return `Rewrite ${what}: "${k.slice(0, 40)}" is binary metadata; its value must be base64.`;
+      const why = metadataValueProblem(k, v);
+      if (why) return `Rewrite ${what}: ${why}`;
     }
   }
   return undefined;
 }
-
-/**
- * CONTRACTS §18.6: does a Map Remote target (or any URL) point at the proxy itself — a loopback / unspecified address,
- * `localhost`, or an emulator alias for this machine, on one of the proxy's ports? Such a rule would relay calls to the
- * proxy without end; hosts refuse it in validation. Pure (no DNS): names that merely resolve here are caught at run
- * time by the hop marker.
- */
-export function targetsProxy(url: string, proxyPorts: readonly number[]): boolean {
-  let u: URL;
-  try {
-    u = new URL(String(url ?? '').trim());
-  } catch {
-    return false;
-  }
-  const port = Number(u.port) || (u.protocol === 'https:' || u.protocol === 'wss:' ? 443 : 80);
-  if (!proxyPorts.includes(port)) return false;
-  const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
-  if (h === 'localhost' || h.endsWith('.localhost')) return true;
-  if (h === '10.0.2.2' || h === '10.0.3.2' || h === '0.0.0.0' || h === '::' || h === '::1') return true;
-  if (/^127\.\d+\.\d+\.\d+$/.test(h)) return true;
-  const mapped = /^(?:0{0,4}:){0,5}ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(h);
-  return !!mapped && (mapped[1].startsWith('127.') || mapped[1] === '0.0.0.0');
-}
-
-/** CONTRACTS §18.6: a status message a breakpoint edit or a script may set, at most this many UTF-8 bytes. */
-export const GRPC_STATUS_MESSAGE_MAX_BYTES = 1024;
-
-/** Largest gRPC message a breakpoint edit may carry (CONTRACTS §17.2, the hook cap). */
-export const GRPC_EDIT_MAX_BYTES = 4 * 1024 * 1024;
 
 /**
  * Why a `resume` edit of a paused gRPC call is invalid (CONTRACTS §17.2), or undefined. `pause` = what is held:
@@ -481,7 +434,7 @@ export function grpcEditProblem(pause: 'message' | 'status', edit: unknown): str
     if (e.message !== undefined && e.drop) return 'Give either a replacement message or drop, not both.';
     if (e.message === undefined && e.messageJson !== undefined) return 'messageJson must be encoded by the host (schema) before it reaches the proxy.';
     if (e.message !== undefined) {
-      if (typeof e.message !== 'string' || (!BASE64.test(e.message) && !BASE64URL.test(e.message))) return 'The replacement message is not base64.';
+      if (typeof e.message !== 'string' || !isBase64(e.message)) return 'The replacement message is not base64.';
       if (Math.floor((e.message.length * 3) / 4) > GRPC_EDIT_MAX_BYTES + 3) return `The replacement message is over ${GRPC_EDIT_MAX_BYTES / 1024 / 1024} MB.`;
     }
     return undefined;
@@ -490,7 +443,7 @@ export function grpcEditProblem(pause: 'message' | 'status', edit: unknown): str
   if (e.status !== undefined) {
     const st = e.status as { code?: unknown; message?: unknown };
     if (!st || typeof st !== 'object') return 'status must be {code, message?}.';
-    if (!Number.isInteger(st.code) || (st.code as number) < 0 || (st.code as number) > 16) return `gRPC status code must be 0–16, got ${String(st.code)}.`;
+    if (!Number.isInteger(st.code) || (st.code as number) < 0 || (st.code as number) > MAX_GRPC_CODE) return `gRPC status code must be 0–${MAX_GRPC_CODE}, got ${String(st.code)}.`;
     if (st.message !== undefined && typeof st.message !== 'string') return 'The status message must be text.';
     if (typeof st.message === 'string' && utf8Length(st.message) > GRPC_STATUS_MESSAGE_MAX_BYTES) return `The status message is over ${GRPC_STATUS_MESSAGE_MAX_BYTES / 1024} KB.`;
   }
@@ -614,23 +567,6 @@ function grpcMockFromExchange(e: Exchange): Extract<RuleAction, { kind: 'grpcMoc
   };
 }
 
-/** A starting point for a script rule (CONTRACTS §13.4): both hooks, changing nothing until edited. */
-export const SCRIPT_TEMPLATE = `// Runs before the request goes to the server. Return the request (edited), { response: { status, headers, body } }
-// to answer it here, or nothing to leave it unchanged. Synchronous only; context.log(...) shows in the request's details.
-function onRequest(request, context) {
-  // request.headers['x-debug'] = '1';
-  // return request;
-}
-
-// Runs before the app gets the response. Return the response (edited) or nothing.
-function onResponse(response, request, context) {
-  // if (response.status === 200 && response.body) {
-  //   const data = JSON.parse(response.body);
-  //   context.log('items', data.items?.length);
-  // }
-}
-`;
-
 /** One recorded SSE event as event-stream text. */
 function sseEventText(f: { event?: string; id?: string; text?: string }): string {
   let out = '';
@@ -644,8 +580,6 @@ function sseEventText(f: { event?: string; id?: string; text?: string }): string
 
 /** Actions a sequence step may not use. */
 const NOT_A_STEP: ReadonlySet<string> = new Set(['sequence', 'breakpoint', 'script']);
-/** At most this many literal body replacements per rewrite side (CONTRACTS §12.6). */
-export const MAX_BODY_REPLACEMENTS = 20;
 
 /** What a sequence step does: an action, or `undefined` = the real server (`passthrough`). */
 export type StepAction = Exclude<SequenceStep['action'], { kind: 'passthrough' }> | undefined;
@@ -705,19 +639,11 @@ function globPrefix(pattern: string): string | undefined {
 const WS_TO_HTTP: Record<string, string> = { 'ws:': 'http:', 'wss:': 'https:' };
 const HTTP_TO_WS: Record<string, string> = { 'http:': 'ws:', 'https:': 'wss:' };
 
-/** Parse a Map Remote target (`to`): an absolute http(s) / ws(s) URL without credentials or fragment. */
+/** Parse a Map Remote target (`to`), checked by the shared `mapTargetProblem` (ws(s):// allowed inside the proxy). */
 export function parseMapTarget(to: string): URL {
-  let t: URL;
-  try {
-    t = new URL(String(to ?? '').trim());
-  } catch {
-    throw new Error(`Map Remote target is not a URL: ${JSON.stringify(String(to ?? '')).slice(0, 200)}`);
-  }
-  if (!['http:', 'https:', 'ws:', 'wss:'].includes(t.protocol)) throw new Error(`Map Remote target must be http(s)://, got ${t.protocol}`);
-  if (!t.hostname) throw new Error('Map Remote target has no host');
-  if (t.username || t.password) throw new Error('Map Remote target must not contain credentials');
-  if (t.hash) throw new Error('Map Remote target must not contain a #fragment');
-  return t;
+  const why = mapTargetProblem(to, { allowWs: true });
+  if (why) throw new Error(why);
+  return new URL(String(to).trim());
 }
 
 /**
@@ -753,8 +679,6 @@ export function mapRemoteUrl(original: string, matchUrl: string, to: string): st
 
 // ---------------------------------------------------------------- v0.7.0 (CONTRACTS §13.4)
 
-/** Largest script source (UTF-8 bytes) a `script` rule may carry. */
-export const MAX_SCRIPT_BYTES = 256 * 1024;
 
 /** UTF-8 length of a string without Buffer / TextEncoder (this module also runs in the webview). */
 function utf8Length(s: string): number {
@@ -782,6 +706,7 @@ function actionProblem(a: RuleAction | undefined): string | undefined {
   }
   if (a.kind === 'sequence') {
     if (!Array.isArray(a.steps) || a.steps.length === 0) return 'A sequence needs at least one step.';
+    if (a.steps.length > MAX_SEQUENCE_STEPS) return `A sequence can have at most ${MAX_SEQUENCE_STEPS} steps.`;
     for (let i = 0; i < a.steps.length; i++) {
       const s = a.steps[i]?.action;
       if (!s || typeof s !== 'object') return `Sequence step ${i + 1} has no action.`;

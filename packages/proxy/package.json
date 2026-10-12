@@ -37,6 +37,10 @@
     "./hosts": {
       "types": "./dist/hosts.d.ts",
       "default": "./dist/hosts.js"
+    },
+    "./grpc-meta": {
+      "types": "./dist/grpc-meta.d.ts",
+      "default": "./dist/grpc-meta.js"
     }
   },
   "typesVersions": {
@@ -61,6 +65,9 @@
       ],
       "hosts": [
         "dist/hosts.d.ts"
+      ],
+      "grpc-meta": [
+        "dist/grpc-meta.d.ts"
       ]
     }
   },

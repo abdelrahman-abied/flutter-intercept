@@ -6,8 +6,9 @@ import type { Exchange, GrpcProxyCodec, InterceptProxy, ReplayEntry, Rule } from
 import { decodeGrpcMessage, grpcHookTesting, grpcTransformStats } from '../src/grpc';
 import { lanIPv4Addresses, lanTesting } from '../src/lan';
 import { randomBytes } from 'crypto';
-import { nextExchange, sleep, startProxy } from './helpers';
+import { nextExchange, sleep, startProxy, notesOf } from './helpers';
 import { frame, grpcCall, h2cSession, startGrpcServer, type GrpcServer } from './grpc-helpers';
+import { TEST_INTERNALS } from '../src/intercept-proxy';
 
 const C = http2.constants;
 const rule = (id: string, url: string, action: Rule['action']): Rule => ({ id, enabled: true, match: { url }, action });
@@ -182,13 +183,13 @@ describe('gRPC breakpoints', () => {
     const r = await grpcCall(session, '/t.Echo/Unary', [big]);
     expect(r.messages[0].length).toBe(big.length + 5);
     let ex = await waitFor(proxy, doneGrpc('/t.Echo/Unary'));
-    expect(ex.error).toMatch(/over 4 MB was forwarded unchanged/);
+    expect(notesOf(ex)).toMatch(/over 4 MB was forwarded unchanged/);
     expect(ex.frames?.find((f) => f.dir === 'send')).toMatchObject({ size: big.length, truncated: true });
     grpcHookTesting.heldTotalCap = 1;
     const r2 = await grpcCall(session, '/t.Echo/Unary', ['small']);
     expect(r2.messages.map(String)).toEqual(['echo:small']);
     ex = await waitFor(proxy, (e) => doneGrpc('/t.Echo/Unary')(e) && e.id !== ex.id);
-    expect(ex.error).toMatch(/too much gRPC data is held right now/); // REVIEW-11 #4: refused when collecting starts
+    expect(notesOf(ex)).toMatch(/too much gRPC data is held right now/); // REVIEW-11 #4: refused when collecting starts
   });
 
   it('gzip messages are paused decompressed; an edit goes out uncompressed', async () => {
@@ -251,15 +252,15 @@ describe('gRPC mutate through the injected codec', () => {
     let r = await grpcCall(session, '/t.Echo/Unary', ['{"n":1}']);
     expect(r.messages.map(String)).toEqual(['echo:{"n":1}']);
     let ex = await waitFor(proxy, doneGrpc('/t.Echo/Unary'));
-    expect(ex.error).toMatch(/mutate: no schema for \/t\.Echo\/Unary/);
+    expect(notesOf(ex)).toMatch(/mutate: no schema for \/t\.Echo\/Unary/);
     proxy.setGrpcCodec(codec);
     r = await grpcCall(session, '/t.Echo/Unary', ['{"n":1}']);
     expect(r.messages.map(String)).toEqual(['echo:{"n":1}']);
     ex = await waitFor(proxy, (e) => doneGrpc('/t.Echo/Unary')(e) && e.id !== ex.id);
-    expect(ex.error).toMatch(/mutate: \$\.n: expected an int32, got a string; the original message was forwarded/);
+    expect(notesOf(ex)).toMatch(/mutate: \$\.n: expected an int32, got a string; the original message was forwarded/);
     const s = await grpcCall(session, '/t.Echo/ServerStream', ['1']);
     expect(s.messages.map(String)).toEqual(['msg0']);
-    expect((await waitFor(proxy, doneGrpc('/t.Echo/ServerStream'))).error).toMatch(/no schema for \/t\.Echo\/ServerStream/);
+    expect(notesOf(await waitFor(proxy, doneGrpc('/t.Echo/ServerStream')))).toMatch(/no schema for \/t\.Echo\/ServerStream/);
   });
 });
 
@@ -327,7 +328,7 @@ describe('replay of recorded gRPC calls', () => {
 
 // ---------------------------------------------------------------- REVIEW-11 regressions
 
-const internals = (p: InterceptProxy) => p as unknown as { grpcHeld: number; paused: Map<string, unknown> };
+const internals = (p: InterceptProxy) => p[TEST_INTERNALS]();
 
 describe('REVIEW-11', () => {
   it('#4 collected / held hook bytes stay within the budget; beyond it messages stream through with a note', async () => {
@@ -344,7 +345,7 @@ describe('REVIEW-11', () => {
     await sleep(800);
     expect(internals(proxy).grpcHeld).toBeLessThanOrEqual(10 * 1024 * 1024);
     expect(internals(proxy).grpcHeld).toBeGreaterThan(0);
-    expect(proxy.getExchanges().some((e) => (e.error ?? '').includes('too much gRPC data is held'))).toBe(true);
+    expect(proxy.getExchanges().some((e) => notesOf(e).includes('too much gRPC data is held'))).toBe(true);
     for (const s of streams) s.close(C.NGHTTP2_CANCEL);
     await sleep(200);
     expect(internals(proxy).grpcHeld).toBe(0);
@@ -390,11 +391,11 @@ describe('REVIEW-11', () => {
     const big = await grpcCall(session, '/t.Echo/Unary', [Buffer.alloc(1024 * 1024 + 10, 65)]);
     expect(big.messages[0].length).toBe(1024 * 1024 + 15);
     expect(calls).toBe(0);
-    expect((await waitFor(proxy, doneGrpc('/t.Echo/Unary'))).error).toMatch(/over 1 MB are forwarded unchanged/);
+    expect(notesOf(await waitFor(proxy, doneGrpc('/t.Echo/Unary')))).toMatch(/over 1 MB are forwarded unchanged/);
     const s = await grpcCall(session, '/t.Echo/ServerStream', ['5']);
     expect(calls).toBe(3); // 3 × 0.7 s > 2 s, then stopped
     expect(s.messages.map(String)).toEqual(['m:msg0', 'm:msg1', 'm:msg2', 'msg3', 'msg4']);
-    expect((await waitFor(proxy, doneGrpc('/t.Echo/ServerStream'))).error).toMatch(/mutate: stopped for this call/);
+    expect(notesOf(await waitFor(proxy, doneGrpc('/t.Echo/ServerStream')))).toMatch(/mutate: stopped for this call/);
   }, 20_000);
 
   it('#7 replay never answers across origins (the fallback applies)', async () => {

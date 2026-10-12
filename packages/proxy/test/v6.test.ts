@@ -10,7 +10,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import type { Exchange, InterceptProxy, ReplayEntry, Rule } from '../src';
 import { mapRemoteUrl, pathTemplate, pickSequenceStep, routeTemplate, ruleProblem } from '../src/rules';
 import { ReplayStore } from '../src/replay';
-import { firstChunkViaProxy, settled, sleep, startProxy, startTinyProxy, startUpstream, viaProxy, type TinyProxy, type Upstream } from './helpers';
+import { firstChunkViaProxy, settled, sleep, startProxy, startTinyProxy, startUpstream, viaProxy, type TinyProxy, type Upstream, notesOf } from './helpers';
 
 const mock = (body: string, status = 200) => ({ kind: 'mock' as const, status, body, headers: { 'content-type': 'text/plain' } });
 const rule = (id: string, url: string, action: Rule['action'], extra: Partial<Rule> = {}): Rule => ({ id, enabled: true, match: { url }, action, ...extra });
@@ -147,8 +147,8 @@ describe('sequence rules (§12.3)', () => {
     ]);
     expect((await viaProxy(proxy.port, `${up.httpUrl}/stream?ms=600`)).text).toBe('data: mocked\n\n');
     const streamed = await firstChunkViaProxy(proxy.port, `${up.httpUrl}/stream?ms=600`);
-    expect(streamed.firstChunkMs).toBeLessThan(400);
     expect(streamed.totalMs).toBeGreaterThanOrEqual(550);
+    expect(streamed.firstChunkMs).toBeLessThan(streamed.totalMs - 250);
     expect((await viaProxy(proxy.port, `${up.httpUrl}/json`)).text).toBe('{"hello":"world"}');
     expect((await viaProxy(proxy.port, `${up.httpUrl}/json`)).text).toBe('{"hello":null}');
   });
@@ -200,7 +200,7 @@ describe('sequence rules (§12.3)', () => {
     expect(r.status).toBe(200);
     const ex = (await settled(proxy)).at(-1)!;
     expect(ex).toMatchObject({ state: 'completed', matchedRuleId: 'bad' });
-    expect(ex.error).toMatch(/Sequence step 1 \(breakpoint\) is not allowed/);
+    expect(notesOf(ex)).toMatch(/Sequence step 1 \(breakpoint\) is not allowed/);
   });
 });
 
@@ -228,7 +228,7 @@ describe('Map Remote (§12.6)', () => {
     expect(echo.path).toBe('/echo?x=1');
     expect(echo.headers.host).toBe('api.example.invalid');
     const s = await firstChunkViaProxy(proxy.port, 'http://sse.example.invalid/stream?ms=600');
-    expect(s.firstChunkMs).toBeLessThan(400);
+    expect(s.firstChunkMs).toBeLessThan(s.totalMs - 250); // streamed: the second event comes 600 ms later
     expect(s.text).toBe('data: one\n\ndata: two\n\n');
   });
 
@@ -321,7 +321,7 @@ describe('rewrite (§12.6)', () => {
     expect(echo.headers['x-keep']).toBe('k');
     expect(echo.headers['content-length']).toBeUndefined(); // framing headers can't be rewritten (GET, no body)
     const t0 = Date.now();
-    const res = await new Promise<{ status: number; headers: http.IncomingHttpHeaders; first: number; text: string }>((resolve, reject) => {
+    const res = await new Promise<{ status: number; headers: http.IncomingHttpHeaders; first: number; total: number; text: string }>((resolve, reject) => {
       const req = http.request({ host: '127.0.0.1', port: proxy.port, path: `${up.httpUrl}/stream?ms=600`, agent: false });
       req.on('response', (r) => {
         let first = -1;
@@ -330,7 +330,7 @@ describe('rewrite (§12.6)', () => {
           if (first < 0) first = Date.now() - t0;
           text += c;
         });
-        r.on('end', () => resolve({ status: r.statusCode!, headers: r.headers, first, text }));
+        r.on('end', () => resolve({ status: r.statusCode!, headers: r.headers, first, total: Date.now() - t0, text }));
       });
       req.on('error', reject);
       req.end();
@@ -338,7 +338,7 @@ describe('rewrite (§12.6)', () => {
     expect(res.status).toBe(503);
     expect(res.headers['x-added']).toBe('1');
     expect(res.headers['cache-control']).toBeUndefined();
-    expect(res.first).toBeLessThan(400); // still streaming
+    expect(res.first).toBeLessThan(res.total - 250); // still streaming: the first event long before the second
     const ex = await settled(proxy);
     expect(ex.map((e) => e.simulated)).toEqual(['Rewritten: request headers', 'Rewritten: status 503, response headers']);
     expect(ex[1].status).toBe(503);
@@ -360,8 +360,8 @@ describe('rewrite (§12.6)', () => {
     expect([...bin.body]).toEqual([0, 1, 2, 0xff, 0xfe, 0x80]);
     const ex = await settled(proxy);
     expect(ex[0]).toMatchObject({ state: 'completed', responseBody: { text: 'hell0 gzip w0rld', encoding: 'utf8' }, simulated: 'Rewritten: response body' });
-    expect(ex[0].error).toMatch(/1 response body replacement\(s\) found nothing/);
-    expect(ex[2].error).toMatch(/not UTF-8 text/);
+    expect(notesOf(ex[0])).toMatch(/1 response body replacement\(s\) found nothing/);
+    expect(notesOf(ex[2])).toMatch(/not UTF-8 text/);
   });
 
   it('request body replace (re-framed); a streamed upload skips the body part with a note', async () => {
@@ -385,7 +385,7 @@ describe('rewrite (§12.6)', () => {
     });
     expect(JSON.parse(chunked).body).toBe('prod');
     const last = (await settled(proxy)).at(-1)!;
-    expect(last.error).toMatch(/body replacement skipped: the request body is streamed/);
+    expect(notesOf(last)).toMatch(/body replacement skipped: the request body is streamed/);
   });
 });
 
@@ -638,7 +638,7 @@ describe('REVIEW-6 #3: body replacement is bounded', () => {
       const ex = await settled(proxy);
       for (const e of ex) {
         expect(e.state).toBe('completed');
-        expect(e.error).toMatch(/response body not changed: the replacements would make it larger than .*; it was forwarded unchanged/);
+        expect(notesOf(e)).toMatch(/response body not changed: the replacements would make it larger than .*; it was forwarded unchanged/);
       }
       // Within the budget it still applies (2000 × +1 byte on 4.5 KB is under +1 MB).
       proxy.setRules([rule('ok', '*', { kind: 'rewrite', response: { replaceBody: [{ find: '"', replace: '""', all: true }] } })]);

@@ -31,8 +31,9 @@ import {
 import { grpcPoolTesting } from '../src/grpc-upstream';
 import { grpcTesting } from '../src/silent';
 import { findOnSocketChain, lanIPv4Addresses, lanTesting, SOCKET_SELF } from '../src/lan';
-import { nextExchange, selfSignedCert, sleep, startProxy, startTinyProxy, startUpstream, viaProxy } from './helpers';
+import { nextExchange, selfSignedCert, sleep, startProxy, startTinyProxy, startUpstream, viaProxy, notesOf } from './helpers';
 import { frame, grpcCall, h2cSession, silentSocket, startGrpcServer, tlsSession, type GrpcServer } from './grpc-helpers';
+import { TEST_INTERNALS } from '../src/intercept-proxy';
 
 const C = http2.constants;
 const rule = (id: string, url: string, action: Rule['action'], extra: Partial<Rule> = {}): Rule => ({ id, enabled: true, match: { url }, action, ...extra });
@@ -771,7 +772,7 @@ describe('rules on gRPC calls', () => {
     expect(r.grpcStatus).toBe(5);
     const ex = await waitFor(proxy, doneGrpc('/t.Echo/Unary'));
     expect(ex.matchedRuleId).toBe('g');
-    expect(ex.error).toMatch(/Mock rule does not apply to gRPC calls/);
+    expect(notesOf(ex)).toMatch(/Mock rule does not apply to gRPC calls/);
     // HTTP: a grpcMock rule is skipped
     const http1 = await startUpstream();
     try {
@@ -789,7 +790,7 @@ describe('rules on gRPC calls', () => {
       const p2 = await startProxy();
       const s = await h2cSession(p2.port, target);
       await grpcCall(s, '/t.Echo/Unary', ['x']);
-      const pool = (p2 as unknown as { grpcPool: { size: number } }).grpcPool;
+      const pool = p2[TEST_INTERNALS]().grpcPool!;
       expect(pool.size).toBe(1);
       await sleep(300);
       expect(pool.size).toBe(0);
@@ -949,7 +950,7 @@ describe('self-check fallback', () => {
       const ex = await waitFor(proxy, (e) => e.kind === 'tunnel' && e.state !== 'pending');
       expect(ex).toMatchObject({ grpcTunnel: true, url: `http://127.0.0.1:${up.port}/` });
       // the note is on the tunnel while it is open (a teardown error may replace it at the end)
-      expect(snapshots.some((e) => e.kind === 'tunnel' && /internals missing/.test(e.error ?? ''))).toBe(true);
+      expect(snapshots.some((e) => e.kind === 'tunnel' && /internals missing/.test(notesOf(e)))).toBe(true);
       expect(proxy.getExchanges().some((e) => e.kind === 'grpc')).toBe(false);
     } finally {
       await proxy.stop();
@@ -1089,7 +1090,7 @@ describe.skipIf(!LAN_IP)('silent tunnels from LAN clients', () => {
     local.destroy();
     expect(up.connections).toBe(2);
     // closeLan drops the gate's sessions
-    const pool = (proxy as unknown as { grpcPool: { size: number } }).grpcPool;
+    const pool = proxy[TEST_INTERNALS]().grpcPool!;
     expect(pool.size).toBe(2);
     await proxy.closeLan();
     await sleep(50);

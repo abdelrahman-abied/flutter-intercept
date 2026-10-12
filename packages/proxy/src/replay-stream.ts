@@ -3,7 +3,8 @@
 import type { Frame } from './types';
 
 /** Gaps between replayed frames are kept, up to this (a recording paused for minutes replays in seconds). */
-export const MAX_REPLAY_GAP_MS = 5000;
+export { MAX_REPLAY_GAP_MS } from './grpc-meta';
+import { MAX_REPLAY_GAP_MS } from './grpc-meta';
 /** A redacted binary frame (no payload kept) is replayed as this many zero bytes at most (its recorded size). */
 export const REDACTED_BINARY_MAX = 64 * 1024;
 

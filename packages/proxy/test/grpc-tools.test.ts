@@ -9,7 +9,7 @@ import { tunnelTesting } from '../src/tunnel';
 import * as dns from 'dns';
 import { decodeGrpcMessage } from '../src/grpc';
 import { lanIPv4Addresses, lanTesting } from '../src/lan';
-import { nextExchange, sleep, startProxy } from './helpers';
+import { nextExchange, sleep, startProxy, notesOf } from './helpers';
 import { grpcCall, h2cSession, startGrpcServer, type GrpcServer } from './grpc-helpers';
 
 const rule = (id: string, url: string, action: Rule['action']): Rule => ({ id, enabled: true, match: { url }, action });
@@ -101,7 +101,7 @@ describe('rewrite on gRPC calls', () => {
     expect(ex.simulated).toBe('Rewritten: metadata');
     expect(ex.requestHeaders['x-added']).toBe('yes');
     expect(ex.responseTrailers?.['x-t2']).toBe('v2');
-    expect(ex.error).toMatch(/"content-type" can't be changed on a gRPC call/);
+    expect(notesOf(ex)).toMatch(/"content-type" can't be changed on a gRPC call/);
   });
 
   it('a trailers-only answer gets the trailer changes in its one frame; replaceBody / status are noted, metadata still applied', async () => {
@@ -116,7 +116,7 @@ describe('rewrite on gRPC calls', () => {
     expect(r).toMatchObject({ trailersOnly: true, grpcStatus: 14 });
     expect(r.headers?.['x-t']).toBe('only');
     const ex = await waitFor(proxy, doneGrpc('/t.Echo/Fail'));
-    expect(ex.error).toMatch(/body replacements and the status don't apply to gRPC calls/);
+    expect(notesOf(ex)).toMatch(/body replacements and the status don't apply to gRPC calls/);
   });
 });
 

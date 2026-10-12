@@ -259,8 +259,13 @@ function attach(id: string, req: http.IncomingMessage, raw: http.ServerResponse,
     return r;
   } as typeof tracked.writeHead;
 
-  const write = tracked.write;
-  const end = tracked.end;
+  // PERF-1 #4: write through the response's own (prototype) methods, not mockttp's tracking wrappers: mockttp then
+  // never copies the body into its tracking stream (nothing reads it — no 'response' listener), so each response is
+  // captured once, by us, bounded. Falls back to the tracked methods if the layout is unexpected.
+  const proto = Object.getPrototypeOf(tracked) as { write?: unknown; end?: unknown } | null;
+  const ownWrapped = Object.prototype.hasOwnProperty.call(tracked, 'write') && Object.prototype.hasOwnProperty.call(tracked, 'end');
+  const write = ownWrapped && typeof proto?.write === 'function' ? (proto.write as typeof tracked.write) : tracked.write;
+  const end = ownWrapped && typeof proto?.end === 'function' ? (proto.end as typeof tracked.end) : tracked.end;
   let shaper: ResponseShaper | undefined;
   const shaped = (): ResponseShaper | undefined => {
     if (!tap.shaping) return undefined;

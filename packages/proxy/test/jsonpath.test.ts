@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { applyOps, formatPath, parsePath, SELECT_LIMIT, selectPath, type PathSegment } from '../src/jsonpath';
 import { MAX_JSON_DEPTH, parseJsonText, RawNumber, stringifyJsonText } from '../src/json-text';
 import { mutateLabel } from '../src/mutate';
+import { budget } from './timing';
 
 describe('parsePath', () => {
   it('parses every form of the grammar', () => {
@@ -328,7 +329,7 @@ describe('REVIEW-4 bounds', () => {
     const few = selectPath(body, path, { limit: 20_000 });
     expect(few.length).toBe(20_000);
     expect(few[19_999].path).toBe('$' + '[0]'.repeat(299) + '[19999]');
-    expect(performance.now() - t0).toBeLessThan(1000); // was 4.3 s / 4.3 GB
+    expect(performance.now() - t0).toBeLessThan(budget(1000)); // was 4.3 s / 4.3 GB
     expect(SELECT_LIMIT).toBe(10_000);
   });
 

@@ -4,7 +4,8 @@ import { isUtf8 } from 'buffer';
 import type { Frame } from './types';
 import type { SseEvent } from './sse';
 
-export const FRAME_PAYLOAD_CAP = 64 * 1024;
+export { FRAME_PAYLOAD_CAP } from './grpc-meta';
+import { FRAME_PAYLOAD_CAP } from './grpc-meta';
 export const DEFAULT_MAX_FRAMES = 500;
 /** Per-exchange byte budget for stored frames (frameCost), oldest dropped beyond it (REVIEW-5 #4). */
 export const MAX_FRAME_BYTES_PER_EXCHANGE = 8 * 1024 * 1024;
@@ -52,7 +53,38 @@ export function sseFrame(e: SseEvent, at = Date.now()): Frame {
   return f;
 }
 
-/** What a stored frame costs against the body byte budget (its kept payload + names). */
+/**
+ * PERF-1 #3: a gRPC message frame keeps its raw bytes here until it is first shown (snapshot / emit), so messages that
+ * are trimmed away before that are never base64-encoded.
+ */
+export const RAW_PAYLOAD = Symbol('flutter-intercept.raw-payload');
+type LazyFrame = Frame & { [RAW_PAYLOAD]?: Buffer };
+
+/** A frame whose `base64` is filled in from `bytes` on first `materializeFrame`. */
+export function lazyPayloadFrame(f: Frame, bytes: Buffer): Frame {
+  if (bytes.length) (f as LazyFrame)[RAW_PAYLOAD] = bytes;
+  return f;
+}
+
+/** Fill in a lazy frame's `base64` (once). Returns the frame. */
+export function materializeFrame(f: Frame): Frame {
+  const raw = (f as LazyFrame)[RAW_PAYLOAD];
+  if (raw) {
+    f.base64 = raw.toString('base64');
+    delete (f as LazyFrame)[RAW_PAYLOAD];
+  }
+  return f;
+}
+
+/**
+ * PERF-1 #9: the measured per-frame overhead (object, fields, array slot) is about 140 B, not 32: small frames were
+ * under-counted 1.6× against the store's byte budget.
+ */
+export const FRAME_OVERHEAD_BYTES = 150;
+
+/** What a stored frame costs against the body byte budget (its kept payload + names + object overhead). */
 export function frameCost(f: Frame): number {
-  return (f.text?.length ?? 0) + (f.base64?.length ?? 0) + (f.event?.length ?? 0) + (f.id?.length ?? 0) + 32;
+  const raw = (f as LazyFrame)[RAW_PAYLOAD];
+  const payload = raw ? Math.ceil(raw.length / 3) * 4 : (f.base64?.length ?? 0);
+  return (f.text?.length ?? 0) + payload + (f.event?.length ?? 0) + (f.id?.length ?? 0) + FRAME_OVERHEAD_BYTES;
 }

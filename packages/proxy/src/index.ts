@@ -99,6 +99,9 @@ export {
   GRPC_HELD_TOTAL_CAP_BYTES,
 } from './grpc';
 export type { GrpcBreakerEvent } from './grpc';
+// CONTRACTS §19.4: the shared node-free metadata / limits module (also `@flutter-intercept/proxy/grpc-meta`)
+export * as grpcMeta from './grpc-meta';
+export { grpcCodeName, isLoopbackHostname, isThisMachine, mapTargetProblem, reservedGrpcMetadataProblem, scriptTemplate } from './grpc-meta';
 // v0.13.0 (CONTRACTS §19.1)
 export { grpcWebVariant, parseGrpcWebTrailers } from './grpc-web';
 export type { GrpcWebVariant } from './grpc-web';

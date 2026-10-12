@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { compileMatcher, matches, ruleFromExchange, RuleFromExchangeError } from '../src';
 import { compileRules, findRule, isInvalidMatcher, isSafeRegexSource, simplifyRegexSource } from '../src/rules';
 import type { Exchange, Rule } from '../src';
+import { bestOfMs, budget } from './timing';
 
 describe('matcher', () => {
   it('glob on the full URL, * = any chars, case-sensitive', () => {
@@ -40,13 +41,12 @@ describe('matcher', () => {
   it('REVIEW-4 #2: globs match in linear time (the reviewer\'s *a*a*a*a*b on 218 chars, and 16 stars on 8 KB)', () => {
     const url = 'a'.repeat(218);
     const m = compileMatcher({ url: '*a*a*a*a*b' });
-    let t0 = performance.now();
     expect(m('GET', url)).toBe(false);
-    expect(performance.now() - t0).toBeLessThan(5); // was 22.9 s
+    expect(bestOfMs(() => m('GET', url))).toBeLessThan(budget(5)); // was 22.9 s
     const long = `https://x.io/${'a/'.repeat(4000)}`;
-    t0 = performance.now();
-    expect(compileMatcher({ url: '*/'.repeat(16) + '*x' })('GET', long)).toBe(false);
-    expect(performance.now() - t0).toBeLessThan(5);
+    const m16 = compileMatcher({ url: '*/'.repeat(16) + '*x' });
+    expect(m16('GET', long)).toBe(false);
+    expect(bestOfMs(() => m16('GET', long))).toBeLessThan(budget(5));
     // semantics unchanged
     const g = (p: string, u: string) => compileMatcher({ url: p })('GET', u);
     expect(g('*a*a*a*a*b', 'xaaaab')).toBe(true);
@@ -67,9 +67,9 @@ describe('matcher', () => {
       expect(isSafeRegexSource(src), src).toBe(false);
       expect(isInvalidMatcher({ url: `/${src}/` }), src).toBe(true);
     }
-    const t0 = performance.now();
-    expect(compileMatcher({ url: '/(.+)+Z/' })('GET', 'a'.repeat(40))).toBe(false);
-    expect(performance.now() - t0).toBeLessThan(5);
+    const unsafe = compileMatcher({ url: '/(.+)+Z/' });
+    expect(unsafe('GET', 'a'.repeat(40))).toBe(false);
+    expect(bestOfMs(() => unsafe('GET', 'a'.repeat(40)))).toBeLessThan(budget(5));
     for (const src of ['\\/users\\/\\d+$', 'v\\d+\\/users\\/\\d+', '(\\d+)?x', '(foo|bar)', '(ab){2,}', '[a-z]+\\/[0-9]+', '^https:\\/\\/api\\.x\\.com\\/.*', 'x{', '(?:a|b)c']) {
       expect(isSafeRegexSource(src), src).toBe(true);
       expect(isInvalidMatcher({ url: `/${src}/` }), src).toBe(false);

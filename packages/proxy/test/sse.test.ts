@@ -11,7 +11,7 @@ import type { AddressInfo } from 'net';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Exchange, InterceptProxy } from '../src';
 import { SseParser, type SseEvent } from '../src/sse';
-import { nextExchange, sleep, startProxy, viaProxy } from './helpers';
+import { nextExchange, sleep, startProxy, viaProxy, notesOf } from './helpers';
 
 function parseAll(chunks: Array<string | Buffer>): SseEvent[] {
   const out: SseEvent[] = [];
@@ -203,17 +203,20 @@ describe('SSE through the proxy', () => {
 
   it('flushes the head of an event stream at once (the app does not wait for the first event)', async () => {
     const t0 = Date.now();
-    const headAt = await new Promise<number>((resolve, reject) => {
+    const exDone = nextExchange(proxy, sseDone('/late'));
+    const { headAt, eventAt } = await new Promise<{ headAt: number; eventAt: number }>((resolve, reject) => {
       const req = http.request({ host: '127.0.0.1', port: proxy.port, path: `${base}/late`, headers: { host: new URL(base).host } });
       req.on('response', (res) => {
-        resolve(Date.now() - t0);
+        const at = Date.now() - t0;
+        res.once('data', () => resolve({ headAt: at, eventAt: Date.now() - t0 }));
         res.resume();
       });
       req.on('error', reject);
       req.end();
     });
-    expect(headAt).toBeLessThan(300);
-    const ex = await nextExchange(proxy, sseDone('/late'));
+    // The head is flushed at once: it arrives long before the event, which the server sends 400 ms later.
+    expect(headAt).toBeLessThan(eventAt - 250);
+    const ex = await exDone;
     expect(texts(ex)).toEqual(['late']);
   });
 
@@ -236,7 +239,7 @@ describe('SSE through the proxy', () => {
     await live;
     req.destroy();
     const ex = await done;
-    expect(ex).toMatchObject({ state: 'completed', error: 'The app closed the event stream.' });
+    expect(ex).toMatchObject({ state: 'completed', notes: ['The app closed the event stream.'] });
     expect(texts(ex)).toEqual(['tick']);
   });
 
@@ -255,7 +258,7 @@ describe('SSE through the proxy', () => {
     expect(zlib.gunzipSync(r.body).length).toBe(70 * 1024 * 1008);
     const ex = await done;
     expect(ex.state).toBe('completed');
-    expect(ex.error).toBe('Events not recorded past 64 MB of decoded stream.');
+    expect(notesOf(ex)).toBe('Events not recorded past 64 MB of decoded stream.');
     expect(ex.framesDropped! + ex.frames!.length).toBeLessThan(70 * 1024);
   }, 60_000);
 
