@@ -1,18 +1,36 @@
 // v0.13.0 (CONTRACTS §19.3 "Decryption"): decrypt every TLS silent gRPC tunnel while a simulator trusts our CA, and
 // learn hosts that pin their own certificate (passed through undecrypted from then on).
 import { once } from 'events';
+import { execFile, execFileSync } from 'child_process';
+import * as fs from 'fs';
+import * as net from 'net';
+import * as os from 'os';
+import * as path from 'path';
 import * as tls from 'tls';
 import { X509Certificate } from 'crypto';
 import { generateCACertificate } from 'mockttp';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Exchange, InterceptProxy } from '../src';
-import { nextExchange, selfSignedCert, startProxy } from './helpers';
+import { nextExchange, selfSignedCert, sleep, startProxy } from './helpers';
+import { grpcPinTesting } from '../src/intercept-proxy';
 import { grpcCall, silentSocket, startGrpcServer, tlsSession, type GrpcServer } from './grpc-helpers';
 
 function waitFor(proxy: InterceptProxy, pred: (e: Exchange) => boolean, timeoutMs = 10_000): Promise<Exchange> {
   const have = [...proxy.getExchanges()].reverse().find(pred);
   return have ? Promise.resolve(have) : nextExchange(proxy, pred, timeoutMs);
 }
+
+/** The Dart fixture, compiled once (skipped without a Dart SDK). */
+const dartDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fi-dart-tls-'));
+const dartClient = path.join(dartDir, process.platform === 'win32' ? 'client.exe' : 'client');
+const haveDartClient = (() => {
+  try {
+    execFileSync('dart', ['compile', 'exe', path.join(__dirname, 'fixtures', 'tls_reject_client.dart'), '-o', dartClient], { stdio: 'ignore', timeout: 120_000 });
+    return true;
+  } catch {
+    return false;
+  }
+})();
 
 let up: GrpcServer;
 let upCert: { key: string; cert: string };
@@ -51,30 +69,100 @@ describe('grpcDecryptAll', () => {
     }
   });
 
-  it('a host whose app rejects our certificate is learned as pinned: one failed handshake, then passed through (noted)', async () => {
+  /** A Dart client (dart:io / BoringSSL, like the app) that doesn't trust our CA: it rejects our certificate. */
+  async function rejectingClient(proxyPort: number, target: string): Promise<void> {
+    const out = await new Promise<string>((resolve) =>
+      execFile(dartClient, [String(proxyPort), target], { timeout: 15_000 }, (_e, stdout) => resolve(String(stdout).trim())),
+    );
+    expect(out).toBe('rejected');
+  }
+
+  /** A client that just drops the connection mid-handshake. */
+  async function droppingClient(proxyPort: number, target: string): Promise<void> {
+    const sock = await silentSocket(proxyPort, target);
+    const t = tls.connect({ socket: sock, servername: 'localhost', ALPNProtocols: ['grpc-exp', 'h2'], ca: upCert.cert });
+    await new Promise<void>((resolve) => t.once('error', () => resolve()));
+  }
+
+  const pinnedNote = (e: Exchange) => /pins its certificate; passed through undecrypted from now on/.test(e.error ?? '');
+  const notes = (proxy: InterceptProxy) => proxy.getExchanges().map((e) => e.error ?? '');
+
+  it.skipIf(!haveDartClient)('dart:io rejecting our certificate (no alert, an early close) pins on the second time; then passthrough (noted)', async () => {
     const proxy = await startProxy({ ca });
     try {
       proxy.setGrpcDecryptAll(true);
       const target = `127.0.0.1:${up.port}`;
-      // The app pins: it verifies against its own CA only (here: the server's), so our MITM certificate fails.
-      const sock = await silentSocket(proxy.port, target);
-      const pinnedClient = tls.connect({ socket: sock, servername: 'localhost', ALPNProtocols: ['grpc-exp', 'h2'], ca: upCert.cert });
-      const err = await new Promise<Error>((resolve) => pinnedClient.once('error', resolve));
-      expect(err.message).toMatch(/certificate|self.signed|unable to verify/i);
-      const learned = await waitFor(proxy, (e) => e.kind === 'tunnel' && /pins its certificate/.test(e.error ?? ''));
-      expect(learned.error).toMatch(/^127\.0\.0\.1 pins its certificate; passed through undecrypted from now on/);
+      await rejectingClient(proxy.port, target);
+      await waitFor(proxy, (e) => /If it happens again within a minute/.test(e.error ?? ''));
+      expect(proxy.grpcPinnedHosts).toEqual([]);
+      await rejectingClient(proxy.port, target);
+      const learned = await waitFor(proxy, (e) => e.kind === 'tunnel' && pinnedNote(e));
+      expect(learned.error).toMatch(/^127\.0\.0\.1 pins its certificate/);
       expect(proxy.grpcPinnedHosts).toEqual([target]);
-      // The next connection is a passthrough tunnel: the pinned app sees the server's own certificate and works.
       const again = await silentSocket(proxy.port, target);
       const t = tls.connect({ socket: again, servername: 'localhost', ALPNProtocols: ['h2'], ca: upCert.cert });
       await once(t, 'secureConnect');
       t.destroy();
-      const tunnel = await waitFor(proxy, (e) => e.kind === 'tunnel' && e.grpcTunnel === true && e.state !== 'pending' && e.method === 'CONNECT' && e.id !== learned.id);
+      const tunnel = await waitFor(proxy, (e) => e.kind === 'tunnel' && e.state !== 'pending' && /passed through undecrypted\.$/.test(e.error ?? ''));
       expect(tunnel.error).toMatch(/127\.0\.0\.1 pins its certificate; passed through undecrypted\./);
-      expect(proxy.getExchanges().filter((e) => /pins its certificate; passed through undecrypted from now on/.test(e.error ?? '')).length).toBe(1);
+      // clearGrpcPinnedHosts, and decrypt-all turned on again, start over
+      proxy.clearGrpcPinnedHosts();
+      expect(proxy.grpcPinnedHosts).toEqual([]);
+      (proxy as unknown as { pinnedHosts: Map<string, number> }).pinnedHosts.set(target, Date.now() + 60_000);
+      proxy.setGrpcDecryptAll(false);
+      proxy.setGrpcDecryptAll(true);
+      expect(proxy.grpcPinnedHosts).toEqual([]);
     } finally {
       await proxy.stop();
     }
     expect(proxy.grpcPinnedHosts).toEqual([]); // forgotten when the proxy stops
+  }, 60_000);
+
+  it('one dropped / reset handshake never pins; a TLS alert (cert-rejected) pins at once', async () => {
+    const proxy = await startProxy({ ca });
+    try {
+      proxy.setGrpcDecryptAll(true);
+      const target = `127.0.0.1:${up.port}`;
+      await droppingClient(proxy.port, target);
+      await waitFor(proxy, (e) => e.kind === 'tunnel' && /If it happens again within a minute/.test(e.error ?? ''));
+      expect(proxy.grpcPinnedHosts).toEqual([]);
+      // A client that sends a TLS alert (OpenSSL / browsers): the failure event mockttp reports, for a tunnel in its handshake.
+      const p = proxy as unknown as { decrypting: Map<string, { host: string; port: number }>; onTlsError(f: unknown): void };
+      p.decrypting.set('127.0.0.1:40001', { host: 'api.example.test', port: 443 });
+      p.onTlsError({ failureCause: 'cert-rejected', remoteIpAddress: '127.0.0.1', remotePort: 40001, timingEvents: {} });
+      expect(proxy.grpcPinnedHosts).toEqual(['api.example.test:443']);
+      // other failures (no shared cipher, a handshake timeout) are never pins
+      p.decrypting.set('127.0.0.1:40002', { host: 'other.example.test', port: 443 });
+      p.onTlsError({ failureCause: 'handshake-timeout', remoteIpAddress: '127.0.0.1', remotePort: 40002, timingEvents: {} });
+      expect(proxy.grpcPinnedHosts).toEqual(['api.example.test:443']);
+      expect(notes(proxy).some((n) => /other\.example\.test; not a certificate rejection/.test(n))).toBe(true);
+    } finally {
+      await proxy.stop();
+    }
   });
+
+  it.skipIf(!haveDartClient)('a grpcDecryptHosts host is never auto-pinned (noted); pins expire', async () => {
+    const proxy = await startProxy({ ca });
+    try {
+      const target = `127.0.0.1:${up.port}`;
+      proxy.setGrpcDecryptHosts(['127.0.0.1']);
+      await rejectingClient(proxy.port, target);
+      await rejectingClient(proxy.port, target);
+      await waitFor(proxy, (e) => e.kind === 'tunnel' && /grpcDecryptHosts/.test(e.error ?? ''));
+      expect(notes(proxy).filter((n) => /stays decrypted — remove it there if the app pins/.test(n)).length).toBe(2);
+      expect(proxy.grpcPinnedHosts).toEqual([]);
+      proxy.setGrpcDecryptHosts([]);
+      proxy.setGrpcDecryptAll(true);
+      grpcPinTesting.ttlMs = 300;
+      await rejectingClient(proxy.port, target);
+      await rejectingClient(proxy.port, target);
+      await waitFor(proxy, pinnedNote);
+      expect(proxy.grpcPinnedHosts).toEqual([target]);
+      await sleep(400);
+      expect(proxy.grpcPinnedHosts).toEqual([]); // expired: decrypted again
+    } finally {
+      delete grpcPinTesting.ttlMs;
+      await proxy.stop();
+    }
+  }, 60_000);
 });

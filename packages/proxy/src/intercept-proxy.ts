@@ -635,7 +635,9 @@ export class InterceptProxy extends EventEmitter {
   /** CONTRACTS §19.3: decrypt every TLS silent gRPC tunnel (but tlsPassthrough / learned pinned hosts). */
   private grpcDecryptAllOn = false;
   /** CONTRACTS §19.3: `host:port`s whose app rejected our certificate on a decrypted silent tunnel (until stop()). */
-  private readonly pinnedHosts = new Set<string>();
+  private readonly pinnedHosts = new Map<string, number>(); // host:port → expiry (epoch ms)
+  /** Handshakes the app closed without an alert, per host:port (dart:io rejects that way): count + first time. */
+  private readonly pinStrikes = new Map<string, { n: number; first: number }>();
   /** Decrypted (MITM) silent TLS tunnels in their handshake: client `address:port` → the CONNECT target. */
   private readonly decrypting = new Map<string, { host: string; port: number }>();
   /** CONTRACTS §19.1: gRPC-Web calls being read (by request id). */
@@ -960,6 +962,7 @@ export class InterceptProxy extends EventEmitter {
     this.grpcPool?.destroyAll();
     this.grpcPool = undefined;
     this.pinnedHosts.clear();
+    this.pinStrikes.clear();
     this.decrypting.clear();
     this.rawServer = undefined;
     this.sendAgent?.destroy();
@@ -1267,7 +1270,27 @@ export class InterceptProxy extends EventEmitter {
    * host (except tlsPassthrough hosts and hosts learned to pin their certificate). Off = only grpcDecryptHosts.
    */
   setGrpcDecryptAll(on: boolean): void {
+    // Turning decrypt-all on again starts over: hosts learned earlier get another chance (REVIEW-13 #6).
+    if (on && !this.grpcDecryptAllOn) {
+      this.pinnedHosts.clear();
+      this.pinStrikes.clear();
+    }
     this.grpcDecryptAllOn = !!on;
+  }
+
+  /** CONTRACTS §19.3: forget every learned pinned host (they are decrypted again under decrypt-all). */
+  clearGrpcPinnedHosts(): void {
+    this.pinnedHosts.clear();
+    this.pinStrikes.clear();
+  }
+
+  /** Is `host:port` a learned pinned host right now (pins expire after GRPC_PIN_TTL_MS)? */
+  private isPinned(key: string): boolean {
+    const until = this.pinnedHosts.get(key);
+    if (until === undefined) return false;
+    if (Date.now() < until) return true;
+    this.pinnedHosts.delete(key);
+    return false;
   }
 
   get grpcDecryptAll(): boolean {
@@ -1276,7 +1299,7 @@ export class InterceptProxy extends EventEmitter {
 
   /** CONTRACTS §19.3: hosts learned to pin their certificate (passed through undecrypted until the proxy stops). */
   get grpcPinnedHosts(): string[] {
-    return [...this.pinnedHosts];
+    return [...this.pinnedHosts.keys()].filter((k) => this.isPinned(k));
   }
 
   /** The gRPC decrypt patterns in use. */
@@ -5183,7 +5206,7 @@ export class InterceptProxy extends EventEmitter {
       return;
     }
     const pinKey = `${host}:${t.port}`;
-    const pinned = kind === 'tls' && !forceDecrypt && this.pinnedHosts.has(pinKey);
+    const pinned = kind === 'tls' && !forceDecrypt && this.isPinned(pinKey);
     const decrypt =
       forceDecrypt ||
       kind === 'h2c' ||
@@ -5695,8 +5718,36 @@ export class InterceptProxy extends EventEmitter {
     if (silent) {
       this.decrypting.delete(key);
       const pinKey = `${silent.host}:${silent.port}`;
-      if (this.pinnedHosts.size < 1000) this.pinnedHosts.add(pinKey);
       const label = net.isIPv6(silent.host) ? `[${silent.host}]` : silent.host;
+      // REVIEW-13 #6: a pin needs the app's rejection of our certificate. A TLS alert (cert-rejected) is one at once.
+      // dart:io (BoringSSL) sends no alert: it closes right after our certificate (mockttp: reset / closed), which a
+      // kill mid-handshake can look like — so that counts only when it happens twice for the host within 60 s.
+      // A host the user listed in grpcDecryptHosts is never auto-pinned.
+      const alert = f.failureCause === 'cert-rejected';
+      const closedEarly = f.failureCause === 'reset' || f.failureCause === 'closed';
+      let strikes = 0;
+      if (closedEarly) {
+        const now = Date.now();
+        const prev = this.pinStrikes.get(pinKey);
+        const st = prev && now - prev.first < PIN_STRIKE_WINDOW_MS ? { n: prev.n + 1, first: prev.first } : { n: 1, first: now };
+        if (this.pinStrikes.size < 1000 || prev) this.pinStrikes.set(pinKey, st);
+        strikes = st.n;
+      }
+      const rejected = alert || strikes >= 2;
+      const explicit = this.grpcDecrypt.some((p) => matchesHostPattern(p, silent.host, silent.port));
+      let error: string;
+      if (explicit && (alert || closedEarly)) {
+        error = `The app ended the TLS handshake for ${silent.host} (${f.failureCause}); it may pin its own certificate. The host is in grpcDecryptHosts, so it stays decrypted — remove it there if the app pins.`;
+      } else if (!rejected) {
+        error = closedEarly
+          ? `The app closed the TLS handshake for ${silent.host} (${f.failureCause}). If it happens again within a minute, the host is passed through undecrypted (it probably pins its certificate).`
+          : `TLS handshake with the app failed (${f.failureCause}) for ${silent.host}; not a certificate rejection, so the host stays decrypted.`;
+      } else {
+        this.pinStrikes.delete(pinKey);
+        if (this.pinnedHosts.size >= 1000) for (const k of [...this.pinnedHosts.keys()]) this.isPinned(k); // drop expired
+        if (this.pinnedHosts.size < 1000) this.pinnedHosts.set(pinKey, Date.now() + (grpcPinTesting.ttlMs ?? GRPC_PIN_TTL_MS));
+        error = `${silent.host} pins its certificate; passed through undecrypted from now on (the app rejected the Flutter Intercept certificate).`;
+      }
       const ex: Exchange = {
         id: `tls-${randomUUID()}`,
         startedAt: f.timingEvents?.startTime ?? Date.now(),
@@ -5706,7 +5757,7 @@ export class InterceptProxy extends EventEmitter {
         state: 'error',
         kind: 'tunnel',
         grpcTunnel: true,
-        error: `${silent.host} pins its certificate; passed through undecrypted from now on (the app rejected the Flutter Intercept certificate: ${f.failureCause}).`,
+        error,
       };
       this.store.set(ex.id, ex);
       this.emitChange(ex);
@@ -5756,6 +5807,12 @@ interface GrpcWebState {
   headStatus?: { code?: number; message?: string };
 }
 
+/** REVIEW-13 #6: two handshakes closed without an alert within this window pin a host (dart:io sends no alert). */
+const PIN_STRIKE_WINDOW_MS = 60_000;
+/** REVIEW-13 #6: a learned pin lasts this long (then the host is tried decrypted again). */
+const GRPC_PIN_TTL_MS = 10 * 60 * 1000;
+/** Test seam: a shorter pin lifetime. Never set outside tests. */
+export const grpcPinTesting: { ttlMs?: number } = {};
 /** REVIEW-13 #1: work bounds of the passive gRPC-Web reader (per call and direction). */
 const GRPC_WEB_RECORD_FRAMES = 1000;
 const GRPC_WEB_DECOMPRESS_MESSAGES = 100;
