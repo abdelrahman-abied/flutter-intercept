@@ -1,10 +1,15 @@
 import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { mockttpCaGenerator } from '../../src/ca';
 import {
   caFingerprint,
+  coreSimulatorDataPath,
   type Exec,
+  jsonFileStore,
+  scrubPaths,
   IosSimTrust,
   type IosSimTrustOptions,
   parseSimulators,
@@ -20,7 +25,8 @@ import {
 const UDID = '0F0F0F0F-1111-4222-8333-444455556666';
 const OTHER = '11111111-2222-3333-4444-555555555555';
 const PHYSICAL = '00008110-0000000000000000';
-const devicesRoot = path.join(path.sep, 'Users', 'dev', 'Library', 'Developer', 'CoreSimulator', 'Devices');
+const HOME = path.join(path.sep, 'Users', 'dev');
+const devicesRoot = path.join(HOME, 'Library', 'Developer', 'CoreSimulator', 'Devices');
 const dataPathOf = (udid: string) => path.join(devicesRoot, udid, 'data');
 const USER_ROW = 'A'.repeat(64); // a certificate the user added themselves
 
@@ -45,6 +51,10 @@ interface Sim {
   hasStore?: boolean;
   /** false: the store has no `tsettings` table. */
   schema?: boolean;
+  /** false: on disk but not in `simctl list` (another device set, or simctl can't see it). */
+  listed?: boolean;
+  /** `simctl list` reports this dataPath instead of the standard one. */
+  reportedDataPath?: string;
 }
 
 /**
@@ -55,6 +65,7 @@ function fakeMac(sims: Sim[]) {
   const files = new Map<string, { data: string; mode: number }>();
   const dirs = new Set<string>();
   const calls: string[][] = [];
+  const sqliteStores: string[] = [];
   const failNext: { add?: string; del?: string; list?: string } = {};
   const sim = (udid: string) => sims.find((s) => s.udid === udid);
   const byStore = (p: string) => sims.find((s) => trustStorePath(dataPathOf(s.udid)) === p);
@@ -64,8 +75,9 @@ function fakeMac(sims: Sim[]) {
       if (failNext.list) throw Object.assign(new Error('xcrun failed'), { stderr: failNext.list });
       const devices: Record<string, unknown[]> = {};
       for (const s of sims) {
+        if (s.listed === false) continue;
         const rt = s.runtime ?? 'com.apple.CoreSimulator.SimRuntime.iOS-26-5';
-        (devices[rt] ??= []).push({ udid: s.udid, name: s.name, state: s.state, dataPath: dataPathOf(s.udid), isAvailable: true });
+        (devices[rt] ??= []).push({ udid: s.udid, name: s.name, state: s.state, dataPath: s.reportedDataPath ?? dataPathOf(s.udid), isAvailable: true });
       }
       return { stdout: JSON.stringify({ devices }), stderr: '' };
     }
@@ -91,9 +103,10 @@ function fakeMac(sims: Sim[]) {
       const store = args[args.length - 2];
       expect(args).toContain('-bail');
       expect(args.slice(args.indexOf('-cmd'), args.indexOf('-cmd') + 2)).toEqual(['-cmd', '.timeout 5000']);
+      sqliteStores.push(store);
       const s = byStore(store);
-      if (!s || s.hasStore === false) throw Object.assign(new Error('sqlite3'), { stderr: 'unable to open database file' });
-      if (s.schema === false) throw Object.assign(new Error('sqlite3'), { stderr: 'no such table: tsettings' });
+      if (!s || s.hasStore === false) throw Object.assign(new Error('sqlite3'), { stderr: `Error: unable to open database "${store}": unable to open database file` });
+      if (s.schema === false) throw Object.assign(new Error('sqlite3'), { stderr: `Parse error in ${store}: no such table: tsettings` });
       let m = /^SELECT COUNT\(\*\) FROM pragma_table_info\('tsettings'\) WHERE name IN \('sha256','data','uuid'\); SELECT COUNT\(\*\) FROM tsettings WHERE sha256 = x'([0-9A-F]{64})';$/.exec(sql);
       if (m) {
         expect(args[0]).toBe('-readonly');
@@ -139,7 +152,7 @@ function fakeMac(sims: Sim[]) {
       for (const k of [...files.keys()]) if (k === p || k.startsWith(p + path.sep)) files.delete(k);
     },
   };
-  return { exec, fs, calls, files, dirs, failNext, sims };
+  return { exec, fs, calls, files, dirs, failNext, sims, sqliteStores };
 }
 
 function memStore(init: SimTrustRecord[] = []) {
@@ -168,6 +181,7 @@ function make(mac: ReturnType<typeof fakeMac>, store = memStore(), extra: Partia
     now: () => 1_000_000,
     heartbeatMs: 0,
     tmpDir: path.join(path.sep, 'tmp'),
+    homeDir: HOME,
     platform: 'darwin',
     log: (m) => logs.push(m),
     ...extra,
@@ -377,21 +391,72 @@ describe('IosSimTrust', () => {
       { udid: OTHER, dataPath: dataPathOf(OTHER), sha256: shaA, owner: 'old', pid: 999, heartbeat: 0 }, // no such simulator any more
     ]);
     const { trust } = make(mac, store);
-    expect(await trust.recover()).toBe(2);
+    expect(await trust.recover()).toBe(1); // the deleted simulator's record is dropped, but no row was removed there
     expect(mac.sims[0].rows.size).toBe(0);
     expect(store.records).toEqual([]);
   });
 
-  it('ignores invalid stored records (never deletes from a path it did not validate)', async () => {
+  it('ignores invalid stored records', async () => {
     const mac = fakeMac([booted(UDID, [shaA])]);
     const store = memStore([
-      { udid: UDID, dataPath: '/etc', sha256: shaA, owner: 'x', pid: 999, heartbeat: 0 },
       { udid: UDID, dataPath: dataPathOf(UDID), sha256: "x'; DROP", owner: 'x', pid: 999, heartbeat: 0 },
       { udid: 'not-a-udid', dataPath: dataPathOf(UDID), sha256: shaA, owner: 'x', pid: 999, heartbeat: 0 },
+      { udid: UDID.toLowerCase(), sha256: shaA, owner: 'x', pid: 999, heartbeat: 0 },
+      { udid: UDID, sha256: shaA, owner: 'x', pid: 0, heartbeat: 0 },
     ] as SimTrustRecord[]);
     const { trust } = make(mac, store);
     expect(await trust.recover()).toBe(0);
     expect(writes(mac)).toEqual([]);
+  });
+
+  it("never uses a record's dataPath: the store path comes from simctl, else the fixed CoreSimulator layout", async () => {
+    const planted = path.join(path.sep, 'tmp', 'evil', UDID, 'data');
+    const mac = fakeMac([booted(UDID, [shaA])]);
+    const store = memStore([{ udid: UDID, dataPath: planted, sha256: shaA, owner: 'gone', pid: 999, heartbeat: 0 }]);
+    const { trust } = make(mac, store);
+    expect(await trust.recover()).toBe(1);
+    expect(mac.sims[0].rows.size).toBe(0);
+    expect(new Set(mac.sqliteStores)).toEqual(new Set([trustStorePath(dataPathOf(UDID))]));
+    expect(mac.sqliteStores.some((p) => p.startsWith(planted))).toBe(false);
+  });
+
+  it('refuses a simctl dataPath that is not <UDID>/data (record kept, nothing written)', async () => {
+    const mac = fakeMac([{ ...booted(UDID, [shaA]), reportedDataPath: path.join(path.sep, 'Volumes', 'x', 'data') }]);
+    const store = memStore([{ udid: UDID, sha256: shaA, owner: 'gone', pid: 999, heartbeat: 0 }]);
+    const { trust } = make(mac, store);
+    expect(await trust.recover()).toBe(0);
+    expect(mac.sims[0].rows.has(shaA)).toBe(true);
+    expect(store.records).toHaveLength(1);
+    expect(writes(mac)).toEqual([]);
+  });
+
+  it('a simulator simctl does not list: the fixed layout when it exists; kept when simctl failed', async () => {
+    const mac = fakeMac([{ ...booted(UDID, [shaA]), state: 'Shutdown', listed: false }]);
+    const store = memStore([{ udid: UDID, sha256: shaA, owner: 'gone', pid: 999, heartbeat: 0 }]);
+    const { trust } = make(mac, store);
+    expect(coreSimulatorDataPath(UDID, HOME)).toBe(dataPathOf(UDID));
+    expect(coreSimulatorDataPath('not-a-udid', HOME)).toBeUndefined();
+    expect(await trust.recover()).toBe(1);
+    expect(mac.sims[0].rows.size).toBe(0);
+
+    // simctl failing and no directory at the fixed path: can't tell → the record stays.
+    const mac2 = fakeMac([]);
+    mac2.failNext.list = 'xcrun: error';
+    const store2 = memStore([{ udid: OTHER, sha256: shaA, owner: 'gone', pid: 999, heartbeat: 0 }]);
+    const t2 = make(mac2, store2);
+    expect(await t2.trust.recover()).toBe(0);
+    expect(store2.records).toHaveLength(1);
+  });
+
+  it('a heartbeat more than a minute in the future does not keep a record alive', async () => {
+    const mac = fakeMac([booted(UDID, [shaA])]);
+    const store = memStore([{ udid: UDID, sha256: shaA, owner: 'planted', pid: 200, heartbeat: 1_000_000 + 10 * 60_000 }]);
+    const { trust } = make(mac, store);
+    expect(await trust.recover()).toBe(1);
+    // …while one slightly ahead (clock skew) still counts as live.
+    const mac2 = fakeMac([booted(UDID, [shaA])]);
+    const store2 = memStore([{ udid: UDID, sha256: shaA, owner: 'w2', pid: 200, heartbeat: 1_000_000 + 30_000 }]);
+    expect(await make(mac2, store2).trust.recover()).toBe(0);
   });
 
   it('shares a row with another live window: only the last one out removes it', async () => {
@@ -488,8 +553,124 @@ describe('IosSimTrust', () => {
       heartbeatMs: 0,
     });
     expect(await broken.ensure(UDID)).toMatchObject({ state: 'not-simulator' });
-    await expect(broken.release(UDID)).resolves.toBeUndefined();
+    await expect(broken.release(UDID)).resolves.toBe(false);
     await expect(broken.recover()).resolves.toBe(0);
-    await expect(broken.releaseAll()).resolves.toBeUndefined();
+    await expect(broken.releaseAll()).resolves.toBe(0);
+  });
+});
+
+describe('REVIEW-13 hardening', () => {
+  it('scrubPaths keeps only the last segment of absolute paths', () => {
+    expect(scrubPaths('Error: unable to open database "/Users/dev/Library/Developer/CoreSimulator/Devices/X/data/private/var/protected/trustd/private/TrustStore.sqlite3": no')).toBe(
+      'Error: unable to open database "TrustStore.sqlite3": no',
+    );
+    expect(scrubPaths('cert at /private/tmp/fi-simtrust-1/flutter-intercept-ca.pem (x)')).toBe('cert at flutter-intercept-ca.pem (x)');
+    expect(scrubPaths("iPhone 17 isn't a booted iOS Simulator. Nothing was changed.")).toBe("iPhone 17 isn't a booted iOS Simulator. Nothing was changed.");
+  });
+
+  it('problems in state() and results carry no absolute paths', async () => {
+    const mac = fakeMac([{ ...booted(), schema: false }]);
+    const { trust } = make(mac);
+    const r = await trust.ensure(UDID, { sessionId: 's' });
+    const problem = (r as { problem: string }).problem;
+    expect(problem).toMatch(/TrustStore\.sqlite3/);
+    expect(problem).not.toContain(HOME);
+    expect(JSON.stringify(trust.state())).not.toContain(HOME);
+
+    const mac2 = fakeMac([booted()]);
+    mac2.failNext.add = `An error was encountered: could not read ${path.join(path.sep, 'private', 'tmp', 'fi-simtrust-9', 'flutter-intercept-ca.pem')}`;
+    const t2 = make(mac2);
+    await t2.trust.ensure(UDID);
+    expect(t2.trust.state()[0].problem).toMatch(/flutter-intercept-ca\.pem/);
+    expect(t2.trust.state()[0].problem).not.toMatch(/\/private\/tmp/);
+  });
+
+  it('release / releaseSession / releaseAll report whether rows were actually removed', async () => {
+    const mac = fakeMac([booted(), booted(OTHER, [shaA])]);
+    const { trust } = make(mac);
+    await trust.ensure(UDID, { sessionId: 's1' });
+    await trust.ensure(UDID, { sessionId: 's2' });
+    expect(await trust.release(UDID, 's1')).toBe(false); // s2 still holds it
+    expect(await trust.release(UDID, 's2')).toBe(true);
+    expect(await trust.release(UDID, 's2')).toBe(false); // nothing held any more
+    expect(await trust.ensure(OTHER, { sessionId: 'p' })).toMatchObject({ state: 'pre-existing' });
+    expect(await trust.releaseSession('p')).toBe(false); // pre-existing: never removed
+    await trust.ensure(UDID, { sessionId: 'a' });
+    mac.sims[0].rows.clear(); // removed by someone else meanwhile
+    expect(await trust.releaseSession('a')).toBe(false);
+    await trust.ensure(UDID, { sessionId: 'b' });
+    expect(await trust.releaseAll()).toBe(1);
+  });
+
+  describe('jsonFileStore', () => {
+    let dir: string;
+    const rec: SimTrustRecord = { udid: UDID, sha256: 'B'.repeat(64), owner: 'me', pid: 1, heartbeat: 1 };
+    const mk = () => (dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fi-simtrust-store-')));
+    const cleanup = () => fs.rmSync(dir, { recursive: true, force: true });
+
+    it('round-trips through a 0600 file written by rename, leaving no temp files', async () => {
+      mk();
+      try {
+        const file = path.join(dir, 'sub', 'sim-trust.json');
+        const store = jsonFileStore(file);
+        expect(store.get()).toEqual([]);
+        await store.set([rec]);
+        expect(store.get()).toEqual([rec]);
+        expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+        expect(fs.statSync(path.dirname(file)).mode & 0o077).toBe(0);
+        expect(fs.readdirSync(path.dirname(file))).toEqual(['sim-trust.json']);
+      } finally {
+        cleanup();
+      }
+    });
+
+    it('never reads or writes through a symlinked file', async () => {
+      mk();
+      try {
+        const victim = path.join(dir, 'victim.txt');
+        fs.writeFileSync(victim, JSON.stringify([rec]));
+        const file = path.join(dir, 'sim-trust.json');
+        fs.symlinkSync(victim, file);
+        const logs: string[] = [];
+        const store = jsonFileStore(file, (m) => logs.push(m));
+        expect(store.get()).toEqual([]);
+        await expect(store.set([])).rejects.toThrow(/symbolic link/);
+        expect(fs.readFileSync(victim, 'utf8')).toBe(JSON.stringify([rec]));
+        expect(logs.join('\n')).not.toContain(dir);
+      } finally {
+        cleanup();
+      }
+    });
+
+    it('refuses a symlinked directory', async () => {
+      mk();
+      try {
+        const real = path.join(dir, 'real');
+        fs.mkdirSync(real);
+        fs.symlinkSync(real, path.join(dir, 'link'));
+        const store = jsonFileStore(path.join(dir, 'link', 'sim-trust.json'));
+        await expect(store.set([rec])).rejects.toThrow(/not a plain directory/);
+        expect(fs.readdirSync(real)).toEqual([]);
+      } finally {
+        cleanup();
+      }
+    });
+
+    it('ignores non-files and oversized or malformed content', async () => {
+      mk();
+      try {
+        const asDir = path.join(dir, 'd.json');
+        fs.mkdirSync(asDir);
+        expect(jsonFileStore(asDir).get()).toEqual([]);
+        const big = path.join(dir, 'big.json');
+        fs.writeFileSync(big, `[${'0,'.repeat(40_000)}0]`);
+        expect(jsonFileStore(big).get()).toEqual([]);
+        const bad = path.join(dir, 'bad.json');
+        fs.writeFileSync(bad, '{"not":"an array"}');
+        expect(jsonFileStore(bad).get()).toEqual([]);
+      } finally {
+        cleanup();
+      }
+    });
   });
 });

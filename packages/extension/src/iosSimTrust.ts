@@ -69,6 +69,8 @@ export const SIM_TRUST_STALE_MS = 120_000;
 /** sqlite3 waits this long for trustd's lock. */
 export const SQLITE_BUSY_MS = 5000;
 const MAX_RECORDS = 20;
+/** Heartbeats further than this in the future are not trusted (REVIEW-13 #7). */
+const FUTURE_HEARTBEAT_MS = 60_000;
 const LIST_TIMEOUT_MS = 10_000;
 const KEYCHAIN_TIMEOUT_MS = 20_000;
 const SQLITE_TIMEOUT_MS = 10_000;
@@ -79,8 +81,11 @@ const SHA256_HEX = /^[0-9A-F]{64}$/;
 /** One simulator whose trust store we added our CA to (persisted so a crash can be repaired). */
 export interface SimTrustRecord {
   udid: string;
-  /** The device's `dataPath` (from `simctl list devices -j`). */
-  dataPath: string;
+  /**
+   * The device's `dataPath` when it was added (informational only: REVIEW-13 #7, removal never uses a stored path; it
+   * derives the path from `simctl list devices -j`, else the fixed CoreSimulator layout).
+   */
+  dataPath?: string;
   /** sha256 (upper-case hex) of the CA certificate DER = the `tsettings.sha256` key. */
   sha256: string;
   owner: string;
@@ -128,6 +133,8 @@ export interface IosSimTrustOptions {
   staleMs?: number;
   /** Directory for the temporary certificate file (default `os.tmpdir()`). */
   tmpDir?: string;
+  /** Home directory for the fixed CoreSimulator layout (default `os.homedir()`). */
+  homeDir?: string;
   /** Default `process.platform`; anything but darwin does nothing. */
   platform?: NodeJS.Platform;
   log?(msg: string): void;
@@ -177,6 +184,86 @@ export function trustStorePath(dataPath: string): string {
   return path.join(dataPath, ...TRUST_STORE_SEGMENTS);
 }
 
+/** The fixed CoreSimulator layout: `~/Library/Developer/CoreSimulator/Devices/<UDID>/data` (udid: upper-case UUID). */
+export function coreSimulatorDataPath(udid: string, homeDir: string = os.homedir()): string | undefined {
+  if (!SIM_UDID.test(udid) || !path.isAbsolute(homeDir)) return undefined;
+  return path.join(homeDir, 'Library', 'Developer', 'CoreSimulator', 'Devices', udid, 'data');
+}
+
+/**
+ * Replaces absolute paths in a text shown to people or agents (problems in `state()`) with their last segment, so
+ * user names and directory layouts don't leak: `/Users/x/…/TrustStore.sqlite3` → `TrustStore.sqlite3`.
+ */
+export function scrubPaths(text: string): string {
+  return text.replace(/(?:~|\b[A-Za-z]:)?(?:\/[^\s'"`()\[\]{},;:/]+){2,}\/?/g, (m) => {
+    const parts = m.split('/').filter(Boolean);
+    return parts[parts.length - 1] ?? '';
+  });
+}
+
+/** Where a standalone tool (CLI) keeps its records: outside any project (`~/Library/Caches/flutter-intercept`). */
+export function defaultSimTrustStoreFile(homeDir: string = os.homedir()): string {
+  return path.join(homeDir, 'Library', 'Caches', 'flutter-intercept', 'sim-trust.json');
+}
+
+const STORE_MAX_BYTES = 64 * 1024;
+
+/**
+ * REVIEW-13 #7: a JSON-file record store for the CLI / sidecar that never follows symlinks: `get` refuses a symlink
+ * or non-regular file (and opens with O_NOFOLLOW); `set` refuses a symlinked file or directory, writes a new 0600
+ * temp file in the same (0700) directory and renames it over the old one.
+ */
+export function jsonFileStore(file: string, log?: (msg: string) => void): SimTrustStore {
+  const say = (m: string) => {
+    try {
+      log?.(`simulator trust: ${m}`);
+    } catch {
+      /* ignore */
+    }
+  };
+  const isLink = (p: string) => {
+    try {
+      return fs.lstatSync(p).isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
+  return {
+    get: () => {
+      let fd: number | undefined;
+      try {
+        const st = fs.lstatSync(file);
+        if (!st.isFile() || st.size > STORE_MAX_BYTES) {
+          say(`ignoring ${path.basename(file)}: not a plain file`);
+          return [];
+        }
+        fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+        const v = JSON.parse(fs.readFileSync(fd, 'utf8')) as unknown;
+        return Array.isArray(v) ? (v as SimTrustRecord[]) : [];
+      } catch {
+        return [];
+      } finally {
+        if (fd !== undefined) fs.closeSync(fd);
+      }
+    },
+    set: async (records) => {
+      const dir = path.dirname(file);
+      await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+      const d = await fs.promises.lstat(dir);
+      if (!d.isDirectory()) throw new Error(`${path.basename(dir)} is not a plain directory`);
+      if (isLink(file)) throw new Error(`${path.basename(file)} is a symbolic link; not writing through it`);
+      const tmp = path.join(dir, `.${path.basename(file)}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+      try {
+        await fs.promises.writeFile(tmp, JSON.stringify(records), { mode: 0o600, flag: 'wx' });
+        await fs.promises.rename(tmp, file);
+      } catch (e) {
+        await fs.promises.rm(tmp, { force: true }).catch(() => undefined);
+        throw e;
+      }
+    },
+  };
+}
+
 /** sha256 (upper-case hex) of the certificate DER and its PEM (the certificate alone), or a problem. */
 export function caFingerprint(pem: string | undefined): { sha256: string; certPem: string } | { problem: string } {
   if (!pem) return { problem: "The Flutter Intercept CA isn't available yet." };
@@ -185,7 +272,7 @@ export function caFingerprint(pem: string | undefined): { sha256: string; certPe
     if (!x.ca) return { problem: "The Flutter Intercept certificate isn't a CA certificate." };
     return { sha256: x.fingerprint256.replace(/:/g, '').toUpperCase(), certPem: x.toString() };
   } catch (e) {
-    return { problem: `The Flutter Intercept CA certificate can't be read (${errorText(e).slice(0, 120)}).` };
+    return { problem: `The Flutter Intercept CA certificate can't be read (${scrubPaths(errorText(e)).slice(0, 120)}).` };
   }
 }
 
@@ -210,7 +297,7 @@ export async function readTrustRow(
     if (lines.length !== 2 || lines[0] !== '3' || !/^\d+$/.test(lines[1])) return { problem: UNKNOWN_STORE };
     return { present: Number(lines[1]) > 0 };
   } catch (e) {
-    return { problem: `${UNKNOWN_STORE} (${errorText(e).slice(0, 160)})` };
+    return { problem: `${UNKNOWN_STORE} (${scrubPaths(errorText(e)).slice(0, 160)})` };
   }
 }
 
@@ -239,7 +326,7 @@ function isValidRecord(r: unknown): r is SimTrustRecord {
     SIM_UDID.test(o.udid) &&
     typeof o.sha256 === 'string' &&
     SHA256_HEX.test(o.sha256) &&
-    validDataPath(o.dataPath, o.udid) &&
+    (o.dataPath === undefined || (typeof o.dataPath === 'string' && o.dataPath.length <= 1024)) &&
     typeof o.owner === 'string' &&
     o.owner.length > 0 &&
     o.owner.length <= 100 &&
@@ -307,33 +394,37 @@ export class IosSimTrust {
    * The session ended: when no other session of this instance holds `udid`, removes our row (unless another live
    * window still holds it). Without `sessionId` (the "Remove it" command), drops every session's hold at once.
    */
-  release(udid: string, sessionId?: string): Promise<void> {
+  release(udid: string, sessionId?: string): Promise<boolean> {
     return this.serial(async () => {
-      const id = udid.toUpperCase();
+      const id = (udid ?? '').toUpperCase();
       const e = this.entries.get(id);
-      if (!e) return;
+      if (!e) return false;
       if (sessionId !== undefined) {
         e.holders.delete(sessionId);
-        if (e.holders.size > 0) return;
+        if (e.holders.size > 0) return false;
       }
-      await this.drop(e);
+      return this.drop(e);
     });
   }
 
-  /** Releases a session on whichever simulator it holds (session end when the host only knows the session id). */
-  releaseSession(sessionId: string): Promise<void> {
+  /** Releases a session on whichever simulator it holds. True when a row was actually removed. */
+  releaseSession(sessionId: string): Promise<boolean> {
     return this.serial(async () => {
+      let removed = false;
       for (const e of [...this.entries.values()]) {
         if (!e.holders.delete(sessionId)) continue;
-        if (e.holders.size === 0) await this.drop(e);
+        if (e.holders.size === 0 && (await this.drop(e))) removed = true;
       }
+      return removed;
     });
   }
 
-  /** Releases everything this instance holds (proxy stop, deactivate). */
-  releaseAll(): Promise<void> {
+  /** Releases everything this instance holds (proxy stop, deactivate). Returns how many rows were removed. */
+  releaseAll(): Promise<number> {
     return this.serial(async () => {
-      for (const e of [...this.entries.values()]) await this.drop(e);
+      let n = 0;
+      for (const e of [...this.entries.values()]) if (await this.drop(e)) n++;
+      return n;
     });
   }
 
@@ -350,10 +441,10 @@ export class IosSimTrust {
         const held = group.some((x) => this.isLive(x));
         if (held) continue; // a live window (or this instance) still uses it
         done.add(key);
-        if (await this.removeRow(r.udid, r.dataPath, r.sha256)) {
-          await this.save(this.stored().filter((x) => !(x.udid === r.udid && x.sha256 === r.sha256)));
-          n++;
-        }
+        const out = await this.removeRow(r.udid, r.sha256);
+        if (out === 'failed') continue; // kept for the next start
+        await this.save(this.stored().filter((x) => !(x.udid === r.udid && x.sha256 === r.sha256)));
+        if (out === 'removed') n++;
       }
       return n;
     });
@@ -418,7 +509,7 @@ export class IosSimTrust {
     try {
       return parseSimulators((await this.exec(XCRUN, ['simctl', 'list', 'devices', '-j'], LIST_TIMEOUT_MS)).stdout);
     } catch (e) {
-      this.log(`xcrun simctl list failed (${errorText(e).slice(0, 200)})`);
+      this.log(`xcrun simctl list failed (${scrubPaths(errorText(e)).slice(0, 200)})`);
       return undefined;
     }
   }
@@ -433,7 +524,9 @@ export class IosSimTrust {
       const e = this.entries.get(r.udid);
       return !!e && e.state === 'trusted' && e.sha256 === r.sha256;
     }
-    if (this.now() - r.heartbeat > (this.opts.staleMs ?? SIM_TRUST_STALE_MS)) return false;
+    const age = this.now() - r.heartbeat;
+    // REVIEW-13 #7: a heartbeat from the future (planted or a skewed clock) never keeps a record alive.
+    if (age > (this.opts.staleMs ?? SIM_TRUST_STALE_MS) || age < -FUTURE_HEARTBEAT_MS) return false;
     try {
       return (this.opts.pidAlive ?? defaultPidAlive)(r.pid);
     } catch {
@@ -477,9 +570,9 @@ export class IosSimTrust {
   }
 
   private fail(udid: string, name: string | undefined, holder: string, problem: string): SimTrustResult {
-    const e: Entry = { udid, name, state: 'failed', problem, holders: new Set([holder]) };
+    const e: Entry = { udid, name, state: 'failed', problem: scrubPaths(problem), holders: new Set([holder]) };
     this.entries.set(udid, e);
-    this.log(`${name || udid}: ${problem}`);
+    this.log(`${name || udid}: ${e.problem}`);
     return this.result(e);
   }
 
@@ -487,10 +580,10 @@ export class IosSimTrust {
     const id = (udid ?? '').toUpperCase();
     const holder = opts.sessionId ?? '';
     if (this.platform() !== 'darwin') return { udid: id, state: 'not-simulator', problem: 'iOS Simulators only exist on macOS. Nothing was changed.' };
-    if (!SIM_UDID.test(id)) return { udid: id, state: 'not-simulator', problem: `${udid} isn't an iOS Simulator. Nothing was changed.` };
+    if (!SIM_UDID.test(id)) return { udid: id, state: 'not-simulator', problem: scrubPaths(`${String(udid).slice(0, 100)} isn't an iOS Simulator. Nothing was changed.`) };
     const ca = caFingerprint(await this.caPem());
     const dev = await this.booted(id);
-    if (!dev) return { udid: id, state: 'not-simulator', problem: `${opts.name ?? udid} isn't a booted iOS Simulator. Nothing was changed.` };
+    if (!dev) return { udid: id, state: 'not-simulator', problem: scrubPaths(`${opts.name ?? id} isn't a booted iOS Simulator. Nothing was changed.`) };
     const name = opts.name ?? (dev.name || undefined);
     const prev = this.entries.get(id);
     if (prev && prev.state !== 'failed' && !('problem' in ca) && (prev.state === 'pre-existing' || prev.sha256 === ca.sha256)) {
@@ -539,7 +632,7 @@ export class IosSimTrust {
       await this.files.writeFile(file, ca.certPem, 0o600);
       await this.exec(XCRUN, ['simctl', 'keychain', id, 'add-root-cert', file], KEYCHAIN_TIMEOUT_MS);
     } catch (e) {
-      addError = errorText(e).slice(0, 200);
+      addError = scrubPaths(errorText(e)).slice(0, 200);
     } finally {
       if (dir) await this.files.rm(dir).catch(() => undefined);
     }
@@ -562,54 +655,79 @@ export class IosSimTrust {
     return r;
   }
 
-  /** Forgets the entry; for a trust we hold, removes the row unless another live window still holds it. */
-  private async drop(e: Entry): Promise<void> {
+  /**
+   * Forgets the entry; for a trust we hold, removes the row unless another live window still holds it. True when a
+   * row was actually removed.
+   */
+  private async drop(e: Entry): Promise<boolean> {
     this.entries.delete(e.udid);
     this.updateTimer();
-    if (e.state !== 'trusted' || !e.sha256 || !e.dataPath) return;
+    if (e.state !== 'trusted' || !e.sha256) return false;
     const same = (r: SimTrustRecord) => r.udid === e.udid && r.sha256 === e.sha256;
     const others = this.stored().filter((r) => same(r) && r.owner !== this.owner && this.isLive(r));
     if (others.length) {
       await this.save(this.stored().filter((r) => !(same(r) && r.owner === this.owner)));
       this.log(`${e.name ?? e.udid}: still used by another window; its trust is kept until that session ends`);
-      return;
+      return false;
     }
-    if (await this.removeRow(e.udid, e.dataPath, e.sha256, e.name)) {
-      await this.save(this.stored().filter((r) => !same(r) || (r.owner !== this.owner && this.isLive(r))));
-    }
+    const out = await this.removeRow(e.udid, e.sha256, e.name);
+    if (out !== 'failed') await this.save(this.stored().filter((r) => !same(r) || (r.owner !== this.owner && this.isLive(r))));
     // else: the record stays for recover() on the next start.
+    return out === 'removed';
   }
 
-  /** Deletes exactly our row. True when it is gone (or the simulator itself is gone). */
-  private async removeRow(udid: string, dataPath: string, sha256: string, name?: string): Promise<boolean> {
-    if (this.platform() !== 'darwin' || !SHA256_HEX.test(sha256) || !validDataPath(dataPath, udid)) return false;
+  /**
+   * REVIEW-13 #7: where a simulator's data lives, never taken from a stored record: the `dataPath` that
+   * `simctl list devices -j` reports for that udid (refused unless it is `/<UDID>/data`), else — the udid not listed —
+   * the fixed CoreSimulator layout. `gone`: listed nowhere and no such directory (the simulator was deleted).
+   * Undefined: can't tell (simctl failed and the fixed path is missing), or refused.
+   */
+  private async dataPathFor(udid: string): Promise<{ dataPath: string } | 'gone' | undefined> {
+    if (!SIM_UDID.test(udid)) return undefined;
+    const list = await this.list();
+    const dev = list?.find((d) => d.udid === udid);
+    if (dev) return validDataPath(dev.dataPath, udid) ? { dataPath: dev.dataPath } : undefined;
+    const fixed = coreSimulatorDataPath(udid, this.opts.homeDir ?? os.homedir());
+    if (!fixed) return undefined;
+    if (await this.files.exists(fixed)) return { dataPath: fixed };
+    return list ? 'gone' : undefined;
+  }
+
+  /** Deletes exactly our row. `removed`: deleted now; `absent`: nothing to delete (or no simulator); `failed`: retry later. */
+  private async removeRow(udid: string, sha256: string, name?: string): Promise<'removed' | 'absent' | 'failed'> {
+    if (this.platform() !== 'darwin' || !SHA256_HEX.test(sha256)) return 'failed';
     const label = name ?? udid;
-    if (!(await this.files.exists(dataPath))) {
+    const where = await this.dataPathFor(udid);
+    if (where === 'gone') {
       this.log(`${label}: the Simulator no longer exists; nothing to remove`);
-      return true;
+      return 'absent';
     }
-    const store = trustStorePath(dataPath);
+    if (!where) {
+      this.log(`${label}: couldn't locate the Simulator's trust store; will retry on the next start`);
+      return 'failed';
+    }
+    const store = trustStorePath(where.dataPath);
     const before = await readTrustRow(this.exec, this.files, store, sha256);
     if ('problem' in before) {
-      this.log(`${label}: couldn't check the trust store (${before.problem}); will retry on the next start`);
-      return false;
+      this.log(`${label}: couldn't check the trust store (${scrubPaths(before.problem)}); will retry on the next start`);
+      return 'failed';
     }
     if (!before.present) {
       this.log(`${label}: the Flutter Intercept CA was already removed`);
-      return true;
+      return 'absent';
     }
     try {
       await this.exec(SQLITE3, ['-bail', '-cmd', `.timeout ${SQLITE_BUSY_MS}`, store, `DELETE FROM tsettings WHERE sha256 = x'${sha256}';`], SQLITE_TIMEOUT_MS);
     } catch (e) {
-      this.log(`${label}: couldn't remove the Flutter Intercept CA (${errorText(e).slice(0, 200)}); will retry on the next start`);
-      return false;
+      this.log(`${label}: couldn't remove the Flutter Intercept CA (${scrubPaths(errorText(e)).slice(0, 200)}); will retry on the next start`);
+      return 'failed';
     }
     const after = await readTrustRow(this.exec, this.files, store, sha256);
     if ('present' in after && !after.present) {
       this.log(`${label} no longer trusts the Flutter Intercept CA`);
-      return true;
+      return 'removed';
     }
     this.log(`${label}: the Flutter Intercept CA is still in the trust store after removing it; will retry on the next start`);
-    return false;
+    return 'failed';
   }
 }
