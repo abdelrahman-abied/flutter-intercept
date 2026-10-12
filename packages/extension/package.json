@@ -100,6 +100,12 @@
           "default": [],
           "markdownDescription": "Hosts (globs on the hostname, e.g. `grpc.example.com`, `*.staging.example`) whose **TLS** gRPC is decrypted. Only for apps that trust the Flutter Intercept CA in debug (pinned to it, or `onBadCertificate`); other TLS gRPC is shown as an undecrypted tunnel. Same host rules as `flutterIntercept.tlsPassthrough`."
         },
+        "flutterIntercept.grpc.trustOnSimulator": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "markdownDescription": "Make **iOS simulators** trust the Flutter Intercept CA while an intercepted session runs on them, so TLS gRPC with default credentials is decrypted. Simulators only (never a physical device); only the certificate Flutter Intercept added is removed when the session ends. Takes effect from **User** settings only."
+        },
         "flutterIntercept.clientCertificates": {
           "type": "array",
           "default": [],
@@ -288,6 +294,16 @@
       {
         "command": "flutterIntercept.saveCaCertificate",
         "title": "Save CA Certificate…",
+        "category": "Flutter Intercept"
+      },
+      {
+        "command": "flutterIntercept.trustSimulatorCa",
+        "title": "Trust the CA on this iOS Simulator",
+        "category": "Flutter Intercept"
+      },
+      {
+        "command": "flutterIntercept.removeSimulatorCa",
+        "title": "Remove the CA from this iOS Simulator",
         "category": "Flutter Intercept"
       }
     ],

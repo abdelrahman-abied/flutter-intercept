@@ -30,6 +30,12 @@
  *     `grpcMock` rule (code 14) answers GetOrder after a hot restart. K2: `flutterIntercept.grpc.enabled: false`
  *     → `FLUTTER_INTERCEPT_GRPC=0` define, the calls work direct and nothing gRPC is recorded.
  *     `FI_DEVICES_ONLY=K` runs only this check; `FI_GRPC_PORT` picks the server port (default: a free one).
+ *  L. CONTRACTS §19.3, booted iOS simulator only and only with FI_SIM_TRUST=1 (it changes the simulator's trust
+ *     store for the session): `flutterIntercept.grpc.trustOnSimulator: true` → the CA's row is in the simulator's
+ *     TrustStore while the session runs, the demo's TLS call (GRPC_TLS_PORT; its onBadCertificate accepts only the
+ *     real server, so it succeeds only through OS trust) is recorded decrypted (`kind: "grpc"`, status 0, messages
+ *     both ways); after the session ends the row is gone (or still there when it pre-existed) and the setting is
+ *     restored. `FI_DEVICES_ONLY=L` runs only this check.
  *
  * Request → source (CONTRACTS §9, template v4), in A and after the hot restart in B: a Dio request made
  * through interceptors (CatalogApi.fetchAlbum) and a package:http request (OrdersApi.createOrder) carry
@@ -55,6 +61,7 @@ import { resolveFrames } from '../../../src/source/resolve';
 import { takeScreenshot, type ScreenshotDeps } from '../../../src/screenshot';
 import { createVmWatcher, vmCallService } from '../../../src/vm';
 import { AndroidGlobalProxy } from '../../../src/adb';
+import { caFingerprint, defaultExec as simExec, IosSimTrust, nodeFs, parseSimulators, readTrustRow, SQLITE3, trustStorePath, XCRUN } from '../../../src/iosSimTrust';
 import type { SessionWarning } from '../../../src/ui/protocol';
 import { activateBoth, freePort, freePortPair, outputOf, registerOutputTracker, RunOutcome, sleep, startSession, stopSession, waitFor } from './helpers';
 
@@ -279,6 +286,10 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
     // ---- K. gRPC (§16, template v6) ----
     if (!physicalIos && (!process.env.FI_DEVICES_ONLY || process.env.FI_DEVICES_ONLY === 'K')) await checkK(dev, tag);
     if (process.env.FI_DEVICES_ONLY === 'K') continue;
+
+    // ---- L. iOS simulator CA trust (§19.3): opt-in twice (FI_SIM_TRUST=1 and a simulator id) ----
+    if (kindFromId(dev) === 'ios-simulator' && process.env.FI_SIM_TRUST === '1' && (!process.env.FI_DEVICES_ONLY || process.env.FI_DEVICES_ONLY === 'L')) await checkL(dev, tag);
+    if (process.env.FI_DEVICES_ONLY === 'L') continue;
 
     // ---- A. launch like F5 (deviceId only) ----
     let session: vscode.DebugSession | undefined;
@@ -656,6 +667,87 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
     } finally {
       server.stop();
     }
+  }
+
+  /** CONTRACTS §19.3: trust on a booted iOS simulator → TLS gRPC decrypted; the row removed again at session end. */
+  async function checkL(dev: string, tag: string) {
+    const name = `DEV ${tag} L simulator CA trust: TLS gRPC decrypted, trust removed at session end`;
+    const t0 = Date.now();
+    const failures: string[] = [];
+    const notes: string[] = [];
+    const udid = dev.toUpperCase();
+    let session: vscode.DebugSession | undefined;
+    let server: { stop: () => void; log: () => string } | undefined;
+    let store: string | undefined;
+    let sha: string | undefined;
+    let preExisting = false;
+    let text = '';
+    const rowPresent = async () => {
+      const r = await readTrustRow(simExec, nodeFs, store!, sha!);
+      if ('problem' in r) throw new Error(r.problem);
+      return r.present;
+    };
+    try {
+      // Read-only "before" state, with the setting still off: the CA (from the entry the provider writes) and its row.
+      await cfg.update('grpc.trustOnSimulator', undefined, vscode.ConfigurationTarget.Global);
+      await api.prepare(folder, { type: 'dart', request: 'launch', name: `FI-D L prepare ${tag}`, deviceId: dev });
+      const pem = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/.exec(fs.readFileSync(entry, 'utf8'))?.[0];
+      const fp = caFingerprint(pem);
+      if ('problem' in fp) throw new Error(`CA from the entry: ${fp.problem}`);
+      sha = fp.sha256;
+      if (!(await new IosSimTrust({ caCertPem: fp.certPem, heartbeatMs: 0 }).isSimulator(udid))) throw new Error(`${dev} is not a booted iOS simulator`);
+      const sim = parseSimulators((await simExec(XCRUN, ['simctl', 'list', 'devices', '-j'], 10_000)).stdout).find((d) => d.udid === udid);
+      if (!sim?.dataPath) throw new Error('no dataPath for the simulator');
+      store = trustStorePath(sim.dataPath);
+      preExisting = await rowPresent();
+      notes.push(`preExisting=${preExisting}`);
+
+      const grpcPort = Number(process.env.FI_GRPC_PORT) || (await freePortPair());
+      server = await startGrpcServer(grpcPort);
+      await api.setRules([]);
+      await cfg.update('grpc.trustOnSimulator', true, vscode.ConfigurationTarget.Global);
+      const since = Date.now();
+      session = await launch(`FI-D L ${tag}`, dev, { toolArgs: [`--dart-define=GRPC_PORT=${grpcPort}`, `--dart-define=GRPC_TLS_PORT=${grpcPort + 1}`, '--dart-define=COVERAGE=false'] });
+      if (!(await rowPresent())) failures.push('the CA is not in the simulator trust store during the session');
+      const s = session;
+      await waitFor(() => (/DEMO_GRPC done/.test(outputOf(s)) ? true : undefined), 600_000, 250);
+      await sleep(500);
+      text = outputOf(s);
+      const tls = demoResults(text).grpc_tls;
+      if (!tls || !/^0 .*"status":"ORDER_STATUS_SHIPPED"/.test(`${tls.status} ${tls.body}`)) failures.push(`grpc_tls: ${tls ? `${tls.status} ${tls.body.slice(0, 160)}` : 'no DEMO_RESULT'}`);
+      const tlsUrl = `:${grpcPort + 1}/demo.orders.v1.OrderService/GetOrder`;
+      const decrypted = api
+        .getExchanges()
+        .filter((e) => e.startedAt >= since && e.kind === 'grpc' && e.url.includes(tlsUrl) && e.state === 'completed');
+      const ok = decrypted.filter((e) => e.grpc?.statusCode === 0 && e.grpc.messagesSent >= 1 && e.grpc.messagesReceived >= 1);
+      if (!ok.length) {
+        const seen = api.getExchanges().filter((e) => e.startedAt >= since && e.url.includes(`:${grpcPort + 1}`));
+        failures.push(`TLS GetOrder not recorded decrypted (status 0, messages both ways): ${seen.map((e) => `${e.kind} ${e.url} ${e.state} ${e.grpc?.statusCode ?? ''} ${e.error ?? ''}`).join(', ') || 'nothing recorded'}`);
+      }
+      notes.push(`decrypted=${ok.length}`);
+
+      // Session end → our row removed (a pre-existing one stays).
+      await stopSession(session).catch(() => false);
+      session = undefined;
+      const want = preExisting;
+      let settled = false; // (waitFor is synchronous)
+      for (const end = Date.now() + 20_000; !settled && Date.now() < end; await sleep(500)) settled = (await rowPresent()) === want;
+      if (!settled) failures.push(preExisting ? 'a pre-existing trust row was removed' : 'the CA is still trusted after the session ended');
+    } catch (e) {
+      failures.push(`exception: ${(e as Error).message}`);
+    } finally {
+      if (session) await stopSession(session).catch(() => false);
+      server?.stop();
+      await cfg.update('grpc.trustOnSimulator', undefined, vscode.ConfigurationTarget.Global);
+      if (cfg.inspect('grpc.trustOnSimulator')?.globalValue !== undefined) failures.push('flutterIntercept.grpc.trustOnSimulator not restored');
+      // Never leave the developer's simulator changed: if our row survived (a failure above), delete exactly it.
+      if (store && sha && !preExisting && (await rowPresent().catch(() => false))) {
+        await simExec(SQLITE3, ['-bail', '-cmd', '.timeout 5000', store, `DELETE FROM tsettings WHERE sha256 = x'${sha}';`], 10_000).catch((e: unknown) => failures.push(`cleanup failed: ${String(e)}`));
+        notes.push('cleanup: removed the row left behind');
+      }
+      await sleep(1500);
+    }
+    check(name, failures, t0, { output: evidence(text), mode: notes.join(' ') });
   }
 
   async function runSimple(
