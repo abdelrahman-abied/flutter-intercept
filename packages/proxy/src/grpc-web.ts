@@ -17,8 +17,15 @@ export function grpcWebVariant(ct: string | string[] | undefined): GrpcWebVarian
 
 /** Trailer bytes kept per call (the trailer frame is a few lines). */
 export const GRPC_WEB_TRAILER_KEEP_BYTES = 16 * 1024;
-/** Decoded output of an HTTP content-encoding (gzip / br / deflate) read per response, then parsing stops. */
-export const GRPC_WEB_DECODE_CAP_BYTES = 64 * 1024 * 1024;
+/**
+ * REVIEW-13 #1: bounds on the reader's WORK, not only its bytes. Decoded output of an HTTP content-encoding per response;
+ * frames read per direction (headers only past the recorded ones); trailer names kept.
+ */
+export const GRPC_WEB_DECODE_CAP_BYTES = 16 * 1024 * 1024;
+export const GRPC_WEB_MAX_FRAMES = 10_000;
+export const GRPC_WEB_MAX_TRAILER_NAMES = 100;
+/** Trailer / metadata names never used as keys (prototype-safe maps, REVIEW-13 #3). */
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 /**
  * Incremental base64 decoder for `-text` bodies: whitespace ignored, decoded in whole 4-character groups, and a group
@@ -83,6 +90,12 @@ export class GrpcWebFrameParser {
   private kept = 0;
   private keep = 0;
   private broken = false;
+  private frames = 0;
+  private trailersSeen = false;
+  /** Reading stopped (a protocol error or the frame cap): further bytes are ignored. */
+  get stopped(): boolean {
+    return this.broken;
+  }
 
   constructor(
     private readonly o: {
@@ -90,6 +103,8 @@ export class GrpcWebFrameParser {
       onTrailers: (raw: Buffer) => void;
       onBad: (why: string) => void;
       compressedKeep: number;
+      /** Stop after this many frames (default GRPC_WEB_MAX_FRAMES). */
+      maxFrames?: number;
     },
   ) {}
 
@@ -109,6 +124,18 @@ export class GrpcWebFrameParser {
           this.o.onBad(`not gRPC-Web framing (flags 0x${this.flags.toString(16).padStart(2, '0')})`);
           return;
         }
+        if (this.trailersSeen) {
+          // The trailer frame ends the stream: anything after it is a protocol error (and never parsed again).
+          this.broken = true;
+          this.o.onBad('frames after the trailer frame');
+          return;
+        }
+        if (++this.frames > (this.o.maxFrames ?? GRPC_WEB_MAX_FRAMES)) {
+          this.broken = true;
+          this.o.onBad(`more than ${this.o.maxFrames ?? GRPC_WEB_MAX_FRAMES} frames`);
+          return;
+        }
+        if (this.flags === 0x80) this.trailersSeen = true;
         this.size = this.header.readUInt32BE(1);
         this.remaining = this.size;
         this.parts = [];
@@ -148,19 +175,37 @@ export class GrpcWebFrameParser {
   }
 }
 
-/** The trailer frame's `name: value` lines (names lower-cased; repeated names become a list). */
+/**
+ * The trailer frame's `name: value` lines (names lower-cased; repeated names become a list). Bounded (the first 16 KB,
+ * GRPC_WEB_MAX_TRAILER_NAMES names, linear merging), prototype-safe (`__proto__` / `constructor` / `prototype` names are
+ * skipped), control characters stripped from values (REVIEW-13 #1 / #3).
+ */
 export function parseGrpcWebTrailers(raw: Buffer): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
-  for (const line of raw.toString('latin1').split(/\r?\n/)) {
+  const lists = new Map<string, string[]>();
+  let names = 0;
+  for (const line of raw.subarray(0, GRPC_WEB_TRAILER_KEEP_BYTES).toString('latin1').split('\n')) {
     const i = line.indexOf(':');
     if (i <= 0) continue;
     const k = line.slice(0, i).trim().toLowerCase();
-    const v = line.slice(i + 1).trim();
-    if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(k)) continue;
-    const prev = out[k];
-    out[k] = prev === undefined ? v : Array.isArray(prev) ? [...prev, v] : [prev, v];
+    if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(k) || UNSAFE_KEYS.has(k)) continue;
+    const v = cleanMetadataValue(line.slice(i + 1));
+    const list = lists.get(k);
+    if (list) {
+      if (list.length < 100) list.push(v);
+      continue;
+    }
+    if (++names > GRPC_WEB_MAX_TRAILER_NAMES) break;
+    lists.set(k, [v]);
   }
+  for (const [k, l] of lists) out[k] = l.length === 1 ? l[0] : l;
   return out;
+}
+
+/** A metadata value without control characters (CR, NUL, ESC…; tab kept), trimmed. */
+export function cleanMetadataValue(v: string): string {
+  // eslint-disable-next-line no-control-regex
+  return v.replace(/[\x00-\x08\x0a-\x1f\x7f]/g, '').trim();
 }
 
 /** `grpc-status` / `grpc-message` of a header or trailer set. */
@@ -180,6 +225,20 @@ export class GrpcWebRecorder {
   private req?: { feed: (b: Buffer) => void; end: () => void };
   private res?: { feed: (b: Buffer) => void; end: () => void };
   private decoded = 0;
+  private stoppedAll = false;
+  private zlibStream?: zlib.Gunzip | zlib.Inflate | zlib.BrotliDecompress;
+  private endedRes = false;
+  private resolveDone?: () => void;
+  /** Resolves when the response has been read to its end (or reading stopped). */
+  readonly done = new Promise<void>((r) => (this.resolveDone = r));
+
+  /** Stop all reading now (the call is forgotten / aborted): decoders destroyed, later bytes ignored. */
+  stop(): void {
+    this.stoppedAll = true;
+    this.zlibStream?.removeAllListeners('data');
+    this.zlibStream?.destroy();
+    this.resolveDone?.();
+  }
 
   constructor(
     private readonly variant: GrpcWebVariant,
@@ -192,6 +251,7 @@ export class GrpcWebRecorder {
   ) {}
 
   requestData(b: Buffer): void {
+    if (this.stoppedAll) return;
     (this.req ??= this.reader('send', this.variant)).feed(b);
   }
 
@@ -208,36 +268,54 @@ export class GrpcWebRecorder {
       this.res = r;
       return;
     }
-    const z = enc === 'gzip' || enc === 'x-gzip' ? zlib.createGunzip() : enc === 'deflate' ? zlib.createInflate() : enc === 'br' ? zlib.createBrotliDecompress() : undefined;
+    const opts = { chunkSize: 64 * 1024 };
+    const z = enc === 'gzip' || enc === 'x-gzip' ? zlib.createGunzip(opts) : enc === 'deflate' ? zlib.createInflate(opts) : enc === 'br' ? zlib.createBrotliDecompress(opts) : undefined;
     if (!z) {
       this.o.onProblem(`The response body is ${enc}-encoded; its gRPC-Web frames were not read.`);
-      this.res = { feed: () => undefined, end: () => undefined };
+      this.res = { feed: () => undefined, end: () => this.resolveDone?.() };
       return;
     }
+    this.zlibStream = z;
+    const stopDecoding = () => {
+      z.removeAllListeners('data');
+      z.destroy();
+      this.resolveDone?.();
+    };
     z.on('data', (d: Buffer) => {
+      if (this.stoppedAll) return stopDecoding();
+      const room = GRPC_WEB_DECODE_CAP_BYTES - this.decoded;
       this.decoded += d.length;
-      if (this.decoded > GRPC_WEB_DECODE_CAP_BYTES) {
+      r.feed(room < d.length ? d.subarray(0, Math.max(0, room)) : d);
+      if (this.decoded >= GRPC_WEB_DECODE_CAP_BYTES) {
         this.o.onProblem(`Only the first ${GRPC_WEB_DECODE_CAP_BYTES / 1024 / 1024} MB of the decoded response were read.`);
-        z.removeAllListeners('data');
-        z.destroy();
-        return;
+        return stopDecoding();
       }
-      r.feed(d);
+      if (r.stopped()) stopDecoding(); // the reader has what it keeps: no more decoding work
     });
-    z.on('error', () => this.o.onProblem(`The response body could not be ${enc}-decoded.`));
-    z.on('end', () => r.end());
-    this.res = { feed: (b) => void (z.destroyed || z.write(b)), end: () => void (z.destroyed || z.end()) };
+    z.on('error', () => {
+      this.o.onProblem(`The response body could not be ${enc}-decoded.`);
+      this.resolveDone?.();
+    });
+    z.on('end', () => {
+      r.end();
+      this.resolveDone?.();
+    });
+    this.res = { feed: (b) => void (z.destroyed || this.stoppedAll || z.write(b)), end: () => void (z.destroyed ? this.resolveDone?.() : z.end()) };
   }
 
   responseData(b: Buffer): void {
+    if (this.stoppedAll) return;
     (this.res ??= this.reader('receive', this.variant)).feed(b);
   }
 
   responseEnd(): void {
-    this.res?.end();
+    if (this.endedRes) return;
+    this.endedRes = true;
+    if (this.res) this.res.end();
+    if (!this.zlibStream || this.zlibStream.destroyed) this.resolveDone?.();
   }
 
-  private reader(dir: 'send' | 'receive', variant: GrpcWebVariant): { feed: (b: Buffer) => void; end: () => void } {
+  private reader(dir: 'send' | 'receive', variant: GrpcWebVariant): { feed: (b: Buffer) => void; end: () => void; stopped: () => boolean } {
     const bad = (why: string) => this.o.onProblem(`gRPC-Web ${dir === 'send' ? 'request' : 'response'}: ${why}; its remaining frames were not read.`);
     const frames = new GrpcWebFrameParser({
       onMessage: (m) => this.o.onMessage(dir, m),
@@ -247,14 +325,15 @@ export class GrpcWebRecorder {
       onBad: bad,
       compressedKeep: this.o.compressedKeep,
     });
-    if (variant === 'binary') return { feed: (b) => frames.push(b), end: () => frames.end() };
+    if (variant === 'binary') return { feed: (b) => frames.stopped || frames.push(b), end: () => frames.end(), stopped: () => frames.stopped };
     const b64 = new Base64Stream((b) => frames.push(b), bad);
     return {
-      feed: (b) => b64.push(b),
+      feed: (b) => frames.stopped || b64.push(b),
       end: () => {
         b64.end();
         frames.end();
       },
+      stopped: () => frames.stopped,
     };
   }
 }

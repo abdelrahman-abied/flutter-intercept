@@ -331,3 +331,14 @@ integration in `intercept-proxy.ts`. Tests: `packages/proxy/test/grpc-web.test.t
     passed through, noted "<host> pins its certificate; passed through undecrypted.".
   - The app sees one failed TLS handshake, which is a connect failure (normal backoff), not a lost connection.
   - Getter `grpcPinnedHosts`.
+- **REVIEW-13 fixes (gRPC-Web reader):**
+  - The reader is bounded by work. At most 1000 recorded frames and 100 decompressed messages per direction; frames
+    past 10 000 stop reading (note). HTTP content-encoding decode stops at 16 MB, or as soon as the parser stops (the
+    zlib stream is destroyed).
+  - Only the first trailer frame is parsed: ≤ 16 KB, ≤ 100 names, linear merging. A later frame is a protocol error.
+  - Syncs are batched per tick and late frames go through `touch`.
+  - Once the response is read (≤ 2 s after its end), late frames join the stored exchange. Then the reader is stopped
+    and nothing is queued any more. An abort stops it at once.
+  - Trailer and metadata maps skip `__proto__` / `constructor` / `prototype` (also `recordedHeaders` /
+    `forwardableHeaders` for HTTP/2). Control characters are stripped from gRPC-Web trailer values.
+  - The deferred rule match passes `grpcWeb`. Locally answered grpcMock preflights send `Access-Control-Max-Age: 0`.

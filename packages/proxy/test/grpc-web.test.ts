@@ -2,6 +2,7 @@
 import { once } from 'events';
 import * as http from 'http';
 import * as zlib from 'zlib';
+import { performance } from 'perf_hooks';
 import type { AddressInfo } from 'net';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Exchange, InterceptProxy, Rule } from '../src';
@@ -39,7 +40,15 @@ function readFrames(body: Buffer): { flags: number; payload: Buffer }[] {
 
 let server: http.Server;
 let base: string;
+// REVIEW-13 probes: ~100 B of br that decode to 64 MB of zeros (13.4 M empty frames), and repeated trailer frames.
+let brBomb: Buffer;
+let brTrailerBomb: Buffer;
+let brProto: Buffer;
 beforeAll(async () => {
+  brBomb = zlib.brotliCompressSync(Buffer.alloc(64 * 1024 * 1024));
+  const tf = trailerFrame('a:\n'.repeat(5461));
+  brTrailerBomb = zlib.brotliCompressSync(Buffer.concat(Array.from({ length: 400 }, () => tf)));
+  brProto = zlib.brotliCompressSync(Buffer.concat([frame('ok'), trailerFrame('grpc-status: 0\r\nconstructor: boom\r\nconstructor: again\r\n__proto__: x\r\nprototype: y\r\nx-v: a\rb\u0000c\u001bd\r\n')]));
   server = http.createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const c of req) chunks.push(c as Buffer);
@@ -59,6 +68,10 @@ beforeAll(async () => {
     };
     if (name === 'Fail') {
       res.writeHead(200, { 'content-type': ct, 'grpc-status': '14', 'grpc-message': 'down%20for%20now', 'content-length': '0' }).end();
+      return;
+    }
+    if (name === 'Bomb' || name === 'TrailerBomb' || name === 'Proto') {
+      res.writeHead(200, { 'content-type': ct, 'content-encoding': 'br' }).end(name === 'Bomb' ? brBomb : name === 'TrailerBomb' ? brTrailerBomb : brProto);
       return;
     }
     if (name === 'Bad') {
@@ -293,5 +306,57 @@ describe('rules on gRPC-Web calls', () => {
     });
     expect(status.s).toBe(204);
     expect(status.h['access-control-allow-origin']).toBe('http://localhost:5000');
+    expect(status.h['access-control-max-age']).toBe('0'); // never cached (REVIEW-13)
+  });
+});
+
+describe('REVIEW-13: the passive reader is bounded by work', () => {
+  /** Event-loop busy time and peak heap growth while `fn` runs and the reader finishes (forgotten). */
+  async function measure(fn: () => Promise<unknown>): Promise<{ activeMs: number; heapMb: number }> {
+    const heap0 = process.memoryUsage().heapUsed;
+    let peak = heap0;
+    const sampler = setInterval(() => (peak = Math.max(peak, process.memoryUsage().heapUsed)), 5);
+    const elu0 = performance.eventLoopUtilization();
+    await fn();
+    const calls = (proxy as unknown as { grpcWebCalls: Map<string, unknown> }).grpcWebCalls;
+    for (let i = 0; i < 300 && calls.size; i++) await sleep(10);
+    const used = performance.eventLoopUtilization(elu0);
+    clearInterval(sampler);
+    expect(calls.size).toBe(0);
+    return { activeMs: used.active, heapMb: (peak - heap0) / 1024 / 1024 };
+  }
+
+  it(`the ${'106'}-byte br bomb (64 MB of zeros) and the repeated-trailer probe: < 100 ms of event loop, < 64 MB heap`, async () => {
+    expect(brBomb.length).toBeLessThan(200);
+    const a = await measure(() => call('/t.Web/Bomb'));
+    expect(a.activeMs).toBeLessThan(100);
+    expect(a.heapMb).toBeLessThan(64);
+    const ex = await waitFor(proxy, (e) => done('/t.Web/Bomb')(e) && !!e.error);
+    expect(ex.error).toMatch(/more than 10000 frames/);
+    expect(ex.grpc?.messagesReceived).toBe(10_000);
+    expect(ex.frames!.length).toBeLessThanOrEqual(500);
+    const b = await measure(() => call('/t.Web/TrailerBomb'));
+    expect(b.activeMs).toBeLessThan(100);
+    expect(b.heapMb).toBeLessThan(64);
+    const t = await waitFor(proxy, (e) => done('/t.Web/TrailerBomb')(e) && !!e.error);
+    expect(t.error).toMatch(/frames after the trailer frame/);
+    expect((t.responseTrailers?.a as string[]).length).toBe(100);
+  });
+
+  it('four bombs in parallel finish without trouble', async () => {
+    const r = await measure(() => Promise.all([1, 2, 3, 4].map(() => call('/t.Web/Bomb'))));
+    expect(r.heapMb).toBeLessThan(128);
+    expect(proxy.getExchanges().filter(done('/t.Web/Bomb')).length).toBe(4);
+  });
+
+  it('trailers are prototype-safe and control characters are stripped', async () => {
+    await call('/t.Web/Proto');
+    const ex = await waitFor(proxy, (e) => done('/t.Web/Proto')(e) && e.grpc?.statusCode !== undefined);
+    const t = ex.responseTrailers!;
+    expect(Object.keys(t).sort()).toEqual(['grpc-status', 'x-v']);
+    expect(Object.prototype.hasOwnProperty.call(t, 'constructor')).toBe(false);
+    expect(Object.getPrototypeOf(t)).toBe(Object.prototype);
+    expect(t['x-v']).toBe('abcd');
+    expect(() => JSON.stringify(ex)).not.toThrow();
   });
 });

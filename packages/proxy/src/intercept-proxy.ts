@@ -1782,8 +1782,7 @@ export class InterceptProxy extends EventEmitter {
       ex.framesDropped = (ex.framesDropped ?? 0) + 1;
     }
     this.frameBytes.set(ex.id, bytes);
-    if (live) this.touch(ex);
-    else this.emitChange(ex);
+    this.touch(ex); // coalesced, also for late frames of a finished exchange
   }
 
   /**
@@ -2650,7 +2649,7 @@ export class InterceptProxy extends EventEmitter {
     if (flow.deferred) {
       // CONTRACTS §11.2: choose the rule now that the operation name can be read.
       const text = body && body.encoding === 'utf8' && !body.truncated ? body.text : undefined;
-      const m = this.matchRule(req.method, req.url, { count: true, body: () => text });
+      const m = this.matchRule(req.method, req.url, { count: true, body: () => text, ...(flow.grpcWeb ? { grpcWeb: true } : {}) });
       const note = m.note ?? flow.note;
       resolved =
         !m.rule && this.replayStore
@@ -2997,6 +2996,8 @@ export class InterceptProxy extends EventEmitter {
   private answerPreflight(req: CompletedRequest, ex: Exchange, flow: Flow): CallbackRequestResult {
     this.track(ex, flow);
     const headers: HeaderBag = preflightResponseHeaders(req.headers as HeaderBag, flow.corsPatch ?? {}) ?? { 'content-length': '0' };
+    // REVIEW-13: a grpcMock's answer depends on the call, not just its URL: the browser must not cache this preflight.
+    if (flow.action?.kind === 'grpcMock') setHeader(headers, 'access-control-max-age', '0');
     ex.status = 204;
     ex.responseHeaders = cleanHeaders(headers);
     ex.cors = { preflight: true, patched: true };
@@ -3557,39 +3558,61 @@ export class InterceptProxy extends EventEmitter {
 
   // ---------------------------------------------------------------- gRPC-Web (CONTRACTS §19.1)
 
-  /** Read a gRPC-Web call's bodies from the taps as they pass (any route), into frames / trailers on its exchange. */
+  /**
+   * Read a gRPC-Web call's bodies from the taps as they pass (any route), into frames / trailers on its exchange.
+   * Bounded by work (REVIEW-13 #1): ≤ GRPC_WEB_RECORD_FRAMES recorded frames and ≤ GRPC_WEB_DECOMPRESS_MESSAGES
+   * decompressed messages per direction, the rest counted from frame headers; the reader stops at its frame / decode
+   * caps and is stopped (decoders destroyed, nothing queued) once the call is forgotten.
+   */
   private watchGrpcWeb(req: OngoingRequest, variant: GrpcWebVariant): void {
     const tap = getTap(req.id);
     if (!tap) return;
     const id = req.id;
     tap.req.skip = true; // frames instead of a raw body copy
     tap.res.skip = true;
-    const st: GrpcWebState = { sent: 0, received: 0, queue: [], notes: [], reqEnc: grpcEncodingOf((req.headers as HeaderBag)['grpc-encoding']) } as unknown as GrpcWebState;
+    const st: GrpcWebState = {
+      sent: 0,
+      received: 0,
+      recorded: { send: 0, receive: 0 },
+      compressed: { send: 0, receive: 0 },
+      queue: [],
+      notes: [],
+      reqEnc: grpcEncodingOf((req.headers as HeaderBag)['grpc-encoding']),
+    } as unknown as GrpcWebState;
     const sink = (f: Frame) => {
+      if (st.forgotten) return; // never queue for a call that is gone
       st.queue.push(f);
-      this.syncGrpcWeb(id);
+      this.scheduleGrpcWebSync(id, st);
     };
-    const sendRec = new GrpcFrameRecorder('send', () => st.reqEnc, sink);
-    const recvRec = new GrpcFrameRecorder('receive', () => st.resEnc, sink);
+    const recs = {
+      send: new GrpcFrameRecorder('send', () => st.reqEnc, sink),
+      receive: new GrpcFrameRecorder('receive', () => st.resEnc, sink),
+    };
+    const note = (text: string) => {
+      if (!st.notes.includes(text) && st.notes.length < 10) st.notes.push(text);
+      this.scheduleGrpcWebSync(id, st);
+    };
     st.rec = new GrpcWebRecorder(variant, {
       onMessage: (dir, m) => {
-        if (dir === 'send') {
-          st.sent++;
-          sendRec.push(m);
-        } else {
-          st.received++;
-          recvRec.push(m);
+        if (st.forgotten) return;
+        if (dir === 'send') st.sent++;
+        else st.received++;
+        if (st.recorded[dir] >= GRPC_WEB_RECORD_FRAMES) {
+          if (st.recorded[dir] === GRPC_WEB_RECORD_FRAMES) note(`Only the first ${GRPC_WEB_RECORD_FRAMES} messages each way were recorded; later ones were counted.`);
+          st.recorded[dir]++;
+          return this.scheduleGrpcWebSync(id, st);
         }
-        this.syncGrpcWeb(id);
+        st.recorded[dir]++;
+        // Decompression work is bounded per call too: later compressed messages are recorded without a payload.
+        const decompress = !m.compressed || st.compressed[dir]++ < GRPC_WEB_DECOMPRESS_MESSAGES;
+        recs[dir].push(decompress ? m : { ...m, kept: Buffer.alloc(0), complete: false });
       },
       onTrailers: (t) => {
+        if (st.forgotten) return;
         st.trailers = t;
-        this.syncGrpcWeb(id);
+        this.scheduleGrpcWebSync(id, st);
       },
-      onProblem: (text) => {
-        if (!st.notes.includes(text)) st.notes.push(text);
-        this.syncGrpcWeb(id);
-      },
+      onProblem: note,
       compressedKeep: GRPC_COMPRESSED_KEEP_BYTES,
     });
     this.grpcWebCalls.set(id, st);
@@ -3604,22 +3627,38 @@ export class InterceptProxy extends EventEmitter {
       const s = grpcStatusOf(h);
       if (s.code !== undefined) st.headStatus = s; // trailers-only (status in the headers)
       st.rec.responseHead(h);
-      this.syncGrpcWeb(id);
+      this.scheduleGrpcWebSync(id, st);
     };
     tap.onResponseData = (b) => st.rec.responseData(b);
     const done = tap.onResponseDone;
     tap.onResponseDone = (finished) => {
       done?.(finished);
       st.rec.requestEnd();
-      st.rec.responseEnd();
-      // Frames still decompressing join the stored exchange; then forget the call.
-      void Promise.all([sendRec.idle(), recvRec.idle()]).then(() => {
-        setTimeout(() => {
+      if (finished) st.rec.responseEnd();
+      else st.rec.stop(); // aborted: release the decoders and buffers now
+      // The rest of the body is read (bounded, at most GRPC_WEB_FORGET_MS), late frames join the stored exchange,
+      // then the call is forgotten and its reader stopped.
+      const deadline = sleep(GRPC_WEB_FORGET_MS);
+      void Promise.race([st.rec.done, deadline])
+        .then(() => Promise.race([Promise.all([recs.send.idle(), recs.receive.idle()]), deadline]))
+        .then(() => {
+          st.rec.stop();
           this.syncGrpcWeb(id);
+          st.forgotten = true;
+          st.queue.length = 0;
           this.grpcWebCalls.delete(id);
-        }, 50);
-      });
+        });
     };
+  }
+
+  /** One sync per tick for a call (REVIEW-13 #1: never one exchange event per frame). */
+  private scheduleGrpcWebSync(id: string, st: GrpcWebState): void {
+    if (st.syncScheduled || st.forgotten) return;
+    st.syncScheduled = true;
+    setImmediate(() => {
+      st.syncScheduled = false;
+      this.syncGrpcWeb(id);
+    });
   }
 
   /** Move what the reader found onto the exchange (once it exists: hooked routes create it after the body). */
@@ -3627,7 +3666,11 @@ export class InterceptProxy extends EventEmitter {
     const st = this.grpcWebCalls.get(id);
     const live = this.live.get(id);
     const ex = live?.ex ?? this.store.get(id);
-    if (!st || !ex || !ex.grpc) return;
+    if (!st) return;
+    if (!ex || !ex.grpc) {
+      if (st.forgotten) st.queue.length = 0;
+      return;
+    }
     const frames = st.queue.splice(0);
     for (const f of frames) this.addFrame(ex, f, true);
     const g = ex.grpc;
@@ -3644,8 +3687,7 @@ export class InterceptProxy extends EventEmitter {
     }
     for (const n of st.notes) if (!(ex.error ?? '').includes(n)) ex.error = ex.error ? `${ex.error} ${n}` : n;
     st.notes.length = 0;
-    if (live?.ex === ex) this.touch(ex);
-    else this.emitChange(ex);
+    this.touch(ex);
   }
 
   /** CORS for a local gRPC-Web answer (like other mocks), plus the gRPC status headers exposed to the page. */
@@ -5700,6 +5742,12 @@ interface GrpcWebState {
   rec: GrpcWebRecorder;
   sent: number;
   received: number;
+  /** Frames recorded / compressed messages decompressed, per direction. */
+  recorded: Record<Frame['dir'], number>;
+  compressed: Record<Frame['dir'], number>;
+  /** The call is forgotten: nothing more is queued. */
+  forgotten?: boolean;
+  syncScheduled?: boolean;
   queue: Frame[];
   notes: string[];
   reqEnc?: string;
@@ -5707,6 +5755,12 @@ interface GrpcWebState {
   trailers?: Record<string, string | string[]>;
   headStatus?: { code?: number; message?: string };
 }
+
+/** REVIEW-13 #1: work bounds of the passive gRPC-Web reader (per call and direction). */
+const GRPC_WEB_RECORD_FRAMES = 1000;
+const GRPC_WEB_DECOMPRESS_MESSAGES = 100;
+/** After the response ended: at most this long to finish reading / decompressing before the call is forgotten. */
+const GRPC_WEB_FORGET_MS = 2000;
 
 /** CONTRACTS §19.1: a gRPC-Web exchange is shown as a gRPC call. */
 function grpcWebExchangeFields(url: string, headers: HeaderBag, web: GrpcWebVariant): Partial<Exchange> {

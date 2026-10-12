@@ -329,6 +329,7 @@ export function forwardableHeaders(h: Record<string, string | string[] | undefin
   for (const [k, v] of Object.entries(h ?? {})) {
     const lk = k.toLowerCase();
     if (v === undefined || lk.startsWith(':') || HOP_BY_HOP.has(lk) || lk.startsWith('flutter-intercept-') || lk === 'x-fi-id' || lk === 'x-fi-send') continue;
+    if (lk === '__proto__' || lk === 'constructor' || lk === 'prototype') continue; // prototype-safe (REVIEW-13 #3)
     if (lk === 'te' && String(v).toLowerCase() !== 'trailers') continue;
     out[lk] = Array.isArray(v) ? v.slice() : v;
   }
@@ -339,7 +340,7 @@ export function forwardableHeaders(h: Record<string, string | string[] | undefin
 export function recordedHeaders(h: Record<string, string | string[] | undefined>): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
   for (const [k, v] of Object.entries(h ?? {})) {
-    if (v === undefined || k.startsWith(':')) continue;
+    if (v === undefined || k.startsWith(':') || k === '__proto__' || k === 'constructor' || k === 'prototype') continue; // prototype-safe
     out[k] = Array.isArray(v) ? v.slice() : v;
   }
   return out;
