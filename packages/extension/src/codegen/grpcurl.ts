@@ -1,12 +1,13 @@
 /**
  * "Copy as grpcurl" for a recorded gRPC call (CONTRACTS §19.2). Pure: no `vscode`, no I/O (the schema comes in).
  *
- *     grpcurl [-plaintext | -insecure] [-import-path <dir> -proto <file>] -H 'name: value' … -d '<json>' host:port pkg.Service/Method
+ *     grpcurl [-plaintext] [-import-path <dir> -proto <file>] -H 'name: value' … -d '<json>' host:port pkg.Service/Method
  *
  * - HTTP/2 gRPC and gRPC-Web calls (`grpc.web`) are both rendered as native gRPC.
- * - `-plaintext` for `http://`; `-insecure` only for a host in `flutterIntercept.grpc.decryptHosts` (an app that trusts
- *   the Flutter Intercept CA in debug usually talks to a server whose certificate isn't publicly trusted); plain TLS
- *   otherwise.
+ * - `-plaintext` for `http://`; TLS otherwise, always verified (REVIEW-13 #4: the command talks to the real server, not
+ *   to the proxy, and carries real credentials — never `-insecure`).
+ * - `maxDataChars` (agents' `maxBodyChars`): a longer `-d` is left out with a note (cut JSON would not run); request
+ *   messages are decoded only as far as needed (the first one; client streaming: until the limit).
  * - `-d`: the request message decoded with the app's schema (client streaming: every request message, in grpcurl's
  *   concatenated format). Without a schema the snippet says so and leaves `-d` out.
  * - `-proto` / `-import-path` when the method came from a `.proto` file inside the workspace (paths relative to the
@@ -19,7 +20,6 @@
  */
 import * as path from 'path';
 import type { Exchange } from '@flutter-intercept/proxy';
-import { matchesHostPattern, parseHostPattern } from '@flutter-intercept/proxy/hosts';
 import { redactGrpcMetadata } from '../agent/redact';
 import { redactJsonValue } from '../agent/samples';
 import { decodeGrpcMessages, grpcMethodPath, type GrpcDeps } from '../grpc/service';
@@ -54,8 +54,8 @@ export interface GrpcurlOptions {
   grpc?: Pick<GrpcDeps, 'codec' | 'schema'>;
   /** The workspace folder `-proto` / `-import-path` are relative to. */
   projectRoot?: string;
-  /** `flutterIntercept.grpc.decryptHosts`: such hosts get `-insecure`. */
-  decryptHosts?: readonly string[];
+  /** The longest `-d` JSON included (default 1 000 000 characters). */
+  maxDataChars?: number;
   /** Agents: URL, metadata and request JSON redacted. */
   redact?: boolean;
 }
@@ -66,16 +66,8 @@ function insideRel(file: string, root: string | undefined): string | undefined {
   return rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel.split(path.sep).join('/') : undefined;
 }
 
-function hostMatches(patterns: readonly string[] | undefined, host: string, port: number): boolean {
-  for (const raw of patterns ?? []) {
-    try {
-      if (matchesHostPattern(parseHostPattern(raw), host, port)) return true;
-    } catch {
-      // an invalid pattern never matches
-    }
-  }
-  return false;
-}
+/** Client-streaming calls: at most this many request messages in `-d`. */
+const MAX_STREAM_MESSAGES = 100;
 
 /** The grpcurl command for a gRPC exchange. Throws a readable Error for anything that isn't one. */
 export function toGrpcurl(e: Exchange, opts: GrpcurlOptions = {}): string {
@@ -91,9 +83,7 @@ export function toGrpcurl(e: Exchange, opts: GrpcurlOptions = {}): string {
   const notes: string[] = [];
   const args: string[] = [];
   const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
-  const host = u.hostname;
   if (u.protocol === 'http:') args.push('-plaintext');
-  else if (hostMatches(opts.decryptHosts, host.replace(/^\[|\]$/g, ''), port)) args.push('-insecure');
 
   // -proto / -import-path for a method read from a .proto in the workspace
   let schemaMethod;
@@ -126,12 +116,16 @@ export function toGrpcurl(e: Exchange, opts: GrpcurlOptions = {}): string {
   }
 
   // -d: the request message(s) as JSON
-  const decoded = decodeGrpcMessages(e, opts.grpc, { filter: (f) => f.kind === 'message' && f.dir === 'send' && !f.dropped }).messages;
+  const maxData = Math.max(0, opts.maxDataChars ?? 1_000_000);
+  const wanted = schemaMethod?.clientStreaming ? MAX_STREAM_MESSAGES : 1;
+  let seen = 0;
+  const decoded = decodeGrpcMessages(e, opts.grpc, { filter: (f) => f.kind === 'message' && f.dir === 'send' && !f.dropped && seen++ < wanted }).messages;
   if (!decoded.length) notes.push('# No request message was recorded: add -d \'<json>\' if the method expects one.');
   else if (decoded.every((m) => m.via === 'schema' && m.json !== undefined && !m.truncated)) {
-    const all = schemaMethod?.clientStreaming ? decoded : decoded.slice(0, 1);
-    const text = all.map((m) => JSON.stringify(opts.redact ? redactJsonValue(m.json) : m.json)).join(' ');
-    args.push(`-d ${shellQuote(text)}`);
+    const text = decoded.map((m) => JSON.stringify(opts.redact ? redactJsonValue(m.json) : m.json)).join(' ');
+    if (text.length > maxData) notes.push(`# The request JSON is ${text.length} characters, over the ${maxData} allowed here (maxBodyChars), so it is not included: add -d '<json>' yourself.`);
+    else args.push(`-d ${shellQuote(text)}`);
+    if (seen > wanted) notes.push(`# Only the first ${wanted} request messages are included.`);
   } else if (decoded.some((m) => m.truncated)) {
     notes.push('# The request message was larger than 64 KB when recorded, so it is not included: add -d \'<json>\' yourself.');
   } else {

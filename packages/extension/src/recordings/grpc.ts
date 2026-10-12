@@ -19,7 +19,7 @@
  */
 import { createHash } from 'crypto';
 import type { Exchange, Frame, GrpcInfo, ReplayEntry } from '@flutter-intercept/proxy';
-import { redactGrpcMetadata, redactText, redactUrl } from '../agent/redact';
+import { ownHeaderEntries, redactGrpcMetadata, redactText, redactUrl } from '../agent/redact';
 import { redactJsonValue } from '../agent/samples';
 import { decodeGrpcMessages, grpcMethodPath, grpcProxyCodec, type GrpcDeps } from '../grpc/service';
 import { capFrames, copyFrame } from './frames';
@@ -49,12 +49,19 @@ export interface FileGrpc {
 /** Custom metadata only (no pseudo headers or protocol fields), as own properties. */
 export function customMetadata(h: Record<string, string | string[]> | undefined): Record<string, string | string[]> | undefined {
   const out: Record<string, string | string[]> = {};
-  for (const [k, v] of Object.entries(h ?? {})) {
+  for (const [k, v] of ownHeaderEntries(h)) {
     const n = k.toLowerCase();
     if (n.startsWith(':') || PROTOCOL_METADATA.has(n)) continue;
     Object.defineProperty(out, k, { value: Array.isArray(v) ? [...v] : v, enumerable: true, writable: true, configurable: true });
   }
   return Object.keys(out).length ? out : undefined;
+}
+
+/** A header map rebuilt from its own string entries (REVIEW-13 #3). */
+function cleanHeaders(h: Record<string, string | string[]> | undefined): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const [k, v] of ownHeaderEntries(h)) Object.defineProperty(out, k, { value: Array.isArray(v) ? [...v] : v, enumerable: true, writable: true, configurable: true });
+  return out;
 }
 
 /**
@@ -144,6 +151,10 @@ export function recordGrpc(e: RecordedExchange, base: RecordedExchange, redact: 
     out.url = redactUrl(e.url);
     out.requestHeaders = redactGrpcMetadata(e.requestHeaders) ?? {};
     out.responseHeaders = redactGrpcMetadata(e.responseHeaders) ?? {};
+  } else {
+    // REVIEW-13 #3: own string values only (a value a parser merged from an inherited property is dropped)
+    out.requestHeaders = cleanHeaders(e.requestHeaders);
+    out.responseHeaders = cleanHeaders(e.responseHeaders);
   }
   if (hash) out.grpcRequestHash = hash;
   else delete out.grpcRequestHash;

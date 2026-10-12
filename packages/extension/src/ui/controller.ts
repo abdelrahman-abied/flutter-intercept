@@ -1760,7 +1760,7 @@ export class InterceptController {
           const ex = this.exchangeOrThrow(checkId(msg.id, 'copySnippet'));
           if (!this.deps.copyToClipboard) throw new Error('Copying is not available in this editor.');
           // The user's own clipboard: unredacted (CONTRACTS §9.3).
-          await this.deps.copyToClipboard(snippetFor(ex, msg.format, { grpc: this.deps.grpc, projectRoot: this.deps.projectRoot?.(), decryptHosts: this.deps.host.grpcDecryptHosts }));
+          await this.deps.copyToClipboard(snippetFor(ex, msg.format, { grpc: this.deps.grpc, projectRoot: this.deps.projectRoot?.() }));
           return;
         }
         case 'setNetworkProfile':

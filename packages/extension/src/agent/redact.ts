@@ -84,22 +84,46 @@ export function redactWebSocketProtocols(value: string): string {
     .join(', ');
 }
 
+/**
+ * REVIEW-13 #3: a header map's own entries with string values only (a non-string element — e.g. an inherited
+ * `constructor` a parser merged in — is dropped, a non-string value skips the entry). Never reads inherited properties.
+ */
+export function ownHeaderEntries(headers: Headers | undefined): [string, string | string[]][] {
+  const out: [string, string | string[]][] = [];
+  if (!headers || typeof headers !== 'object') return out;
+  for (const k of Object.keys(headers)) {
+    const v = Object.getOwnPropertyDescriptor(headers, k)?.value as unknown;
+    if (typeof v === 'string') out.push([k, v]);
+    else if (Array.isArray(v)) out.push([k, v.filter((x): x is string => typeof x === 'string')]);
+  }
+  return out;
+}
+
+/** Sets `k` as an own property (a key named `__proto__` stays a plain entry). */
+export function setOwn<T>(o: Record<string, T>, k: string, v: T): void {
+  Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
+}
+
 export function redactHeaders(headers: Headers | undefined): Headers | undefined {
   if (!headers) return headers;
   const out: Headers = {};
-  for (const [k, v] of Object.entries(headers)) {
+  for (const [k, v] of ownHeaderEntries(headers)) {
     if (k.toLowerCase() === 'sec-websocket-protocol') {
       // One list across repeated header lines, so `access_token` + `<token>` on two lines is caught too.
-      out[k] = Array.isArray(v) ? [redactWebSocketProtocols(v.join(', '))] : redactWebSocketProtocols(v);
+      setOwn(out, k, Array.isArray(v) ? [redactWebSocketProtocols(v.join(', '))] : redactWebSocketProtocols(v));
       continue;
     }
-    out[k] = isSensitiveHeader(k)
-      ? Array.isArray(v)
-        ? v.map(() => REDACTED)
-        : REDACTED
-      : Array.isArray(v)
-        ? v.map((x) => redactSecretValues(x, true))
-        : redactSecretValues(v, true);
+    setOwn(
+      out,
+      k,
+      isSensitiveHeader(k)
+        ? Array.isArray(v)
+          ? v.map(() => REDACTED)
+          : REDACTED
+        : Array.isArray(v)
+          ? v.map((x) => redactSecretValues(x, true))
+          : redactSecretValues(v, true),
+    );
   }
   return out;
 }
@@ -115,11 +139,8 @@ const GRPC_PROTOCOL_METADATA = /^(grpc-(status|message|encoding|accept-encoding|
 export function redactGrpcMetadata(headers: Headers | undefined): Headers | undefined {
   const out = redactHeaders(headers);
   if (!out) return out;
-  for (const k of Object.keys(out)) {
-    if (/-bin$/i.test(k) && !GRPC_PROTOCOL_METADATA.test(k)) {
-      const v = out[k];
-      out[k] = Array.isArray(v) ? v.map(() => REDACTED) : REDACTED;
-    }
+  for (const [k, v] of ownHeaderEntries(out)) {
+    if (/-bin$/i.test(k) && !GRPC_PROTOCOL_METADATA.test(k)) setOwn(out, k, Array.isArray(v) ? v.map(() => REDACTED) : REDACTED);
   }
   return out;
 }

@@ -10,7 +10,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Body, Exchange } from '@flutter-intercept/proxy';
-import { Headers, redactBody, redactFrameText, redactGrpcMetadata, redactHeaders, redactSecretValues, redactText, redactUrl } from './redact';
+import { Headers, ownHeaderEntries, redactBody, redactFrameText, redactGrpcMetadata, redactHeaders, redactSecretValues, redactText, redactUrl } from './redact';
 import { redactJsonValue } from './samples';
 
 /** Decoded JSON per `message` frame of a gRPC exchange (frame order; undefined = not decodable). */
@@ -27,12 +27,12 @@ type NV = { name: string; value: string };
 
 function headerList(h: Headers | undefined): NV[] {
   const out: NV[] = [];
-  for (const [name, v] of Object.entries(h ?? {})) for (const value of Array.isArray(v) ? v : [v]) out.push({ name, value });
+  for (const [name, v] of ownHeaderEntries(h)) for (const value of Array.isArray(v) ? v : [v]) out.push({ name, value });
   return out;
 }
 
 function headerValue(h: Headers | undefined, name: string): string | undefined {
-  for (const [k, v] of Object.entries(h ?? {})) if (k.toLowerCase() === name) return Array.isArray(v) ? v[0] : v;
+  for (const [k, v] of ownHeaderEntries(h)) if (k.toLowerCase() === name) return Array.isArray(v) ? v[0] : v;
   return undefined;
 }
 

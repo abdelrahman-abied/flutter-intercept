@@ -953,7 +953,7 @@ export class AgentApi implements AgentTools {
     // CONTRACTS §19.2: gRPC calls as grpcurl (redacted metadata and request JSON); grpcurl only for gRPC calls
     if (format === 'grpcurl') {
       if (e.kind !== 'grpc') throw new AgentToolError(`exchange "${e.id}" is not a gRPC call: use snippet "curl", "dart_http" or "dio"`, 'invalid');
-      return toGrpcurl(e, { grpc: this.deps.grpc, projectRoot: this.deps.projectRoot(), decryptHosts: this.deps.host.grpcDecryptHosts, redact: this.redact });
+      return toGrpcurl(e, { grpc: this.deps.grpc, projectRoot: this.deps.projectRoot(), redact: this.redact, maxDataChars: maxChars });
     }
     if (e.kind === 'grpc') throw new AgentToolError(`exchange "${e.id}" is a gRPC call: use snippet "grpcurl"`, 'invalid');
     const headers = (this.redact ? redactHeaders(e.requestHeaders) : e.requestHeaders) ?? {};

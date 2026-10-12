@@ -139,6 +139,12 @@ function actionApprovalReasons(a: AnyAction): string[] {
       else if (!hasType && !a.bodyFile && a.body.trimStart().startsWith('<')) out.push('serves what looks like an HTML page');
       break;
     }
+    case 'grpcMock':
+      // REVIEW-13 #2: since 0.13 a grpcMock answers Flutter Web's gRPC-Web calls in the browser: its headers (and, on a
+      // trailers-only answer, its trailers) are gated exactly like a mock's response headers
+      out.push(...responseHeaderReasons(a.headers));
+      out.push(...responseHeaderReasons(a.trailers).map((r) => `${r} as a gRPC trailer`));
+      break;
     case 'script':
       // CONTRACTS §13.4: every shared script needs approval (the approval hash covers the script file's contents).
       // REVIEW-7 #5: say what a script can do, not just where it comes from

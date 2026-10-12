@@ -36,7 +36,7 @@ describe('toGrpcurl', () => {
     );
   });
 
-  it('TLS: -insecure only for decrypt hosts, default port spelled out; -proto / -import-path from the workspace', () => {
+  it('TLS: verified (no -insecure), default port spelled out; -proto / -import-path from the workspace', () => {
     const call = grpcCall({ url: 'https://grpc.example.com/shop.v1.CartService/AddItem', requestHeaders: {} });
     const g = { codec: fakeGrpc().codec, schema: protoSchema };
     const plain = toGrpcurl(call, { grpc: g, projectRoot: '/ws/app' });
@@ -44,7 +44,8 @@ describe('toGrpcurl', () => {
     expect(plain).toMatch(/-import-path protos \\\n  -proto shop\/v1\/shop\.proto/);
     expect(plain).toMatch(/Run from the workspace folder/);
     expect(plain).toMatch(/grpc\.example\.com:443 shop\.v1\.CartService\/AddItem$/);
-    expect(toGrpcurl(call, { grpc: g, projectRoot: '/ws/app', decryptHosts: ['*.example.com'] })).toMatch(/-insecure/);
+    // REVIEW-13 #4: never -insecure (the command talks to the real server)
+    expect(toGrpcurl(call, { grpc: g, projectRoot: '/ws/app' })).not.toMatch(/-insecure/);
     // a .proto outside the workspace: reflection note, no -proto
     expect(toGrpcurl(call, { grpc: g, projectRoot: '/elsewhere' })).toMatch(/must support gRPC reflection/);
   });
@@ -177,5 +178,20 @@ describe('gRPC-Web calls are not resent (owner decision, CONTRACTS §19)', () =>
     expect(e).toBeInstanceOf(AgentToolError);
     expect((e as Error).message).toMatch(/resending gRPC-Web calls comes later/);
     expect(sent).toEqual([]);
+  });
+});
+
+describe('REVIEW-13', () => {
+  it('#4 grpcurl -d honours maxDataChars; client streaming decodes a bounded number of messages', () => {
+    const call = grpcCall();
+    expect(toGrpcurl(call, { grpc: fakeGrpc(), maxDataChars: 10 })).toMatch(/over the 10 allowed here \(maxBodyChars\)/);
+    expect(toGrpcurl(call, { grpc: fakeGrpc(), maxDataChars: 10 })).not.toMatch(/^\s+-d /m);
+    const g = fakeGrpc();
+    let calls = 0;
+    const real = g.codec.decodeMessage;
+    g.codec.decodeMessage = (...a) => (calls++, real(...a));
+    const many = grpcCall({ frames: Array.from({ length: 50 }, (_, i) => ({ dir: 'send' as const, at: i, kind: 'message' as const, base64: pb64({ sku: String(i) }), size: 9 })) });
+    toGrpcurl(many, { grpc: g });
+    expect(calls).toBe(1); // unary: only the first request message
   });
 });
