@@ -272,3 +272,111 @@ Effects:
   - No new `innerHTML` / `dangerouslySetInnerHTML` / `href` / `eval` sinks.
   - Trailers go through `HeadersTable` as Preact text. Badges and the gRPC-Web note are static strings.
   - "Copy as grpcurl" goes through the host (unredacted, the user's own clipboard, §9.3).
+
+## Part 2 — iOS simulator trust
+
+Independent security review of the opt-in iOS simulator CA trust and decrypt-all at 7718e7a (commits 80cce47,
+4b8bb70, 189b3d5, ffdd419).
+
+Scope:
+- `packages/extension/src/iosSimTrust.ts`: `parseSimulators`, `validDataPath`, `caFingerprint`, `readTrustRow`, and
+  `IosSimTrust` (`ensure`, `release`, `releaseSession`, `releaseAll`, `recover`, `tick`, records, heartbeat);
+- the VS Code wiring in `extension.ts` (`simTrustOn`, `sessionDevices`, `publishSimTrust`, the Trust / Remove commands,
+  session start and end, `onStop`, deactivate), `proxyHost.setSimulatorTrust`, and `get_status` for agents;
+- the sidecar (`host.ts` `simTrust`, `sessionStarted` / `sessionEnded`, `applySettings`) and the IntelliJ setting's scope;
+- the CLI (`--trust-simulator`, `jsonFileStore`, `recover` / `ensure` / `releaseAll` in `run.ts`);
+- the proxy: `setGrpcDecryptAll`, `runSilent`, `watchDecryptHandshake`, `onTlsError` (learned pinned hosts).
+
+Spec: CONTRACTS §19.3, §14.7 (the `AndroidGlobalProxy` precedent), §7, §16.1; docs/spikes/ios-sim-trust.md.
+
+I read the code and ran throwaway probes in the session scratchpad, outside the repo. No simulator was touched: no
+`simctl keychain` and no sqlite write against any simulator. The probes:
+- esbuild bundles of `iosSimTrust.ts` driven by a fake `exec` / `fs`, with a copy of the CLI's `jsonFileStore` on real
+  scratch files: planted records, a symlinked store file, and the extension's session-start ordering raced against a
+  session end;
+- the real `/usr/bin/sqlite3` (3.54.0) on databases planted in the scratchpad. One had a `BEFORE DELETE` trigger on
+  `tsettings` that calls `writefile()`, and one had `tsettings` as a view calling `writefile()`. Each was run with the
+  module's exact argument vectors (`-bail -cmd ".timeout 5000" <path> "DELETE …"` and the `-readonly` check).
+
+Threat model as in part 1, plus: a process that can write the project's `.dart_tool`, and other Flutter Intercept
+instances (windows, the sidecar, the CLI) sharing one simulator.
+
+| # | Sev | Finding | Owner |
+|---|---|---|---|
+| 5 | MED | **The trust can outlive the session, and turning the setting off doesn't stop it.** (a) `onDidStartDebugSession` runs `simTrust.isSimulator()` outside the serial chain and only then queues `ensure`. A session that ends during that `simctl list` call (~0.1–0.5 s) queues `releaseSession` first, which does nothing, and then `ensure` adds the row under a holder that is already gone. **Probe:** the session ended 50 ms in, and afterwards state was `trusted`, the row was present and the record kept its heartbeat. The row stays until the proxy stops or the window closes, and it blocks other windows' `recover()`. (b) The **Trust** command calls `ensure` with holder `''`, and `releaseSession` never drops that holder. The command's own message says "until you remove it or the session ends". (c) The extension has no `onDidChangeConfiguration` handler for `grpc.trustOnSimulator` / `grpc.enabled`. Turning the setting off leaves the trust in place and leaves decrypt-all on until the next session event. The sidecar does `releaseAll` + `publishSimTrust` here. | H |
+| 6 | LOW-MED | **Learned pins are too eager and too sticky.** `onTlsError` ignores `failureCause`. mockttp reports `closed` when the client **finished** the handshake and then closed without sending anything (ifTlsDropped), and `reset` when a process is killed mid-handshake. Both happen without any pinning: a channel shut down before its first call, an app stopped or restarted. A host is then passed through for the proxy's whole life, which in VS Code is the window's life, and nothing can reset it. This also covers explicit `grpcDecryptHosts` hosts while decrypt-all is off. Their `grpcMock` / `block` rules stop applying silently: the app reaches the real server, and the only sign is an exchange note. The **Remove** command deletes the row *before* `publishSimTrust` turns decrypt-all off, so tunnels opened in that gap are also learned as pinned. A local or LAN peer can only reduce decryption this way (the cap is 1000; keyed by `host:port`). | P (+ H) |
+| 7 | LOW | **The CLI's record file is in the project and is trusted as is.** `jsonFileStore` writes `<project>/.dart_tool/flutter_intercept/sim-trust.json` with `writeFile` and follows symlinks. **Probe:** a symlink there made `ensure` overwrite an unrelated file in the scratchpad with the JSON records. The repo already guards this pattern in `entries.ts` and `lanPrepare.ts`. Planted records pass `isValidRecord`, because `dataPath` only has to end in `/<UDID>/data`. `recover()` then runs `DELETE … WHERE sha256 = x'<chosen>'` on whatever store is at that path. **Probe:** the DELETE went to `/Users/runner/work/repo/repo/x/<UDID>/data/…`. A record with pid 1 and a heartbeat in the future counts as live forever. The impact is bounded: the same run builds the repo, which runs its code anyway; deleting a row only removes trust; the CLI uses a new CA every run, so its sha256 can't be guessed; and the sqlite probe below showed no code execution. `flutter clean` (or a fresh clone) deletes the record, so a crashed run's row is never removed. | C |
+| 8 | INFO | Smaller items: a row that a session found as `pre-existing` counts as trusted for decrypt-all even after someone removes it. The stores don't see each other (VS Code globalState, sidecar state, CLI file). The result is fail-safe (the second instance sees `pre-existing` and never deletes), but the first instance's removal can then break the other's session, whose fallback is the pins in #6. `recover()` treats a missing `dataPath` as "simulator deleted" and drops the record (an unmounted volume loses it). Problem texts embed `simctl` / `sqlite3` stderr with absolute paths: they are scrubbed for agents, but not in the panel / sidecar status. | H / C |
+
+### 5 (MED) Trust outlives the session; setting off not honoured
+
+- Run the `isSimulator` check inside `ensure`, which already re-checks `Booted`, and call `ensure` synchronously in
+  `onDidStartDebugSession`, as the sidecar does. Alternatively, have `ensure` take a liveness callback
+  (`() => sessionDevices.has(id)`) and check it again before the add.
+- Make the command's trust session-scoped, or say "until you remove it or close the window". Either way, release the
+  `''` holder when the last session on that simulator ends.
+- Add `affectsConfiguration('flutterIntercept.grpc.trustOnSimulator') || …('grpc.enabled')` →
+  `if (!simTrustOn()) await simTrust.releaseAll()`, then `publishSimTrust()`, matching `applySettings` in the sidecar.
+
+### 6 (LOW-MED) Learned pins
+
+- Learn only from `reset`, `cert-rejected` and `no-shared-cipher` during the handshake, never from `closed`. Better:
+  require two failures within a minute.
+- Learn only while decrypt-all decided the decryption, not for explicit `grpcDecryptHosts`. Clear `pinnedHosts` when
+  decrypt-all switches off and when the last session ends.
+- Show the learned hosts in `Status.grpc` and give a way to forget them.
+- In `removeSimulatorCa`, call `setGrpcDecryptAll(false)` before `release`.
+
+### 7 (LOW) CLI record file
+
+- `lstat` and refuse a symlink (or open with `O_NOFOLLOW`), and write via a temp file + rename in a plain directory.
+- Better: keep the CLI records outside the project (for example `~/Library/Caches/flutter-intercept/sim-trust.json`,
+  0600), so `flutter clean` can't lose them and a repo can't plant them.
+- In `recover()` and `drop`, delete only when `dataPath` equals the `dataPath` that `simctl list devices -j` reports
+  for that udid, or the record is under `~/Library/Developer/{CoreSimulator,XCTestDevices}`. Reject heartbeats more
+  than a minute in the future.
+
+## Checked, fine (part 2)
+
+- **Consent:**
+  - VS Code reads `userSetting('grpc.trustOnSimulator')`, which is `inspect().globalValue`, and the setting is
+    `scope: application`. Workspace, folder and launch.json values are ignored.
+  - In IntelliJ, the setting lives in the `Service.Level.APP` settings (`flutter-intercept.xml`).
+  - The CLI enables it only with the `--trust-simulator` flag (no config file or env), and refuses it together with
+    `--no-grpc`.
+  - Agents only read `simulatorTrust` through `get_status`. No agent tool, LM tool or webview message runs the
+    commands or changes the setting.
+  - A cloned repo can still reach the commands through `${command:…}` in a trusted workspace's launch.json. The command
+    needs an intercepted session on a booted simulator, and it doesn't turn decrypt-all on while the setting is off.
+- **Simulators only:**
+  - `SIM_UDID` is strict (8-4-4-4-12 upper hex), so physical ids (`00008110-…`, 40 hex) fail it.
+  - The udid must also be listed `Booted` under an `SimRuntime.iOS-*` runtime in `simctl list devices -j`. Android,
+    macOS and web are never touched.
+  - `dataPath` for an add comes from `simctl` and must be absolute, normalized, free of `..` and end in `/<UDID>/data`.
+- **Commands and SQL:**
+  - `execFile` with argument arrays and absolute `/usr/bin/xcrun` / `/usr/bin/sqlite3`; no shell.
+  - The sha256 is checked against `^[0-9A-F]{64}$` before each SQL statement it goes into.
+  - The read is `-readonly`, and never runs on a missing path (sqlite3 would create one).
+  - **Probe:** planted triggers and views calling `writefile()` fail with "unsafe use of writefile()"
+    (`trusted_schema` = 0), and `-bail` stops before the DELETE.
+- **Only our row:**
+  - The key is the sha256 of our CA's DER, and a row present before us with no record is `pre-existing` and never
+    removed.
+  - The record is written before the add, so a crash is repaired by `recover()`. A failed add drops it.
+  - Two windows sharing a simulator get a reference count plus owner, pid and heartbeat, as `AndroidGlobalProxy` does;
+    the last live owner deletes the row. A crashed owner's row is removed by another window's `drop` / `recover`.
+  - A regenerated CA: the old hold is dropped (its row deleted) before the new add, and records keep the old sha256.
+  - `simctl keychain reset` / `erase` appear nowhere.
+- **Temp certificate:**
+  - `X509Certificate#toString()` gives the certificate only, never the key, and `x.ca` is required.
+  - The file goes in an `mkdtemp` directory (0700) with `wx` and mode 0600, and is removed in `finally`.
+- **Decrypt-all gating:**
+  - On only when every entry in `sessionDevices` is a trusted / pre-existing simulator. It goes off synchronously when
+    a non-simulator session starts, and before release when a session ends.
+  - LAN iPhone sessions are in `sessionDevices`, so it turns off.
+  - Plain Dart sessions have no gRPC hook (no proxy define, §16.1), so leaving them out is harmless.
+  - The sidecar counts every non-web session, and the CLI has one device.
+  - Learned pins and decrypt-all apply only to silent tunnels from the entry's gRPC hook. Ordinary HTTPS interception
+    is unchanged.
+- **No paths to agents:** `get_status` problems go through `scrub` (project and home paths), `setSimulatorTrust` strips
+  control characters and caps lengths, and the status shows udid, name and state only.
