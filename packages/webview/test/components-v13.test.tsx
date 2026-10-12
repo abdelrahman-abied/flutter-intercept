@@ -163,6 +163,22 @@ describe('gRPC-Web in the panel', () => {
     expect($('.grpc-web-body')).not.toBeNull();
   });
 
+  it('the HTTP body section renders from the frames (the proxy drops gRPC-Web bodies); trailers with control characters are escaped', async () => {
+    await mount({ detailTab: 'response' });
+    await emit({ type: 'snapshot', exchanges: [web({ requestBody: undefined, responseBody: undefined, grpc: { ...web().grpc!, web: 'text' },
+      responseTrailers: { 'grpc-status': '0', 'x-note': 'a\u001b[31mred\r\nInjected: 1' } })], rules: [], status: withGrpc });
+    await click($$('.row')[0]);
+    await click(button('Response'));
+    const body = $('.grpc-web-body')!;
+    expect($('summary', body)!.textContent).toContain('HTTP body');
+    expect($('.grpc-web-body-facts', body)!.textContent).toBe(
+      '1 length-prefixed message frame (9 B) + the trailer frame (status and trailers, shown above) — sent as base64 text (grpc-web-text). Each message is in the Messages tab.');
+    const cell = $$('.kv tr').find((tr) => tr.querySelector('th')?.textContent === 'x-note')!.querySelector('td')!;
+    expect(cell.textContent).toBe('a\\x1b[31mred\\x0d\\x0aInjected: 1');
+    await click(button('Request'));
+    expect($('.grpc-web-body-facts')!.textContent).toMatch(/^1 length-prefixed message frame \(9 B\)/);
+  });
+
   it('actions: Mock → grpcMock, Break on this, grpcurl copy; Script / Resend come later', async () => {
     await mount();
     await emit({ type: 'snapshot', exchanges: [web()], rules: [], status: withGrpc });

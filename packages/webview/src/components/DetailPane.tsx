@@ -348,7 +348,7 @@ function RequestTab({ ex }: { ex: Exchange }) {
         <h4 class="section-title">Headers <span class="muted">(metadata)</span></h4>
         <HeadersTable headers={ex.requestHeaders} />
         <GrpcMessagesHint ex={ex} dir="send" />
-        {isGrpcWeb(ex) && <GrpcWebBody body={ex.requestBody} headers={ex.requestHeaders} />}
+        {isGrpcWeb(ex) && <GrpcWebBody ex={ex} dir="send" />}
       </>
     );
   }
@@ -421,7 +421,7 @@ function GrpcResponseTab({ ex }: { ex: Exchange }) {
           </>
         )}
       <GrpcMessagesHint ex={ex} dir="receive" />
-      {isGrpcWeb(ex) && <GrpcWebBody body={ex.responseBody} headers={ex.responseHeaders} />}
+      {isGrpcWeb(ex) && <GrpcWebBody ex={ex} dir="receive" />}
     </>
   );
 }
@@ -434,13 +434,28 @@ function grpcPaused(ex: Exchange): boolean {
   return isGrpc(ex) && (!!ex.grpcPause || !isGrpcWeb(ex));
 }
 
-/** gRPC-Web: the HTTP body as sent (length-prefixed frames, base64 for -text), collapsed. */
-function GrpcWebBody({ body, headers }: { body: Exchange['requestBody']; headers: Exchange['requestHeaders'] | undefined }) {
-  if (!body) return null;
+/**
+ * gRPC-Web: the HTTP body. The proxy keeps the messages as frames and drops the raw body (REVIEW-13 #4), so this
+ * describes the body from the frames — length-prefixed messages (+ the trailer frame), base64 for -text — and shows
+ * the raw body only when one is held (an HTTP-level breakpoint).
+ */
+function GrpcWebBody({ ex, dir }: { ex: Exchange; dir: 'send' | 'receive' }) {
+  const body = dir === 'send' ? ex.requestBody : ex.responseBody;
+  const headers = dir === 'send' ? ex.requestHeaders : ex.responseHeaders;
+  const frames = (ex.frames ?? []).filter((f) => f.kind === 'message' && f.dir === dir);
+  const counted = dir === 'send' ? ex.grpc?.messagesSent ?? frames.length : ex.grpc?.messagesReceived ?? frames.length;
+  const bytes = frames.reduce((n, f) => n + 5 + f.size, 0);
+  const trailer = dir === 'receive' && !!ex.responseTrailers && !ex.grpc?.trailersOnly;
   return (
     <details class="grpc-web-body">
-      <summary>HTTP body <span class="muted">(gRPC-Web frames as sent)</span></summary>
-      <BodyView body={body} headers={headers} />
+      <summary>HTTP body <span class="muted">(gRPC-Web frames)</span></summary>
+      <div class="pad grpc-web-body-facts">
+        {counted} length-prefixed message frame{counted === 1 ? '' : 's'}
+        {frames.length ? ` (${formatBytes(bytes)}${frames.length < counted ? ` for the ${frames.length} kept` : ''})` : ''}
+        {trailer ? ' + the trailer frame (status and trailers, shown above)' : ''}
+        {ex.grpc?.web === 'text' ? ' — sent as base64 text (grpc-web-text)' : ''}. Each message is in the Messages tab.
+      </div>
+      {body && <BodyView body={body} headers={headers} />}
     </details>
   );
 }

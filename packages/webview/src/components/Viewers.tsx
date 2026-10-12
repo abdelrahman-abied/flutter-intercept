@@ -19,13 +19,20 @@ export function HeadersTable({ headers }: { headers: Headers | undefined }) {
       <tbody>
         {rows.map((r, i) => (
           <tr key={i}>
-            <th scope="row">{r.name}</th>
-            <td>{r.value}</td>
+            <th scope="row">{printable(r.name)}</th>
+            <td>{printable(r.value)}</td>
           </tr>
         ))}
       </tbody>
     </table>
   );
+}
+
+/** Control characters (other than tab) as visible escapes ("\x1b"): header / trailer text never carries them raw. */
+export function printable(v: unknown): string {
+  const s = typeof v === 'string' ? v : String(v); // defence in depth: a header source that isn't a string never throws
+  // eslint-disable-next-line no-control-regex
+  return /[\x00-\x08\x0a-\x1f\x7f]/.test(s) ? s.replace(/[\x00-\x08\x0a-\x1f\x7f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`) : s;
 }
 
 export async function copyText(text: string): Promise<void> {
