@@ -94,6 +94,15 @@ import {
   SILENT_TUNNEL_HEADER,
 } from './grpc';
 import { GrpcSessionPool } from './grpc-upstream';
+import {
+  GRPC_WEB_EXPOSE_HEADERS,
+  grpcStatusOf,
+  grpcWebBody,
+  grpcWebContentType,
+  GrpcWebRecorder,
+  grpcWebVariant,
+  type GrpcWebVariant,
+} from './grpc-web';
 import { grpcSelfCheck, injectSilentTunnel, type GrpcSupport } from './silent';
 import { detectGraphql, graphqlOperationNames } from './graphql';
 import {
@@ -282,6 +291,8 @@ interface Flow {
   localError?: string;
   /** CONTRACTS §18.6: a gRPC call that came back from our own relay: answered 14, never recorded. */
   loop?: boolean;
+  /** CONTRACTS §19.1: a gRPC-Web call (an HTTP flow shown as gRPC). */
+  grpcWeb?: GrpcWebVariant;
   /** REVIEW-8 #1: answer 403 with this text — a web page's request to a client-certificate host. */
   refused?: string;
   /** Hooked routes: the Host header to send when it isn't the URL's (preserveHost, a rewritten Host). */
@@ -322,6 +333,8 @@ interface MatchOptions {
   tunnel?: boolean;
   /** A gRPC call (CONTRACTS §16.2): only grpcMock, block, fault, throttle and sequences of those apply. */
   grpc?: boolean;
+  /** A gRPC-Web call (CONTRACTS §19.1): an HTTP request for which grpcMock rules apply too. */
+  grpcWeb?: boolean;
 }
 
 interface MatchResult {
@@ -619,6 +632,8 @@ export class InterceptProxy extends EventEmitter {
   private grpcCodec?: GrpcProxyCodec;
   /** CONTRACTS §17.7: bytes of gRPC messages held at breakpoints right now, across calls. */
   private grpcHeld = 0;
+  /** CONTRACTS §19.1: gRPC-Web calls being read (by request id). */
+  private readonly grpcWebCalls = new Map<string, GrpcWebState>();
   /** CONTRACTS §18.6: this instance's hop marker (on every relayed / sent gRPC call; one arriving with it is a loop). */
   private readonly hopNonce = randomBytes(18).toString('base64url');
   /** CONTRACTS §16.8: when each authority's breaker report was last emitted. */
@@ -1679,6 +1694,11 @@ export class InterceptProxy extends EventEmitter {
   // ---------------------------------------------------------------- store
 
   private emitChange(ex: Exchange): void {
+    if (ex.grpc?.web) {
+      // CONTRACTS §19.1: a gRPC-Web call shows messages as frames, never its raw (binary / base64) bodies.
+      delete ex.requestBody;
+      delete ex.responseBody;
+    }
     if (!ex.captured) {
       // CONTRACTS §11.3: browser requests (Origin) get a CORS diagnosis; `patched` is kept.
       const cors = diagnoseCors(ex);
@@ -1800,6 +1820,7 @@ export class InterceptProxy extends EventEmitter {
   private track(ex: Exchange, flow: Flow): void {
     this.live.set(ex.id, { ex, flow });
     this.store.set(ex.id, ex);
+    if (this.grpcWebCalls.has(ex.id)) queueMicrotask(() => this.syncGrpcWeb(ex.id));
     if (flow.traceId && !ex.source) {
       const info = this.traceJoin.exchange(flow.traceId, ex.id, this.appPackages);
       if (info) ex.source = info;
@@ -1825,7 +1846,7 @@ export class InterceptProxy extends EventEmitter {
       ...(flow.send ? { initiator: flow.send.initiator } : {}),
       ...(flow.send?.resentFrom !== undefined ? { resentFrom: flow.send.resentFrom } : {}),
       ...(flow.viaLan ? { viaLan: true as const } : {}),
-      ...graphqlOf(req.method, url, req.headers),
+      ...(flow.grpcWeb ? grpcWebExchangeFields(url, req.headers, flow.grpcWeb) : graphqlOf(req.method, url, req.headers)),
       ...(this.webSession && !flow.send && !flow.viaLan && !flow.traceId && isBrowserInternal(url, req.headers)
         ? { browserInternal: true as const }
         : {}),
@@ -1977,7 +1998,7 @@ export class InterceptProxy extends EventEmitter {
           note ??= `${what}${rule.name ? ` "${rule.name}"` : ''} does not apply to gRPC calls; the next rule was tried.`;
           continue;
         }
-      } else if (rule.action?.kind === 'grpcMock') continue; // gRPC calls only
+      } else if (rule.action?.kind === 'grpcMock' && !o.grpcWeb) continue; // gRPC (and gRPC-Web) calls only
       if (op !== undefined && !o.ignoreGraphql) {
         if (o.ws || o.tunnel) continue; // the operation of a subscription is inside the frames
         if (o.body) {
@@ -2021,7 +2042,7 @@ export class InterceptProxy extends EventEmitter {
         action = pick.action;
         step = pick.index;
         if (pick.invalid) note ??= pick.invalid;
-        if (!o.grpc && action?.kind === 'grpcMock') {
+        if (!o.grpc && !o.grpcWeb && action?.kind === 'grpcMock') {
           action = undefined;
           note ??= `Sequence step ${step + 1} (grpcMock) applies to gRPC calls only; the request was passed through.`;
         }
@@ -2147,11 +2168,14 @@ export class InterceptProxy extends EventEmitter {
     // CONTRACTS §11.3: a CORS preflight for a request a mock / block / cors rule would handle is answered
     // here (the rule isn't spent by it). Otherwise the OPTIONS request is matched like any other.
     const asked = preflightMethod(req.method, headers);
+    // CONTRACTS §19.1: gRPC-Web (by content-type; a preflight for one asks for the x-grpc-web header).
+    const web = grpcWebVariant(headers['content-type']);
     if (asked) {
-      const pm = this.matchRule(asked, req.url, { count: false, ignoreGraphql: true });
+      const askedWeb = /(^|,)\s*x-grpc-web\s*(,|$)/i.test(getHeader(headers, 'access-control-request-headers') ?? '');
+      const pm = this.matchRule(asked, req.url, { count: false, ignoreGraphql: true, grpcWeb: askedWeb });
       const pre = pm.rule;
       const a = pm.action;
-      if (pre && a && (a.kind === 'mock' || a.kind === 'block' || a.kind === 'cors')) {
+      if (pre && a && (a.kind === 'mock' || a.kind === 'block' || a.kind === 'cors' || a.kind === 'grpcMock')) {
         const o = a.kind === 'cors' ? corsOptions(a) : {};
         // Only for an origin the proxy may allow (loopback, or the cors rule's allowOrigin): otherwise the
         // server answers its own preflight (REVIEW-5 #3).
@@ -2159,7 +2183,7 @@ export class InterceptProxy extends EventEmitter {
       }
     }
     if (!flow) {
-      const m = this.matchRule(req.method, req.url, { count: true, headers });
+      const m = this.matchRule(req.method, req.url, { count: true, headers, ...(web ? { grpcWeb: true } : {}) });
       if (m.deferred) flow = { route: m.needsResponseHook ? 'h2' : 'h1', deferred: true, ...(m.note ? { note: m.note } : {}) };
       else if (!m.rule && this.replayStore) {
         // CONTRACTS §12.4: rules first, then the recording.
@@ -2190,8 +2214,22 @@ export class InterceptProxy extends EventEmitter {
       });
     }
 
+    if (web && !flow.preflight) {
+      flow.grpcWeb = web;
+      if (flow.action?.kind === 'mutate') {
+        // Mutate edits JSON bodies: no effect on protobuf frames (CONTRACTS §19.1).
+        const rule = flow.rule;
+        flow = this.flowFor(req.url, headers, rule, undefined, 'Mutate rules edit JSON bodies; this gRPC-Web call was passed through unchanged.');
+        flow.grpcWeb = web;
+        if (meta?.traceId) flow.traceId = meta.traceId;
+        if (send) flow.send = send;
+        if (lanGateOf(socket)) flow.viaLan = true;
+        flow.te = (req as unknown as { timingEvents?: RequestTimingEvents }).timingEvents;
+      }
+    }
     this.flows.set(req.id, flow);
     this.wireTap(req, flow);
+    if (flow.grpcWeb) this.watchGrpcWeb(req, flow.grpcWeb);
     return flow;
   }
 
@@ -2645,6 +2683,8 @@ export class InterceptProxy extends EventEmitter {
 
     if (flow.replay && flow.replay !== 'deferred') return this.answerReplay(ex, flow, flow.replay);
 
+    if (action?.kind === 'grpcMock' && flow.grpcWeb) return this.answerGrpcWeb(ex, flow, action);
+
     if (action?.kind === 'mock') {
       this.track(ex, flow);
       if (action.delayMs && action.delayMs > 0) {
@@ -2672,6 +2712,16 @@ export class InterceptProxy extends EventEmitter {
       if (action.mode === 'reset') {
         this.finish(ex, 'blocked');
         return { response: 'reset' };
+      }
+      if (flow.grpcWeb) {
+        // CONTRACTS §19.1: a gRPC-Web block answers trailers-only UNAVAILABLE (the browser client reads the status).
+        const h: HeaderBag = { 'content-type': grpcWebContentType(flow.grpcWeb), 'grpc-status': '14', 'grpc-message': encodeGrpcMessage(BLOCK_BODY), 'content-length': '0' };
+        this.addGrpcWebCors(ex, h);
+        ex.status = 200;
+        ex.responseHeaders = cleanHeaders(h);
+        if (ex.grpc) Object.assign(ex.grpc, { statusCode: 14, statusMessage: BLOCK_BODY, trailersOnly: true as const });
+        this.finish(ex, 'blocked');
+        return { response: { statusCode: 200, statusMessage: STATUS_CODES[200], headers: h, rawBody: Buffer.alloc(0) } };
       }
       const status = action.status ?? 403;
       const headers: HeaderBag = { 'content-type': 'text/plain; charset=utf-8' };
@@ -3477,6 +3527,141 @@ export class InterceptProxy extends EventEmitter {
     const raw = (req as unknown as { rawHeaders: Array<[string, string]> }).rawHeaders;
     const rawHeaders = rewritePairs(Array.isArray(raw) ? raw.slice() : [], { remove: ['host'], set: [['Host', map.host]] });
     await step.connectUpstream(destination, map.url, req, rawHeaders, socket, head, options);
+  }
+
+  // ---------------------------------------------------------------- gRPC-Web (CONTRACTS §19.1)
+
+  /** Read a gRPC-Web call's bodies from the taps as they pass (any route), into frames / trailers on its exchange. */
+  private watchGrpcWeb(req: OngoingRequest, variant: GrpcWebVariant): void {
+    const tap = getTap(req.id);
+    if (!tap) return;
+    const id = req.id;
+    tap.req.skip = true; // frames instead of a raw body copy
+    tap.res.skip = true;
+    const st: GrpcWebState = { sent: 0, received: 0, queue: [], notes: [], reqEnc: grpcEncodingOf((req.headers as HeaderBag)['grpc-encoding']) } as unknown as GrpcWebState;
+    const sink = (f: Frame) => {
+      st.queue.push(f);
+      this.syncGrpcWeb(id);
+    };
+    const sendRec = new GrpcFrameRecorder('send', () => st.reqEnc, sink);
+    const recvRec = new GrpcFrameRecorder('receive', () => st.resEnc, sink);
+    st.rec = new GrpcWebRecorder(variant, {
+      onMessage: (dir, m) => {
+        if (dir === 'send') {
+          st.sent++;
+          sendRec.push(m);
+        } else {
+          st.received++;
+          recvRec.push(m);
+        }
+        this.syncGrpcWeb(id);
+      },
+      onTrailers: (t) => {
+        st.trailers = t;
+        this.syncGrpcWeb(id);
+      },
+      onProblem: (text) => {
+        if (!st.notes.includes(text)) st.notes.push(text);
+        this.syncGrpcWeb(id);
+      },
+      compressedKeep: GRPC_COMPRESSED_KEEP_BYTES,
+    });
+    this.grpcWebCalls.set(id, st);
+    tap.onRequestData = (b) => st.rec.requestData(b);
+    const reqEnd = tap.onRequestEnd;
+    tap.onRequestEnd = () => {
+      st.rec.requestEnd();
+      reqEnd?.();
+    };
+    tap.onHeadSeen = (_status, h) => {
+      st.resEnc = grpcEncodingOf(h['grpc-encoding']);
+      const s = grpcStatusOf(h);
+      if (s.code !== undefined) st.headStatus = s; // trailers-only (status in the headers)
+      st.rec.responseHead(h);
+      this.syncGrpcWeb(id);
+    };
+    tap.onResponseData = (b) => st.rec.responseData(b);
+    const done = tap.onResponseDone;
+    tap.onResponseDone = (finished) => {
+      done?.(finished);
+      st.rec.requestEnd();
+      st.rec.responseEnd();
+      // Frames still decompressing join the stored exchange; then forget the call.
+      void Promise.all([sendRec.idle(), recvRec.idle()]).then(() => {
+        setTimeout(() => {
+          this.syncGrpcWeb(id);
+          this.grpcWebCalls.delete(id);
+        }, 50);
+      });
+    };
+  }
+
+  /** Move what the reader found onto the exchange (once it exists: hooked routes create it after the body). */
+  private syncGrpcWeb(id: string): void {
+    const st = this.grpcWebCalls.get(id);
+    const live = this.live.get(id);
+    const ex = live?.ex ?? this.store.get(id);
+    if (!st || !ex || !ex.grpc) return;
+    const frames = st.queue.splice(0);
+    for (const f of frames) this.addFrame(ex, f, true);
+    const g = ex.grpc;
+    g.messagesSent = Math.max(g.messagesSent, st.sent);
+    g.messagesReceived = Math.max(g.messagesReceived, st.received);
+    if (st.reqEnc) g.requestEncoding = st.reqEnc;
+    if (st.resEnc) g.responseEncoding = st.resEnc;
+    const status = st.trailers ? grpcStatusOf(st.trailers) : st.headStatus;
+    if (st.trailers) ex.responseTrailers = { ...st.trailers };
+    if (status?.code !== undefined) {
+      g.statusCode = status.code;
+      if (status.message !== undefined) g.statusMessage = status.message;
+      if (!st.trailers && st.headStatus) g.trailersOnly = true;
+    }
+    for (const n of st.notes) if (!(ex.error ?? '').includes(n)) ex.error = ex.error ? `${ex.error} ${n}` : n;
+    st.notes.length = 0;
+    if (live?.ex === ex) this.touch(ex);
+    else this.emitChange(ex);
+  }
+
+  /** CORS for a local gRPC-Web answer (like other mocks), plus the gRPC status headers exposed to the page. */
+  private addGrpcWebCors(ex: Exchange, headers: HeaderBag): void {
+    this.addCorsToLocalResponse(ex, headers);
+    if (getHeader(headers, 'access-control-allow-origin') && !getHeader(headers, 'access-control-expose-headers')) {
+      headers['access-control-expose-headers'] = GRPC_WEB_EXPOSE_HEADERS;
+    }
+  }
+
+  /** CONTRACTS §19.1: grpcMock for a gRPC-Web call: HTTP 200, the request's variant, frames, then the trailer frame. */
+  private async answerGrpcWeb(ex: Exchange, flow: Flow, a: Extract<RuleAction, { kind: 'grpcMock' }>): Promise<CallbackRequestResult> {
+    this.track(ex, flow);
+    if (a.delayMs && a.delayMs > 0) {
+      const from = performance.now();
+      await sleep(a.delayMs);
+      this.addPhase(ex, 'delayMs', performance.now() - from);
+      if (ex.state !== 'pending') return { response: 'close' };
+    }
+    const variant = flow.grpcWeb!;
+    const code = a.code ?? 0;
+    const messages = (a.messages ?? []).map((m) => Buffer.from(String(m), 'base64'));
+    const custom = Object.fromEntries(Object.entries(a.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
+    const trailers = Object.fromEntries(Object.entries(a.trailers ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
+    const headers: HeaderBag = { ...custom, 'content-type': grpcWebContentType(variant) };
+    let body: Buffer;
+    if (code !== 0 && !messages.length) {
+      // Trailers-only: the status in the headers, no body.
+      Object.assign(headers, trailers, { 'grpc-status': String(code), ...(a.message ? { 'grpc-message': encodeGrpcMessage(a.message) } : {}) });
+      body = Buffer.alloc(0);
+    } else body = grpcWebBody(variant, messages, code, a.message, trailers);
+    if (a.gapMs) ex.error = 'gapMs doesn\'t apply to gRPC-Web mocks (one response body); the messages were sent together.';
+    this.addGrpcWebCors(ex, headers);
+    headers['content-length'] = String(body.length);
+    ex.status = 200;
+    ex.responseHeaders = cleanHeaders(headers);
+    if (ex.grpc) {
+      ex.grpc.statusCode = code;
+      if (a.message) ex.grpc.statusMessage = a.message;
+    }
+    this.finish(ex, 'mocked');
+    return { response: { statusCode: 200, statusMessage: STATUS_CODES[200], headers, rawBody: body } };
   }
 
   // ---------------------------------------------------------------- gRPC (CONTRACTS §16.2)
@@ -5434,6 +5619,36 @@ export { RESPONSE_PAUSE_LIMIT_BYTES };
 /** A `grpc-message` / error text with the "Flutter Intercept:" prefix exactly once (REVIEW-10 #6). */
 function fiText(text: string): string {
   return /^Flutter Intercept\b/.test(text) ? text : `Flutter Intercept: ${text}`;
+}
+
+/** CONTRACTS §19.1: what the reader of one gRPC-Web call collected (moved onto the exchange by syncGrpcWeb). */
+interface GrpcWebState {
+  rec: GrpcWebRecorder;
+  sent: number;
+  received: number;
+  queue: Frame[];
+  notes: string[];
+  reqEnc?: string;
+  resEnc?: string;
+  trailers?: Record<string, string | string[]>;
+  headStatus?: { code?: number; message?: string };
+}
+
+/** CONTRACTS §19.1: a gRPC-Web exchange is shown as a gRPC call. */
+function grpcWebExchangeFields(url: string, headers: HeaderBag, web: GrpcWebVariant): Partial<Exchange> {
+  let path = '/';
+  try {
+    path = new URL(url).pathname;
+  } catch {
+    /* keep / */
+  }
+  const { service, method } = parseGrpcPath(path);
+  const deadlineMs = parseGrpcTimeout(headers['grpc-timeout']);
+  return {
+    kind: 'grpc',
+    frames: [],
+    grpc: { service, method, messagesSent: 0, messagesReceived: 0, web, ...(deadlineMs !== undefined ? { deadlineMs } : {}) },
+  };
 }
 
 /** An HTTP/2 request with a gRPC content type (CONTRACTS §16.2; not gRPC-Web). */

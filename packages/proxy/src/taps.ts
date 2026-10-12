@@ -61,6 +61,10 @@ export interface Tap {
   onResponseHead?: (status: number, headers: Record<string, string | string[]>) => HeadPatch | void;
   /** Each response chunk as it goes to the app (after shaping). */
   onResponseData?: (buf: Buffer) => void;
+  /** CONTRACTS §19.1: each request body chunk as it arrives (observers; never changes anything). */
+  onRequestData?: (buf: Buffer) => void;
+  /** CONTRACTS §19.1: every response head as it is written (after any patch), whatever the exchange's state. */
+  onHeadSeen?: (status: number, headers: Record<string, string | string[]>) => void;
 }
 
 const taps = new Map<string, Tap>();
@@ -184,7 +188,16 @@ function attach(id: string, req: http.IncomingMessage, raw: http.ServerResponse,
 
   const reqEmit = req.emit;
   req.emit = function (this: http.IncomingMessage, event: string | symbol, ...a: unknown[]) {
-    if (event === 'data') add(tap.req, a[0]);
+    if (event === 'data') {
+      const buf = add(tap.req, a[0]);
+      if (buf?.length && tap.onRequestData) {
+        try {
+          tap.onRequestData(buf);
+        } catch {
+          /* observing never breaks the request */
+        }
+      }
+    }
     else if (event === 'end' && !tap.req.ended) {
       tap.req.ended = true;
       tap.onRequestEnd?.();
@@ -225,6 +238,14 @@ function attach(id: string, req: http.IncomingMessage, raw: http.ServerResponse,
         }
       } catch {
         /* never break the response */
+      }
+    }
+    if (tap.onHeadSeen) {
+      try {
+        const hi = typeof a[1] === 'string' ? 2 : 1;
+        tap.onHeadSeen(Number(a[0]), headView(this, a[hi]));
+      } catch {
+        /* observing never breaks the response */
       }
     }
     const r = (writeHead as (...x: unknown[]) => unknown).apply(this, a);

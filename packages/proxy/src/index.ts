@@ -99,6 +99,9 @@ export {
   GRPC_HELD_TOTAL_CAP_BYTES,
 } from './grpc';
 export type { GrpcBreakerEvent } from './grpc';
+// v0.13.0 (CONTRACTS §19.1)
+export { grpcWebVariant, parseGrpcWebTrailers } from './grpc-web';
+export type { GrpcWebVariant } from './grpc-web';
 export type { GrpcSupport } from './silent';
 export { NETWORK_PRESETS, NO_PROFILE, presetProfile, describeProfile } from './network';
 export type { NetworkProfile, NetworkPreset, NetworkPresetId } from './network';

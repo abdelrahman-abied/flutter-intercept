@@ -292,3 +292,33 @@ CONTRACTS §18.1–18.5. Tests: `packages/proxy/test/grpc-tools.test.ts`.
     `resentFrom` is refused.
   - `onGrpcStatus` / breakpoint status messages are capped at 1 KB (`GRPC_STATUS_MESSAGE_MAX_BYTES`).
     `mentionsGrpcHooks` ignores comments.
+
+## As built — proxy (0.13.0)
+
+CONTRACTS §19.1. Files: `packages/proxy/src/grpc-web.ts` (variant detection, `Base64Stream`, `GrpcWebFrameParser`,
+trailer-line parser, `GrpcWebRecorder`, response body builder), hooks in `taps.ts` (`onRequestData`, `onHeadSeen`),
+integration in `intercept-proxy.ts`. Tests: `packages/proxy/test/grpc-web.test.ts`.
+
+- **Detection:** the request `content-type` (`application/grpc-web`, `+proto`, `-text`, `-text+proto`) marks the
+  HTTP flow. Routing and the other rules work as for HTTP. `newExchange` makes it `kind: 'grpc'` with `grpc.web` and
+  `service / method`. Raw bodies are never kept: the taps skip them and `emitChange` drops them.
+- **Reading:** a passive reader on the taps, the same for every route (passthrough, hooked, local answers).
+  - Request bytes come from the request emit hook; the response head (content-type variant, `grpc-encoding`,
+    trailers-only `grpc-status`) from every `writeHead`; response bytes as they go to the browser.
+  - `-text` bodies: whitespace ignored, decoded per whole 4-character group; a padded group ends a segment.
+  - HTTP `content-encoding` gzip / deflate / br is decoded streaming, at most 64 MB per response.
+  - Frames keep the §16 caps: 64 KB per message, compressed prefixes of 256 KB decompressed off the loop.
+  - The trailer frame becomes `responseTrailers` and the status. Bad flags or a truncated frame stop reading,
+    with a note.
+  - Hooked routes create the exchange after the body; the reader queues until then. Late decompressed frames join
+    the stored exchange.
+- **Rules:** `matchRule({grpcWeb})` lets `grpcMock` match.
+  - The answer is HTTP 200 in the request's variant (`+proto` content-type): frames, then the trailer frame, base64
+    for `-text`.
+  - A non-zero code without messages is trailers-only (headers, empty body). `gapMs` doesn't apply (one body; noted).
+  - CORS as for other mocks, plus `access-control-expose-headers: grpc-status, grpc-message, grpc-status-details-bin`.
+  - `block` status → trailers-only `14`.
+  - Preflights asking for `x-grpc-web` are answered locally when a grpcMock matches.
+  - `mutate` falls back to plain passthrough with a note.
+- **Not done:** message-level breakpoints, mutate and scripts for gRPC-Web (a later item).
+
