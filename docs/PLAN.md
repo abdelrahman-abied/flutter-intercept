@@ -278,3 +278,18 @@ Contract: CONTRACTS §19. Owner instruction: take every decision in the project'
 | T trust spike | iOS simulator CA trust feasibility — docs/spikes/ios-sim-trust.md (then design + owner) |
 | lead | contract, types, wiring, docs, E2E, review |
 | T trust (0.13 part 2) | `packages/extension/src/iosSimTrust.ts` + its tests (fake exec / fs), integration check in `test/integration/suite/devices.ts` (iOS simulator only) |
+
+### v0.13.0 status (2026-10-12)
+gRPC-Web shown as gRPC (grpcMock / block in gRPC-Web format), Copy as grpcurl, opt-in iOS simulator CA trust with
+decrypt-all and learned pin fallback, plus a performance and code-quality pass (docs/PERF-1.md, docs/QUALITY-1.md):
+activation no longer loads the proxy, bundle 2.77 → 2.53 MB, gRPC CPU per call −11%, streaming +14%, HTTPS small −25%;
+intercept-proxy.ts 6546 → 2115 lines (modules behind ProxyContext), agent api.ts 2584 → 100, controller.ts 2554 →
+1182, webview state.ts split; one shared node-free `grpc-meta` module for rules and limits; typecheck in every package's
+tests; a protocol drift test (it caught `Status.lan.peer` missing in the webview copy). Verified: unit tests (proxy 541,
+webview 540, extension 2103, cli 115, sidecar 38, plugin 95), VS Code integration suites on the packaged VSIX — default
+42/42, agent 12/12 on macOS incl. gRPC, web 8/8, devices 20/21 on the iOS 26.5 simulator and macOS incl. the new
+simulator-trust check L (CA added, TLS gRPC decrypted, only our row removed at session end; the one failure was
+httpbin.org answering HTML for a moment), `verifyPlugin` Compatible. Independent review: docs/REVIEW-13.md (two parts),
+all findings fixed. Known limit: once decrypted, a development server with a self-signed certificate fails upstream (the
+proxy verifies certificates); a setting for that needs the owner's decision. Not verified: Android emulator for
+0.11–0.13, physical iPhone, connectrpc against a real app, mTLS on gRPC upstreams, IPv6 targets, Edge.
