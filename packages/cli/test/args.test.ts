@@ -77,4 +77,10 @@ describe('parseArgs', () => {
     expect(() => parseArgs(['test', '--no-grpc', '--grpc-decrypt-host', 'a'])).toThrow(/cannot be combined/);
     expect(() => parseArgs(['test', '--grpc-decrypt-host'])).toThrow(/needs a value/);
   });
+
+  it('parses --trust-simulator (CONTRACTS §19.3)', () => {
+    expect(opts(['test', '--trust-simulator']).trustSimulator).toBe(true);
+    expect(opts(['test']).trustSimulator).toBeUndefined();
+    expect(() => parseArgs(['test', '--trust-simulator', '--no-grpc'])).toThrow(/cannot be combined/);
+  });
 });

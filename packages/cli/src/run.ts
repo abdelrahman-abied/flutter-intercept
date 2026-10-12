@@ -16,6 +16,7 @@ import { presetProfile, type NetworkPresetId, type NetworkProfile } from '@flutt
 import { loadOrCreateCa } from '../../extension/src/ca';
 import { findPubspecRoot, hasPubspec, PROXY_DEFINE, readPubspec } from '../../extension/src/entry/generator';
 import { locateAdb, ReverseTracker } from '../../extension/src/adb';
+import { IosSimTrust, type SimTrustStore } from '../../extension/src/iosSimTrust';
 import { displayCommand, spawnPlan } from './command';
 import { redactUrl } from '../../extension/src/agent/redact';
 import { evaluateExpectations, readExpectations, type AssertionResult, type Expectation } from './assertions';
@@ -224,6 +225,7 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'flutter-intercept-run-'));
   fs.chmodSync(tmp, 0o700);
   let proxy: InterceptProxy | undefined;
+  let simTrust: IosSimTrust | undefined;
   let entries: PreparedEntries | undefined;
   const adb = new ReverseTracker({ log });
   let evicted = 0;
@@ -281,6 +283,12 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
       ...(o.grpcDecryptHosts?.length ? { grpcDecryptHosts: o.grpcDecryptHosts } : {}),
     });
     proxy.on('removed', (ids: string[]) => (evicted += ids.length));
+    // CONTRACTS §19.3: an iOS simulator trusts this run's CA (opt-in); a crashed run's certificate is removed by the next run.
+    if (o.trustSimulator) {
+      simTrust = new IosSimTrust({ caCertPem: ca.cert, log, store: jsonFileStore(path.join(projectRoot, '.dart_tool', 'flutter_intercept', 'sim-trust.json')) });
+      const removed = await simTrust.recover().catch(() => 0);
+      if (removed) log(`removed ${removed} Flutter Intercept CA certificate(s) a previous run left on a simulator`);
+    }
     try {
       await proxy.start();
     } catch (e) {
@@ -314,6 +322,16 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
       if (isVerboseFlutter(o.flutterArgs)) log('flutter -v prints dart-define values, which include this run\'s LAN token (it stops working when the run ends)');
     } else {
       log(`proxy on 127.0.0.1:${port}${device ? `, device ${device.id} (${device.kind}) reaches it at ${route.host}:${port}` : ''}`);
+    }
+    if (simTrust) {
+      if (device?.kind !== 'ios-simulator') log('--trust-simulator applies to iOS simulators only: ignored for this device');
+      else {
+        const r = await simTrust.ensure(device.id, { name: device.name ?? 'iOS simulator' });
+        if (r.state === 'trusted' || r.state === 'pre-existing') {
+          proxy.setGrpcDecryptAll(true);
+          log(`the simulator trusts this run's CA until the run ends: TLS gRPC is decrypted`);
+        } else log(`could not make the simulator trust the CA: ${r.problem ?? r.state}`);
+      }
     }
 
     let loaded;
@@ -399,6 +417,7 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
     if (lanDefinesFile) await removeLanDefines(lanDefinesFile);
     if (lanOpen) await proxy?.closeLan().catch((e) => log(`closing the LAN listener: ${(e as Error).message}`));
     await proxy?.stop().catch((e) => log(`proxy stop: ${(e as Error).message}`));
+    await simTrust?.releaseAll().catch((e) => log(`removing the CA from the simulator: ${(e as Error).message}`));
     fs.rmSync(tmp, { recursive: true, force: true });
     removeExitHook?.();
   }
@@ -469,4 +488,22 @@ function safeRead(p: string): string {
 async function settle(proxy: InterceptProxy, maxMs: number): Promise<void> {
   const until = Date.now() + maxMs;
   while (Date.now() < until && proxy.getExchanges().some((e) => !FINAL.has(e.state))) await new Promise((r) => setTimeout(r, 100));
+}
+
+/** CONTRACTS §19.3: the simulator-trust records of CLI runs (so a crashed run's certificate is removed by the next one). */
+function jsonFileStore(file: string): SimTrustStore {
+  return {
+    get: () => {
+      try {
+        const v = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
+        return Array.isArray(v) ? v : [];
+      } catch {
+        return [];
+      }
+    },
+    set: async (records) => {
+      await fs.promises.mkdir(path.dirname(file), { recursive: true });
+      await fs.promises.writeFile(file, JSON.stringify(records), { mode: 0o600 });
+    },
+  };
 }

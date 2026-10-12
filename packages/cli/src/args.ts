@@ -51,6 +51,8 @@ Options:
       --grpc-decrypt-host <glob> Decrypt TLS gRPC to this host (repeatable). Only for apps that trust the
                                  Flutter Intercept CA in debug; other TLS gRPC is listed undecrypted.
       --no-grpc                  Let gRPC calls connect directly (not intercepted).
+      --trust-simulator          iOS simulator only: trust this run's CA so TLS gRPC is decrypted; only that
+                                 certificate is removed at the end of the run (or by the next run after a crash).
   -h, --help                     Show this help.
       --version                  Show the version.
 
@@ -65,7 +67,7 @@ Examples:
   flutter-intercept run -d macos --network-profile slow-3g`;
 
 type ValueKey = 'project' | 'device' | 'port' | 'rules' | 'replay' | 'replayFallback' | 'networkProfile' | 'har' | 'record' | 'assert' | 'junit' | 'flutter';
-type FlagKey = 'noRules' | 'approveSharedRules' | 'noRedact' | 'noGrpc' | 'help' | 'version';
+type FlagKey = 'noRules' | 'approveSharedRules' | 'noRedact' | 'noGrpc' | 'trustSimulator' | 'help' | 'version';
 
 const VALUE_OPTIONS: Record<string, ValueKey> = {
   '--project': 'project',
@@ -90,6 +92,7 @@ const FLAG_OPTIONS: Record<string, FlagKey> = {
   '--approve-shared-rules': 'approveSharedRules',
   '--no-redact': 'noRedact',
   '--no-grpc': 'noGrpc',
+  '--trust-simulator': 'trustSimulator',
   '--help': 'help',
   '-h': 'help',
   '--version': 'version',
@@ -194,6 +197,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
   if (values.flutter !== undefined) options.flutter = values.flutter;
   if (flags.has('noGrpc') && grpcDecryptHosts.length) throw new UsageError('--grpc-decrypt-host and --no-grpc cannot be combined');
   if (flags.has('noGrpc')) options.grpc = false;
+  if (flags.has('trustSimulator')) {
+    if (flags.has('noGrpc')) throw new UsageError('--trust-simulator and --no-grpc cannot be combined');
+    options.trustSimulator = true;
+  }
   if (grpcDecryptHosts.length) options.grpcDecryptHosts = [...new Set(grpcDecryptHosts)];
   return { kind: 'options', options };
 }

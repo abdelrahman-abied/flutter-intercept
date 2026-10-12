@@ -40,6 +40,8 @@ export interface CliOptions {
   grpc?: boolean;
   /** CONTRACTS §16.6: TLS gRPC hosts to decrypt (`--grpc-decrypt-host`, repeatable). */
   grpcDecryptHosts?: string[];
+  /** CONTRACTS §19.3: make the iOS simulator trust this run's CA (`--trust-simulator`); removed at the end of the run. */
+  trustSimulator?: boolean;
 }
 
 export interface CliResult {
