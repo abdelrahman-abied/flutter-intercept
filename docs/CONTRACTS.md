@@ -2097,3 +2097,12 @@ Types already in code: `GrpcInfo.web`, `SnippetFormat 'grpcurl'` (both protocol 
   simulator trusts the Flutter Intercept CA until the session ends".
 - Physical iPhones, Android emulators and macOS desktop are never changed (documented: Android's Dart reads only the
   system store; macOS would need the login keychain and a password prompt).
+
+### 19.4 Quality and performance (QUALITY-1, PERF-1)
+- `Exchange.notes?: string[]` carries informational notes (oldest first, deduplicated, ≤ 20 × 300 chars); `error` is
+  only for real failures and is never overwritten by a note. The webview, agents (`get_request` / `list_requests`
+  `notes`), HAR (`_notes`) and recordings show them.
+- One node-free module `@flutter-intercept/proxy/grpc-meta` (reserved gRPC metadata, status code names, caps / limits,
+  map-remote target checks) is the single source for the proxy, the host and the webview.
+- Sequence steps: at most 50 everywhere. One script template (with the gRPC hooks), from that shared module.
+- Performance budgets (PERF-1) become tests where they can be machine-independent (ratios, structure).

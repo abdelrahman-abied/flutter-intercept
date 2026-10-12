@@ -83,6 +83,9 @@ export interface Exchange {
   // CONTRACTS §17 (v0.11.0)
   /** kind `grpc`, while `paused-*`: what is held (a message, or the end of the call). */
   grpcPause?: GrpcPause;
+  /** QUALITY-1 / CONTRACTS §19.4: informational notes ("mutate: no schema…", "message over 4 MB…"), oldest first,
+   * deduplicated, ≤ 20 × 300 chars. `error` is only for what actually failed. */
+  notes?: string[];
 }
 
 /** CONTRACTS §17.2: what a gRPC breakpoint holds. */
