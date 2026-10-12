@@ -187,6 +187,12 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
         ) : (
           ex.error && <div class="msg error">{ex.error}</div>
         )}
+        {ex.notes && ex.notes.length > 0 && (
+          // CONTRACTS §19.4: informational notes (never errors) — e.g. "mutate: no schema for /pkg.Svc/Method".
+          <ul class="msg info exchange-notes" aria-label="Notes">
+            {ex.notes.map((n, i) => <li key={i}>{n}</li>)}
+          </ul>
+        )}
         {ex.scriptLog && ex.scriptLog.length > 0 && <ScriptLog key={ex.id} ex={ex} />}
       </header>
 

@@ -776,7 +776,7 @@ function applyRequestEdit(ex: Exchange, e?: RequestEdit): Exchange {
   };
 }
 
-function applyResponseEdit(ex: Exchange, e?: ResponseEdit): Partial<Exchange> {
+function applyResponseEdit(e?: ResponseEdit): Partial<Exchange> {
   if (!e) return {};
   const p: Partial<Exchange> = {};
   if (e.status !== undefined) p.status = e.status;
@@ -897,7 +897,7 @@ function simulate(t: Template, opts: { instant?: boolean; startedAt?: number; in
     if (rule?.action.kind === 'breakpoint' && rule.action.phase !== 'request') {
       pause(cur, 'response', resp, (edit) => {
         const p = find(id) ?? cur;
-        update(p, { ...applyResponseEdit(p, edit as ResponseEdit), state: 'completed', durationMs: Date.now() - p.startedAt, pausedAt: undefined, pauseDeadline: undefined });
+        update(p, { ...applyResponseEdit(edit as ResponseEdit), state: 'completed', durationMs: Date.now() - p.startedAt, pausedAt: undefined, pauseDeadline: undefined });
       });
       return;
     }

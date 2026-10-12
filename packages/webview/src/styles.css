@@ -1351,3 +1351,7 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
 .grpc-web-note { flex-basis: 100%; margin: 0; }
 .grpc-web-body { margin-top: 8px; }
 .sim-trust-status { overflow: hidden; text-overflow: ellipsis; }
+
+/* CONTRACTS §19.4 notes */
+.exchange-notes { margin: 6px 0 0; padding-left: 24px; }
+.exchange-notes li { overflow-wrap: anywhere; }

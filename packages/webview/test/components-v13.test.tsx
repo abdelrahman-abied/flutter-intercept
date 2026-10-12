@@ -267,3 +267,20 @@ describe('iOS simulator trust (CONTRACTS §19.3)', () => {
     expect($('.tunnel')!.textContent).toContain('iOS simulator, turn on flutterIntercept.grpc.trustOnSimulator');
   });
 });
+
+describe('Exchange.notes (CONTRACTS §19.4)', () => {
+  it('shows notes as an info list, separate from the error', async () => {
+    await mount();
+    await emit({ type: 'snapshot', exchanges: [h2({ notes: ['mutate: no schema for /demo.Users/GetUser', 'message over 4 MB: not paused'], error: 'upstream reset' })], rules: [], status: withGrpc });
+    await click($$('.row')[0]);
+    expect($$('.exchange-notes li').map((li) => li.textContent)).toEqual(['mutate: no schema for /demo.Users/GetUser', 'message over 4 MB: not paused']);
+    expect($('.detail-head .msg.error')!.textContent).toBe('upstream reset');
+  });
+
+  it('no notes section without notes', async () => {
+    await mount();
+    await emit({ type: 'snapshot', exchanges: [h2()], rules: [], status: withGrpc });
+    await click($$('.row')[0]);
+    expect($('.exchange-notes')).toBeNull();
+  });
+});
