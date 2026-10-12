@@ -4,6 +4,7 @@ import type { Rule } from '@flutter-intercept/proxy';
 import { APPROVALS_KEY, MAX_REVIEW_CODE_CHARS, ruleApprovalHash, SCRIPT_APPROVALS_KEY, SharedRulesCore, WorkspaceFolderInfo } from '../../src/rules/core';
 import { contentHash, toFileRule } from '../../src/rules/file';
 import { approvalReasons, scriptFileSecretProblem, scriptSecretKind, secretProblem } from '../../src/rules/policy';
+import { SCRIPT_TEMPLATE } from '@flutter-intercept/proxy/grpc-meta';
 import { defaultScriptFilePath, MAX_SCRIPT_FILE_BYTES, ScriptFileError, scriptFileSyntaxError, SCRIPTS_DIR, scriptTemplate } from '../../src/rules/scriptFile';
 import { FakeFs, FakeMemento, FILE, fakeValidateRule, ROOT, script } from './rules.fakes';
 
@@ -273,18 +274,18 @@ describe('script template and "Edit script in a file"', () => {
     const t = scriptTemplate({ name: 'Login\n*/ evil' });
     expect(t.split('\n')[0]).toBe('// Flutter Intercept script for the rule "Login * / evil".');
     for (const s of ['function onRequest(request, context)', 'function onResponse(response, request, context)', 'context.log(', 'request.headers[', 'JSON.parse(response.body)']) expect(t).toContain(s);
-    // valid JavaScript, and the hooks behave as documented
+    // valid JavaScript; the hooks change nothing until edited (the examples are comments)
     const hooks = new Function(`${t}\nreturn { onRequest, onResponse };`)() as {
-      onRequest: (r: unknown, c: unknown) => { headers: Record<string, string> };
-      onResponse: (r: unknown, q: unknown, c: unknown) => { body: string } | undefined;
+      onRequest: (r: unknown, c: unknown) => unknown;
+      onResponse: (r: unknown, q: unknown, c: unknown) => unknown;
     };
     const logs: unknown[][] = [];
     const context = { ruleId: 'r', exchangeId: 'e', log: (...a: unknown[]) => logs.push(a) };
     const req = { method: 'GET', url: 'https://api.example.com/a', headers: {} };
-    expect(hooks.onRequest(req, context).headers['x-debug']).toBe('flutter-intercept');
-    expect(JSON.parse(hooks.onResponse({ status: 200, headers: {}, body: '{"a":1}' }, req, context)!.body)).toEqual({ a: 1, editedBy: 'flutter-intercept' });
-    expect(hooks.onResponse({ status: 200, headers: {}, body: 'not json' }, req, context)).toBeUndefined();
-    expect(logs).toHaveLength(2);
+    expect(hooks.onRequest(req, context)).toBeUndefined();
+    expect(hooks.onResponse({ status: 200, headers: {}, body: '{"a":1}' }, req, context)).toBeUndefined();
+    expect(logs).toHaveLength(0);
+    expect(scriptTemplate()).toBe(SCRIPT_TEMPLATE);
   });
 
   it('createScriptFile writes the template (or given code) without overwriting, and refuses credentials', async () => {

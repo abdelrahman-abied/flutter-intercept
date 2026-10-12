@@ -17,6 +17,7 @@ import type { Body, Exchange } from '@flutter-intercept/proxy';
 import { FrameFormatError, validFrames, type StreamKind } from './frames';
 import { grpcInfoFor, MAX_GRPC_STATUS_MESSAGE, MAX_RECORDED_GRPC_CODE } from './grpc';
 import type { RecordedExchange, Recording } from './types';
+import { MAX_NOTE_CHARS, MAX_NOTES } from '@flutter-intercept/proxy/grpc-meta';
 
 /** HTTP-only recordings (0.6 / 0.7 format). */
 export const RECORDING_VERSION = 1;
@@ -189,6 +190,13 @@ export function validEntry(v: unknown, where: string): RecordedExchange {
   if (v.initiator !== undefined) {
     if (v.initiator !== 'editor' && v.initiator !== 'agent') fail(`${where}.initiator`, 'must be "editor" or "agent"');
     e.initiator = v.initiator;
+  }
+  // CONTRACTS §19.4: informational notes (≤ 20 × 300 characters)
+  if (v.notes !== undefined) {
+    if (!Array.isArray(v.notes) || v.notes.length > MAX_NOTES || v.notes.some((n) => typeof n !== 'string' || n.length > MAX_NOTE_CHARS)) {
+      fail(`${where}.notes`, `must be at most ${MAX_NOTES} strings of at most ${MAX_NOTE_CHARS} characters`);
+    }
+    if (v.notes.length) e.notes = [...(v.notes as string[])];
   }
   if (v.graphql !== undefined) {
     const g = v.graphql;

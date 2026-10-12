@@ -38,6 +38,32 @@ const stubPlugin = {
   },
 };
 
+// PERF-1 #7: zod v4 re-exports ~40 locale files (`z.locales`) that nothing here uses; only `en` (its default error map,
+// imported by zod itself) stays. The stub keeps the `locales` namespace with `en` only.
+const zodLocalesPlugin = {
+  name: 'flutter-intercept-zod-locales',
+  setup(b) {
+    b.onLoad({ filter: /[\\/]zod[\\/]v4[\\/]locales[\\/]index\.js$/ }, () => ({ contents: 'export { default as en } from "./en.js";\n', loader: 'js' }));
+  },
+};
+
+/** Bundle budgets (PERF-1 #7): fail the build when the extension grows past them or a locale slips back in. */
+const MAX_EXTENSION_BYTES = 2_600_000;
+function assertBudget(metafile, outfile) {
+  const out = Object.entries(metafile.outputs).find(([k]) => k.endsWith(outfile));
+  const bytes = out ? out[1].bytes : 0;
+  const locales = Object.keys(metafile.inputs).filter((f) => /zod\/v4\/locales\/(?!en\.js$|index\.js$)/.test(f));
+  if (locales.length) {
+    console.error(`bundle contains zod locales (the zod-locales stub stopped matching?):\n  ${locales.slice(0, 5).join('\n  ')}`);
+    process.exit(1);
+  }
+  if (bytes > MAX_EXTENSION_BYTES) {
+    console.error(`${outfile} is ${bytes} bytes, over the ${MAX_EXTENSION_BYTES} budget (PERF-1 #7): find what grew (dist/meta.json) or raise the budget on purpose`);
+    process.exit(1);
+  }
+  console.log(`${outfile}: ${bytes} bytes (budget ${MAX_EXTENSION_BYTES})`);
+}
+
 // Never let these back into the bundle (mockttp's admin server / remote client / PAC engine).
 const forbidden = [
   /node_modules\/mockttp\/dist\/(admin|client|pluggable-admin-api)\//,
@@ -76,10 +102,11 @@ await build({
   minify: !dev,
   keepNames: true,
   metafile: true,
-  plugins: [stubPlugin],
+  plugins: [stubPlugin, zodLocalesPlugin],
 }).then((r) => {
   fs.writeFileSync(path.join(here, 'dist', 'meta.json'), JSON.stringify(r.metafile));
   assertNothingForbidden(r.metafile);
+  if (!dev) assertBudget(r.metafile, 'dist/extension.js');
 });
 
 fs.rmSync(path.join(here, 'dist', 'webview'), { recursive: true, force: true });
@@ -89,7 +116,7 @@ for (const f of ['webview.js', 'webview.css']) fs.copyFileSync(path.join(here, '
 if (withTests) {
   // runTest.js runs in plain Node and launches VS Code; suite/index.js runs inside VS Code.
   await build({ ...common, entryPoints: ['test/integration/runTest.ts'], outfile: 'dist-test/runTest.js', external: ['vscode'] });
-  await build({ ...common, entryPoints: ['test/integration/suite/index.ts'], outfile: 'dist-test/suite/index.js', external: ['vscode', ...optionalExternals], plugins: [stubPlugin] });
+  await build({ ...common, entryPoints: ['test/integration/suite/index.ts'], outfile: 'dist-test/suite/index.js', external: ['vscode', ...optionalExternals], plugins: [stubPlugin, zodLocalesPlugin] });
 }
 
 if (withSmoke) {
@@ -102,6 +129,6 @@ if (withSmoke) {
     minify: !dev,
     keepNames: true,
     metafile: true,
-    plugins: [stubPlugin],
+    plugins: [stubPlugin, zodLocalesPlugin],
   }).then((r) => assertNothingForbidden(r.metafile));
 }

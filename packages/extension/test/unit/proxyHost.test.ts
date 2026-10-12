@@ -4,6 +4,7 @@ import * as net from 'net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { InterceptProxy, type Exchange } from '@flutter-intercept/proxy';
 import { InterceptProxyHost } from '../../src/proxyHost';
+import { withFakeProxy } from './proxy.fakes';
 
 function freePort(): Promise<number> {
   return new Promise((resolve) => {
@@ -81,7 +82,7 @@ describe('InterceptProxyHost with the real InterceptProxy', () => {
   }, 30_000);
 
   it('fails cleanly when the whole range is busy', async () => {
-    const host = new InterceptProxyHost({
+    const host = new InterceptProxyHost(withFakeProxy({
       getPort: () => 65535,
       factory: () => ({
         start: async () => {
@@ -96,7 +97,7 @@ describe('InterceptProxyHost with the real InterceptProxy', () => {
         abort: () => undefined,
         on: () => undefined,
       }),
-    });
+    }));
     await expect(host.start()).rejects.toThrow(/no free proxy port in 65535-65535/);
   });
 });
@@ -132,7 +133,7 @@ describe('InterceptProxyHost port changes', () => {
     let port = 9001;
     let live = true;
     const states: boolean[] = [];
-    const host = new InterceptProxyHost({ getPort: () => port, factory: fakeFactory(log), canRestart: () => !live });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => port, factory: fakeFactory(log), canRestart: () => !live }));
     host.on('state', (r: boolean) => states.push(r));
     expect(await host.start()).toBe(9001);
     port = 9002;
@@ -149,7 +150,7 @@ describe('InterceptProxyHost CA wiring', () => {
   it('passes the install CA to every proxy it creates', async () => {
     const seen: unknown[] = [];
     const ca = { key: 'K', cert: 'C' };
-    const host = new InterceptProxyHost({
+    const host = new InterceptProxyHost(withFakeProxy({
       getPort: () => 1,
       getCa: async () => ca,
       factory: (o) => {
@@ -166,7 +167,7 @@ describe('InterceptProxyHost CA wiring', () => {
           on: () => undefined,
         };
       },
-    });
+    }));
     await host.start();
     await host.stop();
     await host.start();
@@ -206,7 +207,7 @@ describe('InterceptProxyHost v0.3.0 forwarding (CONTRACTS §9.2/9.4)', () => {
 
   it('send starts the proxy on demand and forwards the request', async () => {
     const calls: unknown[] = [];
-    const host = new InterceptProxyHost({ getPort: () => 7001, factory: (o) => fake(o, calls) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => 7001, factory: (o) => fake(o, calls) }));
     expect(host.running).toBe(false);
     await expect(host.send({ method: 'GET', url: 'https://a.dev/', initiator: 'editor' })).resolves.toEqual({ id: 'x1' });
     expect(host.running).toBe(true);
@@ -216,7 +217,7 @@ describe('InterceptProxyHost v0.3.0 forwarding (CONTRACTS §9.2/9.4)', () => {
   it('network profile and app packages are applied at start and re-applied after a restart', async () => {
     const calls: unknown[] = [];
     let port = 7101;
-    const host = new InterceptProxyHost({ getPort: () => port, factory: (o) => fake(o, calls), canRestart: () => true });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => port, factory: (o) => fake(o, calls), canRestart: () => true }));
     host.setNetworkProfile({ kind: 'offline' }); // before start: stored
     host.setAppPackages(['demo_app', 'demo_app', '']);
     expect(host.networkProfile).toEqual({ kind: 'offline' });
@@ -238,7 +239,7 @@ describe('InterceptProxyHost v0.3.0 forwarding (CONTRACTS §9.2/9.4)', () => {
   it('re-emits rule-spent / rule-hit and passes rewriteLocalhost', async () => {
     const seen: unknown[] = [];
     const made: ReturnType<typeof fake>[] = [];
-    const host = new InterceptProxyHost({
+    const host = new InterceptProxyHost(withFakeProxy({
       getPort: () => 7201,
       rewriteLocalhost: () => false,
       factory: (o) => {
@@ -246,7 +247,7 @@ describe('InterceptProxyHost v0.3.0 forwarding (CONTRACTS §9.2/9.4)', () => {
         made.push(p);
         return p;
       },
-    });
+    }));
     host.on('rule-spent', (...a: unknown[]) => seen.push(a));
     await host.start();
     expect(made[0].opts.rewriteLocalhost).toBe(false);
@@ -256,13 +257,4 @@ describe('InterceptProxyHost v0.3.0 forwarding (CONTRACTS §9.2/9.4)', () => {
     expect(seen).toEqual([['r1', 'times'], ['hit', 'r2', 2]]);
   });
 
-  it('an older proxy build: clear errors for send/profile, "none" still accepted', async () => {
-    const logs: string[] = [];
-    const host = new InterceptProxyHost({ getPort: () => 7301, factory: (o) => fake(o, [], false), log: (m) => logs.push(m) });
-    await host.start();
-    await expect(host.send({ method: 'GET', url: 'https://a.dev/', initiator: 'agent' })).rejects.toThrow(/cannot send requests/);
-    expect(() => host.setNetworkProfile({ kind: 'offline' })).toThrow(/cannot simulate/);
-    expect(() => host.setNetworkProfile({ kind: 'none' })).not.toThrow();
-    expect(() => host.setAppPackages(['a'])).not.toThrow();
-  });
 });

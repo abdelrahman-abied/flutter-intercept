@@ -20,21 +20,20 @@
  */
 import * as path from 'path';
 import type { Exchange } from '@flutter-intercept/proxy';
+import { GRPC_CALL_RESERVED, GRPC_REWRITE_RESERVED, HOP_BY_HOP_HEADERS } from '@flutter-intercept/proxy/grpc-meta';
 import { redactGrpcMetadata } from '../agent/redact';
 import { redactJsonValue } from '../agent/samples';
 import { decodeGrpcMessages, grpcMethodPath, type GrpcDeps } from '../grpc/service';
 import { shellQuote, snippetHeaders } from './snippets';
 
-/** Request headers a grpcurl snippet never carries (lower-case): the protocol's, the transport's, the browser's. */
-const GRPCURL_DROPPED = new Set([
-  'content-type',
-  'te',
-  'grpc-encoding',
-  'grpc-accept-encoding',
-  'grpc-timeout',
-  'grpc-status',
-  'grpc-message',
-  'grpc-status-details-bin',
+/**
+ * Request headers a grpcurl snippet never carries (lower-case): the protocol's (grpc-meta's reserved sets), the
+ * transport's (hop-by-hop, encoding), the browser's (gRPC-Web).
+ */
+const GRPCURL_DROPPED: ReadonlySet<string> = new Set([
+  ...GRPC_REWRITE_RESERVED,
+  ...GRPC_CALL_RESERVED,
+  ...HOP_BY_HOP_HEADERS,
   'content-encoding',
   'accept',
   'accept-encoding',

@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import type { Exchange, InterceptProxyOptions } from '@flutter-intercept/proxy';
 import { InterceptProxyHost, MAX_WARNINGS_PER_SESSION } from '../../src/proxyHost';
 import type { SessionWarning } from '../../src/ui/protocol';
+import { withFakeProxy } from './proxy.fakes';
 
 function fake(o: InterceptProxyOptions, calls: unknown[], features = true) {
   const ee = new EventEmitter();
@@ -44,7 +45,7 @@ const warn = (id: string, extra: Partial<SessionWarning> = {}): SessionWarning =
 describe('record / update (CONTRACTS §11.4)', () => {
   it('nothing is recorded while the proxy is stopped', () => {
     const calls: unknown[] = [];
-    const host = new InterceptProxyHost({ getPort: () => 7401, factory: (o) => fake(o, calls) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => 7401, factory: (o) => fake(o, calls) }));
     expect(host.record([profileEx()])).toEqual([]);
     host.update('vm-1', { status: 200 });
     expect(calls).toEqual([]);
@@ -53,7 +54,7 @@ describe('record / update (CONTRACTS §11.4)', () => {
   it('forwards to the proxy, always marked captured: vm-profile; one failure does not stop the batch', async () => {
     const calls: unknown[] = [];
     const logs: string[] = [];
-    const host = new InterceptProxyHost({ getPort: () => 7402, factory: (o) => fake(o, calls), log: (m) => logs.push(m) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => 7402, factory: (o) => fake(o, calls), log: (m) => logs.push(m) }));
     await host.start();
     const ids = host.record([profileEx(), profileEx('https://boom.example.com/'), { ...profileEx(), captured: undefined }]);
     expect(ids).toEqual(['vm-1', 'vm-2']);
@@ -63,20 +64,10 @@ describe('record / update (CONTRACTS §11.4)', () => {
     expect(calls.at(-1)).toEqual(['update', 'vm-1', { status: 200, state: 'completed' }]);
   });
 
-  it('an older proxy build without record(): empty result, logged once', async () => {
-    const logs: string[] = [];
-    const host = new InterceptProxyHost({ getPort: () => 7403, factory: (o) => fake(o, [], false), log: (m) => logs.push(m) });
-    await host.start();
-    expect(host.record([profileEx()])).toEqual([]);
-    expect(host.record([profileEx()])).toEqual([]);
-    expect(() => host.update('x', { status: 1 })).not.toThrow();
-    expect(logs.filter((l) => /cannot record/.test(l))).toHaveLength(1);
-  });
-
   it('vmHostDeps is bound to the host', async () => {
     const calls: unknown[] = [];
     const logs: string[] = [];
-    const host = new InterceptProxyHost({ getPort: () => 7404, factory: (o) => fake(o, calls), log: (m) => logs.push(m) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => 7404, factory: (o) => fake(o, calls), log: (m) => logs.push(m) }));
     await host.start();
     const deps = host.vmHostDeps();
     const { record, update, setWarnings, log } = deps; // unbound use must work
@@ -95,7 +86,7 @@ describe('record / update (CONTRACTS §11.4)', () => {
 
 describe('session warnings (CONTRACTS §11.4)', () => {
   it('replaces per session, dedupes by id across sessions, clears with []', () => {
-    const host = new InterceptProxyHost({ getPort: () => 1, factory: (o) => fake(o, []) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => 1, factory: (o) => fake(o, []) }));
     const events: SessionWarning[][] = [];
     host.on('warnings', (w: SessionWarning[]) => events.push(w));
     host.setWarnings('s1', [warn('a'), warn('b'), warn('a')]);
@@ -120,7 +111,7 @@ describe('session warnings (CONTRACTS §11.4)', () => {
   });
 
   it('drops malformed entries, normalises kind, caps text and count', () => {
-    const host = new InterceptProxyHost({ getPort: () => 1, factory: (o) => fake(o, []) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => 1, factory: (o) => fake(o, []) }));
     host.setWarnings('', [warn('x')]);
     expect(host.warnings).toEqual([]);
     host.setWarnings('s1', [
@@ -144,11 +135,11 @@ describe('setWebSessionActive (CONTRACTS §11.3)', () => {
   it('stored before start, applied at start and after a restart, forwarded while running', async () => {
     const calls: unknown[] = [];
     let port = 7501;
-    const host = new InterceptProxyHost({
+    const host = new InterceptProxyHost(withFakeProxy({
       getPort: () => port,
       canRestart: () => true,
       factory: (o) => ({ ...fake(o, []), setWebSessionActive: (a: boolean) => calls.push([o.port, a]) }),
-    });
+    }));
     host.setWebSessionActive(true);
     expect(host.webSession).toBe(true);
     await host.start();
@@ -162,7 +153,7 @@ describe('setWebSessionActive (CONTRACTS §11.3)', () => {
   });
 
   it('a proxy without it: no error', async () => {
-    const host = new InterceptProxyHost({ getPort: () => 7503, factory: (o) => fake(o, [], false) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => 7503, factory: (o) => fake(o, [], false) }));
     await host.start();
     expect(() => host.setWebSessionActive(true)).not.toThrow();
   });

@@ -15,6 +15,7 @@
  *   "[redacted]", "changeme", "${TOKEN}", anything under 4 characters, globs) stay allowed.
  */
 import type { Rule, RuleAction } from '@flutter-intercept/proxy';
+import { isLoopbackHostname } from '@flutter-intercept/proxy/grpc-meta';
 import { isOpaqueToken, isSensitiveHeader, redactSecretValues } from '../agent/redact';
 
 type AnyAction = RuleAction | { kind: 'passthrough' };
@@ -47,7 +48,10 @@ export function matchLabel(rule: Rule): string {
 
 // ------------------------------------------------------------------ approval gate
 
-/** Loopback host of an absolute URL / origin: localhost, *.localhost, 127.0.0.0/8, ::1 (also IPv4-mapped). */
+/**
+ * Loopback host of an absolute URL / origin: grpc-meta's `isLoopbackHostname` (localhost, *.localhost, 127.0.0.0/8,
+ * ::1, the unspecified 0.0.0.0 / ::, IPv4-mapped / compatible forms).
+ */
 export function isLoopbackTarget(to: string): boolean {
   let host: string;
   try {
@@ -55,12 +59,7 @@ export function isLoopbackTarget(to: string): boolean {
   } catch {
     return false;
   }
-  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
-  if (host === 'localhost' || host.endsWith('.localhost')) return true;
-  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
-  if (host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
-  // IPv4-mapped loopback (WHATWG serialises ::ffff:127.0.0.1 as ::ffff:7f00:1)
-  return /^::ffff:(127\.\d{1,3}\.\d{1,3}\.\d{1,3}|7f[0-9a-f]{2}:[0-9a-f]{1,4})$/.test(host);
+  return isLoopbackHostname(host);
 }
 
 function origin(to: string): string {

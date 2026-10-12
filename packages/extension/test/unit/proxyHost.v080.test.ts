@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import type { ClientCertificate, InterceptProxyOptions } from '@flutter-intercept/proxy';
 import { parseHostPattern } from '@flutter-intercept/proxy';
 import { InterceptProxyHost, normalizeNoProxy, normalizeTlsPassthrough, resolveUpstreamProxy, splitNoProxy, type VscodeHttpProxy } from '../../src/proxyHost';
+import { withFakeProxy } from './proxy.fakes';
 
 /** P's REVIEW-8 #4 parser is in the built proxy (it refuses `*.com`). */
 export const SHARED_PARSER_FIXED = (() => {
@@ -55,13 +56,13 @@ function factory(made: Fake[], features = true) {
 }
 
 function host(made: Fake[], o: { features?: boolean; vscodeHttpProxy?: () => VscodeHttpProxy | undefined; logs?: string[] } = {}) {
-  return new InterceptProxyHost({
+  return new InterceptProxyHost(withFakeProxy({
     getPort: () => 9100,
     factory: factory(made, o.features ?? true),
     log: (m) => o.logs?.push(m),
     canRestart: () => true,
     ...(o.vscodeHttpProxy ? { vscodeHttpProxy: o.vscodeHttpProxy } : {}),
-  });
+  }));
 }
 
 const KEY_MARKER = 'PRIVATE-KEY-MATERIAL-NEVER-LOGGED';
@@ -118,20 +119,11 @@ describe('InterceptProxyHost: TLS passthrough (CONTRACTS §14.2)', () => {
     expect(h.tlsPassthrough).toEqual([]);
   });
 
-  it('an older proxy build: logged once, nothing thrown', async () => {
-    const made: Fake[] = [];
-    const logs: string[] = [];
-    const h = host(made, { features: false, logs });
-    await h.start();
-    h.setTlsPassthrough(['a.example']);
-    h.setTlsPassthrough(['b.example']);
-    expect(logs.filter((l) => /cannot pass TLS through/.test(l))).toHaveLength(1);
-  });
 });
 
 describe('TLS passthrough: hosts in effect and problems in Status (REVIEW-8 #4)', () => {
   const proxyWith = (setTls: (hosts: string[]) => unknown, live?: () => string[]) =>
-    new InterceptProxyHost({
+    new InterceptProxyHost(withFakeProxy({
       getPort: () => 9100,
       factory: (opts) => {
         const p = {
@@ -149,7 +141,7 @@ describe('TLS passthrough: hosts in effect and problems in Status (REVIEW-8 #4)'
         if (live) Object.defineProperty(p, 'tlsPassthrough', { get: live });
         return p as never;
       },
-    });
+    }));
 
   it('a newer proxy returns what it accepted: Status shows only those, its problems become a warning', async () => {
     let inEffect: string[] = [];
@@ -226,19 +218,9 @@ describe('InterceptProxyHost: client certificates (CONTRACTS §14.3)', () => {
     expect(seen).not.toContain('BEGIN');
   });
 
-  it('a proxy build without mTLS: every loaded certificate shows a problem, logged once', async () => {
-    const made: Fake[] = [];
-    const logs: string[] = [];
-    const h = host(made, { features: false, logs });
-    await h.start();
-    h.setClientCertificates([cert('a.example')], [{ host: 'a.example' }, { host: 'b.example', problem: 'x' }]);
-    expect(h.clientCertificateStatus).toEqual([{ host: 'a.example', problem: 'this proxy build cannot present client certificates' }, { host: 'b.example', problem: 'x' }]);
-    expect(logs.filter((l) => /cannot present client certificates/.test(l))).toHaveLength(1);
-  });
-
   it('a throwing proxy setter is logged without the certificate', async () => {
     const logs: string[] = [];
-    const h = new InterceptProxyHost({
+    const h = new InterceptProxyHost(withFakeProxy({
       getPort: () => 9100,
       log: (m) => logs.push(m),
       factory: (opts) =>
@@ -256,7 +238,7 @@ describe('InterceptProxyHost: client certificates (CONTRACTS §14.3)', () => {
             throw new Error('bad certificate');
           },
         }) as never,
-    });
+    }));
     await h.start();
     expect(() => h.setClientCertificates([cert('a.example')])).not.toThrow();
     expect(logs.join('\n')).toMatch(/client certificates not applied: bad certificate/);
@@ -388,7 +370,7 @@ describe('InterceptProxyHost.applyUpstreamSettings (CONTRACTS §14.6)', () => {
   it('an upstream proxy the new proxy rejects at start is logged; the start still succeeds', async () => {
     const logs: string[] = [];
     const calls: unknown[] = [];
-    const h = new InterceptProxyHost({
+    const h = new InterceptProxyHost(withFakeProxy({
       getPort: () => 9100,
       log: (m) => logs.push(m),
       factory: (opts) =>
@@ -407,7 +389,7 @@ describe('InterceptProxyHost.applyUpstreamSettings (CONTRACTS §14.6)', () => {
             if (c) throw new Error('Upstream proxy http://127.0.0.1:9100 is Flutter Intercept itself; that would loop');
           },
         }) as never,
-    });
+    }));
     h.setUpstreamProxy({ url: 'http://127.0.0.1:9100' }, 'http.proxy');
     await expect(h.start()).resolves.toBe(9100);
     expect(logs.join('\n')).toMatch(/upstream proxy not used: .*loop/);

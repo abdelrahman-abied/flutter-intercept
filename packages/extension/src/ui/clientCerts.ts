@@ -18,7 +18,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as tls from 'tls';
-import { parseHostPattern, type ClientCertificate } from '@flutter-intercept/proxy';
+import type { ClientCertificate } from '@flutter-intercept/proxy';
+// PERF-1 #1: the dependency-free subpath (activation never evaluates the proxy / mockttp).
+import { parseHostPattern } from '@flutter-intercept/proxy/hosts';
 
 export const MAX_CLIENT_CERT_FILE_BYTES = 1024 * 1024;
 export const MAX_CLIENT_CERTS = 50;

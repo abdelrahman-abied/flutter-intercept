@@ -184,13 +184,14 @@ describe('validateRule: mapRemote (CONTRACTS §12.6)', () => {
     expect(validateRule(rule({ kind: 'mapRemote', to, preserveHost: true })).action).toEqual({ kind: 'mapRemote', to, preserveHost: true });
   });
   it.each([
-    ['staging.example.com', /absolute/],
-    ['/api', /absolute/],
+    ['staging.example.com', /not a URL/],
+    ['/api', /not a URL/],
     ['ftp://a.dev', /http\(s\)/],
-    ['https://user:pw@a.dev', /user info/],
+    ['https://user:pw@a.dev', /credentials/],
     ['https://a.dev/#x', /fragment/],
-    ['', /absolute/],
-    [42, /absolute/],
+    ['https://a.dev/api?x=1', /query/],
+    ['', /needs a target/],
+    [42, /needs a target/],
     [`https://a.dev/${'x'.repeat(2050)}`, /2048/],
   ])('rejects %j', (to, re) => {
     expect(() => validateRule(rule({ kind: 'mapRemote', to }))).toThrow(re);

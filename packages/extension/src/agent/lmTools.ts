@@ -6,11 +6,12 @@
  * (`vscode.lm.registerTool`) and typed with the minimal shim below.
  */
 import { corsPolicyText } from './corsPolicy';
-import { AgentToolError, AgentTools, isWriteTool, needsConfirmation, READ_TOOLS, toolImages, ToolName, ToolResult, WRITE_TOOLS } from './types';
+import { ALL_TOOLS, LM_TOOL_PREFIX } from './schema';
+import { AgentToolError, AgentTools, isWriteTool, needsConfirmation, toolImages, ToolName, ToolResult } from './types';
 import { GRPC_CODE_NAMES } from '../grpc/service';
 
-export const LM_TOOL_PREFIX = 'flutter_intercept_';
-export const ALL_TOOLS: readonly ToolName[] = [...READ_TOOLS, ...WRITE_TOOLS];
+// QUALITY-1 Q5: one definition (schema.ts), re-exported for importers of this module.
+export { ALL_TOOLS, LM_TOOL_PREFIX } from './schema';
 export const lmToolName = (tool: ToolName) => `${LM_TOOL_PREFIX}${tool}`;
 
 // ---- minimal typed shim of the LM tools API (VS Code ≥ 1.95) ----

@@ -9,9 +9,10 @@ import { InterceptProxyHost } from '../../src/proxyHost';
 import { InterceptController } from '../../src/ui/controller';
 import type { HostMsg, Status } from '../../src/ui/protocol';
 import { fakeGrpc } from './grpc.fakes';
+import { withFakeProxy } from './proxy.fakes';
 
 function host(made: { opts: InterceptProxyOptions; calls: boolean[] }[], o: { support?: boolean; logs?: string[] } = {}) {
-  return new InterceptProxyHost({
+  return new InterceptProxyHost(withFakeProxy({
     getPort: () => 9300,
     canRestart: () => true,
     log: (m) => o.logs?.push(m),
@@ -32,7 +33,7 @@ function host(made: { opts: InterceptProxyOptions; calls: boolean[] }[], o: { su
         ...(o.support === false ? {} : { setGrpcDecryptAll: (on: boolean) => void f.calls.push(on) }),
       };
     },
-  });
+  }));
 }
 
 const ctls: InterceptController[] = [];
@@ -58,11 +59,6 @@ describe('decrypt-all and simulator trust (CONTRACTS §19.3)', () => {
     await h.stop();
     await h.start();
     expect(made[1].calls).toEqual([true]);
-    const logs: string[] = [];
-    const old = host([], { support: false, logs });
-    old.setGrpcDecryptAll(true);
-    await old.start();
-    expect(logs.join('\n')).toMatch(/cannot decrypt TLS gRPC for every host/);
   });
 
   it('setSimulatorTrust sanitises and reports; Status and get_status show it', async () => {

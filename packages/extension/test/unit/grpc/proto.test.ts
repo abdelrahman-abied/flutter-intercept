@@ -1,4 +1,5 @@
 // CONTRACTS §17.5: `.proto` files as a schema source.
+import { expectWithin } from '../timing';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { decodeMessage, encodeMessage, isGrpcGeneratedFile, isProtoFile, loadGrpcSchema, skeleton } from '../../../src/grpc';
@@ -239,10 +240,10 @@ describe('bad .proto input', () => {
 });
 
 describe('REVIEW-11 regressions', () => {
-  it('#1: a message named only with underscores terminates', () => {
-    const t = Date.now();
-    const s = one('syntax = "proto3"; message _ { int32 a = 1; } enum __ { A = 0; } message _B {}');
-    expect(Date.now() - t).toBeLessThan(50);
+  it('#1: a message named only with underscores terminates', async () => {
+    let s!: ReturnType<typeof one>;
+    // QUALITY-1 Q8: best-of-3, scaled (it used to hang forever; the budget only proves it ends quickly)
+    await expectWithin(() => (s = one('syntax = "proto3"; message _ { int32 a = 1; } enum __ { A = 0; } message _B {}')), 200);
     expect(s.message('_')?.dartClass).toBe('x_');
     expect(s.enumType('__')?.dartClass).toBe('x__');
     expect(s.message('_B')?.dartClass).toBe('B_');

@@ -10,10 +10,10 @@ const rule = (action: Rule['action'], url = 'https://api.example.com/*'): Rule =
 
 describe('approval gate', () => {
   it('loopback targets', () => {
-    for (const t of ['http://localhost:8080', 'http://api.localhost', 'http://127.0.0.1:3000/v2', 'http://127.1.2.3', 'http://[::1]:8080', 'http://[::ffff:127.0.0.1]']) {
+    for (const t of ['http://localhost:8080', 'http://api.localhost', 'http://127.0.0.1:3000/v2', 'http://127.1.2.3', 'http://[::1]:8080', 'http://[::ffff:127.0.0.1]', 'http://0.0.0.0', 'http://[::]']) {
       expect(isLoopbackTarget(t), t).toBe(true);
     }
-    for (const t of ['https://staging.example.com', 'http://10.0.2.2:8080', 'http://0.0.0.0', 'http://localhost.evil.com', 'not a url', 'http://127.0.0.1.nip.io']) {
+    for (const t of ['https://staging.example.com', 'http://10.0.2.2:8080', 'http://localhost.evil.com', 'not a url', 'http://127.0.0.1.nip.io']) {
       expect(isLoopbackTarget(t), t).toBe(false);
     }
   });

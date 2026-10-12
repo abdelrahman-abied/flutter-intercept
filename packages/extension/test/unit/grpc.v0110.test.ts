@@ -44,7 +44,7 @@ describe('grpcProxyCodec (CONTRACTS §17.3)', () => {
 
   it('the host applies it to the proxy, after restarts and on refreshGrpcMocks', async () => {
     const made: { codecs: unknown[] }[] = [];
-    const host = new InterceptProxyHost({
+    const host = new InterceptProxyHost(withFakeProxy({
       getPort: () => 9100,
       canRestart: () => true,
       factory: (opts: InterceptProxyOptions) => {
@@ -64,7 +64,7 @@ describe('grpcProxyCodec (CONTRACTS §17.3)', () => {
           setGrpcCodec: (c?: GrpcProxyCodec) => void f.codecs.push(c),
         };
       },
-    });
+    }));
     const codec = grpcProxyCodec(fakeGrpc());
     host.setGrpcCodec(codec);
     await host.start();
@@ -336,6 +336,7 @@ describe('recordings with gRPC (CONTRACTS §17.4)', () => {
 // ------------------------------------------------------------------ REVIEW-11 fixes
 import { clearHeldMessageCache, decodeHeldMessage, MAX_VIEW_DECODE_BYTES } from '../../src/grpc/service';
 import { MAX_PROTO_FILES } from '../../src/grpc/discovery';
+import { withFakeProxy } from './proxy.fakes';
 
 describe('REVIEW-11', () => {
   it('#2: redacted recordings keep no requestHash (save, redacted export); unredacted ones do', async () => {

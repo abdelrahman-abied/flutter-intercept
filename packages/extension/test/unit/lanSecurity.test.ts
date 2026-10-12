@@ -6,8 +6,9 @@ import { prepareLan } from '../../src/debug/lanPrepare';
 import { kindFromId } from '../../src/iosDevices';
 import { lanAddressForIphone } from '../../src/lanAddress';
 import { LanNetworkWatcher, netFingerprint, networkChange, parseArpMac, parseGateway, type NetFingerprint } from '../../src/lanWatch';
-import { InterceptProxyHost, type ProxyLike } from '../../src/proxyHost';
+import { InterceptProxyHost } from '../../src/proxyHost';
 import { InterceptController } from '../../src/ui/controller';
+import { withFakeProxy } from './proxy.fakes';
 
 const PHONE = '00008110-000A1B2C3D4E5F60';
 const routeOut = (iface: string, gw = '192.168.1.1') =>
@@ -130,7 +131,7 @@ describe('network change detection (review 2 #5)', () => {
 
   it('extension wiring contract: change → closeLan({forgetToken}) → new token even with a live session, no "rotated" warning', async () => {
     let lanOpen: { host: string; port: number } | undefined;
-    const factory = (o: { port: number }): ProxyLike => ({
+    const factory = (o: { port: number }) => ({
       start: async () => undefined,
       stop: async () => undefined,
       get port() {
@@ -142,11 +143,11 @@ describe('network change detection (review 2 #5)', () => {
       resume: () => undefined,
       abort: () => undefined,
       on: () => undefined,
-      openLan: async ({ host }) => (lanOpen = { host, port: o.port }),
+      openLan: async ({ host }: { host: string }) => (lanOpen = { host, port: o.port }),
       closeLan: async () => void (lanOpen = undefined),
     });
     const rotated = vi.fn();
-    const h = new InterceptProxyHost({ getPort: () => 9500, factory, canReopenLan: () => false /* session live */, onLanTokenRotatedWhileLive: rotated });
+    const h = new InterceptProxyHost(withFakeProxy({ getPort: () => 9500, factory, canReopenLan: () => false /* session live */, onLanTokenRotatedWhileLive: rotated }));
     const first = await h.openLan('192.168.1.23');
     await h.closeLan({ forgetToken: true });
     expect(lanOpen).toBeUndefined();
@@ -159,7 +160,7 @@ describe('network change detection (review 2 #5)', () => {
 describe('pinned peer in the status (review 2 #2)', () => {
   function hostWithPeer() {
     let peer: string | undefined;
-    const factory = (o: { port: number }): ProxyLike => ({
+    const factory = (o: { port: number }) => ({
       start: async () => undefined,
       stop: async () => undefined,
       get port() {
@@ -171,14 +172,14 @@ describe('pinned peer in the status (review 2 #2)', () => {
       resume: () => undefined,
       abort: () => undefined,
       on: () => undefined,
-      openLan: async ({ host }) => ({ host, port: o.port }),
+      openLan: async ({ host }: { host: string }) => ({ host, port: o.port }),
       closeLan: async () => undefined,
       get lanPeer() {
         return peer;
       },
     });
     const logs: string[] = [];
-    const h = new InterceptProxyHost({ getPort: () => 9600, factory, log: (m) => logs.push(m) });
+    const h = new InterceptProxyHost(withFakeProxy({ getPort: () => 9600, factory, log: (m) => logs.push(m) }));
     return { h, logs, setPeer: (p: string | undefined) => (peer = p) };
   }
 

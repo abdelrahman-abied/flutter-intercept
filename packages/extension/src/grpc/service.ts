@@ -15,35 +15,16 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Exchange, GrpcProxyCodec } from '@flutter-intercept/proxy';
+import { grpcCodeName as metaGrpcCodeName, GRPC_HOOK_CAP_BYTES } from '@flutter-intercept/proxy/grpc-meta';
 import { discoverGrpcFiles, isGrpcSchemaPath, nodeGrpcFs, type GrpcFs } from './discovery';
 import type { GrpcCodec, GrpcMethod, GrpcSchema, RawField } from './types';
 
-/** Canonical gRPC status code names (index = code). */
-export const GRPC_CODE_NAMES = [
-  'OK',
-  'CANCELLED',
-  'UNKNOWN',
-  'INVALID_ARGUMENT',
-  'DEADLINE_EXCEEDED',
-  'NOT_FOUND',
-  'ALREADY_EXISTS',
-  'PERMISSION_DENIED',
-  'RESOURCE_EXHAUSTED',
-  'FAILED_PRECONDITION',
-  'ABORTED',
-  'OUT_OF_RANGE',
-  'UNIMPLEMENTED',
-  'INTERNAL',
-  'UNAVAILABLE',
-  'DATA_LOSS',
-  'UNAUTHENTICATED',
-] as const;
-export type GrpcCodeName = (typeof GRPC_CODE_NAMES)[number];
+export { GRPC_CODE_NAMES, type GrpcCodeName } from '@flutter-intercept/proxy/grpc-meta';
 
-/** `14` → `UNAVAILABLE`; other numbers → their decimal text. */
+/** `14` → `UNAVAILABLE`; codes outside 0–16 → `CODE 42`; not an integer → undefined. */
 export function grpcCodeName(code: number | undefined): string | undefined {
   if (typeof code !== 'number' || !Number.isInteger(code)) return undefined;
-  return GRPC_CODE_NAMES[code] ?? String(code);
+  return metaGrpcCodeName(code);
 }
 
 /** What the controller, the agent API and the proxy host need of the gRPC schema. */
@@ -519,8 +500,6 @@ export function decodeHeldMessage(e: Pick<Exchange, 'id' | 'url' | 'grpcPause' |
 
 // ------------------------------------------------------------------ CONTRACTS §17.3: the proxy's codec
 
-/** The largest message the proxy's hooks hand to the codec (§17.1). */
-export const MAX_CODEC_BYTES = 4 * 1024 * 1024;
 
 /**
  * `InterceptProxy.setGrpcCodec`: decode / encode by method path and direction with the CURRENT schema (looked up on
@@ -537,7 +516,7 @@ export function grpcProxyCodec(grpc: Pick<GrpcDeps, 'codec' | 'schema' | 'enable
   return {
     decode(path, dir, bytes) {
       try {
-        if (!(bytes instanceof Uint8Array) || bytes.length > MAX_CODEC_BYTES) return undefined;
+        if (!(bytes instanceof Uint8Array) || bytes.length > GRPC_HOOK_CAP_BYTES) return undefined;
         const t = typeOf(path, dir);
         if (!t) return undefined;
         const r = grpc.codec.decodeMessage(t.schema, t.type, bytes);
@@ -550,7 +529,7 @@ export function grpcProxyCodec(grpc: Pick<GrpcDeps, 'codec' | 'schema' | 'enable
       const t = typeOf(path, dir);
       if (!t) throw new Error(`no schema for ${path}`);
       const bytes = grpc.codec.encodeMessage(t.schema, t.type, json);
-      if (bytes.length > MAX_CODEC_BYTES) throw new Error('$: the encoded message is larger than 4 MB');
+      if (bytes.length > GRPC_HOOK_CAP_BYTES) throw new Error('$: the encoded message is larger than 4 MB');
       return bytes;
     },
   };

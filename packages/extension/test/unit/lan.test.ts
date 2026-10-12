@@ -7,7 +7,8 @@ import { HOST_KEY, LAN_KEY, lanProxyAddress, MARKER_KEY, PROXY_DEFINE, rewriteDe
 import { IosDeviceClassifier, kindFromId, parseSimctl } from '../../src/iosDevices';
 import { defaultRouteIPv4, ipv4Of, isPrivateIPv4, parseIpRouteDefault, parseRouteGetDefault } from '../../src/lanAddress';
 import { LanLifecycle } from '../../src/lanLifecycle';
-import { InterceptProxyHost, newLanToken, type ProxyLike } from '../../src/proxyHost';
+import { InterceptProxyHost, newLanToken } from '../../src/proxyHost';
+import { withFakeProxy } from './proxy.fakes';
 
 const PHONE = '00008110-000A1B2C3D4E5F60';
 const OLD_PHONE = '2b6f0cc904d137be2e1730235f5664094b831186';
@@ -118,7 +119,7 @@ describe('LAN address (default-route interface)', () => {
 function fakeProxy(log: string[]) {
   return (o: { port: number }) => {
     let lan: { host: string; port: number } | undefined;
-    const p: ProxyLike = {
+    const p = {
       start: async () => void log.push(`start ${o.port}`),
       stop: async () => void log.push('stop'),
       get port() {
@@ -130,7 +131,7 @@ function fakeProxy(log: string[]) {
       resume: () => undefined,
       abort: () => undefined,
       on: () => undefined,
-      openLan: async ({ host, token }) => {
+      openLan: async ({ host, token }: { host: string; token: string }) => {
         log.push(`openLan ${host} tokenLen=${token.length}`);
         lan = { host, port: o.port };
         return lan;
@@ -159,7 +160,7 @@ describe('InterceptProxyHost LAN mode', () => {
     const log: string[] = [];
     const hostLogs: string[] = [];
     const lanEvents: unknown[] = [];
-    const h = new InterceptProxyHost({ getPort: () => 9301, factory: fakeProxy(log), log: (m) => hostLogs.push(m) });
+    const h = new InterceptProxyHost(withFakeProxy({ getPort: () => 9301, factory: fakeProxy(log), log: (m) => hostLogs.push(m) }));
     h.on('lan', (l: unknown) => lanEvents.push(l));
     const [a, b] = await Promise.all([h.openLan('192.168.1.23'), h.openLan('192.168.1.23')]);
     expect(a.token).toBe(b.token);
@@ -182,7 +183,7 @@ describe('InterceptProxyHost LAN mode', () => {
   it('a changed LAN address reopens only when no iPhone session is live', async () => {
     const log: string[] = [];
     let live = true;
-    const h = new InterceptProxyHost({ getPort: () => 9302, factory: fakeProxy(log), canReopenLan: () => !live });
+    const h = new InterceptProxyHost(withFakeProxy({ getPort: () => 9302, factory: fakeProxy(log), canReopenLan: () => !live }));
     const first = await h.openLan('192.168.1.23');
     expect(await h.openLan('10.0.0.7')).toEqual(first); // live session keeps the old listener
     live = false;
@@ -195,7 +196,7 @@ describe('InterceptProxyHost LAN mode', () => {
   it('keeps the token while an iPhone session launched with it is alive (stale token → 407 on plain http)', async () => {
     let live = false;
     let rotatedWhileLive = 0;
-    const h = new InterceptProxyHost({ getPort: () => 9304, factory: fakeProxy([]), canReopenLan: () => !live, onLanTokenRotatedWhileLive: () => rotatedWhileLive++ });
+    const h = new InterceptProxyHost(withFakeProxy({ getPort: () => 9304, factory: fakeProxy([]), canReopenLan: () => !live, onLanTokenRotatedWhileLive: () => rotatedWhileLive++ }));
     const first = await h.openLan('192.168.1.23');
     live = true; // the app on the iPhone was built with first.token
     await h.closeLan(); // e.g. the listener was closed/recycled while the session runs
@@ -208,15 +209,6 @@ describe('InterceptProxyHost LAN mode', () => {
     expect(fresh.token).not.toBe(first.token);
   });
 
-  it('a proxy build without LAN support rejects clearly', async () => {
-    const factory = (o: { port: number }) => {
-      const p = fakeProxy([])(o) as Partial<ProxyLike>;
-      delete p.openLan;
-      return p as ProxyLike;
-    };
-    const h = new InterceptProxyHost({ getPort: () => 9303, factory });
-    await expect(h.openLan('192.168.1.23')).rejects.toThrow(/does not support LAN mode/);
-  });
 });
 
 describe('LanLifecycle', () => {

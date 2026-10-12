@@ -281,7 +281,8 @@ describe('gRPC helpers', () => {
     expect(normalizeMethodName('shop.v1.CartService.AddItem')).toBe('/shop.v1.CartService/AddItem');
     expect(normalizeMethodName('nope')).toBeUndefined();
     expect(grpcCodeName(14)).toBe('UNAVAILABLE');
-    expect(grpcCodeName(99)).toBe('99');
+    expect(grpcCodeName(99)).toBe('CODE 99');
+    expect(grpcCodeName(1.5)).toBeUndefined();
   });
 
   it('scrubAbsolutePaths replaces POSIX, Windows, UNC and file:// paths (also with spaces) and known folders', () => {

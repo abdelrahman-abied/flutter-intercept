@@ -26,9 +26,9 @@ function shapes(file: string): Map<string, string[]> {
     return names.sort();
   };
   for (const st of src.statements) {
-    const exported = ts.getCombinedModifierFlags(st as ts.Declaration) & ts.ModifierFlags.Export;
-    if (!exported) continue;
-    if (ts.isInterfaceDeclaration(st) || ts.isTypeAliasDeclaration(st)) out.set(st.name.text, members(st));
+    if (!ts.isInterfaceDeclaration(st) && !ts.isTypeAliasDeclaration(st)) continue;
+    if (!(ts.getCombinedModifierFlags(st) & ts.ModifierFlags.Export)) continue;
+    out.set(st.name.text, members(st));
   }
   return out;
 }

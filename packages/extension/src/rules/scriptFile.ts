@@ -9,6 +9,7 @@
  * The editor's "Edit script in a file" creates `.vscode/flutter-intercept/scripts/<name>.js` from `scriptTemplate`.
  */
 import type { Rule } from '@flutter-intercept/proxy';
+import { scriptTemplate as metaScriptTemplate } from '@flutter-intercept/proxy/grpc-meta';
 import { BodyFileError, bodyFileStem, bodyFileSyntaxError, checkWorkspaceFile, decodeWorkspaceFile, RulesFs, WorkspaceFileSpec } from './bodyFile';
 import { cleanText } from './policy';
 
@@ -66,74 +67,9 @@ export function defaultScriptFilePath(rule: Pick<Rule, 'name' | 'match'>): strin
 }
 
 /**
- * Starter content for a new script file: both hooks, `context.log`, adding a request header and editing a JSON
- * response, plus commented gRPC hooks (`onGrpcMessage` / `onGrpcStatus`, CONTRACTS §18.2). `rule` (optional) names the
- * rule in the first comment line.
+ * Starter content for a new script file: grpc-meta's `scriptTemplate` (every hook documented, changing nothing until
+ * edited; gRPC hooks commented out, CONTRACTS §13.4 / §18.2). `rule` (optional) names the rule in the first comment line.
  */
 export function scriptTemplate(rule?: Pick<Rule, 'name'>): string {
-  const name = typeof rule?.name === 'string' ? cleanText(rule.name, 80).replace(/\*\//g, '* /') : '';
-  return `// Flutter Intercept script${name ? ` for the rule "${name}"` : ''}.
-// Runs in the proxy for every request the rule matches. Both hooks are optional and must return synchronously;
-// return undefined to leave things as they are. Plain JavaScript only: no require, fetch, timers or Node APIs.
-// context.log(...) lines show up in the request's details. A hook that throws answers the app with 502.
-
-/**
- * Before the request goes to the server.
- * request: { method, url, headers, body? } — body is text; absent (bodyOmitted: true) when binary or over 1 MB.
- * Return the edited request, { response: { status, headers, body } } to answer locally, or undefined.
- */
-function onRequest(request, context) {
-  request.headers['x-debug'] = 'flutter-intercept';
-  context.log('request', request.method, request.url);
-  return request;
-}
-
-/**
- * With the server's response.
- * response: { status, headers, body? }
- * Return the edited response, or undefined.
- */
-function onResponse(response, request, context) {
-  if (response.body === undefined) return undefined;
-  let json;
-  try {
-    json = JSON.parse(response.body);
-  } catch {
-    return undefined; // not JSON: leave it as it is
-  }
-  if (json && typeof json === 'object' && !Array.isArray(json)) {
-    json.editedBy = 'flutter-intercept';
-  }
-  context.log('edited the JSON response of', request.url, '- status', response.status);
-  return { ...response, body: JSON.stringify(json) };
-}
-
-// gRPC calls (CONTRACTS §18.2) use these two hooks instead (onRequest / onResponse are not called for them).
-// Uncomment to use.
-//
-// /**
-//  * For every message of a matching gRPC call, both directions.
-//  * message: { path, dir ('send' = app → server, 'receive'), index, json?, base64, size } — json is decoded with the
-//  * app's protobuf schema (absent without one, or over 1 MB).
-//  * Return undefined (unchanged), { json } (encoded with the schema), { base64 } or { drop: true }.
-//  */
-// function onGrpcMessage(message, context) {
-//   if (message.dir === 'receive' && message.json) {
-//     context.log('message', message.index, 'of', message.path);
-//     return { json: { ...message.json, editedBy: 'flutter-intercept' } };
-//   }
-//   return undefined;
-// }
-//
-// /**
-//  * Before the call's status and trailers go to the app.
-//  * status: { path, code (0 = OK, 14 = UNAVAILABLE, …), message?, trailers }
-//  * Return undefined, or { code?, message?, trailers? }.
-//  */
-// function onGrpcStatus(status, context) {
-//   if (status.code === 0) return undefined;
-//   context.log('call', status.path, 'ended with', status.code, status.message);
-//   return { code: 0, message: '' }; // pretend it worked
-// }
-`;
+  return metaScriptTemplate(typeof rule?.name === 'string' ? cleanText(rule.name, 80) : undefined);
 }

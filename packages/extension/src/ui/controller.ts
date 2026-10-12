@@ -49,32 +49,33 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import type { Exchange, GrpcEdit, GrpcPause, ReplayEntry, ReplayOptions, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
+import type { Exchange, GrpcEdit, ReplayEntry, ReplayOptions, RequestEdit, ResponseEdit, Rule, SendRequest } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
-import { grpcEditProblem, ruleFromExchange, ruleProblem } from '@flutter-intercept/proxy/rules';
+import { ruleFromExchange } from '@flutter-intercept/proxy/rules';
 import { pathError } from '../agent/paths';
-import { decodeJson, decodeSample, defaultFixtureName, FINAL_STATES, defaultModelName, fixtureApiFor, fixtureSamples, isCheckable, modelSamples, redactExchange, routeOf, testPackageFor } from '../agent/samples';
-import { SNIPPET_FORMATS, toSnippet } from '../codegen/snippets';
-import { toGrpcurl, type GrpcurlOptions } from '../codegen/grpcurl';
-import type { CodegenService, FixtureApi, GeneratedFile } from '../codegen/types';
+import { decodeSample, defaultFixtureName, FINAL_STATES, defaultModelName, fixtureSamples, isCheckable, modelSamples, redactExchange, routeOf, testPackageFor } from '../agent/samples';
+import type { CodegenService, GeneratedFile } from '../codegen/types';
 import type { ContractResult, ContractService } from '../contract/types';
 import type { AuthAnalysis } from '../analysis/types';
-import type { Recording, RecordingMeta, RecordingService } from '../recordings/types';
+import type { Recording, RecordingService } from '../recordings/types';
 import type { SharedRulesService, SharedRulesState } from '../rules/types';
 import type { ToOpenApi, ToPostman } from '../export/types';
-import { scriptFileOf, scriptFileSyntaxError, scriptTemplate } from '../rules/scriptFile';
 import { buildHar, ensureDirInside, EXPORT_DIR, type HarGrpcDecoder } from '../agent/har';
-import { decodeGrpcMessages, decodeHeldMessage, grpcMethodFromGlob, grpcMethodPath, grpcProxyCodec, hexOf, MAX_CODEC_BYTES, type GrpcDeps } from '../grpc/service';
+import { decodeGrpcMessages, type GrpcDeps } from '../grpc/service';
 import { gitIgnoreStatus, type GitignoreFs } from '../recordings/gitignore';
 import { mapRemoteSelfProblem } from '../proxyHost';
-import type { AgentStatus, AuthFlowSummary, ContractSummary, ExportFormat, GrpcDecoded, GrpcStatus, HostMsg, RecordingSummary, SendDraft, SessionWarning, SnippetFormat, Status, ViewMsg } from './protocol';
+import { createViewHandlers, type ViewHandlers } from './handlers';
+import type { AgentStatus, AuthFlowSummary, ContractSummary, ExportFormat, GrpcDecoded, GrpcStatus, HostMsg, SessionWarning, Status, ViewMsg } from './protocol';
 
 export type { GrpcDecoded, GrpcDecodedMessage, GrpcStatus } from './protocol';
-/** The §16.4 answer to `decodeGrpc`. */
-export type GrpcDecodedMsg = Extract<HostMsg, { type: 'grpcDecoded' }>;
-/** Kept for callers: `Status` already carries §16.4 `grpc`. */
-export type ControllerStatus = Status;
-type AnyViewMsg = ViewMsg | { type: 'decodeGrpc'; id: string };
+import { fail, validateNetworkProfile, validateRule, validateRules, expireTokenRule } from './validate';
+import { authFlowSummaries, CONTRACT_OFF, contractSummary, isRecordable, isLiveStream, pendingView, readOnlyReason, recordingSummary, sameRules, sharedRulesStatus, uiExchange, UI_STREAM_UPDATE_MS, fixtureApi } from './views';
+import { decodeGrpcForPanel } from './grpcHost';
+
+// QUALITY-1 Q3: moved to ./validate, ./views and ./grpcHost; re-exported so existing imports keep working.
+export { InvalidMessageError, MAX_MUTATE_OPS, validateRule, MAX_SEQUENCE_STEPS, MAX_REWRITE_HEADERS, MAX_REWRITE_REPLACEMENTS, MAX_REWRITE_REPLACE, MAX_REWRITE_TEXT_TOTAL, MAX_BODY_FILE_PATH, MAX_GRPC_MOCK_MESSAGES, MAX_GRPC_MOCK_BYTES, MAX_GRPC_MESSAGE_TEXT, validateGrpcEdit, checkBodyFile, MAX_SCRIPT_BYTES, checkScriptFile, MAX_BODY_FILE_BYTES, checkMapTarget, grpcRewriteProblem, expireTokenRule, validateRules, validateEdit, sanitizeSendHeaders, validateSendDraft, sanitizeGrpcSendHeaders, validateNetworkProfile } from './validate';
+export { pendingView, isRecordable, recordingSummary, authFlowSummaries, sharedRulesStatus, contractSummary, fixtureApi, UI_MAX_FRAMES, UI_MAX_FRAME_CHARS, UI_STREAM_UPDATE_MS, uiFrameCost, uiExchange, readOnlyReason, tunnelBlockRule, tunnelReason, ruleFromExchangeErrorMessage, snippetFor } from './views';
+export { UI_MAX_GRPC_JSON_CHARS, UI_MAX_PAUSED_JSON_CHARS, resolveGrpcEdit, grpcMockRuleFromExchange, GRPC_WEB_RESEND, grpcResendMessages, resolveSendGrpc } from './grpcHost';
 
 export type Sink = (msg: HostMsg) => void;
 
@@ -146,17 +147,6 @@ export type SharedRulesDeps = Pick<SharedRulesService, 'state' | 'save' | 'appro
   removeShared?(id: string): Promise<void>;
   pendingReasons?(): string[];
 };
-
-/** `Rule "Name" reason…` → {name, reason}; other lines keep the whole text as the reason. At most 50, each capped. */
-export function pendingView(lines: readonly string[] | undefined): { name: string; reason: string }[] {
-  return (lines ?? []).slice(0, 50).flatMap((line) => {
-    if (typeof line !== 'string' || !line.trim()) return [];
-    const m = /^Rule "((?:[^"\\]|\\.)*)"\s+([\s\S]+)$/.exec(line.trim());
-    const name = m ? m[1] : 'Shared rule';
-    const reason = (m ? m[2] : line.trim()).replace(/[\r\n]+/g, ' ');
-    return [{ name: name.slice(0, 200), reason: reason.slice(0, 500) }];
-  });
-}
 
 export interface ControllerDeps {
   host: ControllerHost;
@@ -290,1048 +280,6 @@ async function writeExport(file: string, text: string, opts: { private: boolean 
   if (opts.private) await fs.promises.chmod(file, 0o600); // `mode` only applies to a new file
 }
 
-/** REVIEW-7 #6: an optional rule id on a view message. */
-function checkRuleId(v: unknown, where: string): string | undefined {
-  if (v === undefined) return undefined;
-  if (typeof v !== 'string' || !v || v.length > 200) fail(where, 'ruleId must be a rule id');
-  return v;
-}
-
-/** CONTRACTS §12.4: the exchanges a recording keeps — finished plain HTTP traffic the app made through the proxy. */
-/** CONTRACTS §12.4 / §14.5: finished HTTP, WebSocket and SSE exchanges (not tunnels, native-client or browser traffic). */
-export function isRecordable(e: Exchange): boolean {
-  if (e.kind === 'websocket' && e.status !== 101) return false; // an upgrade that never opened (the store agrees)
-  // CONTRACTS §17.4: a gRPC call that ended with a status (the store agrees)
-  if (e.kind === 'grpc' && (e.grpc?.statusCode === undefined || (e.state !== 'completed' && e.state !== 'mocked'))) return false;
-  return FINAL_STATES.has(e.state) && e.kind !== 'tunnel' && e.captured !== 'vm-profile' && !e.browserInternal;
-}
-
-export function recordingSummary(m: RecordingMeta): RecordingSummary {
-  return {
-    id: m.id,
-    name: m.name,
-    createdAt: m.createdAt,
-    exchanges: m.exchanges,
-    redacted: m.redacted,
-    // CONTRACTS §14.5: WebSocket / SSE exchanges among them and their frames (absent in older recordings)
-    ...(typeof m.streams === 'number' && m.streams > 0 ? { streams: m.streams } : {}),
-    ...(typeof m.frames === 'number' && m.frames > 0 ? { frames: m.frames } : {}),
-    // CONTRACTS §17.4
-    ...(typeof m.grpc === 'number' && m.grpc > 0 ? { grpc: m.grpc } : {}),
-  };
-}
-
-export function authFlowSummaries(a: AuthAnalysis | undefined): AuthFlowSummary[] {
-  return (a?.flows ?? []).map((f) => ({
-    steps: f.steps.map((s) => ({ exchangeId: s.exchangeId, role: s.role })),
-    ...(f.stampede ? { stampede: { refreshCalls: f.stampede.refreshCalls, windowMs: f.stampede.windowMs } } : {}),
-    ...(f.problem ? { problem: f.problem } : {}),
-  }));
-}
-
-/** Status.sharedRules from the service state (omitted when there is neither a file nor anything to say). */
-export function sharedRulesStatus(s: SharedRulesState | undefined): Status['sharedRules'] {
-  if (!s) return undefined;
-  if (!s.file && !s.rules.length && !s.problems.length && !s.pendingApproval.length) return undefined;
-  return { ...(s.file ? { file: s.file } : {}), count: s.rules.length, problems: s.problems.slice(0, 50), pendingApproval: s.pendingApproval.length };
-}
-
-/** Deep JSON equality, object key order ignored (`used` is display-only and ignored). */
-function sameRules(a: Rule[], b: Rule[]): boolean {
-  const norm = (r: Rule) => {
-    const { used: _u, ...rest } = r;
-    return rest;
-  };
-  return a.length === b.length && a.every((r, i) => deepEqual(norm(r), norm(b[i])));
-}
-
-function deepEqual(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
-  if (Array.isArray(a) !== Array.isArray(b)) return false;
-  if (Array.isArray(a)) return a.length === (b as unknown[]).length && a.every((x, i) => deepEqual(x, (b as unknown[])[i]));
-  const ka = Object.keys(a).filter((k) => (a as Record<string, unknown>)[k] !== undefined);
-  const kb = Object.keys(b).filter((k) => (b as Record<string, unknown>)[k] !== undefined);
-  return ka.length === kb.length && ka.every((k) => deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
-}
-
-/** CONTRACTS §10.5: the panel's view of a contract result (no file paths). */
-export function contractSummary(r: ContractResult): ContractSummary {
-  return {
-    id: r.exchangeId,
-    checked: r.checked,
-    ...(r.model ? { model: r.model } : {}),
-    via: r.via,
-    violations: r.violations.map((v) => ({ path: v.path, field: v.field, expected: v.expected, actual: v.actual, severity: v.severity, message: v.message })),
-    ...(r.reason ? { reason: r.reason } : {}),
-  };
-}
-
-const CONTRACT_OFF = 'Contract check is off (setting flutterIntercept.contractCheck).';
-
-/**
- * CONTRACTS §10.4: the Retrofit/Chopper interface a mocktail fixture test mocks, from the contract service's
- * endpoint index. Undefined (the generator then falls back to MockClient) without a service or a match.
- */
-export async function fixtureApi(
-  contract: ContractService | undefined,
-  exchanges: Exchange[],
-  root: string | undefined,
-  packageName: string | undefined,
-  log?: (msg: string) => void,
-): Promise<FixtureApi | undefined> {
-  if (!contract) return undefined;
-  try {
-    const [endpoints, models] = await Promise.all([contract.endpoints(), contract.models()]);
-    return fixtureApiFor(endpoints, exchanges, models, { root, packageName });
-  } catch (e) {
-    log?.(`fixture API lookup failed: ${e instanceof Error ? e.message : String(e)}`);
-    return undefined;
-  }
-}
-
-/** Kinds `createRuleFromExchange` can build (throttle/fault rules come from the rule editor); grpcMock: CONTRACTS §16.4. */
-const RULE_KINDS = new Set<RuleAction['kind']>(['mock', 'block', 'breakpoint', 'grpcMock']);
-/** CONTRACTS §16.4: JSON text of one decoded message shown in the panel (longer is cut, `truncated`). */
-export const UI_MAX_GRPC_JSON_CHARS = 256 * 1024;
-/** CONTRACTS §17.6: a held message is shown in full, within reason (a 4 MB message as pretty JSON). */
-export const UI_MAX_PAUSED_JSON_CHARS = 16 * 1024 * 1024;
-const FAULTS = new Set(['reset', 'timeout', 'truncate', 'dns']);
-const PRESET_IDS = new Set(['slow-3g', 'fast-3g', 'flaky']);
-
-/** CONTRACTS §11: what the panel gets of a WebSocket / SSE exchange's frames (the newest; the rest is counted). */
-export const UI_MAX_FRAMES = 200;
-export const UI_MAX_FRAME_CHARS = 2_000_000;
-/** REVIEW-5 #4: an open WebSocket / SSE exchange updates the panel at most every this many ms (≤ 2×/s). */
-export const UI_STREAM_UPDATE_MS = 500;
-
-type Frame = NonNullable<Exchange['frames']>[number];
-
-/** A frame's weight, as the proxy counts it (packages/proxy/src/frames.ts `frameCost`, not exported). */
-export function uiFrameCost(f: Frame): number {
-  return (f.text?.length ?? 0) + (f.base64?.length ?? 0) + (f.event?.length ?? 0) + (f.id?.length ?? 0) + 32;
-}
-
-/** A WebSocket / SSE exchange that is still open (its frames keep changing). */
-function isLiveStream(e: Exchange): boolean {
-  return !!e.kind && e.state === 'pending';
-}
-
-/**
- * The exchange as sent to the webview: at most UI_MAX_FRAMES newest frames and UI_MAX_FRAME_CHARS of frame
- * payload (text, base64, SSE event name and id: `uiFrameCost`), the older ones added to `framesDropped`. Other exchanges are returned as is.
- */
-export function uiExchange(e: Exchange): Exchange {
-  const frames = e.frames;
-  if (!frames || !frames.length) return e;
-  let keep = 0;
-  let chars = 0;
-  for (let i = frames.length - 1; i >= 0 && keep < UI_MAX_FRAMES; i--) {
-    const n = uiFrameCost(frames[i]);
-    if (keep > 0 && chars + n > UI_MAX_FRAME_CHARS) break;
-    chars += n;
-    keep++;
-  }
-  if (keep === frames.length) return e;
-  return { ...e, frames: frames.slice(frames.length - keep), framesDropped: (e.framesDropped ?? 0) + (frames.length - keep) };
-}
-
-/** CONTRACTS §11.4: why a rule / resend can't be based on this exchange, or undefined. */
-export function readOnlyReason(e: Exchange): string | undefined {
-  if (e.captured === 'vm-profile') {
-    return "this request was made by a native HTTP client (read from the app's HTTP profile); it never went through the proxy, so rules can't change it and it can't be resent from here";
-  }
-  return undefined;
-}
-
-/**
- * CONTRACTS §14.2: a block rule for a passed-through TLS connection: every connection to that origin (any method, so
- * it also covers the CONNECT), 403.
- */
-export function tunnelBlockRule(e: Exchange, id: string): Rule {
-  // The authority exactly as the proxy recorded it (`https://host:port`), so the rule matches the tunnel's own URL
-  // whether or not the proxy spells out the default port; no method, so it also covers the CONNECT.
-  const m = /^(https?:\/\/[^/?#\s*]+)/i.exec(e.url ?? '');
-  let ok = false;
-  try {
-    ok = !!m && !!new URL(m[1]).hostname;
-  } catch {
-    ok = false;
-  }
-  if (!m || !ok) throw new Error("Can't create a rule from this connection: its address is not a URL.");
-  const authority = m[1];
-  return { id, enabled: true, name: `block ${authority.replace(/^https?:\/\//i, '')} (TLS passthrough)`, match: { url: `${authority}/*` }, action: { kind: 'block', mode: 'status', status: 403 } };
-}
-
-/** CONTRACTS §14.2: why a tunnel's contents are not shown (agents' `get_request`, the panel). */
-export function tunnelReason(e: Exchange): string | undefined {
-  if (e.kind !== 'tunnel') return undefined;
-  let host = '';
-  try {
-    host = new URL(e.url).hostname;
-  } catch {
-    // keep generic
-  }
-  // CONTRACTS §16.5: a gRPC connection over TLS with the app's default credentials.
-  if (e.grpcTunnel) {
-    return `gRPC over TLS${host ? ` to ${host}` : ''}, not decrypted: the app trusts only its own certificate roots, so only the bytes each way and the timing are known. Add the host to flutterIntercept.grpc.decryptHosts if the app trusts the Flutter Intercept CA in debug (pinned to it, or onBadCertificate). Only block rules (and faults) apply to it.`;
-  }
-  return `the TLS connection${host ? ` to ${host}` : ''} was passed through without decryption because the host matches flutterIntercept.tlsPassthrough (for apps that pin certificates); only the bytes each way and the timing are known, no request, headers or bodies. Only block rules (and faults) apply to it.`;
-}
-
-// ---------------------------------------------------------------------------------------------
-// Host-side validation of everything the webview sends (review #7). The webview is ours, but
-// the host must never persist or apply a malformed rule (a rule without `match` must not become
-// match-all) nor forward an edit the proxy would turn into a broken response for the app.
-// ---------------------------------------------------------------------------------------------
-
-export class InvalidMessageError extends Error {}
-
-const MAX_RULES = 1000;
-const MAX_TEXT = 64 * 1024 * 1024; // bodies (well above the proxy's 5 MB body cap)
-const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/; // RFC 9110 token (header names, methods)
-
-function isObj(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
-
-function fail(where: string, what: string): never {
-  throw new InvalidMessageError(`${where}: ${what}`);
-}
-
-function onlyKeys(o: Record<string, unknown>, allowed: string[], where: string): void {
-  for (const k of Object.keys(o)) if (!allowed.includes(k)) fail(where, `unknown field "${k}"`);
-}
-
-function checkStatus(v: unknown, where: string): number {
-  if (typeof v !== 'number' || !Number.isInteger(v) || v < 100 || v > 599) fail(where, 'status must be an integer 100–599');
-  return v;
-}
-
-function checkHeaderValue(v: unknown, where: string): void {
-  if (typeof v !== 'string') fail(where, 'header values must be strings');
-  if (/[\r\n\0]/.test(v)) fail(where, 'header values must not contain CR, LF or NUL');
-}
-
-/** `Record<string, string>` (mock headers) or, with `multi`, `Record<string, string | string[]>` (edits). */
-function checkHeaders(v: unknown, where: string, multi: boolean): void {
-  if (!isObj(v)) fail(where, 'headers must be an object');
-  for (const [name, value] of Object.entries(v)) {
-    if (!TOKEN.test(name)) fail(where, `invalid header name "${name}"`);
-    if (multi && Array.isArray(value)) value.forEach((x) => checkHeaderValue(x, `${where} "${name}"`));
-    else checkHeaderValue(value, `${where} "${name}"`);
-  }
-}
-
-function isInt(v: unknown, min: number, max: number): v is number {
-  return typeof v === 'number' && Number.isInteger(v) && v >= min && v <= max;
-}
-
-function isNum(v: unknown, min: number, max: number): v is number {
-  return typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
-}
-
-/** latencyMs 0–600000 (integer), kbps / uploadKbps (CONTRACTS §14.4) 1–10 000 000, dropRate 0–1; each optional. */
-function checkThrottle(a: Record<string, unknown>, where: string): void {
-  if (a.latencyMs !== undefined && !isInt(a.latencyMs, 0, 600_000)) fail(where, 'latencyMs must be an integer 0–600000');
-  if (a.kbps !== undefined && !isNum(a.kbps, 1, 10_000_000)) fail(where, 'kbps must be a number 1–10000000');
-  if (a.uploadKbps !== undefined && !isNum(a.uploadKbps, 1, 10_000_000)) fail(where, 'uploadKbps must be a number 1–10000000');
-  if (a.dropRate !== undefined && !isNum(a.dropRate, 0, 1)) fail(where, 'dropRate must be a number 0–1');
-}
-
-function checkUrl(v: unknown, where: string): string {
-  if (typeof v !== 'string') fail(where, 'url must be a string');
-  let u: URL;
-  try {
-    u = new URL(v);
-  } catch {
-    fail(where, `url must be absolute: ${v}`);
-  }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') fail(where, 'url must be http(s)');
-  return v;
-}
-
-function checkBody(v: unknown, where: string): void {
-  if (typeof v !== 'string') fail(where, 'body must be a string');
-  if (v.length > MAX_TEXT) fail(where, 'body is too large');
-}
-
-export const MAX_MUTATE_OPS = 20;
-const MAX_MUTATE_VALUE_CHARS = 1024 * 1024;
-const MUTATE_OPS = new Set(['null', 'delete', 'set']);
-
-/**
- * CONTRACTS §10.2: 1–20 ops; path valid (jsonpath.ts), op null|delete|set; `set` needs `value` (a JSON value) or
- * `valueJson` (JSON text, byte-exact, wins over `value`), each ≤ 1 MB.
- */
-function checkMutateOps(ops: unknown, where: string): void {
-  if (!Array.isArray(ops) || ops.length < 1 || ops.length > MAX_MUTATE_OPS) fail(where, `ops must be a list of 1–${MAX_MUTATE_OPS} changes`);
-  ops.forEach((op, i) => {
-    const ow = `${where}.ops[${i}]`;
-    if (!isObj(op)) fail(ow, 'must be an object');
-    onlyKeys(op, ['path', 'op', 'value', 'valueJson'], ow);
-    const bad = pathError(op.path);
-    if (bad) fail(ow, bad);
-    if (typeof op.op !== 'string' || !MUTATE_OPS.has(op.op)) fail(ow, 'op must be "null", "delete" or "set"');
-    if (op.op !== 'set') {
-      if (op.value !== undefined || op.valueJson !== undefined) fail(ow, `value / valueJson are only used with op "set"`);
-      return;
-    }
-    if (op.valueJson !== undefined) {
-      if (typeof op.valueJson !== 'string') fail(ow, 'valueJson must be a string of JSON text');
-      if (op.valueJson.length > MAX_MUTATE_VALUE_CHARS) fail(ow, 'valueJson must be at most 1 MB');
-      try {
-        JSON.parse(op.valueJson);
-      } catch {
-        fail(ow, 'valueJson must be valid JSON text (e.g. "1.0", "12345678901234567890", "\\"text\\"")');
-      }
-    }
-    if (op.value === undefined) {
-      if (op.valueJson === undefined) fail(ow, 'op "set" needs a value (or valueJson)');
-      return;
-    }
-    let text: string | undefined;
-    try {
-      text = JSON.stringify(op.value);
-    } catch {
-      text = undefined;
-    }
-    if (typeof text !== 'string' || !isJsonValue(op.value)) fail(ow, 'value must be a JSON value (string, number, boolean, null, array or object)');
-    if (text.length > MAX_MUTATE_VALUE_CHARS) fail(ow, 'value must be at most 1 MB as JSON');
-  });
-}
-
-/** Plain JSON only: no functions, symbols, bigints, NaN/Infinity, class instances or cycles (depth ≤ 200). */
-function isJsonValue(v: unknown, depth = 0): boolean {
-  if (depth > 200) return false;
-  if (v === null || typeof v === 'string' || typeof v === 'boolean') return true;
-  if (typeof v === 'number') return Number.isFinite(v);
-  if (Array.isArray(v)) return v.every((x) => isJsonValue(x, depth + 1));
-  if (typeof v === 'object') {
-    const proto = Object.getPrototypeOf(v);
-    if (proto !== Object.prototype && proto !== null) return false;
-    return Object.values(v as Record<string, unknown>).every((x) => isJsonValue(x, depth + 1));
-  }
-  return false;
-}
-
-export function validateRule(raw: unknown, where = 'rule'): Rule {
-  if (!isObj(raw)) fail(where, 'must be an object');
-  // `used` is display-only (CONTRACTS §9.2 rule-hit): accepted so the webview can round-trip rules, then dropped.
-  onlyKeys(raw, ['id', 'enabled', 'name', 'match', 'action', 'times', 'expiresAt', 'used', 'shared'], where);
-  if (typeof raw.id !== 'string' || !raw.id.trim() || raw.id.length > 200) fail(where, 'id must be a non-empty string');
-  if (typeof raw.enabled !== 'boolean') fail(where, 'enabled must be a boolean');
-  if (raw.name !== undefined && (typeof raw.name !== 'string' || raw.name.length > 500)) fail(where, 'name must be a string');
-  if (raw.times !== undefined && !isInt(raw.times, 1, 1000)) fail(where, 'times must be an integer 1–1000');
-  if (raw.expiresAt !== undefined && (typeof raw.expiresAt !== 'number' || !Number.isFinite(raw.expiresAt) || raw.expiresAt <= 0)) {
-    fail(where, 'expiresAt must be a time in epoch milliseconds');
-  }
-  // CONTRACTS §12.1: set by the shared-rules service (rules from .vscode/flutter-intercept.json).
-  if (raw.shared !== undefined && raw.shared !== true) fail(where, 'shared must be true or absent');
-  const m = raw.match;
-  if (!isObj(m)) fail(where, 'match is required (a rule without match would match everything)');
-  onlyKeys(m, ['url', 'method', 'graphqlOperation'], `${where}.match`);
-  if (typeof m.url !== 'string' || !m.url.trim() || m.url.length > 8192) fail(`${where}.match`, 'url must be a non-empty string (use "*" to match everything)');
-  if (m.method !== undefined && (typeof m.method !== 'string' || (m.method !== '' && m.method !== '*' && !TOKEN.test(m.method)))) {
-    fail(`${where}.match`, 'method must be an HTTP method name');
-  }
-  if (m.graphqlOperation !== undefined && (typeof m.graphqlOperation !== 'string' || m.graphqlOperation.length > 200 || !GRAPHQL_NAME.test(m.graphqlOperation))) {
-    fail(`${where}.match`, 'graphqlOperation must be a GraphQL operation name (letters, digits, _; not starting with a digit; at most 200)');
-  }
-  const action = validateAction(raw.action, `${where}.action`, false);
-  const out: Record<string, unknown> = { ...raw, action };
-  delete out.used;
-  // CONTRACTS §11.1 / REVIEW-5 #16: refuse rules the proxy can never apply (e.g. a mock or a truncate fault on a
-  // ws:// URL, a GraphQL operation on a WebSocket upgrade, a script on a WebSocket). CONTRACTS §13.4: a script whose
-  // `file` supplies the code is checked as if it had code (the host reads the file before the proxy gets it).
-  const probe =
-    action.kind === 'script' && action.file !== undefined && !action.code.trim() ? { ...out, action: { ...action, code: '/* read from file */' } } : out;
-  const problem = ruleProblem(probe as unknown as Rule) ?? grpcRewriteProblem(out as unknown as Rule);
-  if (problem) fail(where, problem);
-  return out as unknown as Rule;
-}
-
-/** CONTRACTS §12.3: sequence limits. */
-export const MAX_SEQUENCE_STEPS = 50;
-/** CONTRACTS §12.6: rewrite limits. */
-export const MAX_REWRITE_HEADERS = 50;
-export const MAX_REWRITE_REPLACEMENTS = 20;
-const MAX_REWRITE_FIND = 10 * 1024;
-/** REVIEW-6 #3: each replacement text, and all find + replace texts of one rule together (the proxy also caps the output). */
-export const MAX_REWRITE_REPLACE = 64 * 1024;
-export const MAX_REWRITE_TEXT_TOTAL = 256 * 1024;
-/** CONTRACTS §12.2: `mock.bodyFile` length. */
-export const MAX_BODY_FILE_PATH = 300;
-const SEQUENCE_THEN = new Set(['last', 'passthrough', 'loop']);
-/** Headers a rewrite may not set on the request: framing and hop-by-hop ones the proxy owns, and the proxy's credential. */
-const REWRITE_REQUEST_FORBIDDEN = new Set(['host', 'content-length', 'transfer-encoding', 'connection', 'keep-alive', 'proxy-connection', 'proxy-authorization', 'te', 'trailer', 'upgrade', 'x-fi-id']);
-const REWRITE_RESPONSE_FORBIDDEN = new Set(['content-length', 'transfer-encoding', 'connection', 'keep-alive', 'trailer', 'upgrade']);
-
-/**
- * One rule action. Inside a sequence step (`inStep`), `{kind:'passthrough'}` is allowed and `breakpoint` /
- * `sequence` are not (CONTRACTS §12.3). Returns a copy (mock `body` defaults to "" when `bodyFile` is given).
- */
-function validateAction(a: unknown, aw: string, inStep: boolean): RuleAction {
-  if (!isObj(a)) fail(aw.replace(/\.action$/, ''), 'action is required');
-  switch (a.kind) {
-    case 'mock': {
-      onlyKeys(a, ['kind', 'status', 'headers', 'body', 'delayMs', 'bodyFile'], aw);
-      checkStatus(a.status, aw);
-      if (a.headers !== undefined) checkHeaders(a.headers, aw, false);
-      if (a.bodyFile !== undefined) checkBodyFile(a.bodyFile, aw);
-      if (a.body !== undefined || a.bodyFile === undefined) checkBody(a.body, aw);
-      if (a.delayMs !== undefined && (typeof a.delayMs !== 'number' || !Number.isInteger(a.delayMs) || a.delayMs < 0 || a.delayMs > 600_000)) {
-        fail(aw, 'delayMs must be an integer 0–600000');
-      }
-      return { ...a, body: (a.body as string | undefined) ?? '' } as RuleAction;
-    }
-    case 'block':
-      onlyKeys(a, ['kind', 'mode', 'status'], aw);
-      if (a.mode !== 'reset' && a.mode !== 'status') fail(aw, 'mode must be "reset" or "status"');
-      if (a.status !== undefined) checkStatus(a.status, aw);
-      break;
-    case 'breakpoint':
-      if (inStep) fail(aw, 'a sequence step cannot be a breakpoint');
-      onlyKeys(a, ['kind', 'phase'], aw);
-      if (a.phase !== 'request' && a.phase !== 'response' && a.phase !== 'both') fail(aw, 'phase must be "request", "response" or "both"');
-      break;
-    case 'throttle':
-      onlyKeys(a, ['kind', 'latencyMs', 'kbps', 'uploadKbps', 'dropRate'], aw);
-      checkThrottle(a, aw);
-      break;
-    case 'fault':
-      onlyKeys(a, ['kind', 'fault'], aw);
-      if (typeof a.fault !== 'string' || !FAULTS.has(a.fault)) fail(aw, 'fault must be "reset", "timeout", "truncate" or "dns"');
-      break;
-    case 'mutate':
-      onlyKeys(a, ['kind', 'ops'], aw);
-      checkMutateOps(a.ops, aw);
-      break;
-    case 'cors':
-      onlyKeys(a, ['kind', 'allowOrigin', 'allowCredentials'], aw);
-      if (typeof a.allowOrigin === 'string' && a.allowOrigin.trim().toLowerCase() === 'null') {
-        fail(aw, 'allowOrigin "null" is refused: sandboxed frames and file pages send it, so it would let any of them read the responses');
-      }
-      if (a.allowOrigin !== undefined && !isAllowOrigin(a.allowOrigin)) {
-        fail(aw, 'allowOrigin must be "*" or one origin such as "http://localhost:5000" (at most 500 characters, no spaces or commas)');
-      }
-      if (a.allowCredentials !== undefined && typeof a.allowCredentials !== 'boolean') fail(aw, 'allowCredentials must be a boolean');
-      if (a.allowOrigin === '*' && a.allowCredentials === true) {
-        fail(aw, 'allowOrigin "*" cannot be combined with allowCredentials: browsers reject credentials with a wildcard origin (omit allowOrigin to echo the request\'s Origin)');
-      }
-      break;
-    case 'passthrough':
-      if (!inStep) fail(aw, '"passthrough" is only a sequence step (a rule that changes nothing)');
-      onlyKeys(a, ['kind'], aw);
-      break;
-    case 'sequence': {
-      if (inStep) fail(aw, 'a sequence step cannot be another sequence');
-      onlyKeys(a, ['kind', 'steps', 'then'], aw);
-      if (!Array.isArray(a.steps) || a.steps.length < 1 || a.steps.length > MAX_SEQUENCE_STEPS) fail(aw, `steps must be a list of 1–${MAX_SEQUENCE_STEPS} steps`);
-      if (a.then !== undefined && (typeof a.then !== 'string' || !SEQUENCE_THEN.has(a.then))) fail(aw, 'then must be "last", "passthrough" or "loop"');
-      const steps = a.steps.map((step, i) => {
-        const sw = `${aw}.steps[${i}]`;
-        if (!isObj(step)) fail(sw, 'must be an object {action, count?}');
-        onlyKeys(step, ['action', 'count'], sw);
-        if (step.count !== undefined && !isInt(step.count, 1, 1000)) fail(sw, 'count must be an integer 1–1000');
-        return { ...step, action: validateAction(step.action, `${sw}.action`, true) };
-      });
-      return { ...a, steps } as unknown as RuleAction;
-    }
-    case 'mapRemote': {
-      onlyKeys(a, ['kind', 'to', 'preserveHost'], aw);
-      checkMapTarget(a.to, aw);
-      if (a.preserveHost !== undefined && typeof a.preserveHost !== 'boolean') fail(aw, 'preserveHost must be a boolean');
-      break;
-    }
-    case 'rewrite': {
-      onlyKeys(a, ['kind', 'request', 'response'], aw);
-      if (a.request === undefined && a.response === undefined) fail(aw, 'a rewrite needs request and/or response changes');
-      let text = 0;
-      if (a.request !== undefined) text += checkRewriteSpec(a.request, `${aw}.request`, 'request');
-      if (a.response !== undefined) text += checkRewriteSpec(a.response, `${aw}.response`, 'response');
-      if (text > MAX_REWRITE_TEXT_TOTAL) fail(aw, 'the find and replace texts of one rewrite must total at most 256 KB');
-      break;
-    }
-    case 'grpcMock':
-      checkGrpcMock(a, aw);
-      return { ...a } as unknown as RuleAction;
-    case 'script': {
-      // CONTRACTS §13.4: never inside a sequence; `code` may be empty when `file` supplies it (read by the host).
-      if (inStep) fail(aw, 'a sequence step cannot be a script');
-      onlyKeys(a, ['kind', 'code', 'file'], aw);
-      if (a.file !== undefined) checkScriptFile(a.file, aw);
-      if (a.code !== undefined && typeof a.code !== 'string') fail(aw, 'code must be a string (the JavaScript source)');
-      if (a.code === undefined && a.file === undefined) fail(aw, 'a script needs code or a file');
-      if (a.file === undefined && typeof a.code === 'string' && !a.code.trim()) fail(aw, 'a script needs code (define onRequest and / or onResponse) or a file');
-      if (typeof a.code === 'string' && Buffer.byteLength(a.code, 'utf8') > MAX_SCRIPT_BYTES) fail(aw, 'code must be at most 256 KB');
-      return { ...a, code: (a.code as string | undefined) ?? '' } as RuleAction;
-    }
-    default:
-      fail(aw, `unknown kind ${JSON.stringify(a.kind)}`);
-  }
-  return { ...a } as unknown as RuleAction;
-}
-
-/** CONTRACTS §16.2: grpcMock limits. */
-export const MAX_GRPC_MOCK_MESSAGES = 1000;
-export const MAX_GRPC_MOCK_BYTES = 4 * 1024 * 1024;
-export const MAX_GRPC_MESSAGE_TEXT = 4096;
-/** Headers / trailers a grpcMock may not set: the proxy owns them (and HTTP/2 forbids the connection-specific ones). */
-const GRPC_MOCK_FORBIDDEN = new Set(['content-type', 'grpc-status', 'grpc-message', 'content-length', 'transfer-encoding', 'connection', 'keep-alive', 'proxy-connection', 'upgrade', 'te', 'trailer', 'host']);
-const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-
-/**
- * CONTRACTS §16.2 / §16.8: `grpcMock` — code an integer 0–16, message ≤ 4 KB, `messages` (base64 protobuf
- * payloads) or `messagesJson` (JSON values the host encodes with the app's schema), not both, ≤ 1000 and ≤ 4 MB together;
- * headers / trailers without pseudo headers, content-type, grpc-status / grpc-message or connection headers; delayMs /
- * gapMs 0–600000.
- */
-function checkGrpcMock(a: Record<string, unknown>, aw: string): void {
-  onlyKeys(a, ['kind', 'code', 'message', 'messages', 'messagesJson', 'headers', 'trailers', 'delayMs', 'gapMs'], aw);
-  if (a.code !== undefined && !isInt(a.code, 0, 16)) fail(aw, 'code must be a gRPC status code (an integer 0–16, e.g. 14 = UNAVAILABLE)');
-  if (a.message !== undefined && (typeof a.message !== 'string' || a.message.length > MAX_GRPC_MESSAGE_TEXT)) fail(aw, `message must be text of at most ${MAX_GRPC_MESSAGE_TEXT} characters`);
-  if (a.messages !== undefined && a.messagesJson !== undefined) fail(aw, 'pass messages (base64) or messagesJson (JSON), not both');
-  let bytes = 0;
-  if (a.messages !== undefined) {
-    if (!Array.isArray(a.messages) || a.messages.length > MAX_GRPC_MOCK_MESSAGES) fail(aw, `messages must be a list of at most ${MAX_GRPC_MOCK_MESSAGES} base64 protobuf payloads`);
-    a.messages.forEach((m, i) => {
-      if (typeof m !== 'string' || !BASE64.test(m)) fail(aw, `messages[${i}] must be base64 (a serialized protobuf message)`);
-      bytes += m.length;
-    });
-  }
-  if (a.messagesJson !== undefined) {
-    if (!Array.isArray(a.messagesJson) || a.messagesJson.length > MAX_GRPC_MOCK_MESSAGES) fail(aw, `messagesJson must be a list of at most ${MAX_GRPC_MOCK_MESSAGES} JSON messages`);
-    a.messagesJson.forEach((m, i) => {
-      if (!isJsonValue(m)) fail(aw, `messagesJson[${i}] must be a JSON value`);
-      bytes += JSON.stringify(m).length;
-    });
-  }
-  if (bytes > MAX_GRPC_MOCK_BYTES) fail(aw, 'the messages must total at most 4 MB');
-  for (const side of ['headers', 'trailers'] as const) {
-    if (a[side] === undefined) continue;
-    checkHeaders(a[side], `${aw}.${side}`, false);
-    for (const name of Object.keys(a[side] as object)) {
-      const n = name.toLowerCase();
-      if (n.startsWith(':') || GRPC_MOCK_FORBIDDEN.has(n)) fail(`${aw}.${side}`, `"${name}" can't be set by a gRPC mock (the proxy sets it; use code / message for the status)`);
-    }
-  }
-  for (const k of ['delayMs', 'gapMs'] as const) if (a[k] !== undefined && !isInt(a[k], 0, 600_000)) fail(aw, `${k} must be an integer 0–600000`);
-}
-
-/** CONTRACTS §17.2 / §17.7: the largest replacement message (decoded bytes) and its base64 length. */
-const MAX_GRPC_EDIT_B64 = 4 * Math.ceil(MAX_CODEC_BYTES / 3);
-
-/**
- * CONTRACTS §17.2: a `resume` edit for a paused gRPC call. A message pause takes exactly one of `message` (base64, ≤ 4 MB),
- * `messageJson` (a JSON value, ≤ 4 MB as text; the host encodes it) or `drop: true`; a status pause takes `status`
- * ({code 0–16, message ≤ 4 KB}) and optional custom `trailers` (no pseudo, content-type, grpc-status / grpc-message or
- * connection headers). Empty / undefined = resume unchanged. Throws InvalidMessageError.
- */
-export function validateGrpcEdit(raw: unknown, pause: GrpcPause | undefined): GrpcEdit | undefined {
-  const edit = checkGrpcEdit(raw, pause);
-  // The proxy's own rules (packages/proxy rules.ts), so host and proxy never disagree; messageJson is resolved later.
-  if (edit && pause && edit.messageJson === undefined) {
-    const problem = grpcEditProblem(pause.kind, edit);
-    if (problem) fail('edit', problem);
-  }
-  return edit;
-}
-
-function checkGrpcEdit(raw: unknown, pause: GrpcPause | undefined): GrpcEdit | undefined {
-  const where = 'edit';
-  if (raw === undefined || raw === null) return undefined;
-  if (!isObj(raw)) fail(where, 'must be an object');
-  onlyKeys(raw, ['message', 'messageJson', 'drop', 'status', 'trailers'], where);
-  if (!Object.keys(raw).length) return undefined;
-  if (!pause) fail(where, 'the call is not held at a gRPC breakpoint');
-  if (pause.kind === 'message') {
-    if (raw.status !== undefined || raw.trailers !== undefined) fail(where, 'status and trailers only apply when the call is held at its end (status); this pause holds a message');
-    const given = ['message', 'messageJson', 'drop'].filter((k) => raw[k] !== undefined);
-    if (given.length !== 1) fail(where, 'pass exactly one of message (base64), messageJson or drop');
-    if (raw.drop !== undefined) {
-      if (raw.drop !== true) fail(where, 'drop must be true');
-      return { drop: true };
-    }
-    if (raw.message !== undefined) {
-      if (typeof raw.message !== 'string' || raw.message.length > MAX_GRPC_EDIT_B64 || !BASE64.test(raw.message)) fail(where, 'message must be base64 of a serialized protobuf message (at most 4 MB)');
-      return { message: raw.message };
-    }
-    if (!isJsonValue(raw.messageJson)) fail(where, 'messageJson must be a JSON value');
-    if (JSON.stringify(raw.messageJson).length > MAX_CODEC_BYTES) fail(where, 'messageJson must be at most 4 MB as JSON');
-    return { messageJson: raw.messageJson };
-  }
-  if (raw.message !== undefined || raw.messageJson !== undefined || raw.drop !== undefined) fail(where, 'message, messageJson and drop only apply to a held message; this pause holds the end of the call (edit status / trailers)');
-  if (raw.status === undefined) fail(where, 'pass status {code, message?} (and optionally trailers)');
-  const st = raw.status;
-  if (!isObj(st)) fail(where, 'status must be an object {code, message?}');
-  onlyKeys(st, ['code', 'message'], `${where}.status`);
-  if (!isInt(st.code, 0, 16)) fail(`${where}.status`, 'code must be a gRPC status code (an integer 0–16)');
-  if (st.message !== undefined && (typeof st.message !== 'string' || st.message.length > MAX_GRPC_MESSAGE_TEXT)) fail(`${where}.status`, `message must be text of at most ${MAX_GRPC_MESSAGE_TEXT} characters`);
-  const out: GrpcEdit = { status: { code: st.code as number, ...(st.message !== undefined ? { message: st.message as string } : {}) } };
-  if (raw.trailers !== undefined) {
-    checkHeaders(raw.trailers, `${where}.trailers`, false);
-    const names = Object.keys(raw.trailers as object);
-    if (names.length > 100) fail(`${where}.trailers`, 'at most 100 trailers');
-    for (const name of names) {
-      const n = name.toLowerCase();
-      if (n.startsWith(':') || GRPC_MOCK_FORBIDDEN.has(n)) fail(`${where}.trailers`, `"${name}" can't be set (the proxy sets it; use status for the code and message)`);
-    }
-    out.trailers = { ...(raw.trailers as Record<string, string>) };
-  }
-  return out;
-}
-
-/**
- * CONTRACTS §17.6: validates a gRPC resume edit for `ex` and encodes `messageJson` with the call's request / response
- * type (the held message's direction) into `message`. Errors (no schema, a field that doesn't fit) are thrown; the call
- * then stays paused.
- */
-export function resolveGrpcEdit(ex: Exchange, raw: unknown, grpc: Pick<GrpcDeps, 'codec' | 'schema' | 'enabled'> | undefined): GrpcEdit | undefined {
-  const edit = validateGrpcEdit(raw, ex.grpcPause);
-  if (!edit || edit.messageJson === undefined) return edit;
-  const pause = ex.grpcPause;
-  const path = grpcMethodPath(ex.url);
-  if (!path || pause?.kind !== 'message') throw new Error("This call's method is unknown, so messageJson can't be encoded; pass message (base64).");
-  if (!grpc) throw new Error('gRPC decoding is not available: pass message (base64) instead of messageJson.');
-  let bytes: Uint8Array;
-  try {
-    bytes = grpcProxyCodec(grpc).encode(path, pause.dir, edit.messageJson);
-  } catch (e) {
-    throw new Error(`messageJson can't be encoded as the ${pause.dir === 'send' ? 'request' : 'response'} of ${path}: ${(e as Error)?.message ?? String(e)}`);
-  }
-  const out: GrpcEdit = { message: Buffer.from(bytes).toString('base64') };
-  const problem = grpcEditProblem('message', out);
-  if (problem) throw new Error(problem);
-  return out;
-}
-
-/** The response messages of a finished gRPC exchange as a grpcMock (JSON when the schema decodes every one). */
-export function grpcMockRuleFromExchange(e: Exchange, id: string, grpc: Pick<GrpcDeps, 'codec' | 'schema'> | undefined): Rule {
-  if (e.kind !== 'grpc') throw new Error('a gRPC mock needs a gRPC call; use a mock rule for HTTP requests');
-  const path = grpcMethodPath(e.url);
-  let origin = '';
-  try {
-    origin = new URL(e.url).origin;
-  } catch {
-    // reported below
-  }
-  if (!path || !origin || origin === 'null') throw new Error("its URL isn't a gRPC method (…/package.Service/Method)");
-  if (e.state === 'pending' || e.state === 'paused-request' || e.state === 'paused-response') throw new Error('the call has not finished yet; mock it once it has its status');
-  if (e.framesDropped) throw new Error('some of its messages were not kept (too many), so the mock would be incomplete');
-  const received = (e.frames ?? []).filter((f) => f.kind === 'message' && f.dir === 'receive');
-  if (received.some((f) => f.truncated || typeof f.base64 !== 'string')) throw new Error('some of its response messages were too large to record in full');
-  const decoded = decodeGrpcMessages(e, grpc, { filter: (f) => f.dir === 'receive' });
-  const allJson = decoded.messages.length > 0 && decoded.messages.every((m) => m.via === 'schema');
-  const info = e.grpc;
-  const code = info?.statusCode ?? 0;
-  const custom = (h: Record<string, string | string[]> | undefined): Record<string, string> | undefined => {
-    const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(h ?? {})) {
-      const n = k.toLowerCase();
-      if (n.startsWith(':') || GRPC_MOCK_FORBIDDEN.has(n) || n === 'date' || n === 'server' || n.startsWith('grpc-') || n === 'content-encoding') continue;
-      if (!TOKEN.test(k)) continue;
-      const value = Array.isArray(v) ? v.join(', ') : v;
-      if (typeof value !== 'string' || /[\r\n\0]/.test(value)) continue;
-      out[n] = value;
-    }
-    return Object.keys(out).length ? out : undefined;
-  };
-  const headers = custom(e.responseHeaders);
-  const trailers = custom(e.responseTrailers);
-  const action: RuleAction = {
-    kind: 'grpcMock',
-    ...(code !== 0 ? { code } : {}),
-    ...(info?.statusMessage ? { message: info.statusMessage.slice(0, MAX_GRPC_MESSAGE_TEXT) } : {}),
-    ...(received.length ? (allJson ? { messagesJson: decoded.messages.map((m) => m.json) } : { messages: received.map((f) => f.base64 as string) }) : {}),
-    ...(headers ? { headers } : {}),
-    ...(trailers ? { trailers } : {}),
-  };
-  const name = `gRPC mock ${path} → ${info?.statusCode !== undefined ? `${code}` : 'OK'}${received.length ? ` (${received.length} message${received.length === 1 ? '' : 's'})` : ''}`;
-  return { id, enabled: true, name: name.slice(0, 500), match: { method: 'POST', url: `${origin}${path}` }, action };
-}
-
-/** CONTRACTS §12.2: a workspace-relative path: no absolute path, drive, `..` segment or control characters; ≤ 300. */
-export function checkBodyFile(v: unknown, where: string, field = 'bodyFile'): string {
-  if (typeof v !== 'string' || !v.trim() || v.length > MAX_BODY_FILE_PATH) fail(where, `${field} must be a workspace-relative path (1–${MAX_BODY_FILE_PATH} characters)`);
-  if (/[\0-\x1f]/.test(v)) fail(where, `${field} must not contain control characters`);
-  if (/^[\\/]/.test(v) || /^[A-Za-z]:/.test(v) || /^~/.test(v)) fail(where, `${field} must be relative to the workspace folder (no absolute path)`);
-  if (v.split(/[\\/]+/).some((seg) => seg === '..')) fail(where, `${field} must stay inside the workspace (no ".." segments)`);
-  return v;
-}
-
-/** CONTRACTS §13.4: the most a script (inline code or a new script file) may hold. */
-export const MAX_SCRIPT_BYTES = 256 * 1024;
-
-/**
- * CONTRACTS §13.4: `script.file` = a workspace-relative `.js` path (no absolute path, `..`, control characters; the
- * shared-rules service's `scriptFileSyntaxError`). The disk checks (inside the workspace, ≤ 256 KB) happen on read.
- */
-export function checkScriptFile(v: unknown, where: string, field = 'file'): string {
-  const p = checkBodyFile(v, where, field);
-  const bad = scriptFileSyntaxError(p);
-  if (bad) fail(where, `${field} ${bad}`);
-  return p;
-}
-
-/** CONTRACTS §12.2: the most a new body file may hold (the proxy's body cap). */
-export const MAX_BODY_FILE_BYTES = 5 * 1024 * 1024;
-
-/** CONTRACTS §12.6: `mapRemote.to` = absolute http(s) origin or URL prefix, no credentials, no fragment. */
-export function checkMapTarget(v: unknown, where = 'mapRemote'): URL {
-  if (typeof v !== 'string' || !v.trim() || v.length > 2048) fail(where, 'to must be an absolute http(s) URL such as "https://staging.example.com" (at most 2048 characters)');
-  let u: URL;
-  try {
-    u = new URL(v);
-  } catch {
-    fail(where, `to must be an absolute http(s) URL: ${v.slice(0, 200)}`);
-  }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') fail(where, 'to must be an http(s) URL');
-  if (u.username || u.password || /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*@/i.test(v)) fail(where, 'to must not contain user info (user:password@)');
-  if (v.includes('#')) fail(where, 'to must not contain a fragment (#…)');
-  if (/[\s\0]/.test(v)) fail(where, 'to must not contain whitespace');
-  if (v.includes('\\')) fail(where, 'to must not contain backslashes');
-  return u;
-}
-
-/** Validates one side of a rewrite; returns the total length of its find + replace texts. */
-/**
- * CONTRACTS §18.1: gRPC metadata a rewrite may not set or remove anywhere (the proxy and the protocol own it). For a rule
- * whose URL names a gRPC method, `content-type` and `te` are refused too (validateRule: `grpcRewriteProblem`).
- */
-export const GRPC_RESERVED_METADATA = new Set(['grpc-encoding', 'grpc-accept-encoding', 'grpc-status', 'grpc-message', 'grpc-timeout', 'grpc-status-details-bin']);
-const GRPC_CALL_RESERVED = new Set(['content-type', 'te']);
-
-/** `-bin` metadata values must be base64 (padded or not, standard or URL alphabet), CONTRACTS §18.1. */
-function checkBinValue(name: string, value: unknown, where: string): void {
-  if (!/-bin$/i.test(name)) return;
-  if (typeof value !== 'string' || !/^[A-Za-z0-9+/_-]*={0,2}$/.test(value)) fail(where, `"${name}" is binary metadata (-bin): its value must be base64`);
-}
-
-/** CONTRACTS §18.1: names a rewrite may not touch on a gRPC call (any side, set or remove). */
-function grpcMetadataNames(spec: Record<string, unknown> | undefined): string[] {
-  if (!spec) return [];
-  return [
-    ...Object.keys(isObj(spec.setHeaders) ? spec.setHeaders : {}),
-    ...(Array.isArray(spec.removeHeaders) ? (spec.removeHeaders as unknown[]).filter((x): x is string => typeof x === 'string') : []),
-    ...Object.keys(isObj(spec.setTrailers) ? spec.setTrailers : {}),
-    ...(Array.isArray(spec.removeTrailers) ? (spec.removeTrailers as unknown[]).filter((x): x is string => typeof x === 'string') : []),
-  ];
-}
-
-/**
- * CONTRACTS §18.1: for a rule whose URL names a gRPC method, a rewrite may not set / remove `content-type` or `te`
- * either (reserved `grpc-*` names are refused for every rewrite in `checkRewriteSpec`). Undefined when fine.
- */
-export function grpcRewriteProblem(rule: { match: { url: string }; action: RuleAction }): string | undefined {
-  if (!grpcMethodFromGlob(rule.match.url)) return undefined;
-  const visit = (a: RuleAction | { kind: 'passthrough' }): string | undefined => {
-    if (a.kind === 'sequence') {
-      for (const st of a.steps ?? []) {
-        const r = visit(st.action as RuleAction);
-        if (r) return r;
-      }
-      return undefined;
-    }
-    if (a.kind !== 'rewrite') return undefined;
-    for (const name of [...grpcMetadataNames(a.request as Record<string, unknown> | undefined), ...grpcMetadataNames(a.response as Record<string, unknown> | undefined)]) {
-      const n = name.toLowerCase();
-      if (n.startsWith(':') || GRPC_CALL_RESERVED.has(n)) return `"${name}" can't be changed on a gRPC call (the proxy and the protocol own it)`;
-    }
-    return undefined;
-  };
-  return visit(rule.action);
-}
-
-function checkRewriteSpec(raw: unknown, where: string, side: 'request' | 'response'): number {
-  if (!isObj(raw)) fail(where, 'must be an object');
-  onlyKeys(raw, side === 'response' ? ['setHeaders', 'removeHeaders', 'replaceBody', 'status', 'setTrailers', 'removeTrailers'] : ['setHeaders', 'removeHeaders', 'replaceBody'], where);
-  if (side === 'response' && raw.status !== undefined) checkStatus(raw.status, where);
-  const forbidden = side === 'request' ? REWRITE_REQUEST_FORBIDDEN : REWRITE_RESPONSE_FORBIDDEN;
-  let headers = 0;
-  if (raw.setHeaders !== undefined) {
-    checkHeaders(raw.setHeaders, `${where}.setHeaders`, false);
-    for (const [name, value] of Object.entries(raw.setHeaders as Record<string, unknown>)) {
-      if (forbidden.has(name.toLowerCase())) fail(`${where}.setHeaders`, `"${name}" can't be set by a rewrite (the proxy manages it)`);
-      if (GRPC_RESERVED_METADATA.has(name.toLowerCase())) fail(`${where}.setHeaders`, `"${name}" can't be set by a rewrite (gRPC protocol metadata; change the status with a breakpoint, mutate or a script)`);
-      checkBinValue(name, value, `${where}.setHeaders`);
-      headers++;
-    }
-  }
-  if (raw.removeHeaders !== undefined) {
-    if (!Array.isArray(raw.removeHeaders)) fail(where, 'removeHeaders must be a list of header names');
-    for (const name of raw.removeHeaders) {
-      if (typeof name !== 'string' || !TOKEN.test(name)) fail(`${where}.removeHeaders`, `invalid header name ${JSON.stringify(name)}`);
-      if (GRPC_RESERVED_METADATA.has(name.toLowerCase())) fail(`${where}.removeHeaders`, `"${name}" can't be removed by a rewrite (gRPC protocol metadata)`);
-      headers++;
-    }
-  }
-  // CONTRACTS §18.1: gRPC trailers (custom metadata only; ignored for HTTP)
-  if (raw.setTrailers !== undefined) {
-    checkHeaders(raw.setTrailers, `${where}.setTrailers`, false);
-    for (const [name, value] of Object.entries(raw.setTrailers as Record<string, unknown>)) {
-      const n = name.toLowerCase();
-      if (n.startsWith(':') || GRPC_RESERVED_METADATA.has(n) || GRPC_MOCK_FORBIDDEN.has(n)) fail(`${where}.setTrailers`, `"${name}" can't be set as a trailer (the proxy sets it; change the status with a breakpoint, mutate or a script)`);
-      checkBinValue(name, value, `${where}.setTrailers`);
-      headers++;
-    }
-  }
-  if (raw.removeTrailers !== undefined) {
-    if (!Array.isArray(raw.removeTrailers)) fail(where, 'removeTrailers must be a list of trailer names');
-    for (const name of raw.removeTrailers) {
-      if (typeof name !== 'string' || !TOKEN.test(name)) fail(`${where}.removeTrailers`, `invalid trailer name ${JSON.stringify(name)}`);
-      const n = name.toLowerCase();
-      if (GRPC_RESERVED_METADATA.has(n) || GRPC_MOCK_FORBIDDEN.has(n)) fail(`${where}.removeTrailers`, `"${name}" can't be removed (gRPC protocol metadata)`);
-      headers++;
-    }
-  }
-  if (headers > MAX_REWRITE_HEADERS) fail(where, `at most ${MAX_REWRITE_HEADERS} headers per side`);
-  if (raw.replaceBody !== undefined) {
-    if (!Array.isArray(raw.replaceBody) || raw.replaceBody.length > MAX_REWRITE_REPLACEMENTS) fail(where, `replaceBody must be a list of at most ${MAX_REWRITE_REPLACEMENTS} replacements`);
-    raw.replaceBody.forEach((r, i) => {
-      const rw = `${where}.replaceBody[${i}]`;
-      if (!isObj(r)) fail(rw, 'must be an object {find, replace, all?}');
-      onlyKeys(r, ['find', 'replace', 'all'], rw);
-      if (typeof r.find !== 'string' || !r.find || r.find.length > MAX_REWRITE_FIND) fail(rw, 'find must be non-empty text of at most 10 KB');
-      if (typeof r.replace !== 'string' || r.replace.length > MAX_REWRITE_REPLACE) fail(rw, 'replace must be text of at most 64 KB');
-      if (r.all !== undefined && typeof r.all !== 'boolean') fail(rw, 'all must be a boolean');
-    });
-    return (raw.replaceBody as { find: string; replace: string }[]).reduce((n, r) => n + r.find.length + r.replace.length, 0);
-  }
-  return 0;
-}
-
-/**
- * CONTRACTS §12.3 "Expire token" preset: the next `count` matching requests get 401 {"error":"token_expired"},
- * then the real server answers. `url` is used as the rule's glob; an absolute URL without `*` becomes
- * origin + path + `*` (its query, which may hold secrets, is dropped).
- */
-export function expireTokenRule(id: string, url: string, count: number, opts: { method?: string; namePrefix?: string } = {}): Rule {
-  if (typeof url !== 'string' || !url.trim() || url.length > 8192) fail('expireToken', 'url must be a non-empty URL or URL glob');
-  if (!isInt(count, 1, 1000)) fail('expireToken', 'count must be an integer 1–1000');
-  let pattern = url.trim();
-  if (!pattern.includes('*')) {
-    try {
-      const u = new URL(pattern);
-      if (u.protocol === 'http:' || u.protocol === 'https:') pattern = `${u.origin}${u.pathname}*`;
-    } catch {
-      // a glob without * — used as is
-    }
-  }
-  return {
-    id,
-    enabled: true,
-    name: `${opts.namePrefix ?? ''}Expire token: ${opts.method ? `${opts.method.toUpperCase()} ` : ''}${pattern}`.slice(0, 500),
-    match: { url: pattern, ...(opts.method ? { method: opts.method.toUpperCase() } : {}) },
-    action: {
-      kind: 'sequence',
-      steps: [
-        { action: { kind: 'mock', status: 401, headers: { 'content-type': 'application/json' }, body: '{"error":"token_expired"}' }, count },
-        { action: { kind: 'passthrough' } },
-      ],
-      then: 'last',
-    },
-  };
-}
-
-/** GraphQL Name (spec §2.1.9). */
-const GRAPHQL_NAME = /^[_A-Za-z][_0-9A-Za-z]*$/;
-
-/** `*`, or one serialized origin / token-ish value: printable, no whitespace or commas (a header value), ≤ 500. */
-function isAllowOrigin(v: unknown): v is string {
-  return typeof v === 'string' && v.length > 0 && v.length <= 500 && /^[\x21-\x7e]+$/.test(v) && !v.includes(',');
-}
-
-export function validateRules(raw: unknown): Rule[] {
-  if (!Array.isArray(raw)) fail('setRules', 'rules must be an array');
-  if (raw.length > MAX_RULES) fail('setRules', `at most ${MAX_RULES} rules`);
-  const ids = new Set<string>();
-  return raw.map((r, i) => {
-    const rule = validateRule(r, `rule ${i + 1}`);
-    if (ids.has(rule.id)) fail(`rule ${i + 1}`, `duplicate id "${rule.id}"`);
-    ids.add(rule.id);
-    return rule;
-  });
-}
-
-/**
- * Validates a resume edit. `phase` (from the paused exchange) narrows the allowed fields:
- * a paused request accepts method/url/headers/body, a paused response status/headers/body.
- */
-export function validateEdit(raw: unknown, phase?: 'request' | 'response'): RequestEdit | ResponseEdit | undefined {
-  if (raw === undefined || raw === null) return undefined;
-  const where = 'edit';
-  if (!isObj(raw)) fail(where, 'must be an object');
-  const allowed = phase === 'request' ? ['method', 'url', 'headers', 'body'] : phase === 'response' ? ['status', 'headers', 'body'] : ['method', 'url', 'status', 'headers', 'body'];
-  onlyKeys(raw, allowed, where);
-  if (raw.method !== undefined && (typeof raw.method !== 'string' || !TOKEN.test(raw.method))) fail(where, 'method must be an HTTP method name');
-  if (raw.url !== undefined) checkUrl(raw.url, where);
-  if (raw.status !== undefined) checkStatus(raw.status, where);
-  if (raw.headers !== undefined) checkHeaders(raw.headers, where, true);
-  if (raw.body !== undefined) checkBody(raw.body, where);
-  return raw as RequestEdit | ResponseEdit;
-}
-
-/** Headers `send` never forwards: framing the proxy recomputes, hop-by-hop, and the proxy's own credential. */
-const SEND_DROPPED = new Set(['content-length', 'host', 'connection', 'keep-alive', 'proxy-connection', 'proxy-authorization', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'x-fi-id']);
-
-/** Drops framing / hop-by-hop / proxy headers from a request about to be sent again. */
-export function sanitizeSendHeaders(h: Record<string, string | string[]> | undefined): Record<string, string | string[]> | undefined {
-  if (!h) return h;
-  const out: Record<string, string | string[]> = {};
-  for (const [k, v] of Object.entries(h)) if (!SEND_DROPPED.has(k.toLowerCase()) && !k.startsWith(':')) out[k] = v;
-  return out;
-}
-
-/** Validates the webview composer's request (CONTRACTS §9.3 `send`): method, absolute http(s) URL, headers, text body. */
-export function validateSendDraft(raw: unknown): SendDraft {
-  const where = 'send';
-  if (!isObj(raw)) fail(where, 'request must be an object');
-  onlyKeys(raw, ['method', 'url', 'headers', 'body', 'grpc'], where);
-  if (typeof raw.method !== 'string' || !TOKEN.test(raw.method)) fail(where, 'method must be an HTTP method name');
-  checkUrl(raw.url, where);
-  if (raw.headers !== undefined) checkHeaders(raw.headers, where, true);
-  if (raw.body !== undefined) checkBody(raw.body, where);
-  const grpc = raw.grpc !== undefined ? checkSendGrpc(raw, where) : undefined;
-  const headers = raw.headers !== undefined ? sanitizeSendHeaders(raw.headers as Record<string, string | string[]>) : undefined;
-  return {
-    method: raw.method.toUpperCase(),
-    url: raw.url as string,
-    ...(headers !== undefined ? { headers: grpc ? sanitizeGrpcSendHeaders(headers) : headers } : {}),
-    ...(raw.body !== undefined ? { body: raw.body as string } : {}),
-    ...(grpc ? { grpc } : {}),
-  };
-}
-
-/** CONTRACTS §19: gRPC-Web calls are not resent yet (owner decision 2026-10-12). */
-export const GRPC_WEB_RESEND = "Resending gRPC-Web calls comes later: the proxy resends over HTTP/2, which a gRPC-Web-only server may not accept.";
-
-/** CONTRACTS §18.4: send caps (the proxy enforces them too). */
-export const MAX_SEND_GRPC_MESSAGES = 100;
-export const MAX_SEND_GRPC_TOTAL_BYTES = 16 * 1024 * 1024;
-
-/** `send.grpc`: POST to a gRPC method URL, no body, exactly one of `messages` (base64) / `messagesJson`, within the caps. */
-function checkSendGrpc(raw: Record<string, unknown>, where: string): { messages?: string[]; messagesJson?: unknown[] } {
-  const g = raw.grpc;
-  if (!isObj(g)) fail(where, 'grpc must be an object {messages} or {messagesJson}');
-  onlyKeys(g, ['messages', 'messagesJson'], `${where}.grpc`);
-  if (String(raw.method).toUpperCase() !== 'POST') fail(where, 'a gRPC call is sent with method POST');
-  if (raw.body !== undefined) fail(where, 'a gRPC call has no body: pass grpc.messages or grpc.messagesJson');
-  if (!grpcMethodPath(String(raw.url))) fail(where, 'the URL of a gRPC call ends in /<package.Service>/<Method>');
-  if ((g.messages === undefined) === (g.messagesJson === undefined)) fail(`${where}.grpc`, 'pass exactly one of messages (base64) or messagesJson');
-  if (g.messages !== undefined) {
-    if (!Array.isArray(g.messages) || g.messages.length > MAX_SEND_GRPC_MESSAGES) fail(`${where}.grpc`, `messages must be a list of at most ${MAX_SEND_GRPC_MESSAGES} base64 protobuf messages`);
-    let total = 0;
-    g.messages.forEach((m, i) => {
-      if (typeof m !== 'string' || m.length > MAX_GRPC_EDIT_B64 || !BASE64.test(m)) fail(`${where}.grpc`, `messages[${i}] must be base64 of a serialized protobuf message (at most 4 MB)`);
-      total += Math.floor((m.length * 3) / 4);
-    });
-    if (total > MAX_SEND_GRPC_TOTAL_BYTES) fail(`${where}.grpc`, 'the messages must total at most 16 MB');
-    return { messages: [...(g.messages as string[])] };
-  }
-  if (!Array.isArray(g.messagesJson) || g.messagesJson.length > MAX_SEND_GRPC_MESSAGES) fail(`${where}.grpc`, `messagesJson must be a list of at most ${MAX_SEND_GRPC_MESSAGES} JSON messages`);
-  let jsonTotal = 0;
-  g.messagesJson.forEach((m, i) => {
-    if (!isJsonValue(m)) fail(`${where}.grpc`, `messagesJson[${i}] must be a JSON value`);
-    const n = JSON.stringify(m).length;
-    if (n > MAX_CODEC_BYTES) fail(`${where}.grpc`, `messagesJson[${i}] must be at most 4 MB as JSON`);
-    jsonTotal += n;
-  });
-  // REVIEW-12 #4: bound the encoding work too (the encoded total is capped in resolveSendGrpc)
-  if (jsonTotal > MAX_SEND_GRPC_TOTAL_BYTES * 2) fail(`${where}.grpc`, 'messagesJson must total at most 32 MB as JSON');
-  return { messagesJson: [...(g.messagesJson as unknown[])] };
-}
-
-/** Request metadata a gRPC send never forwards (the proxy sets content-type / te / encodings itself, CONTRACTS §18.4). */
-const GRPC_SEND_DROPPED = new Set(['content-type', 'te', 'grpc-encoding', 'grpc-accept-encoding', 'content-encoding']);
-export function sanitizeGrpcSendHeaders(h: Record<string, string | string[]>): Record<string, string | string[]> {
-  const out: Record<string, string | string[]> = {};
-  for (const [k, v] of Object.entries(sanitizeSendHeaders(h) ?? {})) if (!GRPC_SEND_DROPPED.has(k.toLowerCase())) out[k] = v;
-  return out;
-}
-
-/**
- * CONTRACTS §18.4: the request messages of a recorded gRPC call, to resend unchanged (base64, what the server got:
- * messages dropped at a breakpoint are left out). Throws a readable Error when one was cut (64 KB frame cap / size
- * unknown) or frames were dropped from the record.
- */
-export function grpcResendMessages(e: Exchange): string[] {
-  if (e.kind !== 'grpc') throw new Error('not a gRPC call');
-  if (e.framesDropped) throw new Error('some of its messages were not kept (too many), so its request is incomplete; edit & resend it with messagesJson or messages');
-  const sent = (e.frames ?? []).filter((f) => f.kind === 'message' && f.dir === 'send' && !f.dropped);
-  if (sent.some((f) => f.truncated || f.sizeUnknown || typeof f.base64 !== 'string')) throw new Error('a request message was too large to record in full (64 KB), so it can only be resent edited (messagesJson or messages)');
-  return sent.map((f) => f.base64 as string);
-}
-
-/**
- * CONTRACTS §18.4: `send.grpc` ready for the proxy — `messagesJson` encoded with the method's request type (errors name
- * the message and JSON path). The proxy refuses `messagesJson`.
- */
-export function resolveSendGrpc(url: string, grpcIn: { messages?: string[]; messagesJson?: unknown[] }, grpc: Pick<GrpcDeps, 'codec' | 'schema' | 'enabled'> | undefined): { messages: string[] } {
-  if (grpcIn.messages) return { messages: grpcIn.messages };
-  const path = grpcMethodPath(url);
-  if (!path) throw new Error('the URL of a gRPC call ends in /<package.Service>/<Method>');
-  if (!grpc) throw new Error('gRPC decoding is not available: pass messages (base64) instead of messagesJson.');
-  const codec = grpcProxyCodec(grpc);
-  let total = 0;
-  return {
-    messages: (grpcIn.messagesJson ?? []).map((json, i) => {
-      let bytes: Uint8Array;
-      try {
-        bytes = codec.encode(path, 'send', json);
-      } catch (e) {
-        throw new Error(`messagesJson[${i}] can't be encoded as the request of ${path}: ${(e as Error)?.message ?? String(e)}`);
-      }
-      total += bytes.length;
-      // REVIEW-12 #4: a total cap on the encoded messages (as the proxy's send cap)
-      if (total > MAX_SEND_GRPC_TOTAL_BYTES) throw new Error('the encoded messages must total at most 16 MB');
-      return Buffer.from(bytes).toString('base64');
-    }),
-  };
-}
-
-/** Validates a network profile (CONTRACTS §9.2 network.ts). */
-export function validateNetworkProfile(raw: unknown): NetworkProfile {
-  const where = 'networkProfile';
-  if (!isObj(raw)) fail(where, 'must be an object');
-  switch (raw.kind) {
-    case 'none':
-    case 'offline':
-      onlyKeys(raw, ['kind'], where);
-      return { kind: raw.kind };
-    case 'throttle':
-      onlyKeys(raw, ['kind', 'preset', 'latencyMs', 'kbps', 'uploadKbps', 'dropRate'], where);
-      if (raw.preset !== undefined && (typeof raw.preset !== 'string' || !PRESET_IDS.has(raw.preset))) fail(where, 'preset must be "slow-3g", "fast-3g" or "flaky"');
-      checkThrottle(raw, where);
-      return raw as unknown as NetworkProfile;
-    default:
-      return fail(where, `unknown kind ${JSON.stringify(raw.kind)}`);
-  }
-}
-
-function checkId(v: unknown, where: string): string {
-  if (typeof v !== 'string' || !v) fail(where, 'id must be a non-empty string');
-  return v;
-}
-
-/** Turns a ruleFromExchange failure (proxy's typed error for truncated/binary bodies, review #8) into user text. */
-export function ruleFromExchangeErrorMessage(e: unknown, kind: string): string {
-  const err = e as { code?: unknown; message?: unknown };
-  const what = kind === 'mock' ? 'a mock rule' : `a ${kind} rule`;
-  if (err?.code === 'truncated') return `Can't create ${what} from this exchange: its response body was truncated (too large to store), so the mock would be incomplete.`;
-  if (err?.code === 'binary') return `Can't create ${what} from this exchange: its response body is binary, and mock bodies are text.`;
-  const msg = typeof err?.message === 'string' && err.message ? err.message : String(e);
-  return `Can't create ${what} from this exchange: ${msg}`;
-}
-
-/** The request of `ex` as a code snippet (unredacted: the caller decides what to redact). */
-export function snippetFor(ex: Exchange, format: SnippetFormat, grpcurl?: GrpcurlOptions): string {
-  // CONTRACTS §19.2: gRPC calls (HTTP/2 and gRPC-Web) are copied as grpcurl; grpcurl only for them
-  if (format === 'grpcurl') return toGrpcurl(ex, grpcurl);
-  if (ex.kind === 'grpc') throw new Error(`This is a gRPC call: copy it as grpcurl (a ${format === 'curl' ? 'curl' : 'Dart'} snippet can't replay its protobuf messages).`);
-  return toSnippet({ method: ex.method, url: ex.url, headers: ex.requestHeaders, ...(ex.requestBody ? { body: ex.requestBody } : {}) }, format);
-}
-
 export class InterceptController {
   private readonly sinks = new Set<Sink>();
   private readonly pending = new Map<string, Exchange>();
@@ -1346,7 +294,8 @@ export class InterceptController {
   private sessions = 0;
   private pausedListeners: ((count: number) => void)[] = [];
   // CONTRACTS §10.5 contract checks: cached per exchange id, queued, run a few at a time.
-  private readonly contractResults = new Map<string, ContractResult>();
+  /** @internal (handlers) */
+  readonly contractResults = new Map<string, ContractResult>();
   private readonly contractQueue = new Map<string, Exchange>();
   private readonly contractRunning = new Set<string>();
   private readonly pendingContract = new Map<string, ContractSummary>();
@@ -1361,7 +310,11 @@ export class InterceptController {
   readonly sentCounts: Record<string, number> = {};
   readyCount = 0;
 
-  constructor(private readonly deps: ControllerDeps) {
+  /** QUALITY-1 Q3: the ViewMsg handlers (src/ui/handlers.ts). */
+  private readonly handlers: ViewHandlers;
+
+  constructor(/** @internal (handlers) */ readonly deps: ControllerDeps) {
+    this.handlers = createViewHandlers(this);
     deps.host.on('exchange', (e) => this.onExchange(e));
     deps.host.on('removed', (ids) => this.onRemoved(ids));
     // Start/stop/restart: the exchange list belongs to the proxy instance, so resend everything.
@@ -1400,7 +353,7 @@ export class InterceptController {
     this.pausedListeners.push(l);
   }
 
-  status(): ControllerStatus {
+  status(): Status {
     return {
       proxyRunning: this.deps.host.running,
       port: this.deps.host.port,
@@ -1447,97 +400,9 @@ export class InterceptController {
     };
   }
 
-  /** CONTRACTS §16.4: the panel's `decodeGrpc`: the messages it holds (uiExchange's frames), decoded. */
+  /** CONTRACTS §16.4: the panel's `decodeGrpc`: the messages it holds (uiExchange's frames), decoded (grpcHost.ts). */
   decodeGrpc(id: string): GrpcDecoded {
-    const ex = this.exchangeOrThrow(id);
-    if (ex.kind !== 'grpc') throw new Error(ex.kind === 'tunnel' && ex.grpcTunnel ? (tunnelReason(ex) ?? 'This gRPC connection is not decrypted.') : 'This exchange is not a gRPC call.');
-    const g = this.deps.grpc;
-    const shown = uiExchange(ex);
-    const frames = shown.frames ?? [];
-    const call = decodeGrpcMessages(ex, g, { frames });
-    const m = call.method;
-    const skeleton = (type: string): string | undefined => {
-      try {
-        const schema = g?.schema();
-        if (!schema || !g) return undefined;
-        const v = g.codec.skeleton(schema, type);
-        return v === undefined ? undefined : JSON.stringify(v, null, 2);
-      } catch {
-        return undefined;
-      }
-    };
-    const pretty = (v: unknown): { json?: string; truncated?: true } => {
-      let t: string | undefined;
-      try {
-        t = JSON.stringify(v, null, 2);
-      } catch {
-        t = undefined;
-      }
-      if (t === undefined) return {};
-      return t.length > UI_MAX_GRPC_JSON_CHARS ? { json: t.slice(0, UI_MAX_GRPC_JSON_CHARS), truncated: true } : { json: t };
-    };
-    let problem: string | undefined;
-    if (!g) problem = 'gRPC decoding is not available in this build.';
-    else if (!g.enabled()) problem = 'gRPC support is off (setting flutterIntercept.grpc.enabled): messages are shown as hex only.';
-    else if (!g.schema()) problem = "No protobuf schema was found (the app's generated *.pb.dart / *.pbgrpc.dart files): messages are decoded without field names.";
-    else if (!m) problem = `The app's generated code has no method ${call.path ?? ex.url}: messages are decoded without field names.`;
-    const sk = m ? { request: skeleton(m.requestType), response: skeleton(m.responseType) } : undefined;
-    return {
-      ...(m ? { method: { requestType: m.requestType, responseType: m.responseType, clientStreaming: m.clientStreaming, serverStreaming: m.serverStreaming, ...(m.file ? { file: this.fileLabel(m.file) } : {}) } } : {}),
-      messages: call.messages.map((d) => {
-        const p = d.json !== undefined && d.via !== 'none' ? pretty(d.json) : {};
-        return {
-          dir: d.dir,
-          via: p.json !== undefined ? d.via : 'none',
-          hex: d.bytes ? hexOf(d.bytes) : '',
-          size: d.size,
-          ...(p.json !== undefined ? { json: p.json } : {}),
-          ...(d.truncated || p.truncated ? { truncated: true as const } : {}),
-          ...(d.error ? { error: d.error } : {}),
-        };
-      }),
-      framesDropped: shown.framesDropped ?? 0,
-      ...this.pausedView(ex, g),
-      ...(sk && (sk.request || sk.response) ? { skeletons: { ...(sk.request ? { request: sk.request } : {}), ...(sk.response ? { response: sk.response } : {}) } } : {}),
-      ...(problem ? { problem } : {}),
-    };
-  }
-
-  /** CONTRACTS §17.6: the message a gRPC breakpoint holds, decoded in full (≤ 4 MB). */
-  private pausedView(ex: Exchange, g: GrpcDeps | undefined): Pick<GrpcDecoded, 'paused'> {
-    const p = ex.grpcPause;
-    if (p?.kind !== 'message' || typeof p.base64 !== 'string') return {};
-    const d = decodeHeldMessage(ex, g); // cached, ≤ 1 MB decoded (REVIEW-11 #6)
-    if (!d) return {};
-    let json: string | undefined;
-    try {
-      json = d.json !== undefined && d.via !== 'none' ? JSON.stringify(d.json, null, 2) : undefined;
-    } catch {
-      json = undefined;
-    }
-    const cut = json !== undefined && json.length > UI_MAX_PAUSED_JSON_CHARS;
-    return {
-      paused: {
-        index: p.index,
-        dir: d.dir,
-        via: json !== undefined ? d.via : 'none',
-        hex: d.bytes ? hexOf(d.bytes) : '',
-        size: p.size,
-        ...(json !== undefined ? { json: cut ? json.slice(0, UI_MAX_PAUSED_JSON_CHARS) : json } : {}),
-        ...(cut ? { truncated: true as const } : {}),
-        ...(d.error ? { error: d.error } : {}),
-      },
-    };
-  }
-
-  /** A schema source file for the panel: project-relative when inside the project, else its name. */
-  private fileLabel(file: string): string {
-    const root = this.deps.projectRoot?.();
-    if (root) {
-      const rel = path.relative(root, file);
-      if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return rel.split(path.sep).join('/');
-    }
-    return path.basename(file);
+    return decodeGrpcForPanel(this.exchangeOrThrow(id), this.deps.grpc, this.deps.projectRoot?.());
   }
 
   /** REVIEW-6 #1: the upstream proxy (`host:port`) and whether its certificate checks are off; §14.6 its source. */
@@ -1620,269 +485,20 @@ export class InterceptController {
   }
 
   async handle(raw: unknown, reply: Sink): Promise<void> {
-    const msg = raw as AnyViewMsg;
+    const msg = raw as ViewMsg;
     if (!msg || typeof msg !== 'object' || typeof (msg as { type?: unknown }).type !== 'string') return;
+    // QUALITY-1 Q3: one handler per message type (src/ui/handlers.ts); unknown types are ignored
+    if (!Object.prototype.hasOwnProperty.call(this.handlers, msg.type)) return;
+    const handler = this.handlers[msg.type] as (m: ViewMsg, reply: Sink) => Promise<void> | void;
     try {
-      switch (msg.type) {
-        case 'ready': {
-          this.readyCount++;
-          this.flush();
-          this.send(reply, this.snapshot());
-          const current = this.deps.host.getExchanges();
-          const results = current.flatMap((e) => {
-            const r = this.contractResults.get(e.id);
-            return r ? [contractSummary(r)] : [];
-          });
-          if (results.length) this.send(reply, { type: 'contract', results });
-          for (const e of current) this.maybeCheck(e);
-          if (this.deps.analyzeAuth) this.send(reply, { type: 'authFlows', flows: this.authFlows() });
-          if (this.deps.recordings) {
-            try {
-              this.send(reply, { type: 'recordings', recordings: (await this.deps.recordings.list()).map(recordingSummary) });
-            } catch (e) {
-              this.deps.log?.(`listing recordings failed: ${e instanceof Error ? e.message : String(e)}`);
-            }
-          }
-          return;
-        }
-        case 'resume': {
-          // CONTRACTS §17.2: a paused gRPC call takes a GrpcEdit
-          const gex = this.deps.host.getExchanges().find((e) => e.id === msg.id);
-          if (gex?.kind === 'grpc' && gex.grpcPause) {
-            this.deps.host.resume(gex.id, resolveGrpcEdit(gex, msg.edit, this.deps.grpc));
-            return;
-          }
-          const id = checkId(msg.id, 'resume');
-          const ex = this.deps.host.getExchanges().find((e) => e.id === id);
-          const phase = ex?.state === 'paused-request' ? 'request' : ex?.state === 'paused-response' ? 'response' : undefined;
-          this.deps.host.resume(id, validateEdit(msg.edit, phase));
-          return;
-        }
-        case 'abort':
-          this.deps.host.abort(checkId(msg.id, 'abort'));
-          return;
-        case 'setRules':
-          this.applyRules(msg.rules);
-          return;
-        case 'clear':
-          this.clear();
-          return;
-        case 'setInterceptEnabled':
-          if (typeof msg.enabled !== 'boolean') fail('setInterceptEnabled', 'enabled must be a boolean');
-          await this.deps.setEnabled(msg.enabled);
-          this.broadcastStatus();
-          return;
-        case 'createRuleFromExchange': {
-          if (!RULE_KINDS.has(msg.action)) fail('createRuleFromExchange', `unknown rule action ${JSON.stringify(msg.action)}`);
-          const id = checkId(msg.id, 'createRuleFromExchange');
-          const ex = this.deps.host.getExchanges().find((e) => e.id === id);
-          if (!ex) throw new Error('That exchange is no longer available.');
-          const ro = readOnlyReason(ex);
-          if (ro) throw new Error(`Can't create a rule from this request: ${ro}.`);
-          if (ex.kind === 'websocket' && msg.action !== 'block') {
-            throw new Error(`Can't create ${msg.action === 'mock' ? 'a mock' : 'a breakpoint'} rule from a WebSocket: WebSocket connections can only be blocked (or failed with a fault rule).`);
-          }
-          if (ex.kind === 'tunnel' && msg.action !== 'block') {
-            throw new Error(
-              ex.grpcTunnel
-                ? "Can't mock or pause this gRPC connection: it is TLS that isn't decrypted, so it can only be blocked (or failed with a fault rule). Add the host to flutterIntercept.grpc.decryptHosts if the app trusts the Flutter Intercept CA in debug."
-                : `Can't create ${msg.action === 'mock' ? 'a mock' : msg.action === 'grpcMock' ? 'a gRPC mock' : 'a breakpoint'} rule from a passed-through TLS connection: it isn't decrypted, so it can only be blocked (or failed with a fault rule). Remove the host from flutterIntercept.tlsPassthrough to mock it.`,
-            );
-          }
-          // CONTRACTS §16.2 / §17.2: gRPC calls get gRPC mocks, blocks and breakpoints; HTTP mocks don't apply to them.
-          if (ex.kind === 'grpc' && msg.action === 'mock') {
-            throw new Error("Can't create an HTTP mock rule from a gRPC call: use a gRPC mock instead.");
-          }
-          if (msg.action === 'grpcMock' && ex.kind !== 'grpc') throw new Error("Can't create a gRPC mock from this request: it isn't a gRPC call.");
-          let rule: Rule;
-          try {
-            rule = validateRule(
-              ex.kind === 'tunnel'
-                ? tunnelBlockRule(ex, this.newRuleId())
-                : msg.action === 'grpcMock'
-                  ? grpcMockRuleFromExchange(ex, this.newRuleId(), this.deps.grpc)
-                  : ruleFromExchange(ex, msg.action, this.newRuleId()),
-            );
-          } catch (e) {
-            throw new Error(ruleFromExchangeErrorMessage(e, msg.action === 'grpcMock' ? 'gRPC mock' : msg.action));
-          }
-          this.applyRules([rule, ...this.deps.host.getRules()]);
-          return;
-        }
-        case 'send': {
-          let request = validateSendDraft(msg.request);
-          if (msg.resentFrom !== undefined) {
-            const fromId = checkId(msg.resentFrom, 'send');
-            const from = this.deps.host.getExchanges().find((e) => e.id === fromId);
-            // REVIEW-12 #4: without its record the LAN check can't be made: refuse
-            if (!from) throw new Error("Can't resend this request: its recorded exchange is no longer available (cleared or evicted).");
-            const ro = from && readOnlyReason(from);
-            if (ro) throw new Error(`Can't resend this request: ${ro}.`);
-            if (from?.kind === 'tunnel') throw new Error("Can't resend a passed-through TLS connection: its request was never decrypted.");
-            if (from?.grpc?.web) throw new Error(GRPC_WEB_RESEND);
-            // CONTRACTS §18.4: resending a gRPC call unchanged sends its recorded request messages
-            if (from?.kind === 'grpc' && !request.grpc) {
-              try {
-                request = { ...request, grpc: { messages: grpcResendMessages(from) }, ...(request.headers ? { headers: sanitizeGrpcSendHeaders(request.headers) } : {}) };
-              } catch (e) {
-                throw new Error(`Can't resend this gRPC call: ${(e as Error).message}.`);
-              }
-            }
-          }
-          if (request.grpc) {
-            if (request.body !== undefined) throw new Error('A gRPC call has no body.');
-            request = { ...request, grpc: resolveSendGrpc(request.url, request.grpc, this.deps.grpc) };
-          }
-          if (!this.deps.host.send) throw new Error('This proxy build cannot send requests.');
-          const { id } = await this.deps.host.send({ ...(request as SendRequest), initiator: 'editor', ...(msg.resentFrom ? { resentFrom: msg.resentFrom } : {}) });
-          this.send(reply, { type: 'sent', id });
-          return;
-        }
-        case 'openSource': {
-          const ex = this.exchangeOrThrow(checkId(msg.id, 'openSource'));
-          const frames = ex.source?.frames ?? [];
-          if (!frames.length) {
-            throw new Error(
-              ex.initiator
-                ? 'No source for this request: it was sent from the editor or an agent, not by the app.'
-                : 'No source for this request: its stack trace has not arrived (source capture may be off, or the app was launched before it was turned on).',
-            );
-          }
-          const frame = msg.frame ?? ex.source?.appFrame;
-          if (frame === undefined) throw new Error('No app call site was found in this request\'s stack trace. Pick a frame to open.');
-          if (!isInt(frame, 0, frames.length - 1)) fail('openSource', `frame must be an index 0–${frames.length - 1}`);
-          if (!this.deps.openSource) throw new Error('Opening source is not available in this editor.');
-          await this.deps.openSource(ex, frame);
-          return;
-        }
-        case 'copySnippet': {
-          if (!SNIPPET_FORMATS.includes(msg.format)) fail('copySnippet', `unknown format ${JSON.stringify(msg.format)}`);
-          const ex = this.exchangeOrThrow(checkId(msg.id, 'copySnippet'));
-          if (!this.deps.copyToClipboard) throw new Error('Copying is not available in this editor.');
-          // The user's own clipboard: unredacted (CONTRACTS §9.3).
-          await this.deps.copyToClipboard(snippetFor(ex, msg.format, { grpc: this.deps.grpc, projectRoot: this.deps.projectRoot?.() }));
-          return;
-        }
-        case 'setNetworkProfile':
-          this.setNetworkProfile(msg.profile);
-          return;
-        case 'pickModel':
-          await this.pickModel(this.exchangeOrThrow(checkId(msg.id, 'pickModel')));
-          return;
-        case 'openViolation': {
-          const id = checkId(msg.id, 'openViolation');
-          const r = this.contractResults.get(id);
-          if (!r) throw new Error('This request has no contract check result (yet).');
-          if (!isInt(msg.index, 0, Math.max(0, r.violations.length - 1)) || !r.violations.length) fail('openViolation', 'index is out of range');
-          const v = r.violations[msg.index];
-          if (!v.file) throw new Error(`The source file of model ${v.model} is unknown.`);
-          if (!this.deps.openLocation) throw new Error('Opening files is not available in this editor.');
-          await this.deps.openLocation(v.file, v.line ?? 1);
-          return;
-        }
-        case 'mutateField':
-          this.mutateField(this.exchangeOrThrow(checkId(msg.id, 'mutateField')), msg);
-          return;
-        case 'generateModel':
-          await this.generateModel(this.exchangeOrThrow(checkId(msg.id, 'generateModel')));
-          return;
-        case 'generateFixture':
-          await this.generateFixture(this.exchangeOrThrow(checkId(msg.id, 'generateFixture')));
-          return;
-        // ---- CONTRACTS §12.7
-        case 'shareRule':
-          if (typeof msg.shared !== 'boolean') fail('shareRule', 'shared must be a boolean');
-          await this.shareRule(checkId(msg.id, 'shareRule'), msg.shared);
-          return;
-        case 'approveSharedRules':
-          await this.approveSharedRules();
-          return;
-        case 'openSharedRules':
-          if (!this.deps.openSharedRules) throw new Error('Shared rules need a workspace folder (.vscode/flutter-intercept.json).');
-          await this.deps.openSharedRules();
-          return;
-        case 'openBodyFile': {
-          const p = checkBodyFile(msg.path, 'openBodyFile', 'path');
-          let create: { content: string } | undefined;
-          if (msg.create !== undefined) {
-            if (!isObj(msg.create)) fail('openBodyFile', 'create must be an object {content}');
-            onlyKeys(msg.create, ['content'], 'openBodyFile.create');
-            const content = msg.create.content;
-            if (typeof content !== 'string') fail('openBodyFile', 'create.content must be a string');
-            if (Buffer.byteLength(content, 'utf8') > MAX_BODY_FILE_BYTES) fail('openBodyFile', 'create.content must be at most 5 MB');
-            create = { content };
-          }
-          const ruleId = checkRuleId(msg.ruleId, 'openBodyFile');
-          if (!this.deps.openBodyFile) throw new Error('Opening body files is not available in this editor.');
-          await this.deps.openBodyFile(p, create, ruleId);
-          return;
-        }
-        case 'saveRecording':
-          await this.saveRecording(msg);
-          return;
-        case 'replayRecording':
-          await this.replayRecording(msg.id === undefined ? undefined : checkId(msg.id, 'replayRecording'), msg.fallback);
-          return;
-        case 'diffRecordings': {
-          const { recordings } = this.recordingsOrThrow();
-          if (!this.deps.openDiff) throw new Error('Comparing recordings is not available in this editor.');
-          const a = checkId(msg.a, 'diffRecordings');
-          const b = checkId(msg.b, 'diffRecordings');
-          if (a === b) fail('diffRecordings', 'pick two different recordings');
-          const [ra, rb] = await Promise.all([recordings.load(a), recordings.load(b)]);
-          await this.deps.openDiff(ra, rb);
-          return;
-        }
-        case 'deleteRecording':
-          await this.deleteRecording(checkId(msg.id, 'deleteRecording'));
-          return;
-        case 'expireToken':
-          this.expireToken(msg.url, msg.count);
-          return;
-        // ---- CONTRACTS §13.7
-        case 'export': {
-          const file = await this.exportTraffic(msg.format, msg.ids);
-          if (file) this.send(reply, { type: 'exported', format: msg.format, path: file });
-          return;
-        }
-        case 'openScriptFile': {
-          const p = checkScriptFile(msg.path, 'openScriptFile', 'path');
-          const ruleId = checkRuleId(msg.ruleId, 'openScriptFile');
-          let create: { content: string } | undefined;
-          if (msg.create !== undefined) {
-            if (!isObj(msg.create)) fail('openScriptFile', 'create must be an object {content}');
-            onlyKeys(msg.create, ['content'], 'openScriptFile.create');
-            const content = msg.create.content;
-            if (typeof content !== 'string') fail('openScriptFile', 'create.content must be a string');
-            if (Buffer.byteLength(content, 'utf8') > MAX_SCRIPT_BYTES) fail('openScriptFile', 'create.content must be at most 256 KB');
-            // Empty content: the starter template, naming the rule that uses this file (if one does).
-            const owner = this.deps.host.getRules().find((r) => (ruleId !== undefined ? r.id === ruleId : scriptFileOf(r) === p));
-            create = { content: content.trim() ? content : scriptTemplate(owner) };
-          }
-          if (!this.deps.openScriptFile) throw new Error('Opening script files is not available in this editor.');
-          await this.deps.openScriptFile(p, create, ruleId);
-          return;
-        }
-        case 'openInNewWindow':
-          if (!this.deps.openInNewWindow) throw new Error('Opening the traffic view in a new window is not available in this editor.');
-          await this.deps.openInNewWindow();
-          return;
-        // ---- CONTRACTS §16.4
-        case 'decodeGrpc': {
-          const id = checkId(msg.id, 'decodeGrpc');
-          const answer: GrpcDecodedMsg = { type: 'grpcDecoded', id, decoded: this.decodeGrpc(id) };
-          this.send(reply, answer as unknown as HostMsg);
-          return;
-        }
-        default:
-          return;
-      }
+      await handler(msg, reply);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       this.deps.log?.(`webview action ${msg.type} failed: ${message}`);
       this.send(reply, { type: 'error', message });
     }
   }
+
 
   /**
    * CONTRACTS §13.6: focus one exchange in every attached view (a notification's "Show"). Pending updates are flushed
@@ -2115,7 +731,8 @@ export class InterceptController {
 
   // ------------------------------------------------------------------ CONTRACTS §12.4 recordings, §12.3 presets
 
-  private recordingsOrThrow(): { recordings: RecordingService } {
+  /** @internal (handlers) */
+  recordingsOrThrow(): { recordings: RecordingService } {
     if (!this.deps.recordings) throw new Error('Recordings are not available (open the Flutter project folder).');
     return { recordings: this.deps.recordings };
   }
@@ -2132,7 +749,8 @@ export class InterceptController {
   }
 
   /** `saveRecording`: the finished HTTP exchanges shown (or the given ids). Unredacted unless `redact` (the user's own file). */
-  private async saveRecording(msg: { name?: unknown; ids?: unknown; redact?: unknown }): Promise<void> {
+  /** @internal (handlers) */
+  async saveRecording(msg: { name?: unknown; ids?: unknown; redact?: unknown }): Promise<void> {
     const { recordings } = this.recordingsOrThrow();
     if (typeof msg.name !== 'string' || !msg.name.trim() || msg.name.length > 200) fail('saveRecording', 'name must be 1–200 characters');
     if (msg.redact !== undefined && typeof msg.redact !== 'boolean') fail('saveRecording', 'redact must be a boolean');
@@ -2164,7 +782,8 @@ export class InterceptController {
     this.broadcastStatus();
   }
 
-  private async deleteRecording(id: string): Promise<void> {
+  /** @internal (handlers) */
+  async deleteRecording(id: string): Promise<void> {
     const { recordings } = this.recordingsOrThrow();
     if (this.deps.host.replay?.id === id) this.deps.host.setReplay?.(undefined);
     await recordings.remove(id);
@@ -2282,7 +901,8 @@ export class InterceptController {
   }
 
   /** Queues a finished JSON exchange for checking (once per id). */
-  private maybeCheck(e: Exchange): void {
+  /** @internal (handlers) */
+  maybeCheck(e: Exchange): void {
     if (!this.contractOn || !isCheckable(e)) return;
     if (this.contractResults.has(e.id) || this.contractRunning.has(e.id)) return;
     this.contractQueue.set(e.id, e);
@@ -2326,7 +946,8 @@ export class InterceptController {
     }
   }
 
-  private async pickModel(ex: Exchange): Promise<void> {
+  /** @internal (handlers) */
+  async pickModel(ex: Exchange): Promise<void> {
     if (!this.deps.contract) throw new Error('Contract checking is not available.');
     if (!this.deps.pickModel) throw new Error('Choosing a model is not available in this editor.');
     const choice = await this.deps.pickModel(ex);
@@ -2342,7 +963,8 @@ export class InterceptController {
     if (r) this.flush();
   }
 
-  private mutateField(ex: Exchange, msg: { path?: unknown; op?: unknown; value?: unknown; valueJson?: unknown }): void {
+  /** @internal (handlers) */
+  mutateField(ex: Exchange, msg: { path?: unknown; op?: unknown; value?: unknown; valueJson?: unknown }): void {
     const ro = readOnlyReason(ex);
     if (ro) throw new Error(`Can't change the next responses of this request: ${ro}.`);
     if (ex.kind === 'websocket' || ex.kind === 'sse') throw new Error(`Can't change fields of a ${ex.kind === 'sse' ? 'server-sent event stream' : 'WebSocket'}: mutation rules apply to JSON responses.`);
@@ -2375,7 +997,8 @@ export class InterceptController {
     return { codegen: this.deps.codegen, open: this.deps.openUntitled };
   }
 
-  private async generateModel(ex: Exchange): Promise<void> {
+  /** @internal (handlers) */
+  async generateModel(ex: Exchange): Promise<void> {
     const { codegen, open } = this.codegenOrThrow();
     const json = decodeSample(ex.responseBody);
     if (!json.ok) throw new Error(`Can't generate a model from this response: ${json.reason}.`);
@@ -2396,7 +1019,8 @@ export class InterceptController {
     await open(files);
   }
 
-  private async generateFixture(ex: Exchange): Promise<void> {
+  /** @internal (handlers) */
+  async generateFixture(ex: Exchange): Promise<void> {
     const { codegen, open } = this.codegenOrThrow();
     if (ex.status === undefined || !FINAL_STATES.has(ex.state)) throw new Error('This request has no finished response to turn into a fixture.');
     const template = (p: string) => codegen.routeTemplate(p);
@@ -2420,7 +1044,8 @@ export class InterceptController {
     await open(files);
   }
 
-  private exchangeOrThrow(id: string): Exchange {
+  /** @internal (handlers) */
+  exchangeOrThrow(id: string): Exchange {
     const ex = this.deps.host.getExchanges().find((e) => e.id === id);
     if (!ex) throw new Error('That exchange is no longer available.');
     return ex;
@@ -2454,7 +1079,8 @@ export class InterceptController {
     }
   }
 
-  private newRuleId(): string {
+  /** @internal (handlers) */
+  newRuleId(): string {
     return this.deps.newRuleId?.() ?? `rule_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   }
 
@@ -2492,7 +1118,8 @@ export class InterceptController {
     this.timer = setTimeout(() => this.flush(), ms);
   }
 
-  private flush(): void {
+  /** @internal (handlers) */
+  flush(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     if (this.rulesDirty) {
@@ -2543,7 +1170,8 @@ export class InterceptController {
     for (const s of this.sinks) this.send(s, msg);
   }
 
-  private send(sink: Sink, msg: HostMsg): void {
+  /** @internal (handlers) */
+  send(sink: Sink, msg: HostMsg): void {
     this.sentCounts[msg.type] = (this.sentCounts[msg.type] ?? 0) + 1;
     try {
       sink(msg);

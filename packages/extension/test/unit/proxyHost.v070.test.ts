@@ -4,6 +4,7 @@ import { EventEmitter } from 'events';
 import { describe, expect, it } from 'vitest';
 import type { InterceptProxyOptions, Rule } from '@flutter-intercept/proxy';
 import { filesOf, InterceptProxyHost, scriptFilesOf } from '../../src/proxyHost';
+import { withFakeProxy } from './proxy.fakes';
 
 function factory(made: { rules: Rule[] }[]) {
   return (opts: InterceptProxyOptions) => {
@@ -39,7 +40,7 @@ describe('script.file resolution (CONTRACTS §13.4)', () => {
 
   it('reads files into code with the rule id, keeps authored rules, skips unreadable / unapproved ones with a warning', async () => {
     const made: { rules: Rule[] }[] = [];
-    const host = new InterceptProxyHost({ getPort: () => port++, factory: factory(made) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => port++, factory: factory(made) }));
     const files: Record<string, string> = { 's/a.js': 'function onRequest(r){return r}' };
     const asked: [string, string][] = [];
     host.setScriptFileResolver(async (p, ruleId) => {
@@ -76,7 +77,7 @@ describe('script.file resolution (CONTRACTS §13.4)', () => {
 
   it('without a resolver, file-backed scripts never reach the proxy (no empty code)', async () => {
     const made: { rules: Rule[] }[] = [];
-    const host = new InterceptProxyHost({ getPort: () => port++, factory: factory(made) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => port++, factory: factory(made) }));
     await host.start();
     host.setRules([script('a', 's/a.js')]);
     await host.rulesReady();
@@ -90,7 +91,7 @@ describe('script.file resolution (CONTRACTS §13.4)', () => {
 
   it('body files get the rule id too', async () => {
     const made: { rules: Rule[] }[] = [];
-    const host = new InterceptProxyHost({ getPort: () => port++, factory: factory(made) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => port++, factory: factory(made) }));
     const asked: [string, string][] = [];
     host.setBodyFileResolver(async (p, ruleId) => (asked.push([p, ruleId]), `{"from":"${ruleId}"}`));
     await host.start();

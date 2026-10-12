@@ -10,6 +10,7 @@ import { ensureDirInside, EXPORT_DIR, writeHar } from '../../src/agent/har';
 import { InterceptProxyHost, upstreamDisplay } from '../../src/proxyHost';
 import { ControllerHost, InterceptController, MAX_REWRITE_REPLACE, validateRule } from '../../src/ui/controller';
 import type { HostMsg } from '../../src/ui/protocol';
+import { withFakeProxy } from './proxy.fakes';
 
 vi.mock('vscode', () => ({}));
 
@@ -54,7 +55,7 @@ describe('#1 upstream proxy display', () => {
         },
       };
     };
-    const host = new InterceptProxyHost({ getPort: () => 7700, factory });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => 7700, factory }));
     const events: unknown[] = [];
     host.on('upstream', (i) => events.push(i));
     host.setUpstreamProxy({ url: 'http://127.0.0.1:8888', ignoreCertErrors: true });

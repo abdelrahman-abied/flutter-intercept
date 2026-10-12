@@ -9,8 +9,8 @@
  * - CA: the per-install CA from `getCa` (src/ca.ts) signs the proxy's leaf certificates; generated
  *   entries trust exactly that CA, so it must be the same object for every start.
  * - CONTRACTS §9.2/9.4: forwards `send`, the network profile and the app package names (all re-applied
- *   when the proxy restarts) and re-emits `rule-spent`. Every new proxy member is optional, so an older
- *   proxy build degrades to a clear "not supported" error instead of crashing.
+ *   when the proxy restarts) and re-emits `rule-spent`. The proxy is always bundled with the host (QUALITY-1 Q4): no
+ *   "older proxy build" fallbacks.
  * - CONTRACTS §11.4: forwards `record` / `update` (read-only exchanges from the app's HTTP profile) and keeps the
  *   per-session `SessionWarning`s (`setWarnings`, `warnings`, event 'warnings'); `vmHostDeps()` hands both to
  *   the VM watcher (src/vm/**).
@@ -37,10 +37,12 @@
  */
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
-import { parseHostPattern, type ClientCertificate, type Exchange, type GrpcProxyCodec, type InterceptProxyOptions, type ReplayEntry, type ReplayOptions, type Rule, type RuleAction, type SendRequest } from '@flutter-intercept/proxy';
+import type { ClientCertificate, Exchange, GrpcBreakerEvent, GrpcEdit, RequestEdit, ResponseEdit, GrpcProxyCodec, InterceptProxy, InterceptProxyOptions, ReplayEntry, ReplayOptions, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
+// PERF-1 #1: the dependency-free subpath, so activation never evaluates the proxy (and mockttp).
+import { parseHostPattern } from '@flutter-intercept/proxy/hosts';
+import { targetsProxy } from '@flutter-intercept/proxy/grpc-meta';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 import type { GrpcMessageEncoder } from './grpc/service';
-import { isLoopbackTarget } from './rules/policy';
 import type { SessionWarning } from './ui/protocol';
 import type { VmHostDeps } from './vm/types';
 
@@ -52,58 +54,19 @@ export interface ProxyHost {
   readonly running: boolean;
 }
 
-/** The subset of InterceptProxy the host uses (lets tests inject a fake). */
-export interface ProxyLike {
-  start(): Promise<void>;
-  stop(): Promise<void>;
-  readonly port: number;
-  setRules(rules: Rule[]): void;
-  getExchanges(): Exchange[];
-  clear(): void;
-  resume(id: string, edit?: unknown): void;
-  abort(id: string): void;
-  on(event: 'exchange', l: (e: Exchange) => void): unknown;
-  on(event: 'removed', l: (ids: string[]) => void): unknown;
-  // CONTRACTS §7 (LAN mode). Optional so an older proxy build degrades to "LAN unsupported".
-  openLan?(opts: { host: string; token: string; port?: number }): Promise<{ host: string; port: number }>;
-  closeLan?(): Promise<void>;
-  readonly lan?: { host: string; port: number };
-  /** Review 2 #2: the peer IP the LAN listener is pinned to (first authenticated device), if any. */
-  readonly lanPeer?: string;
-  // CONTRACTS §9.2. Optional: older proxy builds lack them.
-  send?(req: SendRequest): Promise<{ id: string }>;
-  setNetworkProfile?(p: NetworkProfile): void;
-  setAppPackages?(names: string[]): void;
-  on(event: 'rule-spent', l: (ruleId: string, reason: 'times' | 'expired') => void): unknown;
-  on(event: 'rule-hit', l: (ruleId: string, used: number) => void): unknown;
-  // CONTRACTS §11.4. Optional: older proxy builds can't hold read-only (VM profile) exchanges.
-  record?(ex: Omit<Exchange, 'id'>): string;
-  update?(id: string, patch: Partial<Exchange>): void;
-  // CONTRACTS §11.3: while a web session runs, the browser's own traffic is marked `browserInternal`.
-  setWebSessionActive?(active: boolean): void;
-  // CONTRACTS §12. Optional: older proxy builds lack them. `name` (the recording's) is for `simulated` labels.
-  setReplay?(entries: ReplayEntry[] | undefined, opts: ReplayOptions & { name?: string }): void;
-  resetSequences?(): void;
-  setUpstreamProxy?(cfg: UpstreamProxy | undefined): void;
-  /** The upstream proxy in use (`http://host:port`, never credentials). */
-  readonly upstreamProxy?: { url: string; ignoreCertErrors: boolean };
-  // CONTRACTS §14.2 / §14.3. Optional: older proxy builds lack them (the host then logs and shows a problem).
-  /** Newer builds return what they accepted (REVIEW-8 #4); older ones return nothing and throw on a bad pattern. */
-  setTlsPassthrough?(hosts: string[]): void | { hosts: string[]; problems: string[] };
-  /** The passthrough patterns in effect. */
-  readonly tlsPassthrough?: string[];
-  setClientCertificates?(certs: ClientCertificate[]): void;
-  // CONTRACTS §16.2. Optional: older proxy builds lack them (the host then reports a problem).
-  setGrpcDecryptHosts?(hosts: string[]): void | { hosts: string[]; problems: string[] };
-  /** The gRPC self-check of the mockttp internals the silent tunnels use. */
-  grpcSupport?(): { ok: boolean; problem?: string };
-  /** CONTRACTS §19.3: decrypt every TLS silent gRPC tunnel (but tlsPassthrough hosts): the app's simulator trusts our CA. */
-  setGrpcDecryptAll?(on: boolean): void;
-  /** CONTRACTS §17.3: protobuf decode / encode for gRPC mutate rules and breakpoint edits (undefined = none). */
-  setGrpcCodec?(codec?: GrpcProxyCodec): void;
-  /** CONTRACTS §16.8: the entry's breaker sent an app's gRPC connections to an authority direct (`{authority, viaLan}`). */
-  on(event: 'grpcBreaker', l: (info: unknown) => void): unknown;
-}
+/**
+ * QUALITY-1 Q4: the subset of InterceptProxy the host uses (tests inject a fake with the same shape:
+ * test/unit/proxy.fakes.ts). The proxy is always bundled with the host, so nothing here is optional.
+ */
+export type ProxyLike = Pick<
+  InterceptProxy,
+  | 'start' | 'stop' | 'port' | 'setRules' | 'getExchanges' | 'clear' | 'resume' | 'abort' | 'on'
+  | 'openLan' | 'closeLan' | 'lan' | 'lanPeer'
+  | 'send' | 'setNetworkProfile' | 'setAppPackages' | 'record' | 'update' | 'setWebSessionActive'
+  | 'setReplay' | 'resetSequences' | 'setUpstreamProxy' | 'upstreamProxy'
+  | 'setTlsPassthrough' | 'tlsPassthrough' | 'setClientCertificates'
+  | 'setGrpcDecryptHosts' | 'grpcSupport' | 'setGrpcDecryptAll' | 'setGrpcCodec'
+>;
 
 /** REVIEW-6 #1: `host:port` of an upstream proxy URL — never user info, path or query. */
 export function upstreamDisplay(url: string | undefined): string | undefined {
@@ -356,13 +319,11 @@ export function filesOf(rule: Rule): string[] {
   return [...bodyFilesOf(rule), ...scriptFilesOf(rule)];
 }
 
-/** Host names that reach this machine from the app: loopback, the emulators' aliases, any-address. */
-const SELF_ALIASES = new Set(['10.0.2.2', '10.0.3.2', '0.0.0.0', '[::]', '::']);
-
 /**
  * CONTRACTS §18.6 / REVIEW-12 #1: why a Map Remote target would send traffic back into the proxy itself (a relay loop),
  * or undefined. `ports` = the proxy's listening ports (loopback listener, configured port, LAN listener); `hosts` = extra
- * host names of its listeners (the LAN address).
+ * host names of its listeners (the LAN address). grpc-meta's `targetsProxy` (this machine on an own port), plus the LAN
+ * address.
  */
 export function mapRemoteSelfProblem(to: string, own: { ports: readonly (number | undefined)[]; hosts?: readonly (string | undefined)[] }): string | undefined {
   let u: URL;
@@ -371,11 +332,11 @@ export function mapRemoteSelfProblem(to: string, own: { ports: readonly (number 
   } catch {
     return undefined;
   }
-  const host = u.hostname.toLowerCase();
-  const self = isLoopbackTarget(to) || SELF_ALIASES.has(host) || own.hosts?.some((h) => !!h && h.toLowerCase() === host.replace(/^\[|\]$/g, ''));
+  const ports = own.ports.filter((p): p is number => typeof p === 'number');
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const port = Number(u.port) || (u.protocol === 'https:' || u.protocol === 'wss:' ? 443 : 80);
+  const self = targetsProxy(to, ports) || (ports.includes(port) && !!own.hosts?.some((h) => !!h && h.toLowerCase() === host));
   if (!self) return undefined;
-  const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
-  if (!own.ports.some((p) => p === port)) return undefined;
   return `its target ${u.protocol}//${u.host} is Flutter Intercept's own proxy port: the requests would loop back into the proxy`;
 }
 
@@ -492,7 +453,6 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private lanBusy: Promise<unknown> = Promise.resolve();
   /** CONTRACTS §11.4: warnings per debug session id (insertion order kept). */
   private readonly sessionWarnings = new Map<string, SessionWarning[]>();
-  private recordUnsupportedLogged = false;
   private webSessionActive = false;
   // CONTRACTS §12
   /** What the proxy actually got: `rules` with file-backed bodies resolved (rules whose file failed are left out). */
@@ -512,21 +472,16 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   /** Loaded certificates (key material: re-applied after a restart, never logged or emitted). */
   private clientCerts: ClientCertificate[] = [];
   private clientCertStatus: ClientCertificateStatus[] = [];
-  private tlsUnsupportedLogged = false;
   /** REVIEW-8 #4 / #12: setting problems shown in Status.warnings (`upstream`, `tlsPassthrough`). */
   private configWarnings = new Map<string, SessionWarning>();
-  private certsUnsupportedLogged = false;
   // CONTRACTS §16
   private grpcHosts: string[] = [];
   private grpcSettingProblems: string[] = [];
-  private grpcHostsUnsupportedLogged = false;
   private grpcCheck?: { ok: boolean; problem?: string };
   private grpcEncoder?: GrpcMessageEncoder;
   private grpcCodec?: GrpcProxyCodec;
-  private grpcCodecUnsupportedLogged = false;
   // CONTRACTS §19.3
   private decryptAll = false;
-  private decryptAllUnsupportedLogged = false;
   private simDevices: SimulatorTrustDevice[] = [];
   /** §16.8 breaker warnings by authority (insertion order kept). */
   private readonly breakerWarnings = new Map<string, SessionWarning>();
@@ -591,12 +546,12 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       proxy.setRules(this.proxyRules);
       if (this.upstream) {
         try {
-          proxy.setUpstreamProxy?.(this.upstream);
+          proxy.setUpstreamProxy(this.upstream);
         } catch (e) {
           // e.g. it points at this proxy: report it, go direct, never fail the start over it
           this.opts.log?.(`upstream proxy not used: ${e instanceof Error ? e.message : String(e)}`);
           try {
-            proxy.setUpstreamProxy?.(undefined);
+            proxy.setUpstreamProxy(undefined);
           } catch {
             // nothing more to do
           }
@@ -619,13 +574,13 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       const recheck = this.rules.some((r) => mapTargets(r).length > 0);
       this.applyReplay(proxy);
       if (this.profile.kind !== 'none') this.applyProfile(proxy); // a new proxy starts with none
-      if (this.appPackages.length) proxy.setAppPackages?.(this.appPackages);
-      if (this.webSessionActive) proxy.setWebSessionActive?.(true);
+      if (this.appPackages.length) proxy.setAppPackages(this.appPackages);
+      if (this.webSessionActive) proxy.setWebSessionActive(true);
       proxy.on('exchange', (e) => this.emit('exchange', e));
       proxy.on('removed', (ids) => this.emit('removed', ids));
       proxy.on('rule-spent', (ruleId, reason) => this.emit('rule-spent', ruleId, reason));
       proxy.on('rule-hit', (ruleId, used) => this.emit('rule-hit', ruleId, used));
-      proxy.on('grpcBreaker', (info) => this.onGrpcBreaker(info));
+      proxy.on('grpcBreaker', (info: GrpcBreakerEvent) => this.onGrpcBreaker(info));
       this.proxy = proxy;
       if (this.setConfigWarningLater !== undefined) {
         this.setConfigWarning('tlsPassthrough', this.setConfigWarningLater || undefined);
@@ -650,7 +605,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     const proxy = this.proxy;
     if (this.lanState) {
       this.lanState = undefined;
-      await proxy?.closeLan?.().catch(() => undefined);
+      await proxy?.closeLan().catch(() => undefined);
       this.emit('lan', undefined);
     }
     this.proxy = undefined;
@@ -691,7 +646,6 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       await this.start();
       const proxy = this.proxy;
       if (!proxy) throw new Error('proxy is not running');
-      if (!proxy.openLan) throw new Error('this proxy build does not support LAN mode');
       if (this.lanState) {
         if (this.lanState.host === host) return this.lanState;
         if (!(this.opts.canReopenLan?.() ?? false)) {
@@ -737,7 +691,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     this.lanState = undefined;
     this.lastLanPeer = undefined;
     try {
-      await this.proxy?.closeLan?.();
+      await this.proxy?.closeLan();
       this.opts.log?.('LAN listener closed');
     } finally {
       this.emit('lan', undefined);
@@ -801,11 +755,6 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   }
 
   private applyGrpcCodec(proxy: ProxyLike): void {
-    if (!proxy.setGrpcCodec) {
-      if (this.grpcCodec && !this.grpcCodecUnsupportedLogged) this.opts.log?.('this proxy build cannot mutate gRPC messages (no setGrpcCodec)');
-      this.grpcCodecUnsupportedLogged = true;
-      return;
-    }
     try {
       proxy.setGrpcCodec(this.grpcCodec);
     } catch (e) {
@@ -965,11 +914,10 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     if (!entries) {
       const had = !!this.replayState;
       this.replayState = undefined;
-      this.proxy?.setReplay?.(undefined, { fallback: 'passthrough' });
+      this.proxy?.setReplay(undefined, { fallback: 'passthrough' });
       if (had) this.emit('replay', undefined);
       return;
     }
-    if (this.proxy && !this.proxy.setReplay) throw new Error('This proxy build cannot replay recordings.');
     const fallback = opts.fallback === 'fail' ? 'fail' : 'passthrough';
     this.replayState = {
       ...(meta.id !== undefined ? { id: meta.id } : {}),
@@ -986,18 +934,12 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private applyReplay(proxy: ProxyLike): void {
     const r = this.replayState;
     if (!r) return;
-    if (!proxy.setReplay) {
-      this.opts.log?.('this proxy build cannot replay recordings: replay stopped');
-      this.replayState = undefined;
-      this.emit('replay', undefined);
-      return;
-    }
     proxy.setReplay(r.list, { ...r.opts, name: r.recording });
   }
 
-  /** CONTRACTS §12.3: restart every sequence rule at its first step (no-op on older proxy builds). */
+  /** CONTRACTS §12.3: restart every sequence rule at its first step. */
   resetSequences(): void {
-    this.proxy?.resetSequences?.();
+    this.proxy?.resetSequences();
   }
 
   /**
@@ -1017,10 +959,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     this.upstream = next;
     this.upstreamSource = nextSource;
     const proxy = this.proxy;
-    if (proxy) {
-      if (proxy.setUpstreamProxy) proxy.setUpstreamProxy(next);
-      else this.opts.log?.('this proxy build cannot change the upstream proxy while running: it applies when the proxy restarts');
-    }
+    proxy?.setUpstreamProxy(next);
     this.emit('upstream', this.upstreamProxyInfo);
   }
 
@@ -1077,28 +1016,22 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
    * applies when it starts. A copy.
    */
   get tlsPassthrough(): string[] {
-    const live = this.proxy?.setTlsPassthrough ? this.proxy.tlsPassthrough : undefined;
+    const live = this.proxy?.tlsPassthrough;
     return [...(Array.isArray(live) ? live : this.tlsHosts)];
   }
 
   /** Applies the list; returns the proxy's problems (patterns it dropped or refused). */
   private applyTlsPassthrough(proxy: ProxyLike): string[] {
-    if (proxy.setTlsPassthrough) {
-      try {
-        const r = proxy.setTlsPassthrough([...this.tlsHosts]);
-        const problems = r && Array.isArray(r.problems) ? r.problems.map((p) => `flutterIntercept.tlsPassthrough: ${String(p).slice(0, 300)}`) : [];
-        for (const p of problems) this.opts.log?.(p);
-        return problems;
-      } catch (e) {
-        const msg = `TLS passthrough not applied (the previous list stays in effect): ${e instanceof Error ? e.message : String(e)}`;
-        this.opts.log?.(msg);
-        return [msg];
-      }
-    } else if (this.tlsHosts.length && !this.tlsUnsupportedLogged) {
-      this.tlsUnsupportedLogged = true;
-      this.opts.log?.('this proxy build cannot pass TLS through: flutterIntercept.tlsPassthrough is ignored');
+    try {
+      const r = proxy.setTlsPassthrough([...this.tlsHosts]);
+      const problems = r && Array.isArray(r.problems) ? r.problems.map((p) => `flutterIntercept.tlsPassthrough: ${String(p).slice(0, 300)}`) : [];
+      for (const p of problems) this.opts.log?.(p);
+      return problems;
+    } catch (e) {
+      const msg = `TLS passthrough not applied (the previous list stays in effect): ${e instanceof Error ? e.message : String(e)}`;
+      this.opts.log?.(msg);
+      return [msg];
     }
-    return [];
   }
 
   // ------------------------------------------------------------------ CONTRACTS §16 (gRPC)
@@ -1139,11 +1072,6 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   }
 
   private applyGrpcDecryptAll(proxy: ProxyLike): void {
-    if (!proxy.setGrpcDecryptAll) {
-      if (this.decryptAll && !this.decryptAllUnsupportedLogged) this.opts.log?.('this proxy build cannot decrypt TLS gRPC for every host: only flutterIntercept.grpc.decryptHosts are decrypted');
-      this.decryptAllUnsupportedLogged = true;
-      return;
-    }
     try {
       proxy.setGrpcDecryptAll(this.decryptAll);
     } catch (e) {
@@ -1201,7 +1129,6 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   }
 
   private readGrpcSupport(proxy: ProxyLike): { ok: boolean; problem?: string } {
-    if (!proxy.grpcSupport) return { ok: false, problem: 'this proxy build cannot intercept gRPC: gRPC calls are not shown' };
     try {
       const r = proxy.grpcSupport();
       if (r && r.ok === true) return { ok: true };
@@ -1220,7 +1147,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
    * Shown as a `bypass` session warning until the debug sessions end. The payload comes from the proxy: checked and
    * capped, never trusted as markup.
    */
-  private onGrpcBreaker(info: unknown): void {
+  private onGrpcBreaker(info: GrpcBreakerEvent | unknown): void {
     const raw = info && typeof info === 'object' ? (info as { authority?: unknown }).authority : undefined;
     if (typeof raw !== 'string') return;
     const authority = raw.replace(/[\0-\x1f\x7f]+/g, '').trim().slice(0, 300);
@@ -1250,22 +1177,16 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
 
   /** Applies the decrypt list; returns the proxy's problems (patterns it dropped or refused). */
   private applyGrpcDecryptHosts(proxy: ProxyLike): string[] {
-    if (proxy.setGrpcDecryptHosts) {
-      try {
-        const r = proxy.setGrpcDecryptHosts([...this.grpcHosts]);
-        const problems = r && Array.isArray(r.problems) ? r.problems.map((p) => `flutterIntercept.grpc.decryptHosts: ${String(p).slice(0, 300)}`) : [];
-        for (const p of problems) this.opts.log?.(p);
-        return problems;
-      } catch (e) {
-        const msg = `gRPC decrypt hosts not applied (the previous list stays in effect): ${e instanceof Error ? e.message : String(e)}`;
-        this.opts.log?.(msg);
-        return [msg];
-      }
-    } else if (this.grpcHosts.length && !this.grpcHostsUnsupportedLogged) {
-      this.grpcHostsUnsupportedLogged = true;
-      this.opts.log?.('this proxy build cannot decrypt gRPC: flutterIntercept.grpc.decryptHosts is ignored');
+    try {
+      const r = proxy.setGrpcDecryptHosts([...this.grpcHosts]);
+      const problems = r && Array.isArray(r.problems) ? r.problems.map((p) => `flutterIntercept.grpc.decryptHosts: ${String(p).slice(0, 300)}`) : [];
+      for (const p of problems) this.opts.log?.(p);
+      return problems;
+    } catch (e) {
+      const msg = `gRPC decrypt hosts not applied (the previous list stays in effect): ${e instanceof Error ? e.message : String(e)}`;
+      this.opts.log?.(msg);
+      return [msg];
     }
-    return [];
   }
 
   /** REVIEW-8 #4 / #12: one Status warning per setting with problems (undefined text = clear it). */
@@ -1291,7 +1212,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     if (this.proxy) this.applyClientCertificates(this.proxy);
     else if (this.clientCerts.length) this.opts.log?.(`${this.clientCerts.length} client certificate(s) apply when the proxy starts`);
     const before = JSON.stringify(this.clientCertStatus);
-    this.clientCertStatus = this.withSupportProblem(st);
+    this.clientCertStatus = st;
     if (JSON.stringify(this.clientCertStatus) !== before) this.emit('clientCertificates', this.clientCertificateStatus);
   }
 
@@ -1300,23 +1221,12 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     return this.clientCertStatus.map((s) => ({ ...s }));
   }
 
-  /** A running proxy build without mTLS support: every loaded certificate gets that problem. */
-  private withSupportProblem(st: ClientCertificateStatus[]): ClientCertificateStatus[] {
-    if (!this.proxy || this.proxy.setClientCertificates) return st;
-    return st.map((s) => (s.problem ? s : { ...s, problem: 'this proxy build cannot present client certificates' }));
-  }
-
   private applyClientCertificates(proxy: ProxyLike): void {
-    if (proxy.setClientCertificates) {
-      try {
-        proxy.setClientCertificates([...this.clientCerts]);
-      } catch (e) {
-        // never include the certificate objects in the message
-        this.opts.log?.(`client certificates not applied: ${e instanceof Error ? e.message.slice(0, 200) : 'error'}`);
-      }
-    } else if (this.clientCerts.length && !this.certsUnsupportedLogged) {
-      this.certsUnsupportedLogged = true;
-      this.opts.log?.('this proxy build cannot present client certificates: flutterIntercept.clientCertificates is ignored');
+    try {
+      proxy.setClientCertificates([...this.clientCerts]);
+    } catch (e) {
+      // never include the certificate objects in the message
+      this.opts.log?.(`client certificates not applied: ${e instanceof Error ? e.message.slice(0, 200) : 'error'}`);
     }
   }
 
@@ -1348,7 +1258,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     this.proxy?.clear();
   }
 
-  resume(id: string, edit?: unknown): void {
+  resume(id: string, edit?: RequestEdit | ResponseEdit | GrpcEdit): void {
     this.proxy?.resume(id, edit);
   }
 
@@ -1360,7 +1270,6 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     await this.start();
     const proxy = this.proxy;
     if (!proxy) throw new Error('The proxy is not running.');
-    if (!proxy.send) throw new Error('This proxy build cannot send requests.');
     return proxy.send(req);
   }
 
@@ -1370,20 +1279,18 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   }
 
   setNetworkProfile(p: NetworkProfile): void {
-    if (p.kind !== 'none' && this.proxy && !this.proxy.setNetworkProfile) throw new Error('This proxy build cannot simulate network conditions.');
     this.profile = p;
     if (this.proxy) this.applyProfile(this.proxy);
   }
 
   private applyProfile(proxy: ProxyLike): void {
-    if (proxy.setNetworkProfile) proxy.setNetworkProfile(this.profile);
-    else if (this.profile.kind !== 'none') this.opts.log?.('this proxy build cannot simulate network conditions: profile ignored');
+    proxy.setNetworkProfile(this.profile);
   }
 
   /** App package names (pubspec `name`s) → the proxy prefers their frames as `appFrame`. */
   setAppPackages(names: string[]): void {
     this.appPackages = [...new Set(names.filter((n) => typeof n === 'string' && n.length > 0))];
-    this.proxy?.setAppPackages?.(this.appPackages);
+    this.proxy?.setAppPackages(this.appPackages);
   }
 
   abort(id: string): void {
@@ -1392,11 +1299,11 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
 
   /**
    * CONTRACTS §11.3: whether a Flutter Web session is running (the proxy then marks the browser's own requests
-   * `browserInternal`). Kept here and re-applied when the proxy (re)starts; a no-op on older proxy builds.
+   * `browserInternal`). Kept here and re-applied when the proxy (re)starts.
    */
   setWebSessionActive(active: boolean): void {
     this.webSessionActive = active === true;
-    this.proxy?.setWebSessionActive?.(this.webSessionActive);
+    this.proxy?.setWebSessionActive(this.webSessionActive);
   }
 
   get webSession(): boolean {
@@ -1407,16 +1314,11 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
 
   /**
    * Adds read-only exchanges (`captured: 'vm-profile'`) to the running proxy's list; returns their ids in order.
-   * Nothing is recorded (empty result) while the proxy is stopped or when this proxy build can't record.
+   * Nothing is recorded (empty result) while the proxy is stopped.
    */
   record(exchanges: Omit<Exchange, 'id'>[]): string[] {
     const proxy = this.proxy;
     if (!proxy || !exchanges.length) return [];
-    if (!proxy.record) {
-      if (!this.recordUnsupportedLogged) this.opts.log?.('this proxy build cannot record exchanges from the HTTP profile: native-client requests are not listed');
-      this.recordUnsupportedLogged = true;
-      return [];
-    }
     const ids: string[] = [];
     for (const ex of exchanges) {
       try {
@@ -1429,10 +1331,10 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     return ids;
   }
 
-  /** Updates a previously recorded exchange (no-op when it is gone or the proxy can't). `id` is never changed. */
+  /** Updates a previously recorded exchange (no-op when it is gone). `id` is never changed. */
   update(id: string, patch: Partial<Exchange>): void {
     const proxy = this.proxy;
-    if (!proxy?.update) return;
+    if (!proxy) return;
     const { id: _id, ...rest } = patch;
     try {
       proxy.update(id, rest);

@@ -12,27 +12,28 @@ import { InterceptProxyHost, mapRemoteSelfProblem } from '../../src/proxyHost';
 import { InterceptController, resolveSendGrpc, validateRules, type ControllerHost } from '../../src/ui/controller';
 import type { HostMsg } from '../../src/ui/protocol';
 import { fakeGrpc, grpcCall, pb64 } from './grpc.fakes';
+import { withFakeProxy } from './proxy.fakes';
 
 const map = (to: string, id = 'm'): Rule => ({ id, enabled: true, name: 'loop', match: { url: '*/shop.v1.CartService/*' }, action: { kind: 'mapRemote', to } });
 
 describe('#1 Map Remote to the proxy itself', () => {
   it('mapRemoteSelfProblem: loopback / aliases / LAN host on an own port', () => {
     const own = { ports: [8899, 9100], hosts: ['192.168.1.20'] };
-    for (const to of ['http://127.0.0.1:8899', 'http://localhost:8899/x', 'http://[::1]:9100', 'http://10.0.2.2:8899', 'http://0.0.0.0:8899', 'http://192.168.1.20:9100']) expect(mapRemoteSelfProblem(to, own), to).toMatch(/loop back into the proxy/);
+    for (const to of ['http://127.0.0.1:8899', 'http://localhost:8899/x', 'http://[::1]:9100', 'http://10.0.2.2:8899', 'http://0.0.0.0:8899', 'http://192.168.1.20:9100', 'http://[::ffff:127.0.0.1]:8899', 'http://[::]:9100']) expect(mapRemoteSelfProblem(to, own), to).toMatch(/loop back into the proxy/);
     for (const to of ['http://127.0.0.1:50051', 'https://api.example.com:8899', 'http://192.168.1.21:9100', 'http://localhost']) expect(mapRemoteSelfProblem(to, own), to).toBeUndefined();
     expect(mapRemoteSelfProblem('http://localhost', { ports: [80] })).toMatch(/loop/);
   });
 
   it('the host never applies such a rule (shared ones too), with a warning; re-checked once the port is known', async () => {
     const sent: Rule[][] = [];
-    const h = new InterceptProxyHost({
+    const h = new InterceptProxyHost(withFakeProxy({
       getPort: () => 8899,
       canRestart: () => true,
       factory: (opts: InterceptProxyOptions) => {
         const ee = new EventEmitter();
         return { port: opts.port ?? 0, start: async () => undefined, stop: async () => undefined, setRules: (r: Rule[]) => void sent.push(r), getExchanges: () => [], clear: () => undefined, resume: () => undefined, abort: () => undefined, on: (ev: string, l: (...a: any[]) => void) => ee.on(ev, l) };
       },
-    });
+    }));
     h.setRules([{ ...map('http://127.0.0.1:8899'), shared: true }, map('http://127.0.0.1:50051', 'ok')]);
     expect(h.warnings[0]).toMatchObject({ id: 'selfMap:m', text: expect.stringMatching(/Rule "loop" is skipped: .*own proxy port/) });
     await h.start();

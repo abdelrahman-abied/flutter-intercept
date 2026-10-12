@@ -244,6 +244,8 @@ export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string
         ...(e.framesDropped ? { _framesDropped: e.framesDropped } : {}),
         ...(e.graphql ? { _graphql: { ...e.graphql } } : {}),
         ...(e.captured ? { _captured: e.captured } : {}),
+        // CONTRACTS §19.4
+        ...(e.notes?.length ? { _notes: e.notes.map((n) => (r ? redactText(String(n)) : String(n))) } : {}),
         ...frameFields(e, r),
         ...grpcFields(e, opts),
       };

@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import { describe, expect, it } from 'vitest';
 import type { InterceptProxyOptions, ReplayEntry, Rule } from '@flutter-intercept/proxy';
 import { bodyFilesOf, checkUpstreamProxy, InterceptProxyHost } from '../../src/proxyHost';
+import { withFakeProxy } from './proxy.fakes';
 
 interface Fake {
   opts: InterceptProxyOptions;
@@ -45,7 +46,7 @@ describe('replay (CONTRACTS §12.4)', () => {
   it('forwards, keeps the state for Status.replay, emits replay, re-applies after a restart', async () => {
     const made: Fake[] = [];
     let p = port++;
-    const host = new InterceptProxyHost({ getPort: () => p, factory: factory(made), canRestart: () => true });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => p, factory: factory(made), canRestart: () => true }));
     const events: unknown[] = [];
     host.on('replay', (s) => events.push(s));
     host.setReplay([entry], { fallback: 'fail', matchTemplates: true }, { id: 'demo', name: 'Demo' }); // before start: kept
@@ -62,24 +63,12 @@ describe('replay (CONTRACTS §12.4)', () => {
     await host.stop();
   });
 
-  it('an older proxy build: setReplay throws while running; a kept replay is dropped at start', async () => {
-    const made: Fake[] = [];
-    const logs: string[] = [];
-    const host = new InterceptProxyHost({ getPort: () => port++, factory: factory(made, false), log: (m) => logs.push(m) });
-    host.setReplay([entry], { fallback: 'passthrough' }, { name: 'Old' });
-    await host.start();
-    expect(host.replay).toBeUndefined();
-    expect(logs.join('\n')).toMatch(/cannot replay/);
-    expect(() => host.setReplay([entry])).toThrow(/cannot replay/);
-    host.resetSequences(); // no-op
-    await host.stop();
-  });
 });
 
 describe('resetSequences / upstream proxy (CONTRACTS §12.3, §12.6)', () => {
   it('forwards resetSequences only to a running proxy', async () => {
     const made: Fake[] = [];
-    const host = new InterceptProxyHost({ getPort: () => port++, factory: factory(made) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => port++, factory: factory(made) }));
     host.resetSequences();
     await host.start();
     host.resetSequences();
@@ -90,7 +79,7 @@ describe('resetSequences / upstream proxy (CONTRACTS §12.3, §12.6)', () => {
   it('passes the upstream proxy at start and forwards changes while running', async () => {
     const made: Fake[] = [];
     let p = port++;
-    const host = new InterceptProxyHost({ getPort: () => p, factory: factory(made), canRestart: () => true });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => p, factory: factory(made), canRestart: () => true }));
     host.setUpstreamProxy({ url: 'http://127.0.0.1:8888', ignoreCertErrors: true });
     await host.start();
     expect(made[0].opts.upstreamProxy).toEqual({ url: 'http://127.0.0.1:8888', ignoreCertErrors: true });
@@ -100,16 +89,6 @@ describe('resetSequences / upstream proxy (CONTRACTS §12.3, §12.6)', () => {
     p = port++;
     await host.start();
     expect(made[1].opts.upstreamProxy).toBeUndefined();
-    await host.stop();
-  });
-
-  it('older builds: the change applies at the next start (logged)', async () => {
-    const made: Fake[] = [];
-    const logs: string[] = [];
-    const host = new InterceptProxyHost({ getPort: () => port++, factory: factory(made, false), log: (m) => logs.push(m) });
-    await host.start();
-    host.setUpstreamProxy({ url: 'http://proxy.corp:3128' });
-    expect(logs.join('\n')).toMatch(/applies when the proxy restarts/);
     await host.stop();
   });
 
@@ -134,7 +113,7 @@ describe('mock.bodyFile resolution (CONTRACTS §12.2)', () => {
 
   it('without file rules the proxy gets the rules synchronously', async () => {
     const made: Fake[] = [];
-    const host = new InterceptProxyHost({ getPort: () => port++, factory: factory(made) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => port++, factory: factory(made) }));
     await host.start();
     host.setRules([plain]);
     expect(made[0].rules).toEqual([plain]);
@@ -143,7 +122,7 @@ describe('mock.bodyFile resolution (CONTRACTS §12.2)', () => {
 
   it('resolves bodies (also in sequence steps), keeps authored rules in getRules, skips unreadable ones with a warning', async () => {
     const made: Fake[] = [];
-    const host = new InterceptProxyHost({ getPort: () => port++, factory: factory(made) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => port++, factory: factory(made) }));
     const files: Record<string, string> = { 'mocks/a.json': '{"a":1}' };
     host.setBodyFileResolver(async (p) => {
       if (!(p in files)) throw new Error(`${p} not found`);
@@ -191,7 +170,7 @@ describe('mock.bodyFile resolution (CONTRACTS §12.2)', () => {
 
   it('without a resolver, file rules are skipped (never sent with an empty body)', async () => {
     const made: Fake[] = [];
-    const host = new InterceptProxyHost({ getPort: () => port++, factory: factory(made) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => port++, factory: factory(made) }));
     await host.start();
     host.setRules([fileMock('a', 'm.json'), plain]);
     await host.rulesReady();
@@ -204,7 +183,7 @@ describe('mock.bodyFile resolution (CONTRACTS §12.2)', () => {
 
   it('a slower, older resolution never overwrites a newer rule set', async () => {
     const made: Fake[] = [];
-    const host = new InterceptProxyHost({ getPort: () => port++, factory: factory(made) });
+    const host = new InterceptProxyHost(withFakeProxy({ getPort: () => port++, factory: factory(made) }));
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
     host.setBodyFileResolver(async () => {

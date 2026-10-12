@@ -7,6 +7,7 @@ import type { InterceptProxyOptions, Rule } from '@flutter-intercept/proxy';
 import { grpcMockEncoder } from '../../src/grpc/service';
 import { hasGrpcJson, InterceptProxyHost, normalizeGrpcDecryptHosts } from '../../src/proxyHost';
 import { fakeGrpc, pb64 } from './grpc.fakes';
+import { withFakeProxy } from './proxy.fakes';
 
 interface Fake {
   opts: InterceptProxyOptions;
@@ -49,7 +50,7 @@ function factory(made: Fake[], o: { grpc?: boolean; support?: { ok: boolean; pro
 }
 
 function host(made: Fake[], o: Parameters<typeof factory>[1] & { logs?: string[] } = {}) {
-  return new InterceptProxyHost({ getPort: () => 9100, factory: factory(made, o), log: (m) => o.logs?.push(m), canRestart: () => true });
+  return new InterceptProxyHost(withFakeProxy({ getPort: () => 9100, factory: factory(made, o), log: (m) => o.logs?.push(m), canRestart: () => true }));
 }
 
 const grpcRule = (over: Partial<Rule> = {}, action: Record<string, unknown> = {}): Rule =>
@@ -70,7 +71,7 @@ describe('gRPC breaker warnings (CONTRACTS §16.8)', () => {
   it("turn the proxy's 'grpcBreaker' event into one bypass warning per authority, cleared on demand and on stop", async () => {
     const made: Fake[] = [];
     let proxyEmit: ((ev: string, ...a: unknown[]) => void) | undefined;
-    const h = new InterceptProxyHost({
+    const h = new InterceptProxyHost(withFakeProxy({
       getPort: () => 9100,
       factory: (opts) => {
         const p = factory(made)(opts) as any;
@@ -78,7 +79,7 @@ describe('gRPC breaker warnings (CONTRACTS §16.8)', () => {
         return p;
       },
       canRestart: () => true,
-    });
+    }));
     await h.start();
     const seen: unknown[] = [];
     h.on('warnings', (w) => seen.push(w));
@@ -131,7 +132,7 @@ describe('InterceptProxyHost gRPC (CONTRACTS §16.2 / §16.4)', () => {
     expect(h.warnings.find((w) => w.id === 'settings:grpcDecryptHosts')).toBeUndefined();
   });
 
-  it('grpcProblem reflects the self-check; an older proxy build without gRPC says so', async () => {
+  it('grpcProblem reflects the self-check', async () => {
     const ok: Fake[] = [];
     const a = host(ok);
     expect(a.grpcProblem).toBeUndefined();
@@ -150,13 +151,6 @@ describe('InterceptProxyHost gRPC (CONTRACTS §16.2 / §16.4)', () => {
     const throwing = host([], { support: 'throw' });
     await throwing.start();
     expect(throwing.grpcProblem).toMatch(/self-check failed: internals moved/);
-
-    const logs: string[] = [];
-    const old = host([], { grpc: false, logs });
-    old.setGrpcDecryptHosts(['x.example.com']);
-    await old.start();
-    expect(old.grpcProblem).toMatch(/cannot intercept gRPC/);
-    expect(logs.join('\n')).toMatch(/cannot decrypt gRPC/);
   });
 
   it('encodes grpcMock.messagesJson before the proxy gets the rule (also in sequence steps)', async () => {

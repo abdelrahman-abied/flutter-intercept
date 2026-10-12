@@ -108,7 +108,7 @@ export function describeOutcome(e: Exchange): string {
   const code = e.kind === 'grpc' ? e.grpc?.statusCode : undefined;
   if (typeof code === 'number') {
     const name = grpcCodeName(code);
-    const head = `gRPC ${code}${name && name !== String(code) ? ` ${name}` : ''}`;
+    const head = `gRPC ${code}${name && !name.startsWith('CODE ') ? ` ${name}` : ''}`;
     const msg = e.grpc?.statusMessage ? redactText(neutralizeText(e.grpc.statusMessage)).replace(/\s+/g, ' ').trim() : '';
     const text = msg ? `${head}: ${msg}` : head;
     return text.length > MAX_ERROR_CHARS ? `${text.slice(0, MAX_ERROR_CHARS - 1)}…` : text;

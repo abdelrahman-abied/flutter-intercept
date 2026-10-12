@@ -285,9 +285,9 @@ describe('add_map_remote (CONTRACTS §12.7: loopback only)', () => {
     ['http://localhost.evil.dev:80', /local server/],
     ['http://127.0.0.2:80', /local server/],
     ['http://10.0.2.2:8080', /local server/],
-    ['http://user:pw@localhost:8080', /user info/],
+    ['http://user:pw@localhost:8080', /credentials/],
     ['http://localhost:8080/#x', /fragment/],
-    ['http://localhost\\@evil.dev/', /backslash|user info/],
+    ['http://localhost\\@evil.dev/', /backslash|credentials/],
     ['localhost:8080', /absolute|http/],
     ['file:///etc/passwd', /http\(s\)/],
   ])('refuses to=%s', async (to, re) => {

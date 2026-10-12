@@ -21,6 +21,8 @@ import * as path from 'path';
 import { randomBytes } from 'crypto';
 import type { Exchange, ReplayOptions } from '@flutter-intercept/proxy';
 import { redactExchange } from '../agent/samples';
+import { redactText } from '../agent/redact';
+import { MAX_NOTE_CHARS, MAX_NOTES } from '@flutter-intercept/proxy/grpc-meta';
 import { capFrames, copyFrame, redactFrame } from './frames';
 import { diff, diffText } from './diff';
 import { gitIgnoreStatus, type GitignoreFs } from './gitignore';
@@ -135,6 +137,12 @@ export function slugify(name: string): string {
  * proxy's caps. `redact`: secrets redacted like agent views, frames included (CONTRACTS §14.5).
  */
 export function recordedExchange(e: Exchange, redact = false, grpc?: RecordingGrpc): RecordedExchange {
+  const out = recordedExchangeInner(e, redact, grpc);
+  if (redact && out.notes) out.notes = out.notes.map((n) => redactText(n));
+  return out;
+}
+
+function recordedExchangeInner(e: Exchange, redact: boolean, grpc?: RecordingGrpc): RecordedExchange {
   if (e.kind === 'grpc') return recordGrpc(e, pick(e), redact, grpc);
   const src = redact ? redactExchange(e) : e;
   const out = pick(src);
@@ -168,6 +176,8 @@ function pick(e: Exchange): Exchange {
     ...(e.simulated ? { simulated: e.simulated } : {}),
     ...(e.initiator ? { initiator: e.initiator } : {}),
     ...(e.graphql ? { graphql: e.graphql } : {}),
+    // CONTRACTS §19.4 (redacted in `recordedExchange` when saving redacted)
+    ...(e.notes?.length ? { notes: e.notes.slice(0, MAX_NOTES).map((n) => String(n).slice(0, MAX_NOTE_CHARS)) } : {}),
   };
 }
 

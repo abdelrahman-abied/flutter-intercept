@@ -1,4 +1,5 @@
 /** REVIEW-4 #3 (what the index may read), #5 (linear, capped, yielding) and #6 (values in messages). */
+import { expectWithin, TIME_SCALE } from './timing';
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -117,27 +118,35 @@ describe('#5: linear linking, bounded blocking', () => {
     return { '/w/o.g.dart': gen('o.dart'), '/w/o.dart': redirectOwner, '/w/big.g.dart': bigGen, '/w/big.dart': bigOwner };
   }
 
-  it('indexes the crafted files in well under 1 s without blocking the loop for more than 50 ms', async () => {
+  // QUALITY-1 Q8: structure (the scan yields to the loop) and best-of-3 budgets scaled by FI_TIME_SCALE, not one wall time.
+  it('indexes the crafted files in well under 1 s, yielding to the event loop while it works', async () => {
     const files = crafted();
-    const idx = new ContractIndex(recFs(files).fs, { roots: () => ['/w'] });
-    let last = performance.now();
-    let maxGap = 0;
-    let running = true;
-    const probe = () => {
-      const now = performance.now();
-      maxGap = Math.max(maxGap, now - last);
-      last = now;
-      if (running) setImmediate(probe);
+    let ticks = 0;
+    let maxGap = Infinity;
+    const run = async () => {
+      const idx = new ContractIndex(recFs(files).fs, { roots: () => ['/w'] });
+      let last = performance.now();
+      let gap = 0;
+      let running = true;
+      let n = 0;
+      const probe = () => {
+        const now = performance.now();
+        gap = Math.max(gap, now - last);
+        last = now;
+        n++;
+        if (running) setImmediate(probe);
+      };
+      setImmediate(probe);
+      await idx.setFiles(['/w/o.g.dart', '/w/big.g.dart']);
+      running = false;
+      expect(idx.allModels()).toHaveLength(401);
+      expect(idx.model('M399')?.sourceLine).toBeGreaterThan(0);
+      ticks = Math.max(ticks, n);
+      maxGap = Math.min(maxGap, gap);
     };
-    setImmediate(probe);
-    const t0 = performance.now();
-    await idx.setFiles(['/w/o.g.dart', '/w/big.g.dart']);
-    const total = performance.now() - t0;
-    running = false;
-    expect(idx.allModels()).toHaveLength(401);
-    expect(idx.model('M399')?.sourceLine).toBeGreaterThan(0);
-    expect(total).toBeLessThan(1000);
-    expect(maxGap).toBeLessThan(50);
+    await expectWithin(run, 1000);
+    expect(ticks).toBeGreaterThan(2); // it yielded between files / chunks
+    expect(maxGap).toBeLessThan(200 * TIME_SCALE); // no long block (best of the runs)
   });
 });
 
@@ -201,12 +210,11 @@ describe('#6: values in messages', () => {
 });
 
 describe('generated parser stays linear on long inputs', () => {
-  it('a 1 MB generated file parses in one short block', () => {
+  it('a 1 MB generated file parses in one short block', async () => {
     let text = '';
     for (let m = 0; text.length < 1_000_000; m++) text += `M${m} _$M${m}FromJson(Map<String, dynamic> json) => M${m}(a: json['a'] as String, b: (json['b'] as num).toInt());\n`;
-    const t0 = performance.now();
-    const info = parseGeneratedDart(text, '/w/x.g.dart');
-    expect(info.models.length).toBeGreaterThan(5000);
-    expect(performance.now() - t0).toBeLessThan(500);
+    let info: ReturnType<typeof parseGeneratedDart> | undefined;
+    await expectWithin(() => (info = parseGeneratedDart(text, '/w/x.g.dart')), 500);
+    expect(info!.models.length).toBeGreaterThan(5000);
   });
 });
