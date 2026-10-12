@@ -6,6 +6,9 @@ import type { AuthFlowSummary, Exchange, RecordingSummary, Rule, RuleAction, Sta
 import type { RewriteSpec, SequenceStep } from '@flutter-intercept/proxy/types';
 import { splitUrl } from './util';
 import { grpcCodeName, grpcMetadataError } from './grpc';
+import {
+  isLoopbackHostname, mapTargetProblem, MAX_REWRITE_HEADERS, MAX_REWRITE_REPLACEMENTS, MAX_SEQUENCE_STEPS,
+} from '@flutter-intercept/proxy/grpc-meta';
 
 const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -27,7 +30,8 @@ export const THEN_LABEL: Record<SequenceThen, string> = {
   passthrough: 'Go to the real server',
   loop: 'Start again from step 1',
 };
-export const MAX_STEPS = 20;
+/** One cap for every layer (grpc-meta; was 20 here, 50 in the host and agents). */
+export const MAX_STEPS = MAX_SEQUENCE_STEPS;
 export const MAX_STEP_COUNT = 1000;
 
 /** A step in a few characters, for the preview line: "500", "real server", "timeout". */
@@ -81,26 +85,17 @@ function hostOf(url: string): string {
   try { return new URL(url).host; } catch { return url; }
 }
 
-/** localhost, *.localhost, 127.0.0.0/8, ::1 — the machine running the proxy (what agents may map to). */
-export function isLoopbackHost(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  if (h === 'localhost' || h.endsWith('.localhost')) return true;
-  if (h === '::1' || h === '0:0:0:0:0:0:0:1') return true;
-  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
-}
-
 export interface MapTargetCheck { error?: string; origin?: string; loopback: boolean }
 
 /** `to` is an origin (https://staging.example.com) or a URL prefix (http://localhost:8080/api). */
 export function checkMapTarget(to: string): MapTargetCheck {
+  // The rule check is grpc-meta's `mapTargetProblem` (the same in the proxy and the host); the panel trims first,
+  // like the rule it saves.
   const t = to.trim();
-  if (!t) return { error: 'Required: an origin such as http://localhost:8080, or a URL prefix', loopback: false };
-  let u: URL;
-  try { u = new URL(t); } catch { return { error: 'Not a URL — start with http:// or https://', loopback: false }; }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') return { error: 'Only http:// and https:// targets', loopback: false };
-  if (u.username || u.password) return { error: 'No user name or password in the target URL', loopback: false };
-  if (u.search || u.hash || /[?#]/.test(t)) return { error: 'An origin or a URL prefix — no ?query or #fragment', loopback: false };
-  return { origin: u.origin, loopback: isLoopbackHost(u.hostname) };
+  const error = mapTargetProblem(t);
+  if (error) return { error, loopback: false };
+  const u = new URL(t);
+  return { origin: u.origin, loopback: isLoopbackHostname(u.hostname) };
 }
 
 /** Shown under a valid non-loopback target: the app's credentials travel with the request. */
@@ -129,7 +124,7 @@ export interface RewriteForm {
   removeTrailers?: string;
 }
 
-export const MAX_REPLACEMENTS = 20;
+export const MAX_REPLACEMENTS = MAX_REWRITE_REPLACEMENTS;
 
 const emptySide = (): RewriteSideForm => ({ setHeaders: [], removeHeaders: '', replaceBody: [] });
 export function emptyRewriteForm(): RewriteForm {
@@ -195,6 +190,8 @@ function sideError(f: RewriteSideForm, side: 'Request' | 'Response'): string | u
   const rows = usedReplaceRows(f.replaceBody);
   if (rows.some((r) => r.find === '')) return `${side} body: “Find” can't be empty`;
   if (rows.length > MAX_REPLACEMENTS) return `${side} body: at most ${MAX_REPLACEMENTS} replacements`;
+  const headers = f.setHeaders.filter((r) => r.name.trim()).length + removeList(f.removeHeaders).length;
+  if (headers > MAX_REWRITE_HEADERS) return `${side} headers: at most ${MAX_REWRITE_HEADERS} to set or remove`;
   return undefined;
 }
 
@@ -207,12 +204,12 @@ export function rewriteError(f: RewriteForm): string | undefined {
   // Trailers are gRPC-only: the reserved metadata rules always apply to them (CONTRACTS §18.1).
   for (const r of f.setTrailers ?? []) {
     if (!r.name.trim()) { if (r.value.trim()) return 'Trailer: a value needs a name'; continue; }
-    const e = grpcMetadataError(r.name, r.value, 'Trailer');
+    const e = grpcMetadataError(r.name, r.value, 'Trailer', 'trailers');
     if (e) return e;
     if (!TOKEN.test(r.name.trim())) return `Trailer name “${r.name.trim()}” is not valid`;
   }
   for (const n of removeList(f.removeTrailers ?? '')) {
-    const e = grpcMetadataError(n, undefined, 'Trailer');
+    const e = grpcMetadataError(n, undefined, 'Trailer', 'trailers');
     if (e) return e;
     if (!TOKEN.test(n)) return `Trailer to remove “${n}” is not valid`;
   }
@@ -225,11 +222,11 @@ export function rewriteError(f: RewriteForm): string | undefined {
 export function grpcRewriteError(f: RewriteForm): string | undefined {
   for (const [side, label] of [[f.request, 'Request header'], [f.response, 'Response header']] as const) {
     for (const r of side.setHeaders) {
-      const e = grpcMetadataError(r.name, r.value, label);
+      const e = grpcMetadataError(r.name, r.value, label, 'call');
       if (e) return e;
     }
     for (const n of removeList(side.removeHeaders)) {
-      const e = grpcMetadataError(n, undefined, `${label} to remove`);
+      const e = grpcMetadataError(n, undefined, `${label} to remove`, 'call');
       if (e) return e;
     }
   }

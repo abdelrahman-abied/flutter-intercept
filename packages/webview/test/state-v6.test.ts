@@ -7,7 +7,7 @@ import {
 } from '../src/state';
 import {
   authAlerts, bodyFileError, bodySecretHint, UPSTREAM_TITLE, canMoveRule, checkMapTarget, defaultRecordingName, describeRewrite, diffPair, emptyRewriteForm, expireTokenError,
-  expireTokenLabel, flowRows, flowTitle, formatDate, isLoopbackHost, isRecordable, isReplaying, isShared, mapRemoteWarning, MAX_REPLACEMENTS,
+  expireTokenLabel, flowRows, flowTitle, formatDate, isRecordable, isReplaying, isShared, mapRemoteWarning, MAX_REPLACEMENTS,
   needsApproval, pendingApprovalText, recordingNameError, removeList, rewriteError, rewriteFromForm, rewriteSetsRequestHeaders,
   rewriteToForm, sequencePreview, sortRecordings, stampedeText, stepCountError, stepLabel, suggestBodyFile, togglePick,
 } from '../src/scenarios';
@@ -126,15 +126,17 @@ describe('rule form: new kinds round-trip', () => {
     v = validateRuleForm({ ...f, steps: [{ ...newStep('passthrough'), count: '0' }] });
     expect(v.errors.sequence).toMatch(/^Step 1: Count: whole number 1–1000/);
     v = validateRuleForm({ ...f, steps: [{ ...newStep('mapRemote'), mapTo: 'ftp://x' }] });
-    expect(v.errors.sequence).toBe('Step 1: Only http:// and https:// targets');
+    expect(v.errors.sequence).toBe('Step 1: The Map Remote target must be http(s)://, got ftp:');
     expect(validateRuleForm({ ...f, steps: [] }).errors.sequence).toBe('Add at least one step.');
-    expect(validateRuleForm({ ...f, steps: Array.from({ length: 21 }, () => newStep('passthrough')) }).errors.sequence).toBe('At most 20 steps.');
+    // One cap for every layer (grpc-meta MAX_SEQUENCE_STEPS; the panel used to stop at 20).
+    expect(validateRuleForm({ ...f, steps: Array.from({ length: 50 }, () => newStep('passthrough')) }).errors.sequence).toBeUndefined();
+    expect(validateRuleForm({ ...f, steps: Array.from({ length: 51 }, () => newStep('passthrough')) }).errors.sequence).toBe('At most 50 steps.');
     // A non-sequence rule ignores its (default) steps.
     expect(validateRuleForm({ ...base(), steps: [] }).errors.sequence).toBeUndefined();
   });
 
   it('mapRemote and rewrite validation', () => {
-    expect(validateRuleForm({ ...base(), kind: 'mapRemote' }).errors.mapTo).toMatch(/Required/);
+    expect(validateRuleForm({ ...base(), kind: 'mapRemote' }).errors.mapTo).toMatch(/Map Remote needs a target/);
     expect(validateRuleForm({ ...base(), kind: 'mapRemote', mapTo: 'https://staging.example.com' }).errors).toEqual({});
     expect(validateRuleForm({ ...base(), kind: 'rewrite' }).errors.rewrite).toMatch(/Set or remove a header/);
     const rw = { ...emptyRewriteForm(), status: '503' };
@@ -216,12 +218,14 @@ describe('scenarios helpers', () => {
   });
 
   it('Map Remote target checks and the credentials warning', () => {
-    for (const h of ['localhost', 'api.localhost', '127.0.0.1', '127.1.2.3', '[::1]', '::1']) expect(isLoopbackHost(h)).toBe(true);
-    for (const h of ['10.0.2.2', '192.168.1.2', 'example.com', 'localhost.example.com']) expect(isLoopbackHost(h)).toBe(false);
-    expect(checkMapTarget('not a url').error).toMatch(/Not a URL/);
-    expect(checkMapTarget('https://u:p@x.com').error).toMatch(/user name/);
+    // QUALITY-1 Q6: grpc-meta's mapTargetProblem / isLoopbackHostname (one rule set for the proxy, the host and the panel).
+    for (const h of ['localhost', 'api.localhost', '127.0.0.1', '127.1.2.3', '[::1]', '0.0.0.0']) expect(checkMapTarget(`http://${h}:9000`).loopback, h).toBe(true);
+    for (const h of ['10.0.2.2', '192.168.1.2', 'example.com', 'localhost.example.com']) expect(checkMapTarget(`http://${h}:9000`).loopback, h).toBe(false);
+    expect(checkMapTarget('not a url').error).toMatch(/whitespace/);
+    expect(checkMapTarget('notaurl').error).toBeDefined();
+    expect(checkMapTarget('https://u:p@x.com').error).toMatch(/credentials/);
     expect(checkMapTarget('https://x.com/?a=1').error).toMatch(/no \?query/);
-    expect(checkMapTarget('https://x.com/#f').error).toMatch(/no \?query/);
+    expect(checkMapTarget('https://x.com/#f').error).toMatch(/#fragment/);
     expect(checkMapTarget(' https://x.com/api ')).toEqual({ origin: 'https://x.com', loopback: false });
     expect(checkMapTarget('http://127.0.0.1:9000')).toEqual({ origin: 'http://127.0.0.1:9000', loopback: true });
     expect(mapRemoteWarning('https://staging.example.com')).toMatch(/credentials .* sent to https:\/\/staging\.example\.com/);

@@ -1,4 +1,5 @@
 /** Edit & resend (CONTRACTS §9.3 `send`, gRPC §18.4) and snippets. Split out of ../state.ts (QUALITY-1 Q6). */
+import { GRPC_SEND_MAX_MESSAGES } from '@flutter-intercept/proxy/grpc-meta';
 import { type GrpcDecodeEntry, decodedMessages, isGrpc } from '../grpc';
 import type { Exchange, SendDraft, SnippetFormat } from '../protocol';
 import { type Headers, isAbsoluteUrl, isPaused } from '../util';
@@ -99,7 +100,7 @@ export function composeSend(c: Pick<Composer, 'draft' | 'originalBody'> & Partia
 }
 
 /** CONTRACTS §18.4 caps: ≤ 100 messages, ≤ 4 MB each, ≤ 16 MB in all. */
-export const MAX_GRPC_SEND_MESSAGES = 100;
+export { GRPC_SEND_MAX_MESSAGES as MAX_GRPC_SEND_MESSAGES } from '@flutter-intercept/proxy/grpc-meta';
 
 /** The `grpc` part of a send: JSON entries (encoded by the host) or base64 (an empty entry = an empty message). */
 export function grpcSendMessages(g: GrpcComposer): NonNullable<SendDraft['grpc']> {
@@ -115,7 +116,7 @@ export function grpcComposerErrors(c: Pick<Composer, 'draft' | 'grpc'>): string[
   if (!isAbsoluteUrl(c.draft.url.trim())) errors.push('URL must be absolute (http:// or https://)');
   else if (!/^\/[^/]+\/[^/]+$/.test(new URL(c.draft.url.trim()).pathname)) errors.push('URL path must be /package.Service/Method');
   const list = g.mode === 'json' ? g.json ?? [] : g.base64;
-  if (list.length > MAX_GRPC_SEND_MESSAGES) errors.push(`At most ${MAX_GRPC_SEND_MESSAGES} messages`);
+  if (list.length > GRPC_SEND_MAX_MESSAGES) errors.push(`At most ${GRPC_SEND_MAX_MESSAGES} messages`);
   list.forEach((m, i) => {
     if (g.mode === 'json' && !m.trim()) { errors.push(`Message ${i + 1}: enter a JSON object, e.g. {}`); return; }
     const e = grpcMessageError(m, g.mode);

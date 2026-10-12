@@ -2,45 +2,11 @@
  * v0.7.0 JavaScript scripting hooks (CONTRACTS §13.4): editor helpers for the `script` rule action. Pure.
  */
 import type { Exchange, RuleAction } from './protocol';
+import { MAX_SCRIPT_BYTES } from '@flutter-intercept/proxy/grpc-meta';
 
 export const SCRIPTS_DIR = '.vscode/flutter-intercept/scripts';
-export const MAX_SCRIPT_BYTES = 256 * 1024;
-
-/**
- * The inline editor's placeholder and "Start from the template". ("Create file" with an empty inline script sends empty
- * content: the host writes its own template, naming the rule.) Hooks are synchronous plain JavaScript: no require,
- * timers, fetch or import().
- */
-export const SCRIPT_TEMPLATE = `// Flutter Intercept script rule. Define onRequest / onResponse (HTTP) and/or onGrpcMessage / onGrpcStatus (gRPC);
-// synchronous, plain JavaScript.
-// Return an edited object, or undefined to leave it unchanged. context.log(...) writes to the exchange's script log.
-
-function onRequest(request, context) {
-  // request: { method, url, headers, body? }
-  // return { ...request, headers: { ...request.headers, 'x-debug': '1' } };
-  // return { response: { status: 503, headers: { 'content-type': 'application/json' }, body: '{"error":"down"}' } };
-  return undefined;
-}
-
-function onResponse(response, request, context) {
-  // response: { status, headers, body? }
-  // context.log('status', response.status);
-  return undefined;
-}
-
-// gRPC calls (onRequest / onResponse are not called for them):
-function onGrpcMessage(message, context) {
-  // message: { path, dir: 'send' | 'receive', index, json?, base64, size } — json decoded with the app's schema
-  // return { json: { ...message.json, name: 'Test' } };   or { base64: '...' }   or { drop: true }
-  return undefined;
-}
-
-function onGrpcStatus(status, context) {
-  // status: { path, code, message?, trailers } — before the app gets the end of the call
-  // return { code: 14, message: 'backend down' };
-  return undefined;
-}
-`;
+/** The one script template (proxy, host and panel) and the size cap come from grpc-meta (CONTRACTS §19.4). */
+export { MAX_SCRIPT_BYTES, SCRIPT_TEMPLATE } from '@flutter-intercept/proxy/grpc-meta';
 
 /** `.vscode/flutter-intercept/scripts/<slug>.js` from the rule name, else the URL's last path segment. */
 export function suggestScriptFile(name: string, url: string): string {

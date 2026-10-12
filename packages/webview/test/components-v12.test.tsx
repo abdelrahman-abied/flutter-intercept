@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { App } from '../src/components/App';
 import type { Host } from '../src/host';
 import type { Exchange, Frame, GrpcDecoded, HostMsg, Rule, Status, ViewMsg } from '../src/protocol';
-import { grpcActionNote, grpcMetadataError, grpcRewriteNote, reservedGrpcMetadata } from '../src/grpc';
+import { grpcActionNote, grpcMetadataError, grpcRewriteNote } from '../src/grpc';
 import { describeRewrite, emptyRewriteForm, grpcRewriteError, rewriteError, rewriteFromForm, rewriteToForm } from '../src/scenarios';
 import { scriptCodeError } from '../src/scripts';
 import { interceptOff, ruleTemplateFor } from '../src/components/actions';
@@ -96,23 +96,25 @@ describe('pure helpers (CONTRACTS §18)', () => {
     expect(rewriteFromForm(f)).toEqual(a);
     expect(describeRewrite(a)).toBe('Rewrite: response trailers (2)');
     expect(rewriteError(f)).toBeUndefined();
-    expect(rewriteError({ ...emptyRewriteForm(), setTrailers: [{ name: 'grpc-status', value: '0' }] })).toMatch(/“grpc-status” can't be changed on gRPC calls/);
-    expect(rewriteError({ ...emptyRewriteForm(), removeTrailers: ':status' })).toMatch(/reserved/);
-    expect(rewriteError({ ...emptyRewriteForm(), setTrailers: [{ name: 'x-trace-bin', value: 'not base64!' }] })).toMatch(/-bin value must be base64/);
+    expect(rewriteError({ ...emptyRewriteForm(), setTrailers: [{ name: 'grpc-status', value: '0' }] })).toMatch(/"grpc-status" can't be changed/);
+    expect(rewriteError({ ...emptyRewriteForm(), removeTrailers: ':status' })).toMatch(/pseudo headers can't be set or removed/);
+    expect(rewriteError({ ...emptyRewriteForm(), setTrailers: [{ name: 'x-trace-bin', value: 'not base64!' }] })).toMatch(/binary metadata; its value must be base64/);
     expect(rewriteError(emptyRewriteForm())).toMatch(/header or trailer/);
     // Pre-0.12 drafts without the trailer fields still work.
     expect(rewriteError({ request: { setHeaders: [{ name: 'x-a', value: '1' }], removeHeaders: '', replaceBody: [] }, response: emptyRewriteForm().response, status: '' })).toBeUndefined();
   });
 
   it('reserved gRPC metadata in headers: refused on gRPC URLs only', () => {
-    expect(reservedGrpcMetadata('grpc-timeout')).toBe(true);
-    expect(reservedGrpcMetadata('grpc-status-details-bin')).toBe(true); // REVIEW-12
-    expect(rewriteError({ ...emptyRewriteForm(), removeTrailers: 'grpc-status-details-bin' })).toMatch(/reserved/);
-    expect(reservedGrpcMetadata('Content-Type')).toBe(true);
-    expect(reservedGrpcMetadata('authorization')).toBe(false);
-    expect(grpcMetadataError('x-ok', 'v', 'Header')).toBeUndefined();
+    // The reserved sets and texts are grpc-meta's (QUALITY-1 Q6): one answer in the proxy, the host and the panel.
+    expect(grpcMetadataError('grpc-timeout', 'x', 'Header', 'call')).toMatch(/^Header: "grpc-timeout" can't be changed/);
+    expect(rewriteError({ ...emptyRewriteForm(), removeTrailers: 'grpc-status-details-bin' })).toMatch(/"grpc-status-details-bin" can't be changed/); // REVIEW-12
+    expect(grpcMetadataError('Content-Type', 'x', 'Header', 'call')).toMatch(/"Content-Type" can't be changed/);
+    expect(grpcMetadataError('authorization', 'Bearer t', 'Header', 'call')).toBeUndefined();
+    expect(grpcMetadataError('x-ok', 'v', 'Header', 'call')).toBeUndefined();
+    expect(grpcMetadataError('x-trace-bin', 'not base64!', 'Trailer', 'trailers')).toMatch(/must be base64/);
+    expect(grpcMetadataError('x-a', 'line\nbreak', 'Header', 'call')).toMatch(/one line/);
     const f = { ...emptyRewriteForm(), request: { setHeaders: [{ name: 'content-type', value: 'x' }], removeHeaders: '', replaceBody: [] } };
-    expect(grpcRewriteError(f)).toMatch(/Request header “content-type” can't be changed on gRPC calls/);
+    expect(grpcRewriteError(f)).toMatch(/^Request header: "content-type" can't be changed/);
     const form = (url: string) => ({ ...ruleToForm(), url, kind: 'rewrite' as const, rewrite: f });
     expect(validateRuleForm(form('http://*/demo.Users/*')).errors.rewrite).toMatch(/content-type/);
     expect(validateRuleForm(form('https://api.example.com/*')).errors.rewrite).toBeUndefined();
@@ -242,7 +244,7 @@ describe('rewrite / script / map remote on gRPC', () => {
     const trailers = $$('.rewrite-editor .headers-editor').at(-1)!;
     await click(button('+ Add header', trailers));
     await type($('.he-name', trailers)!, 'grpc-status');
-    expect($('.rewrite-editor .msg.error')!.textContent).toMatch(/“grpc-status” can't be changed on gRPC calls/);
+    expect($('.rewrite-editor .msg.error')!.textContent).toMatch(/"grpc-status" can't be changed/);
     await type($('.he-name', trailers)!, 'x-env');
     await type($('.he-value', trailers)!, 'staging');
     await click(button('Add rule', $('.re-actions')!));

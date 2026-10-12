@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import {
   appliesToGrpc, decodedMessages, decodeNote, DECODE_TIMEOUT_MS, describeGrpcMock, GRPC_CODES, GRPC_TUNNEL_HINT, grpcActionNote, grpcCodeLabel,
   grpcCodeName, grpcCodesMatching, grpcCountsShort, grpcPath, grpcPreview, grpcStatusSummary, grpcStatusView, grpcVersion, hexTextDump,
-  isBase64, isGrpcStreaming, looksLikeGrpcUrl, methodTypesText, needsDecode, reservedGrpcHeader,
+  isBase64, isGrpcStreaming, looksLikeGrpcUrl, methodTypesText, needsDecode,
 } from '../src/grpc';
 import { contentClassOf, parseFilter } from '../src/filter';
 import { frameSizeText, frameSizeTitle, hasMessagesTab, KIND_BADGE, kindTitle } from '../src/frames';
@@ -341,10 +341,11 @@ describe('grpcMock rule form', () => {
     expect(h.errors.grpcGapMs).toBeDefined();
     expect(h.errors.grpcHeaders).toMatch(/content-type/);
     expect(h.errors.grpcTrailers).toMatch(/grpc-status/);
-    expect(reservedGrpcHeader(':status')).toBe(true);
-    expect(reservedGrpcHeader('x-foo')).toBe(false);
     expect(isBase64('CgI0Mg==')).toBe(true);
-    expect(isBase64('CgI0Mg=')).toBe(false);
+    // grpc-meta's base64 (shared with the proxy) is lenient about padding and accepts URL-safe / unpadded forms.
+    expect(isBase64('CgI0Mg')).toBe(true);
+    expect(isBase64('Cg_-Mg')).toBe(true);
+    expect(isBase64('not base64!')).toBe(false);
   });
 
   it('is a sequence step', () => {

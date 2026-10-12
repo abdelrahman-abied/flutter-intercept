@@ -373,7 +373,7 @@ describe('grpcMock rule editor', () => {
     await click(button('+ Add header', editors[1]));
     const names = $$('.grpc-mock-editor .he-name');
     await type(names[names.length - 1], 'grpc-status');
-    expect($('.grpc-mock-editor')!.textContent).toMatch(/Trailer “grpc-status” is set by the proxy/);
+    expect($('.grpc-mock-editor')!.textContent).toMatch(/Trailer: "grpc-status" is set by the proxy/);
   });
 
   it('Skeleton: decodes the last matching call on demand, then fills a message from the response type', async () => {

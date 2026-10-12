@@ -227,7 +227,7 @@ describe('paused gRPC calls', () => {
 
     await emit({ type: 'exchange', exchange: paused({ grpcPause: statusPause, pausedAt: Date.now() + 20 }) });
     await type(names()[0], 'grpc-message');
-    expect(editor().textContent).toMatch(/Trailer “grpc-message” is set by the proxy/);
+    expect(editor().textContent).toMatch(/Trailer: "grpc-message" is set by the proxy/);
     expect(button(/Resume with edit/).disabled).toBe(true);
     await type(names()[0], 'x-debug');
     await click(button(/Resume with edit/));

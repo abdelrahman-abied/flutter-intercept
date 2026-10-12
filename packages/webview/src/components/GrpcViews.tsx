@@ -1,11 +1,12 @@
 // v0.10.0 gRPC views (CONTRACTS §16.5): the decode request on open, the status block in the detail header, trailers,
 // one message's decoded / raw / hex view, and the status banner for Status.grpc.problem.
 import { useEffect, useMemo, useState } from 'preact/hooks';
+import { reservedGrpcMetadataProblem } from '@flutter-intercept/proxy/grpc-meta';
 import { useApp } from '../context';
 import type { Exchange, Frame, GrpcDecodedMessage, GrpcEdit, GrpcPause } from '../protocol';
 import {
   DECODE_TIMEOUT_MS, findPreflight, GRPC_CODES, GRPC_DECRYPT_SETTING, GRPC_WEB_NOTE, SIM_TRUST_SETTING, simTrustFailures, grpcCodeLabel, grpcCountsText, grpcFacts, grpcPath, grpcPauseKey, grpcPauseTitle,
-  grpcVersion, hexTextDump, isBase64, isGrpc, needsDecode, pausedDecoded, reservedGrpcHeader,
+  grpcVersion, hexTextDump, isBase64, isGrpc, needsDecode, pausedDecoded,
 } from '../grpc';
 import { grpcHeaderError, grpcMessageError, headersChanged, headersToRows, rowsToFlatRecord, type HeaderRow } from '../state';
 import { HeadersEditor } from './Editors';
@@ -264,7 +265,7 @@ function GrpcMessagePause({ ex, p }: { ex: Exchange; p: Extract<GrpcPause, { kin
     : b64 !== undefined && b64.replace(/\s+/g, '') !== p.base64;
   const error = !changed ? undefined
     : mode === 'json' ? grpcMessageError(json, 'json') ?? (json.trim() ? undefined : 'Enter the message as a JSON object, e.g. {}')
-    : isBase64(base64) ? undefined : 'not valid base64 (A–Z, a–z, 0–9, +, /, = padding)';
+    : isBase64(base64.replace(/\s+/g, '')) ? undefined : 'not valid base64 (A–Z, a–z, 0–9, + and /, or - and _; = padding)';
   const canEdit = !busy && changed && !error;
   const edit = (): GrpcEdit => (mode === 'json'
     ? { messageJson: JSON.parse(json) as unknown }
@@ -326,7 +327,7 @@ function GrpcMessagePause({ ex, p }: { ex: Exchange; p: Extract<GrpcPause, { kin
 }
 
 const visibleTrailers = (t: GrpcPause & { kind: 'status' }): HeaderRow[] =>
-  headersToRows(t.trailers).filter((r) => !reservedGrpcHeader(r.name));
+  headersToRows(t.trailers).filter((r) => !reservedGrpcMetadataProblem(r.name, 'mock'));
 
 function GrpcStatusPause({ ex, p }: { ex: Exchange; p: Extract<GrpcPause, { kind: 'status' }> }) {
   const { busy, resume, abort } = usePauseActions(ex);

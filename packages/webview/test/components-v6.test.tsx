@@ -148,7 +148,7 @@ describe('rule editor: map remote', () => {
     const to = () => byPlaceholder('http://localhost:8080')!;
     expect(saveBtn().disabled).toBe(true);
     await type(to(), 'staging.example.com');
-    expect($('.rule-editor')!.textContent).toContain('Not a URL');
+    expect($('.rule-editor')!.textContent).toContain('is not a URL');
     await type(to(), 'https://staging.example.com');
     expect($('.map-warning')!.textContent).toMatch(/credentials .* https:\/\/staging\.example\.com/);
     await type(to(), 'http://localhost:8080');

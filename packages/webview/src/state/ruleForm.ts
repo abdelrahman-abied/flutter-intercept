@@ -1,7 +1,8 @@
 /** The rule editor form: action fields, validation, form ↔ rule. Split out of ../state.ts (QUALITY-1 Q6). */
 import type { FaultKind, MutateOp } from '@flutter-intercept/proxy/types';
 import { corsActionError } from '../coverage';
-import { isBase64, looksLikeGrpcUrl, reservedGrpcHeader } from '../grpc';
+import { isBase64, metadataValueProblem, MAX_MUTATE_OPS, reservedGrpcMetadataProblem } from '@flutter-intercept/proxy/grpc-meta';
+import { looksLikeGrpcUrl } from '../grpc';
 import { checkPath } from '../jsonpath';
 import type { Rule, RuleAction } from '../protocol';
 import {
@@ -267,6 +268,7 @@ export function validateActionFields(kind: RuleAction['kind'] | StepKind, f: Act
     opErrors = f.mutateOps.map(mutateRowError);
     const first = opErrors.findIndex(Boolean);
     if (!f.mutateOps.length) errors.mutate = 'Add at least one change.';
+    else if (f.mutateOps.length > MAX_MUTATE_OPS) errors.mutate = `At most ${MAX_MUTATE_OPS} changes.`;
     else if (first >= 0) errors.mutate = `Change ${first + 1}: ${opErrors[first]}`;
   } else if (kind === 'mapRemote') {
     const m = checkMapTarget(f.mapTo);
@@ -296,7 +298,7 @@ export function validateActionFields(kind: RuleAction['kind'] | StepKind, f: Act
 export function grpcMessageError(text: string, mode: ActionFields['grpcMessagesMode']): string | undefined {
   const t = text.trim();
   if (!t) return undefined;
-  if (mode === 'base64') return isBase64(t) ? undefined : 'not valid base64 (A–Z, a–z, 0–9, +, /, = padding)';
+  if (mode === 'base64') return isBase64(t.replace(/\s+/g, '')) ? undefined : 'not valid base64 (A–Z, a–z, 0–9, + and /, or - and _; = padding)';
   const j = validateJson(t);
   if (!j.ok) return `not valid JSON (line ${j.line}, column ${j.column}): ${j.message}`;
   if (!t.startsWith('{')) return 'a JSON object (one protobuf message), e.g. {"id": "42"}';
@@ -307,7 +309,8 @@ export function grpcHeaderError(rows: HeaderRow[], what: 'Header' | 'Trailer'): 
   for (const r of rows) {
     const n = r.name.trim();
     if (!n) { if (r.value.trim()) return `${what}: a value needs a name`; continue; }
-    if (reservedGrpcHeader(n)) return `${what} “${n}” is set by the proxy (content-type, grpc-status, grpc-message and :pseudo headers can't be set)`;
+    const reserved = reservedGrpcMetadataProblem(n, 'mock') ?? metadataValueProblem(n, r.value);
+    if (reserved) return `${what}: ${reserved}`;
     if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(n)) return `${what} name “${n}” is not valid`;
   }
   return undefined;

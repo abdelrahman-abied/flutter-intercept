@@ -5,21 +5,15 @@
 import type { Exchange, Frame, GrpcDecoded, GrpcDecodedMessage, RuleAction, Status } from './protocol';
 import type { SequenceStep } from '@flutter-intercept/proxy/types';
 import { frameSizeText, splitUrl } from './util';
+import {
+  GRPC_CODE_NAMES, grpcCodeName, metadataValueProblem, reservedGrpcMetadataProblem, type GrpcMetadataSide,
+} from '@flutter-intercept/proxy/grpc-meta';
 
 // ---------------------------------------------------------------- status codes
 
-/** The 17 canonical gRPC status codes, by number. */
-export const GRPC_CODES = [
-  'OK', 'CANCELLED', 'UNKNOWN', 'INVALID_ARGUMENT', 'DEADLINE_EXCEEDED', 'NOT_FOUND', 'ALREADY_EXISTS',
-  'PERMISSION_DENIED', 'RESOURCE_EXHAUSTED', 'FAILED_PRECONDITION', 'ABORTED', 'OUT_OF_RANGE', 'UNIMPLEMENTED',
-  'INTERNAL', 'UNAVAILABLE', 'DATA_LOSS', 'UNAUTHENTICATED',
-] as const;
-export const MAX_GRPC_CODE = GRPC_CODES.length - 1;
-
-/** "UNAVAILABLE"; codes outside 0–16 as "CODE 42". */
-export function grpcCodeName(code: number): string {
-  return Number.isInteger(code) && code >= 0 && code <= MAX_GRPC_CODE ? GRPC_CODES[code] : `CODE ${code}`;
-}
+// Status code names, reserved metadata, base64 and the limits come from the one shared, node-free module
+// (QUALITY-1 Q2 / Q6, CONTRACTS §19.4): the proxy, the host and the panel give the same answers.
+export { GRPC_CODE_NAMES as GRPC_CODES, MAX_GRPC_CODE, grpcCodeName, isBase64 } from '@flutter-intercept/proxy/grpc-meta';
 
 /** "14 UNAVAILABLE". */
 export function grpcCodeLabel(code: number): string {
@@ -33,7 +27,7 @@ export function grpcCodesMatching(v: string): number[] {
   if (/^\d+$/.test(s)) return [Number(s)];
   const norm = s.replace(/[-_\s]/g, '');
   const out: number[] = [];
-  GRPC_CODES.forEach((name, code) => { if (name.toLowerCase().replace(/_/g, '').startsWith(norm)) out.push(code); });
+  GRPC_CODE_NAMES.forEach((name, code) => { if (name.toLowerCase().replace(/_/g, '').startsWith(norm)) out.push(code); });
   return out;
 }
 
@@ -313,27 +307,16 @@ export function grpcActionNote(kind: string, stepKinds?: readonly string[]): str
   return 'gRPC calls skip this rule: “Mock response” answers HTTP requests — use a gRPC mock for gRPC calls.';
 }
 
-/** CONTRACTS §18.1: metadata a rewrite may not set or remove on gRPC calls (status changes: breakpoint / mutate / script). */
-const RESERVED_GRPC_METADATA = new Set([
-  'content-type', 'te', 'grpc-encoding', 'grpc-accept-encoding', 'grpc-status', 'grpc-message', 'grpc-timeout',
-  'grpc-status-details-bin', // REVIEW-12 / CONTRACTS §18.6: rich error details belong to the status
-]);
-export function reservedGrpcMetadata(name: string): boolean {
-  const n = name.trim().toLowerCase();
-  return n.startsWith(':') || RESERVED_GRPC_METADATA.has(n);
-}
-
-/** Why a metadata name / value can't be used in a gRPC rewrite, if it can't (`-bin` values are base64). */
-export function grpcMetadataError(name: string, value: string | undefined, what: string): string | undefined {
+/**
+ * Why a metadata name / value can't be used, if it can't: `side` as in grpc-meta (`call` = a header rewrite on a gRPC
+ * call, `trailers` = set / remove trailers, `mock` = a grpcMock's or a status pause's headers / trailers). `value`
+ * undefined = a name to remove.
+ */
+export function grpcMetadataError(name: string, value: string | undefined, what: string, side: GrpcMetadataSide): string | undefined {
   const n = name.trim();
   if (!n) return undefined;
-  if (reservedGrpcMetadata(n)) {
-    return `${what} “${n}” can't be changed on gRPC calls (pseudo headers, content-type, te, grpc-encoding, grpc-accept-encoding, ` +
-      'grpc-status, grpc-message, grpc-status-details-bin and grpc-timeout are reserved — change the status with a breakpoint, ' +
-      'Mutate JSON or a script)';
-  }
-  if (value !== undefined && /-bin$/i.test(n) && !isBase64(value.trim())) return `${what} “${n}”: a -bin value must be base64`;
-  return undefined;
+  const p = reservedGrpcMetadataProblem(n, side) ?? (value !== undefined ? metadataValueProblem(n, value) : undefined);
+  return p ? `${what}: ${p}` : undefined;
 }
 
 /** CONTRACTS §18.1: what of a rewrite doesn't apply to gRPC calls (body replacements, the status). */
@@ -350,19 +333,6 @@ export function grpcRewriteNote(a: { request?: { replaceBody?: unknown[] }; resp
 export function looksLikeGrpcUrl(url: string): boolean {
   const path = url.trim().replace(/^[a-z*]+:\/\/[^/]*/i, ''); // the host has dots too
   return /\/[A-Za-z_]\w*(\.[A-Za-z_]\w*)+\/([A-Za-z_]\w*|\*)/.test(path);
-}
-
-/** Reserved names a grpcMock's headers / trailers may not set (the proxy's setRules refuses them). */
-export function reservedGrpcHeader(name: string): boolean {
-  const n = name.trim().toLowerCase();
-  return n.startsWith(':') || n === 'content-type' || n === 'grpc-status' || n === 'grpc-message';
-}
-
-const B64 = /^[A-Za-z0-9+/]*={0,2}$/;
-/** Standard base64 (whitespace ignored), length a multiple of 4. */
-export function isBase64(s: string): boolean {
-  const t = s.replace(/\s+/g, '');
-  return t.length % 4 === 0 && B64.test(t);
 }
 
 /** "gRPC UNAVAILABLE after 200 ms · 3 messages". */

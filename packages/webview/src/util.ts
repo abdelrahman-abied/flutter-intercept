@@ -2,6 +2,7 @@ import type { Body, Exchange, Frame } from './protocol';
 
 import type { StackFrame } from '@flutter-intercept/proxy/types';
 import { FRAMEWORK_PACKAGES } from '@flutter-intercept/proxy/source';
+import { FRAME_PAYLOAD_CAP } from '@flutter-intercept/proxy/grpc-meta';
 
 export type StatusClass = '2xx' | '3xx' | '4xx' | '5xx' | 'error';
 export const STATUS_CLASSES: StatusClass[] = ['2xx', '3xx', '4xx', '5xx', 'error'];
@@ -266,7 +267,7 @@ export function newId(prefix = 'r'): string {
 // ---------------------------------------------------------------- frame sizes (CONTRACTS §16.8)
 
 /** The frame cap (CONTRACTS §16.8): decompression stops past it. */
-export const FRAME_CAP = 64 * 1024;
+export { FRAME_PAYLOAD_CAP as FRAME_CAP } from '@flutter-intercept/proxy/grpc-meta';
 
 /**
  * CONTRACTS §16.8: with `sizeUnknown` the proxy stopped decompressing at the frame cap and `size` is the compressed
@@ -284,6 +285,6 @@ export function frameSizeTitle(f: Pick<Frame, 'size' | 'sizeUnknown'>): string |
 
 function keptBytes(f: Pick<Frame, 'base64' | 'text'>): number {
   const n = f.base64 ? base64ByteLength(f.base64) : 0;
-  return n > 0 ? n : FRAME_CAP;
+  return n > 0 ? n : FRAME_PAYLOAD_CAP;
 }
 
