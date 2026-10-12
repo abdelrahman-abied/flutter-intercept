@@ -205,19 +205,22 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   proxyHost.setRules(saved);
   deactivateHooks = [() => proxyHost.stop(), () => simTrust.releaseAll()];
   /** Status + decrypt-all: every TLS gRPC call is decrypted only while every intercepted dart:io session runs on a simulator that trusts our CA. */
-  const publishSimTrust = () => {
+  const publishSimTrust = (forceOff = false) => {
     const devices = simTrust.state();
     const trusted = new Set(devices.filter((d) => d.state === 'trusted' || d.state === 'pre-existing').map((d) => d.udid));
     const all = sessionDevices.size > 0 && [...sessionDevices.values()].every((d) => d !== undefined && trusted.has(d));
-    proxyHost.setGrpcDecryptAll(simTrustOn() && all);
+    proxyHost.setGrpcDecryptAll(!forceOff && simTrustOn() && all);
     proxyHost.setSimulatorTrust(devices.length ? { devices } : undefined);
   };
-  void simTrust.recover().then(publishSimTrust, (e: unknown) => log(`simulator trust recovery failed: ${String(e)}`)); // repairs a crashed run
+  void simTrust.recover().then(() => publishSimTrust(), (e: unknown) => log(`simulator trust recovery failed: ${String(e)}`)); // repairs a crashed run
   /** The iOS simulator of the active intercepted session (else the only one); a message when there is none. */
-  const simulatorOfSessions = async (): Promise<string | undefined> => {
+  const simulatorOfSessions = async (): Promise<{ udid: string; sessionId: string } | undefined> => {
     const active = vscode.debug.activeDebugSession?.id;
-    const ids = [...new Set([active ? sessionDevices.get(active) : undefined, ...sessionDevices.values()].filter((d): d is string => !!d))];
-    for (const id of ids) if (await simTrust.isSimulator(id)) return id;
+    const order = [...(active && sessionDevices.has(active) ? [active] : []), ...sessionDevices.keys()];
+    for (const sessionId of new Set(order)) {
+      const udid = sessionDevices.get(sessionId);
+      if (udid && (await simTrust.isSimulator(udid))) return { udid, sessionId };
+    }
     void vscode.window.showInformationMessage('Flutter Intercept: start an intercepted session on an iOS simulator first.');
     return undefined;
   };
@@ -378,18 +381,21 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     }),
     // CONTRACTS §19.3: trust / remove the CA on the simulator of an intercepted session (the setting does it automatically).
     vscode.commands.registerCommand('flutterIntercept.trustSimulatorCa', async () => {
-      const udid = await simulatorOfSessions();
-      if (!udid) return;
-      const r = await simTrust.ensure(udid, { name: 'iOS simulator' });
+      const target = await simulatorOfSessions();
+      if (!target) return;
+      // REVIEW-13 #5: tied to the session, so it is removed when that session ends.
+      const r = await simTrust.ensure(target.udid, { name: 'iOS simulator', sessionId: target.sessionId });
+      if (!sessionDevices.has(target.sessionId)) await simTrust.releaseSession(target.sessionId);
       publishSimTrust();
       void (r.state === 'trusted' || r.state === 'pre-existing'
         ? vscode.window.showInformationMessage('Flutter Intercept: this simulator trusts the Flutter Intercept CA until you remove it or the session ends. TLS gRPC is decrypted while every session runs on a trusting simulator.')
         : vscode.window.showWarningMessage(`Flutter Intercept: couldn't make the simulator trust the CA: ${r.problem ?? 'unknown problem'}`));
     }),
     vscode.commands.registerCommand('flutterIntercept.removeSimulatorCa', async () => {
-      const udid = await simulatorOfSessions();
-      if (!udid) return;
-      await simTrust.release(udid);
+      const target = await simulatorOfSessions();
+      if (!target) return;
+      publishSimTrust(true); // stop decrypting before the trust goes, so no call meets an untrusted certificate
+      await simTrust.release(target.udid);
       publishSimTrust();
       void vscode.window.showInformationMessage('Flutter Intercept: removed the Flutter Intercept CA this extension added to the simulator (certificates added by others are kept).');
     }),
@@ -584,6 +590,12 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       if (e.affectsConfiguration('flutterIntercept.tlsPassthrough')) applyTlsPassthrough();
       if (e.affectsConfiguration('flutterIntercept.grpc.decryptHosts')) applyGrpcDecryptHosts();
       if (e.affectsConfiguration('flutterIntercept.grpc.enabled')) grpc.enabledChanged();
+      if (e.affectsConfiguration('flutterIntercept.grpc.trustOnSimulator') || e.affectsConfiguration('flutterIntercept.grpc.enabled')) {
+        if (!simTrustOn()) {
+          publishSimTrust(true);
+          void simTrust.releaseAll().then(() => publishSimTrust(), (err: unknown) => log(`simulator trust release failed: ${String(err)}`));
+        } else publishSimTrust();
+      }
       if (e.affectsConfiguration('flutterIntercept.clientCertificates')) void applyClientCertificates().catch((err: unknown) => log(`client certificates: ${String(err)}`));
     }),
   );
@@ -826,7 +838,9 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
         void simTrust
           .isSimulator(deviceId)
           .then((sim) => (sim ? simTrust.ensure(deviceId, { sessionId: session.id, name: session.name }) : undefined))
-          .then((r) => {
+          .then(async (r) => {
+            // REVIEW-13 #5: the session may have ended while the trust was being added.
+            if (r && !sessionDevices.has(session.id)) await simTrust.releaseSession(session.id);
             if (r && r.state === 'failed') void vscode.window.showWarningMessage(`Flutter Intercept: couldn't make the simulator trust the CA: ${r.problem ?? 'unknown problem'}`);
             publishSimTrust();
           })
@@ -869,7 +883,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       void nativeRoutes.release(session.id).catch((e: unknown) => log(`emulator proxy release failed: ${String(e)}`));
       if (sessionDevices.delete(session.id)) {
         publishSimTrust();
-        void simTrust.releaseSession(session.id).then(publishSimTrust, (e: unknown) => log(`simulator trust release failed: ${String(e)}`));
+        void simTrust.releaseSession(session.id).then(() => publishSimTrust(), (e: unknown) => log(`simulator trust release failed: ${String(e)}`));
       }
       lanLife.ended(session.id); // also on crash / app killed: closes the LAN listener after the last iPhone session
       if (webSessions.delete(session.id) && webSessions.size === 0) proxyHost.setWebSessionActive(false);
