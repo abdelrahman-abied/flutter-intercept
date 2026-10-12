@@ -16,7 +16,7 @@ import { presetProfile, type NetworkPresetId, type NetworkProfile } from '@flutt
 import { loadOrCreateCa } from '../../extension/src/ca';
 import { findPubspecRoot, hasPubspec, PROXY_DEFINE, readPubspec } from '../../extension/src/entry/generator';
 import { locateAdb, ReverseTracker } from '../../extension/src/adb';
-import { IosSimTrust, type SimTrustStore } from '../../extension/src/iosSimTrust';
+import { defaultSimTrustStoreFile, IosSimTrust, jsonFileStore } from '../../extension/src/iosSimTrust';
 import { displayCommand, spawnPlan } from './command';
 import { redactUrl } from '../../extension/src/agent/redact';
 import { evaluateExpectations, readExpectations, type AssertionResult, type Expectation } from './assertions';
@@ -285,7 +285,7 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
     proxy.on('removed', (ids: string[]) => (evicted += ids.length));
     // CONTRACTS §19.3: an iOS simulator trusts this run's CA (opt-in); a crashed run's certificate is removed by the next run.
     if (o.trustSimulator) {
-      simTrust = new IosSimTrust({ caCertPem: ca.cert, log, store: jsonFileStore(path.join(projectRoot, '.dart_tool', 'flutter_intercept', 'sim-trust.json')) });
+      simTrust = new IosSimTrust({ caCertPem: ca.cert, log, store: jsonFileStore(defaultSimTrustStoreFile(), log) }); // REVIEW-13 #7: outside the project, symlink-safe
       const removed = await simTrust.recover().catch(() => 0);
       if (removed) log(`removed ${removed} Flutter Intercept CA certificate(s) a previous run left on a simulator`);
     }
@@ -488,22 +488,4 @@ function safeRead(p: string): string {
 async function settle(proxy: InterceptProxy, maxMs: number): Promise<void> {
   const until = Date.now() + maxMs;
   while (Date.now() < until && proxy.getExchanges().some((e) => !FINAL.has(e.state))) await new Promise((r) => setTimeout(r, 100));
-}
-
-/** CONTRACTS §19.3: the simulator-trust records of CLI runs (so a crashed run's certificate is removed by the next one). */
-function jsonFileStore(file: string): SimTrustStore {
-  return {
-    get: () => {
-      try {
-        const v = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
-        return Array.isArray(v) ? v : [];
-      } catch {
-        return [];
-      }
-    },
-    set: async (records) => {
-      await fs.promises.mkdir(path.dirname(file), { recursive: true });
-      await fs.promises.writeFile(file, JSON.stringify(records), { mode: 0o600 });
-    },
-  };
 }
