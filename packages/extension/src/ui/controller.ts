@@ -1201,6 +1201,9 @@ export function validateSendDraft(raw: unknown): SendDraft {
   };
 }
 
+/** CONTRACTS §19: gRPC-Web calls are not resent yet (owner decision 2026-10-12). */
+export const GRPC_WEB_RESEND = "Resending gRPC-Web calls comes later: the proxy resends over HTTP/2, which a gRPC-Web-only server may not accept.";
+
 /** CONTRACTS §18.4: send caps (the proxy enforces them too). */
 export const MAX_SEND_GRPC_MESSAGES = 100;
 export const MAX_SEND_GRPC_TOTAL_BYTES = 16 * 1024 * 1024;
@@ -1711,6 +1714,7 @@ export class InterceptController {
             const ro = from && readOnlyReason(from);
             if (ro) throw new Error(`Can't resend this request: ${ro}.`);
             if (from?.kind === 'tunnel') throw new Error("Can't resend a passed-through TLS connection: its request was never decrypted.");
+            if (from?.grpc?.web) throw new Error(GRPC_WEB_RESEND);
             // CONTRACTS §18.4: resending a gRPC call unchanged sends its recorded request messages
             if (from?.kind === 'grpc' && !request.grpc) {
               try {

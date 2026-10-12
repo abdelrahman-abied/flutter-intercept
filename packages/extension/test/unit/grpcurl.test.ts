@@ -151,3 +151,31 @@ describe('copySnippet / get_request snippet with gRPC', () => {
     expect((buildHar([web], { redact: true }) as any).log.entries[0]._grpc.web).toBe('binary');
   });
 });
+
+describe('gRPC-Web calls are not resent (owner decision, CONTRACTS §19)', () => {
+  it('the panel and agents refuse with a plain message', async () => {
+    const web = grpcCall({ id: 'w', grpc: { service: 'shop.v1.CartService', method: 'AddItem', statusCode: 0, messagesSent: 1, messagesReceived: 1, web: 'binary' } });
+    const host = new Host();
+    host.exchanges = [web];
+    const sent: unknown[] = [];
+    Object.assign(host, { send: async (r: unknown) => (sent.push(r), { id: 's' }) });
+    const c = new InterceptController({ host, saveRules: () => undefined, getEnabled: () => true, setEnabled: async () => undefined, grpc: fakeGrpc() });
+    const replies: HostMsg[] = [];
+    await c.handle({ type: 'send', request: { method: 'POST', url: web.url }, resentFrom: 'w' }, (m) => replies.push(m));
+    c.dispose();
+    expect((replies[0] as { message: string }).message).toMatch(/Resending gRPC-Web calls comes later: the proxy resends over HTTP\/2/);
+    const api = createAgentApi({
+      host: host as unknown as AgentApiDeps['host'],
+      applyRules: () => undefined,
+      clear: () => undefined,
+      getSettings: () => ({ access: 'readWrite', redactSecrets: true, interceptEnabled: true }),
+      launcher: { launch: vi.fn(), stop: vi.fn(), hotRestart: vi.fn(), sessions: () => [] } as unknown as AppLauncher,
+      projectRoot: () => '/ws/app',
+      grpc: fakeGrpc(),
+    });
+    const e = await api.call('resend_request', { id: 'w', grpc: { messages: ['AA=='] } }).then(() => undefined, (x: unknown) => x);
+    expect(e).toBeInstanceOf(AgentToolError);
+    expect((e as Error).message).toMatch(/resending gRPC-Web calls comes later/);
+    expect(sent).toEqual([]);
+  });
+});

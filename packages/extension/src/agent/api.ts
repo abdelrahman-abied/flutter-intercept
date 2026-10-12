@@ -17,7 +17,7 @@ import type { AuthAnalysis } from '../analysis/types';
 import type { RecordingService } from '../recordings/types';
 import type { ExportResult, ToOpenApi, ToPostman } from '../export/types';
 import type { Screenshot, ScreenshotTarget } from '../screenshot/types';
-import { checkMapTarget, expireTokenRule, fixtureApi, grpcResendMessages, isRecordable, readOnlyReason, resolveGrpcEdit, resolveSendGrpc, sanitizeGrpcSendHeaders, sanitizeSendHeaders, validateSendDraft, tunnelReason, validateEdit, validateRule } from '../ui/controller';
+import { checkMapTarget, expireTokenRule, fixtureApi, GRPC_WEB_RESEND, grpcResendMessages, isRecordable, readOnlyReason, resolveGrpcEdit, resolveSendGrpc, sanitizeGrpcSendHeaders, sanitizeSendHeaders, validateSendDraft, tunnelReason, validateEdit, validateRule } from '../ui/controller';
 import type { SessionWarning } from '../ui/protocol';
 import { buildHar, writeExportFile, writeHar } from './har';
 import { mapRemoteSelfProblem } from '../proxyHost';
@@ -1333,6 +1333,7 @@ export class AgentApi implements AgentTools {
     if (e.kind === 'websocket') return `exchange "${e.id}" is a WebSocket connection; only plain HTTP requests can be resent`;
     if (e.kind === 'sse') return `exchange "${e.id}" is a server-sent event stream; resending it would hold a stream open, so only plain HTTP requests can be resent`;
     if (e.kind === 'tunnel') return `exchange "${e.id}" is a TLS connection passed through without decryption (flutterIntercept.tlsPassthrough); its request was never seen, so it can't be resent`;
+    if (e.grpc?.web) return `exchange "${e.id}": ${GRPC_WEB_RESEND.replace(/\.$/, '').replace(/^R/, 'r')}`;
     if (e.initiator) return `exchange "${e.id}" was itself sent by ${e.initiator === 'agent' ? 'an agent' : 'the editor'}; resend the app's original request instead`;
     if (/^(lan|tls)-/.test(e.id)) return `exchange "${e.id}" is a connection-level record (refused LAN or TLS connection), not a request that reached a server`;
     if (e.viaLan) return `exchange "${e.id}" came from a physical device over the LAN; resending it from this computer would bypass the LAN safeguards`;
