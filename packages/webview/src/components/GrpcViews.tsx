@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Exchange, Frame, GrpcDecodedMessage, GrpcEdit, GrpcPause } from '../protocol';
 import {
-  DECODE_TIMEOUT_MS, findPreflight, GRPC_CODES, GRPC_DECRYPT_SETTING, GRPC_WEB_NOTE, grpcCodeLabel, grpcCountsText, grpcFacts, grpcPath, grpcPauseKey, grpcPauseTitle,
+  DECODE_TIMEOUT_MS, findPreflight, GRPC_CODES, GRPC_DECRYPT_SETTING, GRPC_WEB_NOTE, SIM_TRUST_SETTING, simTrustFailures, grpcCodeLabel, grpcCountsText, grpcFacts, grpcPath, grpcPauseKey, grpcPauseTitle,
   grpcVersion, hexTextDump, isBase64, isGrpc, needsDecode, pausedDecoded, reservedGrpcHeader,
 } from '../grpc';
 import { grpcHeaderError, grpcMessageError, headersChanged, headersToRows, rowsToFlatRecord, type HeaderRow } from '../state';
@@ -204,6 +204,10 @@ export function GrpcTunnelExplanation({ host }: { host: string }) {
         add <code>{host}</code> to <code>{GRPC_DECRYPT_SETTING}</code>. New connections are then decrypted and each call is
         listed with its messages — restart the app if it keeps an open channel. An insecure (h2c) channel is always shown.
       </p>
+      <p>
+        On an <strong>iOS simulator</strong>, turn on <code>{SIM_TRUST_SETTING}</code> (user settings) instead: the simulator
+        then trusts the Flutter Intercept CA until the session ends, and TLS gRPC is decrypted without changing the app.
+      </p>
       {hosts.length > 0 && (
         <p class="muted">Decrypted now: {hosts.map((h, i) => <span key={h}>{i ? ', ' : ''}<code>{h}</code></span>)}</p>
       )}
@@ -385,5 +389,26 @@ function GrpcStatusPause({ ex, p }: { ex: Exchange; p: Extract<GrpcPause, { kind
         <span class="pe-summary">{busy ? 'Sent — waiting for the proxy…' : changed ? 'Edited' : 'No changes'}</span>
       </div>
     </form>
+  );
+}
+
+/** CONTRACTS §19.3: a simulator that couldn't be set to trust the CA — one dismissable warning per device + problem. */
+export function SimTrustBanner() {
+  const { state } = useApp();
+  const failures = simTrustFailures(state.status.grpc?.simulatorTrust);
+  const [dismissed, setDismissed] = useState<string[]>([]);
+  const shown = failures.filter((f) => !dismissed.includes(f.key));
+  if (!shown.length) return null;
+  return (
+    <div class="warnings" role="status" aria-label="Simulator trust">
+      {shown.map((f) => (
+        <div key={f.key} class="warning-banner sim-trust-failed" role="alert">
+          <span class="warning-icon" aria-hidden="true">⚠</span>
+          <span class="warning-text">{f.text}</span>
+          <span class="spacer" />
+          <Button kind="icon" title="Dismiss" onClick={() => setDismissed([...dismissed, f.key])}><Icon name="close" /></Button>
+        </div>
+      ))}
+    </div>
   );
 }

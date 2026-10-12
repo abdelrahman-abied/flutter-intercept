@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { App } from '../src/components/App';
 import type { Host } from '../src/host';
 import type { Exchange, Frame, HostMsg, Rule, Status, ViewMsg } from '../src/protocol';
-import { findPreflight, grpcTitle, isGrpcWeb, isNativeGrpc } from '../src/grpc';
+import { findPreflight, GRPC_TUNNEL_HINT, grpcTitle, isGrpcWeb, isNativeGrpc, simTrustFailures, simTrustSummary } from '../src/grpc';
 import { interceptOff } from '../src/components/actions';
 import { countMatches, EMPTY_FILTERS, filterExchanges, ruleStats, snippetFormatsFor, SNIPPET_LABEL } from '../src/state';
 import { parseFilter } from '../src/filter';
@@ -207,5 +207,47 @@ describe('gRPC-Web in the panel', () => {
     await act(() => { (url as HTMLInputElement).value = 'http://localhost:8080/demo.Users/*'; url.dispatchEvent(new Event('input', { bubbles: true })); });
     expect($('.grpc-rule-note')).toBeNull();
     expect($('.rule-editor')!.textContent).toContain('Matches 1 of the 1 exchanges');
+  });
+});
+
+describe('iOS simulator trust (CONTRACTS §19.3)', () => {
+  const trust = (devices: NonNullable<NonNullable<Status['grpc']>['simulatorTrust']>['devices'], decryptAll = true): Status =>
+    ({ ...withGrpc, grpc: { ...withGrpc.grpc!, simulatorTrust: { devices, decryptAll } } });
+
+  it('pure: summary text and failures', () => {
+    expect(simTrustSummary(undefined)).toBeUndefined();
+    const s = simTrustSummary({ devices: [{ udid: 'AAAA-1', name: 'iPhone 17', state: 'trusted' }], decryptAll: true })!;
+    expect(s.text).toBe('iPhone 17 trusts the Flutter Intercept CA until the session ends · decrypting all TLS gRPC');
+    expect(s.title).toContain('flutterIntercept.grpc.trustOnSimulator');
+    const two = simTrustSummary({ devices: [
+      { udid: 'A', name: 'iPhone 17', state: 'trusted' }, { udid: 'BBBBBBBB-2', state: 'pre-existing' }, { udid: 'C', name: 'iPad', state: 'failed', problem: 'x' },
+    ], decryptAll: false })!;
+    expect(two.text).toBe('iPhone 17 and Simulator BBBBBBBB trust the Flutter Intercept CA until the session ends');
+    expect(two.title).toContain('already trusted before; left in place');
+    expect(simTrustFailures({ devices: [{ udid: 'C', name: 'iPad', state: 'failed', problem: 'unknown trust store schema' }], decryptAll: false }))
+      .toEqual([{ key: 'C:unknown trust store schema', text: 'iPad couldn\'t be set to trust the Flutter Intercept CA: unknown trust store schema TLS gRPC from it stays undecrypted.' }]);
+    expect(GRPC_TUNNEL_HINT).toContain('flutterIntercept.grpc.trustOnSimulator');
+  });
+
+  it('status line item; failed device as a dismissable warning banner', async () => {
+    await mount();
+    await emit({ type: 'snapshot', exchanges: [ex()], rules: [], status: trust([
+      { udid: 'A', name: 'iPhone 17', state: 'trusted' }, { udid: 'C', name: 'iPad Air', state: 'failed', problem: 'unknown trust store schema' },
+    ]) });
+    expect($('.sim-trust-status')!.textContent).toBe('iPhone 17 trusts the Flutter Intercept CA until the session ends · decrypting all TLS gRPC');
+    const banner = $('.sim-trust-failed')!;
+    expect(banner.textContent).toContain('iPad Air couldn\'t be set to trust the Flutter Intercept CA: unknown trust store schema');
+    await click(button('', banner));
+    expect($('.sim-trust-failed')).toBeNull();
+  });
+
+  it('gRPC tunnel rows mention the simulator setting', async () => {
+    await mount();
+    const tun = ex({ id: 'tun', method: 'CONNECT', url: 'https://grpc.example.com:443/', kind: 'tunnel', grpcTunnel: true, status: undefined,
+      requestHeaders: {}, responseHeaders: undefined, responseBody: undefined });
+    await emit({ type: 'snapshot', exchanges: [tun], rules: [], status: withGrpc });
+    expect($('.kb-grpc-tunnel')!.getAttribute('title')).toContain('on an iOS simulator, turn on flutterIntercept.grpc.trustOnSimulator');
+    await click($$('.row')[0]);
+    expect($('.tunnel')!.textContent).toContain('iOS simulator, turn on flutterIntercept.grpc.trustOnSimulator');
   });
 });

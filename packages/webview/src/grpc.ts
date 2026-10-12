@@ -76,8 +76,12 @@ export function isGrpcTunnel(ex: Pick<Exchange, 'kind' | 'grpcTunnel'>): boolean
 }
 
 /** The hint every undecrypted gRPC tunnel carries (row tooltip, detail note). */
+/** CONTRACTS §19.3: opt-in CA trust on iOS simulators (user settings only). */
+export const SIM_TRUST_SETTING = 'flutterIntercept.grpc.trustOnSimulator';
+
 export const GRPC_TUNNEL_HINT =
-  `gRPC over TLS, not decrypted — add the host to ${GRPC_DECRYPT_SETTING} if the app trusts the Flutter Intercept CA in debug`;
+  `gRPC over TLS, not decrypted — add the host to ${GRPC_DECRYPT_SETTING} if the app trusts the Flutter Intercept CA in debug` +
+  ` (on an iOS simulator, turn on ${SIM_TRUST_SETTING} instead)`;
 
 /** Why every action except Block can't be used on an undecrypted gRPC tunnel. */
 export const GRPC_TUNNEL_NO_ACTION =
@@ -368,6 +372,38 @@ export function describeGrpcMock(a: Extract<RuleAction, { kind: 'grpcMock' }>): 
   if (n) parts.push(`${n} message${n === 1 ? '' : 's'}`);
   if (a.delayMs) parts.push(`after ${a.delayMs} ms`);
   return parts.join(' · ');
+}
+
+// ---------------------------------------------------------------- iOS simulator trust (CONTRACTS §19.3)
+
+type SimTrust = NonNullable<NonNullable<Status['grpc']>['simulatorTrust']>;
+type SimDevice = SimTrust['devices'][number];
+const simName = (d: SimDevice) => d.name?.trim() || `Simulator ${d.udid.slice(0, 8)}`;
+
+/** Status line item: "iPhone 17 trusts the Flutter Intercept CA until the session ends · decrypting all TLS gRPC". */
+export function simTrustSummary(t: SimTrust | undefined): { text: string; title: string } | undefined {
+  const ok = (t?.devices ?? []).filter((d) => d.state !== 'failed');
+  if (!t || !ok.length) return undefined;
+  const names = ok.map(simName);
+  const who = names.length === 1 ? `${names[0]} trusts` : `${names.slice(0, -1).join(', ')} and ${names.at(-1)} trust`;
+  const text = `${who} the Flutter Intercept CA until the session ends${t.decryptAll ? ' · decrypting all TLS gRPC' : ''}`;
+  const lines = ok.map((d) => `• ${simName(d)} (${d.udid})${d.state === 'pre-existing' ? ' — the CA was already trusted before; left in place' : ''}`);
+  return {
+    text,
+    title: `iOS simulators trusting the Flutter Intercept CA (${SIM_TRUST_SETTING}):\n${lines.join('\n')}\n\n` +
+      (t.decryptAll
+        ? 'Every session runs on a trusting simulator, so TLS gRPC is decrypted for every host (except TLS passthrough hosts). '
+        : `TLS gRPC is decrypted only for ${GRPC_DECRYPT_SETTING} hosts (a session runs elsewhere). `) +
+      'The trust is removed when the session ends; physical devices are never changed.',
+  };
+}
+
+/** Simulators where adding the trust failed (warning banner). */
+export function simTrustFailures(t: SimTrust | undefined): { key: string; text: string }[] {
+  return (t?.devices ?? []).filter((d) => d.state === 'failed').map((d) => ({
+    key: `${d.udid}:${d.problem ?? ''}`,
+    text: `${simName(d)} couldn't be set to trust the Flutter Intercept CA${d.problem ? `: ${d.problem}` : '.'} TLS gRPC from it stays undecrypted.`,
+  }));
 }
 
 // ---------------------------------------------------------------- status (Status.grpc)

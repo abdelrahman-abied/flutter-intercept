@@ -1350,3 +1350,4 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
 .grpc-web-http { display: inline-flex; align-items: center; gap: 4px; }
 .grpc-web-note { flex-basis: 100%; margin: 0; }
 .grpc-web-body { margin-top: 8px; }
+.sim-trust-status { overflow: hidden; text-overflow: ellipsis; }
