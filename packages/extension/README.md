@@ -1603,6 +1603,10 @@ Remove the CA from this iOS Simulator** takes it away early. What changes and ho
   are never passed through this way.
 - Physical iPhones, Android emulators and phones, and macOS desktop are never changed. The simulator must be booted.
   If its trust store doesn't look as expected, nothing is added and the panel says why.
+- Once a call is decrypted, the proxy connects to the server itself and checks the server's certificate the normal
+  way. A development server with a **self-signed** certificate (one your app accepts with `onBadCertificate`) then
+  fails with gRPC status 14 "… self signed certificate". Keep such a host out of decryption by adding it to
+  `flutterIntercept.tlsPassthrough`, or give the server a certificate from a CA the machine trusts.
 - Android Studio / IntelliJ: tick **Make iOS simulators trust the Flutter Intercept CA during a session** under
   **Settings → Tools → Flutter Intercept → gRPC**. CLI: `--trust-simulator`.
 
