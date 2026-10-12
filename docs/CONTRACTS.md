@@ -2072,5 +2072,28 @@ Types already in code: `GrpcInfo.web`, `SnippetFormat 'grpcurl'` (both protocol 
   workspace; otherwise a comment that the server needs reflection. Shell-quoted; redacted for agents like other
   snippets. Webview: "Copy as grpcurl" on gRPC rows; agents: `get_request snippet: "grpcurl"`.
 
-### 19.3 iOS simulator CA trust (opt-in; spike first: docs/spikes/ios-sim-trust.md)
-Ships only if the spike proves a clean add **and** single-certificate removal. Design is filled in after the spike.
+### 19.3 iOS simulator CA trust (opt-in; docs/spikes/ios-sim-trust.md — proven on iOS 26.5)
+- Setting `flutterIntercept.grpc.trustOnSimulator` (boolean, default false, **user settings only**; sidecar
+  `grpc.trustOnSimulator`; CLI `--trust-simulator`). Commands **Trust the Flutter Intercept CA on this Simulator** /
+  **Remove it** for the running session's simulator.
+- Module `src/iosSimTrust.ts` (vscode-free, used by the extension, the sidecar and the CLI; `exec` / `fs` injected):
+  - Applies only to an id listed **Booted** in `xcrun simctl list devices -j` (physical devices never are).
+  - `ensure(udid)`: read-only check of the trust store row (`<dataPath>/private/var/protected/trustd/private/
+    TrustStore.sqlite3`, table `tsettings`, key = sha256 of our CA DER) → present before us = `pre-existing` (never
+    removed by us); unknown file / schema → refuse with a problem (`failed`). Otherwise write the record first (udid,
+    dataPath, sha256, owner id, pid, heartbeat; same persistence and ownership pattern as `AndroidGlobalProxy`), then
+    `xcrun simctl keychain <udid> add-root-cert <cert-only PEM in a 0600 temp file>`, then confirm the row → `trusted`.
+  - `release(udid)`: delete exactly our row by sha256 with `/usr/bin/sqlite3` (busy timeout), only for records we own
+    and only when no other live session / window still uses that simulator; then drop the record. Works with the
+    simulator booted or shut down. **Never** `simctl keychain reset` / `erase`.
+  - `recover()`: on activation, release records whose owner is gone (stale heartbeat / dead pid).
+  - Called on session start (debug or profile, iOS simulator, setting on), session end, proxy stop, `deactivate()`.
+- Decryption: while at least one simulator is `trusted` and every running intercepted session is on a trusted simulator,
+  the host calls `InterceptProxy.setGrpcDecryptAll(true)`: TLS silent gRPC tunnels are decrypted for every host except
+  `tlsPassthrough` hosts; otherwise only `grpcDecryptHosts`. If the app then fails the TLS handshake for a host (pinned to
+  its own certificate), the proxy passes that host through for the rest of the proxy's life and notes it on the exchange
+  (`Exchange.error` text "… pins its certificate; passed through undecrypted").
+- `Status.grpc.simulatorTrust` lists simulators and their state; agents' `get_status` shows it; the panel shows "This
+  simulator trusts the Flutter Intercept CA until the session ends".
+- Physical iPhones, Android emulators and macOS desktop are never changed (documented: Android's Dart reads only the
+  system store; macOS would need the login keychain and a password prompt).

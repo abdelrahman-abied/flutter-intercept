@@ -52,6 +52,8 @@ export interface GrpcStatus {
   problem?: string;
   /** From the app's generated `*.pb*.dart`. */
   schema?: { methods: number; messages: number; problems: string[] };
+  /** CONTRACTS §19.3: iOS simulators that trust the Flutter Intercept CA (opt-in), and whether every TLS gRPC call is decrypted. */
+  simulatorTrust?: { devices: { udid: string; name?: string; state: 'trusted' | 'pre-existing' | 'failed'; problem?: string }[]; decryptAll: boolean };
 }
 export interface AgentStatus { access: string; mcpUrl?: string; clients: number; lastCall?: { tool: string; at: number } }
 

@@ -28,7 +28,7 @@ export interface SidecarSettings {
   /** The IDE's own HTTP proxy, if any (like VS Code's `http.proxy`): `http://host:port`. */
   ideHttpProxy?: { url?: string; noProxy?: string[] };
   /** CONTRACTS §16.4. Absent = enabled, no decrypt hosts (older plugins). */
-  grpc?: { enabled: boolean; decryptHosts: string[] };
+  grpc?: { enabled: boolean; decryptHosts: string[]; trustOnSimulator?: boolean };
 }
 
 export type DeviceKind = 'android-emulator' | 'android-device' | 'ios-simulator' | 'ios-device' | 'macos' | 'linux' | 'windows' | 'web' | 'other';

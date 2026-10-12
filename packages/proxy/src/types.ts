@@ -398,6 +398,9 @@ export interface InterceptProxyOptions {
   clientCertificates?: ClientCertificate[];
   /** CONTRACTS §16.2: hosts (globs) whose TLS gRPC silent tunnels are decrypted (the app trusts our CA). */
   grpcDecryptHosts?: string[];
+  /** CONTRACTS §19.3: decrypt every TLS gRPC silent tunnel (except tlsPassthrough hosts) — the host sets it while every
+   * running session is on a simulator that trusts our CA. Default false. */
+  grpcDecryptAll?: boolean;
 }
 
 /** CONTRACTS §14.3: one client certificate for upstream mTLS. Key material never leaves the proxy (not in exchanges / events). */

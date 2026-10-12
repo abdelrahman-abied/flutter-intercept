@@ -277,3 +277,4 @@ Contract: CONTRACTS §19. Owner instruction: take every decision in the project'
 | W webview | gRPC-Web badge, Copy as grpcurl, CORS hints for gRPC-Web — `packages/webview/**` except `protocol.ts` |
 | T trust spike | iOS simulator CA trust feasibility — docs/spikes/ios-sim-trust.md (then design + owner) |
 | lead | contract, types, wiring, docs, E2E, review |
+| T trust (0.13 part 2) | `packages/extension/src/iosSimTrust.ts` + its tests (fake exec / fs), integration check in `test/integration/suite/devices.ts` (iOS simulator only) |
