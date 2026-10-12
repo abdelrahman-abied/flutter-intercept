@@ -280,3 +280,32 @@ which don't depend on the machine.
 
 A `packages/proxy/bench/` folder holding the scratch scripts (with a `--quick` mode of about 20 s) would make B1–B9
 runnable on demand. B1, B4, B9 and B10 fit as ordinary vitest tests.
+
+## 6. After fixes — proxy (0.13.0)
+
+Done: #2 (`evict()` iterates the Map), #3 (streamed gRPC frames keep the raw bytes and are base64-encoded only when
+a snapshot is taken; frames are trimmed in one `splice` once the list reaches 2× `maxFrames`), #4 (no `'response'`
+listener: refused WebSocket upgrades are read from the socket's own writes, and the taps write past mockttp's
+tracking stream, so mockttp no longer buffers response bodies), #6 (the LAN socket walk is cached per socket;
+mockttp's `port` is pinned after `listen`), #9 (`FRAME_OVERHEAD_BYTES` = 150; a lazy frame is counted at its
+base64 size). Not done: #8 (body recording as Buffers) and #10 (ECDSA keys in mockttp); both are larger changes.
+
+Same scratch scripts, old dist vs new dist, run back to back on the same machine (`nice -n 10`, other work running,
+so compare the pairs, not the absolute numbers with §3):
+
+| Scenario | Before | After |
+|---|---|---|
+| Unary gRPC, CPU per call at `maxExchanges` 1000 → 10 000 | 69.5 → 90.4 µs (+29%) | 70.9 → 76.1 µs (+7%) |
+| Unary gRPC, CPU per call, no rules | 81.4 µs | 72.2 µs |
+| Unary gRPC, CPU per call, breakpoint rule that doesn't match | 77.3 µs | 75.9 µs |
+| Bytes allocated per unary call | 92.9 KB | 79.1 KB (`emitChange` is no longer the top allocator) |
+| Server stream, 20 000 × 100 B | 1.47 M msg/s | 1.67 M msg/s |
+| Server stream, proxy CPU per message | ≈ 0.91 µs | ≈ 0.91 µs |
+| HTTP 1 MB response, CPU per request | 1.93 ms | 1.77 ms |
+| HTTPS small response, CPU per request | 0.170 ms | 0.128 ms |
+| HTTPS 1 MB response, CPU per request | 3.76 ms | 3.56 ms |
+
+B4 (10 000 vs 1000 within 10%) now passes. `packages/proxy/test/perf-budgets.test.ts` checks B4 as a ratio
+(2000 new exchanges into a full store of 10 000 vs 1000: about 1.2× now, about 10× with the key copy; the test allows
+2.5×) and B2 structurally (a 2000-message stream with `maxFramesPerExchange` 20 does 22 base64 encodes, not 2000+).
+B1's structural half (`grpcTransformStats.created` unchanged) stays in `grpc-parity.test.ts`.
