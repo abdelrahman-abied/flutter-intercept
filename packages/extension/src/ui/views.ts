@@ -192,6 +192,14 @@ export function tunnelReason(e: Exchange): string | undefined {
   } catch {
     // keep generic
   }
+  // CONTRACTS §20.1: passed through because the proxy learned it (the app's own client certificate, or it pins).
+  const learned = e.learnedPassthrough;
+  if (learned?.reason === 'client-certificate') {
+    return `the server${host ? ` ${host}` : ''} asks the app for its own client certificate (mutual TLS), so Flutter Intercept passes it through without decryption and the app talks to it directly; only the bytes each way and the timing are known. To see these requests, add the certificate in the Flutter Intercept panel (Add client certificate…). Only block rules (and faults) apply to it.`;
+  }
+  if (learned?.reason === 'pinned') {
+    return `the app rejected the Flutter Intercept certificate for${host ? ` ${host}` : ' this host'} (it pins its certificate), so the host is passed through without decryption for 10 minutes; only the bytes each way and the timing are known. Add the host to flutterIntercept.tlsPassthrough to keep it that way, or forget it in the panel to try decrypting again. Only block rules (and faults) apply to it.`;
+  }
   // CONTRACTS §16.5: a gRPC connection over TLS with the app's default credentials.
   if (e.grpcTunnel) {
     return `gRPC over TLS${host ? ` to ${host}` : ''}, not decrypted: the app trusts only its own certificate roots, so only the bytes each way and the timing are known. Add the host to flutterIntercept.grpc.decryptHosts if the app trusts the Flutter Intercept CA in debug (pinned to it, or onBadCertificate). Only block rules (and faults) apply to it.`;

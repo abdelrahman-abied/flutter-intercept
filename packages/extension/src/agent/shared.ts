@@ -96,6 +96,8 @@ export interface AgentApiDeps {
     readonly tlsPassthrough?: string[];
     /** §14.3: host pattern + problem per configured client certificate (never paths or key material). */
     readonly clientCertificateStatus?: { host: string; problem?: string }[];
+    /** §20.2: hosts the proxy passes through on its own (read-only for agents: they can't forget them). */
+    readonly learnedPassthrough?: { host: string; port: number; reason: 'client-certificate' | 'pinned'; until?: number }[];
     // CONTRACTS §16.4 (InterceptProxyHost). Optional on older builds.
     readonly grpcDecryptHosts?: string[];
     readonly grpcProblem?: string;

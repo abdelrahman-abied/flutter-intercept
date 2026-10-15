@@ -8,10 +8,26 @@ import { ruleFromExchange } from '@flutter-intercept/proxy/rules';
 import { SNIPPET_FORMATS } from '../codegen/snippets';
 import { scriptFileOf, scriptTemplate } from '../rules/scriptFile';
 import type { InterceptController, Sink } from './controller';
+import { CLIENT_CERT_UI_MISSING, CERT_TOKEN_EXPIRED, CERT_TOKEN_RE, MAX_CERT_PASSPHRASE_CHARS, MAX_CERT_TOKENS, type ClientCertUi } from './clientCertUi';
 import { GRPC_WEB_RESEND, grpcMockRuleFromExchange, grpcResendMessages, resolveGrpcEdit, resolveSendGrpc } from './grpcHost';
 import type { ViewMsg } from './protocol';
 import { checkBodyFile, checkId, checkRuleId, checkScriptFile, fail, isInt, isObj, MAX_BODY_FILE_BYTES, MAX_SCRIPT_BYTES, onlyKeys, sanitizeGrpcSendHeaders, validateEdit, validateRule, validateSendDraft } from './validate';
 import { contractSummary, readOnlyReason, recordingSummary, RULE_KINDS, ruleFromExchangeErrorMessage, snippetFor, tunnelBlockRule } from './views';
+
+const CERT_ROLES = new Set(['pfx', 'cert', 'key']);
+/** A host name (or IP literal) as the proxy keys learned passthrough entries (`host:port`). */
+const LEARNED_HOST = /^[a-z0-9._\-:[\]]{1,260}$/i;
+
+function certUiOrThrow(c: InterceptController): ClientCertUi {
+  if (!c.deps.clientCertUi) throw new Error(CLIENT_CERT_UI_MISSING);
+  return c.deps.clientCertUi;
+}
+
+function checkCertToken(v: unknown, field: string): string | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== 'string' || !CERT_TOKEN_RE.test(v)) fail('addClientCertificate', `${field} must be a file token from chooseClientCertificateFile`);
+  return v;
+}
 
 /** One handler per ViewMsg type. */
 export type ViewHandlers = { [K in ViewMsg['type']]: (msg: Extract<ViewMsg, { type: K }>, reply: Sink) => Promise<void> | void };
@@ -84,7 +100,9 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
         throw new Error(
           ex.grpcTunnel
             ? "Can't mock or pause this gRPC connection: it is TLS that isn't decrypted, so it can only be blocked (or failed with a fault rule). Add the host to flutterIntercept.grpc.decryptHosts if the app trusts the Flutter Intercept CA in debug."
-            : `Can't create ${msg.action === 'mock' ? 'a mock' : msg.action === 'grpcMock' ? 'a gRPC mock' : 'a breakpoint'} rule from a passed-through TLS connection: it isn't decrypted, so it can only be blocked (or failed with a fault rule). Remove the host from flutterIntercept.tlsPassthrough to mock it.`,
+            : ex.learnedPassthrough?.reason === 'client-certificate'
+              ? `Can't create ${msg.action === 'mock' ? 'a mock' : msg.action === 'grpcMock' ? 'a gRPC mock' : 'a breakpoint'} rule from this connection: the server asks for the app's own client certificate, so it is passed through without decryption and can only be blocked (or failed with a fault rule). Add the certificate (Add client certificate…) to decrypt it.`
+              : `Can't create ${msg.action === 'mock' ? 'a mock' : msg.action === 'grpcMock' ? 'a gRPC mock' : 'a breakpoint'} rule from a passed-through TLS connection: it isn't decrypted, so it can only be blocked (or failed with a fault rule). Remove the host from flutterIntercept.tlsPassthrough to mock it.`,
         );
       }
       // CONTRACTS §16.2 / §17.2: gRPC calls get gRPC mocks, blocks and breakpoints; HTTP mocks don't apply to them.
@@ -283,6 +301,79 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
       const id = checkId(msg.id, 'decodeGrpc');
       c.send(reply, { type: 'grpcDecoded', id, decoded: c.decodeGrpc(id) });
       return;
+    },
+    // ---- CONTRACTS §20.3 (never a path or the passphrase in a reply or a log line)
+    chooseClientCertificateFile: async (msg, reply) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'role'], 'chooseClientCertificateFile');
+      if (!CERT_ROLES.has(msg.role)) fail('chooseClientCertificateFile', 'role must be "pfx", "cert" or "key"');
+      const ui = certUiOrThrow(c);
+      let file: { token: string; name: string } | undefined;
+      try {
+        file = await ui.choose(msg.role);
+      } catch (e) {
+        c.send(reply, { type: 'clientCertificateFile', role: msg.role, problem: e instanceof Error ? e.message : String(e) });
+        return;
+      }
+      if (!file) {
+        c.send(reply, { type: 'clientCertificateFile', role: msg.role });
+        return;
+      }
+      // The token is bound to this view (CONTRACTS §20.3).
+      let mine = c.certTokens.get(reply);
+      if (!mine) c.certTokens.set(reply, (mine = new Set()));
+      mine.add(file.token);
+      while (mine.size > MAX_CERT_TOKENS) mine.delete(mine.values().next().value as string);
+      c.send(reply, { type: 'clientCertificateFile', role: msg.role, file: { token: file.token, name: file.name } });
+    },
+    addClientCertificate: async (msg, reply) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'host', 'pfx', 'cert', 'key', 'passphrase'], 'addClientCertificate');
+      if (typeof msg.host !== 'string' || msg.host.length > 300) fail('addClientCertificate', 'host must be a host name pattern');
+      const pfx = checkCertToken(msg.pfx, 'pfx');
+      const cert = checkCertToken(msg.cert, 'cert');
+      const key = checkCertToken(msg.key, 'key');
+      if (msg.passphrase !== undefined && (typeof msg.passphrase !== 'string' || msg.passphrase.length > MAX_CERT_PASSPHRASE_CHARS)) {
+        fail('addClientCertificate', `passphrase must be a string of at most ${MAX_CERT_PASSPHRASE_CHARS} characters`);
+      }
+      const ui = certUiOrThrow(c);
+      const host = msg.host;
+      const mine = c.certTokens.get(reply);
+      const tokens = [pfx, cert, key].filter((t): t is string => t !== undefined);
+      if (tokens.some((t) => !mine?.has(t))) {
+        c.send(reply, { type: 'clientCertificateSaved', host, problem: CERT_TOKEN_EXPIRED });
+        return;
+      }
+      let problem: string | undefined;
+      try {
+        ({ problem } = await ui.add({ host, ...(pfx ? { pfx } : {}), ...(cert ? { cert } : {}), ...(key ? { key } : {}), ...(msg.passphrase ? { passphrase: msg.passphrase } : {}) }));
+      } catch (e) {
+        problem = e instanceof Error ? e.message : String(e);
+      }
+      if (!problem) for (const t of tokens) mine?.delete(t);
+      c.send(reply, { type: 'clientCertificateSaved', host, ...(problem ? { problem } : {}) });
+    },
+    removeClientCertificate: async (msg, reply) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'host'], 'removeClientCertificate');
+      if (typeof msg.host !== 'string' || !msg.host.trim() || msg.host.length > 300) fail('removeClientCertificate', 'host must be a host name pattern');
+      await certUiOrThrow(c).remove(msg.host);
+    },
+    forgetLearnedPassthrough: async (msg, reply) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'host', 'port'], 'forgetLearnedPassthrough');
+      if (msg.host !== undefined && (typeof msg.host !== 'string' || !LEARNED_HOST.test(msg.host))) fail('forgetLearnedPassthrough', 'host must be a host name');
+      if (msg.port !== undefined && !isInt(msg.port, 1, 65535)) fail('forgetLearnedPassthrough', 'port must be 1–65535');
+      if (msg.port !== undefined && msg.host === undefined) fail('forgetLearnedPassthrough', 'port needs a host');
+      const h = c.deps.host;
+      if (!h.forgetLearnedPassthrough) throw new Error("Forgetting learned hosts isn't available here.");
+      if (msg.host === undefined) {
+        h.forgetLearnedPassthrough();
+        return;
+      }
+      const host = msg.host.toLowerCase();
+      if (msg.port !== undefined) {
+        h.forgetLearnedPassthrough(`${host}:${msg.port}`);
+        return;
+      }
+      // A host without a port: every learned port of it.
+      for (const l of h.learnedPassthrough ?? []) if (l.host.toLowerCase() === host) h.forgetLearnedPassthrough(`${l.host}:${l.port}`);
     },
   };
 }

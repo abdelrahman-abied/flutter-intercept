@@ -83,9 +83,11 @@ export function normalizeCertHost(v: unknown): string | undefined {
   return certHostProblem(v) === undefined ? (v as string).trim().toLowerCase() : undefined;
 }
 
-class CertProblem extends Error {}
+/** A path-free, one-sentence reason a certificate file / entry can't be used (CONTRACTS §14.3 problem texts). */
+export class CertProblem extends Error {}
 
-function defaultValidate(cert: ClientCertificate): void {
+/** `tls.createSecureContext` with the certificate; throws when it can't be used (wrong passphrase, mismatched key…). */
+export function defaultValidate(cert: ClientCertificate): void {
   tls.createSecureContext({
     ...(cert.pfx ? { pfx: cert.pfx } : {}),
     ...(cert.cert ? { cert: cert.cert } : {}),
@@ -94,22 +96,30 @@ function defaultValidate(cert: ClientCertificate): void {
   });
 }
 
-/** Turns an OpenSSL / Node error into a short reason without echoing anything the error might quote. */
-function reasonOf(e: unknown, hasPassphrase: boolean): string {
+/**
+ * Turns an OpenSSL / Node error into a short reason without echoing anything the error might quote. `panel`
+ * (CONTRACTS §20.3): the passphrase was typed in the panel's popup, so it doesn't point to the command.
+ */
+export function reasonOf(e: unknown, hasPassphrase: boolean, where: 'setting' | 'panel' = 'setting'): string {
   const msg = e instanceof Error ? e.message : String(e);
   if (/mac verify|bad decrypt|bad password|wrong password|passphrase|interrupted or cancelled|unable to decrypt|maybe wrong password/i.test(msg)) {
+    if (where === 'panel') return hasPassphrase ? 'the passphrase is wrong' : 'it needs a passphrase (enter it in the Passphrase field)';
     return hasPassphrase
       ? 'the stored passphrase is wrong (run "Flutter Intercept: Set Client Certificate Passphrase…")'
       : 'it needs a passphrase (run "Flutter Intercept: Set Client Certificate Passphrase…")';
   }
   if (/key values mismatch/i.test(msg)) return "the key doesn't belong to the certificate";
+  // OpenSSL 3 (Node) can't read PKCS#12 files encrypted with legacy algorithms such as RC2 (older openssl / tools).
+  if (/unsupported pkcs12 pfx data/i.test(msg)) {
+    return 'the PKCS#12 file uses an old encryption (such as RC2) that Node.js can\'t read: export it again with AES (openssl pkcs12 -export -certpbe AES-256-CBC -keypbe AES-256-CBC), or use the PEM certificate and key';
+  }
   if (/no start line|bad base64|unsupported|asn1|not enough data|wrong tag|header too long|too long|decoder/i.test(msg)) return "the file isn't a valid certificate / key in the expected format";
   const code = (e as { code?: unknown })?.code;
   return typeof code === 'string' && /^[A-Z0-9_]{1,80}$/.test(code) ? `it can't be used (${code})` : "it can't be used";
 }
 
 /** Absolute or `~/` paths only (REVIEW-8 #9); undefined for anything relative. */
-function expandPath(p: string, deps: ClientCertLoadDeps): string | undefined {
+function expandPath(p: string, deps: Pick<ClientCertLoadDeps, 'homeDir'>): string | undefined {
   if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) return path.join((deps.homeDir ?? os.homedir)(), p.slice(1));
   if (path.isAbsolute(p)) return path.normalize(p);
   return undefined;
@@ -119,7 +129,7 @@ function expandPath(p: string, deps: ClientCertLoadDeps): string | undefined {
  * Reads one certificate file safely: absolute / `~/` only, realpath, a regular file ≤ 1 MB, opened non-blocking and
  * re-checked on the descriptor. Throws CertProblem with a path-free reason.
  */
-async function readCertFile(field: 'pfx' | 'cert' | 'key', raw: unknown, deps: ClientCertLoadDeps): Promise<Buffer> {
+export async function readCertFile(field: 'pfx' | 'cert' | 'key', raw: unknown, deps: Pick<ClientCertLoadDeps, 'homeDir'>): Promise<Buffer> {
   if (typeof raw !== 'string' || !raw.trim()) throw new CertProblem(`its ${field} path is empty`);
   const p = raw.trim();
   if (p.length > 4096 || p.includes('\0')) throw new CertProblem(`its ${field} path is not a valid path`);
@@ -164,7 +174,8 @@ async function readCertFile(field: 'pfx' | 'cert' | 'key', raw: unknown, deps: C
   }
 }
 
-function pemText(buf: Buffer, field: 'cert' | 'key'): string {
+/** The PEM text of a cert / key file; throws CertProblem when it has no PEM block of that kind. */
+export function pemText(buf: Buffer, field: 'cert' | 'key'): string {
   const text = buf.toString('utf8');
   if (field === 'cert' && !/-----BEGIN CERTIFICATE-----/.test(text)) throw new CertProblem("its cert file isn't a PEM certificate (-----BEGIN CERTIFICATE-----)");
   if (field === 'key' && !/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/.test(text)) throw new CertProblem("its key file isn't a PEM private key (-----BEGIN … PRIVATE KEY-----)");

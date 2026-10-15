@@ -46,6 +46,11 @@
  * status; gRPC calls only get `grpcMock` and `block` rules from an exchange, are never resent nor recorded; HAR exports
  * include them (`_grpc`). `Status.grpc` from the host (decrypt hosts, self-check) and the injected schema service,
  * re-broadcast on the host's 'grpc' event and on schema changes. Types from src/ui/protocol.ts.
+ *
+ * CONTRACTS §20 (v0.14.0): `Status.learnedPassthrough` from the host (re-broadcast on its 'learnedPassthrough' event);
+ * `chooseClientCertificateFile` → `clientCertificateFile`, `addClientCertificate` → `clientCertificateSaved`,
+ * `removeClientCertificate` go through the injected `clientCertUi` (absent → `error`); file tokens are bound to the
+ * view they were issued to. `forgetLearnedPassthrough` goes to the host. Never a path or the passphrase in a reply.
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -79,6 +84,10 @@ export { pendingView, isRecordable, recordingSummary, authFlowSummaries, sharedR
 export { UI_MAX_GRPC_JSON_CHARS, UI_MAX_PAUSED_JSON_CHARS, resolveGrpcEdit, grpcMockRuleFromExchange, GRPC_WEB_RESEND, grpcResendMessages, resolveSendGrpc } from './grpcHost';
 
 export type Sink = (msg: HostMsg) => void;
+
+/** CONTRACTS §20.2: how many learned passthrough hosts Status carries (the proxy keeps up to 1000). */
+export const STATUS_MAX_LEARNED = 200;
+export { CLIENT_CERT_UI_MISSING } from './clientCertUi';
 
 export interface ControllerHost {
   readonly running: boolean;
@@ -124,6 +133,13 @@ export interface ControllerHost {
   readonly clientCertificateStatus?: { host: string; problem?: string }[];
   /** Fire after the passthrough hosts / client certificates changed. */
   on(event: 'tlsPassthrough' | 'clientCertificates', l: (info: unknown) => void): unknown;
+  // CONTRACTS §20.2 (InterceptProxyHost). Optional on older hosts.
+  /** Hosts the proxy passes through on its own (the app's own client certificate, or it pins). */
+  readonly learnedPassthrough?: NonNullable<Status['learnedPassthrough']>;
+  /** Forget one learned `host:port` (none = all). */
+  forgetLearnedPassthrough?(key?: string): void;
+  /** Fires after the learned list changed. */
+  on(event: 'learnedPassthrough', l: (list: unknown) => void): unknown;
   // CONTRACTS §16.4 (InterceptProxyHost). Optional on older hosts.
   /** Hosts whose TLS gRPC is decrypted. */
   readonly grpcDecryptHosts?: string[];
@@ -313,6 +329,10 @@ export class InterceptController {
   readonly sentCounts: Record<string, number> = {};
   readyCount = 0;
 
+  /** CONTRACTS §20.3: client-certificate file tokens per view they were issued to (a token is bound to its panel). */
+  /** @internal (handlers) */
+  readonly certTokens = new WeakMap<Sink, Set<string>>();
+
   /** QUALITY-1 Q3: the ViewMsg handlers (src/ui/handlers.ts). */
   private readonly handlers: ViewHandlers;
 
@@ -338,6 +358,7 @@ export class InterceptController {
     deps.host.on('upstream', () => this.broadcastStatus());
     deps.host.on('tlsPassthrough', () => this.broadcastStatus());
     deps.host.on('clientCertificates', () => this.broadcastStatus());
+    deps.host.on('learnedPassthrough', () => this.broadcastStatus());
     deps.host.on('grpc', () => this.broadcastStatus());
     this.grpcSub = deps.grpc?.onDidChange?.(() => this.broadcastStatus());
     this.modelsSub = deps.contract?.onDidChangeModels(() => this.recheckContracts());
@@ -420,13 +441,29 @@ export class InterceptController {
     };
   }
 
-  /** CONTRACTS §14.2 / §14.3: passthrough hosts and client-certificate status (host patterns + problems only). */
-  private tlsStatus(): Pick<Status, 'tlsPassthrough' | 'clientCertificates'> {
+  /**
+   * CONTRACTS §14.2 / §14.3 / §20.2: passthrough hosts, client-certificate status (host patterns + problems only) and
+   * the hosts the proxy learned to pass through (at most STATUS_MAX_LEARNED).
+   */
+  private tlsStatus(): Pick<Status, 'tlsPassthrough' | 'clientCertificates' | 'learnedPassthrough'> {
     const hosts = this.deps.host.tlsPassthrough;
     const certs = this.deps.host.clientCertificateStatus;
+    let learned: Status['learnedPassthrough'];
+    try {
+      learned = this.deps.host.learnedPassthrough;
+    } catch (e) {
+      this.deps.log?.(`learned passthrough list failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
     return {
       ...(hosts?.length ? { tlsPassthrough: [...hosts] } : {}),
       ...(certs?.length ? { clientCertificates: certs.map((c) => ({ host: c.host, ...(c.problem ? { problem: c.problem } : {}) })) } : {}),
+      ...(learned?.length
+        ? {
+            learnedPassthrough: learned
+              .slice(0, STATUS_MAX_LEARNED)
+              .map((l) => ({ host: l.host, port: l.port, reason: l.reason, ...(typeof l.until === 'number' ? { until: l.until } : {}) })),
+          }
+        : {}),
     };
   }
 

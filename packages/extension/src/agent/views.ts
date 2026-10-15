@@ -18,6 +18,9 @@ import { GRPC_MESSAGES_PER_DIR, MAX_GRPC_MESSAGES_JSON, OUTSIDE_PROJECT, bodyByt
 import type { Frame, ResolvedFrame } from './shared';
 import { AgentContext } from './context';
 
+/** CONTRACTS §20.2: how many learned passthrough hosts get_status lists (the proxy keeps up to 1000). */
+export const AGENT_MAX_LEARNED = 200;
+
 /**
  * QUALITY-1 Q4 (api.ts:916): a rule as agents see it. With redaction on, a grpcMock's base64 `messages` are shown
  * decoded (or summarised), so a view action is not a RuleAction the proxy could use.
@@ -70,6 +73,8 @@ export class AgentViews extends AgentContext {
       ...(e.kind === 'tunnel' ? { notDecrypted: true, ...(e.tunnelBytes ? { bytesSent: e.tunnelBytes.sent, bytesReceived: e.tunnelBytes.received } : {}) } : {}),
       ...(e.grpcTunnel ? { grpcTunnel: true } : {}),
       ...(e.clientCertificate ? { clientCertificate: e.clientCertificate } : {}),
+      // CONTRACTS §20.2: this request taught the proxy to pass host:port through, or this tunnel is passed through because of it
+      ...(e.learnedPassthrough ? { learnedPassthrough: { reason: e.learnedPassthrough.reason, host: e.learnedPassthrough.host, port: e.learnedPassthrough.port } } : {}),
       // CONTRACTS §19.4: informational notes (redacted like other free text)
       ...(e.notes?.length ? { notes: e.notes.map((n) => this.text(String(n))) } : {}),
       // CONTRACTS §16.4
@@ -339,11 +344,31 @@ export class AgentViews extends AgentContext {
     return { grpc: { enabled, decryptHosts: [...hosts], ...(problem ? { problem } : {}), ...(schema ? { schema } : {}), ...(simulatorTrust ? { simulatorTrust } : {}) } };
   }
 
-  /** CONTRACTS §14.2 / §14.3: passthrough hosts and client certificates — host patterns and problems only. */
+  /**
+   * CONTRACTS §14.2 / §14.3 / §20.2: passthrough hosts, client certificates (host patterns and problems only) and the
+   * hosts the proxy learned to pass through (at most AGENT_MAX_LEARNED; `until` absent = until the proxy stops).
+   */
   tlsView(): Record<string, unknown> {
     const hosts = this.deps.host.tlsPassthrough ?? [];
     const certs = this.deps.host.clientCertificateStatus ?? [];
+    let learned: { host: string; port: number; reason: string; until?: number }[] = [];
+    try {
+      learned = this.deps.host.learnedPassthrough ?? [];
+    } catch {
+      learned = [];
+    }
     return {
+      ...(learned.length
+        ? {
+            learnedPassthrough: learned.slice(0, AGENT_MAX_LEARNED).map((l) => ({
+              host: l.host,
+              port: l.port,
+              reason: l.reason,
+              ...(typeof l.until === 'number' ? { until: new Date(l.until).toISOString() } : { untilProxyStops: true }),
+            })),
+            ...(learned.length > AGENT_MAX_LEARNED ? { learnedPassthroughTotal: learned.length } : {}),
+          }
+        : {}),
       ...(hosts.length ? { tlsPassthrough: [...hosts] } : {}),
       ...(certs.length
         ? {

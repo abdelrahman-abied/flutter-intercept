@@ -34,10 +34,12 @@
  *   `mock.bodyFile`: a rule whose messages can't be encoded is skipped and reported as a warning. §16.8: the proxy's
  *   'grpcBreaker' event becomes a `bypass` session warning (`grpc-breaker:<authority>`), cleared with
  *   `clearGrpcBreakerWarnings()` (the controller calls it when the last debug session ends) and on proxy stop.
+ * - CONTRACTS §20.2 (v0.14.0): `learnedPassthrough` (the running proxy's learned `host:port`s, empty when stopped),
+ *   re-emitted as 'learnedPassthrough' on the proxy's event (deduplicated), and `forgetLearnedPassthrough(key?)`.
  */
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
-import type { ClientCertificate, Exchange, GrpcBreakerEvent, GrpcEdit, RequestEdit, ResponseEdit, GrpcProxyCodec, InterceptProxy, InterceptProxyOptions, ReplayEntry, ReplayOptions, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
+import type { ClientCertificate, Exchange, GrpcBreakerEvent, LearnedPassthrough, GrpcEdit, RequestEdit, ResponseEdit, GrpcProxyCodec, InterceptProxy, InterceptProxyOptions, ReplayEntry, ReplayOptions, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
 // PERF-1 #1: the dependency-free subpath, so activation never evaluates the proxy (and mockttp).
 import { parseHostPattern } from '@flutter-intercept/proxy/hosts';
 import { targetsProxy } from '@flutter-intercept/proxy/grpc-meta';
@@ -66,7 +68,40 @@ export type ProxyLike = Pick<
   | 'setReplay' | 'resetSequences' | 'setUpstreamProxy' | 'upstreamProxy'
   | 'setTlsPassthrough' | 'tlsPassthrough' | 'setClientCertificates'
   | 'setGrpcDecryptHosts' | 'grpcSupport' | 'setGrpcDecryptAll' | 'setGrpcCodec'
->;
+> & {
+  // CONTRACTS §20.1 (proxy agent P). Optional so the host compiles against a proxy build without them.
+  readonly learnedPassthrough?: LearnedPassthrough[];
+  forgetLearnedPassthrough?(key?: string): void;
+};
+
+/** CONTRACTS §20.2: one learned passthrough host as Status / agents show it (`until` absent = until the proxy stops). */
+export interface LearnedPassthroughView {
+  host: string;
+  port: number;
+  reason: 'client-certificate' | 'pinned';
+  until?: number;
+}
+
+/** The proxy caps its learned map at 1000 entries (§20.1); never show more. */
+export const MAX_LEARNED_PASSTHROUGH = 1000;
+
+/** A clean copy of the proxy's learned list: well-formed entries only, live ones (until in the future). */
+export function learnedPassthroughView(list: unknown, now = Date.now()): LearnedPassthroughView[] {
+  if (!Array.isArray(list)) return [];
+  const out: LearnedPassthroughView[] = [];
+  for (const e of list) {
+    if (out.length >= MAX_LEARNED_PASSTHROUGH) break;
+    if (!e || typeof e !== 'object') continue;
+    const { host, port, reason, until } = e as Record<string, unknown>;
+    if (typeof host !== 'string' || !host || host.length > 260 || /[\s/@]/.test(host)) continue;
+    if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535) continue;
+    if (reason !== 'client-certificate' && reason !== 'pinned') continue;
+    const u = typeof until === 'number' && Number.isFinite(until) ? until : undefined;
+    if (u !== undefined && u <= now) continue;
+    out.push({ host: host.toLowerCase(), port, reason, ...(u !== undefined ? { until: u } : {}) });
+  }
+  return out;
+}
 
 /** REVIEW-6 #1: `host:port` of an upstream proxy URL — never user info, path or query. */
 export function upstreamDisplay(url: string | undefined): string | undefined {
@@ -432,7 +467,8 @@ export interface InterceptProxyHostOptions {
  * 'lan' ({host, port} | undefined — never the token), 'rule-spent' (ruleId, reason), 'rule-hit' (ruleId, used),
  * 'warnings' (SessionWarning[], the full current list — after every change), 'replay' (ReplayState | undefined),
  * 'upstream' ({display, ignoreCertErrors} | undefined), 'tlsPassthrough' (string[]), 'clientCertificates'
- * (ClientCertificateStatus[] — never key material), 'grpc' ({decryptHosts, problem?} — CONTRACTS §16).
+ * (ClientCertificateStatus[] — never key material), 'grpc' ({decryptHosts, problem?} — CONTRACTS §16),
+ * 'learnedPassthrough' (LearnedPassthroughView[] — CONTRACTS §20.2).
  * Rules, the network profile and the app package names are kept here so they survive restarts and
  * apply from the first request.
  */
@@ -485,6 +521,8 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private simDevices: SimulatorTrustDevice[] = [];
   /** §16.8 breaker warnings by authority (insertion order kept). */
   private readonly breakerWarnings = new Map<string, SessionWarning>();
+  // CONTRACTS §20.2: the learned list last emitted (JSON), so repeated proxy events don't re-broadcast.
+  private learnedSent = '[]';
 
   constructor(private readonly opts: InterceptProxyHostOptions) {
     super();
@@ -581,6 +619,9 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       proxy.on('rule-spent', (ruleId, reason) => this.emit('rule-spent', ruleId, reason));
       proxy.on('rule-hit', (ruleId, used) => this.emit('rule-hit', ruleId, used));
       proxy.on('grpcBreaker', (info: GrpcBreakerEvent) => this.onGrpcBreaker(info));
+      proxy.on('learnedPassthrough', () => {
+        if (this.proxy === proxy) this.emitLearnedPassthrough();
+      });
       this.proxy = proxy;
       if (this.setConfigWarningLater !== undefined) {
         this.setConfigWarning('tlsPassthrough', this.setConfigWarningLater || undefined);
@@ -610,6 +651,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     }
     this.proxy = undefined;
     this.clearGrpcBreakerWarnings();
+    this.emitLearnedPassthrough(); // the learned map belongs to the proxy instance
     try {
       if (proxy) {
         await proxy.stop();
@@ -1214,6 +1256,37 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     const before = JSON.stringify(this.clientCertStatus);
     this.clientCertStatus = st;
     if (JSON.stringify(this.clientCertStatus) !== before) this.emit('clientCertificates', this.clientCertificateStatus);
+  }
+
+  /**
+   * CONTRACTS §20.2: the hosts the running proxy passes through on its own (`client-certificate` / `pinned`), live
+   * entries only; empty while it is stopped.
+   */
+  get learnedPassthrough(): LearnedPassthroughView[] {
+    let list: unknown;
+    try {
+      list = this.proxy?.learnedPassthrough;
+    } catch {
+      list = undefined;
+    }
+    return learnedPassthroughView(list);
+  }
+
+  /** CONTRACTS §20.2: forget one learned `host:port` (none = all); the next CONNECT to it is decrypted again. */
+  forgetLearnedPassthrough(key?: string): void {
+    const proxy = this.proxy;
+    if (!proxy) return;
+    if (!proxy.forgetLearnedPassthrough) throw new Error('This proxy build cannot forget learned hosts.');
+    proxy.forgetLearnedPassthrough(key);
+    this.emitLearnedPassthrough(); // the proxy emits too; deduplicated
+  }
+
+  private emitLearnedPassthrough(): void {
+    const list = this.learnedPassthrough;
+    const json = JSON.stringify(list);
+    if (json === this.learnedSent) return;
+    this.learnedSent = json;
+    this.emit('learnedPassthrough', list);
   }
 
   /** `Status.clientCertificates`: host pattern + problem per configured entry (a copy; never paths or key material). */
