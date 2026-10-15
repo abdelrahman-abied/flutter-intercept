@@ -188,7 +188,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
         ) : (
           ex.error && <div class="msg error">{ex.error}</div>
         )}
-        {ex.learnedPassthrough && <LearnedBanner ex={ex} />}
+        {(ex.learnedPassthrough || ex.needsClientCertificate) && <LearnedBanner ex={ex} />}
         {ex.notes && ex.notes.length > 0 && (
           // CONTRACTS §19.4: informational notes (never errors) — e.g. "mutate: no schema for /pkg.Svc/Method".
           <ul class="msg info exchange-notes" aria-label="Notes">

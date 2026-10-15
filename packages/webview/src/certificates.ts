@@ -87,6 +87,36 @@ export const CERT_WHY =
   'and the server, so to show you these requests it has to present the same certificate to the server. Without it, the ' +
   'requests still work but are passed through without decryption.';
 
+/** Popup text: what the server sees once Flutter Intercept presents the certificate (CONTRACTS §20.7, the owner's wording). */
+export const CERT_SERVER_SEES =
+  'The server gets the same certificate, but the connection now comes from Flutter Intercept instead of your app, and it ' +
+  'looks a little different to the server. Most servers don\'t notice; some security systems do. Use a certificate you\'re ' +
+  'allowed to use for testing, ideally with a development or staging server.';
+
+/** Under the banner of a request the proxy learned from (CONTRACTS §20.7, one line). */
+export const CERT_FIRST_REFUSED =
+  'The first request was tried without the app\'s certificate, so the server may have logged one refused connection from ' +
+  'this computer.';
+
+/**
+ * The banner on a request that failed because the server wants a client certificate, with nothing learned
+ * (`Exchange.needsClientCertificate` only: automatic passthrough is off, or a rule / replay keeps the host decrypted).
+ */
+export function needsCertBannerText(e: Pick<LearnedRef, 'host'>): { title: string; body: string } {
+  return {
+    title: 'This server needs the app\'s own certificate…',
+    body: `${e.host} asks the app to prove who it is with a certificate (mutual TLS), and Flutter Intercept doesn't have ` +
+      'that certificate. Its requests keep failing through Flutter Intercept until you add it.',
+  };
+}
+
+/** The certificates list's line when `Status.autoPassthrough === false` (CONTRACTS §20.7); `ide` = Android Studio / IntelliJ. */
+export function autoPassthroughOffText(ide: boolean): string {
+  return ide
+    ? 'Automatic passthrough is turned off in Settings → Tools → Flutter Intercept.'
+    : 'Automatic passthrough is off (flutterIntercept.autoPassthrough).';
+}
+
 /** Popup text: the certificate stays on this computer (CONTRACTS §20.3); `ide` = Android Studio / IntelliJ. */
 export function certStaysText(ide: boolean): string {
   return 'The certificate stays where it is on this computer: Flutter Intercept only remembers its location and reads it ' +

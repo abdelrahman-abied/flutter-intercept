@@ -1361,6 +1361,7 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
 /* Banner on a request / tunnel the proxy passed through on its own. */
 .learned-banner { margin-top: 6px; overflow-wrap: anywhere; }
 .learned-state { margin-top: 4px; color: var(--fi-muted); }
+.auto-passthrough-off { margin: 2px 0 4px; }
 .learned-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .learned-actions:empty { display: none; }
 
@@ -1415,9 +1416,13 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
   overflow: auto;
   background: rgba(0, 0, 0, 0.35);
 }
+/* The popup never outgrows the window: the head and the Save / Cancel row stay put, the body scrolls. */
 .modal {
   width: 100%;
-  max-width: 520px;
+  max-width: 600px;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
   color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
   background: var(--vscode-editorWidget-background, var(--fi-bg));
   border: 1px solid var(--vscode-editorWidget-border, var(--fi-border));
@@ -1427,7 +1432,9 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
 }
 .modal-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px 6px 12px; border-bottom: 1px solid var(--fi-border); }
 .modal-head h2 { margin: 0; font-size: 13px; font-weight: 600; }
-.modal-body { padding: 6px 12px; }
+.modal > form { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+.modal-head, .modal-actions { flex: none; }
+.modal-body { padding: 6px 12px; overflow: auto; min-height: 0; flex: 1 1 auto; }
 .modal-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1436,8 +1443,8 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
   padding: 8px 12px;
   border-top: 1px solid var(--fi-border);
 }
-.cert-explain h3 { margin: 6px 0 2px; font-size: 12px; font-weight: 600; }
-.cert-explain p { margin: 0 0 4px; line-height: 1.45; color: var(--fi-muted); }
+.cert-explain h3 { margin: 4px 0 1px; font-size: 12px; font-weight: 600; }
+.cert-explain p { margin: 0 0 2px; font-size: 12px; line-height: 1.4; color: var(--fi-muted); }
 .cert-format { border: none; margin: 4px 0; padding: 0; min-width: 0; }
 .cert-format legend { padding: 0; }
 .cert-file { margin: 4px 0; }
@@ -1445,6 +1452,7 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
 .cert-file-name { font-family: var(--fi-mono); font-size: var(--fi-mono-size); overflow-wrap: anywhere; min-width: 0; }
 .cert-file-name.muted { font-family: inherit; font-size: 12px; }
 .cert-blocker { margin: 0; }
+@media (max-height: 560px) { .modal-backdrop { padding-top: 8px; padding-bottom: 8px; } }
 @media (max-width: 420px) {
   .modal-backdrop { padding: 8px 4px; }
   .modal-body, .modal-actions { padding-left: 8px; padding-right: 8px; }

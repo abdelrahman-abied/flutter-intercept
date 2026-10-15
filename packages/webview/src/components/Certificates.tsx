@@ -11,7 +11,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/ho
 import { useApp } from '../context';
 import type { ClientCertFileRole, Exchange, Status, ViewMsg } from '../protocol';
 import {
-  CERT_WHY, certCovering, certHostFor, certSaveBlocker, certStaysText, FILE_ROLE_LABEL, FORMAT_ROLES, isLearnedLive, liveLearned, nextLearnedExpiry,
+  autoPassthroughOffText, CERT_FIRST_REFUSED, CERT_SERVER_SEES, CERT_WHY, certCovering, needsCertBannerText, certHostFor, certSaveBlocker, certStaysText, FILE_ROLE_LABEL, FORMAT_ROLES, isLearnedLive, liveLearned, nextLearnedExpiry,
   LEARNED_REASON, learnedBannerText, learnedKey, learnedUntilText, type CertFormat, type LearnedRef,
 } from '../certificates';
 import type { CertDialog as CertDialogState } from '../state';
@@ -26,11 +26,47 @@ const forgetNotice = (e: LearnedRef) =>
   `New connections to ${learnedKey(e)} are decrypted again. If it still ${e.reason === 'pinned'
     ? 'refuses the proxy\'s certificate' : 'asks for the app\'s certificate'}, it is passed through again.`;
 
-/** CONTRACTS §20.3: on an exchange with `learnedPassthrough` (the request that failed, or a tunnel passed through). */
-export function LearnedBanner({ ex }: { ex: Pick<Exchange, 'learnedPassthrough'> }) {
-  const { state, dispatch, post } = useApp();
+/**
+ * CONTRACTS §20.3 / §20.7: on an exchange with `learnedPassthrough` (the request that failed, or a tunnel passed
+ * through), or with only `needsClientCertificate` (nothing learned, e.g. automatic passthrough is off).
+ */
+export function LearnedBanner({ ex }: { ex: Pick<Exchange, 'learnedPassthrough' | 'needsClientCertificate'> }) {
   const lp = ex.learnedPassthrough;
-  if (!lp) return null;
+  if (lp) return <LearnedHostBanner lp={lp} />;
+  return ex.needsClientCertificate ? <NeedsCertBanner need={ex.needsClientCertificate} /> : null;
+}
+
+/** "Add client certificate…" for a host:port, unless a configured certificate already covers it. */
+function AddCertButton({ target }: { target: Pick<LearnedRef, 'host' | 'port'> }) {
+  const { dispatch } = useApp();
+  return (
+    <Button kind="primary" onClick={() => dispatch({ type: 'openCertDialog', host: certHostFor(target) })}
+      title="Give Flutter Intercept the app's certificate so it can show these requests">
+      Add client certificate…
+    </Button>
+  );
+}
+
+/** §20.7: the server wants a client certificate, nothing was learned: nothing to forget, the requests keep failing. */
+function NeedsCertBanner({ need }: { need: NonNullable<Exchange['needsClientCertificate']> }) {
+  const { state } = useApp();
+  const { title, body } = needsCertBannerText(need);
+  const covered = certCovering(need, state.status.clientCertificates);
+  return (
+    <div class="msg warn learned-banner needs-cert-banner" role="note" aria-label={title}>
+      <div class="learned-text">
+        <strong>{title}</strong> {body}
+      </div>
+      {covered && (
+        <div class="learned-state">A client certificate is set up for <code>{covered}</code>: new connections use it.</div>
+      )}
+      {!covered && <div class="learned-actions"><AddCertButton target={need} /></div>}
+    </div>
+  );
+}
+
+function LearnedHostBanner({ lp }: { lp: LearnedRef }) {
+  const { state, dispatch, post } = useApp();
   const { title, body } = learnedBannerText(lp);
   const live = isLearnedLive(lp, liveLearned(state.status.learnedPassthrough, Date.now()));
   const covered = lp.reason === 'client-certificate' ? certCovering(lp, state.status.clientCertificates) : undefined;
@@ -39,18 +75,14 @@ export function LearnedBanner({ ex }: { ex: Pick<Exchange, 'learnedPassthrough'>
       <div class="learned-text">
         <strong>{title}</strong> {body}
       </div>
+      {lp.reason === 'client-certificate' && <div class="learned-state learned-first">{CERT_FIRST_REFUSED}</div>}
       {covered ? (
         <div class="learned-state">A client certificate is set up for <code>{covered}</code>: new connections use it.</div>
       ) : !live && (
         <div class="learned-state"><code>{lp.host}</code> is no longer passed through: new connections are decrypted again.</div>
       )}
       <div class="learned-actions">
-        {lp.reason === 'client-certificate' && !covered && (
-          <Button kind="primary" onClick={() => dispatch({ type: 'openCertDialog', host: certHostFor(lp) })}
-            title="Give Flutter Intercept the app's certificate so it can show these requests">
-            Add client certificate…
-          </Button>
-        )}
+        {lp.reason === 'client-certificate' && !covered && <AddCertButton target={lp} />}
         {live && !covered && (
           <Button onClick={() => {
             post({ type: 'forgetLearnedPassthrough', host: lp.host, port: lp.port });
@@ -141,11 +173,13 @@ function CertDialogBody({ d }: { d: CertDialogState }) {
             <Button kind="icon" title="Close (Esc)" onClick={close}><Icon name="close" /></Button>
           </div>
           <div class="modal-body">
-            <section class="cert-explain" aria-label="Why and where it is kept">
+            <section class="cert-explain" aria-label="Why, where it is kept, and what the server sees">
               <h3>Why</h3>
               <p>{CERT_WHY}</p>
               <h3>Stays on your computer</h3>
               <p>{certStaysText(inIde())}</p>
+              <h3>What the server sees</h3>
+              <p>{CERT_SERVER_SEES}</p>
             </section>
 
             <label class="field">
@@ -313,6 +347,9 @@ export function CertsPanel({ onClose }: { onClose: (restoreFocus: boolean) => vo
         </Button>
         <Button kind="icon" title="Close (Esc)" onClick={() => onClose(true)}><Icon name="close" /></Button>
       </div>
+      {state.status.autoPassthrough === false && (
+        <p class="hint auto-passthrough-off">{autoPassthroughOffText(inIde())}</p>
+      )}
       {certs.length ? (
         <ul class="certs-list" aria-label="Client certificates">
           {certs.map((c) => (

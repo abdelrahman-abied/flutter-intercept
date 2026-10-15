@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../src/components/App';
 import { isHostMsg, type Host } from '../src/host';
 import type { Exchange, HostMsg, Status, ViewMsg } from '../src/protocol';
-import { certCovering, certHostFor, certSaveBlocker, certStaysText, CERT_WHY, isLearnedLive, LEARNED_REASON, learnedBannerText, learnedKey, learnedUntilText, liveLearned, nextLearnedExpiry } from '../src/certificates';
+import { autoPassthroughOffText, CERT_FIRST_REFUSED, CERT_SERVER_SEES, certCovering, certHostFor, certSaveBlocker, certStaysText, CERT_WHY, isLearnedLive, LEARNED_REASON, learnedBannerText, learnedKey, learnedUntilText, liveLearned, nextLearnedExpiry } from '../src/certificates';
 import { tunnelTitle } from '../src/connection';
 import { initialState, reducer, toPersisted } from '../src/state';
 import { ex, status } from './fixtures';
@@ -474,5 +474,82 @@ describe('client certificates + learned hosts list', () => {
     expect($('.statusline .learned-status')).toBeNull();
     await click(button('Client certificates…'));
     expect($('.certs-panel')!.textContent).toMatch(/None yet/);
+  });
+});
+
+// ---------------------------------------------------------------- §20.7: what the server sees, automatic passthrough off
+
+const NEEDS_ERROR = 'This server needs the app\'s own client certificate (TLS alert certificate_required). Automatic passthrough ' +
+  'is off (flutterIntercept.autoPassthrough), so its requests keep failing through Flutter Intercept: add the certificate in ' +
+  'the Flutter Intercept panel (Add client certificate…), or turn it on.';
+const needsOnly = (over: Partial<Exchange> = {}): Exchange => failed({
+  url: 'https://secure.partner.example:8443/v2/orders', error: NEEDS_ERROR, learnedPassthrough: undefined,
+  needsClientCertificate: { host: 'secure.partner.example', port: 8443 }, ...over,
+});
+
+describe('what the server sees; automatic passthrough off (CONTRACTS §20.7)', () => {
+  it('texts are the owner\'s wording', () => {
+    expect(CERT_SERVER_SEES).toBe('The server gets the same certificate, but the connection now comes from Flutter Intercept ' +
+      'instead of your app, and it looks a little different to the server. Most servers don\'t notice; some security systems ' +
+      'do. Use a certificate you\'re allowed to use for testing, ideally with a development or staging server.');
+    expect(CERT_FIRST_REFUSED).toBe('The first request was tried without the app\'s certificate, so the server may have ' +
+      'logged one refused connection from this computer.');
+    expect(autoPassthroughOffText(false)).toBe('Automatic passthrough is off (flutterIntercept.autoPassthrough).');
+    expect(autoPassthroughOffText(true)).toMatch(/turned off in Settings → Tools → Flutter Intercept/);
+  });
+
+  it('the popup shows "What the server sees" after "Stays on your computer", always visible', async () => {
+    await openDialog();
+    const headings = $$('.cert-explain h3', dialog()!).map((h) => h.textContent);
+    expect(headings).toEqual(['Why', 'Stays on your computer', 'What the server sees']);
+    const p = $$('.cert-explain p', dialog()!).at(-1)!;
+    expect(p.textContent).toBe(CERT_SERVER_SEES);
+    expect(p.closest('details')).toBeNull();
+    expect(p.hasAttribute('hidden')).toBe(false);
+  });
+
+  it('a learned client-certificate request says the first request may have been logged as refused; pinned does not', async () => {
+    await openDetail(failed());
+    expect($('.learned-banner')!.textContent).toContain(CERT_FIRST_REFUSED);
+    await emit({ type: 'exchange', exchange: failed({ learnedPassthrough: { reason: 'pinned', host: 'mtls.example.com', port: 443 } }) });
+    expect($('.learned-banner')!.textContent).not.toContain(CERT_FIRST_REFUSED);
+  });
+
+  it('needsClientCertificate without learnedPassthrough: Add client certificate… (host:port), nothing to forget', async () => {
+    await openDetail(needsOnly(), { ...status, autoPassthrough: false, learnedPassthrough: [] });
+    const banner = $('.learned-banner')!;
+    expect(banner.textContent).toContain('This server needs the app\'s own certificate…');
+    expect(banner.textContent).toMatch(/keep failing through Flutter Intercept until you add it/);
+    expect(banner.textContent).not.toContain(CERT_FIRST_REFUSED);
+    expect(maybeButton('Try decrypting again', banner)).toBeUndefined();
+    await click(button('Add client certificate…', banner));
+    expect($<HTMLInputElement>('.cert-dialog input:not([type])')!.value).toBe('secure.partner.example:8443');
+  });
+
+  it('needsClientCertificate covered by a configured certificate: says so, no button', async () => {
+    await openDetail(needsOnly(), { ...status, clientCertificates: [{ host: 'secure.partner.example:8443' }] });
+    const banner = $('.learned-banner')!;
+    expect(banner.textContent).toMatch(/A client certificate is set up for secure\.partner\.example:8443/);
+    expect(maybeButton('Add client certificate…', banner)).toBeUndefined();
+  });
+
+  it('the certificates list says when automatic passthrough is off (VS Code setting / IDE settings)', async () => {
+    await mount();
+    await emit({ type: 'snapshot', exchanges: [], rules: [], status: { ...status, autoPassthrough: true } });
+    await click(button('Client certificates…'));
+    expect($('.certs-panel .auto-passthrough-off')).toBeNull();
+    await emit({ type: 'status', status: { ...status, autoPassthrough: false } });
+    expect($('.certs-panel .auto-passthrough-off')!.textContent).toBe('Automatic passthrough is off (flutterIntercept.autoPassthrough).');
+    // An older host without the field: nothing said.
+    await emit({ type: 'status', status });
+    expect($('.certs-panel .auto-passthrough-off')).toBeNull();
+  });
+
+  it('Android Studio wording for the off line', async () => {
+    document.body.classList.add('fi-ide');
+    await mount();
+    await emit({ type: 'snapshot', exchanges: [], rules: [], status: { ...status, autoPassthrough: false } });
+    await click(button('Client certificates…'));
+    expect($('.certs-panel .auto-passthrough-off')!.textContent).toBe('Automatic passthrough is turned off in Settings → Tools → Flutter Intercept.');
   });
 });

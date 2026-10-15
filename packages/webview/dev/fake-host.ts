@@ -63,6 +63,8 @@
  * v0.14.0 (CONTRACTS §20): a request that failed because the server needs the app's own certificate, a tunnel passed
  * through because of it, `Status.learnedPassthrough` (plus a pinned host), and the "Add client certificate" messages
  * (fake file names; passphrase "wrong" answers with a problem). ?v14=0 turns it off.
+ * §20.7: a request with only `needsClientCertificate` (automatic passthrough off), `Status.autoPassthrough`; the dev
+ * bar's "auto passthrough" toggles it (off forgets the learned hosts, like the proxy; ?autoPassthrough=0 starts off).
  */
 import type {
   GrpcEdit, AuthFlowSummary, Body, ContractSummary, CorsInfo, Frame, GraphqlInfo, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit,
@@ -1521,10 +1523,34 @@ function startV14() {
   status = { ...status, learnedPassthrough: [
     { host, port: 443, reason: 'client-certificate' },
     { host: 'pinned.shop.example', port: 443, reason: 'pinned', until: Date.now() + 10 * 60_000 },
-  ] };
+  ], autoPassthrough: true };
+  if (params.get('autoPassthrough') === '0') setAutoPassthrough(false);
+  // §20.7: the server wants a client certificate, nothing learned (automatic passthrough was off): it keeps failing.
+  const kept = 'secure.partner.example';
+  const needs: Exchange = {
+    id: `ex_${++seq}`, startedAt: Date.now() - 3000, method: 'POST', url: `https://${kept}:8443/v2/orders`,
+    requestHeaders: { ...UA, host: `${kept}:8443` }, state: 'error', durationMs: 64, timings: fakeTimings(60, 15),
+    error: 'This server needs the app\'s own client certificate (TLS alert certificate_required). Automatic passthrough is off ' +
+      '(flutterIntercept.autoPassthrough), so its requests keep failing through Flutter Intercept: add the certificate in the ' +
+      'Flutter Intercept panel (Add client certificate…), or turn it on.',
+    needsClientCertificate: { host: kept, port: 8443 },
+  };
+  record(needs, true);
+  send({ type: 'exchange', exchange: needs });
   send({ type: 'status', status });
 }
 setTimeout(startV14, 0);
+
+/** §20.7: like the proxy, turning automatic passthrough off forgets every learned host. */
+function setAutoPassthrough(on: boolean) {
+  status = { ...status, autoPassthrough: on, ...(on ? {} : { learnedPassthrough: [] }) };
+  const btn = document.getElementById('dev-auto-passthrough');
+  if (btn) btn.textContent = `auto passthrough: ${on ? 'on' : 'off'}`;
+}
+document.getElementById('dev-auto-passthrough')?.addEventListener('click', () => {
+  setAutoPassthrough(status.autoPassthrough === false);
+  send({ type: 'status', status });
+});
 document.getElementById('dev-tunnel')?.addEventListener('click', () => openTunnel(pick(['pay.bank.example', 'cards.bank.example', 'pinned.example.com']), { live: true }));
 
 // ---------------------------------------------------------------- v0.10.0 (CONTRACTS §16)
