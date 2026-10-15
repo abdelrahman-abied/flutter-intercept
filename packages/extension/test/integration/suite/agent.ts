@@ -1448,9 +1448,11 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
             // through, every call fails with the reason, the failed requests carry needsClientCertificate.
             await fiCfg.update('clientCertificates', certsBefore, vscode.ConfigurationTarget.Global);
             await fiCfg.update('autoPassthrough', false, vscode.ConfigurationTarget.Global);
-            await waitFor(async () => ((await mcpCall('get_status', {})).result.autoPassthrough === false ? true : undefined), 20_000, 300).catch(() =>
-              f.push('get_status autoPassthrough did not turn false'),
-            );
+            // Both settings applied (the certificates reload reads files, asynchronously) before the app runs again.
+            await waitFor(async () => {
+              const st3 = (await mcpCall('get_status', {})).result;
+              return st3.autoPassthrough === false && !(st3.clientCertificates ?? []).length ? true : undefined;
+            }, 20_000, 300).catch(() => f.push('get_status: autoPassthrough not false or certificates still loaded'));
             const from3 = outputOf(session).length;
             const offAt = Date.now();
             const h3 = await mcpCall('hot_restart', { sessionId });
