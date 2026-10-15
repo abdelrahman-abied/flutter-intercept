@@ -49,6 +49,8 @@ export interface UpstreamRefusal {
 export interface LearnVerdict {
   error: string;
   learned?: { reason: 'client-certificate'; host: string; port: number };
+  /** CONTRACTS §20.7: the proxy concluded the server wants the app's client certificate (Exchange.needsClientCertificate). */
+  needs?: { host: string; port: number };
 }
 
 const ADD_CERT = 'add the certificate in the Flutter Intercept panel (Add client certificate…)';
@@ -143,7 +145,7 @@ export class LearnFlow {
 
   /** Response-head time: might this failure teach the host (then the app's connection is closed after it)? */
   mayTeach(f: UpstreamRefusal): boolean {
-    return !f.certPattern && !f.noLearn && (!!f.nginx || f.alert === 116 || f.alert === 40 || f.alert === 42);
+    return this.px.autoPassthrough && !f.certPattern && !f.noLearn && (!!f.nginx || f.alert === 116 || f.alert === 40 || f.alert === 42);
   }
 
   /** The last probe's answer for `host:port` while it is fresh (PROBE_NEGATIVE_MS). */
@@ -164,29 +166,43 @@ export class LearnFlow {
       return why ? { error: `The server rejected the client certificate configured for ${f.certPattern} (${why}).` } : undefined;
     }
     if (f.noLearn) return undefined;
+    const needs = { host: f.host, port: f.port };
     let cause: string;
     if (f.alert === 116) cause = 'TLS alert certificate_required';
     else if (f.nginx) cause = `HTTP 400 "${NGINX_NO_CERT_TEXT}"`;
-    else if (f.alert === 40 || f.alert === 42) {
+    else if ((f.alert === 40 || f.alert === 42) && !this.px.autoPassthrough) {
+      // §20.7: no probe while automatic passthrough is off, so the refusal can't be confirmed.
+      return {
+        error: `The server ended the TLS handshake (${CERT_ALERTS[f.alert]}); it may need the app's own client certificate. Automatic passthrough is off, so Flutter Intercept didn't check: add the certificate in the panel (Add client certificate…) if it needs one.`,
+        needs,
+      };
+    } else if (f.alert === 40 || f.alert === 42) {
       if (this.keepDecrypted(f.host, f.port, { grpc: f.grpc })) return undefined; // no probe for a host that can't be learned
       if (!(await this.probe(f))) return undefined;
       cause = `TLS alert ${CERT_ALERTS[f.alert]}; the server asks for a client certificate`;
     } else return undefined;
-    const needs = `This server needs the app's own client certificate (${cause}).`;
+    const says = `This server needs the app's own client certificate (${cause}).`;
+    if (!this.px.autoPassthrough) {
+      return {
+        error: `${says} Automatic passthrough is off (flutterIntercept.autoPassthrough), so its requests keep failing through Flutter Intercept: ${ADD_CERT}, or turn it on.`,
+        needs,
+      };
+    }
     const kept = this.keepDecrypted(f.host, f.port, { grpc: f.grpc });
     if (kept) {
       const rules = kept.startsWith('The enabled rule') ? ' for the rules to work' : '';
-      return { error: `${needs} ${kept}, so ${label} stays decrypted${rules}. To make these requests work, ${ADD_CERT}.` };
+      return { error: `${says} ${kept}, so ${label} stays decrypted${rules}. To make these requests work, ${ADD_CERT}.`, needs };
     }
     const by = clientKeyOf((f.socket as { remoteAddress?: string } | undefined)?.remoteAddress);
     if (!this.hosts.learn(f.host, f.port, 'client-certificate', { by, ...(f.grpc ? { grpc: true } : {}) })) {
-      return { error: `${needs} ${LEARNED_MAX} hosts are passed through already, so ${label} stays decrypted. To make these requests work, ${ADD_CERT}.` };
+      return { error: `${says} ${LEARNED_MAX} hosts are passed through already, so ${label} stays decrypted. To make these requests work, ${ADD_CERT}.`, needs };
     }
     return {
       error:
-        `${needs} From now on ${label} is passed through without decryption, ` +
+        `${says} From now on ${label} is passed through without decryption, ` +
         `so the app talks to it directly with its own certificate. To see these requests, ${ADD_CERT}.`,
       learned: { reason: 'client-certificate', host: f.host, port: f.port },
+      needs,
     };
   }
 

@@ -992,6 +992,181 @@ describe('pinned: an app that rejects the proxy certificate on an HTTPS CONNECT'
   });
 });
 
+// ---------------------------------------------------------------- automatic passthrough off (CONTRACTS §20.7)
+
+describe.skipIf(!haveCerts)('§20.7: automatic passthrough off; needsClientCertificate', () => {
+  const offText = (cause: string) =>
+    `This server needs the app's own client certificate (${cause}). Automatic passthrough is off (flutterIntercept.autoPassthrough), so its requests keep failing through Flutter Intercept: add the certificate in the Flutter Intercept panel (Add client certificate…), or turn it on.`;
+  let proxy: InterceptProxy;
+  let probes = 0;
+  beforeEach(async () => {
+    probes = 0;
+    probeTesting.probe = async (t) => {
+      probes++;
+      return probeCertificateRequest(t);
+    };
+    proxy = await startProxy({ autoPassthrough: false });
+  });
+  afterEach(async () => {
+    delete probeTesting.probe;
+    await proxy.stop();
+  });
+
+  it('the option and the setter (default on)', async () => {
+    expect(proxy.autoPassthrough).toBe(false);
+    const other = await startProxy();
+    expect(other.autoPassthrough).toBe(true);
+    other.setAutoPassthrough(false);
+    expect(other.autoPassthrough).toBe(false);
+    await other.stop();
+  });
+
+  it('TLS 1.3 certificate_required: says what the server wants, nothing learned, no Connection: close; the next request fails the same way', async () => {
+    const srv = await startMtlsServer({ mode: 'reject' });
+    const app = proxiedAgent(proxy.port, { cert: read('cert.pem'), key: read('key.pem') });
+    try {
+      const first = await get(app.agent, srv.port, '/whoami');
+      expect(first.status).toBe(502);
+      expect(first.headers.connection).not.toBe('close');
+      const ex = await waitFor(proxy, (e) => failed(e) && !!e.needsClientCertificate);
+      expect(ex.error).toBe(offText('TLS alert certificate_required'));
+      expect(ex.needsClientCertificate).toEqual({ host: '127.0.0.1', port: srv.port });
+      expect(ex.learnedPassthrough).toBeUndefined();
+      expect(proxy.learnedPassthrough).toEqual([]);
+      expect((await get(app.agent, srv.port, '/whoami')).status).toBe(502);
+      expect(proxy.getExchanges().some((e) => e.kind === 'tunnel')).toBe(false);
+    } finally {
+      app.agent.destroy();
+      await srv.close();
+    }
+  });
+
+  it('TLS 1.2 handshake_failure: no probe, the "may need" text, needsClientCertificate set', async () => {
+    const srv = await startMtlsServer({ mode: 'reject', maxVersion: 'TLSv1.2' });
+    const app = proxiedAgent(proxy.port);
+    try {
+      expect((await get(app.agent, srv.port, '/whoami')).status).toBe(502);
+      const ex = await waitFor(proxy, (e) => failed(e) && !!e.needsClientCertificate);
+      expect(ex.error).toBe(
+        "The server ended the TLS handshake (handshake_failure); it may need the app's own client certificate. Automatic passthrough is off, so Flutter Intercept didn't check: add the certificate in the panel (Add client certificate…) if it needs one.",
+      );
+      expect(ex.needsClientCertificate).toEqual({ host: '127.0.0.1', port: srv.port });
+      expect(probes).toBe(0);
+      expect(srv.handshakes.filter((h) => h === 'refused').length).toBe(1); // only the request's own connection
+      expect(proxy.learnedPassthrough).toEqual([]);
+    } finally {
+      app.agent.destroy();
+      await srv.close();
+    }
+  });
+
+  it("nginx's 400: the server's own 400, no Connection: close, the off text", async () => {
+    const srv = await startMtlsServer({ mode: 'nginx' });
+    const app = proxiedAgent(proxy.port);
+    try {
+      const r = await get(app.agent, srv.port, '/secure');
+      expect(r.status).toBe(400);
+      expect(r.headers.connection).not.toBe('close');
+      const ex = await waitFor(proxy, (e) => failed(e) && !!e.needsClientCertificate);
+      expect(ex.error).toBe(offText('HTTP 400 "No required SSL certificate was sent"'));
+      expect(proxy.learnedPassthrough).toEqual([]);
+    } finally {
+      app.agent.destroy();
+      await srv.close();
+    }
+  });
+
+  it('on: needsClientCertificate on a learned request and on one a rule keeps decrypted; not for a rejected configured certificate', async () => {
+    proxy.setAutoPassthrough(true);
+    const srv = await startMtlsServer({ mode: 'reject' });
+    try {
+      proxy.setRules([rule('r', `https://127.0.0.1:${srv.port}/*`)]);
+      let app = proxiedAgent(proxy.port);
+      await get(app.agent, srv.port, '/whoami');
+      app.agent.destroy();
+      const kept = await waitFor(proxy, (e) => failed(e) && /stays decrypted/.test(e.error ?? ''));
+      expect(kept.needsClientCertificate).toEqual({ host: '127.0.0.1', port: srv.port });
+      expect(kept.learnedPassthrough).toBeUndefined();
+      proxy.setRules([]);
+      app = proxiedAgent(proxy.port);
+      await get(app.agent, srv.port, '/whoami');
+      app.agent.destroy();
+      const learned = await waitFor(proxy, (e) => failed(e) && !!e.learnedPassthrough);
+      expect(learned.needsClientCertificate).toEqual({ host: '127.0.0.1', port: srv.port });
+    } finally {
+      await srv.close();
+    }
+    // a configured certificate the server rejects: says so, no needsClientCertificate
+    const alert = Buffer.from([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x2a]);
+    const bad = net.createServer((s) => s.once('data', () => s.end(alert)));
+    bad.listen(0, '127.0.0.1');
+    await once(bad, 'listening');
+    try {
+      proxy.setClientCertificates([{ host: '127.0.0.1', cert: read('othercert.pem'), key: read('other.pem') }]);
+      const app = proxiedAgent(proxy.port);
+      await get(app.agent, (bad.address() as AddressInfo).port, '/x');
+      app.agent.destroy();
+      const ex = await waitFor(proxy, (e) => failed(e) && /configured for/.test(e.error ?? ''));
+      expect(ex.needsClientCertificate).toBeUndefined();
+    } finally {
+      bad.close();
+    }
+  });
+
+  it('turning it off forgets everything but gRPC pins; HTTPS pins are not learned while off, gRPC pins under decrypt-all are', async () => {
+    proxy.setAutoPassthrough(true);
+    const p = proxy[TEST_INTERNALS]();
+    const until = Date.now() + 60_000;
+    p.learn.hosts.learn('mtls.example.test', 443, 'client-certificate');
+    p.learn.hosts.learn('web.example.test', 443, 'pinned', { until });
+    p.pinnedHosts.set('grpc.example.test:443', until);
+    const events: LearnedPassthrough[][] = [];
+    proxy.on('learnedPassthrough', (l) => events.push(l));
+    proxy.setAutoPassthrough(false);
+    expect(proxy.learnedPassthrough.map((e) => e.host)).toEqual(['grpc.example.test']);
+    await sleep(10);
+    expect(events.at(-1)?.map((e) => e.host)).toEqual(['grpc.example.test']);
+    // an HTTPS CONNECT the app rejects (an alert): the generic record, no pin, although setHttpPinLearning is on
+    expect(proxy.httpPinLearning).toBe(true);
+    p.decrypting.set('127.0.0.1:40011', { host: 'web2.example.test', port: 443, http: true });
+    p.onTlsError({ failureCause: 'cert-rejected', remoteIpAddress: '127.0.0.1', remotePort: 40011, timingEvents: {} });
+    await waitFor(proxy, (e) => e.state === 'error' && /The app probably rejects the proxy's certificate/.test(String(e.error)));
+    // a decrypted silent gRPC tunnel the app rejects: pinned as in 0.13
+    p.decrypting.set('127.0.0.1:40012', { host: 'grpc2.example.test', port: 443 });
+    p.onTlsError({ failureCause: 'cert-rejected', remoteIpAddress: '127.0.0.1', remotePort: 40012, timingEvents: {} });
+    expect(proxy.grpcPinnedHosts.sort()).toEqual(['grpc.example.test:443', 'grpc2.example.test:443']);
+    expect(proxy.learnedPassthrough.some((e) => e.host === 'web2.example.test')).toBe(false);
+  });
+
+  it('gRPC: certificate_required on the relay while off: UNAVAILABLE with the off text, needsClientCertificate, nothing learned', async () => {
+    const { key, cert } = await selfSignedCert();
+    const server = http2.createSecureServer({ key, cert, requestCert: true, rejectUnauthorized: true, ca: [read('cert.pem')] });
+    server.on('error', () => undefined);
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const port = (server.address() as AddressInfo).port;
+    const target = `127.0.0.1:${port}`;
+    proxy.setGrpcDecryptAll(true);
+    try {
+      const sock = await silentSocket(proxy.port, target);
+      const t = tls.connect({ socket: sock, servername: 'localhost', ALPNProtocols: ['h2'], rejectUnauthorized: false });
+      await once(t, 'secureConnect');
+      const s = http2.connect(`https://${target}`, { createConnection: () => t });
+      s.on('error', () => undefined);
+      expect((await grpcCall(s, '/t.Svc/M', ['x'])).grpcStatus).toBe(14);
+      const ex = await waitFor(proxy, (e) => e.kind === 'grpc' && e.state === 'error');
+      expect(ex.error).toBe(offText('TLS alert certificate_required'));
+      expect(ex.needsClientCertificate).toEqual({ host: '127.0.0.1', port });
+      expect(ex.learnedPassthrough).toBeUndefined();
+      expect(proxy.learnedPassthrough).toEqual([]);
+      expect(s.closed).toBe(false); // the app's connection wasn't closed
+      s.destroy();
+    } finally {
+      server.close();
+    }
+  });
+});
+
 // ---------------------------------------------------------------- performance (CONTRACTS §20.4)
 
 describe('performance', () => {

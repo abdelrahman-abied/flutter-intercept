@@ -644,7 +644,8 @@ export class ConnectFlow {
    */
   pinVerdict(watched: WatchedHandshake, f: TlsHandshakeFailure): Exchange | undefined {
     const w: PinTarget = { host: watched.host, port: watched.port, grpc: !watched.http };
-    if (!w.grpc && !this.px.httpPinLearning) return undefined; // §20.6: native routing on: the generic record, as before 0.14
+    // §20.6 (native routing on) / §20.7 (automatic passthrough off): no HTTPS pins — the generic record, as before 0.14.
+    if (!w.grpc && (!this.px.httpPinLearning || !this.px.autoPassthrough)) return undefined;
     const client = clientKeyOf(String(f.remoteIpAddress ?? ''));
     const key = pinKey(client, w.host, w.port);
     const alert = f.failureCause === 'cert-rejected';

@@ -160,6 +160,7 @@ export class HttpTaps {
     if (!pending) return false;
     const v = await pending;
     if (!v || !this.px.book.live.has(ex.id)) return false;
+    if (v.needs) ex.needsClientCertificate = v.needs;
     if (v.learned) {
       ex.learnedPassthrough = v.learned;
       this.px.learn.closeIdle(v.learned.host, v.learned.port);

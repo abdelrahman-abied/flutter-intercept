@@ -290,6 +290,8 @@ export class InterceptProxy extends EventEmitter {
   /** CONTRACTS §19.3: decrypt every TLS silent gRPC tunnel (but tlsPassthrough / learned pinned hosts). */
   private grpcDecryptAllOn = false;
   private httpPinLearningOn = true;
+  /** CONTRACTS §20.7: learn passthrough hosts on its own (option `autoPassthrough`, default true). */
+  private autoPassthroughOn = true;
   /** CONTRACTS §18.6: this instance's hop marker (on every relayed / sent gRPC call; one arriving with it is a loop). */
   private readonly hopNonce = randomBytes(18).toString('base64url');
   /** QUALITY-1 Q1: the flow modules' view of this proxy (proxy-context.ts). */
@@ -331,6 +333,7 @@ export class InterceptProxy extends EventEmitter {
     if (opts.clientCertificates) this.setClientCertificates(opts.clientCertificates);
     if (opts.grpcDecryptHosts) this.setGrpcDecryptHosts(opts.grpcDecryptHosts);
     if (opts.grpcDecryptAll) this.grpcDecryptAllOn = true;
+    if (opts.autoPassthrough === false) this.autoPassthroughOn = false;
   }
   /** QUALITY-1 Q1: getters and delegates over the members the flow modules use. */
   private makeContext(): ProxyContext {
@@ -373,6 +376,9 @@ export class InterceptProxy extends EventEmitter {
       },
       get grpcDecryptAllOn() {
         return self.grpcDecryptAllOn;
+      },
+      get autoPassthrough() {
+        return self.autoPassthroughOn;
       },
       get httpPinLearning() {
         return self.httpPinLearningOn;
@@ -1119,6 +1125,22 @@ export class InterceptProxy extends EventEmitter {
 
   get httpPinLearning(): boolean {
     return this.httpPinLearningOn;
+  }
+
+  /**
+   * CONTRACTS §20.7: learn passthrough hosts on its own (default on). Off: nothing is learned — neither reason, HTTP or
+   * gRPC, except 0.13's gRPC pins under decrypt-all, which keep working — no probe is sent, no `Connection: close` is
+   * added and idle connections aren't closed; a failed request says what the server wants (`needsClientCertificate`).
+   * Turning it off forgets every learned entry but those gRPC pins. HTTP pins need this and setHttpPinLearning (§20.6).
+   */
+  setAutoPassthrough(on: boolean): void {
+    this.autoPassthroughOn = !!on;
+    if (on) return;
+    this.learn.hosts.forget((e) => !(e.grpc && e.reason === 'pinned'));
+  }
+
+  get autoPassthrough(): boolean {
+    return this.autoPassthroughOn;
   }
 
   /** CONTRACTS §19.3: forget every learned pinned host (they are decrypted again under decrypt-all). */

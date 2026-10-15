@@ -845,6 +845,7 @@ export class GrpcRelay {
       ...(call.flow.send || call.flow.map || !sameServer ? { noLearn: true } : {}),
     });
     if (!v || !call.isLive() || call.stream.closed || call.stream.headersSent) return false;
+    if (v.needs) call.ex.needsClientCertificate = v.needs;
     if (v.learned) call.ex.learnedPassthrough = v.learned;
     this.px.grpcLocal.grpcStatusOnly(call, 14, fiText(v.error), 'error', v.error);
     if (v.learned) {
