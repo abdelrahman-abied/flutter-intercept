@@ -12,7 +12,7 @@ import { LanGate } from './lan';
 import { type NetworkProfile } from './network';
 import { TraceJoin } from './trace';
 import { ScriptRunner } from './script';
-import type { Exchange, InterceptProxyOptions } from './types';
+import type { Exchange, InterceptProxyOptions, Rule } from './types';
 import type { ExchangeStore } from './exchange-store';
 import type { GrpcRelay } from './grpc-relay';
 import type { GrpcLocal } from './grpc-local';
@@ -20,6 +20,7 @@ import type { GrpcHooks } from './grpc-hooks';
 import type { GrpcWebFlow } from './grpc-web-flow';
 import type { HttpEdits } from './http-edits';
 import type { HttpTaps } from './http-taps';
+import type { LearnFlow } from './learn-flow';
 import type { Decision, SendMeta, Flow, MatchOptions, MatchResult, ReqMeta, Paused, LoadedCert } from './flow-types';
 
 /**
@@ -49,6 +50,8 @@ export interface ProxyContext {
   readonly hopNonce: string;
   readonly host: string;
   readonly lanGate: LanGate | undefined;
+  /** CONTRACTS §20.1: learned passthrough hosts. */
+  readonly learn: LearnFlow;
   matchRule(method: string, url: string, o: MatchOptions): MatchResult;
   readonly opts: InterceptProxyOptions;
   readonly passthrough: HostPattern[];
@@ -61,6 +64,8 @@ export interface ProxyContext {
   replayFlow(method: string, url: string, headers: HeaderBag, body: BodyKey, note?: string): Flow;
   readonly replayStore: ReplayStore | undefined;
   readonly reqMeta: WeakMap<object, ReqMeta>;
+  /** CONTRACTS §20.1: an enabled, unspent rule whose URL pattern names this host (patternNamesHost). */
+  ruleNamingHost(host: string, port: number): Rule | undefined;
   readonly scripts: ScriptRunner;
   readonly sends: Map<string, SendMeta>;
   readonly server: mockttp.Mockttp | undefined;

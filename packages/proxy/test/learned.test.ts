@@ -1,0 +1,702 @@
+// v0.14.0 (CONTRACTS §20.1): learned passthrough — servers that want the app's own client certificate (TLS 1.3
+// certificate_required, TLS 1.2 handshake_failure confirmed by a probe, nginx's 400) and apps that pin their certificate
+// on plain HTTPS CONNECTs; the exclusions, the API and event, and the cost of a CONNECT with a full map.
+import { execFileSync } from 'child_process';
+import { once } from 'events';
+import * as fs from 'fs';
+import * as http from 'http';
+import * as http2 from 'http2';
+import * as https from 'https';
+import * as net from 'net';
+import * as os from 'os';
+import * as path from 'path';
+import * as tls from 'tls';
+import { X509Certificate } from 'crypto';
+import type { AddressInfo } from 'net';
+import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { Exchange, InterceptProxy, LearnedPassthrough, Rule } from '../src';
+import {
+  alertOf,
+  alertOfTags,
+  CertRequestFinder,
+  LEARNED_MAX,
+  LearnedHosts,
+  parseLearnedKey,
+  patternNamesHost,
+  probeCertificateRequest,
+  probeTesting,
+} from '../src/learned';
+import { grpcPinTesting, TEST_INTERNALS } from '../src/intercept-proxy';
+import { GRPC_PIN_TTL_MS } from '../src/connect-flow';
+import { nextExchange, notesOf, selfSignedCert, sleep, startProxy, startTinyProxy } from './helpers';
+import { grpcCall, silentSocket } from './grpc-helpers';
+
+function waitFor(proxy: InterceptProxy, pred: (e: Exchange) => boolean, timeoutMs = 10_000): Promise<Exchange> {
+  const have = [...proxy.getExchanges()].reverse().find(pred);
+  return have ? Promise.resolve(have) : nextExchange(proxy, pred, timeoutMs);
+}
+
+const certDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fi-learned-'));
+function openssl(args: string[]): boolean {
+  try {
+    execFileSync('openssl', args, { cwd: certDir, stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+fs.writeFileSync(path.join(certDir, 'ext.cnf'), '[req]\ndistinguished_name=dn\n[dn]\n[ext]\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n');
+const haveCerts =
+  openssl(['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', 'key.pem', '-out', 'cert.pem', '-days', '2', '-subj', '/CN=fi-app-client', '-extensions', 'ext', '-config', 'ext.cnf']) &&
+  openssl(['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', 'other.pem', '-out', 'othercert.pem', '-days', '2', '-subj', '/CN=other', '-extensions', 'ext', '-config', 'ext.cnf']);
+const read = (f: string) => fs.readFileSync(path.join(certDir, f), 'utf8');
+afterAll(() => fs.rmSync(certDir, { recursive: true, force: true }));
+
+const NGINX_PAGE =
+  '<html>\r\n<head><title>400 No required SSL certificate was sent</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n' +
+  '<center>No required SSL certificate was sent</center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n';
+
+/**
+ * An mTLS server (its own certificate; trusts the app's client certificate). `mode`: `reject` = requestCert +
+ * rejectUnauthorized (TLS alerts); `nginx` = asks, accepts none, but answers /secure with nginx's 400 page without one.
+ * `/whoami` names the client certificate's CN; `/ok` always answers.
+ */
+async function startMtlsServer(o: { mode: 'reject' | 'nginx'; maxVersion?: tls.SecureVersion; trust?: string }) {
+  const { key, cert } = await selfSignedCert();
+  const handshakes: string[] = [];
+  const server = https.createServer(
+    { key, cert, requestCert: true, rejectUnauthorized: o.mode === 'reject', ca: [o.trust ?? read('cert.pem')], ...(o.maxVersion ? { maxVersion: o.maxVersion } : {}) },
+    (req, res) => {
+      const s = req.socket as tls.TLSSocket;
+      const cn = s.authorized ? String(s.getPeerCertificate().subject?.CN ?? '') : '';
+      if (req.url === '/secure' && !s.authorized) return void res.writeHead(400, { 'content-type': 'text/html' }).end(NGINX_PAGE);
+      res.writeHead(200, { 'content-type': 'text/plain' }).end(req.url === '/whoami' || req.url === '/secure' ? cn || 'anonymous' : 'ok');
+    },
+  );
+  server.on('secureConnection', (s: tls.TLSSocket) => handshakes.push(s.authorized ? 'cert' : 'none'));
+  server.on('tlsClientError', () => handshakes.push('refused'));
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  return {
+    port: (server.address() as AddressInfo).port,
+    handshakes,
+    async close() {
+      server.closeAllConnections();
+      await new Promise((r) => server.close(r));
+    },
+  };
+}
+
+/** An HTTPS keep-alive agent that goes through the proxy like an app: a CONNECT per connection, then TLS inside it. */
+function proxiedAgent(proxyPort: number, own: tls.ConnectionOptions = {}, maxSockets = 1) {
+  const connects: string[] = [];
+  const sockets: tls.TLSSocket[] = [];
+  const agent = new https.Agent({ keepAlive: true, maxSockets });
+  (agent as unknown as { createConnection: unknown }).createConnection = (opts: { host: string; port: number }, cb: (e: Error | null, s?: net.Socket) => void) => {
+    const c = http.request({ host: '127.0.0.1', port: proxyPort, method: 'CONNECT', path: `${opts.host}:${opts.port}`, agent: false });
+    c.once('connect', (res, sock: net.Socket) => {
+      connects.push(String(res.statusCode));
+      if (res.statusCode !== 200) return cb(new Error(`CONNECT ${res.statusCode}`));
+      // The app trusts both the proxy's CA (debug) and the server: no verification here, its own certificate offered.
+      const t = tls.connect({ socket: sock, servername: 'localhost', rejectUnauthorized: false, ...own });
+      sockets.push(t);
+      t.once('secureConnect', () => cb(null, t));
+      t.once('error', (e) => cb(e));
+    });
+    c.once('error', (e) => cb(e));
+    c.end();
+  };
+  return { agent, connects, sockets };
+}
+
+function get(agent: https.Agent, port: number, p: string): Promise<{ status: number; text: string; headers: http.IncomingHttpHeaders }> {
+  return new Promise((resolve, reject) => {
+    const req = https.request({ host: '127.0.0.1', port, path: p, agent }, (res) => {
+      let text = '';
+      res.on('data', (d) => (text += d));
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, text, headers: res.headers }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+const failed = (e: Exchange) => e.kind !== 'tunnel' && e.state === 'error';
+const learnedText = (cause: string, host: string) =>
+  `This server needs the app's own client certificate (${cause}). From now on ${host} is passed through without decryption, so the app talks to it directly with its own certificate. To see these requests, add the certificate in the Flutter Intercept panel (Add client certificate…).`;
+const rule = (id: string, url: string, extra: Partial<Rule> = {}): Rule => ({ id, enabled: true, match: { url }, action: { kind: 'throttle', latencyMs: 1 }, ...extra });
+
+// ---------------------------------------------------------------- pure parts
+
+describe('learned passthrough: helpers', () => {
+  it('a rule names a host only by a host part (globs, ports, IPv6; not `*`, regexes or patterns without a scheme)', () => {
+    expect(patternNamesHost('https://api.example.com/*', 'api.example.com', 443)).toBe(true);
+    expect(patternNamesHost('https://API.example.com/v1', 'api.example.com', 8443)).toBe(true);
+    expect(patternNamesHost('https://*.example.com/*', 'api.example.com', 443)).toBe(true);
+    expect(patternNamesHost('https://api.example.com:8443/*', 'api.example.com', 443)).toBe(false);
+    expect(patternNamesHost('https://api.example.com:8443/*', 'api.example.com', 8443)).toBe(true);
+    expect(patternNamesHost('*://api.example.com:*', 'api.example.com', 1)).toBe(true);
+    expect(patternNamesHost('https://[::1]:8443/*', '::1', 8443)).toBe(true);
+    expect(patternNamesHost('https://other.example.com/*', 'api.example.com', 443)).toBe(false);
+    for (const p of ['*', 'https://*/*', '*/v1/*', '/api\\.example\\.com/', '']) expect(patternNamesHost(p, 'api.example.com', 443)).toBe(false);
+  });
+
+  it('keys, alerts', () => {
+    expect(parseLearnedKey('API.example.com:8443')).toEqual({ host: 'api.example.com', port: 8443 });
+    expect(parseLearnedKey('[::1]:443')).toEqual({ host: '::1', port: 443 });
+    expect(parseLearnedKey('::1')).toEqual({ host: '::1' });
+    expect(parseLearnedKey('api.example.com')).toEqual({ host: 'api.example.com' });
+    expect(parseLearnedKey('a:b:c:99999')).toBeUndefined();
+    expect(alertOf({ code: 'ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED', message: 'x' })).toBe(116);
+    expect(alertOf({ code: 'EPROTO', message: 'write EPROTO …:ssl/tls alert handshake failure:…:SSL alert number 40' })).toBe(40);
+    expect(alertOf({ code: 'ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE' })).toBe(42);
+    expect(alertOf({ code: 'ECONNRESET', message: 'socket hang up' })).toBeUndefined();
+    expect(alertOfTags(['passthrough-error:EPROTO', 'passthrough-tls-error:ssl-alert-40'])).toBe(40);
+  });
+
+  it('the map: live entries, expiry, a client-certificate entry outlives a pin, the cap', () => {
+    let changes = 0;
+    const m = new LearnedHosts(() => changes++);
+    expect(m.learn('a.test', 443, 'client-certificate')).toBe(true);
+    expect(m.learn('a.test', 443, 'pinned', { until: Date.now() + 1000 })).toBe(true);
+    expect(m.get('a.test:443')?.reason).toBe('client-certificate');
+    expect(m.learn('b.test', 443, 'pinned', { until: Date.now() - 1 })).toBe(true);
+    expect(m.get('b.test:443')).toBeUndefined();
+    for (let i = 0; m.size < LEARNED_MAX; i++) m.learn(`h${i}.test`, 443, 'client-certificate');
+    expect(m.learn('full.test', 443, 'client-certificate')).toBe(false);
+    m.forget((e) => e.host === 'h0.test');
+    expect(m.learn('full.test', 443, 'client-certificate')).toBe(true);
+    expect(m.list().length).toBe(LEARNED_MAX);
+    expect(changes).toBeGreaterThan(LEARNED_MAX);
+  });
+
+  it('CertRequestFinder reads handshake messages across records and stops at ServerHelloDone / alerts', () => {
+    const rec = (type: number, body: Buffer) => Buffer.concat([Buffer.from([type, 3, 3, body.length >> 8, body.length & 255]), body]);
+    const msg = (t: number, len: number) => Buffer.concat([Buffer.from([t, 0, len >> 8, len & 255]), Buffer.alloc(len, 7)]);
+    const flight = Buffer.concat([msg(2, 70), msg(11, 300), msg(13, 20), msg(14, 0)]);
+    const f = new CertRequestFinder();
+    // split mid-message and mid-record
+    const records = Buffer.concat([rec(22, flight.subarray(0, 100)), rec(22, flight.subarray(100))]);
+    expect(f.push(records.subarray(0, 50))).toBeUndefined();
+    expect(f.push(records.subarray(50))).toBe(true);
+    const g = new CertRequestFinder();
+    expect(g.push(rec(22, Buffer.concat([msg(2, 70), msg(11, 300), msg(14, 0)])))).toBe(false);
+    expect(new CertRequestFinder().push(rec(21, Buffer.from([2, 40])))).toBe(false);
+    expect(new CertRequestFinder().push(Buffer.from('HTTP/1.1 400 Bad Request\r\n\r\n'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------- probe
+
+describe.skipIf(!haveCerts)('the CertificateRequest probe', () => {
+  it('sees a TLS 1.2 or 1.3 server ask for a certificate; a server that does not, a LAN-forbidden target and a dead port are no', async () => {
+    const asks = await startMtlsServer({ mode: 'reject' });
+    const asks12 = await startMtlsServer({ mode: 'reject', maxVersion: 'TLSv1.2' });
+    const { key, cert } = await selfSignedCert();
+    const plain = https.createServer({ key, cert }, (_q, r) => r.end('x'));
+    plain.listen(0, '127.0.0.1');
+    await once(plain, 'listening');
+    try {
+      expect(await probeCertificateRequest({ host: '127.0.0.1', port: asks12.port })).toBe(true);
+      expect(await probeCertificateRequest({ host: '127.0.0.1', port: asks.port })).toBe(true); // TLS 1.2 offered: the server's 1.2 flight
+      expect(await probeCertificateRequest({ host: '127.0.0.1', port: (plain.address() as AddressInfo).port })).toBe(false);
+      // a LAN client's probe can't reach this machine (the CONNECT guard)
+      expect(await probeCertificateRequest({ host: '127.0.0.1', port: asks12.port, lan: { listenerHost: '192.0.2.1', closed: () => false } })).toBe(false);
+      const dead = net.createServer();
+      dead.listen(0, '127.0.0.1');
+      await once(dead, 'listening');
+      const deadPort = (dead.address() as AddressInfo).port;
+      dead.close();
+      expect(await probeCertificateRequest({ host: '127.0.0.1', port: deadPort })).toBe(false);
+      // the server never sees a certificate or application data from the probe (its handshake never completes)
+      expect(asks12.handshakes.filter((h) => h === 'cert' || h === 'none')).toEqual([]);
+    } finally {
+      await asks.close();
+      await asks12.close();
+      plain.closeAllConnections();
+      plain.close();
+    }
+  });
+
+  it('times out on a server that never answers (≤ the limit)', async () => {
+    const quiet = net.createServer((s) => s.on('data', () => undefined));
+    quiet.listen(0, '127.0.0.1');
+    await once(quiet, 'listening');
+    const t0 = Date.now();
+    expect(await probeCertificateRequest({ host: '127.0.0.1', port: (quiet.address() as AddressInfo).port }, 300)).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(2000);
+    quiet.close();
+  });
+});
+
+// ---------------------------------------------------------------- client-certificate
+
+describe.skipIf(!haveCerts)('client-certificate: learned, then the app talks to the server with its own certificate', () => {
+  let proxy: InterceptProxy;
+  let events: LearnedPassthrough[][];
+  beforeEach(async () => {
+    proxy = await startProxy();
+    events = [];
+    proxy.on('learnedPassthrough', (l) => events.push(l));
+  });
+  afterEach(async () => {
+    await proxy.stop();
+  });
+
+  for (const v of ['TLSv1.3', 'TLSv1.2'] as const) {
+    it(`${v}: the failed request says why (Connection: close), the next one opens a passed-through tunnel and gets 200 with the app's certificate`, async () => {
+      const srv = await startMtlsServer({ mode: 'reject', maxVersion: v });
+      const app = proxiedAgent(proxy.port, { cert: read('cert.pem'), key: read('key.pem') });
+      try {
+        const first = await get(app.agent, srv.port, '/whoami');
+        expect(first.status).toBe(502);
+        expect(first.headers.connection).toBe('close');
+        const ex = await waitFor(proxy, (e) => failed(e) && !!e.learnedPassthrough);
+        const cause = v === 'TLSv1.3' ? 'TLS alert certificate_required' : 'TLS alert handshake_failure; the server asks for a client certificate';
+        expect(ex.error).toBe(learnedText(cause, `127.0.0.1:${srv.port}`));
+        expect(ex.learnedPassthrough).toEqual({ reason: 'client-certificate', host: '127.0.0.1', port: srv.port });
+        expect(proxy.learnedPassthrough).toEqual([{ host: '127.0.0.1', port: srv.port, reason: 'client-certificate' }]);
+        await sleep(20);
+        expect(events.at(-1)).toEqual(proxy.learnedPassthrough);
+
+        const second = await get(app.agent, srv.port, '/whoami');
+        expect(second).toMatchObject({ status: 200, text: 'fi-app-client' });
+        expect(app.connects).toEqual(['200', '200']); // a new CONNECT: the first connection was closed
+        const tunnel = await waitFor(proxy, (e) => e.kind === 'tunnel' && !!e.learnedPassthrough);
+        expect(tunnel).toMatchObject({ method: 'CONNECT', url: `https://127.0.0.1:${srv.port}/`, learnedPassthrough: { reason: 'client-certificate', host: '127.0.0.1', port: srv.port } });
+        expect(notesOf(tunnel)).toBe("This server needs the app's own certificate: passed through without decryption.");
+        expect(srv.handshakes).toContain('cert');
+        // forget → decrypted again (fails again, learned again)
+        proxy.forgetLearnedPassthrough(`127.0.0.1:${srv.port}`);
+        expect(proxy.learnedPassthrough).toEqual([]);
+        app.agent.destroy();
+        const again = proxiedAgent(proxy.port, { cert: read('cert.pem'), key: read('key.pem') });
+        expect((await get(again.agent, srv.port, '/whoami')).status).toBe(502);
+        again.agent.destroy();
+        await waitFor(proxy, (e) => failed(e) && !!e.learnedPassthrough && e.id !== ex.id);
+        expect(proxy.learnedPassthrough.length).toBe(1);
+      } finally {
+        app.agent.destroy();
+        await srv.close();
+      }
+    });
+  }
+
+  it("nginx's 400: learned at once, the app gets the server's own 400 with Connection: close; its other idle connections are closed", async () => {
+    const srv = await startMtlsServer({ mode: 'nginx' });
+    const app = proxiedAgent(proxy.port, { cert: read('cert.pem'), key: read('key.pem') }, 2);
+    try {
+      // two keep-alive connections, both idle
+      expect((await Promise.all([get(app.agent, srv.port, '/ok'), get(app.agent, srv.port, '/ok')])).map((r) => r.status)).toEqual([200, 200]);
+      expect(app.sockets.length).toBe(2);
+      const closed = app.sockets.map((s) => once(s, 'close'));
+      const r = await get(app.agent, srv.port, '/secure');
+      expect(r.status).toBe(400);
+      expect(r.text).toBe(NGINX_PAGE);
+      expect(r.headers.connection).toBe('close');
+      const ex = await waitFor(proxy, (e) => failed(e) && !!e.learnedPassthrough);
+      expect(ex.status).toBe(400);
+      expect(ex.error).toBe(learnedText('HTTP 400 "No required SSL certificate was sent"', `127.0.0.1:${srv.port}`));
+      await Promise.all(closed); // the other idle connection too
+      const ok = await get(app.agent, srv.port, '/secure');
+      expect(ok).toMatchObject({ status: 200, text: 'fi-app-client' });
+      expect(app.connects.length).toBe(3);
+    } finally {
+      app.agent.destroy();
+      await srv.close();
+    }
+  });
+
+  it('an HTTPS 400 that is not the nginx page teaches nothing (an API error keeps its connection)', async () => {
+    const { key, cert } = await selfSignedCert();
+    const api = https.createServer({ key, cert }, (_q, res) => res.writeHead(400, { 'content-type': 'application/json' }).end('{"error":"bad"}'));
+    api.listen(0, '127.0.0.1');
+    await once(api, 'listening');
+    const app = proxiedAgent(proxy.port);
+    try {
+      const port = (api.address() as AddressInfo).port;
+      const r = await get(app.agent, port, '/x');
+      expect(r.status).toBe(400);
+      expect(r.headers.connection).not.toBe('close');
+      await get(app.agent, port, '/x');
+      expect(app.connects.length).toBe(1);
+      expect(proxy.learnedPassthrough).toEqual([]);
+    } finally {
+      app.agent.destroy();
+      api.closeAllConnections();
+      api.close();
+    }
+  });
+
+  it('configuring a certificate for a learned host forgets it: decrypted again, the proxy presents it', async () => {
+    const srv = await startMtlsServer({ mode: 'reject' });
+    try {
+      const app = proxiedAgent(proxy.port);
+      expect((await get(app.agent, srv.port, '/whoami')).status).toBe(502);
+      app.agent.destroy();
+      expect(proxy.learnedPassthrough.length).toBe(1);
+      proxy.setClientCertificates([{ host: 'other.example.test', cert: read('othercert.pem'), key: read('other.pem') }]);
+      expect(proxy.learnedPassthrough.length).toBe(1); // not for this host
+      proxy.setClientCertificates([{ host: '127.0.0.1', cert: read('cert.pem'), key: read('key.pem') }]);
+      expect(proxy.learnedPassthrough).toEqual([]);
+      const app2 = proxiedAgent(proxy.port);
+      expect(await get(app2.agent, srv.port, '/whoami')).toMatchObject({ status: 200, text: 'fi-app-client' });
+      app2.agent.destroy();
+      const ex = await waitFor(proxy, (e) => e.state === 'completed');
+      expect(ex.clientCertificate).toBe('127.0.0.1');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('a configured certificate the server rejects with an alert: says so, nothing learned, no probe', async () => {
+    // A server that refuses every handshake with bad_certificate (42), as OpenSSL-verifying servers do for a wrong one.
+    const alert = Buffer.from([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x2a]);
+    const bad = net.createServer((s) => s.once('data', () => s.end(alert)));
+    bad.listen(0, '127.0.0.1');
+    await once(bad, 'listening');
+    let probes = 0;
+    probeTesting.probe = async () => (probes++, true);
+    try {
+      proxy.setClientCertificates([{ host: '127.0.0.1', cert: read('othercert.pem'), key: read('other.pem') }]);
+      const app = proxiedAgent(proxy.port);
+      const r = await get(app.agent, (bad.address() as AddressInfo).port, '/x');
+      app.agent.destroy();
+      expect(r.status).toBe(502);
+      expect(r.headers.connection).not.toBe('close');
+      const ex = await waitFor(proxy, (e) => failed(e) && /configured for/.test(e.error ?? ''));
+      expect(ex.error).toBe('The server rejected the client certificate configured for 127.0.0.1 (bad_certificate).');
+      expect(ex.learnedPassthrough).toBeUndefined();
+      expect(proxy.learnedPassthrough).toEqual([]);
+      expect(probes).toBe(0);
+    } finally {
+      delete probeTesting.probe;
+      bad.close();
+    }
+  });
+
+  it('never learned while a rule names the host (it stays decrypted, the error says so) or a recording is replayed', async () => {
+    const srv = await startMtlsServer({ mode: 'reject' });
+    try {
+      proxy.setRules([rule('r1', `https://127.0.0.1:${srv.port}/*`, { name: 'slow api' })]);
+      const app = proxiedAgent(proxy.port);
+      expect((await get(app.agent, srv.port, '/whoami')).status).toBe(502);
+      app.agent.destroy();
+      const ex = await waitFor(proxy, (e) => failed(e) && /stays decrypted/.test(e.error ?? ''));
+      expect(ex.error).toBe(
+        `This server needs the app's own client certificate (TLS alert certificate_required). The enabled rule "slow api" targets 127.0.0.1:${srv.port}, so 127.0.0.1:${srv.port} stays decrypted for the rules to work. To make these requests work, add the certificate in the Flutter Intercept panel (Add client certificate…).`,
+      );
+      expect(proxy.learnedPassthrough).toEqual([]);
+      // a rule without a host part (any host) doesn't keep it decrypted
+      proxy.setRules([rule('r2', '*')]);
+      proxy.setReplay([{ method: 'GET', url: 'https://elsewhere.example/x', status: 200, headers: {} }]);
+      const app2 = proxiedAgent(proxy.port);
+      expect((await get(app2.agent, srv.port, '/whoami')).status).toBe(502);
+      app2.agent.destroy();
+      await waitFor(proxy, (e) => failed(e) && /A recording is being replayed/.test(e.error ?? ''));
+      expect(proxy.learnedPassthrough).toEqual([]);
+      proxy.setReplay(undefined);
+      const app3 = proxiedAgent(proxy.port);
+      expect((await get(app3.agent, srv.port, '/whoami')).status).toBe(502);
+      app3.agent.destroy();
+      expect(proxy.learnedPassthrough.length).toBe(1);
+      // learned, then a rule names the host: its CONNECTs are decrypted again (the rule answers them)
+      proxy.setRules([{ id: 'm', enabled: true, match: { url: `https://127.0.0.1:${srv.port}/*` }, action: { kind: 'mock', status: 200, body: 'mocked' } }]);
+      const app4 = proxiedAgent(proxy.port);
+      expect(await get(app4.agent, srv.port, '/whoami')).toMatchObject({ status: 200, text: 'mocked' });
+      app4.agent.destroy();
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('handshake_failure without a CertificateRequest: no learning; one probe per host:port for many failures', async () => {
+    // A "server" that answers every ClientHello with a handshake_failure alert.
+    const alert = Buffer.from([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]);
+    const bad = net.createServer((s) => s.once('data', () => s.end(alert)));
+    bad.listen(0, '127.0.0.1');
+    await once(bad, 'listening');
+    const port = (bad.address() as AddressInfo).port;
+    let probes = 0;
+    probeTesting.probe = async (t) => {
+      probes++;
+      return probeCertificateRequest(t);
+    };
+    try {
+      const results = await Promise.all(
+        Array.from({ length: 12 }, async () => {
+          const app = proxiedAgent(proxy.port);
+          try {
+            return (await get(app.agent, port, '/x')).status;
+          } finally {
+            app.agent.destroy();
+          }
+        }),
+      );
+      expect(results.every((s) => s === 502)).toBe(true);
+      await sleep(100);
+      expect(probes).toBe(1);
+      expect(proxy.learnedPassthrough).toEqual([]);
+      const ex = proxy.getExchanges().filter(failed);
+      expect(ex.length).toBe(12);
+      for (const e of ex) expect(e.error).toMatch(/handshake failure/);
+    } finally {
+      delete probeTesting.probe;
+      bad.close();
+    }
+  });
+
+  it('the probe goes through the upstream proxy when one is set', async () => {
+    const srv = await startMtlsServer({ mode: 'reject', maxVersion: 'TLSv1.2' });
+    const up = await startTinyProxy();
+    await proxy.stop();
+    proxy = await startProxy({ upstreamProxy: { url: up.url } });
+    try {
+      const app = proxiedAgent(proxy.port, { cert: read('cert.pem'), key: read('key.pem') });
+      const name = `mtls.example.invalid:${srv.port}`;
+      const r = await new Promise<number>((resolve, reject) => {
+        const req = https.request({ host: 'mtls.example.invalid', port: srv.port, path: '/whoami', agent: app.agent }, (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+        });
+        req.on('error', reject);
+        req.end();
+      });
+      expect(r).toBe(502);
+      await waitFor(proxy, (e) => failed(e) && !!e.learnedPassthrough);
+      // the request's own connection and the probe: both CONNECTs through the upstream proxy
+      expect(up.seen.filter((s) => s === `CONNECT ${name}`).length).toBe(2);
+      app.agent.destroy();
+    } finally {
+      await up.close();
+      await srv.close();
+    }
+  });
+
+  it('stop() forgets everything', async () => {
+    const srv = await startMtlsServer({ mode: 'reject' });
+    const app = proxiedAgent(proxy.port);
+    await get(app.agent, srv.port, '/whoami');
+    app.agent.destroy();
+    expect(proxy.learnedPassthrough.length).toBe(1);
+    await proxy.stop();
+    expect(proxy.learnedPassthrough).toEqual([]);
+    await srv.close();
+  });
+});
+
+// ---------------------------------------------------------------- gRPC
+
+describe.skipIf(!haveCerts)('client-certificate on a decrypted gRPC call', () => {
+  for (const v of ['TLSv1.3', 'TLSv1.2'] as const) {
+    it(`${v} on the relay: UNAVAILABLE with the reason, learned; the next silent tunnel is passed through`, async () => {
+      const { key, cert } = await selfSignedCert();
+      const server = http2.createSecureServer({ key, cert, requestCert: true, rejectUnauthorized: true, ca: [read('cert.pem')], maxVersion: v });
+      server.on('stream', (stream) => {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+        stream.once('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+        stream.end();
+      });
+      server.on('error', () => undefined);
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      const port = (server.address() as AddressInfo).port;
+      const target = `127.0.0.1:${port}`;
+      const proxy = await startProxy({ grpcDecryptAll: true });
+      try {
+        const open = async (own: tls.ConnectionOptions) => {
+          const sock = await silentSocket(proxy.port, target);
+          const t = tls.connect({ socket: sock, servername: 'localhost', ALPNProtocols: ['h2'], rejectUnauthorized: false, ...own });
+          await once(t, 'secureConnect');
+          const s = http2.connect(`https://${target}`, { createConnection: () => t });
+          s.on('error', () => undefined);
+          return s;
+        };
+        const s1 = await open({});
+        const closed = once(s1, 'close');
+        const r = await grpcCall(s1, '/t.Svc/M', ['x']);
+        expect(r.grpcStatus).toBe(14);
+        const ex = await waitFor(proxy, (e) => e.kind === 'grpc' && e.state === 'error');
+        expect(ex.error).toBe(learnedText(v === 'TLSv1.3' ? 'TLS alert certificate_required' : 'TLS alert handshake_failure; the server asks for a client certificate', target));
+        expect(ex.learnedPassthrough).toEqual({ reason: 'client-certificate', host: '127.0.0.1', port });
+        expect(proxy.learnedPassthrough).toEqual([{ host: '127.0.0.1', port, reason: 'client-certificate', grpc: true }]);
+        await closed; // the app's connection was closed gracefully (GOAWAY)
+        const s2 = await open({ cert: read('cert.pem'), key: read('key.pem') });
+        expect((await grpcCall(s2, '/t.Svc/M', ['x'])).grpcStatus).toBe(0);
+        s2.destroy();
+        const tunnel = await waitFor(proxy, (e) => e.kind === 'tunnel' && !!e.learnedPassthrough);
+        expect(notesOf(tunnel)).toBe("This server needs the app's own certificate: passed through without decryption.");
+        // decrypt-all turned on again keeps client-certificate entries (it resets gRPC pins only)
+        proxy.setGrpcDecryptAll(false);
+        proxy.setGrpcDecryptAll(true);
+        expect(proxy.learnedPassthrough.length).toBe(1);
+        expect(proxy.grpcPinnedHosts).toEqual([]);
+      } finally {
+        await proxy.stop();
+        server.close();
+      }
+    });
+  }
+});
+
+// ---------------------------------------------------------------- pinned (HTTP)
+
+describe('pinned: an app that rejects the proxy certificate on an HTTPS CONNECT', () => {
+  let proxy: InterceptProxy;
+  let srvPort: number;
+  let srv: https.Server;
+  beforeEach(async () => {
+    const { key, cert } = await selfSignedCert();
+    srv = https.createServer({ key, cert }, (_q, r) => r.end('real'));
+    srv.listen(0, '127.0.0.1');
+    await once(srv, 'listening');
+    srvPort = (srv.address() as AddressInfo).port;
+    proxy = await startProxy();
+  });
+  afterEach(async () => {
+    await proxy.stop();
+    srv.closeAllConnections();
+    srv.close();
+  });
+
+  /** A CONNECT, then a TLS client that verifies (it doesn't trust the proxy's CA): it sends an alert. */
+  async function verifyingClient(): Promise<string> {
+    const c = http.request({ host: '127.0.0.1', port: proxy.port, method: 'CONNECT', path: `127.0.0.1:${srvPort}`, agent: false });
+    c.end();
+    const [, raw] = (await once(c, 'connect')) as [http.IncomingMessage, net.Socket];
+    const t = tls.connect({ socket: raw, servername: 'localhost' });
+    return new Promise((resolve) => {
+      t.once('secureConnect', () => {
+        resolve(t.getPeerCertificate().subject?.CN ?? '');
+        t.destroy();
+      });
+      t.once('error', (e: NodeJS.ErrnoException) => resolve(e.code ?? 'error'));
+    });
+  }
+
+  /** A client that drops the connection right after the proxy's certificate (dart:io's way, no alert). */
+  async function droppingClient(): Promise<void> {
+    const c = http.request({ host: '127.0.0.1', port: proxy.port, method: 'CONNECT', path: `127.0.0.1:${srvPort}`, agent: false });
+    c.end();
+    const [, raw] = (await once(c, 'connect')) as [http.IncomingMessage, net.Socket];
+    const t = tls.connect({ socket: raw, servername: 'localhost', rejectUnauthorized: false });
+    await once(t, 'secureConnect');
+    t.destroy();
+  }
+
+  it('an alert pins at once (10 minutes); the next CONNECT is a passed-through tunnel with the note', async () => {
+    // A client that sends an alert (OpenSSL, browsers; Node and dart:io just close): the failure mockttp reports for a
+    // CONNECT whose handshake we watch.
+    expect(await verifyingClient()).toBe('SELF_SIGNED_CERT_IN_CHAIN'); // (Node: a close, the first strike)
+    const p = proxy[TEST_INTERNALS]();
+    p.decrypting.set('127.0.0.1:40001', { host: '127.0.0.1', port: srvPort, http: true });
+    p.onTlsError({ failureCause: 'cert-rejected', remoteIpAddress: '127.0.0.1', remotePort: 40001, timingEvents: {} });
+    const ex = await waitFor(proxy, (e) => !!e.learnedPassthrough && e.state === 'error');
+    expect(ex.error).toBe(`127.0.0.1:${srvPort} pins its certificate: passed through without decryption from now on, for 10 minutes (the app rejected the Flutter Intercept certificate).`);
+    expect(ex.learnedPassthrough).toEqual({ reason: 'pinned', host: '127.0.0.1', port: srvPort });
+    const [entry] = proxy.learnedPassthrough;
+    expect(entry).toMatchObject({ host: '127.0.0.1', port: srvPort, reason: 'pinned' });
+    expect(entry.grpc).toBeUndefined();
+    expect(entry.until! - Date.now()).toBeGreaterThan(GRPC_PIN_TTL_MS - 5000);
+    expect(proxy.grpcPinnedHosts).toEqual([]); // not a gRPC pin
+    // passed through: the real server's own certificate reaches the client
+    const c = http.request({ host: '127.0.0.1', port: proxy.port, method: 'CONNECT', path: `127.0.0.1:${srvPort}`, agent: false });
+    c.end();
+    const [res, raw] = (await once(c, 'connect')) as [http.IncomingMessage, net.Socket];
+    expect(res.statusCode).toBe(200);
+    const t = tls.connect({ socket: raw, servername: 'localhost', rejectUnauthorized: false });
+    await once(t, 'secureConnect');
+    expect(t.getPeerCertificate().fingerprint256).toBe(new X509Certificate((await selfSignedCert()).cert).fingerprint256);
+    t.destroy();
+    const tunnel = await waitFor(proxy, (e) => e.kind === 'tunnel' && e.state === 'completed' && !!e.learnedPassthrough);
+    expect(notesOf(tunnel)).toBe(`127.0.0.1 pins its certificate: passed through without decryption.`);
+    expect(tunnel.learnedPassthrough).toEqual({ reason: 'pinned', host: '127.0.0.1', port: srvPort });
+  });
+
+  it('a close in the handshake counts twice within a minute; pins expire; a rule naming the host keeps it decrypted', async () => {
+    grpcPinTesting.ttlMs = 300;
+    try {
+      await droppingClient();
+      await waitFor(proxy, (e) => /If it happens again within a minute/.test(e.error ?? ''));
+      expect(proxy.learnedPassthrough).toEqual([]);
+      await droppingClient();
+      await waitFor(proxy, (e) => !!e.learnedPassthrough);
+      expect(proxy.learnedPassthrough.map((e) => e.reason)).toEqual(['pinned']);
+      await sleep(400);
+      expect(proxy.learnedPassthrough).toEqual([]); // expired: decrypted again
+      proxy.setRules([rule('r', `https://127.0.0.1:${srvPort}/*`)]);
+      await droppingClient();
+      await droppingClient();
+      const ex = await waitFor(proxy, (e) => /stays decrypted/.test(e.error ?? ''));
+      expect(ex.error).toMatch(/The enabled rule r targets/);
+      expect(proxy.learnedPassthrough).toEqual([]);
+    } finally {
+      delete grpcPinTesting.ttlMs;
+    }
+  });
+
+  it('the 0.13 gRPC views stay views: grpcPinnedHosts, clearGrpcPinnedHosts, setGrpcDecryptAll reset gRPC pins only', () => {
+    const p = proxy[TEST_INTERNALS]();
+    p.pinnedHosts.set('grpc.example.test:443', Date.now() + 60_000);
+    p.learn.hosts.learn('web.example.test', 443, 'pinned', { until: Date.now() + 60_000 });
+    p.learn.hosts.learn('mtls.example.test', 443, 'client-certificate');
+    expect(proxy.grpcPinnedHosts).toEqual(['grpc.example.test:443']);
+    proxy.clearGrpcPinnedHosts();
+    expect(proxy.grpcPinnedHosts).toEqual([]);
+    expect(proxy.learnedPassthrough.map((e) => e.host)).toEqual(['web.example.test', 'mtls.example.test']);
+    p.pinnedHosts.set('grpc.example.test:443', Date.now() + 60_000);
+    proxy.setGrpcDecryptAll(true);
+    expect(proxy.learnedPassthrough.map((e) => e.host)).toEqual(['web.example.test', 'mtls.example.test']);
+    proxy.forgetLearnedPassthrough('web.example.test');
+    expect(proxy.learnedPassthrough.map((e) => e.host)).toEqual(['mtls.example.test']);
+    proxy.forgetLearnedPassthrough();
+    expect(proxy.learnedPassthrough).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------- performance (CONTRACTS §20.4)
+
+describe('performance', () => {
+  it('a CONNECT costs the same with 1000 learned hosts as with none (O(1) lookup)', async () => {
+    const { key, cert } = await selfSignedCert();
+    const srv = https.createServer({ key, cert }, (_q, r) => r.end('x'));
+    srv.listen(0, '127.0.0.1');
+    await once(srv, 'listening');
+    const port = (srv.address() as AddressInfo).port;
+    const proxy = await startProxy();
+    try {
+      /** N CONNECTs answered by mockttp (decrypted; their TLS never starts), timed end to end. */
+      const round = async (n: number) => {
+        const t0 = performance.now();
+        for (let i = 0; i < n; i++) {
+          const c = http.request({ host: '127.0.0.1', port: proxy.port, method: 'CONNECT', path: `127.0.0.1:${port}`, agent: false });
+          c.end();
+          const [, raw] = (await once(c, 'connect')) as [http.IncomingMessage, net.Socket];
+          raw.destroy();
+        }
+        return (performance.now() - t0) / n;
+      };
+      const lookups = (n: number) => {
+        const learn = proxy[TEST_INTERNALS]().learn;
+        const t0 = performance.now();
+        for (let i = 0; i < n; i++) learn.forConnect('api.example.test', 443 + (i & 7));
+        return ((performance.now() - t0) * 1000) / n;
+      };
+      await round(50); // warm up
+      const emptyMs = Math.min(await round(200), await round(200));
+      const emptyUs = lookups(200_000);
+      const hosts = proxy[TEST_INTERNALS]().learn.hosts;
+      for (let i = 0; i < LEARNED_MAX; i++) hosts.learn(`h${i}.example.test`, 443, i % 2 ? 'client-certificate' : 'pinned', i % 2 ? {} : { until: Date.now() + 60_000 });
+      expect(hosts.size).toBe(LEARNED_MAX);
+      const fullMs = Math.min(await round(200), await round(200));
+      const fullUs = lookups(200_000);
+      console.log(`CONNECT (decrypted) per request: ${emptyMs.toFixed(3)} ms empty, ${fullMs.toFixed(3)} ms with ${LEARNED_MAX} learned; lookup ${emptyUs.toFixed(3)} µs vs ${fullUs.toFixed(3)} µs`);
+      expect(fullMs).toBeLessThan(emptyMs * 1.5 + 0.2);
+      expect(fullUs).toBeLessThan(emptyUs * 3 + 0.5);
+    } finally {
+      await proxy.stop();
+      srv.closeAllConnections();
+      srv.close();
+    }
+  }, 60_000);
+});

@@ -13,6 +13,9 @@ import type { Flow, Live } from './flow-types';
 import { isEventStream } from './proxy-util';
 import { rewriteSets, validRewriteStatus } from './rewrite-flow';
 import { CERT_REFUSAL_MARKER } from './client-certs';
+import { normalizeHostname } from './hosts';
+import { alertOfTags, NGINX_NO_CERT_TEXT } from './learned';
+import type { UpstreamRefusal } from './learn-flow';
 import type { ProxyContext } from './proxy-context';
 
 /** Recording a pass-through HTTP exchange from its taps: head, body, SSE, truncation, shaping. */
@@ -64,6 +67,7 @@ export class HttpTaps {
     const { ex, flow } = live;
     let patch: HeadPatch | undefined;
     let shown = headers;
+    if (this.watchRefusal(live, tap, status, headers)) patch = { set: { connection: 'close' } };
     if (flow.corsPatch && isCorsRequest(ex.method, ex.url, ex.requestHeaders)) {
       const vary = getHeader(headers, 'vary');
       const set = corsResponseHeaders(ex.requestHeaders, Object.keys(headers), vary, flow.corsPatch);
@@ -97,6 +101,74 @@ export class HttpTaps {
       patch = { ...patch, flush: true };
     }
     return patch;
+  }
+
+  /**
+   * CONTRACTS §20.1, at the response head: a 502 for a TLS alert from the server starts the verdict (a probe may
+   * run meanwhile); an HTTPS 400 page may be nginx's "No required SSL certificate was sent" (read at the end). True =
+   * the app's HTTP/1 connection should close after this response (its next request opens a new CONNECT).
+   */
+  watchRefusal(live: Live, tap: Tap, status: number, headers: Record<string, string | string[]>): boolean {
+    const { flow } = live;
+    if (status !== 502 && status !== 400) return false;
+    const f = this.refusal(live, tap);
+    if (!f) return false;
+    if (status === 502) {
+      f.alert = alertOfTags(tap.response.tags);
+      if (f.alert === undefined) return false;
+      flow.learn = this.px.learn.verdict(f);
+    } else {
+      const type = getHeader(headers, 'content-type');
+      if (type !== undefined && !/^\s*text\/html\b/i.test(type)) return false;
+      flow.maybeNginx = true;
+      f.nginx = true;
+    }
+    const h2 = (tap.response as { req?: { httpVersionMajor?: number } }).req?.httpVersionMajor === 2;
+    return !h2 && this.px.learn.mayTeach(f);
+  }
+
+  /** The upstream server of a decrypted HTTPS exchange, as a refusal to judge (undefined: not one). */
+  refusal(live: Live, tap: Tap): UpstreamRefusal | undefined {
+    const { ex, flow } = live;
+    if (!ex.url.startsWith('https://')) return undefined;
+    let host: string;
+    let port: number;
+    try {
+      const u = new URL(ex.url);
+      host = normalizeHostname(u.hostname);
+      port = Number(u.port) || 443;
+    } catch {
+      return undefined;
+    }
+    return {
+      host,
+      port,
+      socket: tap.socket,
+      ...(ex.clientCertificate ? { certPattern: ex.clientCertificate } : {}),
+      // send / resend and Map Remote aren't the app's own connection to this host: explained, never learned.
+      ...(flow.send || flow.map ? { noLearn: true } : {}),
+    };
+  }
+
+  /** CONTRACTS §20.1: the verdict on a refusal, applied to the failed exchange (true = it was). */
+  async applyRefusal(live: Live, tap: Tap): Promise<boolean> {
+    const { ex, flow } = live;
+    let pending = flow.learn;
+    if (!pending && flow.maybeNginx && ex.status === 400 && ex.responseBody?.encoding === 'utf8' && ex.responseBody.text.includes(NGINX_NO_CERT_TEXT)) {
+      const f = this.refusal(live, tap);
+      if (f) pending = this.px.learn.verdict({ ...f, nginx: true });
+    }
+    if (!pending) return false;
+    const v = await pending;
+    if (!v || !this.px.book.live.has(ex.id)) return false;
+    if (v.learned) {
+      ex.learnedPassthrough = v.learned;
+      this.px.learn.closeIdle(v.learned.host, v.learned.port);
+      // An HTTP/2 app connection: no new streams on it, the ones running finish (GOAWAY).
+      (tap.response as { stream?: { session?: { close(): void } } }).stream?.session?.close();
+    }
+    this.px.book.fail(ex, v.error);
+    return true;
   }
 
   /** CONTRACTS §11.1: events are parsed from the bytes going to the app; no body copy is kept. */
@@ -181,6 +253,10 @@ export class HttpTaps {
     if (!this.px.book.live.has(ex.id)) return; // finished meanwhile (e.g. proxy stopped)
     this.px.book.setRequestBody(ex, reqBody);
     ex.responseBody = resBody;
+    if (flow.learn || flow.maybeNginx) {
+      if (await this.applyRefusal(live, tap)) return;
+      if (!this.px.book.live.has(ex.id)) return; // finished while a probe ran
+    }
     const upstreamError = res.tags?.find((t) => t.startsWith('passthrough-error:'));
     const ssrf = res.statusCode === 403 && resBody?.encoding === 'utf8' && resBody.text.includes(SSRF_MARKER);
     const certRefused = res.statusCode === 403 && resBody?.encoding === 'utf8' && resBody.text.includes(CERT_REFUSAL_MARKER);

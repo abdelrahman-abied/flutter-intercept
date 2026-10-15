@@ -60,6 +60,8 @@ import {
   GRPC_SEND_DROPPED,
 } from './proxy-util';
 import { rewriteFlow } from './rewrite-flow';
+import { normalizeHostname } from './hosts';
+import { alertOf } from './learned';
 import type { ProxyContext } from './proxy-context';
 
 /** CONTRACTS §16.2: the gRPC relay (h2c / decrypted silent tunnels and send()). */
@@ -611,6 +613,7 @@ export class GrpcRelay {
       const err = e as Error & { statusCode?: number; code?: string };
       if (err.code === 'E_FI_LOOP') return this.px.grpcLocal.grpcStatusOnly(call, 14, GRPC_LOOP_TEXT, 'error', GRPC_LOOP_TEXT);
       const forbidden = e instanceof SsrfError || err.statusCode === 403;
+      if (!forbidden && protocol === 'https:' && (await this.grpcRefusal(call, err))) return;
       const label = net.isIPv6(host) ? `[${host}]` : host;
       const reason = forbidden
         ? e instanceof SsrfError
@@ -818,6 +821,44 @@ export class GrpcRelay {
     this.px.book.fail(ex, 'The server ended the response without trailers (no gRPC status).');
   }
 
+  /**
+   * CONTRACTS §20.1: a TLS alert from the server of a decrypted gRPC call (TLS 1.2: opening the session; TLS 1.3: on
+   * the first stream). A configured certificate that was rejected, or a server that wants the app's own certificate
+   * (learned: the app's next silent tunnel to it is passed through; its HTTP/2 connection is closed gracefully, so it
+   * opens one). True = the call was answered (UNAVAILABLE with the verdict).
+   */
+  async grpcRefusal(call: GrpcCall, err: Error & { code?: string }): Promise<boolean> {
+    const alert = alertOf(err);
+    if (alert === undefined) return false;
+    let u: URL;
+    try {
+      u = new URL(call.flow.map?.url ?? call.req.url);
+    } catch {
+      return false;
+    }
+    if (u.protocol !== 'https:') return false;
+    const v = await this.px.learn.verdict({
+      host: normalizeHostname(u.hostname),
+      port: Number(u.port) || 443,
+      alert,
+      socket: requestInternals(call.req).socket,
+      grpc: true,
+      ...(call.ex.clientCertificate ? { certPattern: call.ex.clientCertificate } : {}),
+      ...(call.flow.send || call.flow.map ? { noLearn: true } : {}),
+    });
+    if (!v || !call.isLive() || call.stream.closed || call.stream.headersSent) return false;
+    if (v.learned) call.ex.learnedPassthrough = v.learned;
+    this.px.grpcLocal.grpcStatusOnly(call, 14, fiText(v.error), 'error', v.error);
+    if (v.learned) {
+      try {
+        call.stream.session?.close();
+      } catch {
+        /* gone */
+      }
+    }
+    return true;
+  }
+
   /** The server's stream closed: unless its trailers came, map the failure for the app (UNAVAILABLE or its reset). */
   onGrpcUpstreamClosed(call: GrpcCall): void {
     const { ex, stream, up } = call;
@@ -828,7 +869,15 @@ export class GrpcRelay {
     if (!err && !peerReset) return; // ended without trailers: the pipe ends the app's response (sendGrpcTrailers)
     const reason = peerReset ? `the server reset the stream (${h2CodeName(code)})` : `the connection to the server failed (${err?.message ?? 'closed'})`;
     if (!stream.headersSent) {
-      return this.px.grpcLocal.grpcStatusOnly(call, 14, fiText(reason), 'error', `${capitalize(reason)}.`);
+      const unavailable = () => this.px.grpcLocal.grpcStatusOnly(call, 14, fiText(reason), 'error', `${capitalize(reason)}.`);
+      // CONTRACTS §20.1: a TLS alert that ended the connection (TLS 1.3 refuses a missing certificate after the handshake).
+      if (!peerReset && alertOf(err) !== undefined) {
+        void this.grpcRefusal(call, err!).then((done) => {
+          if (!done && call.isLive() && !stream.closed && !stream.headersSent) unavailable();
+        });
+        return;
+      }
+      return unavailable();
     }
     if (peerReset) {
       // Mid-response: the same reset for the app (code preserved).

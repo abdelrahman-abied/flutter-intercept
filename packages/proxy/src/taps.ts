@@ -49,6 +49,8 @@ export interface Tap {
   req: Capture;
   res: Capture;
   response: http.ServerResponse & { tags?: string[]; getHeaders(): http.OutgoingHttpHeaders };
+  /** The app's connection the request came on (CONTRACTS §20.1: its LAN gate guards a probe). */
+  socket?: unknown;
   onRequestEnd?: () => void;
   /** finished = response fully written; false = connection closed first. Called once. */
   onResponseDone?: (finished: boolean) => void;
@@ -183,7 +185,7 @@ function installTapHook(): boolean {
 }
 
 function attach(id: string, req: http.IncomingMessage, raw: http.ServerResponse, tracked: Tap['response']): void {
-  const tap: Tap = { id, req: newCapture(), res: newCapture(), response: tracked };
+  const tap: Tap = { id, req: newCapture(), res: newCapture(), response: tracked, socket: req.socket };
   taps.set(id, tap);
 
   const reqEmit = req.emit;

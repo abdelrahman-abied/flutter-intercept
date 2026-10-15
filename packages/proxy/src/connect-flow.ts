@@ -36,7 +36,8 @@ import {
   SSRF_MARKER,
 } from './lan';
 import { describeProfile } from './network';
-import type { Exchange } from './types';
+import { hostLabel, learnedKey } from './learned';
+import type { Exchange, LearnedPassthrough } from './types';
 import type { FlowFault, Flow, MatchResult, SilentInfo } from './flow-types';
 import { SILENT_INFO } from './flow-types';
 import { FAULT_LABELS, profileLabel, sleep, clipNote, INTERNAL_TUNNEL_HEADER } from './proxy-util';
@@ -45,36 +46,33 @@ import type { ProxyContext } from './proxy-context';
 /** REVIEW-13 #6: two handshakes closed without an alert within this window pin a host (dart:io sends no alert). */
 export const PIN_STRIKE_WINDOW_MS = 60_000;
 
-/** REVIEW-13 #6: a learned pin lasts this long (then the host is tried decrypted again). */
+/** REVIEW-13 #6 / CONTRACTS §20.1: a learned pin lasts this long (then the host is tried decrypted again). */
 export const GRPC_PIN_TTL_MS = 10 * 60 * 1000;
 
 /** Test seam: a shorter pin lifetime. Never set outside tests. */
 export const grpcPinTesting: { ttlMs?: number } = {};
 
-/** CONNECT handling: silent tunnels, TLS passthrough, decrypted gRPC tunnels and learned pins. */
+/** The note on a tunnel passed through because of a learned entry (CONTRACTS §20.1; gRPC pins keep the 0.13 text). */
+function learnedNote(e: LearnedPassthrough, host: string): string {
+  if (e.reason === 'client-certificate') return "This server needs the app's own certificate: passed through without decryption.";
+  return e.grpc ? `${host} pins its certificate; passed through undecrypted.` : `${host} pins its certificate: passed through without decryption.`;
+}
+
+/** CONNECT handling: silent tunnels, TLS passthrough, decrypted gRPC tunnels and learned passthrough (pins). */
 export class ConnectFlow {
   /** Upstream sockets of open passthrough tunnels (destroyed by stop()). */
   readonly tunnelSockets = new Set<net.Socket>();
-  /** CONTRACTS §19.3: `host:port`s whose app rejected our certificate on a decrypted silent tunnel (until stop()). */
-  readonly pinnedHosts = new Map<string, number>();
- // host:port → expiry (epoch ms)
   /** Handshakes the app closed without an alert, per host:port (dart:io rejects that way): count + first time. */
   readonly pinStrikes = new Map<string, { n: number; first: number }>();
-  /** Decrypted (MITM) silent TLS tunnels in their handshake: client `address:port` → the CONNECT target. */
-  readonly decrypting = new Map<string, { host: string; port: number }>();
+  /**
+   * Decrypted (MITM) TLS tunnels in their handshake: client `address:port` → the CONNECT target (CONTRACTS §19.3:
+   * silent gRPC tunnels; §20.1: HTTP CONNECTs mockttp answers, `http`).
+   */
+  readonly decrypting = new Map<string, { host: string; port: number; http?: true }>();
   /** CONTRACTS §16.8: when each authority's breaker report was last emitted. */
   readonly breakerSeen = new Map<string, number>();
 
   constructor(private readonly px: ProxyContext) {}
-
-  /** Is `host:port` a learned pinned host right now (pins expire after GRPC_PIN_TTL_MS)? */
-  isPinned(key: string): boolean {
-    const until = this.pinnedHosts.get(key);
-    if (until === undefined) return false;
-    if (Date.now() < until) return true;
-    this.pinnedHosts.delete(key);
-    return false;
-  }
 
   // ---------------------------------------------------------------- TLS passthrough (CONTRACTS §14.2)
 
@@ -102,8 +100,9 @@ export class ConnectFlow {
   }
 
   /**
-   * A silent CONNECT (CONTRACTS §16.2) or a CONNECT to a passthrough host: handled here (true), else mockttp answers
-   * it (false). The marker counts on HTTP/1 CONNECTs only (an HTTP/2 CONNECT arrives with a response object).
+   * A silent CONNECT (CONTRACTS §16.2) or a CONNECT to a passthrough or learned host (§14.2, §20.1): handled here
+   * (true), else mockttp answers it (false) and its handshake is watched for a pin. The marker counts on HTTP/1
+   * CONNECTs only (an HTTP/2 CONNECT arrives with a response object).
    */
   onConnect(req: http.IncomingMessage, socket: unknown, head: Buffer | undefined): boolean {
     const marker = socket instanceof net.Socket ? tunnelMarker(req.headers[SILENT_TUNNEL_HEADER]) : undefined;
@@ -115,13 +114,23 @@ export class ConnectFlow {
       void this.runSilent(req, socket as net.Socket, head ?? Buffer.alloc(0)).catch(() => (socket as net.Socket).destroy());
       return true;
     }
-    if (!this.px.passthrough.length || !(socket instanceof net.Socket) || socket instanceof tls.TLSSocket) return false;
+    if (!(socket instanceof net.Socket) || socket instanceof tls.TLSSocket) return false;
     const t = splitHostPort(req.url ?? '');
     if (!t) return false;
     const host = normalizeHostname(t.host);
-    if (!host || !this.px.passthrough.some((p) => matchesHostPattern(p, host, t.port))) return false;
-    void this.runTunnel(req, socket, head ?? Buffer.alloc(0), host, t.port).catch(() => socket.destroy());
-    return true;
+    if (!host) return false;
+    if (this.px.passthrough.length && this.px.passthrough.some((p) => matchesHostPattern(p, host, t.port))) {
+      void this.runTunnel(req, socket, head ?? Buffer.alloc(0), host, t.port).catch(() => socket.destroy());
+      return true;
+    }
+    const learned = this.px.learn.forConnect(host, t.port);
+    if (learned) {
+      const extra = { note: learnedNote(learned, host), learned };
+      void this.runTunnel(req, socket, head ?? Buffer.alloc(0), host, t.port, undefined, extra).catch(() => socket.destroy());
+      return true;
+    }
+    this.watchDecryptHandshake(socket, host, t.port, true);
+    return false;
   }
 
   /**
@@ -179,25 +188,31 @@ export class ConnectFlow {
       socket.destroy();
       return;
     }
-    const pinKey = `${host}:${t.port}`;
-    const pinned = kind === 'tls' && !forceDecrypt && this.isPinned(pinKey);
-    const decrypt =
-      forceDecrypt ||
-      kind === 'h2c' ||
-      (!pinned &&
-        (this.px.grpcDecryptAllOn || this.px.grpcDecrypt.some((p) => matchesHostPattern(p, host, t.port))) &&
-        !this.px.passthrough.some((p) => matchesHostPattern(p, host, t.port)));
+    const explicit = this.px.grpcDecrypt.some((p) => matchesHostPattern(p, host, t.port));
+    const listed = this.px.passthrough.some((p) => matchesHostPattern(p, host, t.port));
+    // CONTRACTS §20.1: under decrypt-all, a learned host (a pin, or a server that wants the app's own certificate) is
+    // passed through; a grpcDecryptHosts host never is.
+    const learned = kind === 'tls' && !forceDecrypt && this.px.grpcDecryptAllOn && !explicit && !listed ? this.px.learn.forConnect(host, t.port) : undefined;
+    const decrypt = forceDecrypt || kind === 'h2c' || (!learned && (this.px.grpcDecryptAllOn || explicit) && !listed);
     const raw = this.px.rawServer;
     if (decrypt && this.px.grpcCheck.ok && raw && this.px.server) {
-      if (kind === 'tls' && !forceDecrypt) this.watchDecryptHandshake(socket, host, t.port);
+      if (kind === 'tls' && !forceDecrypt) this.watchDecryptHandshake(socket, host, t.port, false);
       if (injectSilentTunnel(raw, socket, target, head.length ? head : undefined)) return;
     }
-    const note = pinned
-      ? `${host} pins its certificate; passed through undecrypted.`
+    const note = learned
+      ? learnedNote(learned, host)
       : decrypt && !this.px.grpcCheck.ok
         ? (this.px.grpcCheck.problem ?? 'gRPC interception is unavailable; passed through undecrypted.')
         : undefined;
-    await this.runTunnel(req, socket, head, host, t.port, { silent: true, plain: kind === 'h2c', connectTimeoutMs: info.connectTimeoutMs, ...(note ? { note } : {}) });
+    await this.runTunnel(
+      req,
+      socket,
+      head,
+      host,
+      t.port,
+      { silent: true, plain: kind === 'h2c', connectTimeoutMs: info.connectTimeoutMs, ...(note ? { note } : {}) },
+      learned ? { learned } : undefined,
+    );
   }
 
   /**
@@ -228,13 +243,14 @@ export class ConnectFlow {
   }
 
   /**
-   * CONTRACTS §19.3: remember a decrypted silent TLS tunnel until its handshake is done, so a handshake the app fails
-   * (it pins its own certificate) teaches the proxy to pass that host through from then on (one failed connection).
+   * CONTRACTS §19.3 / §20.1: remember a decrypted TLS tunnel (a silent gRPC one, or an HTTP CONNECT mockttp answers)
+   * until its handshake is done, so a handshake the app fails (it pins its own certificate) teaches the proxy to pass
+   * that host through from then on.
    */
-  watchDecryptHandshake(socket: net.Socket, host: string, port: number): void {
+  watchDecryptHandshake(socket: net.Socket, host: string, port: number, http: boolean): void {
     const key = `${normalizeIp(socket.remoteAddress ?? '')}:${socket.remotePort}`;
     if (this.decrypting.size >= 1000) return;
-    this.decrypting.set(key, { host, port });
+    this.decrypting.set(key, http ? { host, port, http } : { host, port });
     const forget = () => {
       if (this.decrypting.get(key)?.host === host) this.decrypting.delete(key);
     };
@@ -298,6 +314,7 @@ export class ConnectFlow {
     host: string,
     port: number,
     silent?: { silent: true; plain: boolean; connectTimeoutMs: number; note?: string },
+    extra?: { note?: string; learned?: LearnedPassthrough },
   ): Promise<void> {
     socket.on('error', () => undefined);
     if (!lanConnectAllowed(socket)) {
@@ -351,7 +368,9 @@ export class ConnectFlow {
       }
     }
     if (cut) flow.fault = cut;
-    if (silent?.note) note = note ? `${silent.note} ${note}` : silent.note;
+    const first = silent?.note ?? extra?.note;
+    if (first) note = note ? `${first} ${note}` : first;
+    const learned = extra?.learned;
     const requestHeaders = cleanHeaders(req.headers as HeaderBag);
     delete requestHeaders['proxy-authorization']; // the LAN token
     delete requestHeaders[SILENT_TUNNEL_HEADER];
@@ -370,6 +389,7 @@ export class ConnectFlow {
       ...(note ? { notes: [clipNote(note)] } : {}),
       ...(simulated ? { simulated } : {}),
       ...(gate ? { viaLan: true as const } : {}),
+      ...(learned ? { learnedPassthrough: { reason: learned.reason, host: learned.host, port: learned.port } } : {}),
     };
     this.px.book.track(ex, flow);
     // CONTRACTS §16.8 (REVIEW-10 #1): a cut silent tunnel is held, never closed — a close looks like a lost connection
@@ -489,56 +509,17 @@ export class ConnectFlow {
   }
 
   onTlsError(f: TlsHandshakeFailure): void {
-    // CONTRACTS §19.3: the app failed our certificate on a decrypted silent gRPC tunnel: it pins; pass it through now.
+    // CONTRACTS §19.3 / §20.1: the app failed our certificate on a decrypted tunnel we watch: it may pin.
     const key = `${normalizeIp(String(f.remoteIpAddress ?? ''))}:${f.remotePort}`;
-    const silent = this.decrypting.get(key);
-    if (silent) {
+    const watched = this.decrypting.get(key);
+    if (watched) {
       this.decrypting.delete(key);
-      const pinKey = `${silent.host}:${silent.port}`;
-      const label = net.isIPv6(silent.host) ? `[${silent.host}]` : silent.host;
-      // REVIEW-13 #6: a pin needs the app's rejection of our certificate. A TLS alert (cert-rejected) is one at once.
-      // dart:io (BoringSSL) sends no alert: it closes right after our certificate (mockttp: reset / closed), which a
-      // kill mid-handshake can look like — so that counts only when it happens twice for the host within 60 s.
-      // A host the user listed in grpcDecryptHosts is never auto-pinned.
-      const alert = f.failureCause === 'cert-rejected';
-      const closedEarly = f.failureCause === 'reset' || f.failureCause === 'closed';
-      let strikes = 0;
-      if (closedEarly) {
-        const now = Date.now();
-        const prev = this.pinStrikes.get(pinKey);
-        const st = prev && now - prev.first < PIN_STRIKE_WINDOW_MS ? { n: prev.n + 1, first: prev.first } : { n: 1, first: now };
-        if (this.pinStrikes.size < 1000 || prev) this.pinStrikes.set(pinKey, st);
-        strikes = st.n;
+      const ex = this.pinVerdict(watched, f);
+      if (ex) {
+        this.px.book.store.set(ex.id, ex);
+        this.px.book.emitChange(ex);
+        return;
       }
-      const rejected = alert || strikes >= 2;
-      const explicit = this.px.grpcDecrypt.some((p) => matchesHostPattern(p, silent.host, silent.port));
-      let error: string;
-      if (explicit && (alert || closedEarly)) {
-        error = `The app ended the TLS handshake for ${silent.host} (${f.failureCause}); it may pin its own certificate. The host is in grpcDecryptHosts, so it stays decrypted — remove it there if the app pins.`;
-      } else if (!rejected) {
-        error = closedEarly
-          ? `The app closed the TLS handshake for ${silent.host} (${f.failureCause}). If it happens again within a minute, the host is passed through undecrypted (it probably pins its certificate).`
-          : `TLS handshake with the app failed (${f.failureCause}) for ${silent.host}; not a certificate rejection, so the host stays decrypted.`;
-      } else {
-        this.pinStrikes.delete(pinKey);
-        if (this.pinnedHosts.size >= 1000) for (const k of [...this.pinnedHosts.keys()]) this.isPinned(k); // drop expired
-        if (this.pinnedHosts.size < 1000) this.pinnedHosts.set(pinKey, Date.now() + (grpcPinTesting.ttlMs ?? GRPC_PIN_TTL_MS));
-        error = `${silent.host} pins its certificate; passed through undecrypted from now on (the app rejected the Flutter Intercept certificate).`;
-      }
-      const ex: Exchange = {
-        id: `tls-${randomUUID()}`,
-        startedAt: f.timingEvents?.startTime ?? Date.now(),
-        method: 'CONNECT',
-        url: `https://${label}:${silent.port}/`,
-        requestHeaders: {},
-        state: 'error',
-        kind: 'tunnel',
-        grpcTunnel: true,
-        error,
-      };
-      this.px.book.store.set(ex.id, ex);
-      this.px.book.emitChange(ex);
-      return;
     }
     const host = f.tlsMetadata?.sniHostname ?? f.destination?.hostname ?? 'unknown-host';
     const port = f.destination?.port;
@@ -555,5 +536,68 @@ export class ConnectFlow {
     };
     this.px.book.store.set(ex.id, ex);
     this.px.book.emitChange(ex);
+  }
+
+  /**
+   * REVIEW-13 #6 / CONTRACTS §20.1: a pin needs the app's rejection of our certificate. A TLS alert (cert-rejected) is
+   * one at once. dart:io (BoringSSL) sends no alert: it closes right after our certificate (mockttp: reset / closed),
+   * which a kill mid-handshake can look like — so that counts only when it happens twice for the host within
+   * PIN_STRIKE_WINDOW_MS. Never learned for a grpcDecryptHosts host (gRPC), while a recording is replayed, or when an
+   * enabled rule names the host. The exchange that records the failed handshake.
+   */
+  pinVerdict(watched: { host: string; port: number; http?: true }, f: TlsHandshakeFailure): Exchange | undefined {
+    const w = { host: watched.host, port: watched.port, grpc: !watched.http };
+    const pinKey = learnedKey(w.host, w.port);
+    const label = net.isIPv6(w.host) ? `[${w.host}]` : w.host;
+    const alert = f.failureCause === 'cert-rejected';
+    const closedEarly = f.failureCause === 'reset' || f.failureCause === 'closed';
+    let strikes = 0;
+    if (closedEarly) {
+      const now = Date.now();
+      const prev = this.pinStrikes.get(pinKey);
+      const st = prev && now - prev.first < PIN_STRIKE_WINDOW_MS ? { n: prev.n + 1, first: prev.first } : { n: 1, first: now };
+      if (this.pinStrikes.size < 1000 || prev) this.pinStrikes.set(pinKey, st);
+      strikes = st.n;
+    }
+    const rejected = alert || strikes >= 2;
+    const explicit = !!w.grpc && this.px.grpcDecrypt.some((p) => matchesHostPattern(p, w.host, w.port));
+    const kept = explicit ? undefined : this.px.learn.keepDecrypted(w.host, w.port);
+    let error: string;
+    let learned: Exchange['learnedPassthrough'];
+    if (explicit && (alert || closedEarly)) {
+      error = `The app ended the TLS handshake for ${w.host} (${f.failureCause}); it may pin its own certificate. The host is in grpcDecryptHosts, so it stays decrypted — remove it there if the app pins.`;
+    } else if (!rejected) {
+      if (!w.grpc && !closedEarly) return undefined; // HTTP: not a rejection of our certificate (the generic record)
+      error = closedEarly
+        ? w.grpc
+          ? `The app closed the TLS handshake for ${w.host} (${f.failureCause}). If it happens again within a minute, the host is passed through undecrypted (it probably pins its certificate).`
+          : `The app closed the TLS handshake for ${hostLabel(w.host, w.port)} (${f.failureCause}). If it happens again within a minute, ${hostLabel(w.host, w.port)} is passed through without decryption (the app probably pins its certificate).`
+        : `TLS handshake with the app failed (${f.failureCause}) for ${w.host}; not a certificate rejection, so the host stays decrypted.`;
+    } else if (kept) {
+      this.pinStrikes.delete(pinKey);
+      error = `The app rejected the Flutter Intercept certificate for ${hostLabel(w.host, w.port)} (${f.failureCause}); it probably pins its own. ${kept}, so it stays decrypted.`;
+    } else {
+      this.pinStrikes.delete(pinKey);
+      const until = Date.now() + (grpcPinTesting.ttlMs ?? GRPC_PIN_TTL_MS);
+      const ok = this.px.learn.hosts.learn(w.host, w.port, 'pinned', { until, ...(w.grpc ? { grpc: true } : {}) });
+      if (ok) learned = { reason: 'pinned', host: w.host, port: w.port };
+      error = !ok
+        ? `${hostLabel(w.host, w.port)} pins its certificate (the app rejected the Flutter Intercept certificate), but too many hosts are passed through already; it stays decrypted.`
+        : w.grpc
+          ? `${w.host} pins its certificate; passed through undecrypted from now on (the app rejected the Flutter Intercept certificate).`
+          : `${hostLabel(w.host, w.port)} pins its certificate: passed through without decryption from now on, for ${Math.round((grpcPinTesting.ttlMs ?? GRPC_PIN_TTL_MS) / 60_000)} minutes (the app rejected the Flutter Intercept certificate).`;
+    }
+    return {
+      id: `tls-${randomUUID()}`,
+      startedAt: f.timingEvents?.startTime ?? Date.now(),
+      method: 'CONNECT',
+      url: `https://${label}:${w.port}/`,
+      requestHeaders: {},
+      state: 'error',
+      kind: 'tunnel',
+      ...(w.grpc ? { grpcTunnel: true as const } : {}),
+      error,
+      ...(learned ? { learnedPassthrough: learned } : {}),
+    };
   }
 }

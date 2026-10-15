@@ -48,7 +48,7 @@ import {
   type UpstreamProxyConfig,
   type UpstreamProxySpec,
 } from './upstream-proxy';
-import { matchesHostPattern, parseHostPatterns, type HostPattern } from './hosts';
+import { matchesHostPattern, normalizeHostname, parseHostPatterns, type HostPattern } from './hosts';
 import {
   CONNECT_TIMEOUT_HEADER,
   encodeGrpcMessage,
@@ -101,6 +101,7 @@ import type {
   GrpcEdit,
   GrpcProxyCodec,
   InterceptProxyOptions,
+  LearnedPassthrough,
   ReplayEntry,
   ReplayOptions,
   RequestEdit,
@@ -115,6 +116,8 @@ import { GrpcLocal } from './grpc-local';
 import { GrpcHooks } from './grpc-hooks';
 import { GrpcWebFlow } from './grpc-web-flow';
 import { ConnectFlow } from './connect-flow';
+import { LearnFlow } from './learn-flow';
+import { learnedKey, parseLearnedKey, patternNamesHost } from './learned';
 import { WsFlow } from './ws-flow';
 import { ReplayFlow } from './replay-flow';
 import { HttpEdits } from './http-edits';
@@ -189,8 +192,10 @@ export interface ProxyTestInternals {
   readonly paused: Map<string, unknown>;
   readonly lanGate: LanGate | undefined;
   readonly rawServer: net.Server | undefined;
-  readonly pinnedHosts: Map<string, number>;
-  readonly decrypting: Map<string, { host: string; port: number }>;
+  /** CONTRACTS §19.3 / §20.1: learn a gRPC pin (`host:port` → until), as onTlsError does. */
+  readonly pinnedHosts: { set(key: string, until: number): unknown };
+  readonly decrypting: Map<string, { host: string; port: number; http?: true }>;
+  readonly learn: LearnFlow;
   onTlsError(f: unknown): void;
 }
 
@@ -279,6 +284,8 @@ export class InterceptProxy extends EventEmitter {
   private rawServer?: net.Server;
   /** setRules: grpcMock rules refused for their headers / values (disabled, CONTRACTS §16.2). */
   private refused: { id: string; problem: string }[] = [];
+  /** CONTRACTS §20.1: learned passthrough hosts (HTTP CONNECTs and gRPC silent tunnels). */
+  private readonly learn: LearnFlow;
   /** CONTRACTS §19.3: decrypt every TLS silent gRPC tunnel (but tlsPassthrough / learned pinned hosts). */
   private grpcDecryptAllOn = false;
   /** CONTRACTS §18.6: this instance's hop marker (on every relayed / sent gRPC call; one arriving with it is a loop). */
@@ -310,6 +317,7 @@ export class InterceptProxy extends EventEmitter {
     this.hooks = new GrpcHooks(this.ctx);
     this.grpcWeb = new GrpcWebFlow(this.ctx);
     this.connect = new ConnectFlow(this.ctx);
+    this.learn = new LearnFlow(this.ctx);
     this.ws = new WsFlow(this.ctx);
     this.replays = new ReplayFlow(this.ctx);
     this.edits = new HttpEdits(this.ctx);
@@ -388,6 +396,9 @@ export class InterceptProxy extends EventEmitter {
       get lanGate() {
         return self.lanGate;
       },
+      get learn() {
+        return self.learn;
+      },
       matchRule: (...a) => self.matchRule(...a),
       get opts() {
         return self.opts;
@@ -409,6 +420,7 @@ export class InterceptProxy extends EventEmitter {
         return self.rawServer;
       },
       replayFlow: (...a) => self.replayFlow(...a),
+      ruleNamingHost: (...a) => self.ruleNamingHost(...a),
       get replayStore() {
         return self.replayStore;
       },
@@ -468,7 +480,15 @@ export class InterceptProxy extends EventEmitter {
         return self.rawServer;
       },
       get pinnedHosts() {
-        return self.connect.pinnedHosts;
+        return {
+          set: (key: string, until: number) => {
+            const k = parseLearnedKey(key);
+            if (k?.port !== undefined) self.learn.hosts.learn(k.host, k.port, 'pinned', { until, grpc: true });
+          },
+        };
+      },
+      get learn() {
+        return self.learn;
       },
       get decrypting() {
         return self.connect.decrypting;
@@ -765,7 +785,7 @@ export class InterceptProxy extends EventEmitter {
     this.pool = undefined;
     this.grpcPool?.destroyAll();
     this.grpcPool = undefined;
-    this.connect.pinnedHosts.clear();
+    this.learn.clear();
     this.connect.pinStrikes.clear();
     this.connect.decrypting.clear();
     this.rawServer = undefined;
@@ -1075,16 +1095,13 @@ export class InterceptProxy extends EventEmitter {
    */
   setGrpcDecryptAll(on: boolean): void {
     // Turning decrypt-all on again starts over: hosts learned earlier get another chance (REVIEW-13 #6).
-    if (on && !this.grpcDecryptAllOn) {
-      this.connect.pinnedHosts.clear();
-      this.connect.pinStrikes.clear();
-    }
+    if (on && !this.grpcDecryptAllOn) this.clearGrpcPinnedHosts();
     this.grpcDecryptAllOn = !!on;
   }
 
   /** CONTRACTS §19.3: forget every learned pinned host (they are decrypted again under decrypt-all). */
   clearGrpcPinnedHosts(): void {
-    this.connect.pinnedHosts.clear();
+    this.learn.hosts.forget((e) => !!e.grpc && e.reason === 'pinned');
     this.connect.pinStrikes.clear();
   }
 
@@ -1092,9 +1109,37 @@ export class InterceptProxy extends EventEmitter {
     return this.grpcDecryptAllOn;
   }
 
-  /** CONTRACTS §19.3: hosts learned to pin their certificate (passed through undecrypted until the proxy stops). */
+  /** CONTRACTS §19.3: hosts learned on gRPC tunnels to pin their certificate (`host:port`, live ones). */
   get grpcPinnedHosts(): string[] {
-    return [...this.connect.pinnedHosts.keys()].filter((k) => this.connect.isPinned(k));
+    return this.learn.hosts.list().filter((e) => e.grpc && e.reason === 'pinned').map((e) => learnedKey(e.host, e.port));
+  }
+
+  /**
+   * CONTRACTS §20.1: hosts passed through without decryption because the proxy learned it — the server wants the
+   * app's own client certificate (`client-certificate`, until the proxy stops, it is forgotten, or a certificate is
+   * configured for it) or the app rejects the proxy's certificate (`pinned`, GRPC_PIN_TTL_MS). Live entries only.
+   */
+  get learnedPassthrough(): LearnedPassthrough[] {
+    return this.learn.hosts.list();
+  }
+
+  /**
+   * CONTRACTS §20.1: forget learned hosts — `host:port` (`[v6]:port`; a bare host = every port), none = all. Their
+   * next CONNECT is decrypted again. Emits 'learnedPassthrough' when something was forgotten.
+   */
+  forgetLearnedPassthrough(key?: string): void {
+    if (key === undefined) {
+      this.learn.hosts.clear();
+      this.connect.pinStrikes.clear();
+      return;
+    }
+    const k = parseLearnedKey(key);
+    if (!k) return;
+    this.learn.hosts.forget((e) => e.host === k.host && (k.port === undefined || e.port === k.port));
+    for (const s of [...this.connect.pinStrikes.keys()]) {
+      const p = parseLearnedKey(s);
+      if (p && p.host === k.host && (k.port === undefined || p.port === k.port)) this.connect.pinStrikes.delete(s);
+    }
   }
 
   /** The gRPC decrypt patterns in use. */
@@ -1181,6 +1226,8 @@ export class InterceptProxy extends EventEmitter {
     }
     this.certs = loaded;
     this.certStatus = status;
+    // CONTRACTS §20.1: a host that now has a certificate is decrypted again (the proxy presents it).
+    if (loaded.length) this.learn.hosts.forget((e) => e.reason === 'client-certificate' && !!this.certFor(e.host, e.port));
     return status.map((x) => ({ ...x }));
   }
 
@@ -1370,6 +1417,8 @@ export class InterceptProxy extends EventEmitter {
   override on(event: 'lan-peer', listener: (ip: string) => void): this;
   /** CONTRACTS §16.8: the app's gRPC connections to `authority` went direct for 30 s (the entry's breaker). */
   override on(event: 'grpcBreaker', listener: (e: GrpcBreakerEvent) => void): this;
+  /** CONTRACTS §20.1: the learned passthrough hosts changed (the whole list, as `learnedPassthrough`). */
+  override on(event: 'learnedPassthrough', listener: (list: LearnedPassthrough[]) => void): this;
   override on(event: 'rule-spent', listener: (ruleId: string, reason: 'times' | 'expired') => void): this;
   /** `step`: sequence rules only (CONTRACTS §12.3), 0-based index of the step that answered, -1 = after the steps. */
   override on(event: 'rule-hit', listener: (ruleId: string, used: number, step?: number) => void): this;
@@ -1549,6 +1598,15 @@ export class InterceptProxy extends EventEmitter {
     return { note };
   }
 
+  /** CONTRACTS §20.1: the first enabled, unspent rule whose URL pattern names `host` (patternNamesHost). */
+  private ruleNamingHost(host: string, port: number): Rule | undefined {
+    const now = Date.now();
+    for (const { rule } of this.compiled) {
+      if (rule.enabled && !this.spentReason(rule, now) && patternNamesHost(rule.match?.url ?? '', host, port)) return rule;
+    }
+    return undefined;
+  }
+
   /** Could a rule from index `from` on (method + URL match) need the response hook? */
   private responseHookFrom(from: number, method: string, url: string, now: number): boolean {
     for (let i = from; i < this.compiled.length; i++) {
@@ -1658,6 +1716,11 @@ export class InterceptProxy extends EventEmitter {
     const socket = requestInternals(req).socket;
     if (lanGateOf(socket)) flow.viaLan = true;
     if (socket && typeof socket === 'object') this.connRequest.set(socket, req.id);
+    // CONTRACTS §20.1: the app's keep-alive connections per server, closed when the server is learned.
+    const dest = (req as { destination?: { hostname?: string; port?: number } }).destination;
+    if (req.protocol === 'https' && dest?.hostname && dest.port && String(req.httpVersion).startsWith('1')) {
+      this.learn.trackConnection(socket, normalizeHostname(dest.hostname), dest.port);
+    }
     flow.te = requestInternals(req).timingEvents;
     const latency = flow.throttle?.latencyMs;
     if (flow.route === 'plain' && latency && latency > 0) {

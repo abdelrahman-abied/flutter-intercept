@@ -10,6 +10,7 @@ import { GrpcMessageTransform } from './grpc';
 import { GrpcWebRecorder, type GrpcWebVariant } from './grpc-web';
 import { type CorsOptions } from './cors';
 import { SseRecorder } from './sse';
+import type { LearnVerdict } from './learn-flow';
 import { type NetworkProfile } from './network';
 import type {
   Exchange,
@@ -132,6 +133,10 @@ export interface Flow {
   wantHost?: string;
   /** mockttp's timing events of the request (CONTRACTS §13.2 `requestMs`). */
   te?: RequestTimingEvents;
+  /** CONTRACTS §20.1: the verdict on an upstream refusal (started at the response head; a probe may be running). */
+  learn?: Promise<LearnVerdict | undefined>;
+  /** CONTRACTS §20.1: an HTTPS 400 page that may be nginx's "No required SSL certificate was sent". */
+  maybeNginx?: boolean;
 }
 
 /** The part of mockttp's TimingEvents we read (high-resolution `performance.now()` timestamps). */

@@ -569,8 +569,10 @@ describe('TLS silent tunnels', () => {
   });
 
   it('HTTP/1.1 clients and a Chrome-like ALPN offer still get HTTP/1.1; an h2-only offer gets h2', async () => {
+    // One host per handshake: two dropped handshakes to one host within a minute would pin it (CONTRACTS §20.1).
+    let n = 0;
     const alpn = async (protocols: string[]) => {
-      const c = http.request({ host: '127.0.0.1', port: proxy.port, method: 'CONNECT', path: 'example.test:443', agent: false });
+      const c = http.request({ host: '127.0.0.1', port: proxy.port, method: 'CONNECT', path: `h${n++}.example.test:443`, agent: false });
       c.end();
       const [, raw] = (await once(c, 'connect')) as [http.IncomingMessage, net.Socket];
       const t = tls.connect({ socket: raw, servername: 'example.test', ALPNProtocols: protocols, rejectUnauthorized: false });
