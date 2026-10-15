@@ -289,6 +289,7 @@ export class InterceptProxy extends EventEmitter {
   private readonly learn: LearnFlow;
   /** CONTRACTS §19.3: decrypt every TLS silent gRPC tunnel (but tlsPassthrough / learned pinned hosts). */
   private grpcDecryptAllOn = false;
+  private httpPinLearningOn = true;
   /** CONTRACTS §18.6: this instance's hop marker (on every relayed / sent gRPC call; one arriving with it is a loop). */
   private readonly hopNonce = randomBytes(18).toString('base64url');
   /** QUALITY-1 Q1: the flow modules' view of this proxy (proxy-context.ts). */
@@ -372,6 +373,9 @@ export class InterceptProxy extends EventEmitter {
       },
       get grpcDecryptAllOn() {
         return self.grpcDecryptAllOn;
+      },
+      get httpPinLearning() {
+        return self.httpPinLearningOn;
       },
       get grpcLocal() {
         return self.grpcLocal;
@@ -1099,6 +1103,22 @@ export class InterceptProxy extends EventEmitter {
     // Turning decrypt-all on again starts over: hosts learned earlier get another chance (REVIEW-13 #6).
     if (on && !this.grpcDecryptAllOn) this.clearGrpcPinnedHosts();
     this.grpcDecryptAllOn = !!on;
+  }
+
+  /**
+   * CONTRACTS §20.6: learn `pinned` HTTPS hosts (default on). The host turns it off while it routes an emulator's native
+   * clients through the proxy (§14.7): they share the app's loopback client, they are expected to reject the CA (the
+   * host notices that in the HTTP profile and stops routing), and a pin there would pass the Dart app's own requests
+   * to that host through as well. Off also forgets the HTTPS pins; gRPC pins are not affected.
+   */
+  setHttpPinLearning(on: boolean): void {
+    this.httpPinLearningOn = !!on;
+    if (on) return;
+    this.learn.hosts.forget((e) => !e.grpc && e.reason === 'pinned');
+  }
+
+  get httpPinLearning(): boolean {
+    return this.httpPinLearningOn;
   }
 
   /** CONTRACTS §19.3: forget every learned pinned host (they are decrypted again under decrypt-all). */

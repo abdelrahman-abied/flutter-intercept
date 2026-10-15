@@ -42,6 +42,8 @@ export interface ProxyContext {
   readonly grpcCheck: GrpcSupport;
   readonly grpcDecrypt: HostPattern[];
   readonly grpcDecryptAllOn: boolean;
+  /** CONTRACTS §20.6: HTTPS pin learning (off while the host routes an emulator's native clients through the proxy). */
+  readonly httpPinLearning: boolean;
   readonly grpcLocal: GrpcLocal;
   readonly grpcPool: GrpcSessionPool | undefined;
   readonly grpcWeb: GrpcWebFlow;

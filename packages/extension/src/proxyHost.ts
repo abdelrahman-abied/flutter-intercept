@@ -68,7 +68,7 @@ export type ProxyLike = Pick<
   | 'send' | 'setNetworkProfile' | 'setAppPackages' | 'record' | 'update' | 'setWebSessionActive'
   | 'setReplay' | 'resetSequences' | 'setUpstreamProxy' | 'upstreamProxy'
   | 'setTlsPassthrough' | 'tlsPassthrough' | 'setClientCertificates'
-  | 'setGrpcDecryptHosts' | 'grpcSupport' | 'setGrpcDecryptAll' | 'setGrpcCodec'
+  | 'setGrpcDecryptHosts' | 'grpcSupport' | 'setGrpcDecryptAll' | 'setGrpcCodec' | 'setHttpPinLearning'
   | 'learnedPassthrough' | 'forgetLearnedPassthrough'
 >;
 
@@ -511,6 +511,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private grpcCodec?: GrpcProxyCodec;
   // CONTRACTS §19.3
   private decryptAll = false;
+  private httpPinLearning = true;
   private simDevices: SimulatorTrustDevice[] = [];
   /** §16.8 breaker warnings by authority (insertion order kept). */
   private readonly breakerWarnings = new Map<string, SessionWarning>();
@@ -599,6 +600,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       }
       this.grpcCheck = this.readGrpcSupport(proxy);
       if (this.decryptAll) this.applyGrpcDecryptAll(proxy);
+      if (!this.httpPinLearning) this.applyHttpPinLearning(proxy);
       if (this.grpcCodec) this.applyGrpcCodec(proxy);
       if (this.clientCerts.length) this.applyClientCertificates(proxy);
       // REVIEW-12 #1: the port is known now — re-check Map Remote targets against it
@@ -1104,6 +1106,26 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
 
   get grpcDecryptAll(): boolean {
     return this.decryptAll;
+  }
+
+  /**
+   * CONTRACTS §20.6: the proxy's HTTPS pin learning — the lead's wiring turns it off while an emulator's native clients
+   * are routed through the proxy (AndroidGlobalProxy `onRoutedChange`). Kept across restarts.
+   */
+  setHttpPinLearning(on: boolean): void {
+    const next = on !== false;
+    if (next === this.httpPinLearning) return;
+    this.httpPinLearning = next;
+    this.opts.log?.(`HTTPS pin learning ${next ? 'on' : 'off (native clients are routed through the proxy)'}`);
+    if (this.proxy) this.applyHttpPinLearning(this.proxy);
+  }
+
+  private applyHttpPinLearning(proxy: ProxyLike): void {
+    try {
+      proxy.setHttpPinLearning(this.httpPinLearning);
+    } catch (e) {
+      this.opts.log?.(`HTTPS pin learning not applied: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   private applyGrpcDecryptAll(proxy: ProxyLike): void {

@@ -836,6 +836,28 @@ describe('pinned: an app that rejects the proxy certificate on an HTTPS CONNECT'
     expect(tunnel.learnedPassthrough).toEqual({ reason: 'pinned', host: '127.0.0.1', port: srvPort });
   });
 
+  it('§20.6: no HTTPS pins while the host routes native clients (setHttpPinLearning(false)); turning it off forgets HTTPS pins', async () => {
+    const p = proxy[TEST_INTERNALS]();
+    p.decrypting.set('127.0.0.1:40002', { host: '127.0.0.1', port: srvPort, http: true });
+    p.onTlsError({ failureCause: 'cert-rejected', remoteIpAddress: '127.0.0.1', remotePort: 40002, timingEvents: {} });
+    await waitFor(proxy, (e) => !!e.learnedPassthrough && e.state === 'error');
+    expect(proxy.learnedPassthrough.map((e) => e.reason)).toEqual(['pinned']);
+    proxy.setHttpPinLearning(false);
+    expect(proxy.httpPinLearning).toBe(false);
+    expect(proxy.learnedPassthrough).toEqual([]); // forgotten
+    p.decrypting.set('127.0.0.1:40003', { host: '127.0.0.1', port: srvPort, http: true });
+    p.onTlsError({ failureCause: 'cert-rejected', remoteIpAddress: '127.0.0.1', remotePort: 40003, timingEvents: {} });
+    // The pre-0.14 record: the rejection is reported, nothing is learned.
+    const ex = await waitFor(proxy, (e) => e.state === 'error' && /The app probably rejects the proxy's certificate/.test(String(e.error)));
+    expect(ex.learnedPassthrough).toBeUndefined();
+    expect(proxy.learnedPassthrough).toEqual([]);
+    proxy.setHttpPinLearning(true);
+    p.decrypting.set('127.0.0.1:40004', { host: '127.0.0.1', port: srvPort, http: true });
+    p.onTlsError({ failureCause: 'cert-rejected', remoteIpAddress: '127.0.0.1', remotePort: 40004, timingEvents: {} });
+    for (let i = 0; i < 100 && proxy.learnedPassthrough.length !== 1; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(proxy.learnedPassthrough.map((e) => e.reason)).toEqual(['pinned']); // learning again
+  });
+
   it('a close in the handshake counts twice within a minute; pins expire; a rule naming the host keeps it decrypted', async () => {
     grpcPinTesting.ttlMs = 300;
     try {

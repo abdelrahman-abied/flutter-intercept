@@ -2245,3 +2245,12 @@ of a failing mTLS host (no probe storm). Quality pass per QUALITY-1.
 - **Plugin.** Requests `ui.chooseClientCertificateFile`, `settings.writeClientCertificates`,
   `secrets.setClientCertPassphrase`, `secrets.clientCertPassphrase`, `ui.confirmRemoveClientCertificate`. Settings
   Apply merges the user's certificate-text edits onto what is stored now.
+
+### 20.6 Native clients on the Android emulator (found by the devices suite)
+While the host routes an emulator's native clients through the proxy (§14.7, `nativeClients: "proxy"`), HTTPS pin
+learning is off: `InterceptProxy.setHttpPinLearning(false)` (on again when the last emulator is released; turning it
+off forgets the HTTPS pins; gRPC pins unaffected). Native clients that don't trust the CA are expected there; the host
+notices that in the HTTP profile and stops routing (§14.8), and the emulator's clients share the app's loopback client,
+so a pin would also pass the Dart app's own requests to that host through. Wiring: `AndroidGlobalProxy`
+`onRoutedChange(routed)` → `InterceptProxyHost.setHttpPinLearning(!routed)` (kept across proxy restarts), in the
+extension and the sidecar.

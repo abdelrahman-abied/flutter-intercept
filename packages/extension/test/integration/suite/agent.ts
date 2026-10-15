@@ -387,7 +387,7 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
         sessionId = l.result.sessionId;
         if (l.isError || !sessionId) throw new Error(`launch_app: ${l.text.slice(0, 200)}`);
         const w = await mcpCall('wait_for_request', { url: USERS1, method: 'GET', sinceMs: since, timeoutMs: 120_000 });
-        if (w.isError || w.result.timedOut || w.result.status !== 200) throw new Error(`wait_for_request: ${w.text.slice(0, 200)}`);
+        if (w.isError || w.result.timedOut || w.result.status !== 200) throw new Error(`wait_for_request: ${w.result.error ? `error "${String(w.result.error).slice(0, 400)}" ` : ""}${w.text.slice(0, 200)}`);
         const id = w.result.id as string;
 
         // get_request_source: the trace may arrive just after the exchange completes.
@@ -970,7 +970,7 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
         sessionId = l.result.sessionId;
         if (l.isError || !sessionId) throw new Error(`launch_app: ${l.text.slice(0, 200)}`);
         const w = await mcpCall('wait_for_request', { url: USERS1, method: 'GET', sinceMs: since, timeoutMs: 120_000 });
-        if (w.isError || w.result.timedOut || w.result.status !== 200) throw new Error(`wait_for_request: ${w.text.slice(0, 200)}`);
+        if (w.isError || w.result.timedOut || w.result.status !== 200) throw new Error(`wait_for_request: ${w.result.error ? `error "${String(w.result.error).slice(0, 400)}" ` : ""}${w.text.slice(0, 200)}`);
 
         // Timings (§13.2): a real request through the proxy has phases; slowerThanMs filters.
         const g = await mcpCall('get_request', { id: w.result.id, includeBodies: false });

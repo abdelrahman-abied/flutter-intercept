@@ -39,6 +39,7 @@ export function fakeProxy(opts: InterceptProxyOptions, overrides: object = {}): 
     setGrpcDecryptHosts: (hosts?: string[]) => ({ hosts: hosts ?? [], problems: [] }),
     grpcSupport: () => ({ ok: true }),
     setGrpcDecryptAll: () => undefined,
+    setHttpPinLearning: () => undefined,
     setGrpcCodec: () => undefined,
     learnedPassthrough: [],
     forgetLearnedPassthrough: () => undefined,

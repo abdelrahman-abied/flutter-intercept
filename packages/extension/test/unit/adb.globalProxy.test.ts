@@ -70,6 +70,19 @@ describe('AndroidGlobalProxy (CONTRACTS §14.7)', () => {
     expect(adb.calls[i + 1]).toBe('-s emulator-5554 shell settings delete global http_proxy');
   });
 
+  it('CONTRACTS §20.6: onRoutedChange fires when routing starts and when the last emulator is released', async () => {
+    const adb = fakeAdb();
+    const seen: boolean[] = [];
+    const gp = new AndroidGlobalProxy({ exec: adb.exec, adbPath: '/adb', store: memStore(), onRoutedChange: (r) => seen.push(r) });
+    await gp.apply('s1', 'emulator-5554', 9123);
+    await gp.apply('s2', 'emulator-5554', 9123); // same emulator, reference-counted: no second event
+    expect(seen).toEqual([true]);
+    await gp.release('s1');
+    expect(seen).toEqual([true]);
+    await gp.release('s2');
+    expect(seen).toEqual([true, false]);
+  });
+
   it('restores a previous ":0" without deleting it', async () => {
     const adb = fakeAdb({ http_proxy: ':0', global_http_proxy_host: '', global_http_proxy_port: '0' });
     const gp = new AndroidGlobalProxy({ exec: adb.exec, adbPath: '/adb' });

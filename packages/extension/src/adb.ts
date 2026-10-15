@@ -304,6 +304,11 @@ export interface AndroidGlobalProxyOptions extends AdbOptions {
   staleMs?: number;
   /** `isRouted()` re-reads `http_proxy` at most this often, ms (default 10 s). */
   recheckMs?: number;
+  /**
+   * CONTRACTS §20.6: called when this instance starts or stops routing any emulator (true = at least one routed). The
+   * host turns the proxy's HTTPS pin learning off meanwhile.
+   */
+  onRoutedChange?(routed: boolean): void;
 }
 
 export const GLOBAL_PROXY_HEARTBEAT_MS = 30_000;
@@ -354,6 +359,7 @@ export class AndroidGlobalProxy {
   private readonly pid: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private readonly lastCheck = new Map<string, number>(); // serial → epoch ms
+  private wasRouted = false;
   private checking = false;
 
   constructor(private readonly opts: AndroidGlobalProxyOptions = {}) {
@@ -482,6 +488,15 @@ export class AndroidGlobalProxy {
   }
 
   private updateTimer(): void {
+    const routed = this.active.size > 0;
+    if (routed !== this.wasRouted) {
+      this.wasRouted = routed;
+      try {
+        this.opts.onRoutedChange?.(routed);
+      } catch (e) {
+        this.log(`native proxy: routed-change listener failed (${errorText(e).slice(0, 200)})`);
+      }
+    }
     const ms = this.opts.heartbeatMs ?? GLOBAL_PROXY_HEARTBEAT_MS;
     if (this.active.size > 0 && !this.timer && ms > 0) {
       this.timer = setInterval(() => void this.tick(), ms);
@@ -551,6 +566,7 @@ export class AndroidGlobalProxy {
         if (current !== mine.value) {
           // Changed behind our back: it isn't ours any more.
           this.active.delete(serial);
+          this.updateTimer();
           await this.save(this.stored().filter((r) => r.serial !== serial));
           this.log(`native proxy: ${serial} http_proxy changed outside Flutter Intercept; leaving it alone`);
           return { applied: false, reason: 'user-proxy' };

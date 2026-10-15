@@ -102,6 +102,8 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   // CONTRACTS §14.7: native clients on Android emulators via the emulator's global proxy (always restored).
   const nativeRoutes = new AndroidGlobalProxy({
     log,
+    // CONTRACTS §20.6: no HTTPS pin learning while native clients are routed (they share the app's loopback client).
+    onRoutedChange: (routed) => proxyHost.setHttpPinLearning(!routed),
     store: {
       get: () => context.globalState.get('flutterIntercept.emulatorProxies', []),
       set: (r) => context.globalState.update('flutterIntercept.emulatorProxies', r),

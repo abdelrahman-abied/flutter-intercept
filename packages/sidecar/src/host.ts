@@ -387,6 +387,8 @@ export class SidecarHost {
     this.reverses = new ReverseTracker(adbOpts);
     this.nativeRoutes = new AndroidGlobalProxy({
       ...adbOpts,
+      // CONTRACTS §20.6: no HTTPS pin learning while native clients are routed (they share the app's loopback client).
+      onRoutedChange: (routed) => this.proxyHost.setHttpPinLearning(!routed),
       store: { get: () => this.state.get(EMULATOR_PROXIES_KEY, []), set: (r) => this.state.update(EMULATOR_PROXIES_KEY, r) },
     });
     void this.nativeRoutes.recover().catch((e: unknown) => log(`emulator proxy recovery failed: ${String(e)}`));
