@@ -45,6 +45,7 @@ export interface Status {
   tlsPassthrough?: string[];            // CONTRACTS §14.2: hosts passed through undecrypted (tunnels)
   clientCertificates?: { host: string; problem?: string }[]; // CONTRACTS §14.3 (never key material)
   learnedPassthrough?: { host: string; port: number; reason: LearnedPassthroughReason; until?: number }[]; // CONTRACTS §20.2 (until absent = until the proxy stops)
+  autoPassthrough?: boolean;            // CONTRACTS §20.7: false = servers are never passed through on their own
   upstreamProxyInsecure?: true;         // REVIEW-6 #1: upstream certificate checks are off
   grpc?: GrpcStatus;                    // CONTRACTS §16.4
 }

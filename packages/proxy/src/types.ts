@@ -89,6 +89,8 @@ export interface Exchange {
   // CONTRACTS §20 (v0.14.0)
   /** This request taught the proxy to pass `host:port` through (it failed), or this tunnel is passed through because of it. */
   learnedPassthrough?: { reason: LearnedPassthroughReason; host: string; port: number };
+  /** CONTRACTS §20.7: the proxy concluded this server wants the app's client certificate (learned or not). */
+  needsClientCertificate?: { host: string; port: number };
 }
 
 /** CONTRACTS §20.1: why a host is passed through undecrypted without being configured. */
@@ -421,6 +423,8 @@ export interface InterceptProxyOptions {
   /** CONTRACTS §19.3: decrypt every TLS gRPC silent tunnel (except tlsPassthrough hosts) — the host sets it while every
    * running session is on a simulator that trusts our CA. Default false. */
   grpcDecryptAll?: boolean;
+  /** CONTRACTS §20.7: learn passthrough hosts on its own (default true). Off: no learning, no probe. */
+  autoPassthrough?: boolean;
 }
 
 /** CONTRACTS §14.3: one client certificate for upstream mTLS. Key material never leaves the proxy (not in exchanges / events). */

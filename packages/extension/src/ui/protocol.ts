@@ -30,6 +30,7 @@ export interface Status {
   clientCertificates?: { host: string; problem?: string }[];
   /** CONTRACTS §20.2: hosts the proxy passes through on its own (`until` absent = until the proxy stops). */
   learnedPassthrough?: { host: string; port: number; reason: LearnedPassthroughReason; until?: number }[];
+  autoPassthrough?: boolean;            // CONTRACTS §20.7: false = servers are never passed through on their own
   /** CONTRACTS §16.4: gRPC interception and the schema read from the app's generated `*.pb*.dart`. */
   grpc?: GrpcStatus;
 }

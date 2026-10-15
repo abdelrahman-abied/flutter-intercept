@@ -2254,3 +2254,32 @@ notices that in the HTTP profile and stops routing (§14.8), and the emulator's 
 so a pin would also pass the Dart app's own requests to that host through. Wiring: `AndroidGlobalProxy`
 `onRoutedChange(routed)` → `InterceptProxyHost.setHttpPinLearning(!routed)` (kept across proxy restarts), in the
 extension and the sidecar.
+
+### 20.7 Telling the developer what the server sees; turning automatic passthrough off (owner request, before release)
+- **Setting** `flutterIntercept.autoPassthrough` (boolean, default `true`; any scope — turning it off only makes the
+  proxy do less); sidecar `autoPassthrough`, plugin checkbox in Settings → Tools → Flutter Intercept ("Pass servers that
+  need the app's own certificate, or that the app pins, through automatically"). Proxy: option
+  `InterceptProxyOptions.autoPassthrough` (default true), `setAutoPassthrough(on)`, getter `autoPassthrough`; the host
+  keeps it across restarts.
+- **Off:** nothing is learned (neither reason, HTTP or gRPC — except 0.13's gRPC pins under decrypt-all, which keep
+  working as before), **no probe** is sent, no `Connection: close` is added, idle connections aren't closed. Turning it
+  off forgets every learned entry except those gRPC pins. The failed request's error then reads:
+  `This server needs the app's own client certificate (<cause>). Automatic passthrough is off (flutterIntercept.autoPassthrough), so its requests keep failing through Flutter Intercept: add the certificate in the Flutter Intercept panel (Add client certificate…), or turn it on.`
+  For alerts 40 / 42 (no probe): `The server ended the TLS handshake (<alert>); it may need the app's own client certificate. Automatic passthrough is off, so Flutter Intercept didn't check: add the certificate in the panel (Add client certificate…) if it needs one.`
+- **`Exchange.needsClientCertificate?: {host, port}`** — set on the failed request whenever the proxy concluded the
+  server wants a client certificate (learned or not, i.e. also when automatic passthrough is off or the host is kept
+  decrypted by a rule / replay). The webview's banner offers **Add client certificate…** for it even without
+  `learnedPassthrough` (no "Try decrypting again" then). Agents: `get_request` / `list_requests` show it; HAR
+  `_needsClientCertificate`.
+- **`Status.autoPassthrough`** (boolean). The panel's certificates list says "Automatic passthrough is off" when false;
+  agents' `get_status` shows it.
+- **Popup text** — a third section, *What the server sees* (owner's request, plain words):
+  "The server gets the same certificate, but the connection now comes from Flutter Intercept instead of your app, and
+  it looks a little different to the server. Most servers don't notice; some security systems do. Use a certificate
+  you're allowed to use for testing, ideally with a development or staging server."
+  And under the banner of a learned request (one line): "The first request was tried without the app's certificate,
+  so the server may have logged one refused connection from this computer."
+- **README** tutorial "Apps with their own certificate": a short *What the server sees* paragraph (the first refused
+  attempt, at most one short check for unclear refusals, the different-looking connection after adding the
+  certificate, nothing that names Flutter Intercept — internal headers are removed), and how to turn automatic
+  passthrough off. Plugin README the same in two lines.
