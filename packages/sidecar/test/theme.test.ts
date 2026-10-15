@@ -38,4 +38,11 @@ describe('settings', () => {
     expect(s.tlsPassthrough).toEqual(['a.com']);
     expect(s.ideHttpProxy).toEqual({ url: 'http://p:1' });
   });
+
+  it('autoPassthrough defaults to true; only a boolean false turns it off (CONTRACTS §20.7)', () => {
+    expect(DEFAULT_SETTINGS.autoPassthrough).toBe(true);
+    expect(normalizeSettings({}).autoPassthrough).toBe(true);
+    expect(normalizeSettings({ autoPassthrough: 0 }).autoPassthrough).toBe(true);
+    expect(normalizeSettings({ autoPassthrough: false }).autoPassthrough).toBe(false);
+  });
 });

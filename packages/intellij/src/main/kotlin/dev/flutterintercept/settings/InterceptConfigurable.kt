@@ -87,6 +87,11 @@ class InterceptConfigurable : BoundConfigurable("Flutter Intercept") {
                     textArea().bindText(::tlsText).rows(3).align(AlignX.FILL)
                         .comment("One host or glob per line (e.g. *.bank.example): passed through without decryption.")
                 }
+                row {
+                    checkBox("Pass servers that need the app's own certificate, or that the app pins, through automatically")
+                        .bindSelected(working::autoPassthrough)
+                        .comment("Off: those requests keep failing until you add the certificate, and Flutter Intercept never tries the server on its own.")
+                }
                 row("Client certificates:") {}
                 row {
                     textArea().bindText(::certText).rows(3).align(AlignX.FILL)

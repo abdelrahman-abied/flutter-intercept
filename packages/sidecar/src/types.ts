@@ -23,6 +23,8 @@ export interface SidecarSettings {
   upstreamProxy?: string;
   upstreamProxyIgnoreCertErrors: boolean;
   tlsPassthrough: string[];
+  /** CONTRACTS §20.7: pass servers that need the app's own certificate, or that the app pins, through automatically. Default true. */
+  autoPassthrough: boolean;
   clientCertificates: { host: string; pfx?: string; cert?: string; key?: string }[];
   agent: { access: 'readWrite' | 'readOnly' | 'off'; redactSecrets: boolean; screenshots: boolean; mcpPort: number };
   /** The IDE's own HTTP proxy, if any (like VS Code's `http.proxy`): `http://host:port`. */

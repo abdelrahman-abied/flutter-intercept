@@ -19,6 +19,7 @@ export const DEFAULT_SETTINGS: SidecarSettings = {
   rewriteLocalhost: true,
   upstreamProxyIgnoreCertErrors: false,
   tlsPassthrough: [],
+  autoPassthrough: true,
   clientCertificates: [],
   agent: { access: 'readWrite', redactSecrets: true, screenshots: true, mcpPort: DEFAULT_MCP_PORT },
   grpc: { enabled: true, decryptHosts: [], trustOnSimulator: false },
@@ -65,6 +66,7 @@ export function normalizeSettings(raw: unknown): SidecarSettings {
     ...(upstream ? { upstreamProxy: upstream } : {}),
     upstreamProxyIgnoreCertErrors: bool(s.upstreamProxyIgnoreCertErrors, d.upstreamProxyIgnoreCertErrors),
     tlsPassthrough: strList(s.tlsPassthrough),
+    autoPassthrough: bool(s.autoPassthrough, d.autoPassthrough),
     clientCertificates: certs,
     agent: {
       access: oneOf(a.access, ['readWrite', 'readOnly', 'off'] as const, d.agent.access),

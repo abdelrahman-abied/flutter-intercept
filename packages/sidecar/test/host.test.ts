@@ -149,6 +149,21 @@ describe('SidecarHost', () => {
     expect(ctl.status().upstreamProxy).toBeUndefined();
   });
 
+  it('applies autoPassthrough (default on) to the proxy host at start and on every change — CONTRACTS §20.7', async () => {
+    const ph = (host as unknown as { proxyHost: { autoPassthrough: boolean } }).proxyHost;
+    const ctl = (host as unknown as { controller: { status(): Record<string, unknown> } }).controller;
+    expect(ph.autoPassthrough).toBe(true); // init's settings had no autoPassthrough
+    await host.handle('settings', { settings: settings({ autoPassthrough: false }) });
+    expect(ph.autoPassthrough).toBe(false);
+    expect(ctl.status().autoPassthrough).toBe(false);
+    await host.handle('settings', { settings: settings({ autoPassthrough: 'no' }) }); // wrong type → default
+    expect(ph.autoPassthrough).toBe(true);
+    await host.handle('settings', { settings: settings({ autoPassthrough: false }) });
+    await host.handle('settings', { settings: settings({ autoPassthrough: true }) });
+    expect(ph.autoPassthrough).toBe(true);
+    expect(ctl.status().autoPassthrough).toBe(true);
+  });
+
   const launch = (deviceKind: DeviceKind, deviceId?: string, flutterMode: 'debug' | 'profile' | 'release' = 'debug', args: string[] = ['--flavor', 'dev']) => ({
     launchId: `l-${deviceKind}-${deviceId ?? 'none'}`,
     projectRoot: project,

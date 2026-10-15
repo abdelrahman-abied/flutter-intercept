@@ -464,6 +464,7 @@ export class SidecarHost {
     this.shared.onDidChangeBodyFile((p) => this.proxyHost.refreshBodyFiles(p));
     this.applyUpstreamProxy();
     this.proxyHost.setTlsPassthrough(this.settings.tlsPassthrough);
+    this.proxyHost.setAutoPassthrough(this.settings.autoPassthrough); // CONTRACTS §20.7
     void this.applyClientCertificates();
     // CONTRACTS §16.4: gRPC decrypt hosts and the schema from the app's generated `*.pb*.dart`.
     this.proxyHost.setGrpcDecryptHosts(this.settings.grpc?.decryptHosts ?? []);
@@ -804,6 +805,7 @@ export class SidecarHost {
       this.applyUpstreamProxy();
     }
     if (changed('tlsPassthrough')) this.proxyHost.setTlsPassthrough(next.tlsPassthrough);
+    if (changed('autoPassthrough')) this.proxyHost.setAutoPassthrough(next.autoPassthrough);
     if (changed('grpc')) {
       this.proxyHost.setGrpcDecryptHosts(next.grpc?.decryptHosts ?? []);
       if (prev.grpc?.enabled !== next.grpc?.enabled) this.grpc.enabledChanged();

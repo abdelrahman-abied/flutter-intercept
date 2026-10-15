@@ -41,6 +41,9 @@ class InterceptSettingsState {
     @XCollection(style = XCollection.Style.v2, elementName = "host")
     var tlsPassthrough: MutableList<String> = mutableListOf()
 
+    /** CONTRACTS §20.7: pass servers that need the app's own certificate, or that the app pins, through automatically. */
+    var autoPassthrough: Boolean = true
+
     @XCollection(style = XCollection.Style.v2)
     var clientCertificates: MutableList<ClientCertificateEntry> = mutableListOf()
 
@@ -89,6 +92,7 @@ class InterceptSettingsState {
         upstreamProxy.trim().takeIf { it.isNotEmpty() }?.let { out["upstreamProxy"] = it }
         out["upstreamProxyIgnoreCertErrors"] = upstreamProxyIgnoreCertErrors
         out["tlsPassthrough"] = tlsPassthrough.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        out["autoPassthrough"] = autoPassthrough
         out["clientCertificates"] = clientCertificates.filter { it.host.isNotBlank() }.map { c ->
             linkedMapOf<String, Any>("host" to c.host.trim()).also { m ->
                 c.pfx?.trim()?.takeIf { it.isNotEmpty() }?.let { m["pfx"] = it }
