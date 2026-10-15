@@ -2106,3 +2106,109 @@ Types already in code: `GrpcInfo.web`, `SnippetFormat 'grpcurl'` (both protocol 
   map-remote target checks) is the single source for the proxy, the host and the webview.
 - Sequence steps: at most 50 everywhere. One script template (with the gRPC hooks), from that shared module.
 - Performance budgets (PERF-1) become tests where they can be machine-independent (ratios, structure).
+
+
+## 20. v0.14.0 — Apps with their own certificate (2026-10-15)
+
+Owner request: an app (Dio) that uses a client certificate (mTLS) fails through the extension, because the app's
+certificate reaches the proxy, not the server. (1) Pass such hosts through on their own; (2) let the user add the
+certificate from the traffic panel (VS Code and Android Studio) to see those requests. No settings.json editing, no
+separate security document. Plan and owners: docs/PLAN.md "v0.14.0". Types already in code: `LearnedPassthrough`,
+`LearnedPassthroughReason`, `Exchange.learnedPassthrough` (proxy `types.ts`), `Status.learnedPassthrough` and the
+messages below (both `protocol.ts`), `ClientCertUi` (`packages/extension/src/ui/clientCertUi.ts`).
+
+### 20.1 Learned passthrough for HTTP / HTTPS (proxy)
+One map in the proxy, `host:port` → `{reason, until}`, for HTTP CONNECTs and gRPC silent tunnels alike (the 0.13 gRPC
+pin map becomes part of it; `grpcPinnedHosts` / `clearGrpcPinnedHosts` stay as thin views over it). A CONNECT to a
+learned `host:port` is tunnelled like a `tlsPassthrough` host (§14.2: `kind: 'tunnel'`, same LAN guards, upstream proxy
+chaining, block / fault rules on the CONNECT), the tunnel exchange carries `learnedPassthrough` and a note. The app then
+does TLS with the real server itself, with its own certificate and key; the proxy never sees or stores them.
+
+Two reasons:
+- **`client-certificate`** — the server asks for a client certificate the proxy doesn't have:
+  - a TLS alert `certificate_required` (116) on the upstream connection → at once;
+  - `handshake_failure` (40) / `bad_certificate` (42) → only once confirmed that the server asks for a client
+    certificate (e.g. a short TLS 1.2 probe to the same `host:port`, through the upstream proxy if one is set, that sees
+    a `CertificateRequest`; the probe sends no certificate and no application data, ≤ 5 s, at most one at a time per
+    `host:port`, ≤ 4 at once). Not confirmed → no learning, the error stays as today;
+  - an HTTP 400 whose body says `No required SSL certificate was sent` (nginx with `ssl_verify_client on`) → at once.
+  Lasts until the proxy stops, the user forgets it, or a client certificate is configured for the host.
+- **`pinned`** — the app rejects the proxy's certificate on a decrypted HTTPS CONNECT (the 0.13 rules for gRPC, now also
+  for HTTP): a TLS alert from the app at once; a close / reset in the handshake twice within `PIN_STRIKE_WINDOW_MS`.
+  Lasts `GRPC_PIN_TTL_MS` (10 min), as gRPC pins do. (Dio `validateCertificate` checks after the response, so the proxy
+  can't see it: documented; `tlsPassthrough` is the answer there.)
+
+Never learned:
+- when a client certificate is configured for the host (§14.3): the configured certificate was presented and rejected →
+  the exchange's error says `The server rejected the client certificate configured for <pattern> (<alert>).`;
+- when an **enabled rule targets that host** (its URL pattern has a host part that matches the host, any action): the
+  host stays decrypted so the rules keep working; the error says so and points to "Add client certificate…";
+- while a recording is replayed; for hosts in `grpcDecryptHosts` (gRPC, as 0.13); for the proxy's own send/resend tunnel.
+- Cap: 1000 entries (expired ones dropped first, then nothing new is learned).
+
+Exchange text (exact wording, the agents and the panel show it as is):
+- The request that failed (state `error`; the response the app gets is a 502 with `Connection: close`, or the server's
+  own 400, also with `Connection: close`, so the app's next request opens a new CONNECT): `error` =
+  `This server needs the app's own client certificate (<cause>). From now on <host> is passed through without decryption, so the app talks to it directly with its own certificate. To see these requests, add the certificate in the Flutter Intercept panel (Add client certificate…).`
+  — and `learnedPassthrough` = `{reason: 'client-certificate', host, port}`. The proxy closes the app's other idle
+  keep-alive connections to that `host:port` too.
+- Tunnels passed through because of it: note `This server needs the app's own certificate: passed through without decryption.`
+  (`pinned`: `<host> pins its certificate: passed through without decryption.`), plus `learnedPassthrough`.
+
+API (`InterceptProxy`): `get learnedPassthrough(): LearnedPassthrough[]` (only live entries), `forgetLearnedPassthrough(
+key?: string)` (`host:port`, none = all), event `'learnedPassthrough'` (the list) after every change.
+`setClientCertificates()` drops `client-certificate` entries whose host now matches a loaded certificate.
+`setGrpcDecryptAll(true)` keeps resetting only `pinned` entries learned from gRPC, as 0.13.
+
+### 20.2 Host and agents (extension, sidecar)
+- `Status.learnedPassthrough?: {host, port, reason, until}[]` (no `until` beyond the proxy's life: `client-certificate`
+  shows "until the proxy stops"). Re-broadcast on the proxy's event. Agents: `get_status` / `list_requests` / `get_request`
+  show `learnedPassthrough`; `languageModelTools` descriptions updated (and `schema.ts`, kept equal by the unit test).
+  Agents can't add, remove or read certificates, and can't forget learned hosts.
+- HAR `_learnedPassthrough`, recordings keep the note (they already keep `notes`).
+
+### 20.3 Adding a client certificate from the panel (host + webview; plugin: same messages)
+Webview → host:
+- `{type: 'chooseClientCertificateFile', role: 'pfx' | 'cert' | 'key'}` → the host's native file picker (filters:
+  `.p12 .pfx` / `.pem .crt .cer` / `.pem .key`, any file allowed) → host → webview
+  `{type: 'clientCertificateFile', role, file?: {token, name}, problem?}`. `token` = random, one use, valid 10 min, bound
+  to this panel; `name` = the file's base name. **The path never reaches the webview.**
+- `{type: 'addClientCertificate', host, pfx?: token, cert?: token, key?: token, passphrase?: string}` → host:
+  checks the host pattern (`certHostProblem`), the tokens, loads the files with the §14.3 rules (absolute, regular file,
+  ≤ 1 MB, non-blocking open), tries `tls.createSecureContext` with the passphrase; then writes the entry (paths) to the
+  **user-level** `flutterIntercept.clientCertificates` (replaces an entry with the same host, case-insensitive; ≤
+  `MAX_CLIENT_CERTS`), stores the passphrase in secret storage (`passphraseSecretKey(host)`; empty → deleted), reloads
+  the certificates (which forgets the learned entry, §20.1). Answer `{type: 'clientCertificateSaved', host, problem?}`
+  — a problem (wrong passphrase, key doesn't match…) keeps the popup open. The passphrase is never logged, echoed back,
+  put in Status, or kept by the webview after sending.
+- `{type: 'removeClientCertificate', host}` → removes the user-level entry with that host and its secret; Status updates.
+- `{type: 'forgetLearnedPassthrough', host?, port?}` → `forgetLearnedPassthrough`.
+- Controller: these go to `ControllerDeps.clientCertUi?: ClientCertUi` (`src/ui/clientCertUi.ts`; without it → `error`
+  "Adding client certificates isn't available here."). One shared, vscode-free implementation
+  (`createClientCertUi(platform)`) holds the tokens and the checks; each IDE gives a small `ClientCertPlatform`:
+  `pickFile(role)`, `readEntries()` / `writeEntries(entries)` (user level), `setPassphrase(host, value | undefined)`.
+  VS Code: `showOpenDialog`, `ConfigurationTarget.Global`, `context.secrets`. Plugin: sidecar → IDE ui-requests
+  (`FileChooser`, `InterceptSettings` (application level), `PasswordSafe`).
+
+Webview:
+- A failed exchange or tunnel row with `learnedPassthrough.reason === 'client-certificate'`: a banner "This server needs
+  the app's own certificate…" with **Add client certificate…** (host prefilled: `host`, plus `:port` when not 443) and
+  **Try decrypting again** (forget). `pinned`: the banner without the add button.
+- **Add client certificate** popup: host field; "Certificate file" choice: PKCS#12 (`.p12`/`.pfx`, one file) or PEM
+  (certificate + private key); passphrase (password field, optional); Save / Cancel; problems inline. It explains, in
+  plain words (owner's request):
+  *Why*: "This server asks the app to prove who it is with a certificate (mutual TLS). Flutter Intercept sits between
+  your app and the server, so to show you these requests it has to present the same certificate to the server.
+  Without it, the requests still work but are passed through without decryption."
+  *Stays on your computer*: "The certificate stays where it is on this computer: Flutter Intercept only remembers its
+  location and reads it when connecting. It is never uploaded or sent anywhere except to this server during the TLS
+  handshake, exactly as your app does. The passphrase is kept in VS Code's secret storage (Android Studio: the IDE's
+  password safe)." (The plugin build says the Android Studio variant.)
+- A small **Client certificates** list (from `Status.clientCertificates`: host, problem) with Remove (confirm inline)
+  and **Add…** (empty host); and the learned hosts (`Status.learnedPassthrough`: host:port, reason, Forget).
+
+### 20.4 Review, performance, quality
+Independent review docs/REVIEW-14.md (fix all): tokens and paths, passphrase handling, user-level-only writes, the
+probe (no SSRF beyond what a CONNECT already allows, LAN guard, caps), what an upstream server / a web page can make the
+proxy learn, rules / replay exclusions. Performance: CONNECT handling with a learned map of 1000 entries, the error path
+of a failing mTLS host (no probe storm). Quality pass per QUALITY-1.

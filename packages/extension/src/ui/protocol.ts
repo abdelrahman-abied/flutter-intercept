@@ -28,6 +28,7 @@ export interface Status {
   tlsPassthrough?: string[];
   /** CONTRACTS §14.3: configured client certificates (host pattern + whether it loaded; never paths' contents or passphrases). */
   clientCertificates?: { host: string; problem?: string }[];
+  learnedPassthrough?: { host: string; port: number; reason: 'client-certificate' | 'pinned'; until?: number }[]; // CONTRACTS §20.2
   /** CONTRACTS §16.4: gRPC interception and the schema read from the app's generated `*.pb*.dart`. */
   grpc?: GrpcStatus;
 }
@@ -58,7 +59,10 @@ export type HostMsg =
   | { type: 'select'; id: string }                                     // focus this exchange (from a notification's "Show")
   | { type: 'exported'; format: ExportFormat; path: string }           // after a successful 'export'
   // CONTRACTS §16.4
-  | { type: 'grpcDecoded'; id: string; decoded: GrpcDecoded };         // answer to 'decodeGrpc'
+  | { type: 'grpcDecoded'; id: string; decoded: GrpcDecoded }          // answer to 'decodeGrpc'
+  // CONTRACTS §20.3 (never a path, never the passphrase)
+  | { type: 'clientCertificateFile'; role: ClientCertFileRole; file?: { token: string; name: string }; problem?: string } // answer to 'chooseClientCertificateFile'; no file + no problem = cancelled
+  | { type: 'clientCertificateSaved'; host: string; problem?: string }; // answer to 'addClientCertificate'
 
 // webview → host
 export type ViewMsg =
@@ -95,7 +99,15 @@ export type ViewMsg =
   | { type: 'openInNewWindow' }                                        // opens the panel as an editor in its own window
   | { type: 'openScriptFile'; path: string; create?: { content: string }; ruleId?: string } // like openBodyFile, for script rules (.js); create never reuses an existing file (REVIEW-7 #1)
   // CONTRACTS §16.4
-  | { type: 'decodeGrpc'; id: string };                                // host answers 'grpcDecoded'
+  | { type: 'decodeGrpc'; id: string }                                 // host answers 'grpcDecoded'
+  // CONTRACTS §20.3
+  | { type: 'chooseClientCertificateFile'; role: ClientCertFileRole }   // host answers 'clientCertificateFile'
+  | { type: 'addClientCertificate'; host: string; pfx?: string; cert?: string; key?: string; passphrase?: string } // file tokens; host answers 'clientCertificateSaved'
+  | { type: 'removeClientCertificate'; host: string }
+  | { type: 'forgetLearnedPassthrough'; host?: string; port?: number }; // none = all
+
+/** CONTRACTS §20.3: which file the picker is for. */
+export type ClientCertFileRole = 'pfx' | 'cert' | 'key';
 
 /** CONTRACTS §13.5 */
 export type ExportFormat = 'openapi' | 'postman' | 'har';

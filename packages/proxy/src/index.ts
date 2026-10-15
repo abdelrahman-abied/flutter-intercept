@@ -75,6 +75,8 @@ export type {
   ScriptRequest,
   ScriptResponse,
   ClientCertificate,
+  LearnedPassthrough,
+  LearnedPassthroughReason,
   GrpcInfo,
   GrpcPause,
   GrpcEdit,

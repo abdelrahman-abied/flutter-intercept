@@ -293,3 +293,14 @@ httpbin.org answering HTML for a moment), `verifyPlugin` Compatible. Independent
 all findings fixed. Known limit: once decrypted, a development server with a self-signed certificate fails upstream (the
 proxy verifies certificates); a setting for that needs the owner's decision. Not verified: Android emulator for
 0.11–0.13, physical iPhone, connectrpc against a real app, mTLS on gRPC upstreams, IPv6 targets, Edge.
+
+## v0.14.0 — Apps with their own certificate (started 2026-10-15, branch `feature/0.14.0`)
+Contract: CONTRACTS §20. Owner request: an mTLS app (Dio with a client certificate) must keep working through the
+extension (learned passthrough), and the user can add the certificate from the panel to see those requests.
+| Agent | Owns |
+|---|---|
+| P proxy | learned passthrough map (HTTP + gRPC), detection (alerts, probe, nginx 400), `Connection: close`, exclusions, API + event — `packages/proxy/**` except `types.ts` / `index.ts` |
+| H host + agents | `createClientCertUi` + VS Code platform, controller messages, Status, agents / HAR, settings / commands — `packages/extension/**` except `src/ui/protocol.ts` |
+| W webview | banner on such requests, Add client certificate popup (with the "why / stays on your computer" text), certificates + learned hosts list — `packages/webview/**` except `src/protocol.ts` |
+| I plugin | sidecar wiring of `createClientCertUi` (ui-requests), IntelliJ FileChooser / settings / PasswordSafe, Status — `packages/sidecar/**`, `packages/intellij/**` |
+| lead | contract, types, wiring, e2e mTLS server + integration check, docs, review |

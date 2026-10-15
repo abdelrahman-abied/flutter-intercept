@@ -28,7 +28,10 @@ export type HostMsg =
   | { type: 'select'; id: string }                                     // focus this exchange (from a notification's "Show")
   | { type: 'exported'; format: ExportFormat; path: string }           // after a successful 'export'
   // CONTRACTS §16.4
-  | { type: 'grpcDecoded'; id: string; decoded: GrpcDecoded };         // answer to 'decodeGrpc'
+  | { type: 'grpcDecoded'; id: string; decoded: GrpcDecoded }          // answer to 'decodeGrpc'
+  // CONTRACTS §20.3 (never a path, never the passphrase)
+  | { type: 'clientCertificateFile'; role: ClientCertFileRole; file?: { token: string; name: string }; problem?: string } // answer to 'chooseClientCertificateFile'; no file + no problem = cancelled
+  | { type: 'clientCertificateSaved'; host: string; problem?: string }; // answer to 'addClientCertificate'
 export interface Status {
   proxyRunning: boolean; port?: number; interceptEnabled: boolean; sessions: number;
   lan?: { host: string; port: number; peer?: string }; // present while the LAN listener is open (never the token); peer = the pinned iPhone address
@@ -41,6 +44,7 @@ export interface Status {
   upstreamProxySource?: 'flutterIntercept' | 'http.proxy'; // CONTRACTS §14.6
   tlsPassthrough?: string[];            // CONTRACTS §14.2: hosts passed through undecrypted (tunnels)
   clientCertificates?: { host: string; problem?: string }[]; // CONTRACTS §14.3 (never key material)
+  learnedPassthrough?: { host: string; port: number; reason: 'client-certificate' | 'pinned'; until?: number }[]; // CONTRACTS §20.2
   upstreamProxyInsecure?: true;         // REVIEW-6 #1: upstream certificate checks are off
   grpc?: GrpcStatus;                    // CONTRACTS §16.4
 }
@@ -92,7 +96,15 @@ export type ViewMsg =
   | { type: 'openInNewWindow' }                                        // opens the panel as an editor in its own window
   | { type: 'openScriptFile'; path: string; create?: { content: string }; ruleId?: string } // like openBodyFile, for script rules (.js); create never reuses an existing file (REVIEW-7 #1)
   // CONTRACTS §16.4
-  | { type: 'decodeGrpc'; id: string };                                // host answers 'grpcDecoded'
+  | { type: 'decodeGrpc'; id: string }                                 // host answers 'grpcDecoded'
+  // CONTRACTS §20.3
+  | { type: 'chooseClientCertificateFile'; role: ClientCertFileRole }   // host answers 'clientCertificateFile'
+  | { type: 'addClientCertificate'; host: string; pfx?: string; cert?: string; key?: string; passphrase?: string } // file tokens; host answers 'clientCertificateSaved'
+  | { type: 'removeClientCertificate'; host: string }
+  | { type: 'forgetLearnedPassthrough'; host?: string; port?: number }; // none = all
+
+/** CONTRACTS §20.3: which file the picker is for. */
+export type ClientCertFileRole = 'pfx' | 'cert' | 'key';
 
 /** CONTRACTS §13.5 */
 export type ExportFormat = 'openapi' | 'postman' | 'har';

@@ -65,6 +65,7 @@ import { decodeGrpcMessages, type GrpcDeps } from '../grpc/service';
 import { gitIgnoreStatus, type GitignoreFs } from '../recordings/gitignore';
 import { mapRemoteSelfProblem } from '../proxyHost';
 import { createViewHandlers, type ViewHandlers } from './handlers';
+import type { ClientCertUi } from './clientCertUi';
 import type { AgentStatus, AuthFlowSummary, ContractSummary, ExportFormat, GrpcDecoded, GrpcStatus, HostMsg, SessionWarning, Status, ViewMsg } from './protocol';
 
 export type { GrpcDecoded, GrpcDecodedMessage, GrpcStatus } from './protocol';
@@ -198,6 +199,8 @@ export interface ControllerDeps {
   shared?: SharedRulesDeps;
   /** Recordings (src/recordings/**). */
   recordings?: RecordingService;
+  /** CONTRACTS §20.3: adding / removing client certificates from the panel. Absent → those messages answer with an `error`. */
+  clientCertUi?: ClientCertUi;
   /** Opens a side-by-side diff of two recordings (`vscode.diff` over `RecordingService.diffText`). */
   openDiff?: (a: Recording, b: Recording) => Promise<unknown>;
   /** Auth-flow analysis (src/analysis/**, pure). */

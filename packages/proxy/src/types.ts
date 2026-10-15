@@ -86,6 +86,23 @@ export interface Exchange {
   /** QUALITY-1 / CONTRACTS §19.4: informational notes ("mutate: no schema…", "message over 4 MB…"), oldest first,
    * deduplicated, ≤ 20 × 300 chars. `error` is only for what actually failed. */
   notes?: string[];
+  // CONTRACTS §20 (v0.14.0)
+  /** This request taught the proxy to pass `host:port` through (it failed), or this tunnel is passed through because of it. */
+  learnedPassthrough?: { reason: LearnedPassthroughReason; host: string; port: number };
+}
+
+/** CONTRACTS §20.1: why a host is passed through undecrypted without being configured. */
+export type LearnedPassthroughReason = 'client-certificate' | 'pinned';
+
+/** CONTRACTS §20.1: one learned passthrough host (`InterceptProxy.learnedPassthrough`). */
+export interface LearnedPassthrough {
+  host: string;
+  port: number;
+  reason: LearnedPassthroughReason;
+  /** Epoch ms; absent = until the proxy stops (`client-certificate`). */
+  until?: number;
+  /** Learned on a gRPC silent tunnel. */
+  grpc?: true;
 }
 
 /** CONTRACTS §17.2: what a gRPC breakpoint holds. */
