@@ -1,7 +1,8 @@
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { loadMcpToken, MCP_TOKEN_KEY, SidecarHost, usableFolder, type PluginLink } from '../src/host';
 import { RpcFailure } from '../src/rpc';
 import type { DeviceKind, InitResult, PrepareLaunchResult } from '../src/types';
@@ -299,6 +300,73 @@ describe('SidecarHost', () => {
     expect(s?.webLaunchUrl).toBe('http://localhost:51234/');
     await host.handle('sessionEnded', { sessionId: 'w1' });
   });
+
+  it('panel adds and removes a client certificate through the IDE (chooser, user settings, password safe) — CONTRACTS §20.3', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { generateCACertificate } = require('mockttp/dist/util/certificates') as { generateCACertificate(o: { subject?: Record<string, string>; bits?: number }): Promise<{ key: string; cert: string }> };
+    const pair = await generateCACertificate({ subject: { commonName: 'fi sidecar client' }, bits: 2048 });
+    const passphrase = 'sidecar-test-passphrase';
+    const certDir = path.join(tmp, 'certs');
+    fs.mkdirSync(certDir, { recursive: true });
+    const certFile = path.join(certDir, 'client.crt');
+    const keyFile = path.join(certDir, 'client.key');
+    fs.writeFileSync(certFile, pair.cert);
+    fs.writeFileSync(keyFile, crypto.createPrivateKey(pair.key).export({ type: 'pkcs8', format: 'pem', cipher: 'aes-256-cbc', passphrase }));
+
+    // The plugin: a file chooser, application settings that are sent back with `settings`, a password safe.
+    const safe = new Map<string, string>();
+    let stored: unknown[] = [];
+    link.answers['ui.chooseClientCertificateFile'] = (p: { role: string }) => (p.role === 'cert' ? certFile : p.role === 'key' ? keyFile : null);
+    link.answers['settings.writeClientCertificates'] = (p: { entries: unknown[] }) => {
+      stored = p.entries;
+      void host.handle('settings', { settings: settings({ clientCertificates: p.entries }) });
+      return null;
+    };
+    link.answers['secrets.setClientCertPassphrase'] = (p: { host: string; passphrase?: string }) => {
+      if (p.passphrase) safe.set(p.host, p.passphrase);
+      else safe.delete(p.host);
+      return null;
+    };
+    link.answers['secrets.clientCertPassphrase'] = (p: { host: string }) => safe.get(p.host) ?? null;
+
+    type Ctl = { handle(msg: unknown, reply: (m: unknown) => void): Promise<void>; status(): Record<string, unknown> };
+    const ctl = (host as unknown as { controller: Ctl }).controller;
+    const replies: Record<string, unknown>[] = [];
+    const reply = (m: unknown) => replies.push(m as Record<string, unknown>);
+    const last = (type: string) => replies.filter((r) => r.type === type).at(-1) as Record<string, any>;
+
+    await ctl.handle({ type: 'chooseClientCertificateFile', role: 'cert' }, reply);
+    const cert = last('clientCertificateFile');
+    await ctl.handle({ type: 'chooseClientCertificateFile', role: 'key' }, reply);
+    const key = last('clientCertificateFile');
+    expect(cert).toMatchObject({ role: 'cert', file: { name: 'client.crt' } });
+    expect(key).toMatchObject({ role: 'key', file: { name: 'client.key' } });
+    await ctl.handle({ type: 'chooseClientCertificateFile', role: 'pfx' }, reply);
+    expect(last('clientCertificateFile')).toEqual({ type: 'clientCertificateFile', role: 'pfx' }); // cancelled
+
+    // Wrong passphrase: nothing written, the popup gets a problem.
+    await ctl.handle({ type: 'addClientCertificate', host: 'API.example.com', cert: cert.file.token, key: key.file.token, passphrase: 'wrong' }, reply);
+    expect(last('clientCertificateSaved').problem).toBeTruthy();
+    expect(link.requests.some((r) => r.method === 'settings.writeClientCertificates')).toBe(false);
+
+    await ctl.handle({ type: 'addClientCertificate', host: 'API.example.com', cert: cert.file.token, key: key.file.token, passphrase }, reply);
+    expect(last('clientCertificateSaved')).toEqual({ type: 'clientCertificateSaved', host: 'API.example.com' }); // echoed as sent
+    expect(stored).toEqual([{ host: 'api.example.com', cert: certFile, key: keyFile }]);
+    expect(safe.get('api.example.com')).toBe(passphrase);
+    await vi.waitFor(() => expect(ctl.status().clientCertificates).toEqual([{ host: 'api.example.com' }]));
+    // The panel never sees a path or the passphrase; the log never has the passphrase.
+    const seen = JSON.stringify(replies);
+    expect(seen).not.toContain(certDir);
+    expect(seen).not.toContain(passphrase);
+    expect(logs.join('\n')).not.toContain(passphrase);
+
+    await ctl.handle({ type: 'removeClientCertificate', host: 'api.example.com' }, reply);
+    await vi.waitFor(() => expect(ctl.status().clientCertificates).toBeUndefined());
+    expect(stored).toEqual([]);
+    expect(safe.has('api.example.com')).toBe(false);
+    expect(ctl.status()).not.toHaveProperty('learnedPassthrough'); // proxy not running: nothing learned
+    await host.handle('settings', { settings: settings() });
+  }, 60_000);
 
   it('accepts the optional additions (workspaceFolders, uiVisible, fileSaved)', async () => {
     await host.handle('workspaceFolders', { workspaceFolders: [project, 'relative/ignored'] });

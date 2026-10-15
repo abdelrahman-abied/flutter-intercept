@@ -1,5 +1,6 @@
-// CONTRACTS §15.1 / types.ts `SidecarRequest`: the UI the sidecar can't do itself, with IDE APIs. Runs off the EDT;
-// every UI call hops to the EDT. Answers follow types.ts (value | null); refusals are errors with readable messages.
+// CONTRACTS §15.1 / §20.3 / types.ts `SidecarRequest`: the UI the sidecar can't do itself, with IDE APIs. Runs off
+// the EDT; every UI call hops to the EDT. Answers follow types.ts (value | null); refusals are errors with readable
+// messages.
 package dev.flutterintercept.ui
 
 import com.google.gson.JsonArray
@@ -10,10 +11,12 @@ import com.intellij.credentialStore.generateServiceName
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffManager
 import com.intellij.diff.requests.SimpleDiffRequest
+import com.intellij.ide.impl.ProjectUtil
 import com.intellij.notification.NotificationAction
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.fileChooser.FileChooser
 import com.intellij.openapi.fileChooser.FileChooserFactory
 import com.intellij.openapi.fileChooser.FileSaverDescriptor
 import com.intellij.openapi.fileEditor.FileEditorManager
@@ -38,6 +41,7 @@ import dev.flutterintercept.core.PathGuard
 import dev.flutterintercept.core.PathRefusedException
 import dev.flutterintercept.core.ProjectRoots
 import dev.flutterintercept.settings.ClientCertificates
+import dev.flutterintercept.settings.InterceptSettings
 import dev.flutterintercept.sidecar.RpcException
 import dev.flutterintercept.toolwindow.InterceptToolWindow
 import java.awt.datatransfer.StringSelection
@@ -70,6 +74,18 @@ object UiRequestHandler {
             "secrets.clientCertPassphrase" -> CompletableFuture.supplyAsync({
                 ClientCertificates.getPassphrase(p.requireString("host"))?.takeIf { it.isNotEmpty() }
             }, AppExecutorUtil.getAppExecutorService())
+            // CONTRACTS §20.3: "Add client certificate…" in the panel (the shared ClientCertUi's platform in the sidecar).
+            "ui.chooseClientCertificateFile" -> chooseClientCertificateFile(p)
+            "settings.writeClientCertificates" -> writeClientCertificates(p)
+            "secrets.setClientCertPassphrase" -> try {
+                val (host, passphrase) = ClientCertificates.passphraseRequest(p)
+                CompletableFuture.supplyAsync({
+                    ClientCertificates.setPassphrase(host, passphrase)
+                    null
+                }, AppExecutorUtil.getAppExecutorService())
+            } catch (e: RpcException) {
+                CompletableFuture.failedFuture(e)
+            }
             // The sidecar's own secrets (e.g. `flutterIntercept.mcpToken`) in the IDE's password safe; values never logged.
             "secrets.get" -> CompletableFuture.supplyAsync({ secretGet(p.requireString("key")) }, AppExecutorUtil.getAppExecutorService())
             "secrets.set" -> CompletableFuture.supplyAsync({
@@ -227,6 +243,35 @@ object UiRequestHandler {
             ?: project?.basePath?.let { File(it).toPath() }
         val wrapper = FileChooserFactory.getInstance().createSaveFileDialog(descriptor, project).save(dir, default?.name ?: "")
         return wrapper?.file?.absolutePath
+    }
+
+    // ── client certificates (CONTRACTS §20.3) ──────────────────────────────────────────────────────────────────
+
+    /**
+     * The IDE's file chooser for one certificate role → the absolute path, or null when cancelled. Brings the project
+     * window to the front first: in Android Studio the panel usually runs in the system browser (§15.4).
+     */
+    private fun chooseClientCertificateFile(p: JsonObject): CompletableFuture<Any?> {
+        val role = p.optString("role")?.takeIf { it in ClientCertificates.ROLES }
+            ?: return CompletableFuture.failedFuture(RpcException("role must be pfx, cert or key", "invalid"))
+        return onEdt {
+            val project = activeProject()
+            if (project != null) ProjectUtil.focusProjectWindow(project, true)
+            val file = FileChooser.chooseFile(ClientCertificates.chooserDescriptor(role), project, null) ?: return@onEdt null
+            if (!file.isInLocalFileSystem) throw RpcException("Choose a file on this computer.", "invalid")
+            val path = file.toNioPath().toAbsolutePath().toString()
+            ClientCertificates.pathProblem(path)?.let { throw RpcException(it, "invalid") }
+            path
+        }
+    }
+
+    /** Stores the user-level entries; [InterceptSettings.update] sends them back to the sidecar (`settings`). */
+    private fun writeClientCertificates(p: JsonObject): CompletableFuture<Any?> = onEdt(ModalityState.any()) {
+        val settings = InterceptSettings.getInstance()
+        val next = settings.snapshot()
+        next.clientCertificates = ClientCertificates.entriesFromSidecar(p.get("entries"), next.clientCertificates).toMutableList()
+        settings.update(next)
+        null
     }
 
     // ── ui.confirm / ui.notify ───────────────────────────────────────────────────────────────────────────────────

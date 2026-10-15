@@ -107,7 +107,14 @@ export type SidecarRequest =
   | { method: 'secrets.clientCertPassphrase'; params: { host: string } }                                                                   // → string | null
   /** REVIEW-9: the MCP token in the IDE's password store (key `flutterIntercept.mcpToken`); error code `unavailable` = no store. */
   | { method: 'secrets.get'; params: { key: string } }                                                                                     // → string | null
-  | { method: 'secrets.set'; params: { key: string; value: string } };                                                                     // → null
+  | { method: 'secrets.set'; params: { key: string; value: string } }                                                                      // → null
+  // CONTRACTS §20.3 ("Add client certificate…" in the panel; src/clientCerts.ts). Both sides check what they receive.
+  /** The IDE's file chooser (any file can be picked); cancelled → null. */
+  | { method: 'ui.chooseClientCertificateFile'; params: { role: 'pfx' | 'cert' | 'key' } }                                                // → absolute path | null
+  /** Replace the user-level `clientCertificates` (application settings); the plugin then sends `settings` as for any change. */
+  | { method: 'settings.writeClientCertificates'; params: { entries: { host: string; pfx?: string; cert?: string; key?: string }[] } }   // → null
+  /** Store the passphrase for a host pattern in the password safe (key as `secrets.clientCertPassphrase`); absent / '' deletes it. */
+  | { method: 'secrets.setClientCertPassphrase'; params: { host: string; passphrase?: string } };                                         // → null
 
 // ── sidecar → plugin events ──────────────────────────────────────────────────────────────────────────────
 export type SidecarEvent =

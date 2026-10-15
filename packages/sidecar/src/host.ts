@@ -7,7 +7,9 @@
  *
  * Plugin → sidecar methods: those of types.ts `PluginRequest`, plus three optional additions (see EXTRA_METHODS).
  * Sidecar → plugin: types.ts `SidecarRequest`s, including `secrets.clientCertPassphrase` (an error answer means "no
- * passphrase") and `secrets.get` / `secrets.set` for the MCP token (`unavailable` → private file in dataDir); events `ready`, `status`, `log`, plus `settingsChanged`.
+ * passphrase"), `secrets.get` / `secrets.set` for the MCP token (`unavailable` → private file in dataDir), and the
+ * panel's "Add client certificate…" (CONTRACTS §20.3, clientCerts.ts); events `ready`, `status`, `log`, plus
+ * `settingsChanged`.
  */
 import { execFile } from 'child_process';
 import * as crypto from 'crypto';
@@ -42,11 +44,13 @@ import { createRecordingService } from '../../extension/src/recordings/store';
 import { takeScreenshot } from '../../extension/src/screenshot';
 import { checkSourcePath, packageRootsFor, resolveFrames } from '../../extension/src/source/resolve';
 import { loadClientCertificates } from '../../extension/src/ui/clientCerts';
+import { createClientCertUi } from '../../extension/src/ui/clientCertUi';
 import { InterceptController, validateRule, validateRules } from '../../extension/src/ui/controller';
 import { matchesProxyExchange } from '../../extension/src/vm/profile';
 import type { WebSocketCtor } from '../../extension/src/vm/transport';
 import { webScreenshot } from '../../extension/src/web/screenshot';
 import { createPathDecision } from '../../extension/src/rules/createPolicy';
+import { createSidecarClientCertPlatform } from './clientCerts';
 import { createNodeContractService, DONT_CHECK, type NodeContractService } from './contract';
 import { prepareLaunch, type LaunchRecord } from './launch';
 import { RpcFailure } from './rpc';
@@ -235,6 +239,9 @@ export class SidecarHost {
   private revealed = false;
   private lastStatus = '';
   private passphraseUnsupported = false;
+  /** Client certificate loads run one at a time; a request while one runs queues (at most) one more. */
+  private certChain: Promise<void> = Promise.resolve();
+  private certQueued?: Promise<void>;
   private shuttingDown?: Promise<void>;
 
   // composed in init()
@@ -541,6 +548,17 @@ export class SidecarHost {
         await this.ask('ui.diff', { title: `Recordings: ${a.name} ↔ ${b.name}`, left: { name: `${a.name}.txt`, content: diffText(a) }, right: { name: `${b.name}.txt`, content: diffText(b) } });
       },
       analyzeAuth: (ex) => analyzeAuth(ex),
+      clientCertUi: createClientCertUi(
+        createSidecarClientCertPlatform({
+          request: (method, params) => this.ask(method, params),
+          entries: () => this.settings.clientCertificates,
+          entriesWritten: (entries) => {
+            this.settings = { ...this.settings, clientCertificates: normalizeSettings({ clientCertificates: entries }).clientCertificates };
+          },
+          reload: () => this.applyClientCertificates(),
+          log,
+        }),
+      ),
     });
     this.disposers.push(() => this.controller.dispose());
     void shared.ready.then(async () => {
@@ -751,7 +769,22 @@ export class SidecarHost {
     }
   }
 
-  private async applyClientCertificates(): Promise<void> {
+  /**
+   * Loads `settings.clientCertificates` into the proxy. Serialised: a `settings` call and the panel's save can ask at
+   * the same time, and an older load (without the new passphrase) must not finish last.
+   */
+  private applyClientCertificates(): Promise<void> {
+    if (this.certQueued) return this.certQueued;
+    const run = this.certChain.then(() => {
+      this.certQueued = undefined;
+      return this.loadClientCertificatesNow();
+    });
+    this.certQueued = run;
+    this.certChain = run;
+    return run;
+  }
+
+  private async loadClientCertificatesNow(): Promise<void> {
     try {
       const r = await loadClientCertificates(this.settings.clientCertificates, { getPassphrase: (h) => this.getPassphrase(h), log: this.log });
       this.proxyHost.setClientCertificates(r.certs, r.status);
