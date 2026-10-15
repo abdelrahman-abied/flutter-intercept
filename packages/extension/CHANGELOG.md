@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.14.1
+
+### What the server sees, and turning automatic passthrough off
+
+- The **Add client certificate** popup has a third part, **What the server sees**: the server gets the same
+  certificate, but the connection comes from Flutter Intercept instead of your app and looks a little different; most
+  servers don't notice, some security systems do. Use a certificate you're allowed to use for testing, ideally with a
+  development or staging server.
+- A request that taught Flutter Intercept to pass a server through says that the server may have logged one refused
+  connection from your computer (the first try, without the app's certificate).
+- New setting `flutterIntercept.autoPassthrough` (default on). Off: Flutter Intercept never tries such a server on its
+  own — no passthrough, no check — and those requests keep failing with the reason until you add the certificate.
+- **Add client certificate…** is also offered on a request whose server needs the app's certificate when nothing was
+  passed through (automatic passthrough off, or a rule of yours keeps the server decrypted).
+- Agents: `get_status` shows `autoPassthrough`; `list_requests` / `get_request` show `needsClientCertificate`; HAR
+  `_needsClientCertificate`.
+
 ## 0.14.0
 
 ### Apps with their own certificate (mTLS)

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.14.1 (preview)
+
+- The **Add client certificate** popup explains what the server sees (the same certificate, from a connection that
+  looks a little different from the app's), and a passed-through request says the server may have logged one refused
+  attempt.
+- New checkbox in **Settings → Tools → Flutter Intercept**: **Pass servers that need the app's own certificate, or
+  that the app pins, through automatically** (on by default). Off: those requests keep failing until you add the
+  certificate, and Flutter Intercept never tries the server on its own.
+- **Add client certificate…** is offered on such requests even when nothing was passed through. Agents:
+  `autoPassthrough` in `get_status`, `needsClientCertificate` on requests.
+
 ## 0.14.0 (preview)
 
 - **Apps with their own certificate (mTLS)**, the same as in the VS Code extension 0.14.0:
