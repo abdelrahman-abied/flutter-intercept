@@ -248,6 +248,8 @@ export function buildHar(exchanges: Exchange[], opts: HarOptions): Record<string
         ...(e.notes?.length ? { _notes: e.notes.map((n) => (r ? redactText(String(n)) : String(n))) } : {}),
         // CONTRACTS §20.2
         ...(e.learnedPassthrough ? { _learnedPassthrough: { reason: e.learnedPassthrough.reason, host: e.learnedPassthrough.host, port: e.learnedPassthrough.port } } : {}),
+        // CONTRACTS §20.7
+        ...(e.needsClientCertificate ? { _needsClientCertificate: { host: e.needsClientCertificate.host, port: e.needsClientCertificate.port } } : {}),
         ...frameFields(e, r),
         ...grpcFields(e, opts),
       };

@@ -98,6 +98,8 @@ export interface AgentApiDeps {
     readonly clientCertificateStatus?: { host: string; problem?: string }[];
     /** §20.2: hosts the proxy passes through on its own (read-only for agents: they can't forget them). */
     readonly learnedPassthrough?: Omit<LearnedPassthrough, 'grpc'>[];
+    /** §20.7: false = servers are never passed through on their own (`flutterIntercept.autoPassthrough`). */
+    readonly autoPassthrough?: boolean;
     // CONTRACTS §16.4 (InterceptProxyHost). Optional on older builds.
     readonly grpcDecryptHosts?: string[];
     readonly grpcProblem?: string;

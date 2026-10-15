@@ -183,6 +183,14 @@ export function tunnelBlockRule(e: Exchange, id: string): Rule {
   return { id, enabled: true, name: `block ${authority.replace(/^https?:\/\//i, '')} (TLS passthrough)`, match: { url: `${authority}/*` }, action: { kind: 'block', mode: 'status', status: 403 } };
 }
 
+/**
+ * CONTRACTS §20.7: the server wants the app's own client certificate — the proxy concluded it on this request
+ * (`needsClientCertificate`, learned or not) or passes this tunnel through because of it.
+ */
+export function needsOwnCertificate(e: Exchange): boolean {
+  return !!e.needsClientCertificate || e.learnedPassthrough?.reason === 'client-certificate';
+}
+
 /** CONTRACTS §14.2: why a tunnel's contents are not shown (agents' `get_request`, the panel). */
 export function tunnelReason(e: Exchange): string | undefined {
   if (e.kind !== 'tunnel') return undefined;
@@ -194,7 +202,7 @@ export function tunnelReason(e: Exchange): string | undefined {
   }
   // CONTRACTS §20.1: passed through because the proxy learned it (the app's own client certificate, or it pins).
   const learned = e.learnedPassthrough;
-  if (learned?.reason === 'client-certificate') {
+  if (needsOwnCertificate(e)) {
     return `the server${host ? ` ${host}` : ''} asks the app for its own client certificate (mutual TLS), so Flutter Intercept passes it through without decryption and the app talks to it directly; only the bytes each way and the timing are known. To see these requests, add the certificate in the Flutter Intercept panel (Add client certificate…). Only block rules (and faults) apply to it.`;
   }
   if (learned?.reason === 'pinned') {

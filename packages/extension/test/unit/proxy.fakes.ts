@@ -41,6 +41,8 @@ export function fakeProxy(opts: InterceptProxyOptions, overrides: object = {}): 
     setGrpcDecryptAll: () => undefined,
     setHttpPinLearning: () => undefined,
     setGrpcCodec: () => undefined,
+    setAutoPassthrough: () => undefined,
+    autoPassthrough: true,
     learnedPassthrough: [],
     forgetLearnedPassthrough: () => undefined,
   };

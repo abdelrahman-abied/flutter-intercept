@@ -76,6 +76,8 @@ export class AgentViews extends AgentContext {
       ...(e.clientCertificate ? { clientCertificate: e.clientCertificate } : {}),
       // CONTRACTS §20.2: this request taught the proxy to pass host:port through, or this tunnel is passed through because of it
       ...(e.learnedPassthrough ? { learnedPassthrough: { reason: e.learnedPassthrough.reason, host: e.learnedPassthrough.host, port: e.learnedPassthrough.port } } : {}),
+      // CONTRACTS §20.7: the server wants the app's own client certificate (learned or not)
+      ...(e.needsClientCertificate ? { needsClientCertificate: { host: e.needsClientCertificate.host, port: e.needsClientCertificate.port } } : {}),
       // CONTRACTS §19.4: informational notes (redacted like other free text)
       ...(e.notes?.length ? { notes: e.notes.map((n) => this.text(String(n))) } : {}),
       // CONTRACTS §16.4
@@ -358,7 +360,10 @@ export class AgentViews extends AgentContext {
     } catch {
       learned = [];
     }
+    const auto = this.deps.host.autoPassthrough;
     return {
+      // CONTRACTS §20.7
+      ...(typeof auto === 'boolean' ? { autoPassthrough: auto } : {}),
       ...(learned.length
         ? {
             learnedPassthrough: learned.slice(0, AGENT_MAX_LEARNED).map((l) => ({

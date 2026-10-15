@@ -141,6 +141,10 @@ export interface ControllerHost {
   forgetLearnedPassthrough?(key?: string): void;
   /** Fires after the learned list changed. */
   on(event: 'learnedPassthrough', l: (list: unknown) => void): unknown;
+  /** CONTRACTS §20.7: automatic passthrough on / off (`flutterIntercept.autoPassthrough`). Optional on older hosts. */
+  readonly autoPassthrough?: boolean;
+  /** Fires after it changed. */
+  on(event: 'autoPassthrough', l: (on: unknown) => void): unknown;
   // CONTRACTS §16.4 (InterceptProxyHost). Optional on older hosts.
   /** Hosts whose TLS gRPC is decrypted. */
   readonly grpcDecryptHosts?: string[];
@@ -359,6 +363,7 @@ export class InterceptController {
     deps.host.on('tlsPassthrough', () => this.broadcastStatus());
     deps.host.on('clientCertificates', () => this.broadcastStatus());
     deps.host.on('learnedPassthrough', () => this.broadcastStatus());
+    deps.host.on('autoPassthrough', () => this.broadcastStatus());
     deps.host.on('grpc', () => this.broadcastStatus());
     this.grpcSub = deps.grpc?.onDidChange?.(() => this.broadcastStatus());
     this.modelsSub = deps.contract?.onDidChangeModels(() => this.recheckContracts());
@@ -443,9 +448,9 @@ export class InterceptController {
 
   /**
    * CONTRACTS §14.2 / §14.3 / §20.2: passthrough hosts, client-certificate status (host patterns + problems only) and
-   * the hosts the proxy learned to pass through (at most STATUS_MAX_LEARNED).
+   * the hosts the proxy learned to pass through (at most STATUS_MAX_LEARNED); §20.7 whether it does so automatically.
    */
-  private tlsStatus(): Pick<Status, 'tlsPassthrough' | 'clientCertificates' | 'learnedPassthrough'> {
+  private tlsStatus(): Pick<Status, 'tlsPassthrough' | 'clientCertificates' | 'learnedPassthrough' | 'autoPassthrough'> {
     const hosts = this.deps.host.tlsPassthrough;
     const certs = this.deps.host.clientCertificateStatus;
     let learned: Status['learnedPassthrough'];
@@ -464,6 +469,8 @@ export class InterceptController {
               .map((l) => ({ host: l.host, port: l.port, reason: l.reason, ...(typeof l.until === 'number' ? { until: l.until } : {}) })),
           }
         : {}),
+      // CONTRACTS §20.7
+      ...(typeof this.deps.host.autoPassthrough === 'boolean' ? { autoPassthrough: this.deps.host.autoPassthrough } : {}),
     };
   }
 

@@ -70,7 +70,9 @@ export type ProxyLike = Pick<
   | 'setTlsPassthrough' | 'tlsPassthrough' | 'setClientCertificates'
   | 'setGrpcDecryptHosts' | 'grpcSupport' | 'setGrpcDecryptAll' | 'setGrpcCodec' | 'setHttpPinLearning'
   | 'learnedPassthrough' | 'forgetLearnedPassthrough'
->;
+> &
+  // CONTRACTS §20.7: optional until the built proxy (dist typings) has them; then move both into the Pick.
+  Partial<{ setAutoPassthrough(on: boolean): void; readonly autoPassthrough: boolean }>;
 
 /** CONTRACTS §20.2: one learned passthrough host as Status / agents show it (`until` absent = until the proxy stops). */
 export type LearnedPassthroughView = Omit<LearnedPassthrough, 'grpc'>;
@@ -461,7 +463,7 @@ export interface InterceptProxyHostOptions {
  * 'warnings' (SessionWarning[], the full current list — after every change), 'replay' (ReplayState | undefined),
  * 'upstream' ({display, ignoreCertErrors} | undefined), 'tlsPassthrough' (string[]), 'clientCertificates'
  * (ClientCertificateStatus[] — never key material), 'grpc' ({decryptHosts, problem?} — CONTRACTS §16),
- * 'learnedPassthrough' (LearnedPassthroughView[] — CONTRACTS §20.2).
+ * 'learnedPassthrough' (LearnedPassthroughView[] — CONTRACTS §20.2), 'autoPassthrough' (boolean — CONTRACTS §20.7).
  * Rules, the network profile and the app package names are kept here so they survive restarts and
  * apply from the first request.
  */
@@ -512,6 +514,8 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   // CONTRACTS §19.3
   private decryptAll = false;
   private httpPinLearning = true;
+  /** CONTRACTS §20.7: `flutterIntercept.autoPassthrough` (kept across restarts). */
+  private autoPass = true;
   private simDevices: SimulatorTrustDevice[] = [];
   /** §16.8 breaker warnings by authority (insertion order kept). */
   private readonly breakerWarnings = new Map<string, SessionWarning>();
@@ -567,6 +571,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
         ...(this.clientCerts.length ? { clientCertificates: [...this.clientCerts] } : {}),
         ...(this.grpcHosts.length ? { grpcDecryptHosts: [...this.grpcHosts] } : {}),
         ...(this.decryptAll ? { grpcDecryptAll: true } : {}),
+        ...(!this.autoPass ? { autoPassthrough: false } : {}),
       });
       try {
         await proxy.start();
@@ -601,6 +606,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       this.grpcCheck = this.readGrpcSupport(proxy);
       if (this.decryptAll) this.applyGrpcDecryptAll(proxy);
       if (!this.httpPinLearning) this.applyHttpPinLearning(proxy);
+      if (!this.autoPass) this.applyAutoPassthrough(proxy);
       if (this.grpcCodec) this.applyGrpcCodec(proxy);
       if (this.clientCerts.length) this.applyClientCertificates(proxy);
       // REVIEW-12 #1: the port is known now — re-check Map Remote targets against it
@@ -1118,6 +1124,38 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     this.httpPinLearning = next;
     this.opts.log?.(`HTTPS pin learning ${next ? 'on' : 'off (native clients are routed through the proxy)'}`);
     if (this.proxy) this.applyHttpPinLearning(this.proxy);
+  }
+
+  /**
+   * CONTRACTS §20.7: automatic passthrough (`flutterIntercept.autoPassthrough`, default on). Off: the proxy learns
+   * nothing, sends no probe and forgets what it learned (except gRPC pins under decrypt-all); it combines this with
+   * §20.6's `setHttpPinLearning`. Kept across restarts. Emits 'autoPassthrough' (boolean) when it changed.
+   */
+  setAutoPassthrough(on: boolean): void {
+    const next = on !== false;
+    if (next === this.autoPass) return;
+    this.autoPass = next;
+    this.opts.log?.(`automatic passthrough ${next ? 'on' : 'off (flutterIntercept.autoPassthrough)'}`);
+    if (this.proxy) this.applyAutoPassthrough(this.proxy);
+    this.emit('autoPassthrough', next);
+  }
+
+  /** `Status.autoPassthrough`: the setting in effect. */
+  get autoPassthrough(): boolean {
+    return this.autoPass;
+  }
+
+  private applyAutoPassthrough(proxy: ProxyLike): void {
+    try {
+      if (!proxy.setAutoPassthrough) {
+        this.opts.log?.('automatic passthrough: this proxy build cannot turn it off');
+        return;
+      }
+      proxy.setAutoPassthrough(this.autoPass);
+    } catch (e) {
+      this.opts.log?.(`automatic passthrough not applied: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    this.emitLearnedPassthrough(); // turning it off forgets learned entries
   }
 
   private applyHttpPinLearning(proxy: ProxyLike): void {

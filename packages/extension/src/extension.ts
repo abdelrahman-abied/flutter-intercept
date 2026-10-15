@@ -315,6 +315,11 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     proxyHost.setTlsPassthrough(vscode.workspace.getConfiguration('flutterIntercept').get('tlsPassthrough', []));
   };
   applyTlsPassthrough();
+  // CONTRACTS §20.7: automatic passthrough (any scope: turning it off only makes the proxy do less).
+  const applyAutoPassthrough = () => {
+    proxyHost.setAutoPassthrough(vscode.workspace.getConfiguration('flutterIntercept').get<boolean>('autoPassthrough', true) !== false);
+  };
+  applyAutoPassthrough();
   // CONTRACTS §16.4: TLS gRPC hosts to decrypt (a repo may set it: it only widens decryption for apps that trust our CA).
   const applyGrpcDecryptHosts = () => {
     proxyHost.setGrpcDecryptHosts(vscode.workspace.getConfiguration('flutterIntercept').get('grpc.decryptHosts', []));
@@ -597,6 +602,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       if (e.affectsConfiguration('flutterIntercept.contractCheck')) controller.recheckContracts();
       if (e.affectsConfiguration('flutterIntercept.upstreamProxy') || e.affectsConfiguration('flutterIntercept.upstreamProxyIgnoreCertErrors') || e.affectsConfiguration('http.proxy') || e.affectsConfiguration('http.noProxy') || e.affectsConfiguration('http.proxySupport')) applyUpstreamProxy();
       if (e.affectsConfiguration('flutterIntercept.tlsPassthrough')) applyTlsPassthrough();
+      if (e.affectsConfiguration('flutterIntercept.autoPassthrough')) applyAutoPassthrough();
       if (e.affectsConfiguration('flutterIntercept.grpc.decryptHosts')) applyGrpcDecryptHosts();
       if (e.affectsConfiguration('flutterIntercept.grpc.enabled')) grpc.enabledChanged();
       if (e.affectsConfiguration('flutterIntercept.grpc.trustOnSimulator') || e.affectsConfiguration('flutterIntercept.grpc.enabled')) {

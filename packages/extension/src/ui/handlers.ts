@@ -23,7 +23,7 @@ import {
 import { GRPC_WEB_RESEND, grpcMockRuleFromExchange, grpcResendMessages, resolveGrpcEdit, resolveSendGrpc } from './grpcHost';
 import type { ViewMsg } from './protocol';
 import { checkBodyFile, checkId, checkRuleId, checkScriptFile, fail, isInt, isObj, MAX_BODY_FILE_BYTES, MAX_SCRIPT_BYTES, onlyKeys, sanitizeGrpcSendHeaders, validateEdit, validateRule, validateSendDraft } from './validate';
-import { contractSummary, readOnlyReason, recordingSummary, RULE_KINDS, ruleFromExchangeErrorMessage, snippetFor, tunnelBlockRule } from './views';
+import { contractSummary, needsOwnCertificate, readOnlyReason, recordingSummary, RULE_KINDS, ruleFromExchangeErrorMessage, snippetFor, tunnelBlockRule } from './views';
 
 /** A host name (or IP literal) as the proxy keys learned passthrough entries (`host:port`). */
 const LEARNED_HOST = /^[a-z0-9._\-:[\]]{1,260}$/i;
@@ -111,7 +111,7 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
         throw new Error(
           ex.grpcTunnel
             ? "Can't mock or pause this gRPC connection: it is TLS that isn't decrypted, so it can only be blocked (or failed with a fault rule). Add the host to flutterIntercept.grpc.decryptHosts if the app trusts the Flutter Intercept CA in debug."
-            : ex.learnedPassthrough?.reason === 'client-certificate'
+            : needsOwnCertificate(ex)
               ? `Can't create ${what} rule from this connection: the server asks for the app's own client certificate, so it is passed through without decryption and can only be blocked (or failed with a fault rule). Add the certificate (Add client certificate…) to decrypt it.`
               : `Can't create ${what} rule from a passed-through TLS connection: it isn't decrypted, so it can only be blocked (or failed with a fault rule). Remove the host from flutterIntercept.tlsPassthrough to mock it.`,
         );
