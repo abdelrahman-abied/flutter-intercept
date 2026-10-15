@@ -304,3 +304,22 @@ extension (learned passthrough), and the user can add the certificate from the p
 | W webview | banner on such requests, Add client certificate popup (with the "why / stays on your computer" text), certificates + learned hosts list — `packages/webview/**` except `src/protocol.ts` |
 | I plugin | sidecar wiring of `createClientCertUi` (ui-requests), IntelliJ FileChooser / settings / PasswordSafe, Status — `packages/sidecar/**`, `packages/intellij/**` |
 | lead | contract, types, wiring, e2e mTLS server + integration check, docs, review |
+
+### v0.14.0 status (2026-10-15)
+Apps with their own certificate: a server that asks for the app's client certificate (TLS alert 116, 40 / 42 confirmed
+by a TLS 1.2 probe, nginx's 400) is passed through without decryption after one failed request, so the app keeps
+working with its own certificate; apps that reject the proxy's certificate on HTTPS are pinned per client for 10
+minutes (as gRPC in 0.13). **Add client certificate…** from the request, the status-line list or the palette (VS Code
+and Android Studio): native file picker (tokens; the panel never sees a path), passphrase in secret storage /
+PasswordSafe, user-level `machine`-scoped setting, removal confirmed by the IDE. Agents see `learnedPassthrough`, can't
+touch certificates. Review docs/REVIEW-14.md (two Low-Medium, three Low, all fixed), docs/PERF-2.md (no HTTPS
+regression; false pins from spare connections fixed; bundle 2.59 → 2.51 MB, budget 2.55 MB), docs/QUALITY-2.md
+(shared `learned-meta` module). The Android devices suite found one regression, fixed before release: no HTTPS pin
+learning while an emulator's native clients are routed (§20.6).
+Verified: unit tests (proxy 584, webview 567, extension 2147, cli 115, sidecar 50, plugin 106), VS Code integration on
+the packaged VSIX — default 42/42, agent 13/13 on macOS incl. gRPC and the new mTLS check (demo Dio app with a client
+certificate against `scripts/e2e/mtls_server.mjs`: first call fails once, then 200 with the app's own certificate;
+after adding the certificate the calls are decrypted), web 8/8, devices on the iOS 26.5 simulator + macOS 19/21 and
+the Android emulator 11/13 (every failure an external host timing out or resetting — jsonplaceholder also timed out
+with no proxy at all during the run), `verifyPlugin` Compatible. Not verified: physical iPhone, a real customer mTLS
+API, IPv6 targets, nginx 400 on buffered routes.
