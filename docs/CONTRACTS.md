@@ -2283,3 +2283,6 @@ extension and the sidecar.
   attempt, at most one short check for unclear refusals, the different-looking connection after adding the
   certificate, nothing that names Flutter Intercept — internal headers are removed), and how to turn automatic
   passthrough off. Plugin README the same in two lines.
+- **Certificate changes reset upstream connections** (found by the agent suite): `setClientCertificates()` retires
+  every kept-alive upstream connection and TLS session (HTTP agents, upstream-proxy agents, the LAN gate's agents, gRPC
+  sessions — calls in flight finish), so a server never keeps seeing a removed or replaced certificate.

@@ -1270,6 +1270,10 @@ export class InterceptProxy extends EventEmitter {
     }
     this.certs = loaded;
     this.certStatus = status;
+    // CONTRACTS §20.7: no kept-alive upstream connection / resumed TLS session carries a certificate that changed.
+    this.pool?.resetConnections();
+    this.lanGate?.resetAgents();
+    this.grpcPool?.retireAll();
     // CONTRACTS §20.1: a host that now has a certificate is decrypted again (the proxy presents it).
     if (loaded.length) this.learn.hosts.forget((e) => e.reason === 'client-certificate' && !!this.certFor(e.host, e.port));
     return status.map((x) => ({ ...x }));

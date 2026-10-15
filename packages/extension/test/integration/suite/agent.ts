@@ -1458,7 +1458,11 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
             const h3 = await mcpCall('hot_restart', { sessionId });
             if (h3.isError) f.push(`hot_restart (off): ${h3.text.slice(0, 200)}`);
             const r3 = await mtlsLines(from3, 1).catch(() => mtlsLines(from3, 2));
-            if (r3.some((x) => / 200 /.test(x))) f.push(`run 3 (auto passthrough off) should fail: ${r3.join(' | ').slice(0, 300)}`);
+            if (r3.some((x) => / 200 /.test(x))) {
+              const all3 = ((await mcpCall('list_requests', { sinceMs: offAt - 5000, limit: 50 })).result.items ?? []) as any[];
+              const brief = all3.filter((x) => /:486\d\d/.test(String(x.url))).map((x) => ({ u: x.url, k: x.kind, st: x.status, s: x.state, at: x.startedAt - offAt, cc: x.clientCertificate, l: x.learnedPassthrough?.reason, n: !!x.needsClientCertificate }));
+              f.push(`run 3 (auto passthrough off) should fail: ${r3.map((x) => x.replace(/.*DEMO_RESULT (\S+ \S+ ms=\d+).*/, '$1')).join(' | ')} — exchanges ${JSON.stringify(brief).slice(0, 1500)}`);
+            }
             const off = ((await mcpCall('list_requests', { url: `*:${mtlsPort}/whoami`, sinceMs: offAt, limit: 10 })).result.items ?? []) as any[];
             if (!off.length || off.some((x) => x.learnedPassthrough) || !off.some((x) => x.needsClientCertificate?.port === mtlsPort)) {
               f.push(`run 3 requests: ${JSON.stringify(off).slice(0, 300)}`);

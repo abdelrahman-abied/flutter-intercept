@@ -490,6 +490,15 @@ describe.skipIf(!haveCerts)('mTLS client certificates (CONTRACTS §14.3)', () =>
     expect(ex.error).toMatch(/comes from a web page/);
   });
 
+  it('CONTRACTS §20.7: once a certificate is removed, no kept-alive connection or resumed session presents it any more', async () => {
+    proxy.setClientCertificates([{ host: '127.0.0.1', pfx: read('client.pfx'), passphrase: 's3cret-pass' }]);
+    for (let i = 0; i < 3; i++) expect(await viaProxy(proxy.port, `https://127.0.0.1:${srv.port}/whoami`)).toMatchObject({ status: 200 });
+    proxy.setClientCertificates([]);
+    const r = await viaProxy(proxy.port, `https://127.0.0.1:${srv.port}/whoami`);
+    expect(r.status).toBe(502); // a fresh connection without a certificate: the server refuses it
+    expect((await settled(proxy)).at(-1)?.clientCertificate).toBeUndefined();
+  });
+
   it('problems are reported per entry in words, and those entries are skipped', () => {
     const status = proxy.setClientCertificates([
       { host: 'a.example', pfx: read('client.pfx'), passphrase: 'wrong' },

@@ -239,6 +239,12 @@ export interface UpstreamPool {
   readonly upstream: UpstreamProxySpec | undefined;
   /** The plan (timings, upload pacing) for the upstream request a downstream connection is about to make. */
   setRequestPlan(lookup: RequestPlanLookup | undefined): void;
+  /**
+   * Upstream connections and TLS sessions opened so far are never used again (requests in flight finish): fresh agents
+   * from now on. CONTRACTS §20.7: after the client certificates change, a server must not keep seeing the old
+   * certificate through a kept-alive connection or a resumed TLS session.
+   */
+  resetConnections(): void;
   destroy(): void;
 }
 
@@ -267,6 +273,16 @@ export function createUpstreamPool(opts: { rewriteLocalhost?: boolean } = {}): U
     },
     setRequestPlan(lookup) {
       pool.plan = lookup;
+    },
+    resetConnections() {
+      retireAgents({ http: pool.http, https: pool.https } as UpstreamAgents);
+      pool.http = rewrite ? new RewritingHttpAgent(keepAliveOptions()) : new http.Agent(keepAliveOptions());
+      pool.https = rewrite ? new RewritingHttpsAgent(keepAliveOptions()) : new https.Agent(keepAliveOptions());
+      if (pool.upstream) {
+        const spec = pool.upstream.spec;
+        retireAgents(pool.upstream);
+        pool.upstream = createUpstreamAgents(spec, undefined, rewrite ? (h) => HOST_ALIASES[h] : undefined);
+      }
     },
     destroy() {
       pools.delete(proxyConfig);

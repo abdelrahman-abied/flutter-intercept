@@ -572,8 +572,8 @@ export class LanGate {
   private _address?: { host: string; port: number };
   private _closed = false;
   private _peer?: string;
-  /** Guarded upstream agents for this gate's sockets (destroyed with the gate). */
-  readonly agents: { http: GuardedHttpAgent; https: GuardedHttpsAgent };
+  /** Guarded upstream agents for this gate's sockets (destroyed with the gate; replaced by resetAgents). */
+  agents: { http: GuardedHttpAgent; https: GuardedHttpsAgent };
 
   constructor(
     private readonly token: string,
@@ -583,6 +583,22 @@ export class LanGate {
     this.agents = {
       http: new GuardedHttpAgent(keepAliveOptions(), host),
       https: new GuardedHttpsAgent(keepAliveOptions(), host),
+    };
+  }
+
+  /**
+   * CONTRACTS §20.7: fresh agents (no kept-alive connection, no TLS session) after the client certificates changed;
+   * the old ones finish what is in flight and keep nothing.
+   */
+  resetAgents(): void {
+    for (const agent of [this.agents.http, this.agents.https] as http.Agent[]) {
+      // As upstream-proxy.ts retireAgents (not imported: it imports this module).
+      (agent as unknown as { keepSocketAlive: () => boolean }).keepSocketAlive = () => false;
+      for (const list of Object.values(agent.freeSockets)) for (const sock of list ?? []) sock.destroy();
+    }
+    this.agents = {
+      http: new GuardedHttpAgent(keepAliveOptions(), this.host),
+      https: new GuardedHttpsAgent(keepAliveOptions(), this.host),
     };
   }
 

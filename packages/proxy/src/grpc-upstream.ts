@@ -113,6 +113,12 @@ export class GrpcSessionPool {
     }
   }
 
+  /** CONTRACTS §20.7: no new calls on the sessions opened so far (calls in flight finish); new sessions from now on. */
+  retireAll(): void {
+    for (const list of [...this.entries.values()]) for (const e of [...list]) e.session.close();
+    this.entries.clear();
+  }
+
   destroyAll(): void {
     this.stopped = true;
     for (const list of [...this.entries.values()]) for (const e of [...list]) e.session.destroy();
