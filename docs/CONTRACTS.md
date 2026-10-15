@@ -2212,3 +2212,36 @@ Independent review docs/REVIEW-14.md (fix all): tokens and paths, passphrase han
 probe (no SSRF beyond what a CONNECT already allows, LAN guard, caps), what an upstream server / a web page can make the
 proxy learn, rules / replay exclusions. Performance: CONNECT handling with a learned map of 1000 entries, the error path
 of a failing mTLS host (no probe storm). Quality pass per QUALITY-1.
+
+### 20.5 As built (v0.14.0, after REVIEW-14 and PERF-2)
+- **Key and destination.** Entries are keyed on the CONNECT target (the `host:port` the app's CONNECT named — what
+  its next CONNECT is matched on). A refusal teaches only when the request names that same server: the URL host (Host,
+  `:authority` or SNI) equals the CONNECT target's host and the port matches. A CONNECT to an IP whose Host / SNI /
+  `:authority` names another host teaches nothing (the error stays as before); an app connecting by IP with Host = the
+  IP is learned under the IP.
+- **Per client.** `client-certificate` entries describe the server and apply to every client. `pinned` entries and
+  pin strikes are per client: the peer address of its connection to the proxy (the LAN device's address in LAN mode;
+  every loopback address is one client — local processes, iOS simulators and Android emulators can't be told apart).
+  A pin passes only that client's CONNECTs and silent tunnels through. `learnedPassthrough` shows one entry per
+  `host:port` (pins from several clients merged, latest `until`).
+- **Strikes.** A TLS alert from the client pins at once, for that client. A close / reset in the handshake is a
+  strike only once the proxy's TLS flight was written to that connection (> 512 bytes since the CONNECT); two strikes
+  within `PIN_STRIKE_WINDOW_MS` pin. Not counted at all when that client completed a decrypted request to the same
+  `host:port` within `PIN_STRIKE_WINDOW_MS`; a connection that carried a request ends its handshake watch.
+- **Caps.** 1000 entries in all, 250 per teaching client (a client at its limit loses its own oldest entry). Full map:
+  expired entries first, then the oldest pin; only a map full of `client-certificate` entries refuses a new one.
+  Strikes ≤ 1000, swept by age.
+- **Step-aside.** Both reasons step aside while a recording is replayed or an enabled rule names the host (also rules
+  added later): the host is decrypted again meanwhile.
+- **Event** `'learnedPassthrough'` also fires when a pin expires (one timer at the earliest `until`); not for an
+  unchanged relearn.
+- **nginx.** `Connection: close` is added at the head of an HTTPS 400 only when it is `text/html` and the host may be
+  learned (no configured certificate, no rule naming it, no replay).
+- **Probe.** Answers are reused both ways for `PROBE_NEGATIVE_MS`; a probe counts toward the 4-at-once cap until its
+  work ends; through an upstream proxy its CONNECT has the same 5 s deadline.
+- **Host.** `ClientCertPlatform` gained `getPassphrase?` (a failed save restores the old passphrase), `confirmRemove?`
+  (IDE confirmation; cancel = nothing changes, nothing sent), `reload?`; `ClientCertUi.remove` returns
+  `{cancelled?}`. One file chooser at a time. `flutterIntercept.clientCertificates` is `machine`-scoped (not synced).
+- **Plugin.** Requests `ui.chooseClientCertificateFile`, `settings.writeClientCertificates`,
+  `secrets.setClientCertPassphrase`, `secrets.clientCertPassphrase`, `ui.confirmRemoveClientCertificate`. Settings
+  Apply merges the user's certificate-text edits onto what is stored now.
