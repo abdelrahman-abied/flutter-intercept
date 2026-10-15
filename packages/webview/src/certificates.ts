@@ -14,14 +14,19 @@ export type LearnedRef = NonNullable<Exchange['learnedPassthrough']>;
 /** The popup's two ways to give a certificate: one PKCS#12 file, or a PEM certificate + its private key. */
 export type CertFormat = 'pfx' | 'pem';
 
-/** "host:port" — how the panel names a learned host (display and React keys; the host formats the proxy's key). */
-export function learnedKey(e: Pick<LearnedRef, 'host' | 'port'>): string {
-  return `${e.host}:${e.port}`;
+/** An IPv6 literal in brackets (`[2001:db8::1]`), so a port can follow it; other hosts as they are. */
+function withPortable(host: string): string {
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
 }
 
-/** The popup's host prefill: the host, plus `:port` when it isn't 443. */
+/** "host:port" — how the panel names a learned host (display and React keys; the host formats the proxy's key). */
+export function learnedKey(e: Pick<LearnedRef, 'host' | 'port'>): string {
+  return `${withPortable(e.host)}:${e.port}`;
+}
+
+/** The popup's host prefill: the host, plus `:port` when it isn't 443 (IPv6 in brackets then: `[2001:db8::1]:8443`). */
 export function certHostFor(e: Pick<LearnedRef, 'host' | 'port'>): string {
-  return e.port === 443 ? e.host : `${e.host}:${e.port}`;
+  return e.port === 443 ? e.host : `${withPortable(e.host)}:${e.port}`;
 }
 
 /** The configured certificate pattern that covers this host:port, if any (display only; the host decides). */

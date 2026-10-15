@@ -94,6 +94,9 @@ describe('pure helpers (CONTRACTS §20)', () => {
   it('host prefill adds the port when it is not 443', () => {
     expect(certHostFor({ host: 'a.example', port: 443 })).toBe('a.example');
     expect(certHostFor({ host: 'a.example', port: 8443 })).toBe('a.example:8443');
+    expect(certHostFor({ host: '2001:db8::1', port: 8443 })).toBe('[2001:db8::1]:8443'); // QUALITY-2: a valid pattern
+    expect(certHostFor({ host: '2001:db8::1', port: 443 })).toBe('2001:db8::1');
+    expect(learnedKey({ host: '2001:db8::1', port: 443 })).toBe('[2001:db8::1]:443');
   });
 
   it('names a learned host and explains each reason (QUALITY-2: exported helpers)', () => {
