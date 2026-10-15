@@ -13,8 +13,13 @@
  *   `tls.createSecureContext` with the passphrase.
  * - Writes: the **user-level** entries only (`platform.readEntries` / `writeEntries`): an entry with the same host
  *   (case-insensitive) is replaced where it is, a new one goes first (the proxy presents the first match, and the user
- *   just asked for this one); at most MAX_CLIENT_CERTS. The passphrase is stored before the entry is written (so the
- *   reload the write triggers already sees it); empty → deleted. Saves and removals run one at a time.
+ *   just asked for this one); at most MAX_CLIENT_CERTS. A new passphrase is stored before the entry is written (so the
+ *   reload the write triggers already sees it) and, REVIEW-14 #4, put back as it was when the write fails (the previous
+ *   one read through `getPassphrase`; without it the new one stays). An empty passphrase deletes the stored one only
+ *   after the write succeeded. Saves and removals run one at a time.
+ * - Remove: REVIEW-14 #4 — the IDE confirms natively (`confirmRemove`) before anything is changed; the webview's own
+ *   confirmation isn't enough (it is the least trusted part). Cancelled → nothing changes, `{cancelled: true}`.
+ * - REVIEW-14 #6: one file chooser at a time (a second `choose` while one is open → CERT_CHOOSER_OPEN).
  * - Problems are plain sentences without paths, file contents or the passphrase (the loader's texts).
  */
 import * as crypto from 'crypto';
@@ -36,6 +41,16 @@ export interface ClientCertPlatform {
   /** Store (or with undefined / '' delete) the passphrase for a host pattern in the IDE's secret store. */
   setPassphrase(host: string, passphrase: string | undefined): Promise<void>;
   /**
+   * REVIEW-14 #4, optional: the stored passphrase for a host pattern (undefined = none), read before a save replaces it
+   * so it can be put back when writing the entries fails. Without it a failed write leaves the new passphrase stored.
+   */
+  getPassphrase?(host: string): Promise<string | undefined> | string | undefined;
+  /**
+   * REVIEW-14 #4, optional: ask the user in the IDE (a native modal) before removing the certificate for `host`;
+   * resolves true to go ahead. Without it, removal isn't confirmed by the host (only by the panel).
+   */
+  confirmRemove?(host: string): Promise<boolean>;
+  /**
    * Optional: reload the certificates into the proxy after a save / removal (which also forgets the host's learned
    * passthrough, §20.1). Leave it out when writing the entries already triggers a reload (VS Code's config listener).
    */
@@ -52,8 +67,11 @@ export interface ClientCertUi {
   choose(role: ClientCertFileRole): Promise<{ token: string; name: string } | undefined>;
   /** Check, then save the entry (user level) and the passphrase. `problem` = nothing saved, the popup stays open. */
   add(req: { host: string; pfx?: string; cert?: string; key?: string; passphrase?: string }): Promise<{ problem?: string }>;
-  /** Remove the user-level entry with this host (case-insensitive) and its passphrase. */
-  remove(host: string): Promise<void>;
+  /**
+   * Remove the user-level entry with this host (case-insensitive) and its passphrase, after the IDE's confirmation
+   * (`platform.confirmRemove`); `cancelled` = the user said no, nothing changed. Throws a user-readable Error.
+   */
+  remove(host: string): Promise<{ cancelled?: true }>;
 }
 
 /** CONTRACTS §20.3: the controller's answer when no `clientCertUi` is wired. */
@@ -66,6 +84,7 @@ export const CERT_TOKEN_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const ROLES: readonly ClientCertFileRole[] = ['pfx', 'cert', 'key'];
 
 export const CERT_TOKEN_EXPIRED = 'The chosen file is no longer valid (choices last 10 minutes): choose it again.';
+export const CERT_CHOOSER_OPEN = 'A file chooser is already open.';
 export const CERT_GIVE_FILES = 'Choose a PKCS#12 file (.p12 / .pfx), or a PEM certificate and its private key.';
 
 export interface ClientCertUiOptions {
@@ -103,6 +122,7 @@ function sameHost(entry: unknown, host: string): boolean {
 
 export function createClientCertUi(platform: ClientCertPlatform, opts: ClientCertUiOptions = {}): ClientCertUi {
   const tokens = new Map<string, Chosen>();
+  let picking = false;
   const now = () => platform.now?.() ?? Date.now();
   const validate = opts.validate ?? defaultValidate;
   // One save / removal at a time (each reads, changes and writes the whole user-level list).
@@ -139,7 +159,15 @@ export function createClientCertUi(platform: ClientCertPlatform, opts: ClientCer
   return {
     async choose(role) {
       if (!ROLES.includes(role)) throw new Error('Unknown certificate file kind.');
-      const file = await platform.pickFile(role);
+      // REVIEW-14 #6: one native chooser at a time (a compromised panel can't queue them)
+      if (picking) throw new Error(CERT_CHOOSER_OPEN);
+      let file: string | undefined;
+      picking = true;
+      try {
+        file = await platform.pickFile(role);
+      } finally {
+        picking = false;
+      }
       if (file === undefined || file === null) return undefined;
       if (typeof file !== 'string' || !path.isAbsolute(file)) throw new Error("That file can't be used: choose a file on this computer.");
       try {
@@ -194,17 +222,44 @@ export function createClientCertUi(platform: ClientCertPlatform, opts: ClientCer
           const at = entries.findIndex((e) => sameHost(e, host));
           const next = at >= 0 ? entries.map((e, i) => (i === at ? entry : e)).filter((e, i) => i === at || !sameHost(e, host)) : [entry, ...entries];
           if (next.length > MAX_CLIENT_CERTS) throw new CertProblem(`You already have ${MAX_CLIENT_CERTS} client certificates: remove one first.`);
-          try {
-            await platform.setPassphrase(host, passphrase);
-          } catch (e) {
-            platform.log?.(`client certificate for ${host}: storing the passphrase failed: ${e instanceof Error ? e.message : String(e)}`);
-            throw new CertProblem("Couldn't store the passphrase in the IDE's secret storage.");
+          // REVIEW-14 #4: a new passphrase goes first (the reload the write triggers sees it) and is put back as it was
+          // when the write fails; an empty one deletes the stored one only once the entry is written.
+          let previous: { value: string | undefined } | undefined;
+          if (passphrase !== undefined) {
+            if (platform.getPassphrase) {
+              try {
+                const p = await platform.getPassphrase(host);
+                previous = { value: typeof p === 'string' && p.length > 0 ? p : undefined };
+              } catch (e) {
+                platform.log?.(`client certificate for ${host}: reading the stored passphrase failed: ${e instanceof Error ? e.message : String(e)}`);
+              }
+            }
+            try {
+              await platform.setPassphrase(host, passphrase);
+            } catch (e) {
+              platform.log?.(`client certificate for ${host}: storing the passphrase failed: ${e instanceof Error ? e.message : String(e)}`);
+              throw new CertProblem("Couldn't store the passphrase in the IDE's secret storage.");
+            }
           }
           try {
             await platform.writeEntries(next as ClientCertEntry[]);
           } catch (e) {
             platform.log?.(`client certificate for ${host}: writing the user settings failed: ${e instanceof Error ? e.message : String(e)}`);
+            if (passphrase !== undefined && previous) {
+              try {
+                await platform.setPassphrase(host, previous.value);
+              } catch (e2) {
+                platform.log?.(`client certificate for ${host}: putting the previous passphrase back failed: ${e2 instanceof Error ? e2.message : String(e2)}`);
+              }
+            }
             throw new CertProblem("Couldn't save the certificate in your user settings (see the Flutter Intercept log).");
+          }
+          if (passphrase === undefined) {
+            try {
+              await platform.setPassphrase(host, undefined);
+            } catch (e) {
+              platform.log?.(`client certificate for ${host}: deleting the old passphrase failed: ${e instanceof Error ? e.message : String(e)}`);
+            }
           }
           for (const t of used) tokens.delete(t);
           platform.log?.(`client certificate for ${host} saved to the user settings`);
@@ -230,8 +285,22 @@ export function createClientCertUi(platform: ClientCertPlatform, opts: ClientCer
         }
         const next = entries.filter((e) => !sameHost(e, host));
         if (next.length === entries.length) throw new Error(`No client certificate for ${host} is in your user settings.`);
+        // REVIEW-14 #4: the IDE confirms before anything changes (the panel's own confirmation isn't enough)
+        if (platform.confirmRemove) {
+          let ok = false;
+          try {
+            ok = (await platform.confirmRemove(host)) === true;
+          } catch (e) {
+            platform.log?.(`client certificate for ${host}: the confirmation failed: ${e instanceof Error ? e.message : String(e)}`);
+          }
+          if (!ok) return { cancelled: true as const };
+        }
+        // the list may have changed while the question was open
+        const latest = await readEntries().catch(() => entries);
+        const after = latest.filter((e) => !sameHost(e, host));
+        if (after.length === latest.length) return {};
         try {
-          await platform.writeEntries(next as ClientCertEntry[]);
+          await platform.writeEntries(after as ClientCertEntry[]);
         } catch (e) {
           platform.log?.(`client certificate for ${host}: writing the user settings failed: ${e instanceof Error ? e.message : String(e)}`);
           throw new Error("Couldn't update your user settings (see the Flutter Intercept log).");
@@ -243,6 +312,7 @@ export function createClientCertUi(platform: ClientCertPlatform, opts: ClientCer
         }
         platform.log?.(`client certificate for ${host} removed from the user settings`);
         await reload();
+        return {};
       });
     },
   };

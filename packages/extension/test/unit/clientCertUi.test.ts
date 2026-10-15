@@ -10,7 +10,7 @@ import * as tls from 'tls';
 import { execFileSync } from 'child_process';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { MAX_CLIENT_CERT_FILE_BYTES, MAX_CLIENT_CERTS, type ClientCertEntry } from '../../src/ui/clientCerts';
-import { CERT_TOKEN_EXPIRED, CERT_TOKEN_RE, CERT_TOKEN_TTL_MS, createClientCertUi, MAX_CERT_TOKENS, type ClientCertFileRole, type ClientCertPlatform } from '../../src/ui/clientCertUi';
+import { CERT_CHOOSER_OPEN, CERT_TOKEN_EXPIRED, CERT_TOKEN_RE, CERT_TOKEN_TTL_MS, createClientCertUi, MAX_CERT_TOKENS, type ClientCertFileRole, type ClientCertPlatform } from '../../src/ui/clientCertUi';
 
 let dir: string;
 let pair: { key: string; cert: string };
@@ -59,6 +59,7 @@ class FakePlatform implements ClientCertPlatform {
   reloads = 0;
   t = 1_000_000;
   failWrite = false;
+  confirms: string[] = [];
   async pickFile(_role: ClientCertFileRole) {
     return this.picks.shift();
   }
@@ -86,9 +87,27 @@ class FakePlatform implements ClientCertPlatform {
   }
 }
 
-function setup() {
+function setup(opts: { getPassphrase?: boolean; confirm?: boolean[] } = {}) {
   const p = new FakePlatform();
-  return { p, ui: createClientCertUi(p) };
+  const order: string[] = [];
+  const platform: ClientCertPlatform = {
+    pickFile: (r) => p.pickFile(r),
+    readEntries: () => p.readEntries(),
+    writeEntries: (e) => {
+      order.push('write');
+      return p.writeEntries(e);
+    },
+    setPassphrase: (h, v) => {
+      order.push(v ? 'store' : 'delete');
+      return p.setPassphrase(h, v);
+    },
+    reload: () => p.reload(),
+    log: (m) => p.log(m),
+    now: () => p.now(),
+    ...(opts.getPassphrase ? { getPassphrase: (h: string) => p.secrets.get(h) } : {}),
+    ...(opts.confirm ? { confirmRemove: async (h: string) => (p.confirms.push(h), opts.confirm!.shift() ?? false) } : {}),
+  };
+  return { p, ui: createClientCertUi(platform), order };
 }
 
 async function choose(p: FakePlatform, ui: ReturnType<typeof createClientCertUi>, role: ClientCertFileRole, file: string) {
@@ -291,6 +310,94 @@ describe('add', () => {
     const b = [await choose(p, ui, 'cert', F('client.crt')), await choose(p, ui, 'key', F('client.key'))];
     await Promise.all([ui.add({ host: 'a.example', cert: a[0].token, key: a[1].token }), ui.add({ host: 'b.example', cert: b[0].token, key: b[1].token })]);
     expect((p.entries as ClientCertEntry[]).map((e) => e.host).sort()).toEqual(['a.example', 'b.example']);
+  });
+});
+
+describe('REVIEW-14 #4: passphrase order and rollback', () => {
+  async function pemTokens(p: FakePlatform, ui: ReturnType<typeof createClientCertUi>, key = 'client.enc.key') {
+    return { cert: (await choose(p, ui, 'cert', F('client.crt'))).token, key: (await choose(p, ui, 'key', F(key))).token };
+  }
+
+  it('a failed write puts the previous passphrase back (getPassphrase)', async () => {
+    const { p, ui, order } = setup({ getPassphrase: true });
+    const OLD = ['old', String(Date.now())].join('-');
+    p.entries = [{ host: 'mtls.example', pfx: '/old.p12' }];
+    p.secrets.set('mtls.example', OLD);
+    p.failWrite = true;
+    const r = await ui.add({ host: 'mtls.example', ...(await pemTokens(p, ui)), passphrase: PASS });
+    expect(r.problem).toMatch(/Couldn't save/);
+    expect(order).toEqual(['store', 'write', 'store']);
+    expect(p.secrets.get('mtls.example')).toBe(OLD);
+    expect(p.logs.join('\n')).not.toContain(OLD);
+  });
+
+  it('nothing was stored before → the new one is deleted again', async () => {
+    const { p, ui } = setup({ getPassphrase: true });
+    p.failWrite = true;
+    await ui.add({ host: 'mtls.example', ...(await pemTokens(p, ui)), passphrase: PASS });
+    expect(p.secrets.has('mtls.example')).toBe(false);
+  });
+
+  it('without getPassphrase: the new one stays (no rollback possible), nothing is deleted', async () => {
+    const { p, ui, order } = setup();
+    p.failWrite = true;
+    await ui.add({ host: 'mtls.example', ...(await pemTokens(p, ui)), passphrase: PASS });
+    expect(order).toEqual(['store', 'write']);
+    expect(p.secrets.get('mtls.example')).toBe(PASS);
+  });
+
+  it('an empty passphrase deletes the stored one only after the write succeeded', async () => {
+    const OLD = ['old', String(Date.now())].join('-');
+    for (const failWrite of [true, false]) {
+      const { p, ui, order } = setup({ getPassphrase: true });
+      p.secrets.set('plain.example', OLD);
+      p.failWrite = failWrite;
+      await ui.add({ host: 'plain.example', ...(await pemTokens(p, ui, 'client.key')) });
+      if (failWrite) {
+        expect(order).toEqual(['write']);
+        expect(p.secrets.get('plain.example')).toBe(OLD);
+      } else {
+        expect(order).toEqual(['write', 'delete']);
+        expect(p.secrets.has('plain.example')).toBe(false);
+      }
+    }
+  });
+});
+
+describe('REVIEW-14 #4: Remove is confirmed by the IDE', () => {
+  it('cancelled → nothing changes; confirmed → removed', async () => {
+    const { p, ui } = setup({ confirm: [false, true] });
+    p.entries = [{ host: 'a.example', pfx: '/a.p12' }];
+    p.secrets.set('a.example', 'x');
+    expect(await ui.remove('a.example')).toEqual({ cancelled: true });
+    expect(p.writes).toEqual([]);
+    expect(p.secrets.get('a.example')).toBe('x');
+    expect(await ui.remove('A.example')).toEqual({});
+    expect(p.confirms).toEqual(['a.example', 'a.example']);
+    expect(p.writes.at(-1)).toEqual([]);
+    expect(p.secrets.has('a.example')).toBe(false);
+  });
+
+  it('no question for a host that has no entry', async () => {
+    const { p, ui } = setup({ confirm: [true] });
+    p.entries = [];
+    await expect(ui.remove('a.example')).rejects.toThrow(/No client certificate/);
+    expect(p.confirms).toEqual([]);
+  });
+});
+
+describe('REVIEW-14 #6: one file chooser at a time', () => {
+  it('a second choose while one is open → a problem; after it closes, fine', async () => {
+    const p = new FakePlatform();
+    let release: (v: string | undefined) => void = () => undefined;
+    const ui = createClientCertUi({ ...p, pickFile: () => new Promise((r) => (release = r)), readEntries: () => [], writeEntries: async () => undefined, setPassphrase: async () => undefined });
+    const first = ui.choose('cert');
+    await expect(ui.choose('key')).rejects.toThrow(CERT_CHOOSER_OPEN);
+    release(F('client.crt'));
+    expect((await first)?.name).toBe('client.crt');
+    const again = ui.choose('key');
+    release(undefined);
+    expect(await again).toBeUndefined();
   });
 });
 

@@ -3,6 +3,7 @@
  * Each handler validates its message, acts through the controller and answers on `reply`; a throw becomes an `error`
  * message (InterceptController.handle). Host obligations per message are documented on InterceptController.
  */
+import * as net from 'net';
 import type { Rule, SendRequest } from '@flutter-intercept/proxy';
 import { ruleFromExchange } from '@flutter-intercept/proxy/rules';
 import { SNIPPET_FORMATS } from '../codegen/snippets';
@@ -17,6 +18,14 @@ import { contractSummary, readOnlyReason, recordingSummary, RULE_KINDS, ruleFrom
 const CERT_ROLES = new Set(['pfx', 'cert', 'key']);
 /** A host name (or IP literal) as the proxy keys learned passthrough entries (`host:port`). */
 const LEARNED_HOST = /^[a-z0-9._\-:[\]]{1,260}$/i;
+
+/** REVIEW-14 #5: `{host, port?}` as the proxy keys learned entries (`[2001:db8::1]:443`, `api.example:443`, bare host). */
+export function learnedKeyOf(rawHost: string, port?: number): string {
+  const bracketed = /^\[(.+)\]$/.exec(rawHost);
+  const host = (bracketed ? bracketed[1] : rawHost).toLowerCase();
+  if (port === undefined) return host; // a bare IPv6 address is what the proxy expects without a port
+  return net.isIPv6(host) ? `[${host}]:${port}` : `${host}:${port}`;
+}
 
 function certUiOrThrow(c: InterceptController): ClientCertUi {
   if (!c.deps.clientCertUi) throw new Error(CLIENT_CERT_UI_MISSING);
@@ -354,6 +363,8 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
     removeClientCertificate: async (msg, reply) => {
       onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'host'], 'removeClientCertificate');
       if (typeof msg.host !== 'string' || !msg.host.trim() || msg.host.length > 300) fail('removeClientCertificate', 'host must be a host name pattern');
+      // REVIEW-14 #4: the IDE confirms natively; cancelled = nothing changed, no reply (the panel has nothing pending and
+      // the list in Status stays as it is).
       await certUiOrThrow(c).remove(msg.host);
     },
     forgetLearnedPassthrough: async (msg, reply) => {
@@ -367,13 +378,8 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
         h.forgetLearnedPassthrough();
         return;
       }
-      const host = msg.host.toLowerCase();
-      if (msg.port !== undefined) {
-        h.forgetLearnedPassthrough(`${host}:${msg.port}`);
-        return;
-      }
-      // A host without a port: every learned port of it.
-      for (const l of h.learnedPassthrough ?? []) if (l.host.toLowerCase() === host) h.forgetLearnedPassthrough(`${l.host}:${l.port}`);
+      // REVIEW-14 #5: the proxy's key form — `[v6]:port` for IPv6, `host:port` otherwise, a bare host = every port.
+      h.forgetLearnedPassthrough(learnedKeyOf(msg.host, msg.port));
     },
   };
 }

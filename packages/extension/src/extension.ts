@@ -392,6 +392,10 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       if (value) await context.secrets.store(passphraseSecretKey(host), value);
       else await context.secrets.delete(passphraseSecretKey(host));
     },
+    // REVIEW-14 #4: the previous passphrase is put back when a save fails; Remove is confirmed here, natively.
+    getPassphrase: (host) => Promise.resolve(context.secrets.get(passphraseSecretKey(host))),
+    confirmRemove: async (host) =>
+      (await vscode.window.showWarningMessage(`Remove the client certificate for ${host}? Its passphrase is deleted too.`, { modal: true }, 'Remove')) === 'Remove',
     log,
   });
   context.subscriptions.push(

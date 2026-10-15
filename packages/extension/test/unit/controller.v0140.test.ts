@@ -2,11 +2,14 @@
 // certificate messages (strict validation, tokens bound to the view they were issued to, no clientCertUi → error),
 // forgetLearnedPassthrough, tunnel texts for learned hosts, and InterceptProxyHost's learned list / event / forget.
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
+import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Exchange, InterceptProxyOptions, Rule } from '@flutter-intercept/proxy';
 import { InterceptProxyHost, learnedPassthroughView } from '../../src/proxyHost';
 import { CLIENT_CERT_UI_MISSING, ControllerDeps, ControllerHost, InterceptController, STATUS_MAX_LEARNED, tunnelReason } from '../../src/ui/controller';
 import { CERT_TOKEN_EXPIRED, type ClientCertUi } from '../../src/ui/clientCertUi';
+import { learnedKeyOf } from '../../src/ui/handlers';
 import type { HostMsg, Status, ViewMsg } from '../../src/ui/protocol';
 import { withFakeProxy } from './proxy.fakes';
 
@@ -52,8 +55,10 @@ class FakeUi implements ClientCertUi {
     this.adds.push(req);
     return this.next;
   }
+  cancelRemove = false;
   async remove(host: string) {
     this.removed.push(host);
+    return this.cancelRemove ? { cancelled: true as const } : {};
   }
 }
 
@@ -183,6 +188,17 @@ describe('client certificate messages (CONTRACTS §20.3)', () => {
     expect(ui.removed).toEqual(['API.example']);
     expect(replies).toEqual([]);
   });
+
+  it('REVIEW-14 #4: a Remove cancelled in the IDE sends nothing (no error, no message)', async () => {
+    const ui = new FakeUi();
+    ui.cancelRemove = true;
+    const { c, reply, replies, msgs } = setup({ clientCertUi: ui });
+    const before = msgs.length;
+    await send(c, { type: 'removeClientCertificate', host: 'a.example' }, reply);
+    expect(ui.removed).toEqual(['a.example']);
+    expect(replies).toEqual([]);
+    expect(msgs.length).toBe(before);
+  });
 });
 
 describe('forgetLearnedPassthrough (CONTRACTS §20.3)', () => {
@@ -196,8 +212,29 @@ describe('forgetLearnedPassthrough (CONTRACTS §20.3)', () => {
     await send(c, { type: 'forgetLearnedPassthrough' }, reply);
     await send(c, { type: 'forgetLearnedPassthrough', host: 'B.example', port: 443 }, reply);
     await send(c, { type: 'forgetLearnedPassthrough', host: 'a.example' }, reply);
-    expect(host.forgotten).toEqual([undefined, 'b.example:443', 'a.example:443', 'a.example:8443']);
+    expect(host.forgotten).toEqual([undefined, 'b.example:443', 'a.example']); // a bare host = every port (the proxy's form)
     expect(replies).toEqual([]);
+  });
+
+  it('REVIEW-14 #5: IPv6 hosts are keyed [v6]:port (bracketed or not in the message), a bare v6 without a port', async () => {
+    const { c, host, reply, replies } = setup();
+    await send(c, { type: 'forgetLearnedPassthrough', host: '2001:DB8::1', port: 443 }, reply);
+    await send(c, { type: 'forgetLearnedPassthrough', host: '[2001:db8::1]', port: 8443 }, reply);
+    await send(c, { type: 'forgetLearnedPassthrough', host: '2001:db8::1' }, reply);
+    await send(c, { type: 'forgetLearnedPassthrough', host: '10.0.0.5', port: 443 }, reply);
+    expect(host.forgotten).toEqual(['[2001:db8::1]:443', '[2001:db8::1]:8443', '2001:db8::1', '10.0.0.5:443']);
+    expect(replies).toEqual([]);
+  });
+
+  it('REVIEW-14 #5: the keys round-trip through the proxy parser', async () => {
+    // the proxy's own parser, from its build (the package doesn't export the module)
+    const built = path.resolve(__dirname, '..', '..', '..', 'proxy', 'dist', 'learned.js');
+    if (!fs.existsSync(built)) return;
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { parseLearnedKey } = require(built) as { parseLearnedKey: (k: string) => { host: string; port?: number } | undefined };
+    expect(parseLearnedKey(learnedKeyOf('2001:db8::1', 443))).toEqual({ host: '2001:db8::1', port: 443 });
+    expect(parseLearnedKey(learnedKeyOf('[2001:db8::1]'))).toEqual({ host: '2001:db8::1' });
+    expect(parseLearnedKey(learnedKeyOf('API.example', 8443))).toEqual({ host: 'api.example', port: 8443 });
   });
 
   it('a host without it answers an error', async () => {

@@ -109,7 +109,7 @@
         "flutterIntercept.clientCertificates": {
           "type": "array",
           "default": [],
-          "scope": "application",
+          "scope": "machine",
           "items": {
             "type": "object",
             "required": [
