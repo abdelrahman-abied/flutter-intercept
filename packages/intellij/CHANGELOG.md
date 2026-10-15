@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.14.0 (preview)
+
+- **Apps with their own certificate (mTLS)**, the same as in the VS Code extension 0.14.0:
+  - A server that asks for the app's own client certificate (or an app that rejects the proxy's certificate) is
+    passed through without decryption after one failed request, so the app keeps working with its own certificate.
+  - **Add client certificate…** on such a request or in the **Client certificates** list of the traffic view: the
+    IDE's file chooser (PKCS#12, or PEM certificate and key), then the passphrase. The location goes to the plugin
+    settings, the passphrase to the IDE's password safe; the certificate is never uploaded anywhere. Remove
+    certificates and retry passed-through servers from the same list.
+  - Agents: `learnedPassthrough` in `get_status`, `list_requests` and `get_request`.
+- **Fix**: decoding a gRPC message on demand in the traffic view works again.
+
 ## 0.13.0 (preview)
 
 - **gRPC-Web, grpcurl and TLS gRPC on the iOS simulator**, the same as in the VS Code extension 0.13.0:

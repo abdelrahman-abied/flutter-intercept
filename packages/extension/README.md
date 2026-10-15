@@ -463,7 +463,7 @@ endpoints.
 **Pinned hosts, certificates and native clients**
 
 39. [Let pinned hosts through without decryption](#let-pinned-hosts-through-without-decryption)
-40. [Use a client certificate (mTLS)](#use-a-client-certificate-mtls)
+40. [Apps with their own certificate (mTLS)](#apps-with-their-own-certificate-mtls)
 41. [Route native clients on an Android emulator](#route-native-clients-on-an-android-emulator)
 42. [Find requests that bypass the proxy](#find-requests-that-bypass-the-proxy)
 
@@ -1151,20 +1151,37 @@ the bytes sent and received, and your pinning checks passing.
 paused; a block rule still cuts the connection. `*` in a pattern also matches dots (`*.example` matches
 `a.b.example`). A host in both this setting and `flutterIntercept.grpc.decryptHosts` is passed through.
 
-### Use a client certificate (mTLS)
+### Apps with their own certificate (mTLS)
 
-You'll reach a server that requires your app's client certificate.
+You'll keep an app working when its server asks for the app's own certificate (mutual TLS), and then see those
+requests too.
 
-1. Open your **user** settings and add an entry to `flutterIntercept.clientCertificates`, for example
-   `{"host": "api.corp.example", "pfx": "~/certs/app.p12"}` (or `"cert"` and `"key"` PEM files).
-2. If the file has a passphrase, run **Flutter Intercept: Set Client Certificate Passphrase…**.
-3. Run the app.
+1. Run the app as usual. Nothing to set up.
+2. The first request to such a server may fail once. Its details say "This server needs the app's own client
+   certificate…": from then on Flutter Intercept passes that server through **without decryption**, so the app talks
+   to it directly with its own certificate. The app's next requests work, and show as "not decrypted" rows.
+3. To see these requests, click **Add client certificate…** on that request (the server is filled in), choose the
+   certificate file — a PKCS#12 file (`.p12` / `.pfx`), or a PEM certificate and its private key — and type its
+   passphrase if it has one. Save.
 
-**You should see:** requests to that host succeed, with a "client certificate: api.corp.example" badge in the
-details. A certificate that can't be loaded shows the reason in the status line.
+**You should see:** the next requests to that server decrypted like any other, with a "client certificate" badge in
+the details.
 
-**Tip:** the passphrase is kept in VS Code's secret storage, and certificate contents never appear in the panel,
-logs or anything AI agents read.
+**Tip:** the certificate stays where it is on your computer. Flutter Intercept only remembers its location (in your
+**user** settings, `flutterIntercept.clientCertificates`) and presents it to that server during the connection, the
+way your app does; it is never uploaded anywhere. The passphrase is kept in VS Code's secret storage. The **Client
+certificates** item in the status line lists what you added (Remove) and the servers passed through automatically
+(**Try decrypting again**). Agents can't add, read or remove certificates. The same works from the palette:
+**Flutter Intercept: Add Client Certificate…**.
+
+**Good to know:**
+- A server stays passed through until the proxy stops, you choose **Try decrypting again**, or you add its
+  certificate.
+- If one of your rules targets that server (a mock, for example), it is never passed through automatically, so your
+  rules keep working: add the certificate instead.
+- Apps that pin their own certificate are handled the same way: after the app rejects the Flutter Intercept
+  certificate, that server is passed through for 10 minutes. Pinning that checks after the response (Dio's
+  `validateCertificate`) can't be detected: add the host to `flutterIntercept.tlsPassthrough`.
 
 ### Route native clients on an Android emulator
 

@@ -189,8 +189,10 @@ These aren't intercepted:
 gRPC-Web calls are shown as gRPC and can be mocked or blocked, but message-level breakpoints, Mutate JSON, gRPC
 script hooks and resend don't apply to them yet.
 
-Hosts the app pins itself (Dio's `validateCertificate`) need `flutterIntercept.tlsPassthrough`; servers that
-require a client certificate need `flutterIntercept.clientCertificates`. See the full
+Servers that need the app's own client certificate (mTLS), and apps that reject the proxy's certificate, keep working:
+after one failed request that server is passed through without decryption. To see those requests, add the certificate
+from the panel (**Add client certificate…**). Pinning checked after the response (Dio's `validateCertificate`) still
+needs `flutterIntercept.tlsPassthrough`. See the full
 [limitations](packages/extension/README.md#limitations).
 
 ## Requirements

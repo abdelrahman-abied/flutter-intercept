@@ -71,6 +71,18 @@ The VS Code tutorials cover it step by step, starting at
 [See gRPC calls and their messages](../extension/README.md#see-grpc-calls-and-their-messages); the
 [limitations](../extension/README.md#limitations) apply here too.
 
+## Apps with their own certificate (mTLS)
+
+1. Run the app. If a server asks for the app's own certificate, the first request to it may fail once; after that the
+   server is passed through without decryption and the app talks to it directly with its own certificate.
+2. To see those requests, click **Add client certificate…** on that request in the traffic view, choose the PKCS#12
+   file (or the PEM certificate and its key) in the IDE's file chooser, type the passphrase if there is one, and save.
+
+The certificate stays where it is on your computer: the plugin only remembers its location (Settings → Tools →
+Flutter Intercept) and presents it to that server during the connection, the way the app does. It is never uploaded
+anywhere. The passphrase goes to the IDE's password safe. Step by step:
+[Apps with their own certificate](../extension/README.md#apps-with-their-own-certificate-mtls).
+
 ## Differences from VS Code
 
 - Android Studio shows the traffic through the Flutter plugin's embedded browser (see above).

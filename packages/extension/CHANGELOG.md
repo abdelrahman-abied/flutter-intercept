@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.14.0
+
+### Apps with their own certificate (mTLS)
+
+- **Servers that need the app's own certificate keep working.** When a server asks for a client certificate the proxy
+  doesn't have (a TLS `certificate_required` alert, a handshake failure confirmed by a short probe that sees the
+  server ask for a certificate, or nginx's "No required SSL certificate was sent"), the first request fails once with
+  a clear explanation. From then on that server is passed through **without decryption**, so the app talks to it
+  directly with its own certificate and key, which Flutter Intercept never sees. Its keep-alive connections are
+  closed so the next request already goes direct. It lasts until the proxy stops, **Try decrypting again**, or a
+  certificate is added for it.
+- **Apps that reject the proxy's certificate** (their own trusted roots, pinning in the TLS handshake) are handled the
+  same way for HTTPS, as 0.13 did for gRPC: that server is passed through for 10 minutes after a TLS alert, or after
+  two rejected handshakes within a minute.
+- Never automatic when a rule of yours targets that server (so mocks and breakpoints keep working), while a recording
+  is replayed, or when a certificate is already configured for it (then the server rejected that certificate, and the
+  request says so).
+- **Add client certificate…** on such a request (the server is filled in), or from the new **Client certificates**
+  item in the status line, or **Flutter Intercept: Add Client Certificate…** in the palette: choose a PKCS#12 file or
+  a PEM certificate and key, type the passphrase, save. The popup explains why the certificate is needed and that it
+  stays on your computer. The file stays where it is (its location goes to the user-level
+  `flutterIntercept.clientCertificates`), the passphrase to VS Code's secret storage; the panel never sees the path.
+  The same list removes certificates and lets passed-through servers be tried again. No settings.json editing.
+- Passed-through rows say why ("This server needs the app's own certificate: passed through without decryption.").
+
+### Agent API
+- `get_status` shows `learnedPassthrough` (host, port, reason, until). `list_requests` / `get_request` show
+  `learnedPassthrough` on the request that failed and on the passed-through tunnels; HAR `_learnedPassthrough`.
+- Agents can't add, read or remove certificates, and can't make a server be tried again.
+
+### Fixes
+- The panel dropped the host's answer to "decode this gRPC message" (since 0.10): decoding a gRPC call on demand in
+  the panel works again.
+
 ## 0.13.0
 
 ### gRPC-Web, grpcurl and TLS gRPC on the iOS simulator
