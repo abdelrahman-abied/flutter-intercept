@@ -172,6 +172,18 @@ export function reducer(state: State, action: Action): State {
     case 'toggleWaterfall':
       return { ...state, showWaterfall: !state.showWaterfall };
 
+    case 'openCertDialog':
+      return { ...state, certDialog: { id: (state.certDialog?.id ?? 0) + 1, host: action.host, files: {} } };
+
+    case 'closeCertDialog':
+      return state.certDialog ? { ...state, certDialog: undefined } : state;
+
+    case 'certPicking':
+      return state.certDialog ? { ...state, certDialog: { ...state.certDialog, picking: action.role, problem: undefined } } : state;
+
+    case 'certSaving':
+      return state.certDialog ? { ...state, certDialog: { ...state.certDialog, saving: action.host, problem: undefined } } : state;
+
     case 'grpcRequested': {
       const prev = state.grpcDecoded[action.id];
       return {

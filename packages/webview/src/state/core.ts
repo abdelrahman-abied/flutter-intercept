@@ -1,6 +1,6 @@
 /** Core state types, the initial state, persistence and the Action union. Split out of ../state.ts (QUALITY-1 Q6). */
 import type { GrpcDecodeEntry } from '../grpc';
-import type { AuthFlowSummary, ContractSummary, Exchange, HostMsg, RecordingSummary, Rule, RuleAction, Status } from '../protocol';
+import type { AuthFlowSummary, ClientCertFileRole, ContractSummary, Exchange, HostMsg, RecordingSummary, Rule, RuleAction, Status } from '../protocol';
 import type { StatusClass } from '../util';
 
 export const MAX_HOST_ERRORS = 5;
@@ -57,6 +57,25 @@ export interface GrpcComposer {
 }
 export interface HostError { id: number; message: string }
 
+/**
+ * CONTRACTS §20.3: the open "Add client certificate" popup — the parts host answers change. Never persisted (not in
+ * Persisted) and never holds a path or the passphrase: the passphrase lives only in the popup's own field, and a file is
+ * a one-use token plus its base name.
+ */
+export interface CertDialog {
+  /** Bumped on every open: the popup remounts with a fresh host field. */
+  id: number;
+  /** Host prefill. */
+  host: string;
+  files: Partial<Record<ClientCertFileRole, { token: string; name: string }>>;
+  /** A file picker is open for this role (the host answers `clientCertificateFile`). */
+  picking?: ClientCertFileRole;
+  /** `addClientCertificate` sent for this host; waiting for `clientCertificateSaved`. */
+  saving?: string;
+  /** The host's answer: a file couldn't be used, or nothing was saved (wrong passphrase, key doesn't match…). */
+  problem?: string;
+}
+
 export interface State {
   exchanges: Exchange[];        // arrival order (oldest first)
   rules: Rule[];
@@ -95,6 +114,8 @@ export interface State {
   grpcDecoded: Record<string, GrpcDecodeEntry>;
   /** A new rule prefilled from an exchange ("Rewrite / Script / Map remote for this…"), opened unsaved in the editor. */
   ruleTemplate?: Rule;
+  /** CONTRACTS §20.3: the "Add client certificate" popup, while open. */
+  certDialog?: CertDialog;
 }
 
 export const NEW_RULE = '__new__';
@@ -171,4 +192,11 @@ export type Action =
   /** Open the rule editor on a new, unsaved rule prefilled from an exchange (CONTRACTS §18). */
   | { type: 'newRuleFrom'; rule: Rule }
   /** CONTRACTS §18.4: the gRPC part of "Edit and resend". */
-  | { type: 'patchGrpcComposer'; patch: Partial<GrpcComposer> };
+  | { type: 'patchGrpcComposer'; patch: Partial<GrpcComposer> }
+  /** CONTRACTS §20.3: the "Add client certificate" popup (host = prefill, '' = empty). */
+  | { type: 'openCertDialog'; host: string }
+  | { type: 'closeCertDialog' }
+  /** `chooseClientCertificateFile` posted for this role. */
+  | { type: 'certPicking'; role: ClientCertFileRole }
+  /** `addClientCertificate` posted for this host. */
+  | { type: 'certSaving'; host: string };

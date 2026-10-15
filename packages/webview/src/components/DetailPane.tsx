@@ -13,6 +13,7 @@ import { frameTotal, hasMessagesTab } from '../frames';
 import { GRPC_TUNNEL_HINT, GRPC_WEB_LATER, isGrpc, isGrpcTunnel, isGrpcWeb } from '../grpc';
 import { GrpcPauseEditor, GrpcStatusSection, GrpcTunnelExplanation, TrailersSection, useGrpcDecode } from './GrpcViews';
 import { FramesView } from './FramesView';
+import { LearnedBanner } from './Certificates';
 import { expireTokenError, expireTokenLabel } from '../scenarios';
 import { PauseEditor } from './Editors';
 import { Icon } from './Icon';
@@ -187,6 +188,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
         ) : (
           ex.error && <div class="msg error">{ex.error}</div>
         )}
+        {ex.learnedPassthrough && <LearnedBanner ex={ex} />}
         {ex.notes && ex.notes.length > 0 && (
           // CONTRACTS §19.4: informational notes (never errors) — e.g. "mutate: no schema for /pkg.Svc/Method".
           <ul class="msg info exchange-notes" aria-label="Notes">
@@ -307,7 +309,7 @@ export function TunnelTab({ ex }: { ex: Exchange }) {
         </tbody>
       </table>
       <p class="hint">{tunnelBytesText(ex)}.</p>
-      {grpcTun ? <GrpcTunnelExplanation host={host} /> : <>
+      {grpcTun ? <GrpcTunnelExplanation host={host} /> : ex.learnedPassthrough ? <LearnedTunnelExplanation lp={ex.learnedPassthrough} /> : <>
       <h4 class="section-title">Why it isn't decrypted</h4>
       <p>
         {pattern ? <><code>{host}</code> matches <code>{pattern}</code> in </> : <><code>{host}</code> is listed in </>}
@@ -327,6 +329,37 @@ export function TunnelTab({ ex }: { ex: Exchange }) {
       </p>
       </>}
     </div>
+  );
+}
+
+/** CONTRACTS §20.1: a tunnel the proxy passed through on its own (not configured in a setting). */
+function LearnedTunnelExplanation({ lp }: { lp: NonNullable<Exchange['learnedPassthrough']> }) {
+  return (
+    <>
+      <h4 class="section-title">Why it isn't decrypted</h4>
+      {lp.reason === 'client-certificate' ? (
+        <p>
+          <code>{lp.host}</code> asks the app to prove who it is with a certificate (mutual TLS), and Flutter Intercept
+          doesn't have that certificate. So it passes the connection straight through: the app does the TLS with the
+          server itself, with its own certificate, and keeps working.
+        </p>
+      ) : (
+        <p>
+          The app refused the proxy's certificate for <code>{lp.host}</code> (it checks the server's certificate itself),
+          so for a few minutes the connection is passed straight through and the app keeps working.
+        </p>
+      )}
+      <p class="muted">
+        Only the timing up to the tunnel opening and the encrypted byte counts are known. Mock, breakpoint, rewrite and
+        script rules never apply; a Block rule (or a fault) on this host still does.
+      </p>
+      <h4 class="section-title">To see this traffic</h4>
+      <p>
+        {lp.reason === 'client-certificate'
+          ? <>Add the app's certificate (<strong>Add client certificate…</strong> above). New connections are then decrypted and listed as normal requests — restart the app if it keeps an open connection.</>
+          : <>Let the app trust the Flutter Intercept certificate in debug builds, then <strong>Try decrypting again</strong> above.</>}
+      </p>
+    </>
   );
 }
 

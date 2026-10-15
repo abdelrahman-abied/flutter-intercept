@@ -55,11 +55,20 @@ export function tunnelBytesText(ex: Pick<Exchange, 'tunnelBytes' | 'state'>): st
   return `${formatBytes(b.sent)} sent by the app · ${formatBytes(b.received)} received from the server (encrypted)`;
 }
 
+/** CONTRACTS §20.1: plain words for why the proxy passes a host through on its own. */
+export const LEARNED_REASON: Record<NonNullable<Exchange['learnedPassthrough']>['reason'], string> = {
+  'client-certificate': 'needs the app\'s own certificate',
+  'pinned': 'the app doesn\'t accept the proxy\'s certificate',
+};
+
 /** Tooltip of the list badge / row. */
-export function tunnelTitle(ex: Pick<Exchange, 'tunnelBytes' | 'state' | 'url'>): string {
+export function tunnelTitle(ex: Pick<Exchange, 'tunnelBytes' | 'state' | 'url'> & Partial<Pick<Exchange, 'learnedPassthrough'>>): string {
   const { host, port } = tunnelTarget(ex);
   const live = ex.state === 'pending' ? ' · open' : '';
-  return `${TUNNEL_LABEL}: ${host}:${port} matches ${TLS_PASSTHROUGH_SETTING}${live}\n${tunnelBytesText(ex)}`;
+  const why = ex.learnedPassthrough
+    ? `passed through automatically (${LEARNED_REASON[ex.learnedPassthrough.reason]})`
+    : `matches ${TLS_PASSTHROUGH_SETTING}`;
+  return `${TUNNEL_LABEL}: ${host}:${port} ${why}${live}\n${tunnelBytesText(ex)}`;
 }
 
 /**

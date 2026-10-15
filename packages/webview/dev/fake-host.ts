@@ -59,6 +59,10 @@
  * (schema counts, one decrypt host), `decodeGrpc` answered with fake schema JSON (raw fields for an unknown method,
  * plus skeletons), and `createRuleFromExchange` with `grpcMock`. ?grpc=0 turns it off; ?grpcProblem=1 adds the
  * proxy's self-check problem (banner).
+ *
+ * v0.14.0 (CONTRACTS §20): a request that failed because the server needs the app's own certificate, a tunnel passed
+ * through because of it, `Status.learnedPassthrough` (plus a pinned host), and the "Add client certificate" messages
+ * (fake file names; passphrase "wrong" answers with a problem). ?v14=0 turns it off.
  */
 import type {
   GrpcEdit, AuthFlowSummary, Body, ContractSummary, CorsInfo, Frame, GraphqlInfo, Exchange, HostMsg, NetworkProfile, RequestEdit, ResponseEdit,
@@ -510,7 +514,38 @@ function onViewMsg(msg: ViewMsg) {
       if (!status.networkProfile) delete status.networkProfile;
       send({ type: 'status', status });
       break;
+    // CONTRACTS §20.3 (v0.14.0): fake picker / save; passphrase "wrong" → a problem, the popup stays open.
+    case 'chooseClientCertificateFile': {
+      const name = { pfx: 'client.p12', cert: 'client.crt', key: 'client.key' }[msg.role];
+      setTimeout(() => send({ type: 'clientCertificateFile', role: msg.role, file: { token: `tok_${++seq}`, name } }), 300);
+      break;
+    }
+    case 'addClientCertificate': {
+      const problem = msg.passphrase === 'wrong' ? 'Wrong passphrase for client.p12.' : undefined;
+      if (!problem) {
+        const certs = (status.clientCertificates ?? []).filter((c) => c.host.toLowerCase() !== msg.host.toLowerCase());
+        status = { ...status, clientCertificates: [...certs, { host: msg.host }],
+          learnedPassthrough: (status.learnedPassthrough ?? []).filter((l) => l.reason !== 'client-certificate' || !hostMatches(msg.host, l.host)) };
+        send({ type: 'status', status });
+      }
+      setTimeout(() => send({ type: 'clientCertificateSaved', host: msg.host, problem }), 400);
+      break;
+    }
+    case 'removeClientCertificate':
+      status = { ...status, clientCertificates: (status.clientCertificates ?? []).filter((c) => c.host.toLowerCase() !== msg.host.toLowerCase()) };
+      send({ type: 'status', status });
+      break;
+    case 'forgetLearnedPassthrough':
+      status = { ...status, learnedPassthrough: msg.host === undefined ? []
+        : (status.learnedPassthrough ?? []).filter((l) => !(l.host === msg.host && (msg.port === undefined || l.port === msg.port))) };
+      send({ type: 'status', status });
+      break;
   }
+}
+
+/** Dev only: "host" or "host:port" vs a host name (no globs). */
+function hostMatches(pattern: string, host: string): boolean {
+  return pattern.toLowerCase().replace(/:\d+$/, '') === host.toLowerCase();
 }
 
 function invalidSend(r: SendDraft): string | undefined {
@@ -1463,6 +1498,33 @@ function startV8() {
   send({ type: 'status', status });
 }
 setTimeout(startV8, 0);
+
+// ---------------------------------------------------------------- v0.14.0 (CONTRACTS §20)
+
+function startV14() {
+  if (params.get('v14') === '0') return;
+  const host = 'mtls.example.com';
+  const failed: Exchange = {
+    id: `ex_${++seq}`, startedAt: Date.now() - 6000, method: 'GET', url: `https://${host}/v1/account`,
+    requestHeaders: { ...UA, host }, state: 'error', durationMs: 85, timings: fakeTimings(80, 20),
+    error: `This server needs the app's own client certificate (TLS alert certificate_required). From now on ${host} is passed ` +
+      'through without decryption, so the app talks to it directly with its own certificate. To see these requests, add the ' +
+      'certificate in the Flutter Intercept panel (Add client certificate…).',
+    learnedPassthrough: { reason: 'client-certificate', host, port: 443 },
+  };
+  record(failed, true);
+  send({ type: 'exchange', exchange: failed });
+  const id = openTunnel(host, { live: true });
+  const t = find(id)!;
+  update(t, { learnedPassthrough: { reason: 'client-certificate', host, port: 443 },
+    notes: ['This server needs the app\'s own certificate: passed through without decryption.'] });
+  status = { ...status, learnedPassthrough: [
+    { host, port: 443, reason: 'client-certificate' },
+    { host: 'pinned.shop.example', port: 443, reason: 'pinned', until: Date.now() + 10 * 60_000 },
+  ] };
+  send({ type: 'status', status });
+}
+setTimeout(startV14, 0);
 document.getElementById('dev-tunnel')?.addEventListener('click', () => openTunnel(pick(['pay.bank.example', 'cards.bank.example', 'pinned.example.com']), { live: true }));
 
 // ---------------------------------------------------------------- v0.10.0 (CONTRACTS §16)

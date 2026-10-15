@@ -2,6 +2,7 @@ import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import { AppContext, useApp } from '../context';
 import type { ConnectionState, Host } from '../host';
 import type { HostMsg, Status } from '../protocol';
+import { CertDialog, CertsPanel, CertsStatusItem, LearnedStatusItem } from './Certificates';
 import { agentLine } from '../util';
 import { FALLBACK_LABEL, pendingApprovalText, INSECURE_TITLE, SHARED_FILE } from '../scenarios';
 import { clientCertSummary, fromVsCodeProxy, passthroughSummary, upstreamLabel, upstreamTitle } from '../connection';
@@ -67,6 +68,8 @@ export function App({ host }: { host: Host }) {
   }, [filters, view, detailTab, selectedId, splitPct, drafts, editingRuleId, composer, dismissedWarnings, showWaterfall]);
 
   const ctx = useMemo(() => ({ state, dispatch, post: host.post }), [state, host]);
+  // CONTRACTS §20.3: the client certificates / learned hosts list, opened from the status line.
+  const [certsOpen, setCertsOpen] = useState(false);
 
   return (
     <AppContext.Provider value={ctx}>
@@ -86,7 +89,12 @@ export function App({ host }: { host: Host }) {
             : state.view === 'recordings' ? <RecordingsView />
             : <AuthFlowsView />}
         </main>
-        <StatusLine />
+        {certsOpen && <CertsPanel onClose={(restore) => {
+          setCertsOpen(false);
+          if (restore) document.querySelector<HTMLElement>('.statusline .certs-toggle')?.focus();
+        }} />}
+        <StatusLine certsOpen={certsOpen} onToggleCerts={() => setCertsOpen(!certsOpen)} />
+        <CertDialog />
       </div>
     </AppContext.Provider>
   );
@@ -192,7 +200,7 @@ function EmptyState() {
   );
 }
 
-function StatusLine() {
+function StatusLine({ certsOpen, onToggleCerts }: { certsOpen: boolean; onToggleCerts: () => void }) {
   const { state } = useApp();
   const { status, exchanges, filters, connected, contracts } = state;
   const shown = useMemo(() => filterExchanges(exchanges, filters, contracts).length, [exchanges, filters, contracts]);
@@ -231,7 +239,8 @@ function StatusLine() {
       {passthrough && <span class="passthrough-status" title={passthrough.title}>{passthrough.text}</span>}
       {grpc && <span class={`grpc-status-item${grpc.problems ? ' has-problem' : ''}`} title={grpc.title}>{grpc.text}</span>}
       {simTrust && <span class="sim-trust-status" title={simTrust.title}>{simTrust.text}</span>}
-      {certs && <ClientCertStatus certs={status.clientCertificates!} summary={certs} />}
+      {connected && <LearnedStatusItem learned={status.learnedPassthrough} open={certsOpen} onToggle={onToggleCerts} />}
+      {connected && <CertsStatusItem certs={status.clientCertificates} summary={certs} open={certsOpen} onToggle={onToggleCerts} />}
       {status.replay && (
         <span class="replay-status" title={`Answering requests from the recording “${status.replay.recording}”; unmatched requests ${FALLBACK_LABEL[status.replay.fallback]}.`}>
           Replaying {status.replay.recording}
@@ -239,28 +248,6 @@ function StatusLine() {
       )}
       {status.agent && <AgentStatusItem agent={status.agent} />}
     </footer>
-  );
-}
-
-const CERTS_SHOWN = 3;
-
-/** CONTRACTS §14.3: the configured client certificates by host pattern; a load problem is highlighted (never key material). */
-function ClientCertStatus({ certs, summary }: {
-  certs: NonNullable<Status['clientCertificates']>; summary: NonNullable<ReturnType<typeof clientCertSummary>>;
-}) {
-  // Problems first, so a broken certificate is never hidden behind "+N".
-  const sorted = [...certs.filter((c) => c.problem), ...certs.filter((c) => !c.problem)];
-  const shown = sorted.slice(0, CERTS_SHOWN);
-  return (
-    <span class={`cert-status${summary.problems ? ' has-problem' : ''}`} title={summary.title}>
-      {summary.problems ? `Client certificates (${summary.problems} problem${summary.problems === 1 ? '' : 's'}):` : 'Client certificates:'}
-      {shown.map((c, i) => (
-        <span key={i} class={`cert-host${c.problem ? ' cert-problem' : ''}`} title={c.problem ? `${c.host}: ${c.problem}` : c.host}>
-          {' '}{c.problem ? '✕ ' : ''}{c.host}{i < shown.length - 1 ? ',' : ''}
-        </span>
-      ))}
-      {sorted.length > CERTS_SHOWN && <span class="muted"> +{sorted.length - CERTS_SHOWN}</span>}
-    </span>
   );
 }
 

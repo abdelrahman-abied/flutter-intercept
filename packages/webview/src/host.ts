@@ -33,7 +33,13 @@ export interface Host {
 /** `connecting` = first attempt, `open` = connected, `reconnecting` = lost (or never reached) and retrying. */
 export type ConnectionState = 'connecting' | 'open' | 'reconnecting';
 
-const HOST_TYPES = new Set(['snapshot', 'exchange', 'rules', 'status', 'removed', 'error', 'cleared', 'sent', 'contract', 'recordings', 'authFlows', 'select', 'exported']);
+/** Every HostMsg type (a missing one fails to compile: a type left out here would be dropped silently). */
+const HOST_TYPE_LIST = {
+  snapshot: true, exchange: true, rules: true, status: true, removed: true, error: true, cleared: true, sent: true,
+  contract: true, recordings: true, authFlows: true, select: true, exported: true, grpcDecoded: true,
+  clientCertificateFile: true, clientCertificateSaved: true,
+} satisfies Record<HostMsg['type'], true>;
+const HOST_TYPES = new Set<string>(Object.keys(HOST_TYPE_LIST));
 
 export function isHostMsg(data: unknown): data is HostMsg {
   return typeof data === 'object' && data !== null && HOST_TYPES.has((data as { type?: unknown }).type as string);

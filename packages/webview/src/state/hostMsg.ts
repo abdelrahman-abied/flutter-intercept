@@ -191,6 +191,10 @@ export function applyHostMsg(state: State, msg: HostMsg): State {
         hostErrors: [...state.hostErrors, { id: nextErrorId(), message: msg.message }].slice(-MAX_HOST_ERRORS),
         resolving: {},
         composer: state.composer?.sending ? { ...state.composer, sending: false } : state.composer,
+        // e.g. "Adding client certificates isn't available here.": the popup stops waiting (and shows it inline).
+        certDialog: state.certDialog && (state.certDialog.saving || state.certDialog.picking)
+          ? { ...state.certDialog, saving: undefined, picking: undefined, problem: msg.message }
+          : state.certDialog,
       };
 
     case 'cleared':
@@ -210,6 +214,29 @@ export function applyHostMsg(state: State, msg: HostMsg): State {
 
     case 'exported':
       return { ...state, notice: notice(`Exported ${EXPORT_LABEL[msg.format] ?? msg.format} to ${msg.path}`) };
+
+    case 'clientCertificateFile': {
+      // CONTRACTS §20.3: only the popup that asked uses the token (a late answer after Cancel is dropped; it expires).
+      const d = state.certDialog;
+      if (!d || d.picking !== msg.role) return state;
+      if (msg.file) return { ...state, certDialog: { ...d, picking: undefined, problem: undefined, files: { ...d.files, [msg.role]: msg.file } } };
+      return { ...state, certDialog: { ...d, picking: undefined, problem: msg.problem } }; // no file, no problem = cancelled
+    }
+
+    case 'clientCertificateSaved': {
+      const d = state.certDialog;
+      const ours = !!d?.saving && d.saving.toLowerCase() === msg.host.toLowerCase();
+      if (msg.problem) {
+        // The popup stays open with the problem inline; with no popup waiting, it is a notice.
+        if (ours) return { ...state, certDialog: { ...d!, saving: undefined, problem: msg.problem } };
+        return { ...state, notice: notice(`Client certificate for ${msg.host} not saved: ${msg.problem}`) };
+      }
+      return {
+        ...state,
+        certDialog: ours ? undefined : d,
+        notice: notice(`Client certificate saved for ${msg.host}. New connections to it are decrypted and shown.`),
+      };
+    }
 
     case 'grpcDecoded': {
       // Answers are kept only for exchanges still listed; the answer is for the version last asked for.
