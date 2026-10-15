@@ -3,29 +3,30 @@
  * Each handler validates its message, acts through the controller and answers on `reply`; a throw becomes an `error`
  * message (InterceptController.handle). Host obligations per message are documented on InterceptController.
  */
-import * as net from 'net';
 import type { Rule, SendRequest } from '@flutter-intercept/proxy';
+// REVIEW-14 #5: the proxy's own key format (`[v6]:port`); the subpath doesn't load the proxy (PERF-1 #1).
+import { learnedKeyOf } from '@flutter-intercept/proxy/learned-meta';
 import { ruleFromExchange } from '@flutter-intercept/proxy/rules';
 import { SNIPPET_FORMATS } from '../codegen/snippets';
 import { scriptFileOf, scriptTemplate } from '../rules/scriptFile';
 import type { InterceptController, Sink } from './controller';
-import { CLIENT_CERT_UI_MISSING, CERT_TOKEN_EXPIRED, CERT_TOKEN_RE, MAX_CERT_PASSPHRASE_CHARS, MAX_CERT_TOKENS, type ClientCertUi } from './clientCertUi';
+import {
+  CERT_FILE_ROLES,
+  CERT_TOKEN_EXPIRED,
+  CERT_TOKEN_RE,
+  CLIENT_CERT_UI_MISSING,
+  MAX_CERT_HOST_CHARS,
+  MAX_CERT_PASSPHRASE_CHARS,
+  MAX_CERT_TOKENS,
+  type ClientCertUi,
+} from './clientCertUi';
 import { GRPC_WEB_RESEND, grpcMockRuleFromExchange, grpcResendMessages, resolveGrpcEdit, resolveSendGrpc } from './grpcHost';
 import type { ViewMsg } from './protocol';
 import { checkBodyFile, checkId, checkRuleId, checkScriptFile, fail, isInt, isObj, MAX_BODY_FILE_BYTES, MAX_SCRIPT_BYTES, onlyKeys, sanitizeGrpcSendHeaders, validateEdit, validateRule, validateSendDraft } from './validate';
 import { contractSummary, readOnlyReason, recordingSummary, RULE_KINDS, ruleFromExchangeErrorMessage, snippetFor, tunnelBlockRule } from './views';
 
-const CERT_ROLES = new Set(['pfx', 'cert', 'key']);
 /** A host name (or IP literal) as the proxy keys learned passthrough entries (`host:port`). */
 const LEARNED_HOST = /^[a-z0-9._\-:[\]]{1,260}$/i;
-
-/** REVIEW-14 #5: `{host, port?}` as the proxy keys learned entries (`[2001:db8::1]:443`, `api.example:443`, bare host). */
-export function learnedKeyOf(rawHost: string, port?: number): string {
-  const bracketed = /^\[(.+)\]$/.exec(rawHost);
-  const host = (bracketed ? bracketed[1] : rawHost).toLowerCase();
-  if (port === undefined) return host; // a bare IPv6 address is what the proxy expects without a port
-  return net.isIPv6(host) ? `[${host}]:${port}` : `${host}:${port}`;
-}
 
 function certUiOrThrow(c: InterceptController): ClientCertUi {
   if (!c.deps.clientCertUi) throw new Error(CLIENT_CERT_UI_MISSING);
@@ -106,12 +107,13 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
         throw new Error(`Can't create ${msg.action === 'mock' ? 'a mock' : 'a breakpoint'} rule from a WebSocket: WebSocket connections can only be blocked (or failed with a fault rule).`);
       }
       if (ex.kind === 'tunnel' && msg.action !== 'block') {
+        const what = msg.action === 'mock' ? 'a mock' : msg.action === 'grpcMock' ? 'a gRPC mock' : 'a breakpoint';
         throw new Error(
           ex.grpcTunnel
             ? "Can't mock or pause this gRPC connection: it is TLS that isn't decrypted, so it can only be blocked (or failed with a fault rule). Add the host to flutterIntercept.grpc.decryptHosts if the app trusts the Flutter Intercept CA in debug."
             : ex.learnedPassthrough?.reason === 'client-certificate'
-              ? `Can't create ${msg.action === 'mock' ? 'a mock' : msg.action === 'grpcMock' ? 'a gRPC mock' : 'a breakpoint'} rule from this connection: the server asks for the app's own client certificate, so it is passed through without decryption and can only be blocked (or failed with a fault rule). Add the certificate (Add client certificate…) to decrypt it.`
-              : `Can't create ${msg.action === 'mock' ? 'a mock' : msg.action === 'grpcMock' ? 'a gRPC mock' : 'a breakpoint'} rule from a passed-through TLS connection: it isn't decrypted, so it can only be blocked (or failed with a fault rule). Remove the host from flutterIntercept.tlsPassthrough to mock it.`,
+              ? `Can't create ${what} rule from this connection: the server asks for the app's own client certificate, so it is passed through without decryption and can only be blocked (or failed with a fault rule). Add the certificate (Add client certificate…) to decrypt it.`
+              : `Can't create ${what} rule from a passed-through TLS connection: it isn't decrypted, so it can only be blocked (or failed with a fault rule). Remove the host from flutterIntercept.tlsPassthrough to mock it.`,
         );
       }
       // CONTRACTS §16.2 / §17.2: gRPC calls get gRPC mocks, blocks and breakpoints; HTTP mocks don't apply to them.
@@ -314,7 +316,7 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
     // ---- CONTRACTS §20.3 (never a path or the passphrase in a reply or a log line)
     chooseClientCertificateFile: async (msg, reply) => {
       onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'role'], 'chooseClientCertificateFile');
-      if (!CERT_ROLES.has(msg.role)) fail('chooseClientCertificateFile', 'role must be "pfx", "cert" or "key"');
+      if (!CERT_FILE_ROLES.includes(msg.role)) fail('chooseClientCertificateFile', 'role must be "pfx", "cert" or "key"');
       const ui = certUiOrThrow(c);
       let file: { token: string; name: string } | undefined;
       try {
@@ -336,7 +338,7 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
     },
     addClientCertificate: async (msg, reply) => {
       onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'host', 'pfx', 'cert', 'key', 'passphrase'], 'addClientCertificate');
-      if (typeof msg.host !== 'string' || msg.host.length > 300) fail('addClientCertificate', 'host must be a host name pattern');
+      if (typeof msg.host !== 'string' || msg.host.length > MAX_CERT_HOST_CHARS) fail('addClientCertificate', 'host must be a host name pattern');
       const pfx = checkCertToken(msg.pfx, 'pfx');
       const cert = checkCertToken(msg.cert, 'cert');
       const key = checkCertToken(msg.key, 'key');
@@ -362,7 +364,7 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
     },
     removeClientCertificate: async (msg, reply) => {
       onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'host'], 'removeClientCertificate');
-      if (typeof msg.host !== 'string' || !msg.host.trim() || msg.host.length > 300) fail('removeClientCertificate', 'host must be a host name pattern');
+      if (typeof msg.host !== 'string' || !msg.host.trim() || msg.host.length > MAX_CERT_HOST_CHARS) fail('removeClientCertificate', 'host must be a host name pattern');
       // REVIEW-14 #4: the IDE confirms natively; cancelled = nothing changed, no reply (the panel has nothing pending and
       // the list in Status stays as it is).
       await certUiOrThrow(c).remove(msg.host);

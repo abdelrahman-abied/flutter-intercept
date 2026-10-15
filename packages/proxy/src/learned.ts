@@ -4,19 +4,25 @@
 import * as net from 'net';
 import * as tls from 'tls';
 import { Duplex } from 'stream';
-import { normalizeHostname } from './hosts';
 import { normalizeIp } from './lan';
+import { LEARNED_MAX, LEARNED_PER_CLIENT, learnedKey, pinKey } from './learned-meta';
 import { openTunnelUpstream, type TunnelUpstream } from './tunnel';
 import type { LearnedPassthrough, LearnedPassthroughReason } from './types';
 
-/** At most this many learned entries in all (when full: expired ones go, then the oldest pin; then nothing new is learned). */
-export const LEARNED_MAX = 1000;
+// The key format, caps and labels live in ./learned-meta (shared with the extension host); re-exported for the proxy.
+export { hostLabel, LEARNED_MAX, LEARNED_PER_CLIENT, learnedKey, parseLearnedKey } from './learned-meta';
+
 /** A probe gives up after this long (connect, upstream proxy and the server's first flight). */
 export const PROBE_TIMEOUT_MS = 5000;
 /** Probes running at once, over all hosts. */
 export const PROBE_MAX_AT_ONCE = 4;
-/** A probe's answer is reused for that host:port within this window (a negative one: no new probe until then). */
+/**
+ * A probe's answer, yes or no, is reused for that host:port within this window: no new probe until then (PERF-2 #2;
+ * the name predates reusing positive answers too).
+ */
 export const PROBE_NEGATIVE_MS = 60_000;
+/** Probe answers remembered at once (expired ones are swept when full). */
+export const PROBED_MAX = 1000;
 
 /** nginx's answer (`ssl_verify_client on`) to a request without a client certificate. */
 export const NGINX_NO_CERT_TEXT = 'No required SSL certificate was sent';
@@ -33,29 +39,6 @@ export const CERT_ALERTS: Record<number, string> = {
   49: 'access_denied',
   116: 'certificate_required',
 };
-
-/** The learned map's key (and the 0.13 gRPC pin key): bare host (IPv6 without brackets), port. */
-export const learnedKey = (host: string, port: number): string => `${host}:${port}`;
-
-/** `host` for 443, else `host:port` (IPv6 in brackets): how messages name a learned host. */
-export function hostLabel(host: string, port: number): string {
-  const h = net.isIPv6(host) ? `[${host}]` : host;
-  return port === 443 ? h : `${h}:${port}`;
-}
-
-/** `host:port` / `[v6]:port` / `host` (any port) → the host and the port, if given. */
-export function parseLearnedKey(key: string): { host: string; port?: number } | undefined {
-  const s = String(key ?? '').trim();
-  const m = /^\[([^\]]+)\](?::(\d+))?$/.exec(s) ?? (net.isIPv6(s) ? [s, s, undefined] : /^([^:[\]]+)(?::(\d+))?$/.exec(s));
-  if (!m) return undefined;
-  const host = normalizeHostname(m[1]);
-  const port = m[2] !== undefined ? Number(m[2]) : undefined;
-  if (!host || (port !== undefined && !(Number.isInteger(port) && port >= 1 && port <= 65535))) return undefined;
-  return port === undefined ? { host } : { host, port };
-}
-
-/** At most this many learned entries per client (CONTRACTS §20.1: a client at its limit loses its oldest entry). */
-export const LEARNED_PER_CLIENT = 250;
 
 /** The client key of every loopback address (local processes, simulators and emulators share it: not separable). */
 export const LOOPBACK_CLIENT = 'loopback';
@@ -102,7 +85,7 @@ export class LearnedHosts {
     const hp = learnedKey(host, port);
     const cc = this.map.get(hp);
     if (cc) return cc.e;
-    return this.live(`${client}|${hp}`);
+    return this.live(pinKey(client, host, port));
   }
 
   private live(key: string): LearnedPassthrough | undefined {
@@ -121,7 +104,7 @@ export class LearnedHosts {
     const hp = learnedKey(host, port);
     const by = o.by ?? LOOPBACK_CLIENT;
     if (reason === 'pinned' && this.map.has(hp)) return true;
-    const key = reason === 'pinned' ? `${by}|${hp}` : hp;
+    const key = reason === 'pinned' ? pinKey(by, host, port) : hp;
     const have = this.live(key);
     if (!have) {
       if ((this.perClient.get(by) ?? 0) >= LEARNED_PER_CLIENT) this.evict((s) => s.by === by);

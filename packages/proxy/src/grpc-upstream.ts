@@ -6,6 +6,7 @@ import type { LanGate } from './lan';
 import { openTunnelUpstream } from './tunnel';
 import { elapsed, type TimingSink } from './timing';
 import type { UpstreamProxySpec } from './upstream-proxy';
+import { bracketHost } from './learned-meta';
 
 /*
  * Upstream HTTP/2 sessions for the gRPC relay (CONTRACTS §16.2). node:http2 is not one of the modules VS Code
@@ -65,7 +66,6 @@ interface Entry {
 /** Test seam: a shorter idle timeout. Never set outside tests. */
 export const grpcPoolTesting: { idleMs?: number } = {};
 
-const bracket = (h: string) => (net.isIPv6(h) ? `[${h}]` : h);
 
 export class GrpcSessionPool {
   private readonly entries = new Map<string, Entry[]>();
@@ -126,7 +126,7 @@ export class GrpcSessionPool {
       if (!gate) this.gateIds.set(r.gate, (gate = this.nextGateId++));
     }
     const tlsKey = r.protocol === 'https:' ? `${r.rejectUnauthorized ? 'verify' : 'insecure'}|${r.cert?.pattern ?? ''}` : '';
-    return `${gate}|${r.protocol}//${bracket(r.host)}:${r.port}|${tlsKey}|${r.upstream?.label ?? ''}|${r.alias?.(r.host) ?? ''}`;
+    return `${gate}|${r.protocol}//${bracketHost(r.host)}:${r.port}|${tlsKey}|${r.upstream?.label ?? ''}|${r.alias?.(r.host) ?? ''}`;
   }
 
   private pick(key: string): Entry | undefined {
@@ -175,7 +175,7 @@ export class GrpcSessionPool {
   }
 
   private async open(r: GrpcSessionRequest, key: string, timings: TimingSink): Promise<Entry> {
-    const label = `${bracket(r.host)}:${r.port}`;
+    const label = `${bracketHost(r.host)}:${r.port}`;
     let raw: net.Socket | undefined;
     let secure: tls.TLSSocket | undefined;
     let session: http2.ClientHttp2Session | undefined;

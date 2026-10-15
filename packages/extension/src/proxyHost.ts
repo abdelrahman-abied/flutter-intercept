@@ -43,6 +43,7 @@ import type { ClientCertificate, Exchange, GrpcBreakerEvent, LearnedPassthrough,
 // PERF-1 #1: the dependency-free subpath, so activation never evaluates the proxy (and mockttp).
 import { parseHostPattern } from '@flutter-intercept/proxy/hosts';
 import { targetsProxy } from '@flutter-intercept/proxy/grpc-meta';
+import { LEARNED_MAX } from '@flutter-intercept/proxy/learned-meta';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 import type { GrpcMessageEncoder } from './grpc/service';
 import type { SessionWarning } from './ui/protocol';
@@ -68,22 +69,14 @@ export type ProxyLike = Pick<
   | 'setReplay' | 'resetSequences' | 'setUpstreamProxy' | 'upstreamProxy'
   | 'setTlsPassthrough' | 'tlsPassthrough' | 'setClientCertificates'
   | 'setGrpcDecryptHosts' | 'grpcSupport' | 'setGrpcDecryptAll' | 'setGrpcCodec'
-> & {
-  // CONTRACTS §20.1 (proxy agent P). Optional so the host compiles against a proxy build without them.
-  readonly learnedPassthrough?: LearnedPassthrough[];
-  forgetLearnedPassthrough?(key?: string): void;
-};
+  | 'learnedPassthrough' | 'forgetLearnedPassthrough'
+>;
 
 /** CONTRACTS §20.2: one learned passthrough host as Status / agents show it (`until` absent = until the proxy stops). */
-export interface LearnedPassthroughView {
-  host: string;
-  port: number;
-  reason: 'client-certificate' | 'pinned';
-  until?: number;
-}
+export type LearnedPassthroughView = Omit<LearnedPassthrough, 'grpc'>;
 
-/** The proxy caps its learned map at 1000 entries (§20.1); never show more. */
-export const MAX_LEARNED_PASSTHROUGH = 1000;
+/** The proxy caps its learned map at LEARNED_MAX entries (§20.1); never show more. */
+export const MAX_LEARNED_PASSTHROUGH = LEARNED_MAX;
 
 /** A clean copy of the proxy's learned list: well-formed entries only, live ones (until in the future). */
 export function learnedPassthroughView(list: unknown, now = Date.now()): LearnedPassthroughView[] {
@@ -1276,7 +1269,6 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   forgetLearnedPassthrough(key?: string): void {
     const proxy = this.proxy;
     if (!proxy) return;
-    if (!proxy.forgetLearnedPassthrough) throw new Error('This proxy build cannot forget learned hosts.');
     proxy.forgetLearnedPassthrough(key);
     this.emitLearnedPassthrough(); // the proxy emits too; deduplicated
   }

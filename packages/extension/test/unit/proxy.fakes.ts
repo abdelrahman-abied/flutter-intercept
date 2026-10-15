@@ -40,6 +40,8 @@ export function fakeProxy(opts: InterceptProxyOptions, overrides: object = {}): 
     grpcSupport: () => ({ ok: true }),
     setGrpcDecryptAll: () => undefined,
     setGrpcCodec: () => undefined,
+    learnedPassthrough: [],
+    forgetLearnedPassthrough: () => undefined,
   };
   // Keep getters (e.g. `get port()`, `get lan()`) of the overrides live.
   const out = Object.create(null) as Record<string, unknown>;

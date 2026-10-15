@@ -1,6 +1,6 @@
 // CONTRACTS §3 types come from the proxy package (type-only import: nothing is bundled).
 // §4 message types are defined here, verbatim from docs/CONTRACTS.md.
-import type { Exchange, GrpcEdit, RequestEdit, ResponseEdit, Rule, RuleAction } from '@flutter-intercept/proxy/types';
+import type { Exchange, GrpcEdit, LearnedPassthroughReason, RequestEdit, ResponseEdit, Rule, RuleAction } from '@flutter-intercept/proxy/types';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 export type { NetworkProfile } from '@flutter-intercept/proxy/network';
 
@@ -44,7 +44,7 @@ export interface Status {
   upstreamProxySource?: 'flutterIntercept' | 'http.proxy'; // CONTRACTS §14.6
   tlsPassthrough?: string[];            // CONTRACTS §14.2: hosts passed through undecrypted (tunnels)
   clientCertificates?: { host: string; problem?: string }[]; // CONTRACTS §14.3 (never key material)
-  learnedPassthrough?: { host: string; port: number; reason: 'client-certificate' | 'pinned'; until?: number }[]; // CONTRACTS §20.2
+  learnedPassthrough?: { host: string; port: number; reason: LearnedPassthroughReason; until?: number }[]; // CONTRACTS §20.2 (until absent = until the proxy stops)
   upstreamProxyInsecure?: true;         // REVIEW-6 #1: upstream certificate checks are off
   grpc?: GrpcStatus;                    // CONTRACTS §16.4
 }

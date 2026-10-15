@@ -5,6 +5,7 @@ import { isLoopbackHostname } from './grpc-meta';
 import * as tls from 'tls';
 import { keepAliveOptions } from './idle';
 import { normalizeIp } from './lan';
+import { bracketHost } from './learned-meta';
 
 /*
  * Chaining to another HTTP proxy (CONTRACTS §12.6: Charles, Burp, a corporate proxy). Our own agents, not
@@ -145,7 +146,6 @@ export function isLoopbackHost(hostIn: string): boolean {
   return isLoopbackHostname(net.isIP(h) ? normalizeIp(h) : h);
 }
 
-const bracket = (h: string) => (net.isIPv6(h) ? `[${h}]` : h);
 const CONNECT_HEAD_MAX = 16 * 1024;
 const CONNECT_TIMEOUT_MS = 30_000;
 
@@ -158,7 +158,7 @@ export function connectTunnel(
   /** Give up after this long in all (the idle timeout alone lets a slow-dripping proxy hold the attempt). */
   deadlineMs?: number,
 ): void {
-  const target = `${bracket(host)}:${port}`;
+  const target = `${bracketHost(host)}:${port}`;
   const socket = net.connect({ host: p.host, port: p.port });
   let buf = Buffer.alloc(0);
   let done = false;
@@ -245,7 +245,7 @@ export class ProxiedHttpAgent extends http.Agent {
     // `connectHost` is the address the guard checked (LAN clients): the upstream proxy is given that IP, not the
     // name, so it can't resolve it again to something else (REVIEW-6 #11). The Host header keeps the name.
     const send = (connectHost: string) => {
-      const absolute = `http://${bracket(connectHost)}${port === 80 ? '' : `:${port}`}${path}`;
+      const absolute = `http://${bracketHost(connectHost)}${port === 80 ? '' : `:${port}`}${path}`;
       r.path = absolute;
       if (typeof r._header === 'string') {
         // Headers given as an array are rendered in the ClientRequest constructor, before addRequest; and once the
@@ -267,7 +267,7 @@ export class ProxiedHttpAgent extends http.Agent {
         }
       } else {
         if (this.spec.auth) r.setHeader('proxy-authorization', this.spec.auth);
-        if (!r.getHeader('host')) r.setHeader('host', `${bracket(host)}${port === 80 ? '' : `:${port}`}`);
+        if (!r.getHeader('host')) r.setHeader('host', `${bracketHost(host)}${port === 80 ? '' : `:${port}`}`);
       }
       const proxied = { ...options, host: this.spec.host, hostname: this.spec.host, port: this.spec.port, servername: undefined };
       delete proxied.lookup; // mockttp's lookup is for the target, the proxy's name resolves normally

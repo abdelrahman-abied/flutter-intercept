@@ -70,6 +70,7 @@ import { decodeGrpcMessages, type GrpcDeps } from '../grpc/service';
 import { gitIgnoreStatus, type GitignoreFs } from '../recordings/gitignore';
 import { mapRemoteSelfProblem } from '../proxyHost';
 import { createViewHandlers, type ViewHandlers } from './handlers';
+import { LEARNED_SHOWN_MAX } from '@flutter-intercept/proxy/learned-meta';
 import type { ClientCertUi } from './clientCertUi';
 import type { AgentStatus, AuthFlowSummary, ContractSummary, ExportFormat, GrpcDecoded, GrpcStatus, HostMsg, SessionWarning, Status, ViewMsg } from './protocol';
 
@@ -85,8 +86,8 @@ export { UI_MAX_GRPC_JSON_CHARS, UI_MAX_PAUSED_JSON_CHARS, resolveGrpcEdit, grpc
 
 export type Sink = (msg: HostMsg) => void;
 
-/** CONTRACTS §20.2: how many learned passthrough hosts Status carries (the proxy keeps up to 1000). */
-export const STATUS_MAX_LEARNED = 200;
+/** CONTRACTS §20.2: how many learned passthrough hosts Status carries (the proxy keeps up to LEARNED_MAX). */
+export const STATUS_MAX_LEARNED = LEARNED_SHOWN_MAX;
 export { CLIENT_CERT_UI_MISSING } from './clientCertUi';
 
 export interface ControllerHost {
@@ -329,8 +330,7 @@ export class InterceptController {
   readonly sentCounts: Record<string, number> = {};
   readyCount = 0;
 
-  /** CONTRACTS §20.3: client-certificate file tokens per view they were issued to (a token is bound to its panel). */
-  /** @internal (handlers) */
+  /** @internal (handlers) CONTRACTS §20.3: client-certificate file tokens per view they were issued to (a token is bound to its panel). */
   readonly certTokens = new WeakMap<Sink, Set<string>>();
 
   /** QUALITY-1 Q3: the ViewMsg handlers (src/ui/handlers.ts). */

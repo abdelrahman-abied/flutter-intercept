@@ -13,9 +13,8 @@ import type { Flow, Live } from './flow-types';
 import { isEventStream } from './proxy-util';
 import { rewriteSets, validRewriteStatus } from './rewrite-flow';
 import { CERT_REFUSAL_MARKER } from './client-certs';
-import { normalizeHostname } from './hosts';
 import { alertOfTags, NGINX_NO_CERT_TEXT } from './learned';
-import type { UpstreamRefusal } from './learn-flow';
+import { httpsServerOf, isSameServer, type UpstreamRefusal } from './learn-flow';
 import type { ProxyContext } from './proxy-context';
 
 /** Recording a pass-through HTTP exchange from its taps: head, body, SSE, truncation, shaping. */
@@ -135,21 +134,14 @@ export class HttpTaps {
   refusal(live: Live, tap: Tap): UpstreamRefusal | undefined {
     const { ex, flow } = live;
     if (!ex.url.startsWith('https://')) return undefined;
-    let host: string;
-    let port: number;
-    try {
-      const u = new URL(ex.url);
-      host = normalizeHostname(u.hostname);
-      port = Number(u.port) || 443;
-    } catch {
-      return undefined;
-    }
+    const server = httpsServerOf(ex.url);
+    if (!server) return undefined;
     // REVIEW-14 #1: learn only when the request names the server the connection goes to (the CONNECT target, which the
     // app's next CONNECT is matched on). A CONNECT to an IP whose Host / SNI names another host teaches nothing.
-    const sameServer = !!flow.dest && flow.dest.host === host && flow.dest.port === port;
+    const sameServer = isSameServer(server, flow.dest);
     return {
-      host,
-      port,
+      host: server.host,
+      port: server.port,
       socket: tap.socket,
       ...(ex.clientCertificate ? { certPattern: ex.clientCertificate } : {}),
       // send / resend and Map Remote aren't the app's own connection to this host: explained, never learned.

@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../src/components/App';
 import { isHostMsg, type Host } from '../src/host';
 import type { Exchange, HostMsg, Status, ViewMsg } from '../src/protocol';
-import { certCovering, certHostFor, certSaveBlocker, certStaysText, CERT_WHY, isLearnedLive, learnedUntilText, liveLearned, nextLearnedExpiry } from '../src/certificates';
+import { certCovering, certHostFor, certSaveBlocker, certStaysText, CERT_WHY, isLearnedLive, LEARNED_REASON, learnedBannerText, learnedKey, learnedUntilText, liveLearned, nextLearnedExpiry } from '../src/certificates';
 import { tunnelTitle } from '../src/connection';
 import { initialState, reducer, toPersisted } from '../src/state';
 import { ex, status } from './fixtures';
@@ -94,6 +94,17 @@ describe('pure helpers (CONTRACTS §20)', () => {
   it('host prefill adds the port when it is not 443', () => {
     expect(certHostFor({ host: 'a.example', port: 443 })).toBe('a.example');
     expect(certHostFor({ host: 'a.example', port: 8443 })).toBe('a.example:8443');
+  });
+
+  it('names a learned host and explains each reason (QUALITY-2: exported helpers)', () => {
+    expect(learnedKey({ host: 'a.example', port: 443 })).toBe('a.example:443');
+    const cc = learnedBannerText({ reason: 'client-certificate', host: 'a.example', port: 443 });
+    expect(cc.title).toBe('This server needs the app\'s own certificate…');
+    expect(cc.body).toMatch(/^a\.example asks the app to prove who it is/);
+    const pin = learnedBannerText({ reason: 'pinned', host: 'p.example', port: 443 });
+    expect(pin.title).toBe('p.example doesn\'t accept the proxy\'s certificate…');
+    expect(pin.body).toMatch(/certificate pinning/);
+    expect(Object.keys(LEARNED_REASON).sort()).toEqual(['client-certificate', 'pinned']);
   });
 
   it('Save is blocked until the host and the files the format needs are there', () => {

@@ -60,8 +60,9 @@ import {
   GRPC_SEND_DROPPED,
 } from './proxy-util';
 import { rewriteFlow } from './rewrite-flow';
-import { normalizeHostname } from './hosts';
 import { alertOf } from './learned';
+import { bracketHost } from './learned-meta';
+import { connectTargetOf, httpsServerOf, isSameServer } from './learn-flow';
 import type { ProxyContext } from './proxy-context';
 
 /** CONTRACTS §16.2: the gRPC relay (h2c / decrypted silent tunnels and send()). */
@@ -614,7 +615,7 @@ export class GrpcRelay {
       if (err.code === 'E_FI_LOOP') return this.px.grpcLocal.grpcStatusOnly(call, 14, GRPC_LOOP_TEXT, 'error', GRPC_LOOP_TEXT);
       const forbidden = e instanceof SsrfError || err.statusCode === 403;
       if (!forbidden && protocol === 'https:' && (await this.grpcRefusal(call, err))) return;
-      const label = net.isIPv6(host) ? `[${host}]` : host;
+      const label = bracketHost(host);
       const reason = forbidden
         ? e instanceof SsrfError
           ? err.message
@@ -830,21 +831,13 @@ export class GrpcRelay {
   async grpcRefusal(call: GrpcCall, err: Error & { code?: string }): Promise<boolean> {
     const alert = alertOf(err);
     if (alert === undefined) return false;
-    let u: URL;
-    try {
-      u = new URL(call.flow.map?.url ?? call.req.url);
-    } catch {
-      return false;
-    }
-    if (u.protocol !== 'https:') return false;
-    const host = normalizeHostname(u.hostname);
-    const port = Number(u.port) || 443;
+    const server = httpsServerOf(call.flow.map?.url ?? call.req.url);
+    if (!server) return false;
     // REVIEW-14 #1: learn only when the call names the CONNECT target (what the app's next silent tunnel is matched on).
-    const dest = requestInternals(call.req).destination as { hostname?: string; port?: number } | undefined;
-    const sameServer = !!dest?.hostname && normalizeHostname(dest.hostname) === host && dest.port === port;
+    const sameServer = isSameServer(server, connectTargetOf(call.req));
     const v = await this.px.learn.verdict({
-      host,
-      port,
+      host: server.host,
+      port: server.port,
       alert,
       socket: requestInternals(call.req).socket,
       grpc: true,

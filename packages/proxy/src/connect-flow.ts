@@ -36,20 +36,24 @@ import {
   SSRF_MARKER,
 } from './lan';
 import { describeProfile } from './network';
-import { clientKeyOf, hostLabel, learnedKey } from './learned';
+import { clientKeyOf, hostLabel } from './learned';
+import { bracketHost, pinKey } from './learned-meta';
 import type { Exchange, LearnedPassthrough } from './types';
 import type { FlowFault, Flow, MatchResult, SilentInfo } from './flow-types';
 import { SILENT_INFO } from './flow-types';
 import { FAULT_LABELS, profileLabel, sleep, clipNote, INTERNAL_TUNNEL_HEADER } from './proxy-util';
 import type { ProxyContext } from './proxy-context';
 
-/** REVIEW-13 #6: two handshakes closed without an alert within this window pin a host (dart:io sends no alert). */
+/**
+ * REVIEW-13 #6 / REVIEW-14 #2: two handshakes one client closed without an alert within this window pin the host for that
+ * client (dart:io sends no alert); a client that completed a decrypted request to the host within it gets no strikes.
+ */
 export const PIN_STRIKE_WINDOW_MS = 60_000;
 
 /** REVIEW-13 #6 / CONTRACTS §20.1: a learned pin lasts this long (then the host is tried decrypted again). */
 export const GRPC_PIN_TTL_MS = 10 * 60 * 1000;
 
-/** Decrypted handshakes watched at once (and hosts remembered as accepting the proxy's certificate). */
+/** Decrypted handshakes watched at once. */
 const WATCH_MAX = 1000;
 /** A watched connection that never carried a request is forgotten after this long (swept when the map is full). */
 const WATCH_MAX_AGE_MS = 60_000;
@@ -64,6 +68,37 @@ const STRIKES_MAX = 1000;
 
 /** Test seam: a shorter pin lifetime. Never set outside tests. */
 export const grpcPinTesting: { ttlMs?: number } = {};
+
+/** A decrypted TLS connection watched in its handshake (ConnectFlow.decrypting): the CONNECT target and how it started. */
+export interface WatchedHandshake {
+  host: string;
+  port: number;
+  /** An HTTP CONNECT mockttp answers (CONTRACTS §20.1); absent = a silent gRPC tunnel (§19.3). */
+  http?: true;
+  /** When the watch began (swept after WATCH_MAX_AGE_MS when the map is full). */
+  at?: number;
+  socket?: net.Socket;
+  /** REVIEW-14 #2: bytes written to the client when the watch began (did our certificate reach it?). */
+  sent0?: number;
+}
+
+/** The server a failed handshake was for; `grpc` = a silent gRPC tunnel (0.13 texts), else an HTTP CONNECT. */
+interface PinTarget {
+  host: string;
+  port: number;
+  grpc: boolean;
+}
+
+/** What pinVerdict records: the exchange's error, and the learned pin if there is one. */
+interface PinOutcome {
+  error: string;
+  learned?: Exchange['learnedPassthrough'];
+}
+
+/** The client side of a connection as `address:port` (the decrypting map's key; mockttp's TLS failures carry the same). */
+function peerKey(address: unknown, port: unknown): string {
+  return `${normalizeIp(String(address ?? ''))}:${port}`;
+}
 
 /** The note on a tunnel passed through because of a learned entry (CONTRACTS §20.1; gRPC pins keep the 0.13 text). */
 function learnedNote(e: LearnedPassthrough, host: string): string {
@@ -84,7 +119,7 @@ export class ConnectFlow {
    * Decrypted (MITM) TLS tunnels in their handshake: client `address:port` → the CONNECT target (CONTRACTS §19.3:
    * silent gRPC tunnels; §20.1: HTTP CONNECTs mockttp answers, `http`).
    */
-  readonly decrypting = new Map<string, { host: string; port: number; http?: true; at?: number; socket?: net.Socket; sent0?: number }>();
+  readonly decrypting = new Map<string, WatchedHandshake>();
   /**
    * PERF-2 #1: `client|host:port` → when that client last sent a request over a decrypted connection to it, i.e. it accepted the
    * proxy's certificate there. A handshake closed without an alert (a connection pool dropping a spare connection, a
@@ -272,7 +307,7 @@ export class ConnectFlow {
    * that host through from then on.
    */
   watchDecryptHandshake(socket: net.Socket, host: string, port: number, http: boolean): void {
-    const key = `${normalizeIp(socket.remoteAddress ?? '')}:${socket.remotePort}`;
+    const key = peerKey(socket.remoteAddress, socket.remotePort);
     const now = Date.now();
     if (this.decrypting.size >= WATCH_MAX) {
       // PERF-2 #1: entries of connections that stay open unused leave after WATCH_MAX_AGE_MS (one sweep when full,
@@ -281,7 +316,7 @@ export class ConnectFlow {
       if (this.decrypting.size >= WATCH_MAX) return;
     }
     // REVIEW-14 #2: what had been written to the client when the watch began (did our certificate reach it?).
-    const entry = { host, port, ...(http ? { http: true as const } : {}), at: now, socket, sent0: socket.bytesWritten };
+    const entry: WatchedHandshake = { host, port, ...(http ? { http: true as const } : {}), at: now, socket, sent0: socket.bytesWritten };
     this.decrypting.set(key, entry);
     // mockttp reports a failed handshake after the socket closed: keep the entry a little longer than that. A
     // connection that carried a request has left the map already (handshakeWorked): no timer for it.
@@ -303,16 +338,16 @@ export class ConnectFlow {
     this.worked.add(socket);
     const s = socket as { remoteAddress?: string; remotePort?: number };
     if (this.decrypting.size) {
-      const key = `${normalizeIp(s.remoteAddress ?? '')}:${s.remotePort}`;
+      const key = peerKey(s.remoteAddress, s.remotePort);
       const w = this.decrypting.get(key);
       if (w && w.host === host && w.port === port) this.decrypting.delete(key);
     }
-    const hp = `${clientKeyOf(s.remoteAddress)}|${learnedKey(host, port)}`;
+    const hp = pinKey(clientKeyOf(s.remoteAddress), host, port);
     this.pinStrikes.delete(hp);
     const now = Date.now();
-    if (!this.accepted.has(hp) && this.accepted.size >= WATCH_MAX) {
+    if (!this.accepted.has(hp) && this.accepted.size >= STRIKES_MAX) {
       for (const [k, at] of this.accepted) if (now - at >= PIN_STRIKE_WINDOW_MS) this.accepted.delete(k);
-      if (this.accepted.size >= WATCH_MAX) return;
+      if (this.accepted.size >= STRIKES_MAX) return;
     }
     this.accepted.set(hp, now);
   }
@@ -568,7 +603,7 @@ export class ConnectFlow {
 
   onTlsError(f: TlsHandshakeFailure): void {
     // CONTRACTS §19.3 / §20.1: the app failed our certificate on a decrypted tunnel we watch: it may pin.
-    const key = `${normalizeIp(String(f.remoteIpAddress ?? ''))}:${f.remotePort}`;
+    const key = peerKey(f.remoteIpAddress, f.remotePort);
     const watched = this.decrypting.get(key);
     if (watched) {
       this.decrypting.delete(key);
@@ -601,76 +636,86 @@ export class ConnectFlow {
    * one at once. dart:io (BoringSSL) sends no alert: it closes right after our certificate (mockttp: reset / closed),
    * which a kill mid-handshake can look like — so that counts only when it happens twice for the host within
    * PIN_STRIKE_WINDOW_MS. Never learned for a grpcDecryptHosts host (gRPC), while a recording is replayed, or when an
-   * enabled rule names the host. The exchange that records the failed handshake.
+   * enabled rule names the host. Returns the exchange that records the failed handshake; undefined = onTlsError's
+   * generic record (HTTP: not a rejection of our certificate).
    *
    * REVIEW-14 #2: strikes and pins are per client (clientKeyOf: the LAN device, or loopback), so another app on the
    * device can't pin hosts for the Flutter app; and a handshake dropped before our certificate was sent is no strike.
    */
-  pinVerdict(watched: { host: string; port: number; http?: true; socket?: net.Socket; sent0?: number }, f: TlsHandshakeFailure): Exchange | undefined {
-    const w = { host: watched.host, port: watched.port, grpc: !watched.http };
+  pinVerdict(watched: WatchedHandshake, f: TlsHandshakeFailure): Exchange | undefined {
+    const w: PinTarget = { host: watched.host, port: watched.port, grpc: !watched.http };
     const client = clientKeyOf(String(f.remoteIpAddress ?? ''));
-    const pinKey = `${client}|${learnedKey(w.host, w.port)}`;
-    const label = net.isIPv6(w.host) ? `[${w.host}]` : w.host;
+    const key = pinKey(client, w.host, w.port);
     const alert = f.failureCause === 'cert-rejected';
     const served = !watched.socket || watched.socket.bytesWritten - (watched.sent0 ?? 0) > CERT_SENT_BYTES;
     const closed = (f.failureCause === 'reset' || f.failureCause === 'closed') && served;
     // PERF-2 #1: the app completed a decrypted request to this server within the window: it accepts the proxy's
     // certificate, so a handshake it drops (a spare pool connection, a cancelled request) is no pin strike.
-    const at = this.accepted.get(pinKey);
+    const at = this.accepted.get(key);
     const acceptsUs = at !== undefined && Date.now() - at < PIN_STRIKE_WINDOW_MS;
     if (closed && acceptsUs && !w.grpc) return undefined; // HTTP: the generic record, as before 0.14
     const closedEarly = closed && !acceptsUs;
-    let strikes = 0;
-    if (closedEarly) {
-      const now = Date.now();
-      const prev = this.pinStrikes.get(pinKey);
-      const st = prev && now - prev.first < PIN_STRIKE_WINDOW_MS ? { n: prev.n + 1, first: prev.first } : { n: 1, first: now };
-      if (!prev && this.pinStrikes.size >= STRIKES_MAX) {
-        // REVIEW-14 #2: old strikes leave (one sweep when full), so stale ones never switch close-based learning off.
-        for (const [k, v] of this.pinStrikes) if (now - v.first >= PIN_STRIKE_WINDOW_MS) this.pinStrikes.delete(k);
-      }
-      if (this.pinStrikes.size < STRIKES_MAX || prev) this.pinStrikes.set(pinKey, st);
-      strikes = st.n;
-    }
+    const strikes = closedEarly ? this.strike(key) : 0;
     const rejected = alert || strikes >= 2;
-    const explicit = !!w.grpc && this.px.grpcDecrypt.some((p) => matchesHostPattern(p, w.host, w.port));
+    const explicit = w.grpc && this.px.grpcDecrypt.some((p) => matchesHostPattern(p, w.host, w.port));
     const kept = explicit ? undefined : this.px.learn.keepDecrypted(w.host, w.port);
-    let error: string;
-    let learned: Exchange['learnedPassthrough'];
+    let outcome: PinOutcome;
     if (explicit && (alert || closedEarly)) {
-      error = `The app ended the TLS handshake for ${w.host} (${f.failureCause}); it may pin its own certificate. The host is in grpcDecryptHosts, so it stays decrypted — remove it there if the app pins.`;
+      outcome = { error: `The app ended the TLS handshake for ${w.host} (${f.failureCause}); it may pin its own certificate. The host is in grpcDecryptHosts, so it stays decrypted — remove it there if the app pins.` };
     } else if (!rejected) {
       if (!w.grpc && !closedEarly) return undefined; // HTTP: not a rejection of our certificate (the generic record)
-      error = closedEarly
-        ? w.grpc
-          ? `The app closed the TLS handshake for ${w.host} (${f.failureCause}). If it happens again within a minute, the host is passed through undecrypted (it probably pins its certificate).`
-          : `The app closed the TLS handshake for ${hostLabel(w.host, w.port)} (${f.failureCause}). If it happens again within a minute, ${hostLabel(w.host, w.port)} is passed through without decryption (the app probably pins its certificate).`
-        : `TLS handshake with the app failed (${f.failureCause}) for ${w.host}; not a certificate rejection, so the host stays decrypted.`;
-    } else if (kept) {
-      this.pinStrikes.delete(pinKey);
-      error = `The app rejected the Flutter Intercept certificate for ${hostLabel(w.host, w.port)} (${f.failureCause}); it probably pins its own. ${kept}, so it stays decrypted.`;
+      outcome = {
+        error: closedEarly
+          ? w.grpc
+            ? `The app closed the TLS handshake for ${w.host} (${f.failureCause}). If it happens again within a minute, the host is passed through undecrypted (it probably pins its certificate).`
+            : `The app closed the TLS handshake for ${hostLabel(w.host, w.port)} (${f.failureCause}). If it happens again within a minute, ${hostLabel(w.host, w.port)} is passed through without decryption (the app probably pins its certificate).`
+          : `TLS handshake with the app failed (${f.failureCause}) for ${w.host}; not a certificate rejection, so the host stays decrypted.`,
+      };
     } else {
-      this.pinStrikes.delete(pinKey);
-      const until = Date.now() + (grpcPinTesting.ttlMs ?? GRPC_PIN_TTL_MS);
-      const ok = this.px.learn.hosts.learn(w.host, w.port, 'pinned', { until, by: client, ...(w.grpc ? { grpc: true } : {}) });
-      if (ok) learned = { reason: 'pinned', host: w.host, port: w.port };
-      error = !ok
-        ? `${hostLabel(w.host, w.port)} pins its certificate (the app rejected the Flutter Intercept certificate), but too many hosts are passed through already; it stays decrypted.`
-        : w.grpc
-          ? `${w.host} pins its certificate; passed through undecrypted from now on (the app rejected the Flutter Intercept certificate).`
-          : `${hostLabel(w.host, w.port)} pins its certificate: passed through without decryption from now on, for ${Math.round((grpcPinTesting.ttlMs ?? GRPC_PIN_TTL_MS) / 60_000)} minutes (the app rejected the Flutter Intercept certificate).`;
+      this.pinStrikes.delete(key);
+      outcome = kept
+        ? { error: `The app rejected the Flutter Intercept certificate for ${hostLabel(w.host, w.port)} (${f.failureCause}); it probably pins its own. ${kept}, so it stays decrypted.` }
+        : this.learnPin(w, client);
     }
     return {
       id: `tls-${randomUUID()}`,
       startedAt: f.timingEvents?.startTime ?? Date.now(),
       method: 'CONNECT',
-      url: `https://${label}:${w.port}/`,
+      url: `https://${bracketHost(w.host)}:${w.port}/`,
       requestHeaders: {},
       state: 'error',
       kind: 'tunnel',
       ...(w.grpc ? { grpcTunnel: true as const } : {}),
-      error,
-      ...(learned ? { learnedPassthrough: learned } : {}),
+      error: outcome.error,
+      ...(outcome.learned ? { learnedPassthrough: outcome.learned } : {}),
+    };
+  }
+
+  /** REVIEW-13 #6: one close / reset strike for `key` (pinKey); the client's strikes for the host within the window. */
+  private strike(key: string): number {
+    const now = Date.now();
+    const prev = this.pinStrikes.get(key);
+    const st = prev && now - prev.first < PIN_STRIKE_WINDOW_MS ? { n: prev.n + 1, first: prev.first } : { n: 1, first: now };
+    if (!prev && this.pinStrikes.size >= STRIKES_MAX) {
+      // REVIEW-14 #2: old strikes leave (one sweep when full), so stale ones never switch close-based learning off.
+      for (const [k, v] of this.pinStrikes) if (now - v.first >= PIN_STRIKE_WINDOW_MS) this.pinStrikes.delete(k);
+    }
+    if (this.pinStrikes.size < STRIKES_MAX || prev) this.pinStrikes.set(key, st);
+    return st.n;
+  }
+
+  /** The app rejected our certificate for `w`: pin it for `client` (GRPC_PIN_TTL_MS), and the record's text. */
+  private learnPin(w: PinTarget, client: string): PinOutcome {
+    const ttl = grpcPinTesting.ttlMs ?? GRPC_PIN_TTL_MS;
+    const ok = this.px.learn.hosts.learn(w.host, w.port, 'pinned', { until: Date.now() + ttl, by: client, ...(w.grpc ? { grpc: true } : {}) });
+    if (!ok) {
+      return { error: `${hostLabel(w.host, w.port)} pins its certificate (the app rejected the Flutter Intercept certificate), but too many hosts are passed through already; it stays decrypted.` };
+    }
+    return {
+      error: w.grpc
+        ? `${w.host} pins its certificate; passed through undecrypted from now on (the app rejected the Flutter Intercept certificate).`
+        : `${hostLabel(w.host, w.port)} pins its certificate: passed through without decryption from now on, for ${Math.round(ttl / 60_000)} minutes (the app rejected the Flutter Intercept certificate).`,
+      learned: { reason: 'pinned', host: w.host, port: w.port },
     };
   }
 }

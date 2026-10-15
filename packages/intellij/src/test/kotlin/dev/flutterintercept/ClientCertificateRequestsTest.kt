@@ -30,6 +30,13 @@ class ClientCertificateRequestsTest {
     }
 
     @Test
+    fun legacyHostsOnlyNameAPassphrase() {
+        // QUALITY-2: looser than hostProblem (a host typed on the settings page may fail the proxy's rules), one line, ≤ 300.
+        for (ok in listOf("api.example.com", "a b.example", "*", "x".repeat(300))) assertNull(ok, ClientCertificates.legacyHostProblem(ok))
+        for (bad in listOf(null, "", "   ", "x".repeat(301), "a\nb", "a\u0000b")) assertNotNull(bad.toString(), ClientCertificates.legacyHostProblem(bad))
+    }
+
+    @Test
     fun hostShapes() {
         for (ok in listOf("api.example.com", "*.corp.example:8443", " API.Example.com ", "192.0.2.10:443", "[2001:db8::1]:8443", "2001:db8::1", "svc_1.example")) {
             assertNull(ok, ClientCertificates.hostProblem(ok))

@@ -2,14 +2,12 @@
 // certificate messages (strict validation, tokens bound to the view they were issued to, no clientCertUi → error),
 // forgetLearnedPassthrough, tunnel texts for learned hosts, and InterceptProxyHost's learned list / event / forget.
 import { EventEmitter } from 'events';
-import * as fs from 'fs';
-import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Exchange, InterceptProxyOptions, Rule } from '@flutter-intercept/proxy';
 import { InterceptProxyHost, learnedPassthroughView } from '../../src/proxyHost';
 import { CLIENT_CERT_UI_MISSING, ControllerDeps, ControllerHost, InterceptController, STATUS_MAX_LEARNED, tunnelReason } from '../../src/ui/controller';
 import { CERT_TOKEN_EXPIRED, type ClientCertUi } from '../../src/ui/clientCertUi';
-import { learnedKeyOf } from '../../src/ui/handlers';
+import { learnedKeyOf, parseLearnedKey } from '@flutter-intercept/proxy/learned-meta';
 import type { HostMsg, Status, ViewMsg } from '../../src/ui/protocol';
 import { withFakeProxy } from './proxy.fakes';
 
@@ -227,11 +225,7 @@ describe('forgetLearnedPassthrough (CONTRACTS §20.3)', () => {
   });
 
   it('REVIEW-14 #5: the keys round-trip through the proxy parser', async () => {
-    // the proxy's own parser, from its build (the package doesn't export the module)
-    const built = path.resolve(__dirname, '..', '..', '..', 'proxy', 'dist', 'learned.js');
-    if (!fs.existsSync(built)) return;
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { parseLearnedKey } = require(built) as { parseLearnedKey: (k: string) => { host: string; port?: number } | undefined };
+    // the proxy's own parser (QUALITY-2: one module, @flutter-intercept/proxy/learned-meta, writes and reads the key)
     expect(parseLearnedKey(learnedKeyOf('2001:db8::1', 443))).toEqual({ host: '2001:db8::1', port: 443 });
     expect(parseLearnedKey(learnedKeyOf('[2001:db8::1]'))).toEqual({ host: '2001:db8::1' });
     expect(parseLearnedKey(learnedKeyOf('API.example', 8443))).toEqual({ host: 'api.example', port: 8443 });
@@ -308,11 +302,14 @@ describe('InterceptProxyHost learned passthrough (CONTRACTS §20.2)', () => {
     expect(host.learnedPassthrough).toEqual([]);
   });
 
-  it('a proxy build without the API: empty list, forget says so', async () => {
+  it('a proxy that learned nothing: empty list, forget is a no-op (QUALITY-2: the API is always there)', async () => {
     const host = new InterceptProxyHost(withFakeProxy({ getPort: () => 9100, factory: () => ({}) }));
+    const events: unknown[] = [];
+    host.on('learnedPassthrough', (l) => events.push(l));
     await host.start();
     expect(host.learnedPassthrough).toEqual([]);
-    expect(() => host.forgetLearnedPassthrough()).toThrow(/cannot forget/);
+    expect(() => host.forgetLearnedPassthrough()).not.toThrow();
+    expect(events).toEqual([]); // nothing changed: no event
     await host.stop();
   });
 

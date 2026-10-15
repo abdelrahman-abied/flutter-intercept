@@ -2,9 +2,11 @@
  * v0.14.0 (CONTRACTS §20): servers that need the app's own certificate (mutual TLS), hosts the proxy learned to pass
  * through, and the "Add client certificate" popup's texts. Pure: no DOM.
  */
-import { hostGlobMatch, LEARNED_REASON } from './connection';
+import { hostGlobMatch } from './connection';
 import type { ClientCertFileRole, Exchange, Status } from './protocol';
 import { formatRemaining } from './util';
+
+export { LEARNED_REASON } from './connection';
 
 export type LearnedEntry = NonNullable<Status['learnedPassthrough']>[number];
 export type LearnedRef = NonNullable<Exchange['learnedPassthrough']>;
@@ -12,7 +14,7 @@ export type LearnedRef = NonNullable<Exchange['learnedPassthrough']>;
 /** The popup's two ways to give a certificate: one PKCS#12 file, or a PEM certificate + its private key. */
 export type CertFormat = 'pfx' | 'pem';
 
-/** "host:port" — how the proxy keys a learned host. */
+/** "host:port" — how the panel names a learned host (display and React keys; the host formats the proxy's key). */
 export function learnedKey(e: Pick<LearnedRef, 'host' | 'port'>): string {
   return `${e.host}:${e.port}`;
 }
@@ -35,8 +37,9 @@ export function isLearnedLive(e: Pick<LearnedRef, 'host' | 'port'>, live: readon
 }
 
 /**
- * Entries still in force at `now`. The proxy drops an expired pin without an event (REVIEW-14 #6), so Status can still
- * list it: never show it, nor count it. Returns `list` itself when nothing expired (cheap, keeps memoised identities).
+ * Entries still in force at `now`. The proxy announces an expired pin on a timer (REVIEW-14 #6), but the Status the
+ * panel holds can still list it until that broadcast arrives (or from an older host): never show it, nor count it.
+ * Returns `list` itself when nothing expired (cheap, keeps memoised identities).
  */
 export function liveLearned<T extends Pick<LearnedEntry, 'until'>>(list: readonly T[] | undefined, now: number): readonly T[] | undefined {
   if (!list || !list.some((l) => l.until !== undefined && l.until <= now)) return list;
@@ -49,8 +52,6 @@ export function nextLearnedExpiry(list: readonly Pick<LearnedEntry, 'until'>[] |
   for (const l of list ?? []) if (l.until !== undefined && l.until > now && (next === undefined || l.until < next)) next = l.until;
   return next;
 }
-
-export { LEARNED_REASON };
 
 /** "until the proxy stops" / "for 8m 10s more". */
 export function learnedUntilText(e: Pick<LearnedEntry, 'until'>, now: number): string {

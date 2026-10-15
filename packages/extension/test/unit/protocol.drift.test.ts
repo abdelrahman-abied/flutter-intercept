@@ -43,5 +43,7 @@ describe('protocol.ts copies (webview ↔ extension host)', () => {
       expect(host.has(name), `${name} missing in the extension copy`).toBe(true);
       expect(host.get(name), name).toEqual(m);
     }
+    // QUALITY-2: and the other way round (a type added only to the host copy is drift too).
+    for (const name of host.keys()) expect(web.has(name), `${name} missing in the webview copy`).toBe(true);
   });
 });

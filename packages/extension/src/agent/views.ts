@@ -15,11 +15,12 @@ import { redactJsonValue } from './samples';
 import { ToolInput } from './schema';
 import { AgentToolError } from './types';
 import { GRPC_MESSAGES_PER_DIR, MAX_GRPC_MESSAGES_JSON, OUTSIDE_PROJECT, bodyBytes, streamingLabel, protoTypeLabel, restoreRedactedJson } from './shared';
-import type { Frame, ResolvedFrame } from './shared';
+import type { AgentApiDeps, Frame, ResolvedFrame } from './shared';
+import { LEARNED_SHOWN_MAX } from '@flutter-intercept/proxy/learned-meta';
 import { AgentContext } from './context';
 
-/** CONTRACTS §20.2: how many learned passthrough hosts get_status lists (the proxy keeps up to 1000). */
-export const AGENT_MAX_LEARNED = 200;
+/** CONTRACTS §20.2: how many learned passthrough hosts get_status lists (the proxy keeps up to LEARNED_MAX). */
+export const AGENT_MAX_LEARNED = LEARNED_SHOWN_MAX;
 
 /**
  * QUALITY-1 Q4 (api.ts:916): a rule as agents see it. With redaction on, a grpcMock's base64 `messages` are shown
@@ -351,7 +352,7 @@ export class AgentViews extends AgentContext {
   tlsView(): Record<string, unknown> {
     const hosts = this.deps.host.tlsPassthrough ?? [];
     const certs = this.deps.host.clientCertificateStatus ?? [];
-    let learned: { host: string; port: number; reason: string; until?: number }[] = [];
+    let learned: NonNullable<AgentApiDeps['host']['learnedPassthrough']> = [];
     try {
       learned = this.deps.host.learnedPassthrough ?? [];
     } catch {

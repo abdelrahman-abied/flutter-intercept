@@ -2,7 +2,7 @@
  * Shared pieces of the agent API (QUALITY-1 Q5): its dependencies, the rule safety checks agents get, filters and
  * small helpers used by the tool modules (src/agent/tools/*) and the views. No vscode.
  */
-import type { Body, Exchange, GrpcEdit, ReplayEntry, ReplayOptions, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest, StackFrame } from '@flutter-intercept/proxy';
+import type { Body, Exchange, GrpcEdit, LearnedPassthrough, ReplayEntry, ReplayOptions, RequestEdit, ResponseEdit, Rule, RuleAction, SendRequest, StackFrame } from '@flutter-intercept/proxy';
 import { type NetworkProfile } from '@flutter-intercept/proxy/network';
 import { compileMatcher } from '@flutter-intercept/proxy/rules';
 import type { CodegenService } from '../codegen/types';
@@ -97,7 +97,7 @@ export interface AgentApiDeps {
     /** §14.3: host pattern + problem per configured client certificate (never paths or key material). */
     readonly clientCertificateStatus?: { host: string; problem?: string }[];
     /** §20.2: hosts the proxy passes through on its own (read-only for agents: they can't forget them). */
-    readonly learnedPassthrough?: { host: string; port: number; reason: 'client-certificate' | 'pinned'; until?: number }[];
+    readonly learnedPassthrough?: Omit<LearnedPassthrough, 'grpc'>[];
     // CONTRACTS §16.4 (InterceptProxyHost). Optional on older builds.
     readonly grpcDecryptHosts?: string[];
     readonly grpcProblem?: string;

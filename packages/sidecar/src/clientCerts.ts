@@ -16,8 +16,8 @@
  */
 import * as path from 'path';
 import type { ClientCertEntry } from '../../extension/src/ui/clientCerts';
-import { certHostProblem, MAX_CLIENT_CERTS } from '../../extension/src/ui/clientCerts';
-import type { ClientCertFileRole, ClientCertPlatform } from '../../extension/src/ui/clientCertUi';
+import { certHostProblem, MAX_CLIENT_CERTS, nonEmptyString } from '../../extension/src/ui/clientCerts';
+import { CERT_FILE_ROLES, MAX_CERT_HOST_CHARS, type ClientCertPlatform } from '../../extension/src/ui/clientCertUi';
 import { RpcFailure } from './rpc';
 
 export const CERT_FILE_METHOD = 'ui.chooseClientCertificateFile';
@@ -26,7 +26,7 @@ export const CERT_PASSPHRASE_SET_METHOD = 'secrets.setClientCertPassphrase';
 export const CERT_PASSPHRASE_GET_METHOD = 'secrets.clientCertPassphrase';
 export const CERT_CONFIRM_REMOVE_METHOD = 'ui.confirmRemoveClientCertificate';
 
-const ROLES: readonly ClientCertFileRole[] = ['pfx', 'cert', 'key'];
+/** The loader's path limit too (clientCerts.ts `readCertFile`). */
 const MAX_PATH = 4096;
 
 export interface SidecarClientCertDeps {
@@ -41,7 +41,11 @@ export interface SidecarClientCertDeps {
   log?(line: string): void;
 }
 
-export type SidecarClientCertEntry = { host: string; pfx?: string; cert?: string; key?: string };
+/** One user-level entry as the plugin stores it: the extension's `ClientCertEntry` (paths, never contents). */
+export type SidecarClientCertEntry = ClientCertEntry;
+
+/** Same host (ignoring case and spaces around it) and the same files: an entry the plugin stores already. */
+const entryKey = (e: SidecarClientCertEntry): string => JSON.stringify([e.host.trim().toLowerCase(), e.pfx ?? '', e.cert ?? '', e.key ?? '']);
 
 /** A path the IDE answered with: absolute, one line, bounded. Undefined when it isn't. */
 export function usableCertPath(v: unknown): string | undefined {
@@ -63,20 +67,17 @@ const optPath = (v: unknown, n: number, field: string): string | undefined => {
 export function entriesForPlugin(entries: unknown, stored: readonly SidecarClientCertEntry[]): SidecarClientCertEntry[] {
   if (!Array.isArray(entries)) throw new Error('the client certificate entries must be a list');
   if (entries.length > MAX_CLIENT_CERTS) throw new Error(`at most ${MAX_CLIENT_CERTS} client certificates can be stored`);
-  const known = new Set(stored.map((e) => JSON.stringify([e.host.trim().toLowerCase(), e.pfx ?? '', e.cert ?? '', e.key ?? ''])));
+  const known = new Set(stored.map(entryKey));
   return entries.map((raw, i) => {
     const n = i + 1;
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`entry ${n} must be an object`);
     const e = raw as Record<string, unknown>;
     if (typeof e.host !== 'string') throw new Error(`entry ${n} has no host`);
-    const out: SidecarClientCertEntry = {
-      host: e.host,
-      ...(optPath(e.pfx, n, 'pfx') ? { pfx: e.pfx as string } : {}),
-      ...(optPath(e.cert, n, 'cert') ? { cert: e.cert as string } : {}),
-      ...(optPath(e.key, n, 'key') ? { key: e.key as string } : {}),
-    };
-    const isKnown = known.has(JSON.stringify([out.host.trim().toLowerCase(), out.pfx ?? '', out.cert ?? '', out.key ?? '']));
-    if (!isKnown) {
+    const pfx = optPath(e.pfx, n, 'pfx');
+    const cert = optPath(e.cert, n, 'cert');
+    const key = optPath(e.key, n, 'key');
+    const out: SidecarClientCertEntry = { host: e.host, ...(pfx ? { pfx } : {}), ...(cert ? { cert } : {}), ...(key ? { key } : {}) };
+    if (!known.has(entryKey(out))) {
       const problem = certHostProblem(out.host);
       if (problem !== undefined) throw new Error(`entry ${n}: ${problem}`);
     }
@@ -99,7 +100,7 @@ function ideError(e: unknown, what: string): Error {
  * (REVIEW-14 #6). Storing a passphrase still needs a valid pattern.
  */
 export function deletableHost(v: unknown): string | undefined {
-  if (typeof v !== 'string' || !v.trim() || v.length > 300 || /[\u0000-\u001f\u007f]/.test(v)) return undefined;
+  if (typeof v !== 'string' || !v.trim() || v.length > MAX_CERT_HOST_CHARS || /[\u0000-\u001f\u007f]/.test(v)) return undefined;
   return v.trim().toLowerCase();
 }
 
@@ -110,7 +111,7 @@ export function createSidecarClientCertPlatform(deps: SidecarClientCertDeps): Cl
   let picking = false;
   return {
     async pickFile(role) {
-      if (!ROLES.includes(role)) throw new Error('Unknown certificate file kind.');
+      if (!CERT_FILE_ROLES.includes(role)) throw new Error('Unknown certificate file kind.');
       if (picking) throw new Error(CHOOSER_BUSY);
       picking = true;
       let v: unknown;
@@ -137,7 +138,7 @@ export function createSidecarClientCertPlatform(deps: SidecarClientCertDeps): Cl
       deps.entriesWritten(checked);
     },
     async setPassphrase(host, passphrase) {
-      const value = typeof passphrase === 'string' && passphrase.length > 0 ? passphrase : undefined;
+      const value = nonEmptyString(passphrase);
       if (value !== undefined && certHostProblem(host) !== undefined) throw new Error('The host is not a valid host pattern.');
       const key = deletableHost(host);
       if (key === undefined) throw new Error('The host is not a valid host pattern.');
@@ -156,7 +157,7 @@ export function createSidecarClientCertPlatform(deps: SidecarClientCertDeps): Cl
       } catch (e) {
         throw ideError(e, 'read the stored passphrase');
       }
-      return typeof v === 'string' && v.length > 0 ? v : undefined;
+      return nonEmptyString(v);
     },
     async confirmRemove(host) {
       const key = deletableHost(host);

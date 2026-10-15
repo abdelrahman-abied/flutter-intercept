@@ -25,7 +25,7 @@
 import * as crypto from 'crypto';
 import * as path from 'path';
 import type { ClientCertificate } from '@flutter-intercept/proxy';
-import { CertProblem, certHostProblem, defaultValidate, MAX_CLIENT_CERTS, pemText, readCertFile, reasonOf, type ClientCertEntry } from './clientCerts';
+import { CertProblem, certHostProblem, defaultValidate, MAX_CLIENT_CERTS, nonEmptyString, pemText, readCertFile, reasonOf, type ClientCertEntry } from './clientCerts';
 import type { ClientCertFileRole } from './protocol';
 
 export type { ClientCertFileRole } from './protocol';
@@ -61,12 +61,21 @@ export interface ClientCertPlatform {
   now?(): number;
 }
 
+/** `ClientCertUi.add`: the host pattern, the file tokens (`pfx`, or `cert` + `key`) and the passphrase. */
+export interface ClientCertAddRequest {
+  host: string;
+  pfx?: string;
+  cert?: string;
+  key?: string;
+  passphrase?: string;
+}
+
 /** What the controller calls (ControllerDeps.clientCertUi). */
 export interface ClientCertUi {
   /** Native picker → a one-use token (10 min) + the file's base name; undefined = cancelled. Throws a user-readable Error. */
   choose(role: ClientCertFileRole): Promise<{ token: string; name: string } | undefined>;
   /** Check, then save the entry (user level) and the passphrase. `problem` = nothing saved, the popup stays open. */
-  add(req: { host: string; pfx?: string; cert?: string; key?: string; passphrase?: string }): Promise<{ problem?: string }>;
+  add(req: ClientCertAddRequest): Promise<{ problem?: string }>;
   /**
    * Remove the user-level entry with this host (case-insensitive) and its passphrase, after the IDE's confirmation
    * (`platform.confirmRemove`); `cancelled` = the user said no, nothing changed. Throws a user-readable Error.
@@ -81,7 +90,14 @@ export const MAX_CERT_TOKENS = 50;
 export const MAX_CERT_PASSPHRASE_CHARS = 1024;
 /** What a token looks like (the controller checks message fields against it). */
 export const CERT_TOKEN_RE = /^[A-Za-z0-9_-]{16,64}$/;
-const ROLES: readonly ClientCertFileRole[] = ['pfx', 'cert', 'key'];
+/** Every ClientCertFileRole (the controller, this module and the sidecar check roles against it). */
+export const CERT_FILE_ROLES: readonly ClientCertFileRole[] = ['pfx', 'cert', 'key'];
+/**
+ * A host the panel names (add, remove, a passphrase to delete): at most this many characters. Looser than
+ * `certHostProblem` (260) so an entry typed by hand with a refused host can still be removed; the plugin's
+ * `MAX_LEGACY_HOST` is the same.
+ */
+export const MAX_CERT_HOST_CHARS = 300;
 
 export const CERT_TOKEN_EXPIRED = 'The chosen file is no longer valid (choices last 10 minutes): choose it again.';
 export const CERT_CHOOSER_OPEN = 'A file chooser is already open.';
@@ -102,6 +118,11 @@ interface Chosen {
 function sentence(reason: string): string {
   const r = reason.replace(/^its /, 'the ').replace(/^it /, 'this certificate ');
   return `${r.charAt(0).toUpperCase()}${r.slice(1)}${/[.!?]$/.test(r) ? '' : '.'}`;
+}
+
+/** An error's message for a log line (never shown to the panel as is). */
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 function problemOf(e: unknown): string {
@@ -136,8 +157,8 @@ export function createClientCertUi(platform: ClientCertPlatform, opts: ClientCer
     const t = now();
     for (const [k, c] of tokens) if (c.expires <= t) tokens.delete(k);
   };
-  const lookup = (token: string | undefined, role: ClientCertFileRole): Chosen | undefined => {
-    if (token === undefined) return undefined;
+  /** The live file a token stands for (this role only); CERT_TOKEN_EXPIRED otherwise. */
+  const chosen = (token: string, role: ClientCertFileRole): Chosen => {
     const c = typeof token === 'string' ? tokens.get(token) : undefined;
     if (!c || c.role !== role || c.expires <= now()) throw new CertProblem(CERT_TOKEN_EXPIRED);
     return c;
@@ -152,13 +173,75 @@ export function createClientCertUi(platform: ClientCertPlatform, opts: ClientCer
     try {
       await platform.reload?.();
     } catch (e) {
-      platform.log?.(`client certificates: reload failed: ${e instanceof Error ? e.message : String(e)}`);
+      platform.log?.(`client certificates: reload failed: ${errText(e)}`);
+    }
+  };
+  /** `add`'s files, read again (they may have changed since they were chosen): the certificate, the entry, the tokens. */
+  const readChosen = async (req: ClientCertAddRequest, host: string): Promise<{ cert: ClientCertificate; entry: ClientCertEntry; used: string[] }> => {
+    const hasPfx = req.pfx !== undefined;
+    const hasPem = req.cert !== undefined || req.key !== undefined;
+    if (hasPfx === hasPem) throw new CertProblem(CERT_GIVE_FILES);
+    if (req.pfx !== undefined) {
+      const pfx = chosen(req.pfx, 'pfx');
+      return { cert: { host, pfx: await readCertFile('pfx', pfx.file, {}) }, entry: { host, pfx: pfx.file }, used: [req.pfx] };
+    }
+    if (req.cert === undefined) throw new CertProblem('Choose the certificate file too (PEM).');
+    if (req.key === undefined) throw new CertProblem('Choose the private key file too (PEM).');
+    const c = chosen(req.cert, 'cert');
+    const k = chosen(req.key, 'key');
+    return {
+      cert: { host, cert: pemText(await readCertFile('cert', c.file, {}), 'cert'), key: pemText(await readCertFile('key', k.file, {}), 'key') },
+      entry: { host, cert: c.file, key: k.file },
+      used: [req.cert, req.key],
+    };
+  };
+  /**
+   * REVIEW-14 #4: write the entries and the passphrase. A new passphrase goes first (the reload the write triggers sees
+   * it) and is put back as it was when the write fails; an empty one deletes the stored one only once the entry is
+   * written. Throws CertProblem.
+   */
+  const store = async (host: string, passphrase: string | undefined, next: unknown[]): Promise<void> => {
+    let previous: { value: string | undefined } | undefined;
+    if (passphrase !== undefined) {
+      if (platform.getPassphrase) {
+        try {
+          previous = { value: nonEmptyString(await platform.getPassphrase(host)) };
+        } catch (e) {
+          platform.log?.(`client certificate for ${host}: reading the stored passphrase failed: ${errText(e)}`);
+        }
+      }
+      try {
+        await platform.setPassphrase(host, passphrase);
+      } catch (e) {
+        platform.log?.(`client certificate for ${host}: storing the passphrase failed: ${errText(e)}`);
+        throw new CertProblem("Couldn't store the passphrase in the IDE's secret storage.");
+      }
+    }
+    try {
+      await platform.writeEntries(next as ClientCertEntry[]);
+    } catch (e) {
+      platform.log?.(`client certificate for ${host}: writing the user settings failed: ${errText(e)}`);
+      if (passphrase !== undefined && previous) {
+        try {
+          await platform.setPassphrase(host, previous.value);
+        } catch (e2) {
+          platform.log?.(`client certificate for ${host}: putting the previous passphrase back failed: ${errText(e2)}`);
+        }
+      }
+      throw new CertProblem("Couldn't save the certificate in your user settings (see the Flutter Intercept log).");
+    }
+    if (passphrase === undefined) {
+      try {
+        await platform.setPassphrase(host, undefined);
+      } catch (e) {
+        platform.log?.(`client certificate for ${host}: deleting the old passphrase failed: ${errText(e)}`);
+      }
     }
   };
 
   return {
     async choose(role) {
-      if (!ROLES.includes(role)) throw new Error('Unknown certificate file kind.');
+      if (!CERT_FILE_ROLES.includes(role)) throw new Error('Unknown certificate file kind.');
       // REVIEW-14 #6: one native chooser at a time (a compromised panel can't queue them)
       if (picking) throw new Error(CERT_CHOOSER_OPEN);
       let file: string | undefined;
@@ -189,29 +272,10 @@ export function createClientCertUi(platform: ClientCertPlatform, opts: ClientCer
         const hostProblem = certHostProblem(req?.host);
         if (hostProblem !== undefined) return { problem: sentence(`the host can't be used: ${hostProblem}`) };
         const host = req.host.trim().toLowerCase();
-        const passphrase = typeof req.passphrase === 'string' && req.passphrase.length > 0 ? req.passphrase : undefined;
+        const passphrase = nonEmptyString(req.passphrase);
         if (passphrase !== undefined && passphrase.length > MAX_CERT_PASSPHRASE_CHARS) return { problem: 'The passphrase is too long.' };
         try {
-          const hasPfx = req.pfx !== undefined;
-          const hasPem = req.cert !== undefined || req.key !== undefined;
-          if (hasPfx === hasPem) throw new CertProblem(CERT_GIVE_FILES);
-          let cert: ClientCertificate;
-          let entry: ClientCertEntry;
-          const used: string[] = [];
-          if (hasPfx) {
-            const pfx = lookup(req.pfx, 'pfx') as Chosen;
-            used.push(req.pfx as string);
-            cert = { host, pfx: await readCertFile('pfx', pfx.file, {}) };
-            entry = { host, pfx: pfx.file };
-          } else {
-            if (req.cert === undefined) throw new CertProblem('Choose the certificate file too (PEM).');
-            if (req.key === undefined) throw new CertProblem('Choose the private key file too (PEM).');
-            const c = lookup(req.cert, 'cert') as Chosen;
-            const k = lookup(req.key, 'key') as Chosen;
-            used.push(req.cert, req.key);
-            cert = { host, cert: pemText(await readCertFile('cert', c.file, {}), 'cert'), key: pemText(await readCertFile('key', k.file, {}), 'key') };
-            entry = { host, cert: c.file, key: k.file };
-          }
+          const { cert, entry, used } = await readChosen(req, host);
           if (passphrase !== undefined) cert.passphrase = passphrase;
           try {
             validate(cert);
@@ -222,52 +286,14 @@ export function createClientCertUi(platform: ClientCertPlatform, opts: ClientCer
           const at = entries.findIndex((e) => sameHost(e, host));
           const next = at >= 0 ? entries.map((e, i) => (i === at ? entry : e)).filter((e, i) => i === at || !sameHost(e, host)) : [entry, ...entries];
           if (next.length > MAX_CLIENT_CERTS) throw new CertProblem(`You already have ${MAX_CLIENT_CERTS} client certificates: remove one first.`);
-          // REVIEW-14 #4: a new passphrase goes first (the reload the write triggers sees it) and is put back as it was
-          // when the write fails; an empty one deletes the stored one only once the entry is written.
-          let previous: { value: string | undefined } | undefined;
-          if (passphrase !== undefined) {
-            if (platform.getPassphrase) {
-              try {
-                const p = await platform.getPassphrase(host);
-                previous = { value: typeof p === 'string' && p.length > 0 ? p : undefined };
-              } catch (e) {
-                platform.log?.(`client certificate for ${host}: reading the stored passphrase failed: ${e instanceof Error ? e.message : String(e)}`);
-              }
-            }
-            try {
-              await platform.setPassphrase(host, passphrase);
-            } catch (e) {
-              platform.log?.(`client certificate for ${host}: storing the passphrase failed: ${e instanceof Error ? e.message : String(e)}`);
-              throw new CertProblem("Couldn't store the passphrase in the IDE's secret storage.");
-            }
-          }
-          try {
-            await platform.writeEntries(next as ClientCertEntry[]);
-          } catch (e) {
-            platform.log?.(`client certificate for ${host}: writing the user settings failed: ${e instanceof Error ? e.message : String(e)}`);
-            if (passphrase !== undefined && previous) {
-              try {
-                await platform.setPassphrase(host, previous.value);
-              } catch (e2) {
-                platform.log?.(`client certificate for ${host}: putting the previous passphrase back failed: ${e2 instanceof Error ? e2.message : String(e2)}`);
-              }
-            }
-            throw new CertProblem("Couldn't save the certificate in your user settings (see the Flutter Intercept log).");
-          }
-          if (passphrase === undefined) {
-            try {
-              await platform.setPassphrase(host, undefined);
-            } catch (e) {
-              platform.log?.(`client certificate for ${host}: deleting the old passphrase failed: ${e instanceof Error ? e.message : String(e)}`);
-            }
-          }
+          await store(host, passphrase, next);
           for (const t of used) tokens.delete(t);
           platform.log?.(`client certificate for ${host} saved to the user settings`);
           await reload();
           return {};
         } catch (e) {
           if (e instanceof CertProblem) return { problem: sentence(e.message) };
-          platform.log?.(`client certificate for ${host}: ${e instanceof Error ? e.message : String(e)}`);
+          platform.log?.(`client certificate for ${host}: ${errText(e)}`);
           return { problem: `The certificate for ${host} couldn't be saved.` };
         }
       });
@@ -275,7 +301,7 @@ export function createClientCertUi(platform: ClientCertPlatform, opts: ClientCer
 
     remove(rawHost) {
       return serial(async () => {
-        if (typeof rawHost !== 'string' || !rawHost.trim() || rawHost.length > 300) throw new Error('Which client certificate? The host is missing.');
+        if (typeof rawHost !== 'string' || !rawHost.trim() || rawHost.length > MAX_CERT_HOST_CHARS) throw new Error('Which client certificate? The host is missing.');
         const host = rawHost.trim().toLowerCase();
         let entries: unknown[];
         try {
@@ -291,7 +317,7 @@ export function createClientCertUi(platform: ClientCertPlatform, opts: ClientCer
           try {
             ok = (await platform.confirmRemove(host)) === true;
           } catch (e) {
-            platform.log?.(`client certificate for ${host}: the confirmation failed: ${e instanceof Error ? e.message : String(e)}`);
+            platform.log?.(`client certificate for ${host}: the confirmation failed: ${errText(e)}`);
           }
           if (!ok) return { cancelled: true as const };
         }
@@ -302,13 +328,13 @@ export function createClientCertUi(platform: ClientCertPlatform, opts: ClientCer
         try {
           await platform.writeEntries(after as ClientCertEntry[]);
         } catch (e) {
-          platform.log?.(`client certificate for ${host}: writing the user settings failed: ${e instanceof Error ? e.message : String(e)}`);
+          platform.log?.(`client certificate for ${host}: writing the user settings failed: ${errText(e)}`);
           throw new Error("Couldn't update your user settings (see the Flutter Intercept log).");
         }
         try {
           await platform.setPassphrase(host, undefined);
         } catch (e) {
-          platform.log?.(`client certificate for ${host}: deleting the passphrase failed: ${e instanceof Error ? e.message : String(e)}`);
+          platform.log?.(`client certificate for ${host}: deleting the passphrase failed: ${errText(e)}`);
         }
         platform.log?.(`client certificate for ${host} removed from the user settings`);
         await reload();

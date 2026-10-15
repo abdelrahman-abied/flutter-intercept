@@ -46,8 +46,8 @@ import { disposeRecordingDiffs, openRecordingDiff } from './recordings/vscodeDif
 import { createSharedRulesService } from './rules/service';
 import { toOpenApi, toPostman } from './export';
 import { registerNotifications } from './notify';
-import { certHostProblem, clientCertHosts, loadClientCertificates, PASSPHRASE_SECRET_PREFIX, passphraseSecretKey, type ClientCertEntry } from './ui/clientCerts';
-import { createClientCertUi, type ClientCertFileRole } from './ui/clientCertUi';
+import { clientCertHosts, loadClientCertificates, PASSPHRASE_SECRET_PREFIX, passphraseSecretKey } from './ui/clientCerts';
+import { createVscodeClientCertUi, registerAddClientCertificateCommand } from './ui/clientCertVscode';
 import { createPathDecision } from './rules/createPolicy';
 import { TrafficPanel } from './ui/panel';
 import { TrafficViewProvider, VIEW_ID } from './ui/view';
@@ -366,38 +366,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   void applyClientCertificates().catch((e: unknown) => log(`client certificates: ${String(e)}`));
   // CONTRACTS §20.3: adding / removing a client certificate from the panel (user settings + secret storage; the
   // config / secrets listeners reload the certificates).
-  const CERT_FILTERS: Record<ClientCertFileRole, Record<string, string[]>> = {
-    pfx: { 'PKCS#12 (.p12, .pfx)': ['p12', 'pfx'], 'All files': ['*'] },
-    cert: { 'PEM certificate (.pem, .crt, .cer)': ['pem', 'crt', 'cer'], 'All files': ['*'] },
-    key: { 'PEM private key (.pem, .key)': ['pem', 'key'], 'All files': ['*'] },
-  };
-  const CERT_PICK_TITLE: Record<ClientCertFileRole, string> = {
-    pfx: 'Client certificate (PKCS#12 .p12 / .pfx)',
-    cert: 'Client certificate (PEM)',
-    key: 'Private key of the client certificate (PEM)',
-  };
-  const clientCertUi = createClientCertUi({
-    pickFile: async (role) => {
-      const picked = await vscode.window.showOpenDialog({ canSelectFiles: true, canSelectFolders: false, canSelectMany: false, filters: CERT_FILTERS[role], title: CERT_PICK_TITLE[role], openLabel: 'Choose' });
-      const uri = picked?.[0];
-      if (!uri) return undefined;
-      if (uri.scheme !== 'file') throw new Error('Choose a file on this computer.');
-      return uri.fsPath;
-    },
-    readEntries: () => userSetting<unknown>('clientCertificates'),
-    writeEntries: async (entries: ClientCertEntry[]) => {
-      await vscode.workspace.getConfiguration('flutterIntercept').update('clientCertificates', entries.length ? entries : undefined, vscode.ConfigurationTarget.Global);
-    },
-    setPassphrase: async (host, value) => {
-      if (value) await context.secrets.store(passphraseSecretKey(host), value);
-      else await context.secrets.delete(passphraseSecretKey(host));
-    },
-    // REVIEW-14 #4: the previous passphrase is put back when a save fails; Remove is confirmed here, natively.
-    getPassphrase: (host) => Promise.resolve(context.secrets.get(passphraseSecretKey(host))),
-    confirmRemove: async (host) =>
-      (await vscode.window.showWarningMessage(`Remove the client certificate for ${host}? Its passphrase is deleted too.`, { modal: true }, 'Remove')) === 'Remove',
-    log,
-  });
+  const clientCertUi = createVscodeClientCertUi(context, userSetting, log);
   context.subscriptions.push(
     context.secrets.onDidChange((e) => {
       if (e.key.startsWith(PASSPHRASE_SECRET_PREFIX)) void applyClientCertificates().catch((err: unknown) => log(`client certificates: ${String(err)}`));
@@ -435,48 +404,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
       void vscode.window.showInformationMessage('Flutter Intercept: removed the Flutter Intercept CA this extension added to the simulator (certificates added by others are kept).');
     }),
     // CONTRACTS §20.3: the panel's "Add client certificate…" with native inputs (same checks and storage).
-    vscode.commands.registerCommand('flutterIntercept.addClientCertificate', async (hostArg?: unknown) => {
-      const host = await vscode.window.showInputBox({
-        title: 'Add Client Certificate',
-        prompt: 'Host the certificate is for (a host name pattern, optional :port), e.g. api.example.com or *.corp.example:8443',
-        value: typeof hostArg === 'string' ? hostArg : '',
-        ignoreFocusOut: true,
-        validateInput: (v) => certHostProblem(v),
-      });
-      if (host === undefined) return;
-      const PFX = 'PKCS#12 file (.p12 / .pfx)';
-      const PEM = 'PEM certificate + private key';
-      const kind = await vscode.window.showQuickPick([PFX, PEM], { title: 'Add Client Certificate', placeHolder: 'Certificate file' });
-      if (!kind) return;
-      const tokens: { pfx?: string; cert?: string; key?: string } = {};
-      for (const role of kind === PFX ? (['pfx'] as const) : (['cert', 'key'] as const)) {
-        let file: { token: string } | undefined;
-        try {
-          file = await clientCertUi.choose(role);
-        } catch (e) {
-          void vscode.window.showErrorMessage(`Flutter Intercept: ${e instanceof Error ? e.message : String(e)}`);
-          return;
-        }
-        if (!file) return;
-        tokens[role] = file.token;
-      }
-      for (;;) {
-        const passphrase = await vscode.window.showInputBox({ title: 'Add Client Certificate', prompt: 'Passphrase (leave empty if it has none)', password: true, ignoreFocusOut: true });
-        if (passphrase === undefined) return;
-        const r = await clientCertUi.add({ host, ...tokens, ...(passphrase ? { passphrase } : {}) });
-        if (!r.problem) {
-          void vscode.window.showInformationMessage(`Flutter Intercept: client certificate for ${host.trim().toLowerCase()} saved (user settings; the passphrase in VS Code's secret storage).`);
-          return;
-        }
-        // A wrong / missing passphrase can be fixed here; anything else ends the flow.
-        if (!/passphrase/i.test(r.problem)) {
-          void vscode.window.showErrorMessage(`Flutter Intercept: ${r.problem}`);
-          return;
-        }
-        const again = await vscode.window.showWarningMessage(`Flutter Intercept: ${r.problem}`, 'Try Again');
-        if (again !== 'Try Again') return;
-      }
-    }),
+    registerAddClientCertificateCommand(clientCertUi),
     vscode.commands.registerCommand('flutterIntercept.setClientCertificatePassphrase', async () => {
       const hosts = clientCertHosts(userSetting<unknown>('clientCertificates'));
       if (!hosts.length) {

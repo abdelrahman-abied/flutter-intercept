@@ -41,6 +41,10 @@
     "./grpc-meta": {
       "types": "./dist/grpc-meta.d.ts",
       "default": "./dist/grpc-meta.js"
+    },
+    "./learned-meta": {
+      "types": "./dist/learned-meta.d.ts",
+      "default": "./dist/learned-meta.js"
     }
   },
   "typesVersions": {
@@ -68,6 +72,9 @@
       ],
       "grpc-meta": [
         "dist/grpc-meta.d.ts"
+      ],
+      "learned-meta": [
+        "dist/learned-meta.d.ts"
       ]
     }
   },

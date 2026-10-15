@@ -71,27 +71,12 @@ object UiRequestHandler {
                 activeProject()?.let { InterceptToolWindow.show(it, focus = true) }
                 null
             }
-            // Never prompts: the passphrase stored with "Set Client Certificate Passphrase…" or the panel, or null.
-            "secrets.clientCertPassphrase" -> {
-                val host = p.requireString("host")
-                ClientCertificates.legacyHostProblem(host)?.let { return CompletableFuture.failedFuture(RpcException(it, "invalid")) }
-                CompletableFuture.supplyAsync({
-                    ClientCertificates.getPassphrase(host)?.takeIf { it.isNotEmpty() }
-                }, AppExecutorUtil.getAppExecutorService())
-            }
+            "secrets.clientCertPassphrase" -> clientCertPassphrase(p)
             // CONTRACTS §20.3: "Add client certificate…" in the panel (the shared ClientCertUi's platform in the sidecar).
             "ui.chooseClientCertificateFile" -> chooseClientCertificateFile(p)
             "settings.writeClientCertificates" -> writeClientCertificates(p)
             "ui.confirmRemoveClientCertificate" -> confirmRemoveClientCertificate(p)
-            "secrets.setClientCertPassphrase" -> try {
-                val (host, passphrase) = ClientCertificates.passphraseRequest(p)
-                CompletableFuture.supplyAsync({
-                    ClientCertificates.setPassphrase(host, passphrase)
-                    null
-                }, AppExecutorUtil.getAppExecutorService())
-            } catch (e: RpcException) {
-                CompletableFuture.failedFuture(e)
-            }
+            "secrets.setClientCertPassphrase" -> setClientCertPassphrase(p)
             // The sidecar's own secrets (e.g. `flutterIntercept.mcpToken`) in the IDE's password safe; values never logged.
             "secrets.get" -> CompletableFuture.supplyAsync({ secretGet(p.requireString("key")) }, AppExecutorUtil.getAppExecutorService())
             "secrets.set" -> CompletableFuture.supplyAsync({
@@ -251,12 +236,34 @@ object UiRequestHandler {
         return wrapper?.file?.absolutePath
     }
 
-    // ── client certificates (CONTRACTS §20.3) ──────────────────────────────────────────────────────────────────
+    // ── client certificates (CONTRACTS §14.3, §20.3) ───────────────────────────────────────────────────────────
 
-    /**
-     * The IDE's file chooser for one certificate role → the absolute path, or null when cancelled. Brings the project
-     * window to the front first: in Android Studio the panel usually runs in the system browser (§15.4).
-     */
+    /** Never prompts: the passphrase stored with "Set Client Certificate Passphrase…" or the panel, or null. */
+    private fun clientCertPassphrase(p: JsonObject): CompletableFuture<Any?> {
+        val host = p.requireString("host")
+        ClientCertificates.legacyHostProblem(host)?.let { return CompletableFuture.failedFuture(RpcException(it, "invalid")) }
+        return CompletableFuture.supplyAsync({
+            ClientCertificates.getPassphrase(host)?.takeIf { it.isNotEmpty() }
+        }, AppExecutorUtil.getAppExecutorService())
+    }
+
+    /** Stores (or with no passphrase deletes) a passphrase, checked by [ClientCertificates.passphraseRequest]. */
+    private fun setClientCertPassphrase(p: JsonObject): CompletableFuture<Any?> {
+        val (host, passphrase) = try {
+            ClientCertificates.passphraseRequest(p)
+        } catch (e: RpcException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return CompletableFuture.supplyAsync({
+            ClientCertificates.setPassphrase(host, passphrase)
+            null
+        }, AppExecutorUtil.getAppExecutorService())
+    }
+
+    /** The active project with its window brought to the front: in Android Studio the panel usually runs in the system browser (§15.4). */
+    private fun focusActiveProject(): Project? = activeProject()?.also { ProjectUtil.focusProjectWindow(it, true) }
+
+    /** The IDE's file chooser for one certificate role → the absolute path, or null when cancelled (the IDE in front first). */
     private fun chooseClientCertificateFile(p: JsonObject): CompletableFuture<Any?> {
         val role = p.optString("role")?.takeIf { it in ClientCertificates.ROLES }
             ?: return CompletableFuture.failedFuture(RpcException("role must be pfx, cert or key", "invalid"))
@@ -265,8 +272,7 @@ object UiRequestHandler {
             return CompletableFuture.failedFuture(RpcException("A file chooser is already open in the IDE.", "busy"))
         }
         return onEdt {
-            val project = activeProject()
-            if (project != null) ProjectUtil.focusProjectWindow(project, true)
+            val project = focusActiveProject()
             val file = FileChooser.chooseFile(ClientCertificates.chooserDescriptor(role), project, null) ?: return@onEdt null
             if (!file.isInLocalFileSystem) throw RpcException("Choose a file on this computer.", "invalid")
             val path = file.toNioPath().toAbsolutePath().toString()
@@ -285,8 +291,7 @@ object UiRequestHandler {
         val host = p.optString("host")?.trim()
         ClientCertificates.legacyHostProblem(host)?.let { return CompletableFuture.failedFuture(RpcException(it, "invalid")) }
         return onEdt {
-            val project = activeProject()
-            if (project != null) ProjectUtil.focusProjectWindow(project, true)
+            val project = focusActiveProject()
             ConfirmDialog(project, ClientCertificates.removeQuestion(host!!), null, listOf(ClientCertificates.REMOVE_BUTTON)).ask() == ClientCertificates.REMOVE_BUTTON
         }
     }

@@ -1,7 +1,7 @@
 // A flow module of InterceptProxy (QUALITY-1 Q1); it sees the proxy through ProxyContext.
 
 import * as net from 'net';
-import { matchesHostPattern } from './hosts';
+import { matchesHostPattern, normalizeHostname } from './hosts';
 import { lanGateOf } from './lan';
 import {
   CERT_ALERTS,
@@ -10,19 +10,22 @@ import {
   LEARNED_MAX,
   LearnedHosts,
   learnedKey,
+  NGINX_NO_CERT_TEXT,
   PROBE_MAX_AT_ONCE,
   PROBE_NEGATIVE_MS,
+  PROBED_MAX,
   probeCertificateRequest,
   probeTesting,
   type ProbeTarget,
 } from './learned';
+import { requestInternals } from './mockttp-internals';
 import { HOST_ALIASES } from './upstream-pool';
 import type { LearnedPassthrough } from './types';
 import type { ProxyContext } from './proxy-context';
 
 /** What a decrypted request's upstream failure looked like (CONTRACTS §20.1 "client-certificate"). */
 export interface UpstreamRefusal {
-  /** The server (bare host, port) the proxy connected to. */
+  /** The server the request names (bare host, port). Learned only when it is the CONNECT target (else `noLearn`). */
   host: string;
   port: number;
   /** The TLS alert the server sent. */
@@ -49,6 +52,39 @@ export interface LearnVerdict {
 }
 
 const ADD_CERT = 'add the certificate in the Flutter Intercept panel (Add client certificate…)';
+
+/** A server: bare host (lower case, IPv6 without brackets) and port. */
+export interface ServerKey {
+  host: string;
+  port: number;
+}
+
+/**
+ * REVIEW-14 #1: the server a request's connection goes to — inside a CONNECT tunnel, the CONNECT target (before Map
+ * Remote changes the URL). Learning keys on it, never on the Host / `:authority` / SNI name.
+ */
+export function connectTargetOf(req: object): ServerKey | undefined {
+  const d = requestInternals(req).destination as Partial<{ hostname: string; port: number }> | undefined;
+  const host = d?.hostname ? normalizeHostname(d.hostname) : '';
+  return host && d?.port ? { host, port: d.port } : undefined;
+}
+
+/** The server an `https:` URL names (port 443 by default); undefined for another scheme or a URL that doesn't parse. */
+export function httpsServerOf(url: string): ServerKey | undefined {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return undefined;
+  }
+  if (u.protocol !== 'https:') return undefined;
+  return { host: normalizeHostname(u.hostname), port: Number(u.port) || 443 };
+}
+
+/** REVIEW-14 #1: does the request name the server its connection goes to (same host and port)? */
+export function isSameServer(named: ServerKey, dest: ServerKey | undefined): boolean {
+  return !!dest && dest.host === named.host && dest.port === named.port;
+}
 
 /** Learned passthrough (CONTRACTS §20.1): the map, its exclusions, the probe, and the app's idle connections. */
 export class LearnFlow {
@@ -124,30 +160,31 @@ export class LearnFlow {
   async verdict(f: UpstreamRefusal): Promise<LearnVerdict | undefined> {
     const label = hostLabel(f.host, f.port);
     if (f.certPattern) {
-      const why = f.nginx ? 'No required SSL certificate was sent' : f.alert !== undefined ? (CERT_ALERTS[f.alert] ?? undefined) : undefined;
+      const why = f.nginx ? NGINX_NO_CERT_TEXT : f.alert !== undefined ? CERT_ALERTS[f.alert] : undefined;
       return why ? { error: `The server rejected the client certificate configured for ${f.certPattern} (${why}).` } : undefined;
     }
     if (f.noLearn) return undefined;
     let cause: string;
     if (f.alert === 116) cause = 'TLS alert certificate_required';
-    else if (f.nginx) cause = 'HTTP 400 "No required SSL certificate was sent"';
+    else if (f.nginx) cause = `HTTP 400 "${NGINX_NO_CERT_TEXT}"`;
     else if (f.alert === 40 || f.alert === 42) {
       if (this.keepDecrypted(f.host, f.port, { grpc: f.grpc })) return undefined; // no probe for a host that can't be learned
       if (!(await this.probe(f))) return undefined;
       cause = `TLS alert ${CERT_ALERTS[f.alert]}; the server asks for a client certificate`;
     } else return undefined;
+    const needs = `This server needs the app's own client certificate (${cause}).`;
     const kept = this.keepDecrypted(f.host, f.port, { grpc: f.grpc });
     if (kept) {
       const rules = kept.startsWith('The enabled rule') ? ' for the rules to work' : '';
-      return { error: `This server needs the app's own client certificate (${cause}). ${kept}, so ${label} stays decrypted${rules}. To make these requests work, ${ADD_CERT}.` };
+      return { error: `${needs} ${kept}, so ${label} stays decrypted${rules}. To make these requests work, ${ADD_CERT}.` };
     }
     const by = clientKeyOf((f.socket as { remoteAddress?: string } | undefined)?.remoteAddress);
     if (!this.hosts.learn(f.host, f.port, 'client-certificate', { by, ...(f.grpc ? { grpc: true } : {}) })) {
-      return { error: `This server needs the app's own client certificate (${cause}). ${LEARNED_MAX} hosts are passed through already, so ${label} stays decrypted. To make these requests work, ${ADD_CERT}.` };
+      return { error: `${needs} ${LEARNED_MAX} hosts are passed through already, so ${label} stays decrypted. To make these requests work, ${ADD_CERT}.` };
     }
     return {
       error:
-        `This server needs the app's own client certificate (${cause}). From now on ${label} is passed through without decryption, ` +
+        `${needs} From now on ${label} is passed through without decryption, ` +
         `so the app talks to it directly with its own certificate. To see these requests, ${ADD_CERT}.`,
       learned: { reason: 'client-certificate', host: f.host, port: f.port },
     };
@@ -186,10 +223,10 @@ export class LearnFlow {
       .then((yes) => {
         this.probing.delete(key);
         const now = Date.now();
-        if (this.probed.size >= 1000 && !this.probed.has(key)) {
+        if (this.probed.size >= PROBED_MAX && !this.probed.has(key)) {
           for (const [k, r] of this.probed) if (now - r.at >= PROBE_NEGATIVE_MS) this.probed.delete(k);
         }
-        if (this.probed.size < 1000 || this.probed.has(key)) this.probed.set(key, { yes, at: now });
+        if (this.probed.size < PROBED_MAX || this.probed.has(key)) this.probed.set(key, { yes, at: now });
         return yes;
       });
     this.probing.set(key, p);

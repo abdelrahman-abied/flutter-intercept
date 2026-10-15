@@ -1,5 +1,5 @@
 /** CONTRACTS §4, verbatim. */
-import type { Exchange, GrpcEdit, RequestEdit, ResponseEdit, Rule, RuleAction } from '@flutter-intercept/proxy';
+import type { Exchange, GrpcEdit, LearnedPassthroughReason, RequestEdit, ResponseEdit, Rule, RuleAction } from '@flutter-intercept/proxy';
 import type { NetworkProfile } from '@flutter-intercept/proxy/network';
 
 export interface Status {
@@ -28,7 +28,8 @@ export interface Status {
   tlsPassthrough?: string[];
   /** CONTRACTS §14.3: configured client certificates (host pattern + whether it loaded; never paths' contents or passphrases). */
   clientCertificates?: { host: string; problem?: string }[];
-  learnedPassthrough?: { host: string; port: number; reason: 'client-certificate' | 'pinned'; until?: number }[]; // CONTRACTS §20.2
+  /** CONTRACTS §20.2: hosts the proxy passes through on its own (`until` absent = until the proxy stops). */
+  learnedPassthrough?: { host: string; port: number; reason: LearnedPassthroughReason; until?: number }[];
   /** CONTRACTS §16.4: gRPC interception and the schema read from the app's generated `*.pb*.dart`. */
   grpc?: GrpcStatus;
 }

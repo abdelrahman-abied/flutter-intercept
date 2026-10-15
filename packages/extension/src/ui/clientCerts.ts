@@ -27,6 +27,11 @@ export const MAX_CLIENT_CERTS = 50;
 /** Secret-storage key for one entry's passphrase (keyed by its host pattern). */
 export const PASSPHRASE_SECRET_PREFIX = 'flutterIntercept.clientCertificatePassphrase:';
 
+/** A passphrase as stored / typed: a non-empty string, else undefined (an empty one means "none"). */
+export function nonEmptyString(v: unknown): string | undefined {
+  return typeof v === 'string' && v.length > 0 ? v : undefined;
+}
+
 export function passphraseSecretKey(host: string): string {
   return `${PASSPHRASE_SECRET_PREFIX}${host.trim().toLowerCase()}`;
 }
@@ -233,8 +238,7 @@ export async function loadClientCertificates(setting: unknown, deps: ClientCertL
       }
       let passphrase: string | undefined;
       try {
-        const p = await deps.getPassphrase(host);
-        passphrase = typeof p === 'string' && p.length > 0 ? p : undefined;
+        passphrase = nonEmptyString(await deps.getPassphrase(host));
       } catch {
         passphrase = undefined;
       }

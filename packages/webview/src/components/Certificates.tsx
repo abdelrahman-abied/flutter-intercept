@@ -6,6 +6,7 @@
  * The popup never sees a path: the host's file picker answers with a one-use token and the file's base name. The
  * passphrase lives only in the popup's own field and is cleared as soon as it is sent.
  */
+import type { Ref } from 'preact';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { ClientCertFileRole, Exchange, Status, ViewMsg } from '../protocol';
@@ -125,24 +126,6 @@ function CertDialogBody({ d }: { d: CertDialogState }) {
     setPassphrase(''); // never kept after sending
   };
   const titleId = `cert-dialog-title-${d.id}`;
-  const fileRow = (role: ClientCertFileRole, first: boolean) => {
-    const f = d.files[role];
-    const labelId = `cert-file-${role}-${d.id}`;
-    return (
-      <div class="cert-file" key={role}>
-        <span id={labelId} class="field-label">{FILE_ROLE_LABEL[role]}</span>
-        <div class="cert-file-line">
-          <button ref={first ? fileRef : undefined} type="button" class="btn btn-secondary" disabled={busy || !!d.picking}
-            aria-describedby={labelId} onClick={() => choose(role)}>
-            {d.picking === role ? 'Choosing…' : f ? 'Change…' : 'Choose file…'}
-          </button>
-          <span class={`cert-file-name${f ? '' : ' muted'}`} aria-label={`${FILE_ROLE_LABEL[role]}: ${f ? f.name : 'none chosen'}`}>
-            {f ? f.name : 'No file chosen'}
-          </span>
-        </div>
-      </div>
-    );
-  };
 
   return (
     <div class="modal-backdrop">
@@ -184,7 +167,9 @@ function CertDialogBody({ d }: { d: CertDialogState }) {
                   PEM (certificate + private key)
                 </label>
               </div>
-              {FORMAT_ROLES[format].map((role, i) => fileRow(role, i === 0))}
+              {FORMAT_ROLES[format].map((role, i) => (
+                <CertFileRow key={role} d={d} role={role} busy={busy} buttonRef={i === 0 ? fileRef : undefined} onChoose={choose} />
+              ))}
             </fieldset>
 
             <label class="field">
@@ -203,6 +188,33 @@ function CertDialogBody({ d }: { d: CertDialogState }) {
             <Button onClick={close}>Cancel</Button>
           </div>
         </form>
+      </div>
+    </div>
+  );
+}
+
+/** One file of the popup: its label, the Choose / Change button and the chosen file's base name (never a path). */
+function CertFileRow({ d, role, busy, buttonRef, onChoose }: {
+  d: CertDialogState;
+  role: ClientCertFileRole;
+  busy: boolean;
+  /** The first file's button (focused when the host is prefilled). */
+  buttonRef?: Ref<HTMLButtonElement>;
+  onChoose: (role: ClientCertFileRole) => void;
+}) {
+  const f = d.files[role];
+  const labelId = `cert-file-${role}-${d.id}`;
+  return (
+    <div class="cert-file">
+      <span id={labelId} class="field-label">{FILE_ROLE_LABEL[role]}</span>
+      <div class="cert-file-line">
+        <button ref={buttonRef} type="button" class="btn btn-secondary" disabled={busy || !!d.picking}
+          aria-describedby={labelId} onClick={() => onChoose(role)}>
+          {d.picking === role ? 'Choosing…' : f ? 'Change…' : 'Choose file…'}
+        </button>
+        <span class={`cert-file-name${f ? '' : ' muted'}`} aria-label={`${FILE_ROLE_LABEL[role]}: ${f ? f.name : 'none chosen'}`}>
+          {f ? f.name : 'No file chosen'}
+        </span>
       </div>
     </div>
   );
@@ -244,7 +256,7 @@ export function CertsStatusItem({ certs, summary, open, onToggle }: {
 }
 
 /**
- * The learned entries still in force. The proxy sends no event when a pin expires (REVIEW-14 #6): one timer at the
+ * The learned entries still in force. Status may still list a pin that just expired (liveLearned): one timer at the
  * earliest `until` re-checks, and the filtering only runs when the list changes or that timer fires.
  */
 function useLiveLearned(list: Status['learnedPassthrough']): Status['learnedPassthrough'] {
@@ -281,7 +293,7 @@ export function CertsPanel({ onClose }: { onClose: (restoreFocus: boolean) => vo
   const { state, dispatch, post } = useApp();
   const certs = state.status.clientCertificates ?? [];
   const all = state.status.learnedPassthrough ?? [];
-  // Ticks only while the list is open and a pin has an end; expired pins drop out (no event from the proxy).
+  // Ticks only while the list is open and a pin has an end; expired pins drop out without waiting for a new Status.
   const now = useNow(all.some((l) => l.until !== undefined));
   const learned = liveLearned(all, now) ?? [];
   const ref = useRef<HTMLElement>(null);
