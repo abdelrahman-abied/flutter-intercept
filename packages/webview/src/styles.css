@@ -778,7 +778,7 @@ textarea.code-input {
   z-index: 20;
   padding: 6px 10px 8px;
   min-width: 320px;
-  background: var(--vscode-editorWidget-background);
+  background: var(--vscode-editorWidget-background, var(--fi-bg));
   color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
   border: 1px solid var(--vscode-editorWidget-border, var(--fi-border));
   border-radius: 4px;
@@ -1419,7 +1419,7 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
   width: 100%;
   max-width: 520px;
   color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
-  background: var(--vscode-editorWidget-background);
+  background: var(--vscode-editorWidget-background, var(--fi-bg));
   border: 1px solid var(--vscode-editorWidget-border, var(--fi-border));
   border-radius: 4px;
   box-shadow: 0 4px 16px var(--vscode-widget-shadow, transparent);
