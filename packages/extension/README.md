@@ -1174,6 +1174,18 @@ certificates** item in the status line lists what you added (Remove) and the ser
 (**Try decrypting again**). Agents can't add, read or remove certificates. The same works from the palette:
 **Flutter Intercept: Add Client Certificate…**.
 
+**What the server sees:** nothing that names Flutter Intercept (its internal headers are removed before a request
+leaves). Two things can show up in the server's logs, though:
+- The first request to such a server is tried without the app's certificate, so the server may log one refused
+  connection from your computer. When the refusal is unclear, Flutter Intercept makes at most one short check that
+  sends no certificate and no data.
+- After you add the certificate, the server gets the same certificate, but the connection comes from Flutter
+  Intercept instead of your app and looks a little different. Most servers don't notice; some security systems do.
+  Use a certificate you're allowed to use for testing, ideally with a development or staging server.
+
+To stop Flutter Intercept from trying such servers on its own, turn off `flutterIntercept.autoPassthrough`: those
+requests then keep failing (with the reason) until you add the certificate.
+
 **Good to know:**
 - A server stays passed through until the proxy stops, you choose **Try decrypting again**, or you add its
   certificate.

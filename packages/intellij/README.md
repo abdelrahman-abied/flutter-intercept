@@ -80,7 +80,10 @@ The VS Code tutorials cover it step by step, starting at
 
 The certificate stays where it is on your computer: the plugin only remembers its location (Settings → Tools →
 Flutter Intercept) and presents it to that server during the connection, the way the app does. It is never uploaded
-anywhere. The passphrase goes to the IDE's password safe. Step by step:
+anywhere. The passphrase goes to the IDE's password safe. The server never sees anything that names Flutter Intercept,
+but it may log the first refused attempt, and after you add the certificate the connection comes from the plugin
+instead of the app: use a certificate you're allowed to use for testing. **Pass servers … through automatically** in
+Settings → Tools → Flutter Intercept turns the automatic part off. Step by step:
 [Apps with their own certificate](../extension/README.md#apps-with-their-own-certificate-mtls).
 
 ## Differences from VS Code
