@@ -6,6 +6,10 @@
  *   settings.writeClientCertificates {entries: {host, pfx?, cert?, key?}[]}         → null (user level; the plugin then
  *                                                                                      sends `settings` as for any change)
  *   secrets.setClientCertPassphrase  {host, passphrase?}  (absent / '' = delete)   → null
+ *   secrets.clientCertPassphrase     {host}                                       → string | null (the stored one, read
+ *                                                                                      before a save replaces it, REVIEW-14 #4)
+ *   ui.confirmRemoveClientCertificate {host}                                      → true to remove (a native modal in the
+ *                                                                                      IDE, REVIEW-14 #4; anything else = no)
  *
  * The entries are read from the settings the plugin sent (`SidecarSettings.clientCertificates`). Both sides check what
  * they receive. The passphrase only travels in that one request: never logged, never in an error message.
@@ -19,6 +23,8 @@ import { RpcFailure } from './rpc';
 export const CERT_FILE_METHOD = 'ui.chooseClientCertificateFile';
 export const CERT_ENTRIES_METHOD = 'settings.writeClientCertificates';
 export const CERT_PASSPHRASE_SET_METHOD = 'secrets.setClientCertPassphrase';
+export const CERT_PASSPHRASE_GET_METHOD = 'secrets.clientCertPassphrase';
+export const CERT_CONFIRM_REMOVE_METHOD = 'ui.confirmRemoveClientCertificate';
 
 const ROLES: readonly ClientCertFileRole[] = ['pfx', 'cert', 'key'];
 const MAX_PATH = 4096;
@@ -87,15 +93,33 @@ function ideError(e: unknown, what: string): Error {
   return new Error(msg || `The IDE couldn't ${what}.`);
 }
 
+/**
+ * A host that may name a passphrase to delete: one line, not blank, ≤ 300 characters. Looser than `certHostProblem`, so
+ * the passphrase of an entry typed on the plugin's settings page with a host the proxy refuses can still be removed
+ * (REVIEW-14 #6). Storing a passphrase still needs a valid pattern.
+ */
+export function deletableHost(v: unknown): string | undefined {
+  if (typeof v !== 'string' || !v.trim() || v.length > 300 || /[\u0000-\u001f\u007f]/.test(v)) return undefined;
+  return v.trim().toLowerCase();
+}
+
+export const CHOOSER_BUSY = 'A file chooser is already open in the IDE.';
+
 export function createSidecarClientCertPlatform(deps: SidecarClientCertDeps): ClientCertPlatform {
+  // REVIEW-14 #6: one native chooser at a time (in the browser fallback each one brings the IDE to the front).
+  let picking = false;
   return {
     async pickFile(role) {
       if (!ROLES.includes(role)) throw new Error('Unknown certificate file kind.');
+      if (picking) throw new Error(CHOOSER_BUSY);
+      picking = true;
       let v: unknown;
       try {
         v = await deps.request(CERT_FILE_METHOD, { role });
       } catch (e) {
         throw ideError(e, 'choose certificate files');
+      } finally {
+        picking = false;
       }
       if (v === null || v === undefined) return undefined;
       const file = usableCertPath(v);
@@ -113,12 +137,34 @@ export function createSidecarClientCertPlatform(deps: SidecarClientCertDeps): Cl
       deps.entriesWritten(checked);
     },
     async setPassphrase(host, passphrase) {
-      if (certHostProblem(host) !== undefined) throw new Error('The host is not a valid host pattern.');
       const value = typeof passphrase === 'string' && passphrase.length > 0 ? passphrase : undefined;
+      if (value !== undefined && certHostProblem(host) !== undefined) throw new Error('The host is not a valid host pattern.');
+      const key = deletableHost(host);
+      if (key === undefined) throw new Error('The host is not a valid host pattern.');
       try {
-        await deps.request(CERT_PASSPHRASE_SET_METHOD, { host: host.trim().toLowerCase(), ...(value !== undefined ? { passphrase: value } : {}) });
+        await deps.request(CERT_PASSPHRASE_SET_METHOD, { host: key, ...(value !== undefined ? { passphrase: value } : {}) });
       } catch (e) {
         throw ideError(e, 'store the passphrase');
+      }
+    },
+    async getPassphrase(host) {
+      const key = deletableHost(host);
+      if (key === undefined) return undefined;
+      let v: unknown;
+      try {
+        v = await deps.request(CERT_PASSPHRASE_GET_METHOD, { host: key });
+      } catch (e) {
+        throw ideError(e, 'read the stored passphrase');
+      }
+      return typeof v === 'string' && v.length > 0 ? v : undefined;
+    },
+    async confirmRemove(host) {
+      const key = deletableHost(host);
+      if (key === undefined) return false;
+      try {
+        return (await deps.request(CERT_CONFIRM_REMOVE_METHOD, { host: key })) === true;
+      } catch (e) {
+        throw ideError(e, 'ask before removing a certificate');
       }
     },
     reload: () => deps.reload(),

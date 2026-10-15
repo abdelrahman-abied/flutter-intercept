@@ -360,7 +360,14 @@ describe('SidecarHost', () => {
     expect(seen).not.toContain(passphrase);
     expect(logs.join('\n')).not.toContain(passphrase);
 
+    // REVIEW-14 #4: the IDE asks first; "Cancel" changes nothing.
+    link.answers['ui.confirmRemoveClientCertificate'] = () => false;
     await ctl.handle({ type: 'removeClientCertificate', host: 'api.example.com' }, reply);
+    expect(stored).toHaveLength(1);
+    expect(safe.get('api.example.com')).toBe(passphrase);
+    link.answers['ui.confirmRemoveClientCertificate'] = () => true;
+    await ctl.handle({ type: 'removeClientCertificate', host: 'api.example.com' }, reply);
+    expect(link.requests.filter((r) => r.method === 'ui.confirmRemoveClientCertificate').map((r) => r.params)).toEqual([{ host: 'api.example.com' }, { host: 'api.example.com' }]);
     await vi.waitFor(() => expect(ctl.status().clientCertificates).toBeUndefined());
     expect(stored).toEqual([]);
     expect(safe.has('api.example.com')).toBe(false);

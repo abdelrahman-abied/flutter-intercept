@@ -75,6 +75,8 @@ object ClientCertificates {
     const val MAX_ENTRIES = 50
     const val MAX_PATH = 4096
     const val MAX_HOST = 260
+    /** A host that only names a passphrase to delete (the extension's `remove` accepts up to 300). */
+    const val MAX_LEGACY_HOST = 300
     const val MAX_PASSPHRASE = 4096
 
     /** `ClientCertFileRole` of the protocol. */
@@ -166,6 +168,34 @@ object ClientCertificates {
         }
     }
 
+    /**
+     * REVIEW-14 #3: what the settings page's Apply stores. [base] is the list the page loaded, [mine] what its text says
+     * now, [current] what is stored now (the panel may have added or removed an entry while the dialog was open).
+     * Unchanged since loading → exactly [mine]. Otherwise only the page's own edits are applied to [current]: entries
+     * the user deleted or changed go, entries the user typed are added (replacing the same host), except for a host the
+     * panel changed meanwhile, whose newer entry is kept.
+     */
+    fun mergeEdits(
+        base: List<ClientCertificateEntry>,
+        mine: List<ClientCertificateEntry>,
+        current: List<ClientCertificateEntry>,
+    ): List<ClientCertificateEntry> {
+        val baseKeys = base.map(::trimmed)
+        if (current.map(::trimmed) == baseKeys) return mine
+        val mineKeys = mine.map(::trimmed)
+        val removed = baseKeys.filter { it !in mineKeys }
+        val added = mine.filter { trimmed(it) !in baseKeys }
+        val changedElsewhere = current.filter { trimmed(it) !in baseKeys }.map { trimmed(it).host }.toSet()
+        val out = current.filter { trimmed(it) !in removed }.toMutableList()
+        for (e in added) {
+            val host = trimmed(e).host
+            if (host in changedElsewhere) continue
+            val at = out.indexOfFirst { trimmed(it).host == host }
+            if (at >= 0) out[at] = e else out += e
+        }
+        return out
+    }
+
     private fun trimmed(e: ClientCertificateEntry) = ClientCertificateEntry().also {
         it.host = e.host.trim().lowercase()
         it.pfx = e.pfx?.trim()?.takeIf(String::isNotEmpty)
@@ -175,11 +205,15 @@ object ClientCertificates {
 
     private fun sameEntry(a: ClientCertificateEntry, b: ClientCertificateEntry) = a.host.isNotEmpty() && a == b
 
-    /** `secrets.setClientCertPassphrase` params: the checked host and the passphrase (null = delete). Never echoes the value. */
+    /**
+     * `secrets.setClientCertPassphrase` params: the checked host and the passphrase (null = delete). Never echoes the
+     * value. Storing needs a valid host pattern; deleting accepts any one-line host up to [MAX_LEGACY_HOST] characters,
+     * so the passphrase of an entry typed on the settings page with a host the proxy refuses can still be removed
+     * (REVIEW-14 #6). The key is always under [PASSPHRASE_PREFIX].
+     */
     fun passphraseRequest(p: JsonObject): Pair<String, String?> {
         val hostEl = p.get("host")
         val host = if (hostEl != null && hostEl.isJsonPrimitive && hostEl.asJsonPrimitive.isString) hostEl.asString else null
-        hostProblem(host)?.let { throw RpcException(it, "invalid") }
         val v = p.get("passphrase")
         val passphrase = when {
             v == null || v.isJsonNull -> null
@@ -187,6 +221,24 @@ object ClientCertificates {
             else -> throw RpcException("passphrase must be a string", "invalid")
         }
         if (passphrase != null && passphrase.length > MAX_PASSPHRASE) throw RpcException("The passphrase is too long.", "invalid")
+        if (passphrase != null) hostProblem(host)?.let { throw RpcException(it, "invalid") }
+        else legacyHostProblem(host)?.let { throw RpcException(it, "invalid") }
         return host!!.trim() to passphrase
+    }
+
+    const val REMOVE_BUTTON = "Remove"
+
+    /** The same question as the VS Code host's modal (REVIEW-14 #4). */
+    fun removeQuestion(host: String) = "Remove the client certificate for ${host.trim().lowercase()}? Its passphrase is deleted too."
+
+    /** A host good enough to name a passphrase to delete: one line, not blank, at most [MAX_LEGACY_HOST] characters. */
+    fun legacyHostProblem(host: String?): String? {
+        val h = host?.trim().orEmpty()
+        return when {
+            h.isEmpty() -> "The host is missing."
+            h.length > MAX_LEGACY_HOST -> "The host is too long."
+            h.any { it.isISOControl() } -> "The host is not a host name pattern."
+            else -> null
+        }
     }
 }

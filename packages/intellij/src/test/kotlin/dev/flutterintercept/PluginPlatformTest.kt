@@ -10,6 +10,7 @@ import dev.flutterintercept.api.InterceptSidecar
 import dev.flutterintercept.api.LaunchPlan
 import dev.flutterintercept.api.LaunchRequest
 import dev.flutterintercept.core.InterceptSidecarImpl
+import dev.flutterintercept.settings.InterceptConfigurable
 import dev.flutterintercept.settings.InterceptSettings
 import dev.flutterintercept.sidecar.RpcException
 import dev.flutterintercept.sidecar.SIDECAR_PATH_PROPERTY
@@ -54,6 +55,42 @@ class PluginPlatformTest : BasePlatformTestCase() {
             assertTrue("$e", e is RpcException && e.message!!.startsWith("This file is outside the project"))
         } finally {
             outside.delete()
+        }
+    }
+
+    /** REVIEW-14 #3: Apply in Settings → Tools → Flutter Intercept keeps a certificate the panel added while it was open. */
+    fun testSettingsApplyKeepsACertificateAddedFromThePanel() {
+        val settings = InterceptSettings.getInstance()
+        val before = settings.snapshot()
+        val configurable = InterceptConfigurable()
+        try {
+            configurable.createComponent()
+            configurable.reset()
+            handle("settings.writeClientCertificates", """{"entries":[{"host":"panel.example","pfx":"/certs/panel.p12"}]}""")
+            assertEquals(listOf("panel.example"), settings.state.clientCertificates.map { it.host })
+            configurable.apply() // the user changed something else and pressed OK
+            assertEquals(listOf("panel.example"), settings.state.clientCertificates.map { it.host })
+            assertEquals("/certs/panel.p12", settings.state.clientCertificates[0].pfx)
+        } finally {
+            configurable.disposeUIResources()
+            settings.update(before)
+        }
+    }
+
+    fun testClientCertificatePassphraseRequests() {
+        handle("secrets.setClientCertPassphrase", """{"host":"API.example.com","passphrase":"platform-test-secret"}""")
+        assertEquals("platform-test-secret", handle("secrets.clientCertPassphrase", """{"host":"api.example.com"}"""))
+        handle("secrets.setClientCertPassphrase", """{"host":"api.example.com"}""")
+        assertNull(handle("secrets.clientCertPassphrase", """{"host":"api.example.com"}"""))
+        for ((method, json) in listOf(
+            "secrets.setClientCertPassphrase" to """{"host":"a=b","passphrase":"x"}""",
+            "secrets.clientCertPassphrase" to """{"host":""}""",
+            "ui.confirmRemoveClientCertificate" to """{"host":" "}""",
+            "ui.chooseClientCertificateFile" to """{"role":"ca"}""",
+            "settings.writeClientCertificates" to """{"entries":[{"host":"x.example","pfx":"relative.p12"}]}""",
+        )) {
+            val e = try { handle(method, json); null } catch (e: ExecutionException) { e.cause }
+            assertTrue("$method: $e", e is RpcException && e.code == "invalid")
         }
     }
 

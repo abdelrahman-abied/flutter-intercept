@@ -48,6 +48,7 @@ import java.awt.datatransfer.StringSelection
 import java.io.File
 import java.nio.file.Path
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.swing.JList
 
 object UiRequestHandler {
@@ -70,13 +71,18 @@ object UiRequestHandler {
                 activeProject()?.let { InterceptToolWindow.show(it, focus = true) }
                 null
             }
-            // Never prompts: the passphrase stored with "Set Client Certificate Passphrase…", or null.
-            "secrets.clientCertPassphrase" -> CompletableFuture.supplyAsync({
-                ClientCertificates.getPassphrase(p.requireString("host"))?.takeIf { it.isNotEmpty() }
-            }, AppExecutorUtil.getAppExecutorService())
+            // Never prompts: the passphrase stored with "Set Client Certificate Passphrase…" or the panel, or null.
+            "secrets.clientCertPassphrase" -> {
+                val host = p.requireString("host")
+                ClientCertificates.legacyHostProblem(host)?.let { return CompletableFuture.failedFuture(RpcException(it, "invalid")) }
+                CompletableFuture.supplyAsync({
+                    ClientCertificates.getPassphrase(host)?.takeIf { it.isNotEmpty() }
+                }, AppExecutorUtil.getAppExecutorService())
+            }
             // CONTRACTS §20.3: "Add client certificate…" in the panel (the shared ClientCertUi's platform in the sidecar).
             "ui.chooseClientCertificateFile" -> chooseClientCertificateFile(p)
             "settings.writeClientCertificates" -> writeClientCertificates(p)
+            "ui.confirmRemoveClientCertificate" -> confirmRemoveClientCertificate(p)
             "secrets.setClientCertPassphrase" -> try {
                 val (host, passphrase) = ClientCertificates.passphraseRequest(p)
                 CompletableFuture.supplyAsync({
@@ -254,6 +260,10 @@ object UiRequestHandler {
     private fun chooseClientCertificateFile(p: JsonObject): CompletableFuture<Any?> {
         val role = p.optString("role")?.takeIf { it in ClientCertificates.ROLES }
             ?: return CompletableFuture.failedFuture(RpcException("role must be pfx, cert or key", "invalid"))
+        // REVIEW-14 #6: one chooser at a time (each one also brings the IDE to the front).
+        if (!choosingCertificate.compareAndSet(false, true)) {
+            return CompletableFuture.failedFuture(RpcException("A file chooser is already open in the IDE.", "busy"))
+        }
         return onEdt {
             val project = activeProject()
             if (project != null) ProjectUtil.focusProjectWindow(project, true)
@@ -262,6 +272,22 @@ object UiRequestHandler {
             val path = file.toNioPath().toAbsolutePath().toString()
             ClientCertificates.pathProblem(path)?.let { throw RpcException(it, "invalid") }
             path
+        }.whenComplete { _, _ -> choosingCertificate.set(false) }
+    }
+
+    private val choosingCertificate = AtomicBoolean(false)
+
+    /**
+     * REVIEW-14 #4: the IDE asks before the panel removes a certificate and deletes its passphrase (the panel's own
+     * confirmation isn't enough). Cancel is the default button; true only for Remove.
+     */
+    private fun confirmRemoveClientCertificate(p: JsonObject): CompletableFuture<Any?> {
+        val host = p.optString("host")?.trim()
+        ClientCertificates.legacyHostProblem(host)?.let { return CompletableFuture.failedFuture(RpcException(it, "invalid")) }
+        return onEdt {
+            val project = activeProject()
+            if (project != null) ProjectUtil.focusProjectWindow(project, true)
+            ConfirmDialog(project, ClientCertificates.removeQuestion(host!!), null, listOf(ClientCertificates.REMOVE_BUTTON)).ask() == ClientCertificates.REMOVE_BUTTON
         }
     }
 

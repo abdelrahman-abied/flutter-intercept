@@ -103,7 +103,7 @@ export type SidecarRequest =
   | { method: 'ui.confirm'; params: { message: string; detail?: string; buttons: string[]; modal?: boolean } }                              // → button | null
   | { method: 'ui.notify'; params: { level: 'info' | 'warning' | 'error'; message: string; buttons?: string[] } }                           // → button | null
   | { method: 'ui.reveal'; params?: { exchangeId?: string } }                                                                               // focus the tool window
-  /** A client-certificate passphrase from the IDE's password store, without prompting; error / null = none. */
+  /** A client-certificate passphrase from the IDE's password store, without prompting; error / null = none (also read before the panel replaces it, REVIEW-14 #4). */
   | { method: 'secrets.clientCertPassphrase'; params: { host: string } }                                                                   // → string | null
   /** REVIEW-9: the MCP token in the IDE's password store (key `flutterIntercept.mcpToken`); error code `unavailable` = no store. */
   | { method: 'secrets.get'; params: { key: string } }                                                                                     // → string | null
@@ -114,7 +114,9 @@ export type SidecarRequest =
   /** Replace the user-level `clientCertificates` (application settings); the plugin then sends `settings` as for any change. */
   | { method: 'settings.writeClientCertificates'; params: { entries: { host: string; pfx?: string; cert?: string; key?: string }[] } }   // → null
   /** Store the passphrase for a host pattern in the password safe (key as `secrets.clientCertPassphrase`); absent / '' deletes it. */
-  | { method: 'secrets.setClientCertPassphrase'; params: { host: string; passphrase?: string } };                                         // → null
+  | { method: 'secrets.setClientCertPassphrase'; params: { host: string; passphrase?: string } }                                          // → null
+  /** REVIEW-14 #4: a native modal "Remove the client certificate for <host>? Its passphrase is deleted too." (Remove / Cancel). */
+  | { method: 'ui.confirmRemoveClientCertificate'; params: { host: string } };                                                            // → true to remove
 
 // ── sidecar → plugin events ──────────────────────────────────────────────────────────────────────────────
 export type SidecarEvent =

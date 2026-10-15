@@ -100,6 +100,11 @@ class ClientCertificateRequestsTest {
         refused { ClientCertificates.passphraseRequest(obj("""{"passphrase":"x"}""")) }
         refused { ClientCertificates.passphraseRequest(obj("""{"host":"a=b","passphrase":"x"}""")) }
         refused { ClientCertificates.passphraseRequest(obj("""{"host":"a.example","passphrase":1}""")) }
+        // REVIEW-14 #6: a legacy settings-page host the proxy refuses: its passphrase can be deleted, not stored.
+        assertEquals("Bad Host" to null, ClientCertificates.passphraseRequest(obj("""{"host":"Bad Host"}""")))
+        refused { ClientCertificates.passphraseRequest(obj("""{"host":"Bad Host","passphrase":"x"}""")) }
+        refused { ClientCertificates.passphraseRequest(obj("""{"host":"a\nb"}""")) }
+        refused { ClientCertificates.passphraseRequest(obj("""{"host":"${"x".repeat(301)}"}""")) }
         val long = JsonObject().apply { addProperty("host", "a.example"); addProperty("passphrase", "p".repeat(4097)) }
         val e = refused { ClientCertificates.passphraseRequest(long) }
         assertFalse(e.message!!.contains("ppp"))
@@ -119,5 +124,33 @@ class ClientCertificateRequestsTest {
         assertTrue(ClientCertificates.chooserDescriptor("cert").description.contains(".crt"))
         assertTrue(ClientCertificates.chooserDescriptor("key").description.contains(".key"))
         refused { ClientCertificates.chooserDescriptor("ca") }
+    }
+
+    private fun entry(host: String, pfx: String) = ClientCertificateEntry().also { it.host = host; it.pfx = pfx }
+
+    @Test
+    fun applyKeepsWhatThePanelChangedMeanwhile() {
+        val a = entry("a.example", "/a.p12")
+        val b = entry("b.example", "/b.p12")
+        val panel = entry("panel.example", "/panel.p12")
+        // Nothing changed elsewhere: exactly the page's list (order included).
+        assertEquals(listOf(b, a), ClientCertificates.mergeEdits(listOf(a, b), listOf(b, a), listOf(a, b)))
+        // REVIEW-14 #3: the panel added an entry while the dialog was open, the user changed nothing there → kept.
+        assertEquals(listOf(panel, a, b), ClientCertificates.mergeEdits(listOf(a, b), listOf(a, b), listOf(panel, a, b)))
+        // ... and the user's own edits still apply: b deleted, a's file changed, c added.
+        val a2 = entry("a.example", "/a2.p12")
+        val c = entry("c.example", "/c.p12")
+        assertEquals(listOf(panel, a2, c), ClientCertificates.mergeEdits(listOf(a, b), listOf(a2, c), listOf(panel, a, b)))
+        // The panel replaced a's entry meanwhile: its newer entry wins over the page's stale edit of the same host.
+        val aPanel = entry("A.example", "/a-panel.p12")
+        assertEquals(listOf(aPanel, b), ClientCertificates.mergeEdits(listOf(a, b), listOf(a2, b), listOf(aPanel, b)))
+        // The panel removed b meanwhile; the page didn't touch it → stays removed.
+        assertEquals(listOf(a), ClientCertificates.mergeEdits(listOf(a, b), listOf(a, b), listOf(a)))
+    }
+
+    @Test
+    fun removeQuestionMatchesVsCode() {
+        assertEquals("Remove the client certificate for api.example.com? Its passphrase is deleted too.", ClientCertificates.removeQuestion(" API.example.com "))
+        assertEquals("Remove", ClientCertificates.REMOVE_BUTTON)
     }
 }

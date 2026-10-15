@@ -26,6 +26,8 @@ class InterceptConfigurable : BoundConfigurable("Flutter Intercept") {
     private var tlsText = ""
     private var grpcText = ""
     private var certText = ""
+    /** The certificate list [certText] was loaded from (REVIEW-14 #3: Apply merges onto what is stored now). */
+    private var baseCerts: List<ClientCertificateEntry> = emptyList()
 
     private fun load() {
         val s = settings.snapshot()
@@ -36,6 +38,7 @@ class InterceptConfigurable : BoundConfigurable("Flutter Intercept") {
         working.grpcDecryptHosts = s.grpcDecryptHosts.toMutableList()
         grpcText = s.grpcDecryptHosts.joinToString("\n")
         certText = ClientCertificates.format(s.clientCertificates)
+        baseCerts = s.clientCertificates.map(ClientCertificateEntry::copy)
     }
 
     override fun createPanel(): DialogPanel {
@@ -113,9 +116,13 @@ class InterceptConfigurable : BoundConfigurable("Flutter Intercept") {
         if (bad.isNotEmpty()) throw ConfigurationException("Client certificates: line ${bad.joinToString(", ")} isn't “host = file” or “host = cert, key”.")
         working.tlsPassthrough = tlsText.lines().map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
         working.grpcDecryptHosts = grpcText.lines().map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
-        working.clientCertificates = certs.toMutableList()
+        // A certificate added or removed from the traffic panel while this dialog was open is kept (REVIEW-14 #3).
+        val merged = ClientCertificates.mergeEdits(baseCerts, certs, settings.snapshot().clientCertificates)
+        working.clientCertificates = merged.map(ClientCertificateEntry::copy).toMutableList()
         working.nodePath = working.nodePath.trim()
         settings.update(working)
+        if (merged != certs) reset() // show what is stored now
+        else baseCerts = merged.map(ClientCertificateEntry::copy)
     }
 
     override fun reset() {

@@ -1,7 +1,11 @@
 // CONTRACTS §20.3: the sidecar's ClientCertPlatform (IDE requests for the panel's "Add client certificate…").
 import { describe, expect, it } from 'vitest';
 import {
+  CERT_CONFIRM_REMOVE_METHOD,
   CERT_ENTRIES_METHOD,
+  CERT_PASSPHRASE_GET_METHOD,
+  CHOOSER_BUSY,
+  deletableHost,
   CERT_FILE_METHOD,
   CERT_PASSPHRASE_SET_METHOD,
   createSidecarClientCertPlatform,
@@ -91,7 +95,7 @@ describe('sidecar client certificate platform', () => {
       { host: 'api.example.com' },
       { host: 'api.example.com' },
     ]);
-    await expect(f.platform.setPassphrase('not a host', 'very-secret-passphrase')).rejects.toThrow(/host/);
+    await expect(f.platform.setPassphrase('*', 'very-secret-passphrase')).rejects.toThrow(/host/);
     const failing = fake({ [CERT_PASSPHRASE_SET_METHOD]: () => { throw new Error('password safe locked'); } });
     const err = await failing.platform.setPassphrase('api.example.com', 'very-secret-passphrase').catch((e: Error) => e);
     expect(String(err)).not.toContain('very-secret-passphrase');
@@ -111,6 +115,44 @@ describe('sidecar client certificate platform', () => {
     const stored = [{ host: 'Bad Host', pfx: 'relative.p12' }];
     expect(entriesForPlugin([{ host: 'new.example', pfx: '/n.p12' }, ...stored], stored)).toEqual([{ host: 'new.example', pfx: '/n.p12' }, ...stored]);
     expect(entriesForPlugin([{ host: 'a.example', pfx: '/a.p12', cert: '', extra: 1 }], [])).toEqual([{ host: 'a.example', pfx: '/a.p12' }]);
+  });
+
+  it('one file chooser at a time (REVIEW-14 #6)', async () => {
+    let answer!: (v: unknown) => void;
+    const f = fake({ [CERT_FILE_METHOD]: () => new Promise((res) => (answer = res)) });
+    const first = f.platform.pickFile('pfx');
+    await expect(f.platform.pickFile('cert')).rejects.toThrow(CHOOSER_BUSY);
+    answer('/certs/client.p12');
+    expect(await first).toBe('/certs/client.p12');
+    const failing = fake({ [CERT_FILE_METHOD]: () => { throw new RpcFailure('no', 'invalid'); } });
+    await expect(failing.platform.pickFile('pfx')).rejects.toThrow('no');
+    await expect(failing.platform.pickFile('pfx')).rejects.toThrow('no'); // released after a failure
+    expect(failing.requests).toHaveLength(2);
+    expect(f.requests).toHaveLength(1);
+  });
+
+  it('getPassphrase reads the stored one; confirmRemove asks the IDE (REVIEW-14 #4)', async () => {
+    const f = fake({ [CERT_PASSPHRASE_GET_METHOD]: (p) => (p.host === 'api.example.com' ? 'old-secret' : null), [CERT_CONFIRM_REMOVE_METHOD]: (p) => p.host === 'api.example.com' });
+    expect(await f.platform.getPassphrase!('API.example.com')).toBe('old-secret');
+    expect(await f.platform.getPassphrase!('other.example')).toBeUndefined();
+    expect(await f.platform.confirmRemove!('API.example.com')).toBe(true);
+    expect(await f.platform.confirmRemove!('other.example')).toBe(false);
+    expect(await f.platform.confirmRemove!('a\nb')).toBe(false);
+    expect(f.requests.filter((r) => r.method === CERT_CONFIRM_REMOVE_METHOD).map((r) => r.params)).toEqual([{ host: 'api.example.com' }, { host: 'other.example' }]);
+    const truthy = fake({ [CERT_CONFIRM_REMOVE_METHOD]: () => 'Remove' });
+    expect(await truthy.platform.confirmRemove!('api.example.com')).toBe(false); // only `true` removes
+    const old = fake();
+    await expect(old.platform.confirmRemove!('api.example.com')).rejects.toThrow(/update Flutter Intercept/);
+  });
+
+  it('a legacy host the proxy refuses: its passphrase can be deleted, not stored (REVIEW-14 #6)', async () => {
+    const f = fake({ [CERT_PASSPHRASE_SET_METHOD]: () => null });
+    await f.platform.setPassphrase('Bad Host', undefined);
+    expect(f.requests.at(-1)?.params).toEqual({ host: 'bad host' });
+    await expect(f.platform.setPassphrase('Bad Host', 'x')).rejects.toThrow(/host/);
+    expect(deletableHost('a\u0007b')).toBeUndefined();
+    expect(deletableHost('x'.repeat(301))).toBeUndefined();
+    expect(deletableHost(' ')).toBeUndefined();
   });
 
   it('usableCertPath', () => {
