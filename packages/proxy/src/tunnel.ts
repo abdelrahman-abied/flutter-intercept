@@ -34,6 +34,8 @@ export interface TunnelUpstream {
   timings: (p: TimingPatch) => void;
   /** Direct connections: give up after this long (default TUNNEL_CONNECT_TIMEOUT_MS). */
   timeoutMs?: number;
+  /** Through the upstream proxy: give up after this long in all (REVIEW-14 #6: the probe). Default: its idle timeout. */
+  upstreamDeadlineMs?: number;
 }
 
 /** Does this upstream connection go through the upstream proxy (CONTRACTS §12.6)? Same rule as openTunnelUpstream. */
@@ -57,12 +59,18 @@ export async function openTunnelUpstream(o: TunnelUpstream): Promise<net.Socket>
     const spec = o.upstream;
     const from = performance.now();
     return new Promise((resolve, reject) => {
-      connectTunnel(spec, host, o.port, (err, socket) => {
-        if (err || !socket) return reject(err ?? new Error('no tunnel'));
-        o.timings({ connectMs: elapsed(from) });
-        socket.resume();
-        resolve(socket);
-      });
+      connectTunnel(
+        spec,
+        host,
+        o.port,
+        (err, socket) => {
+          if (err || !socket) return reject(err ?? new Error('no tunnel'));
+          o.timings({ connectMs: elapsed(from) });
+          socket.resume();
+          resolve(socket);
+        },
+        o.upstreamDeadlineMs,
+      );
     });
   }
   return new Promise((resolve, reject) => {

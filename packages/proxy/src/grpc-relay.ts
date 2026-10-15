@@ -837,14 +837,19 @@ export class GrpcRelay {
       return false;
     }
     if (u.protocol !== 'https:') return false;
+    const host = normalizeHostname(u.hostname);
+    const port = Number(u.port) || 443;
+    // REVIEW-14 #1: learn only when the call names the CONNECT target (what the app's next silent tunnel is matched on).
+    const dest = requestInternals(call.req).destination as { hostname?: string; port?: number } | undefined;
+    const sameServer = !!dest?.hostname && normalizeHostname(dest.hostname) === host && dest.port === port;
     const v = await this.px.learn.verdict({
-      host: normalizeHostname(u.hostname),
-      port: Number(u.port) || 443,
+      host,
+      port,
       alert,
       socket: requestInternals(call.req).socket,
       grpc: true,
       ...(call.ex.clientCertificate ? { certPattern: call.ex.clientCertificate } : {}),
-      ...(call.flow.send || call.flow.map ? { noLearn: true } : {}),
+      ...(call.flow.send || call.flow.map || !sameServer ? { noLearn: true } : {}),
     });
     if (!v || !call.isLive() || call.stream.closed || call.stream.headersSent) return false;
     if (v.learned) call.ex.learnedPassthrough = v.learned;

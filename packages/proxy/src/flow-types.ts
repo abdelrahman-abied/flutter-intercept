@@ -137,6 +137,8 @@ export interface Flow {
   learn?: Promise<LearnVerdict | undefined>;
   /** CONTRACTS §20.1: an HTTPS 400 page that may be nginx's "No required SSL certificate was sent". */
   maybeNginx?: boolean;
+  /** REVIEW-14 #1: the server the app's connection goes to (the CONNECT target), for HTTPS requests. */
+  dest?: { host: string; port: number };
 }
 
 /** The part of mockttp's TimingEvents we read (high-resolution `performance.now()` timestamps). */

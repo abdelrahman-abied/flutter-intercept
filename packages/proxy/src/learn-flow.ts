@@ -5,6 +5,7 @@ import { matchesHostPattern } from './hosts';
 import { lanGateOf } from './lan';
 import {
   CERT_ALERTS,
+  clientKeyOf,
   hostLabel,
   LEARNED_MAX,
   LearnedHosts,
@@ -34,7 +35,10 @@ export interface UpstreamRefusal {
   socket?: unknown;
   /** Learned on a gRPC call (a silent tunnel's host). */
   grpc?: boolean;
-  /** The request isn't the app's own CONNECT traffic (send / resend, Map Remote): explain, never learn. */
+  /**
+   * Explain, never learn: the request isn't the app's own CONNECT traffic (send / resend, Map Remote), or the server
+   * the proxy connected to isn't the one the request names (REVIEW-14 #1: a CONNECT to an IP with another Host / SNI).
+   */
   noLearn?: boolean;
 }
 
@@ -51,6 +55,8 @@ export class LearnFlow {
   readonly hosts: LearnedHosts;
   /** Probes in flight per host:port (shared by every failure that waits for one). */
   private readonly probing = new Map<string, Promise<boolean>>();
+  /** Probes whose work hasn't ended yet (the cap). */
+  private busy = 0;
   /**
    * host:port → the last probe's answer and when (PERF-2 #2: reused within PROBE_NEGATIVE_MS, both ways — failures
    * that arrive after a probe said yes don't start another one, which matters once the map is full).
@@ -89,12 +95,13 @@ export class LearnFlow {
   }
 
   /**
-   * The learned entry an HTTP CONNECT to `host:port` is passed through for (O(1) for hosts not learned). A
-   * `client-certificate` entry yields while a recording is replayed or a rule names the host (they answer it).
+   * The learned entry a CONNECT from `client` (clientKeyOf) to `host:port` is passed through for: a `client-certificate`
+   * entry, or that client's own pin. O(1) for hosts not learned. An entry yields while a recording is replayed or a
+   * rule names the host (REVIEW-14 #6: rules added after it too), so they answer it.
    */
-  forConnect(host: string, port: number): LearnedPassthrough | undefined {
-    const e = this.hosts.get(learnedKey(host, port));
-    if (!e || e.reason === 'pinned') return e;
+  forConnect(host: string, port: number, client: string): LearnedPassthrough | undefined {
+    const e = this.hosts.lookup(host, port, client);
+    if (!e) return undefined;
     return this.keepDecrypted(host, port) ? undefined : e;
   }
 
@@ -134,7 +141,8 @@ export class LearnFlow {
       const rules = kept.startsWith('The enabled rule') ? ' for the rules to work' : '';
       return { error: `This server needs the app's own client certificate (${cause}). ${kept}, so ${label} stays decrypted${rules}. To make these requests work, ${ADD_CERT}.` };
     }
-    if (!this.hosts.learn(f.host, f.port, 'client-certificate', f.grpc ? { grpc: true } : {})) {
+    const by = clientKeyOf((f.socket as { remoteAddress?: string } | undefined)?.remoteAddress);
+    if (!this.hosts.learn(f.host, f.port, 'client-certificate', { by, ...(f.grpc ? { grpc: true } : {}) })) {
       return { error: `This server needs the app's own client certificate (${cause}). ${LEARNED_MAX} hosts are passed through already, so ${label} stays decrypted. To make these requests work, ${ADD_CERT}.` };
     }
     return {
@@ -145,14 +153,17 @@ export class LearnFlow {
     };
   }
 
-  /** One probe per host:port at a time, ≤ PROBE_MAX_AT_ONCE in all; its answer is reused for PROBE_NEGATIVE_MS. */
+  /**
+   * One probe per host:port at a time, ≤ PROBE_MAX_AT_ONCE in all — counted until the probe's work has ended, not just
+   * its answer (REVIEW-14 #6) — and its answer is reused for PROBE_NEGATIVE_MS.
+   */
   private probe(f: UpstreamRefusal): Promise<boolean> {
     const key = learnedKey(f.host, f.port);
     const running = this.probing.get(key);
     if (running) return running;
     const recent = this.recentProbe(key);
     if (recent) return Promise.resolve(recent.yes);
-    if (this.probing.size >= PROBE_MAX_AT_ONCE || this.px.targetsSelf(f.host, f.port)) return Promise.resolve(false);
+    if (this.busy >= PROBE_MAX_AT_ONCE || this.px.targetsSelf(f.host, f.port)) return Promise.resolve(false);
     const gate = lanGateOf(f.socket);
     if (gate?.closed) return Promise.resolve(false);
     const target: ProbeTarget = {
@@ -162,7 +173,15 @@ export class LearnFlow {
       upstream: this.px.upstreamSpec,
       ...(!gate && (this.px.opts.rewriteLocalhost ?? true) ? { alias: (h: string) => HOST_ALIASES[h] } : {}),
     };
-    const p = (probeTesting.probe ?? probeCertificateRequest)(target)
+    this.busy++;
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      this.busy--;
+    };
+    const run = probeTesting.probe ? probeTesting.probe(target).finally(done) : probeCertificateRequest(target, undefined, done);
+    const p = run
       .catch(() => false)
       .then((yes) => {
         this.probing.delete(key);

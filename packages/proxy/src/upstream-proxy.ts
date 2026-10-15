@@ -150,14 +150,23 @@ const CONNECT_HEAD_MAX = 16 * 1024;
 const CONNECT_TIMEOUT_MS = 30_000;
 
 /** Open a CONNECT tunnel to `host:port` through the proxy. */
-export function connectTunnel(p: UpstreamProxySpec, host: string, port: number, cb: (err: Error | null, socket?: net.Socket) => void): void {
+export function connectTunnel(
+  p: UpstreamProxySpec,
+  host: string,
+  port: number,
+  cb: (err: Error | null, socket?: net.Socket) => void,
+  /** Give up after this long in all (the idle timeout alone lets a slow-dripping proxy hold the attempt). */
+  deadlineMs?: number,
+): void {
   const target = `${bracket(host)}:${port}`;
   const socket = net.connect({ host: p.host, port: p.port });
   let buf = Buffer.alloc(0);
   let done = false;
+  const deadline = deadlineMs && deadlineMs > 0 ? setTimeout(() => finish(new Error(`The upstream proxy ${p.label} did not complete CONNECT ${target} in time`)), deadlineMs) : undefined;
   const finish = (err: Error | null, s?: net.Socket) => {
     if (done) return;
     done = true;
+    clearTimeout(deadline);
     socket.setTimeout(0);
     socket.off('data', onData);
     if (err) socket.destroy();

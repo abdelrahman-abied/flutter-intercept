@@ -19,7 +19,10 @@ import {
   alertOf,
   alertOfTags,
   CertRequestFinder,
+  clientKeyOf,
   LEARNED_MAX,
+  LEARNED_PER_CLIENT,
+  LOOPBACK_CLIENT,
   LearnedHosts,
   parseLearnedKey,
   patternNamesHost,
@@ -121,6 +124,29 @@ function get(agent: https.Agent, port: number, p: string): Promise<{ status: num
   });
 }
 
+/**
+ * REVIEW-14 #1: a CONNECT to `ip:port`, then TLS with SNI `name` and a request with `Host: name` (an attacker's own
+ * server by IP, posing as another host). The response status and headers.
+ */
+async function connectByIpAs(proxyPort: number, ip: string, port: number, name: string, p = '/secure'): Promise<{ status: number; headers: http.IncomingHttpHeaders }> {
+  const c = http.request({ host: '127.0.0.1', port: proxyPort, method: 'CONNECT', path: `${ip}:${port}`, agent: false });
+  c.end();
+  const [, raw] = (await once(c, 'connect')) as [http.IncomingMessage, net.Socket];
+  const t = tls.connect({ socket: raw, servername: name, rejectUnauthorized: false });
+  await once(t, 'secureConnect');
+  return new Promise((resolve, reject) => {
+    const r = http.request({ createConnection: () => t, path: p, headers: { host: name, connection: 'keep-alive' } }, (res) => {
+      res.resume();
+      res.on('end', () => {
+        t.destroy();
+        resolve({ status: res.statusCode ?? 0, headers: res.headers });
+      });
+    });
+    r.on('error', reject);
+    r.end();
+  });
+}
+
 const failed = (e: Exchange) => e.kind !== 'tunnel' && e.state === 'error';
 const learnedText = (cause: string, host: string) =>
   `This server needs the app's own client certificate (${cause}). From now on ${host} is passed through without decryption, so the app talks to it directly with its own certificate. To see these requests, add the certificate in the Flutter Intercept panel (Add client certificate…).`;
@@ -159,10 +185,11 @@ describe('learned passthrough: helpers', () => {
     const m = new LearnedHosts(() => changes++);
     expect(m.learn('a.test', 443, 'client-certificate')).toBe(true);
     expect(m.learn('a.test', 443, 'pinned', { until: Date.now() + 1000 })).toBe(true);
-    expect(m.get('a.test:443')?.reason).toBe('client-certificate');
+    expect(m.lookup('a.test', 443, LOOPBACK_CLIENT)?.reason).toBe('client-certificate');
     expect(m.learn('b.test', 443, 'pinned', { until: Date.now() - 1 })).toBe(true);
-    expect(m.get('b.test:443')).toBeUndefined();
-    for (let i = 0; m.size < LEARNED_MAX; i++) m.learn(`h${i}.test`, 443, 'client-certificate');
+    expect(m.lookup('b.test', 443, LOOPBACK_CLIENT)).toBeUndefined();
+    // full of client-certificate entries taught by other clients: refused
+    for (let i = 0; m.size < LEARNED_MAX; i++) m.learn(`h${i}.test`, 443, 'client-certificate', { by: `192.0.2.${i % 8}` });
     expect(m.learn('full.test', 443, 'client-certificate')).toBe(false);
     m.forget((e) => e.host === 'h0.test');
     expect(m.learn('full.test', 443, 'client-certificate')).toBe(true);
@@ -174,6 +201,39 @@ describe('learned passthrough: helpers', () => {
     expect(changes).toBe(before);
     m.learn('full.test', 443, 'client-certificate', { grpc: true });
     expect(changes).toBe(before + 1);
+  });
+
+  it('REVIEW-14 #2: pins are per client; one client at its limit loses its own oldest entries; a full map drops pins first', () => {
+    const m = new LearnedHosts(() => undefined);
+    const until = Date.now() + 60_000;
+    m.learn('api.test', 443, 'pinned', { until, by: '192.0.2.7' });
+    expect(m.lookup('api.test', 443, '192.0.2.7')?.reason).toBe('pinned');
+    expect(m.lookup('api.test', 443, LOOPBACK_CLIENT)).toBeUndefined();
+    m.learn('api.test', 443, 'pinned', { until: until + 1, by: LOOPBACK_CLIENT });
+    expect(m.list()).toEqual([{ host: 'api.test', port: 443, reason: 'pinned', until: until + 1 }]); // one row per host:port
+    // a flood from one client: its own oldest entries go; the other client's stay
+    for (let i = 0; i < LEARNED_PER_CLIENT + 50; i++) m.learn(`f${i}.test`, 443, 'pinned', { until, by: '192.0.2.66' });
+    expect(m.lookup('f0.test', 443, '192.0.2.66')).toBeUndefined();
+    expect(m.lookup(`f${LEARNED_PER_CLIENT + 49}.test`, 443, '192.0.2.66')).toBeDefined();
+    expect(m.lookup('api.test', 443, '192.0.2.7')).toBeDefined();
+    expect(m.lookup('api.test', 443, LOOPBACK_CLIENT)).toBeDefined();
+    // a map full of pins still learns a client-certificate host (the oldest pin goes)
+    for (let c = 0; m.size < LEARNED_MAX; c++) for (let i = 0; i < LEARNED_PER_CLIENT && m.size < LEARNED_MAX; i++) m.learn(`p${c}-${i}.test`, 443, 'pinned', { until, by: `198.51.100.${c}` });
+    expect(m.learn('mtls.test', 443, 'client-certificate', { by: '203.0.113.1' })).toBe(true);
+    expect(m.size).toBe(LEARNED_MAX);
+    expect(clientKeyOf('::ffff:127.0.0.1')).toBe(LOOPBACK_CLIENT);
+    expect(clientKeyOf('::1')).toBe(LOOPBACK_CLIENT);
+    expect(clientKeyOf('::ffff:192.0.2.5')).toBe('192.0.2.5');
+  });
+
+  it('REVIEW-14 #6: an expired pin leaves with an event', async () => {
+    let changes = 0;
+    const m = new LearnedHosts(() => changes++);
+    m.learn('api.test', 443, 'pinned', { until: Date.now() + 50 });
+    expect(changes).toBe(1);
+    await sleep(120);
+    expect(changes).toBe(2);
+    expect(m.size).toBe(0);
   });
 
   it('CertRequestFinder reads handshake messages across records and stops at ServerHelloDone / alerts', () => {
@@ -468,7 +528,8 @@ describe.skipIf(!haveCerts)('client-certificate: learned, then the app talks to 
       return probeCertificateRequest(t);
     };
     const hosts = proxy[TEST_INTERNALS]().learn.hosts;
-    for (let i = 0; i < LEARNED_MAX; i++) hosts.learn(`h${i}.example.test`, 443, 'client-certificate');
+    // full of client-certificate hosts that other clients taught
+    for (let i = 0; i < LEARNED_MAX; i++) hosts.learn(`h${i}.example.test`, 443, 'client-certificate', { by: `192.0.2.${i % 8}` });
     try {
       for (let i = 0; i < 4; i++) {
         const app = proxiedAgent(proxy.port);
@@ -511,6 +572,71 @@ describe.skipIf(!haveCerts)('client-certificate: learned, then the app talks to 
     }
   });
 
+  it('REVIEW-14 #1: a CONNECT to an IP whose Host / SNI names another host teaches nothing (alert 116 and the nginx 400)', async () => {
+    for (const mode of ['reject', 'nginx'] as const) {
+      const srv = await startMtlsServer({ mode });
+      try {
+        const r = await connectByIpAs(proxy.port, '127.0.0.1', srv.port, 'api.victim.example');
+        expect(r.status).toBe(mode === 'reject' ? 502 : 400);
+        expect(r.headers.connection).not.toBe('close');
+        const ex = await waitFor(proxy, (e) => e.kind !== 'tunnel' && e.state !== 'pending' && e.url.startsWith('https://api.victim.example'));
+        expect(ex.url).toBe(`https://api.victim.example:${srv.port}/secure`);
+        expect(ex.learnedPassthrough).toBeUndefined();
+        expect(ex.error ?? '').not.toMatch(/needs the app's own client certificate/); // today's text
+        await sleep(50);
+        expect(proxy.learnedPassthrough).toEqual([]);
+        // the real app's CONNECT to that name stays decrypted
+        expect(proxy[TEST_INTERNALS]().learn.forConnect('api.victim.example', srv.port, LOOPBACK_CLIENT)).toBeUndefined();
+      } finally {
+        await srv.close();
+      }
+    }
+  });
+
+  it('REVIEW-14 #1: an app that connects by IP (Host = the IP) is learned under the IP its next CONNECT uses', async () => {
+    const srv = await startMtlsServer({ mode: 'reject' });
+    try {
+      const r = await connectByIpAs(proxy.port, '127.0.0.1', srv.port, `127.0.0.1:${srv.port}`, '/whoami');
+      expect(r.status).toBe(502);
+      expect(r.headers.connection).toBe('close');
+      expect(proxy.learnedPassthrough).toEqual([{ host: '127.0.0.1', port: srv.port, reason: 'client-certificate' }]);
+      const app = proxiedAgent(proxy.port, { cert: read('cert.pem'), key: read('key.pem') });
+      expect(await get(app.agent, srv.port, '/whoami')).toMatchObject({ status: 200, text: 'fi-app-client' });
+      app.agent.destroy();
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("REVIEW-14 #6: an HTML 400 closes the app's connection only for a host that may be learned", async () => {
+    const { key, cert } = await selfSignedCert();
+    const html = https.createServer({ key, cert }, (req, res) =>
+      req.url === '/bare' ? res.writeHead(400).end('bad') : res.writeHead(400, { 'content-type': 'text/html' }).end('<p>bad</p>'),
+    );
+    html.listen(0, '127.0.0.1');
+    await once(html, 'listening');
+    const port = (html.address() as AddressInfo).port;
+    try {
+      const one = async (p: string) => {
+        const app = proxiedAgent(proxy.port);
+        const r = await get(app.agent, port, p);
+        app.agent.destroy();
+        return r.headers.connection;
+      };
+      expect(await one('/page')).toBe('close'); // may be nginx's page: read at the end
+      expect(await one('/bare')).not.toBe('close'); // no content type: not nginx
+      proxy.setRules([rule('r', `https://127.0.0.1:${port}/other/*`)]);
+      expect(await one('/page')).not.toBe('close'); // a rule names the host: never learned
+      proxy.setRules([]);
+      proxy.setClientCertificates([{ host: '127.0.0.1', cert: read('cert.pem'), key: read('key.pem') }]);
+      expect(await one('/page')).not.toBe('close'); // a configured certificate: never learned
+      expect(proxy.learnedPassthrough).toEqual([]);
+    } finally {
+      html.closeAllConnections();
+      html.close();
+    }
+  });
+
   it('stop() forgets everything', async () => {
     const srv = await startMtlsServer({ mode: 'reject' });
     const app = proxiedAgent(proxy.port);
@@ -524,6 +650,39 @@ describe.skipIf(!haveCerts)('client-certificate: learned, then the app talks to 
 });
 
 // ---------------------------------------------------------------- gRPC
+
+describe('the probe cap', () => {
+  it('REVIEW-14 #6: probes that hang in an upstream proxy count toward the 4-at-once cap until their work ends (≤ 5 s)', async () => {
+    const seen: net.Socket[] = [];
+    const hang = net.createServer((s) => {
+      seen.push(s);
+      s.on('data', () => undefined); // reads the CONNECT, never answers
+    });
+    hang.listen(0, '127.0.0.1');
+    await once(hang, 'listening');
+    const proxy = await startProxy({ upstreamProxy: { url: `http://127.0.0.1:${(hang.address() as AddressInfo).port}` } });
+    try {
+      const learn = proxy[TEST_INTERNALS]().learn;
+      const t0 = Date.now();
+      const all = Promise.all(Array.from({ length: 6 }, (_, i) => learn.verdict({ host: `h${i}.example.invalid`, port: 443, alert: 40 })));
+      await sleep(300);
+      expect(seen.length).toBe(4);
+      expect(await all).toEqual(Array(6).fill(undefined));
+      expect(Date.now() - t0).toBeLessThan(7000);
+      await sleep(100);
+      expect(seen.every((s) => s.destroyed || s.readableEnded)).toBe(true); // the upstream deadline closed them
+      // slots are free again
+      const again = learn.verdict({ host: 'h9.example.invalid', port: 443, alert: 40 });
+      await sleep(300);
+      expect(seen.length).toBe(5);
+      await again;
+    } finally {
+      await proxy.stop();
+      for (const s of seen) s.destroy();
+      hang.close();
+    }
+  }, 20_000);
+});
 
 describe.skipIf(!haveCerts)('client-certificate on a decrypted gRPC call', () => {
   for (const v of ['TLSv1.3', 'TLSv1.2'] as const) {
@@ -575,6 +734,32 @@ describe.skipIf(!haveCerts)('client-certificate on a decrypted gRPC call', () =>
       }
     });
   }
+
+  it('REVIEW-14 #1: a silent tunnel to an IP whose :authority names another host teaches nothing', async () => {
+    const { key, cert } = await selfSignedCert();
+    const server = http2.createSecureServer({ key, cert, requestCert: true, rejectUnauthorized: true, ca: [read('cert.pem')] });
+    server.on('error', () => undefined);
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const port = (server.address() as AddressInfo).port;
+    const proxy = await startProxy({ grpcDecryptAll: true });
+    try {
+      const sock = await silentSocket(proxy.port, `127.0.0.1:${port}`);
+      const t = tls.connect({ socket: sock, servername: 'localhost', ALPNProtocols: ['h2'], rejectUnauthorized: false });
+      await once(t, 'secureConnect');
+      const s = http2.connect(`https://localhost:${port}`, { createConnection: () => t });
+      s.on('error', () => undefined);
+      const r = await grpcCall(s, '/t.Svc/M', ['x']);
+      expect(r.grpcStatus).toBe(14);
+      const ex = await waitFor(proxy, (e) => e.kind === 'grpc' && e.state === 'error');
+      expect(ex.learnedPassthrough).toBeUndefined();
+      expect(proxy.learnedPassthrough).toEqual([]);
+      s.destroy();
+    } finally {
+      await proxy.stop();
+      server.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------- pinned (HTTP)
@@ -698,6 +883,74 @@ describe('pinned: an app that rejects the proxy certificate on an HTTPS CONNECT'
     t.destroy();
   });
 
+  it("REVIEW-14 #2: another client's pin doesn't pass the app's CONNECTs through", async () => {
+    const p = proxy[TEST_INTERNALS]();
+    p.decrypting.set('192.0.2.9:40001', { host: '127.0.0.1', port: srvPort, http: true });
+    p.onTlsError({ failureCause: 'cert-rejected', remoteIpAddress: '192.0.2.9', remotePort: 40001, timingEvents: {} });
+    await waitFor(proxy, (e) => !!e.learnedPassthrough);
+    expect(proxy.learnedPassthrough.map((e) => e.reason)).toEqual(['pinned']);
+    expect(p.learn.forConnect('127.0.0.1', srvPort, '192.0.2.9')?.reason).toBe('pinned');
+    expect(p.learn.forConnect('127.0.0.1', srvPort, LOOPBACK_CLIENT)).toBeUndefined();
+    // the app (loopback) still gets the proxy's certificate: decrypted
+    const c = http.request({ host: '127.0.0.1', port: proxy.port, method: 'CONNECT', path: `127.0.0.1:${srvPort}`, agent: false });
+    c.end();
+    const [, raw] = (await once(c, 'connect')) as [http.IncomingMessage, net.Socket];
+    const t = tls.connect({ socket: raw, servername: 'localhost', rejectUnauthorized: false });
+    await once(t, 'secureConnect');
+    expect(t.getPeerCertificate().fingerprint256).not.toBe(new X509Certificate((await selfSignedCert()).cert).fingerprint256);
+    t.destroy();
+  });
+
+  it('REVIEW-14 #2: a handshake dropped before the proxy sent its certificate is no strike', async () => {
+    // What mockttp reports for both is `reset`; the client's connection tells them apart: a client that destroys its
+    // socket right after its ClientHello leaves ~19 bytes written to it (the CONNECT answer) when it wins the race,
+    // ~3.5 KB once our TLS flight went out (measured).
+    const p = proxy[TEST_INTERNALS]();
+    const fail = (port: number, written: number) => {
+      p.decrypting.set(`127.0.0.1:${port}`, { host: '127.0.0.1', port: srvPort, http: true, socket: { bytesWritten: written } as net.Socket, sent0: 0 });
+      p.onTlsError({ failureCause: 'reset', remoteIpAddress: '127.0.0.1', remotePort: port, timingEvents: {} });
+    };
+    fail(40001, 19);
+    fail(40002, 19);
+    fail(40003, 19);
+    await sleep(20);
+    expect(proxy.learnedPassthrough).toEqual([]);
+    expect(proxy.getExchanges().some((e) => /If it happens again/.test(e.error ?? ''))).toBe(false);
+    fail(40004, 3545);
+    fail(40005, 3545);
+    await waitFor(proxy, (e) => !!e.learnedPassthrough);
+    expect(proxy.learnedPassthrough.map((e) => e.reason)).toEqual(['pinned']);
+  });
+
+  it('REVIEW-14 #2: 1000 stale single strikes do not stop close-based learning for a new host', async () => {
+    const strikes = (proxy as unknown as { connect: { pinStrikes: Map<string, { n: number; first: number }> } }).connect.pinStrikes;
+    for (let i = 0; i < 1000; i++) strikes.set(`192.0.2.1|h${i}.example.test:443`, { n: 1, first: Date.now() - 120_000 });
+    await droppingClient();
+    await droppingClient();
+    await waitFor(proxy, (e) => !!e.learnedPassthrough);
+    expect(proxy.learnedPassthrough.map((e) => e.host)).toEqual(['127.0.0.1']);
+    expect(strikes.size).toBeLessThan(1000);
+  });
+
+  it('REVIEW-14 #6: a pin yields to a rule added after it', async () => {
+    const p = proxy[TEST_INTERNALS]();
+    p.learn.hosts.learn('127.0.0.1', srvPort, 'pinned', { until: Date.now() + 60_000, by: LOOPBACK_CLIENT });
+    const fingerprint = async () => {
+      const c = http.request({ host: '127.0.0.1', port: proxy.port, method: 'CONNECT', path: `127.0.0.1:${srvPort}`, agent: false });
+      c.end();
+      const [, raw] = (await once(c, 'connect')) as [http.IncomingMessage, net.Socket];
+      const t = tls.connect({ socket: raw, servername: 'localhost', rejectUnauthorized: false });
+      await once(t, 'secureConnect');
+      const f = t.getPeerCertificate().fingerprint256;
+      t.destroy();
+      return f;
+    };
+    const real = new X509Certificate((await selfSignedCert()).cert).fingerprint256;
+    expect(await fingerprint()).toBe(real); // passed through
+    proxy.setRules([rule('r', `https://127.0.0.1:${srvPort}/*`)]);
+    expect(await fingerprint()).not.toBe(real); // decrypted: the rule applies
+  });
+
   it('the 0.13 gRPC views stay views: grpcPinnedHosts, clearGrpcPinnedHosts, setGrpcDecryptAll reset gRPC pins only', () => {
     const p = proxy[TEST_INTERNALS]();
     p.pinnedHosts.set('grpc.example.test:443', Date.now() + 60_000);
@@ -742,14 +995,14 @@ describe('performance', () => {
       const lookups = (n: number) => {
         const learn = proxy[TEST_INTERNALS]().learn;
         const t0 = performance.now();
-        for (let i = 0; i < n; i++) learn.forConnect('api.example.test', 443 + (i & 7));
+        for (let i = 0; i < n; i++) learn.forConnect('api.example.test', 443 + (i & 7), LOOPBACK_CLIENT);
         return ((performance.now() - t0) * 1000) / n;
       };
       await round(50); // warm up
       const emptyMs = Math.min(await round(200), await round(200));
       const emptyUs = lookups(200_000);
       const hosts = proxy[TEST_INTERNALS]().learn.hosts;
-      for (let i = 0; i < LEARNED_MAX; i++) hosts.learn(`h${i}.example.test`, 443, i % 2 ? 'client-certificate' : 'pinned', i % 2 ? {} : { until: Date.now() + 60_000 });
+      for (let i = 0; i < LEARNED_MAX; i++) hosts.learn(`h${i}.example.test`, 443, i % 2 ? 'client-certificate' : 'pinned', { by: `192.0.2.${i % 8}`, ...(i % 2 ? {} : { until: Date.now() + 60_000 }) });
       expect(hosts.size).toBe(LEARNED_MAX);
       const fullMs = Math.min(await round(200), await round(200));
       const fullUs = lookups(200_000);

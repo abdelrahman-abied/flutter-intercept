@@ -118,10 +118,14 @@ export class HttpTaps {
       if (f.alert === undefined) return false;
       flow.learn = this.px.learn.verdict(f);
     } else {
-      const type = getHeader(headers, 'content-type');
-      if (type !== undefined && !/^\s*text\/html\b/i.test(type)) return false;
-      flow.maybeNginx = true;
+      // nginx's page is text/html. The page is read at the end (a configured certificate's rejection is explained too).
+      if (!/^\s*text\/html\b/i.test(getHeader(headers, 'content-type') ?? '')) return false;
       f.nginx = true;
+      if (f.noLearn && !f.certPattern) return false;
+      flow.maybeNginx = true;
+      // REVIEW-14 #6: close the app's connection only for a host that may be learned (no configured certificate, no
+      // rule naming it, no replay); an API's HTML 400 elsewhere keeps its connection.
+      if (this.px.learn.keepDecrypted(f.host, f.port)) return false;
     }
     const h2 = (tap.response as { req?: { httpVersionMajor?: number } }).req?.httpVersionMajor === 2;
     return !h2 && this.px.learn.mayTeach(f);
@@ -140,13 +144,16 @@ export class HttpTaps {
     } catch {
       return undefined;
     }
+    // REVIEW-14 #1: learn only when the request names the server the connection goes to (the CONNECT target, which the
+    // app's next CONNECT is matched on). A CONNECT to an IP whose Host / SNI names another host teaches nothing.
+    const sameServer = !!flow.dest && flow.dest.host === host && flow.dest.port === port;
     return {
       host,
       port,
       socket: tap.socket,
       ...(ex.clientCertificate ? { certPattern: ex.clientCertificate } : {}),
       // send / resend and Map Remote aren't the app's own connection to this host: explained, never learned.
-      ...(flow.send || flow.map ? { noLearn: true } : {}),
+      ...(flow.send || flow.map || !sameServer ? { noLearn: true } : {}),
     };
   }
 

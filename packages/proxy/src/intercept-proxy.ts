@@ -194,7 +194,7 @@ export interface ProxyTestInternals {
   readonly rawServer: net.Server | undefined;
   /** CONTRACTS §19.3 / §20.1: learn a gRPC pin (`host:port` → until), as onTlsError does. */
   readonly pinnedHosts: { set(key: string, until: number): unknown };
-  readonly decrypting: Map<string, { host: string; port: number; http?: true; at?: number }>;
+  readonly decrypting: Map<string, { host: string; port: number; http?: true; at?: number; socket?: net.Socket; sent0?: number }>;
   readonly learn: LearnFlow;
   onTlsError(f: unknown): void;
 }
@@ -1138,7 +1138,7 @@ export class InterceptProxy extends EventEmitter {
     if (!k) return;
     this.learn.hosts.forget((e) => e.host === k.host && (k.port === undefined || e.port === k.port));
     for (const s of [...this.connect.pinStrikes.keys()]) {
-      const p = parseLearnedKey(s);
+      const p = parseLearnedKey(s.slice(s.indexOf('|') + 1)); // client|host:port
       if (p && p.host === k.host && (k.port === undefined || p.port === k.port)) this.connect.pinStrikes.delete(s);
     }
   }
@@ -1679,6 +1679,10 @@ export class InterceptProxy extends EventEmitter {
     const meta = this.reqMeta.get(req);
     const send = meta?.sendNonce ? this.sends.get(meta.sendNonce) : undefined;
     const headers = req.headers as HeaderBag;
+    // The server the connection goes to: inside a CONNECT tunnel, the CONNECT target (before Map Remote changes it).
+    const dest = (req as { destination?: { hostname?: string; port?: number } }).destination;
+    const destHost = dest?.hostname ? normalizeHostname(dest.hostname) : '';
+    const destPort = dest?.port;
     let flow: Flow | undefined;
     // CONTRACTS §11.3: a CORS preflight for a request a mock / block / cors rule would handle is answered
     // here (the rule isn't spent by it). Otherwise the OPTIONS request is matched like any other.
@@ -1718,12 +1722,12 @@ export class InterceptProxy extends EventEmitter {
     if (lanGateOf(socket)) flow.viaLan = true;
     if (socket && typeof socket === 'object') this.connRequest.set(socket, req.id);
     // CONTRACTS §20.1: the app's keep-alive connections per server, closed when the server is learned.
-    const dest = (req as { destination?: { hostname?: string; port?: number } }).destination;
-    if (req.protocol === 'https' && dest?.hostname && dest.port) {
-      const destHost = normalizeHostname(dest.hostname);
+    if (req.protocol === 'https' && destHost && destPort) {
+      // REVIEW-14 #1: learning keys on the CONNECT target, never on the Host / SNI name.
+      flow.dest = { host: destHost, port: destPort };
       // PERF-2 #1: the connection's handshake with the proxy's certificate worked (no longer watched for a pin).
-      this.connect.handshakeWorked(socket, destHost, dest.port);
-      if (String(req.httpVersion).startsWith('1')) this.learn.trackConnection(socket, destHost, dest.port);
+      this.connect.handshakeWorked(socket, destHost, destPort);
+      if (String(req.httpVersion).startsWith('1')) this.learn.trackConnection(socket, destHost, destPort);
     }
     flow.te = requestInternals(req).timingEvents;
     const latency = flow.throttle?.latencyMs;
@@ -1742,8 +1746,10 @@ export class InterceptProxy extends EventEmitter {
       if (flow.action?.kind === 'mutate') {
         // Mutate edits JSON bodies: no effect on protobuf frames (CONTRACTS §19.1).
         const rule = flow.rule;
+        const was = flow;
         flow = this.flowFor(req.url, headers, rule, undefined, 'Mutate rules edit JSON bodies; this gRPC-Web call was passed through unchanged.');
         flow.grpcWeb = web;
+        if (was.dest) flow.dest = was.dest;
         if (meta?.traceId) flow.traceId = meta.traceId;
         if (send) flow.send = send;
         if (lanGateOf(socket)) flow.viaLan = true;

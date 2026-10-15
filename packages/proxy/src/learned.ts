@@ -5,10 +5,11 @@ import * as net from 'net';
 import * as tls from 'tls';
 import { Duplex } from 'stream';
 import { normalizeHostname } from './hosts';
+import { normalizeIp } from './lan';
 import { openTunnelUpstream, type TunnelUpstream } from './tunnel';
 import type { LearnedPassthrough, LearnedPassthroughReason } from './types';
 
-/** At most this many learned hosts (expired ones are dropped first; then nothing new is learned). */
+/** At most this many learned entries in all (when full: expired ones go, then the oldest pin; then nothing new is learned). */
 export const LEARNED_MAX = 1000;
 /** A probe gives up after this long (connect, upstream proxy and the server's first flight). */
 export const PROBE_TIMEOUT_MS = 5000;
@@ -53,12 +54,42 @@ export function parseLearnedKey(key: string): { host: string; port?: number } | 
   return port === undefined ? { host } : { host, port };
 }
 
+/** At most this many learned entries per client (CONTRACTS §20.1: a client at its limit loses its oldest entry). */
+export const LEARNED_PER_CLIENT = 250;
+
+/** The client key of every loopback address (local processes, simulators and emulators share it: not separable). */
+export const LOOPBACK_CLIENT = 'loopback';
+
 /**
- * The map itself. Lookups are O(1); an expired entry is dropped when it is looked up (or when the map is full).
- * `changed` runs after every change made here (learn / forget / clear), not on a silent expiry.
+ * Which client of the proxy a connection is (REVIEW-14 #2): its peer address — the LAN device's address for LAN
+ * clients, `loopback` for every loopback address. Pins and strikes are kept per client.
+ */
+export function clientKeyOf(address: string | undefined): string {
+  const a = normalizeIp(String(address ?? ''));
+  if (!a) return 'unknown';
+  return a === '::1' || /^127\./.test(a) ? LOOPBACK_CLIENT : a;
+}
+
+/** A stored entry: the public one, plus the client that taught it (`by`). */
+interface Stored {
+  e: LearnedPassthrough;
+  by: string;
+}
+
+/**
+ * The map itself. `client-certificate` entries are about a server and apply to every client; `pinned` entries are
+ * about one client (REVIEW-14 #2) and apply to that client's CONNECTs only. Lookups are O(1).
+ *
+ * Caps: LEARNED_MAX entries in all and LEARNED_PER_CLIENT per teaching client. A client at its limit loses its own
+ * oldest entry, so one client can't stop learning for the others; a full map drops expired entries, then the oldest
+ * pin, before it refuses. Expired pins leave on a timer and that is a change (`changed`) too.
  */
 export class LearnedHosts {
-  private readonly map = new Map<string, LearnedPassthrough>();
+  /** `host:port` (client-certificate) or `client|host:port` (pinned) → entry, oldest first. */
+  private readonly map = new Map<string, Stored>();
+  private readonly perClient = new Map<string, number>();
+  private timer?: NodeJS.Timeout;
+  private timerAt = Infinity;
 
   constructor(private readonly changed: () => void) {}
 
@@ -66,29 +97,46 @@ export class LearnedHosts {
     return this.map.size;
   }
 
-  /** The live entry for `host:port` (learnedKey). */
-  get(key: string): LearnedPassthrough | undefined {
-    const e = this.map.get(key);
-    if (!e) return undefined;
-    if (e.until === undefined || Date.now() < e.until) return e;
-    this.map.delete(key);
+  /** The live entry a CONNECT from `client` to `host:port` is passed through for. */
+  lookup(host: string, port: number, client: string): LearnedPassthrough | undefined {
+    const hp = learnedKey(host, port);
+    const cc = this.map.get(hp);
+    if (cc) return cc.e;
+    return this.live(`${client}|${hp}`);
+  }
+
+  private live(key: string): LearnedPassthrough | undefined {
+    const s = this.map.get(key);
+    if (!s) return undefined;
+    if (s.e.until === undefined || Date.now() < s.e.until) return s.e;
+    this.remove(key, s);
     return undefined;
   }
 
   /**
-   * Learn (or renew) a host. A `client-certificate` entry is never replaced by a `pinned` one (it outlives it).
-   * False = the map is full of live entries.
+   * Learn (or renew) an entry. A pin under a `client-certificate` entry for the same server is redundant (true, not
+   * stored). False = the map is full of live `client-certificate` entries.
    */
-  learn(host: string, port: number, reason: LearnedPassthroughReason, o: { until?: number; grpc?: boolean } = {}): boolean {
-    const key = learnedKey(host, port);
-    const have = this.get(key);
-    if (have?.reason === 'client-certificate' && reason === 'pinned') return true;
-    if (!have && this.map.size >= LEARNED_MAX) {
-      this.dropExpired();
-      if (this.map.size >= LEARNED_MAX) return false;
+  learn(host: string, port: number, reason: LearnedPassthroughReason, o: { until?: number; grpc?: boolean; by?: string } = {}): boolean {
+    const hp = learnedKey(host, port);
+    const by = o.by ?? LOOPBACK_CLIENT;
+    if (reason === 'pinned' && this.map.has(hp)) return true;
+    const key = reason === 'pinned' ? `${by}|${hp}` : hp;
+    const have = this.live(key);
+    if (!have) {
+      if ((this.perClient.get(by) ?? 0) >= LEARNED_PER_CLIENT) this.evict((s) => s.by === by);
+      if (this.map.size >= LEARNED_MAX) {
+        this.dropExpired();
+        if (this.map.size >= LEARNED_MAX) this.evict((s) => s.e.reason === 'pinned');
+        if (this.map.size >= LEARNED_MAX) return false;
+      }
     }
     const next: LearnedPassthrough = { host, port, reason, ...(o.until !== undefined ? { until: o.until } : {}), ...(o.grpc ? { grpc: true as const } : {}) };
-    this.map.set(key, next);
+    const old = this.map.get(key);
+    if (old) this.count(old.by, -1);
+    this.map.set(key, { e: next, by });
+    this.count(by, 1);
+    if (next.until !== undefined) this.arm(next.until);
     // PERF-2 #3: renewing an entry with the same values (every failure of a burst re-learns the host) is no change.
     if (!have || have.reason !== next.reason || have.until !== next.until || !!have.grpc !== !!next.grpc) this.changed();
     return true;
@@ -97,9 +145,9 @@ export class LearnedHosts {
   /** Forget the entries `pred` picks; true if any went. */
   forget(pred: (e: LearnedPassthrough) => boolean): boolean {
     let n = 0;
-    for (const [k, e] of this.map) {
-      if (pred(e)) {
-        this.map.delete(k);
+    for (const [k, s] of this.map) {
+      if (pred(s.e)) {
+        this.remove(k, s);
         n++;
       }
     }
@@ -108,20 +156,79 @@ export class LearnedHosts {
   }
 
   clear(): void {
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    this.timerAt = Infinity;
+    this.perClient.clear();
     if (!this.map.size) return;
     this.map.clear();
     this.changed();
   }
 
-  /** Live entries, oldest first (copies). */
+  /** Live entries, oldest first (copies), one per `host:port`: pins of several clients show once (the latest `until`). */
   list(): LearnedPassthrough[] {
     this.dropExpired();
-    return [...this.map.values()].map((e) => ({ ...e }));
+    const out = new Map<string, LearnedPassthrough>();
+    for (const { e } of this.map.values()) {
+      const hp = learnedKey(e.host, e.port);
+      const prev = out.get(hp);
+      if (!prev) out.set(hp, { ...e });
+      else if (prev.reason === 'pinned' && e.reason === 'pinned') {
+        prev.until = Math.max(prev.until ?? 0, e.until ?? 0);
+        if (e.grpc) prev.grpc = true;
+      } else if (e.reason === 'client-certificate') out.set(hp, { ...e });
+    }
+    return [...out.values()];
   }
 
-  private dropExpired(): void {
+  private remove(key: string, s: Stored): void {
+    this.map.delete(key);
+    this.count(s.by, -1);
+  }
+
+  private count(by: string, d: number): void {
+    const n = (this.perClient.get(by) ?? 0) + d;
+    if (n > 0) this.perClient.set(by, n);
+    else this.perClient.delete(by);
+  }
+
+  /** Drop the oldest entry `pred` picks (insertion order). */
+  private evict(pred: (s: Stored) => boolean): void {
+    for (const [k, s] of this.map) {
+      if (pred(s)) {
+        this.remove(k, s);
+        this.changed();
+        return;
+      }
+    }
+  }
+
+  private dropExpired(): boolean {
     const now = Date.now();
-    for (const [k, e] of this.map) if (e.until !== undefined && now >= e.until) this.map.delete(k);
+    let n = 0;
+    for (const [k, s] of this.map) {
+      if (s.e.until !== undefined && now >= s.e.until) {
+        this.remove(k, s);
+        n++;
+      }
+    }
+    return n > 0;
+  }
+
+  /** REVIEW-14 #6: an event when the earliest pin expires (one timer, at the earliest `until`). */
+  private arm(until: number): void {
+    if (until >= this.timerAt) return;
+    clearTimeout(this.timer);
+    this.timerAt = until;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      this.timerAt = Infinity;
+      if (this.dropExpired()) this.changed();
+      let next = Infinity;
+      for (const { e } of this.map.values()) if (e.until !== undefined && e.until < next) next = e.until;
+      if (next !== Infinity) this.arm(next);
+    }, Math.max(0, until - Date.now()) + 5);
+    this.timer.unref?.();
   }
 }
 
@@ -240,7 +347,7 @@ export type ProbeTarget = Pick<TunnelUpstream, 'host' | 'port' | 'lan' | 'upstre
  * the client answers, so no certificate (not even an empty one), no key exchange and no application data are sent.
  * False on any failure or after `timeoutMs`.
  */
-export async function probeCertificateRequest(t: ProbeTarget, timeoutMs = PROBE_TIMEOUT_MS): Promise<boolean> {
+export async function probeCertificateRequest(t: ProbeTarget, timeoutMs = PROBE_TIMEOUT_MS, onSettled?: () => void): Promise<boolean> {
   let raw: net.Socket | undefined;
   let secure: tls.TLSSocket | undefined;
   let timer: NodeJS.Timeout | undefined;
@@ -256,7 +363,7 @@ export async function probeCertificateRequest(t: ProbeTarget, timeoutMs = PROBE_
     timer.unref?.();
   });
   const work = (async (): Promise<boolean> => {
-    raw = await openTunnelUpstream({ ...t, timings: () => undefined, timeoutMs });
+    raw = await openTunnelUpstream({ ...t, timings: () => undefined, timeoutMs, upstreamDeadlineMs: timeoutMs });
     if (over) {
       raw.destroy(); // opened after the deadline
       return false;
@@ -290,6 +397,9 @@ export async function probeCertificateRequest(t: ProbeTarget, timeoutMs = PROBE_
       secure.on('error', () => resolve(false));
     });
   })().catch(() => false);
+  // REVIEW-14 #6: the caller counts a probe until its work has really ended (a DNS lookup or an upstream proxy can
+  // outlive the deadline), not until the answer.
+  void work.finally(() => onSettled?.());
   try {
     return await Promise.race([work, deadline]);
   } finally {
@@ -297,5 +407,5 @@ export async function probeCertificateRequest(t: ProbeTarget, timeoutMs = PROBE_
   }
 }
 
-/** Test seam: replace the probe. Never set outside tests. */
+/** Test seam: replace the probe (it counts until its promise settles). Never set outside tests. */
 export const probeTesting: { probe?: (t: ProbeTarget) => Promise<boolean> } = {};
