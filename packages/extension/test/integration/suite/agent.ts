@@ -20,6 +20,8 @@
  * v0.10.0 (MCP door, CONTRACTS §16.4; opt-in FI_AGENT_GRPC=1 with scripts/e2e/grpc_server running): the demo's gRPC
  * GetOrder call listed (kind "grpc"), decoded (get_request / get_frames), get_grpc_schema, add_grpc_mock (JSON messages,
  * times 1; an error status) after hot restarts, assert_traffic expect.grpcStatus, get_status grpc.
+ * v0.14.0 (MCP door, CONTRACTS §20; opt-in FI_AGENT_MTLS=1 with scripts/e2e/mtls_server.mjs running): the demo's mTLS
+ * calls pass through once learned, then are decrypted with a client certificate added in user settings.
  *
  * Two paths, chosen automatically:
  *  - "lm":     the extension registered `flutter_intercept_*` (lead wiring + package.json
@@ -1350,6 +1352,116 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
       }
       } finally {
         await grpcDartCfg.update('flutterRunAdditionalArgs', grpcRunArgsBefore, vscode.ConfigurationTarget.Global).then(undefined, () => undefined);
+      }
+    }
+
+    // v0.14.0 (CONTRACTS §20; opt-in FI_AGENT_MTLS=1 with scripts/e2e/mtls_server.mjs running, FI_MTLS_DIR = its --dir,
+    // FI_MTLS_PORT = its --port; runTest passes NODE_EXTRA_CA_CERTS=<dir>/ca.pem so the proxy trusts that private CA):
+    // the demo's Dio calls with the app's own client certificate. Run 1: the first call per port may fail once, then
+    // the proxy passes those hosts through (tunnels with learnedPassthrough "client-certificate", get_status) and the
+    // app's next calls succeed with its own certificate. Run 2 (client certificate added in user settings, PEM, no
+    // passphrase): the learned hosts are forgotten and the calls are decrypted (200, clientCertificate set).
+    if (process.env.FI_AGENT_MTLS === '1') {
+      const dir = process.env.FI_MTLS_DIR ?? '';
+      const mtlsPort = Number(process.env.FI_MTLS_PORT) || 48600;
+      const b64 = (f: string) => fs.readFileSync(`${dir}/${f}`).toString('base64');
+      const dartCfg = vscode.workspace.getConfiguration('dart');
+      const fiCfg = vscode.workspace.getConfiguration('flutterIntercept');
+      const runArgsBefore = dartCfg.inspect<string[]>('flutterRunAdditionalArgs')?.globalValue;
+      const certsBefore = fiCfg.inspect<unknown>('clientCertificates')?.globalValue;
+      await dartCfg.update(
+        'flutterRunAdditionalArgs',
+        [...(runArgsBefore ?? []), `--dart-define=MTLS_PORT=${mtlsPort}`, `--dart-define=MTLS_P12=${b64('client.p12')}`, '--dart-define=MTLS_PASS=demo-pass', `--dart-define=MTLS_CA=${b64('ca.pem')}`],
+        vscode.ConfigurationTarget.Global,
+      );
+      try {
+        for (const dev of devices) {
+          const out: RunOutcome = { name: `AGENT ${dev} v0.14.0 over MCP: mTLS app — learned passthrough, then the added client certificate decrypts`, output: '', proxyHits: [], failures: [], ms: 0 };
+          const f = out.failures;
+          const t0 = Date.now();
+          let sessionId: string | undefined;
+          const notes: string[] = [];
+          try {
+            client = await connect();
+            await mcpCall('clear_requests', {}).catch(() => undefined);
+            const since = Date.now();
+            const l = await mcpCall('launch_app', { deviceId: dev });
+            sessionId = l.result.sessionId;
+            if (l.isError || !sessionId) throw new Error(`launch_app: ${l.text.slice(0, 200)}`);
+            const session = sessions.get(sessionId!);
+            if (!session) throw new Error('session object not seen');
+            const mtlsLines = (from: number, batch: number) =>
+              waitFor(() => {
+                const o = outputOf(session).slice(from);
+                return o.includes(`DEMO_MTLS done ${batch}`) ? o.split(/\r?\n/).filter((x) => x.includes('DEMO_RESULT mtls_')) : undefined;
+              }, 240_000, 500);
+            // Run 1: rounds 2 and 3 must work (passed through with the app's own certificate).
+            const r1 = await mtlsLines(0, 1);
+            for (const label of ['mtls_strict_2', 'mtls_strict_3', 'mtls_nginx_2', 'mtls_nginx_3']) {
+              const line = r1.find((x) => x.includes(`${label} `));
+              if (!line || !/ 200 .*"client":"demo-app"/.test(line)) f.push(`run 1 ${label}: ${line ?? 'missing'}`);
+            }
+            notes.push(`run 1: ${r1.map((x) => x.replace(/.*DEMO_RESULT (\S+) (\S+).*/, '$1=$2')).join(' ')}`);
+            const st = await mcpCall('get_status', {});
+            const learned = (st.result.learnedPassthrough ?? []) as any[];
+            for (const port of [mtlsPort, mtlsPort + 1]) {
+              if (!learned.some((x) => x.port === port && x.reason === 'client-certificate')) f.push(`get_status learnedPassthrough ${port}: ${JSON.stringify(learned).slice(0, 300)}`);
+            }
+            const tunnels = ((await mcpCall('list_requests', { kind: 'tunnel', sinceMs: since, limit: 50 })).result.items ?? []) as any[];
+            if (!tunnels.some((x) => x.learnedPassthrough?.reason === 'client-certificate')) f.push(`no learned tunnel: ${JSON.stringify(tunnels).slice(0, 300)}`);
+            const failed = ((await mcpCall('list_requests', { url: `*:${mtlsPort}/whoami`, sinceMs: since, limit: 10 })).result.items ?? []) as any[];
+            const first = failed.find((x) => x.learnedPassthrough && x.kind !== 'tunnel');
+            if (first) {
+              const g = (await mcpCall('get_request', { id: first.id })).result;
+              if (!/needs the app's own client certificate/.test(String(g.error))) f.push(`failed request error: ${String(g.error).slice(0, 200)}`);
+            } else notes.push('no failed first request recorded (the app may have reused nothing)');
+
+            // Run 2: add the certificate (user settings, PEM), hot restart: every call decrypted and answered.
+            await fiCfg.update(
+              'clientCertificates',
+              [
+                { host: `localhost:${mtlsPort}`, cert: `${dir}/client.pem`, key: `${dir}/client.key` },
+                { host: `localhost:${mtlsPort + 1}`, cert: `${dir}/client.pem`, key: `${dir}/client.key` },
+              ],
+              vscode.ConfigurationTarget.Global,
+            );
+            await waitFor(async () => {
+              const s2 = (await mcpCall('get_status', {})).result;
+              return (s2.clientCertificates ?? []).length === 2 && !(s2.learnedPassthrough ?? []).some((x: any) => x.port === mtlsPort) ? true : undefined;
+            }, 20_000, 300).catch(() => f.push('the added certificates did not load / forget the learned hosts'));
+            const from = outputOf(session).length;
+            const restartAt = Date.now();
+            const h = await mcpCall('hot_restart', { sessionId });
+            if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+            const r2 = await mtlsLines(from, 1).catch(() => mtlsLines(from, 2));
+            for (const line of r2) if (!/ 200 .*"client":"demo-app"/.test(line)) f.push(`run 2: ${line.slice(0, 200)}`);
+            const dec = ((await mcpCall('list_requests', { url: `*:${mtlsPort}/whoami`, sinceMs: restartAt, limit: 10 })).result.items ?? []) as any[];
+            const ok = dec.find((x) => x.status === 200 && x.kind !== 'tunnel');
+            if (!ok) f.push(`run 2 not decrypted: ${JSON.stringify(dec).slice(0, 300)}`);
+            else {
+              const g = (await mcpCall('get_request', { id: ok.id })).result;
+              if (g.clientCertificate !== `localhost:${mtlsPort}`) f.push(`clientCertificate: ${g.clientCertificate}`);
+            }
+            notes.push(`run 2: ${r2.length} calls, decrypted ${dec.filter((x) => x.status === 200).length}`);
+            const s3 = await mcpCall('stop_app', { sessionId });
+            if (s3.isError || s3.result.stopped !== 1) f.push(`stop_app: ${s3.text.slice(0, 200)}`);
+            else sessionId = undefined;
+            out.output = notes.join('; ');
+          } catch (e) {
+            f.push(`exception: ${(e as Error).message}`);
+            out.output = notes.join('; ');
+          } finally {
+            await fiCfg.update('clientCertificates', certsBefore, vscode.ConfigurationTarget.Global).then(undefined, () => undefined);
+            if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
+            await client?.close().catch(() => undefined);
+            client = undefined;
+          }
+          out.ms = Date.now() - t0;
+          results.push(out);
+          console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+        }
+      } finally {
+        await dartCfg.update('flutterRunAdditionalArgs', runArgsBefore, vscode.ConfigurationTarget.Global).then(undefined, () => undefined);
       }
     }
 

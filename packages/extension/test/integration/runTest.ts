@@ -156,6 +156,8 @@ async function main(): Promise<void> {
           FI_CLAUDE_EVIDENCE: process.env.FI_CLAUDE_EVIDENCE ?? '',
           FI_CLAUDE_BUDGET: process.env.FI_CLAUDE_BUDGET ?? '',
           FI_RESULTS: resultsFile,
+          // CONTRACTS §20 e2e (FI_AGENT_MTLS): the mTLS test server's private CA, so the proxy can verify it once decrypted.
+          ...(process.env.FI_MTLS_DIR ? { NODE_EXTRA_CA_CERTS: path.join(process.env.FI_MTLS_DIR, 'ca.pem') } : {}),
         },
       });
     } finally {

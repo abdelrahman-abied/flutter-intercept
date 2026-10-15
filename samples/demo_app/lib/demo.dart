@@ -17,6 +17,7 @@ import 'api/orders_api.dart';
 import 'api/users_api.dart';
 import 'coverage.dart';
 import 'grpc_demo.dart';
+import 'mtls_demo.dart';
 import 'pinned_roots.dart';
 
 /// --dart-define=APP_SETS_OVERRIDES=true : the app installs its own
@@ -272,6 +273,22 @@ Future<void> runGrpcBatch() async {
   log('DEMO_GRPC done $_grpcBatch');
 }
 
+// mTLS calls (lib/mtls_demo.dart): three rounds after the first batch and after every hot restart when MTLS_PORT is
+// set. Through Flutter Intercept the first round may fail once (the proxy learns the server needs the app's own
+// certificate), the next rounds must succeed (passed through, or decrypted once the certificate is added).
+int _mtlsBatch = 0;
+Future<void> runMtlsBatch() async {
+  _mtlsBatch++;
+  log('DEMO_MTLS start $_mtlsBatch port=$mtlsPort');
+  for (var round = 1; round <= 3; round++) {
+    for (final e in mtlsCalls.entries) {
+      await _timed('${e.key}_$round', e.value);
+    }
+    await Future<void>.delayed(const Duration(seconds: 1));
+  }
+  log('DEMO_MTLS done $_mtlsBatch');
+}
+
 Future<String> _grpcScreenCall(String label, Future<GrpcOutcome> Function() fn) async {
   String? line;
   await _timed(label, fn, onLine: (l) => line = l);
@@ -304,7 +321,8 @@ void runDemo({required String flavor}) {
       'appZoneOverrides=$appZoneOverrides findProxy=${appFindProxy.isEmpty ? '-' : appFindProxy} '
       'pinning=${appPinning.isEmpty ? '-' : appPinning} repeat=$repeatSeconds'
       '${localPort > 0 ? ' local=$localHealthUrl' : ''}'
-      '${grpcPort > 0 ? ' grpc=$grpcHost:$grpcPort' : ''}');
+      '${grpcPort > 0 ? ' grpc=$grpcHost:$grpcPort' : ''}'
+      '${mtlsPort > 0 ? ' mtls=$mtlsHost:$mtlsPort' : ''}');
   if (appSetsOverrides) HttpOverrides.global = AppHttpOverrides();
 
   void start() {
@@ -312,6 +330,7 @@ void runDemo({required String flavor}) {
     runApp(DemoApp(flavor: flavor));
     final first = runBatch();
     if (grpcPort > 0) first.then((_) => runGrpcBatch());
+    if (mtlsPort > 0) first.then((_) => runMtlsBatch());
     if (coverage) first.then((_) => runCoverage());
     if (coverage && coverageRepeatSeconds > 0) {
       Timer.periodic(Duration(seconds: coverageRepeatSeconds), (_) => runCoverage());
