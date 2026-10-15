@@ -6,11 +6,11 @@
  * The popup never sees a path: the host's file picker answers with a one-use token and the file's base name. The
  * passphrase lives only in the popup's own field and is cleared as soon as it is sent.
  */
-import { useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { ClientCertFileRole, Exchange, Status, ViewMsg } from '../protocol';
 import {
-  CERT_WHY, certCovering, certHostFor, certSaveBlocker, certStaysText, FILE_ROLE_LABEL, FORMAT_ROLES, isLearnedLive,
+  CERT_WHY, certCovering, certHostFor, certSaveBlocker, certStaysText, FILE_ROLE_LABEL, FORMAT_ROLES, isLearnedLive, liveLearned, nextLearnedExpiry,
   LEARNED_REASON, learnedBannerText, learnedKey, learnedUntilText, type CertFormat, type LearnedRef,
 } from '../certificates';
 import type { CertDialog as CertDialogState } from '../state';
@@ -31,7 +31,7 @@ export function LearnedBanner({ ex }: { ex: Pick<Exchange, 'learnedPassthrough'>
   const lp = ex.learnedPassthrough;
   if (!lp) return null;
   const { title, body } = learnedBannerText(lp);
-  const live = isLearnedLive(lp, state.status.learnedPassthrough);
+  const live = isLearnedLive(lp, liveLearned(state.status.learnedPassthrough, Date.now()));
   const covered = lp.reason === 'client-certificate' ? certCovering(lp, state.status.clientCertificates) : undefined;
   return (
     <div class="msg warn learned-banner" role="note" aria-label={title}>
@@ -243,10 +243,27 @@ export function CertsStatusItem({ certs, summary, open, onToggle }: {
   );
 }
 
+/**
+ * The learned entries still in force. The proxy sends no event when a pin expires (REVIEW-14 #6): one timer at the
+ * earliest `until` re-checks, and the filtering only runs when the list changes or that timer fires.
+ */
+function useLiveLearned(list: Status['learnedPassthrough']): Status['learnedPassthrough'] {
+  const [tick, setTick] = useState(0);
+  const live = useMemo(() => liveLearned(list, Date.now()) as Status['learnedPassthrough'], [list, tick]);
+  useEffect(() => {
+    const next = nextLearnedExpiry(list, Date.now());
+    if (next === undefined) return;
+    const t = setTimeout(() => setTick((n) => n + 1), Math.min(2 ** 31 - 1, Math.max(0, next - Date.now()) + 20));
+    return () => clearTimeout(t);
+  }, [list, tick]);
+  return live;
+}
+
 /** Status line: hosts passed through automatically (CONTRACTS §20.2); opens the list. */
-export function LearnedStatusItem({ learned, open, onToggle }: {
+export function LearnedStatusItem({ learned: all, open, onToggle }: {
   learned: Status['learnedPassthrough']; open: boolean; onToggle: () => void;
 }) {
+  const learned = useLiveLearned(all);
   if (!learned?.length) return null;
   const n = learned.length;
   return (
@@ -263,9 +280,10 @@ export function LearnedStatusItem({ learned, open, onToggle }: {
 export function CertsPanel({ onClose }: { onClose: (restoreFocus: boolean) => void }) {
   const { state, dispatch, post } = useApp();
   const certs = state.status.clientCertificates ?? [];
-  const learned = state.status.learnedPassthrough ?? [];
-  const [confirming, setConfirming] = useState<string | undefined>();
-  const now = useNow(learned.some((l) => l.until !== undefined));
+  const all = state.status.learnedPassthrough ?? [];
+  // Ticks only while the list is open and a pin has an end; expired pins drop out (no event from the proxy).
+  const now = useNow(all.some((l) => l.until !== undefined));
+  const learned = liveLearned(all, now) ?? [];
   const ref = useRef<HTMLElement>(null);
   useLayoutEffect(() => { ref.current?.querySelector<HTMLElement>('h2')?.focus(); }, []);
   const add = (host: string) => dispatch({ type: 'openCertDialog', host });
@@ -273,7 +291,7 @@ export function CertsPanel({ onClose }: { onClose: (restoreFocus: boolean) => vo
   return (
     <section ref={ref} class="certs-panel" aria-labelledby="certs-panel-title"
       onKeyDown={(e) => {
-        if (e.key === 'Escape' && !(e.target as HTMLElement).closest('.confirm')) { e.preventDefault(); onClose(true); }
+        if (e.key === 'Escape') { e.preventDefault(); onClose(true); }
       }}>
       <div class="certs-head">
         <h2 id="certs-panel-title" tabIndex={-1}>Client certificates</h2>
@@ -291,20 +309,12 @@ export function CertsPanel({ onClose }: { onClose: (restoreFocus: boolean) => vo
                 <code class="certs-host">{c.host}</code>
                 {c.problem && <span class="certs-problem">✕ {c.problem}</span>}
                 <span class="spacer" />
-                {confirming !== c.host && (
-                  <Button kind="danger" onClick={() => setConfirming(c.host)} title={`Stop using the certificate for ${c.host}`}>Remove</Button>
-                )}
+                {/* REVIEW-14 #4: the IDE asks to confirm (natively) before removing anything; cancelling changes nothing. */}
+                <Button kind="danger" onClick={() => post({ type: 'removeClientCertificate', host: c.host })}
+                  title={`Stop using the certificate for ${c.host} (asks to confirm; the file itself isn't touched)`}>
+                  Remove…
+                </Button>
               </div>
-              {confirming === c.host && (
-                <div class="confirm" role="alertdialog" aria-label={`Remove the certificate for ${c.host}?`}
-                  onKeyDown={(e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setConfirming(undefined); } }}>
-                  <span>Stop using this certificate for <code>{c.host}</code>? The file itself isn't touched.</span>
-                  <Button kind="danger" onClick={() => { setConfirming(undefined); post({ type: 'removeClientCertificate', host: c.host }); }}>
-                    Remove
-                  </Button>
-                  <Button onClick={() => setConfirming(undefined)}>Cancel</Button>
-                </div>
-              )}
             </li>
           ))}
         </ul>

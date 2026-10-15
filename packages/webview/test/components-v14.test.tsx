@@ -5,11 +5,11 @@
 // message filter knowing every HostMsg type.
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../src/components/App';
 import { isHostMsg, type Host } from '../src/host';
 import type { Exchange, HostMsg, Status, ViewMsg } from '../src/protocol';
-import { certCovering, certHostFor, certSaveBlocker, certStaysText, CERT_WHY, isLearnedLive, learnedUntilText } from '../src/certificates';
+import { certCovering, certHostFor, certSaveBlocker, certStaysText, CERT_WHY, isLearnedLive, learnedUntilText, liveLearned, nextLearnedExpiry } from '../src/certificates';
 import { tunnelTitle } from '../src/connection';
 import { initialState, reducer, toPersisted } from '../src/state';
 import { ex, status } from './fixtures';
@@ -114,6 +114,12 @@ describe('pure helpers (CONTRACTS §20)', () => {
     expect(certCovering({ host: 'api.bank.example', port: 443 }, [{ host: '*.bank.example' }])).toBe('*.bank.example');
     expect(certCovering({ host: 'api.bank.example', port: 443 }, [{ host: '*.bank.example:8443' }])).toBeUndefined();
     expect(learnedUntilText({}, 0)).toBe('until the proxy stops');
+    const list = [{ until: undefined }, { until: 100 }, { until: 300 }, { until: 200 }];
+    expect(liveLearned(list, 50)).toBe(list); // nothing expired: same array
+    expect(liveLearned(list, 150)).toEqual([{ until: undefined }, { until: 300 }, { until: 200 }]);
+    expect(liveLearned(undefined, 0)).toBeUndefined();
+    expect(nextLearnedExpiry(list, 150)).toBe(200);
+    expect(nextLearnedExpiry(list, 300)).toBeUndefined();
     expect(learnedUntilText({ until: 70_000 }, 0)).toBe('for 1m 10s more');
   });
 
@@ -350,7 +356,7 @@ describe('Add client certificate popup', () => {
 // ---------------------------------------------------------------- list
 
 describe('client certificates + learned hosts list', () => {
-  it('opens from the status line; Remove asks inline; Add… opens the popup with an empty host', async () => {
+  it('opens from the status line; Remove leaves the confirming to the IDE; Add… opens the popup with an empty host', async () => {
     await mount();
     await emit({ type: 'snapshot', exchanges: [], rules: [], status: { ...status, clientCertificates: [
       { host: 'api.corp.example' }, { host: '*.bank.example', problem: 'Could not read bank.p12: wrong passphrase' },
@@ -364,12 +370,12 @@ describe('client certificates + learned hosts list', () => {
     expect(items.map((li) => $('.certs-host', li)!.textContent)).toEqual(['api.corp.example', '*.bank.example']);
     expect(items[1].textContent).toContain('wrong passphrase');
 
-    await click(button('Remove', items[0]));
-    const confirm = $('[role="alertdialog"]', panel)!;
-    expect(confirm.textContent).toMatch(/Stop using this certificate for api\.corp\.example\?/);
-    expect(sent().some((m) => m.type === 'removeClientCertificate')).toBe(false);
-    await click(button('Remove', confirm));
+    // REVIEW-14 #4: the host asks natively (no second, inline question); cancelled there = no Status change, nothing here.
+    await click(button('Remove…', items[0]));
+    expect($('[role="alertdialog"]', panel)).toBeNull();
     expect(lastOf('removeClientCertificate')).toEqual({ type: 'removeClientCertificate', host: 'api.corp.example' });
+    expect($$('.certs-list li', $('.certs-panel')!)).toHaveLength(2);
+    expect($('.host-error')).toBeNull();
 
     await click(button(/Add…/, panel));
     expect($<HTMLInputElement>('.cert-dialog input:not([type])')!.value).toBe('');
@@ -401,6 +407,51 @@ describe('client certificates + learned hosts list', () => {
 
     await click(button('Add certificate…', rows[0]));
     expect($<HTMLInputElement>('.cert-dialog input:not([type])')!.value).toBe('mtls.example.com:8443');
+  });
+
+  it('expired pins are neither listed nor counted (the proxy sends no event when one expires)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    try {
+      const t0 = Date.now();
+      await mount();
+      await act(() => {
+        listener!({ type: 'snapshot', exchanges: [], rules: [], status: { ...status, learnedPassthrough: [
+          { host: 'mtls.example.com', port: 443, reason: 'client-certificate' },
+          { host: 'old.example.com', port: 443, reason: 'pinned', until: t0 - 1000 },
+          { host: 'soon.example.com', port: 443, reason: 'pinned', until: t0 + 5000 },
+        ] } });
+        vi.advanceTimersByTime(1);
+      });
+      expect($('.statusline .learned-status')!.textContent).toBe('Passed through: 2 hosts');
+      // The status line re-checks at the earliest end, with no message from the host.
+      await act(() => { vi.advanceTimersByTime(5100); });
+      expect($('.statusline .learned-status')!.textContent).toBe('Passed through: 1 host');
+      await act(() => { $('.statusline .learned-status')!.click(); vi.advanceTimersByTime(1); });
+      expect($$('.certs-list[aria-label="Passed through automatically"] li').map((li) => $('.certs-host', li)!.textContent))
+        .toEqual(['mtls.example.com:443']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the open list drops a pin when its time is up', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    try {
+      await mount();
+      await act(() => {
+        listener!({ type: 'snapshot', exchanges: [], rules: [], status: { ...status, learnedPassthrough: [
+          { host: 'soon.example.com', port: 443, reason: 'pinned', until: Date.now() + 3000 },
+        ] } });
+        vi.advanceTimersByTime(1);
+      });
+      await act(() => { $('.statusline .learned-status')!.click(); vi.advanceTimersByTime(1); });
+      expect($$('.certs-list[aria-label="Passed through automatically"] li')).toHaveLength(1);
+      await act(() => { vi.advanceTimersByTime(3100); });
+      expect($$('.certs-list[aria-label="Passed through automatically"] li')).toHaveLength(0);
+      expect($('.statusline .learned-status')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('nothing configured: a quiet entry point; the list says none yet', async () => {

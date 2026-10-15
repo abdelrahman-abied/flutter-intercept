@@ -1402,7 +1402,6 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
 .certs-row { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-height: 26px; }
 .certs-host { overflow-wrap: anywhere; }
 .certs-problem { color: var(--fi-err); overflow-wrap: anywhere; }
-.certs-list .confirm { margin: 2px 0 4px; }
 
 /* Modal popup ("Add client certificate"). */
 .modal-backdrop {

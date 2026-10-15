@@ -28,10 +28,26 @@ export function certCovering(e: Pick<LearnedRef, 'host' | 'port'>, certs: Status
 }
 
 /** Is this learned host still passed through? (An older host without `Status.learnedPassthrough` → assume yes.) */
-export function isLearnedLive(e: Pick<LearnedRef, 'host' | 'port'>, live: Status['learnedPassthrough']): boolean {
+export function isLearnedLive(e: Pick<LearnedRef, 'host' | 'port'>, live: readonly LearnedEntry[] | undefined): boolean {
   if (!live) return true;
   const key = learnedKey(e).toLowerCase();
   return live.some((l) => learnedKey(l).toLowerCase() === key);
+}
+
+/**
+ * Entries still in force at `now`. The proxy drops an expired pin without an event (REVIEW-14 #6), so Status can still
+ * list it: never show it, nor count it. Returns `list` itself when nothing expired (cheap, keeps memoised identities).
+ */
+export function liveLearned<T extends Pick<LearnedEntry, 'until'>>(list: readonly T[] | undefined, now: number): readonly T[] | undefined {
+  if (!list || !list.some((l) => l.until !== undefined && l.until <= now)) return list;
+  return list.filter((l) => l.until === undefined || l.until > now);
+}
+
+/** The earliest `until` still ahead of `now` (one timer re-checks then), or undefined. */
+export function nextLearnedExpiry(list: readonly Pick<LearnedEntry, 'until'>[] | undefined, now: number): number | undefined {
+  let next: number | undefined;
+  for (const l of list ?? []) if (l.until !== undefined && l.until > now && (next === undefined || l.until < next)) next = l.until;
+  return next;
 }
 
 export { LEARNED_REASON };
