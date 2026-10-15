@@ -51,8 +51,11 @@ export class LearnFlow {
   readonly hosts: LearnedHosts;
   /** Probes in flight per host:port (shared by every failure that waits for one). */
   private readonly probing = new Map<string, Promise<boolean>>();
-  /** host:port whose probe found no CertificateRequest → when (not probed again within PROBE_NEGATIVE_MS). */
-  private readonly negative = new Map<string, number>();
+  /**
+   * host:port → the last probe's answer and when (PERF-2 #2: reused within PROBE_NEGATIVE_MS, both ways — failures
+   * that arrive after a probe said yes don't start another one, which matters once the map is full).
+   */
+  private readonly probed = new Map<string, { yes: boolean; at: number }>();
   /** The app's HTTP/1 connections that carried HTTPS requests, per host:port (until they close). */
   private readonly conns = new Map<string, Set<net.Socket>>();
   private readonly tracked = new WeakSet<object>();
@@ -100,6 +103,12 @@ export class LearnFlow {
     return !f.certPattern && !f.noLearn && (!!f.nginx || f.alert === 116 || f.alert === 40 || f.alert === 42);
   }
 
+  /** The last probe's answer for `host:port` while it is fresh (PROBE_NEGATIVE_MS). */
+  private recentProbe(key: string): { yes: boolean; at: number } | undefined {
+    const r = this.probed.get(key);
+    return r && Date.now() - r.at < PROBE_NEGATIVE_MS ? r : undefined;
+  }
+
   /**
    * CONTRACTS §20.1: what an upstream refusal means. A configured certificate that was rejected says so; a demand for
    * the app's own certificate (alert 116 or the nginx 400 at once, 40 / 42 once a probe sees a CertificateRequest)
@@ -136,14 +145,13 @@ export class LearnFlow {
     };
   }
 
-  /** One probe per host:port at a time, ≤ PROBE_MAX_AT_ONCE in all, none again soon after a negative one. */
+  /** One probe per host:port at a time, ≤ PROBE_MAX_AT_ONCE in all; its answer is reused for PROBE_NEGATIVE_MS. */
   private probe(f: UpstreamRefusal): Promise<boolean> {
     const key = learnedKey(f.host, f.port);
     const running = this.probing.get(key);
     if (running) return running;
-    const now = Date.now();
-    const neg = this.negative.get(key);
-    if (neg !== undefined && now - neg < PROBE_NEGATIVE_MS) return Promise.resolve(false);
+    const recent = this.recentProbe(key);
+    if (recent) return Promise.resolve(recent.yes);
     if (this.probing.size >= PROBE_MAX_AT_ONCE || this.px.targetsSelf(f.host, f.port)) return Promise.resolve(false);
     const gate = lanGateOf(f.socket);
     if (gate?.closed) return Promise.resolve(false);
@@ -158,10 +166,11 @@ export class LearnFlow {
       .catch(() => false)
       .then((yes) => {
         this.probing.delete(key);
-        if (!yes) {
-          if (this.negative.size >= 1000) for (const [k, at] of this.negative) if (now - at >= PROBE_NEGATIVE_MS) this.negative.delete(k);
-          if (this.negative.size < 1000) this.negative.set(key, Date.now());
+        const now = Date.now();
+        if (this.probed.size >= 1000 && !this.probed.has(key)) {
+          for (const [k, r] of this.probed) if (now - r.at >= PROBE_NEGATIVE_MS) this.probed.delete(k);
         }
+        if (this.probed.size < 1000 || this.probed.has(key)) this.probed.set(key, { yes, at: now });
         return yes;
       });
     this.probing.set(key, p);
@@ -204,7 +213,7 @@ export class LearnFlow {
   clear(): void {
     this.hosts.clear();
     this.probing.clear();
-    this.negative.clear();
+    this.probed.clear();
     this.conns.clear();
   }
 }

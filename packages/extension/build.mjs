@@ -22,6 +22,9 @@ const stubs = {
   'pac-proxy-agent': { file: 'stubs/upstream-proxy-agent.js', importers: ['mockttp/dist/rules/http-agents.js'] },
   'socks-proxy-agent': { file: 'stubs/upstream-proxy-agent.js', importers: ['mockttp/dist/rules/http-agents.js'] },
   'https-proxy-agent': { file: 'stubs/upstream-proxy-agent.js', importers: ['mockttp/dist/rules/http-agents.js'] },
+  // PERF-2 #4: the MCP SDK's Zod 3 compatibility paths (every schema here is Zod 4).
+  'zod/v3': { file: 'stubs/zod-v3.js', importers: ['@modelcontextprotocol/sdk/dist/esm/server/zod-compat.js'] },
+  'zod-to-json-schema': { file: 'stubs/zod-v3.js', importers: ['@modelcontextprotocol/sdk/dist/esm/server/zod-json-schema-compat.js'] },
 };
 const stubPlugin = {
   name: 'flutter-intercept-stubs',
@@ -47,14 +50,19 @@ const zodLocalesPlugin = {
   },
 };
 
-/** Bundle budgets (PERF-1 #7): fail the build when the extension grows past them or a locale slips back in. */
-const MAX_EXTENSION_BYTES = 2_600_000;
+/** Bundle budgets (PERF-1 #7, PERF-2 #4): fail the build when the extension grows past them or a locale / Zod 3 slips back in. */
+const MAX_EXTENSION_BYTES = 2_550_000;
 function assertBudget(metafile, outfile) {
   const out = Object.entries(metafile.outputs).find(([k]) => k.endsWith(outfile));
   const bytes = out ? out[1].bytes : 0;
   const locales = Object.keys(metafile.inputs).filter((f) => /zod\/v4\/locales\/(?!en\.js$|index\.js$)/.test(f));
   if (locales.length) {
     console.error(`bundle contains zod locales (the zod-locales stub stopped matching?):\n  ${locales.slice(0, 5).join('\n  ')}`);
+    process.exit(1);
+  }
+  const zod3 = Object.keys(metafile.inputs).filter((f) => /node_modules\/(zod\/v3|zod-to-json-schema)\//.test(f));
+  if (zod3.length) {
+    console.error(`bundle contains Zod 3 (the zod/v3 stub stopped matching? PERF-2 #4):\n  ${zod3.slice(0, 5).join('\n  ')}`);
     process.exit(1);
   }
   if (bytes > MAX_EXTENSION_BYTES) {

@@ -168,6 +168,12 @@ describe('learned passthrough: helpers', () => {
     expect(m.learn('full.test', 443, 'client-certificate')).toBe(true);
     expect(m.list().length).toBe(LEARNED_MAX);
     expect(changes).toBeGreaterThan(LEARNED_MAX);
+    // PERF-2 #3: re-learning a host with the same values (a burst of failures) is not a change (no event, no Status).
+    const before = changes;
+    for (let i = 0; i < 20; i++) expect(m.learn('full.test', 443, 'client-certificate')).toBe(true);
+    expect(changes).toBe(before);
+    m.learn('full.test', 443, 'client-certificate', { grpc: true });
+    expect(changes).toBe(before + 1);
   });
 
   it('CertRequestFinder reads handshake messages across records and stops at ServerHelloDone / alerts', () => {
@@ -440,9 +446,41 @@ describe.skipIf(!haveCerts)('client-certificate: learned, then the app talks to 
       const ex = proxy.getExchanges().filter(failed);
       expect(ex.length).toBe(12);
       for (const e of ex) expect(e.error).toMatch(/handshake failure/);
+      // A later failure there reuses the probe's answer (PROBE_NEGATIVE_MS).
+      const app = proxiedAgent(proxy.port);
+      try {
+        expect((await get(app.agent, port, '/x')).status).toBe(502);
+      } finally {
+        app.agent.destroy();
+      }
+      expect(probes).toBe(1);
     } finally {
       delete probeTesting.probe;
       bad.close();
+    }
+  });
+
+  it('PERF-2 #2: a probe that said yes is reused — with the map full, repeated failures start no new probes', async () => {
+    const srv = await startMtlsServer({ mode: 'reject', maxVersion: 'TLSv1.2' });
+    let probes = 0;
+    probeTesting.probe = async (t) => {
+      probes++;
+      return probeCertificateRequest(t);
+    };
+    const hosts = proxy[TEST_INTERNALS]().learn.hosts;
+    for (let i = 0; i < LEARNED_MAX; i++) hosts.learn(`h${i}.example.test`, 443, 'client-certificate');
+    try {
+      for (let i = 0; i < 4; i++) {
+        const app = proxiedAgent(proxy.port);
+        expect((await get(app.agent, srv.port, '/whoami')).status).toBe(502);
+        app.agent.destroy();
+      }
+      await waitFor(proxy, (e) => failed(e) && /hosts are passed through already/.test(e.error ?? ''));
+      expect(probes).toBe(1);
+      expect(hosts.size).toBe(LEARNED_MAX);
+    } finally {
+      delete probeTesting.probe;
+      await srv.close();
     }
   });
 
@@ -633,6 +671,31 @@ describe('pinned: an app that rejects the proxy certificate on an HTTPS CONNECT'
     } finally {
       delete grpcPinTesting.ttlMs;
     }
+  });
+
+  it('PERF-2 #1: an app that completed a decrypted request drops spare connections without pinning the host', async () => {
+    // An app that trusts the proxy's CA makes a request over a decrypted CONNECT and keeps the connection open…
+    const c = http.request({ host: '127.0.0.1', port: proxy.port, method: 'CONNECT', path: `127.0.0.1:${srvPort}`, agent: false });
+    c.end();
+    const [, raw] = (await once(c, 'connect')) as [http.IncomingMessage, net.Socket];
+    const t = tls.connect({ socket: raw, servername: 'localhost', rejectUnauthorized: false });
+    await once(t, 'secureConnect');
+    let got = '';
+    t.on('data', (d: Buffer) => (got += d.toString('latin1')));
+    t.write(`GET / HTTP/1.1\r\nHost: 127.0.0.1:${srvPort}\r\n\r\n`);
+    for (let i = 0; i < 200 && !got.includes('real'); i++) await sleep(10);
+    expect(got).toContain('real');
+    // …its connection is no longer watched for a failed handshake (no entry per busy connection)…
+    expect(proxy[TEST_INTERNALS]().decrypting.size).toBe(0);
+    // …then drops two spare connections right after their handshakes (a pool trimming, a cancelled request): that is
+    // not a pin (an app that pins never completes a decrypted request), so the host stays decrypted.
+    await droppingClient();
+    await droppingClient();
+    await waitFor(proxy, (e) => e.method === 'CONNECT' && /TLS handshake with the app failed/.test(e.error ?? ''));
+    await sleep(300);
+    expect(proxy.learnedPassthrough).toEqual([]);
+    expect(proxy.getExchanges().filter((e) => e.method === 'CONNECT' && e.state === 'error').length).toBe(2);
+    t.destroy();
   });
 
   it('the 0.13 gRPC views stay views: grpcPinnedHosts, clearGrpcPinnedHosts, setGrpcDecryptAll reset gRPC pins only', () => {

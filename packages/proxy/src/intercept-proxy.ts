@@ -194,7 +194,7 @@ export interface ProxyTestInternals {
   readonly rawServer: net.Server | undefined;
   /** CONTRACTS §19.3 / §20.1: learn a gRPC pin (`host:port` → until), as onTlsError does. */
   readonly pinnedHosts: { set(key: string, until: number): unknown };
-  readonly decrypting: Map<string, { host: string; port: number; http?: true }>;
+  readonly decrypting: Map<string, { host: string; port: number; http?: true; at?: number }>;
   readonly learn: LearnFlow;
   onTlsError(f: unknown): void;
 }
@@ -788,6 +788,7 @@ export class InterceptProxy extends EventEmitter {
     this.learn.clear();
     this.connect.pinStrikes.clear();
     this.connect.decrypting.clear();
+    this.connect.accepted.clear();
     this.rawServer = undefined;
     this.sendAgent?.destroy();
     this.sendAgent = undefined;
@@ -1718,8 +1719,11 @@ export class InterceptProxy extends EventEmitter {
     if (socket && typeof socket === 'object') this.connRequest.set(socket, req.id);
     // CONTRACTS §20.1: the app's keep-alive connections per server, closed when the server is learned.
     const dest = (req as { destination?: { hostname?: string; port?: number } }).destination;
-    if (req.protocol === 'https' && dest?.hostname && dest.port && String(req.httpVersion).startsWith('1')) {
-      this.learn.trackConnection(socket, normalizeHostname(dest.hostname), dest.port);
+    if (req.protocol === 'https' && dest?.hostname && dest.port) {
+      const destHost = normalizeHostname(dest.hostname);
+      // PERF-2 #1: the connection's handshake with the proxy's certificate worked (no longer watched for a pin).
+      this.connect.handshakeWorked(socket, destHost, dest.port);
+      if (String(req.httpVersion).startsWith('1')) this.learn.trackConnection(socket, destHost, dest.port);
     }
     flow.te = requestInternals(req).timingEvents;
     const latency = flow.throttle?.latencyMs;

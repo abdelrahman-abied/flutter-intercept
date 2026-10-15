@@ -49,6 +49,11 @@ export const PIN_STRIKE_WINDOW_MS = 60_000;
 /** REVIEW-13 #6 / CONTRACTS §20.1: a learned pin lasts this long (then the host is tried decrypted again). */
 export const GRPC_PIN_TTL_MS = 10 * 60 * 1000;
 
+/** Decrypted handshakes watched at once (and hosts remembered as accepting the proxy's certificate). */
+const WATCH_MAX = 1000;
+/** A watched connection that never carried a request is forgotten after this long (swept when the map is full). */
+const WATCH_MAX_AGE_MS = 60_000;
+
 /** Test seam: a shorter pin lifetime. Never set outside tests. */
 export const grpcPinTesting: { ttlMs?: number } = {};
 
@@ -68,7 +73,15 @@ export class ConnectFlow {
    * Decrypted (MITM) TLS tunnels in their handshake: client `address:port` → the CONNECT target (CONTRACTS §19.3:
    * silent gRPC tunnels; §20.1: HTTP CONNECTs mockttp answers, `http`).
    */
-  readonly decrypting = new Map<string, { host: string; port: number; http?: true }>();
+  readonly decrypting = new Map<string, { host: string; port: number; http?: true; at?: number }>();
+  /**
+   * PERF-2 #1: `host:port` → when the app last sent a request over a decrypted connection to it, i.e. it accepted the
+   * proxy's certificate there. A handshake closed without an alert (a connection pool dropping a spare connection, a
+   * cancelled request) is then not a pin strike: an app that pins never completes a decrypted request.
+   */
+  readonly accepted = new Map<string, number>();
+  /** Connections already seen by handshakeWorked (one check per connection, not per request). */
+  private readonly worked = new WeakSet<object>();
   /** CONTRACTS §16.8: when each authority's breaker report was last emitted. */
   readonly breakerSeen = new Map<string, number>();
 
@@ -249,14 +262,47 @@ export class ConnectFlow {
    */
   watchDecryptHandshake(socket: net.Socket, host: string, port: number, http: boolean): void {
     const key = `${normalizeIp(socket.remoteAddress ?? '')}:${socket.remotePort}`;
-    if (this.decrypting.size >= 1000) return;
-    this.decrypting.set(key, http ? { host, port, http } : { host, port });
-    const forget = () => {
-      if (this.decrypting.get(key)?.host === host) this.decrypting.delete(key);
-    };
-    // mockttp reports a failed handshake after the socket closed: keep the entry a little longer than that.
-    socket.once('close', () => setTimeout(forget, 5000).unref?.());
-    setTimeout(forget, 60_000).unref?.();
+    const now = Date.now();
+    if (this.decrypting.size >= WATCH_MAX) {
+      // PERF-2 #1: entries of connections that stay open unused leave after WATCH_MAX_AGE_MS (one sweep when full,
+      // instead of a timer per connection).
+      for (const [k, e] of this.decrypting) if (now - (e.at ?? now) >= WATCH_MAX_AGE_MS) this.decrypting.delete(k);
+      if (this.decrypting.size >= WATCH_MAX) return;
+    }
+    const entry = http ? { host, port, http: true as const, at: now } : { host, port, at: now };
+    this.decrypting.set(key, entry);
+    // mockttp reports a failed handshake after the socket closed: keep the entry a little longer than that. A
+    // connection that carried a request has left the map already (handshakeWorked): no timer for it.
+    socket.once('close', () => {
+      if (this.decrypting.get(key) !== entry) return;
+      setTimeout(() => {
+        if (this.decrypting.get(key) === entry) this.decrypting.delete(key);
+      }, 5000).unref?.();
+    });
+  }
+
+  /**
+   * PERF-2 #1: a request arrived over a decrypted TLS connection (HTTP/1, HTTP/2 or gRPC) to `host:port`: its handshake
+   * worked. The connection is no longer watched (a later close isn't a failed handshake), and the app is known to
+   * accept the proxy's certificate for that server (pinVerdict). Once per connection.
+   */
+  handshakeWorked(socket: unknown, host: string, port: number): void {
+    if (!socket || typeof socket !== 'object' || this.worked.has(socket)) return;
+    this.worked.add(socket);
+    const s = socket as { remoteAddress?: string; remotePort?: number };
+    if (this.decrypting.size) {
+      const key = `${normalizeIp(s.remoteAddress ?? '')}:${s.remotePort}`;
+      const w = this.decrypting.get(key);
+      if (w && w.host === host && w.port === port) this.decrypting.delete(key);
+    }
+    const hp = learnedKey(host, port);
+    this.pinStrikes.delete(hp);
+    const now = Date.now();
+    if (!this.accepted.has(hp) && this.accepted.size >= WATCH_MAX) {
+      for (const [k, at] of this.accepted) if (now - at >= PIN_STRIKE_WINDOW_MS) this.accepted.delete(k);
+      if (this.accepted.size >= WATCH_MAX) return;
+    }
+    this.accepted.set(hp, now);
   }
 
   /** The first payload chunk of a silent tunnel, put back into the socket (undefined: closed or nothing in time). */
@@ -550,7 +596,13 @@ export class ConnectFlow {
     const pinKey = learnedKey(w.host, w.port);
     const label = net.isIPv6(w.host) ? `[${w.host}]` : w.host;
     const alert = f.failureCause === 'cert-rejected';
-    const closedEarly = f.failureCause === 'reset' || f.failureCause === 'closed';
+    const closed = f.failureCause === 'reset' || f.failureCause === 'closed';
+    // PERF-2 #1: the app completed a decrypted request to this server within the window: it accepts the proxy's
+    // certificate, so a handshake it drops (a spare pool connection, a cancelled request) is no pin strike.
+    const at = this.accepted.get(pinKey);
+    const acceptsUs = at !== undefined && Date.now() - at < PIN_STRIKE_WINDOW_MS;
+    if (closed && acceptsUs && !w.grpc) return undefined; // HTTP: the generic record, as before 0.14
+    const closedEarly = closed && !acceptsUs;
     let strikes = 0;
     if (closedEarly) {
       const now = Date.now();

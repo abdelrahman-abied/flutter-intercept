@@ -14,7 +14,7 @@ export const LEARNED_MAX = 1000;
 export const PROBE_TIMEOUT_MS = 5000;
 /** Probes running at once, over all hosts. */
 export const PROBE_MAX_AT_ONCE = 4;
-/** A probe that saw no CertificateRequest isn't repeated for that host:port within this window. */
+/** A probe's answer is reused for that host:port within this window (a negative one: no new probe until then). */
 export const PROBE_NEGATIVE_MS = 60_000;
 
 /** nginx's answer (`ssl_verify_client on`) to a request without a client certificate. */
@@ -87,8 +87,10 @@ export class LearnedHosts {
       this.dropExpired();
       if (this.map.size >= LEARNED_MAX) return false;
     }
-    this.map.set(key, { host, port, reason, ...(o.until !== undefined ? { until: o.until } : {}), ...(o.grpc ? { grpc: true as const } : {}) });
-    this.changed();
+    const next: LearnedPassthrough = { host, port, reason, ...(o.until !== undefined ? { until: o.until } : {}), ...(o.grpc ? { grpc: true as const } : {}) };
+    this.map.set(key, next);
+    // PERF-2 #3: renewing an entry with the same values (every failure of a burst re-learns the host) is no change.
+    if (!have || have.reason !== next.reason || have.until !== next.until || !!have.grpc !== !!next.grpc) this.changed();
     return true;
   }
 
