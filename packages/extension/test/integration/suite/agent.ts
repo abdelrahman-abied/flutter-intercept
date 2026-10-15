@@ -1376,7 +1376,7 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
       );
       try {
         for (const dev of devices) {
-          const out: RunOutcome = { name: `AGENT ${dev} v0.14.0 over MCP: mTLS app — learned passthrough, then the added client certificate decrypts`, output: '', proxyHits: [], failures: [], ms: 0 };
+          const out: RunOutcome = { name: `AGENT ${dev} v0.14.0 over MCP: mTLS app — learned passthrough, the added client certificate decrypts, autoPassthrough off`, output: '', proxyHits: [], failures: [], ms: 0 };
           const f = out.failures;
           const t0 = Date.now();
           let sessionId: string | undefined;
@@ -1443,6 +1443,26 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
               if (g.clientCertificate !== `localhost:${mtlsPort}`) f.push(`clientCertificate: ${g.clientCertificate}`);
             }
             notes.push(`run 2: ${r2.length} calls, decrypted ${dec.filter((x) => x.status === 200).length}`);
+
+            // Run 3 (CONTRACTS §20.7): certificates removed and flutterIntercept.autoPassthrough off — nothing is passed
+            // through, every call fails with the reason, the failed requests carry needsClientCertificate.
+            await fiCfg.update('clientCertificates', certsBefore, vscode.ConfigurationTarget.Global);
+            await fiCfg.update('autoPassthrough', false, vscode.ConfigurationTarget.Global);
+            await waitFor(async () => ((await mcpCall('get_status', {})).result.autoPassthrough === false ? true : undefined), 20_000, 300).catch(() =>
+              f.push('get_status autoPassthrough did not turn false'),
+            );
+            const from3 = outputOf(session).length;
+            const offAt = Date.now();
+            const h3 = await mcpCall('hot_restart', { sessionId });
+            if (h3.isError) f.push(`hot_restart (off): ${h3.text.slice(0, 200)}`);
+            const r3 = await mtlsLines(from3, 1).catch(() => mtlsLines(from3, 2));
+            if (r3.some((x) => / 200 /.test(x))) f.push(`run 3 (auto passthrough off) should fail: ${r3.join(' | ').slice(0, 300)}`);
+            const off = ((await mcpCall('list_requests', { url: `*:${mtlsPort}/whoami`, sinceMs: offAt, limit: 10 })).result.items ?? []) as any[];
+            if (!off.length || off.some((x) => x.learnedPassthrough) || !off.some((x) => x.needsClientCertificate?.port === mtlsPort)) {
+              f.push(`run 3 requests: ${JSON.stringify(off).slice(0, 300)}`);
+            }
+            if (((await mcpCall('list_requests', { kind: 'tunnel', sinceMs: offAt, limit: 10 })).result.items ?? []).length) f.push('run 3: a tunnel was opened');
+            notes.push(`run 3 (off): ${r3.length} calls failed as expected, ${off.length} recorded`);
             const s3 = await mcpCall('stop_app', { sessionId });
             if (s3.isError || s3.result.stopped !== 1) f.push(`stop_app: ${s3.text.slice(0, 200)}`);
             else sessionId = undefined;
@@ -1452,6 +1472,7 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
             out.output = notes.join('; ');
           } finally {
             await fiCfg.update('clientCertificates', certsBefore, vscode.ConfigurationTarget.Global).then(undefined, () => undefined);
+            await fiCfg.update('autoPassthrough', undefined, vscode.ConfigurationTarget.Global).then(undefined, () => undefined);
             if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
             await client?.close().catch(() => undefined);
             client = undefined;

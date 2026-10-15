@@ -69,10 +69,8 @@ export type ProxyLike = Pick<
   | 'setReplay' | 'resetSequences' | 'setUpstreamProxy' | 'upstreamProxy'
   | 'setTlsPassthrough' | 'tlsPassthrough' | 'setClientCertificates'
   | 'setGrpcDecryptHosts' | 'grpcSupport' | 'setGrpcDecryptAll' | 'setGrpcCodec' | 'setHttpPinLearning'
-  | 'learnedPassthrough' | 'forgetLearnedPassthrough'
-> &
-  // CONTRACTS §20.7: optional until the built proxy (dist typings) has them; then move both into the Pick.
-  Partial<{ setAutoPassthrough(on: boolean): void; readonly autoPassthrough: boolean }>;
+  | 'learnedPassthrough' | 'forgetLearnedPassthrough' | 'setAutoPassthrough' | 'autoPassthrough'
+>;
 
 /** CONTRACTS §20.2: one learned passthrough host as Status / agents show it (`until` absent = until the proxy stops). */
 export type LearnedPassthroughView = Omit<LearnedPassthrough, 'grpc'>;
@@ -1147,10 +1145,6 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
 
   private applyAutoPassthrough(proxy: ProxyLike): void {
     try {
-      if (!proxy.setAutoPassthrough) {
-        this.opts.log?.('automatic passthrough: this proxy build cannot turn it off');
-        return;
-      }
       proxy.setAutoPassthrough(this.autoPass);
     } catch (e) {
       this.opts.log?.(`automatic passthrough not applied: ${e instanceof Error ? e.message : String(e)}`);
