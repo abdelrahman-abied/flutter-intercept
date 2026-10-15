@@ -34,6 +34,16 @@
 - The panel dropped the host's answer to "decode this gRPC message" (since 0.10): decoding a gRPC call on demand in
   the panel works again.
 
+### Performance, quality and security
+- **Performance** (docs/PERF-2.md): no measurable cost on HTTPS; a server that needs a client certificate is learned
+  in about a fifth of a second with a single probe, then costs almost nothing per request (0.13 failed every request).
+  Spare connections an app drops no longer count as pinning. The extension is smaller: 2.59 → 2.51 MB.
+- **Quality** (docs/QUALITY-2.md): one shared module for learned-host keys and limits, client-certificate code out of
+  activation, long functions split.
+- **Security** (docs/REVIEW-14.md, all findings fixed): a server can only make the proxy learn its own address;
+  pins are per device; removing a certificate is confirmed by VS Code; a failed save keeps the previous passphrase;
+  certificate locations aren't copied by Settings Sync (`machine` scope).
+
 ## 0.13.0
 
 ### gRPC-Web, grpcurl and TLS gRPC on the iOS simulator

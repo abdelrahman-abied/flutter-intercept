@@ -11,6 +11,9 @@
     certificates and retry passed-through servers from the same list.
   - Agents: `learnedPassthrough` in `get_status`, `list_requests` and `get_request`.
 - **Fix**: decoding a gRPC message on demand in the traffic view works again.
+- **Settings**: pressing OK or Apply in Settings → Tools → Flutter Intercept no longer drops a certificate added from
+  the traffic view meanwhile. Removing a certificate is confirmed by the IDE.
+- **Performance, quality, security**: docs/PERF-2.md, docs/QUALITY-2.md, docs/REVIEW-14.md (all findings fixed).
 
 ## 0.13.0 (preview)
 

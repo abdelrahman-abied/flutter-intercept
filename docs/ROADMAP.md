@@ -185,7 +185,7 @@ built: docs/spikes/grpc.md "As built — proxy (0.13.0)".
 - Resend and edit & resend for gRPC-Web calls (refused today).
 - Message-level tools for gRPC-Web: breakpoints on single messages, Mutate JSON, gRPC script hooks.
 - connectrpc over TLS (its HTTP/2 transport uses `SecureSocket.connect`, which the hook can't see).
-- Show learned pinned hosts in `Status.grpc` with a way to forget them (REVIEW-13 #6).
+- ~~Show learned pinned hosts in `Status.grpc` with a way to forget them (REVIEW-13 #6).~~ Done in 0.14 (`Status.learnedPassthrough`, Forget).
 - PERF-1 #8: keep recorded bodies as Buffers and decode lazily (≈ 11% CPU on 1 MB responses, RSS headroom).
 - PERF-1 #10: ECDSA P-256 CA and leaf keys in mockttp (handshake bursts block the loop for ~1.5 ms each).
 - PERF-1 #5: pipeline script hooks on gRPC streams (9.6 k msg/s under a script).
@@ -193,6 +193,27 @@ built: docs/spikes/grpc.md "As built — proxy (0.13.0)".
   settings wired once, one `openWorkspaceFile`).
 - QUALITY-1 remaining: the rest of Q8 (fake timers, the slow `lan` / `generator` suites), Q10 `errorMessage()` helper, Q11 dead exports and inert
   `eslint-disable` comments, Q12 test files named by feature.
+
+### 0.14.0 — Apps with their own certificate (built 2026-10-15, CONTRACTS §20, docs/REVIEW-14.md, docs/PERF-2.md, docs/QUALITY-2.md)
+
+Owner request: an mTLS app (Dio with a client certificate) fails through the proxy. E2e: `scripts/e2e/mtls_server.mjs`
++ `samples/demo_app/lib/mtls_demo.dart`, agent suite `FI_AGENT_MTLS=1`.
+
+| Item | Notes |
+|---|---|
+| **Learned passthrough** | One map for HTTP and gRPC. `client-certificate`: TLS alert 116 at once, 40 / 42 confirmed by a TLS 1.2 probe that sees a CertificateRequest, nginx's 400 page; until the proxy stops / forget / a certificate added. `pinned`: the app's alert at once, or two closes after our certificate within 60 s; 10 min, per client. Keyed on the CONNECT target and only when the request names that server. Never when a rule names the host, during replay, with a configured certificate. `Connection: close` + idle keep-alives closed so the next request goes direct. |
+| **Add client certificate** | Banner on such requests, popup (why / stays on your computer), list in the status line (Remove, Try decrypting again), palette command. Native file pickers return one-use tokens (the path never reaches the panel); user-level `clientCertificates` (`machine` scope) + secret storage / PasswordSafe; confirm Remove in the IDE; rollback on a failed save. |
+| **Performance (PERF-2)** | No HTTPS regression; mTLS host learned in 150–315 ms with one probe; false pins from spare connections fixed; Zod 3 stubbed (bundle 2.59 → 2.51 MB, budget lowered to 2.55 MB). |
+| **Quality (QUALITY-2)** | `@flutter-intercept/proxy/learned-meta` (keys, caps), one same-server rule, long functions split, VS Code client-certificate code out of `activate()`. |
+| **Security (REVIEW-14)** | Learning bound to the server the app connected to; per-client pins; IDE-confirmed removal and passphrase rollback; plugin Settings Apply merges panel adds; IPv6 keys. |
+
+**Next / considered (0.14 follow-ups)**
+
+- Tell loopback clients apart for pins (local processes vs simulators / emulators share 127.0.0.1).
+- Learn `wss://` upgrades to mTLS hosts; detect the nginx 400 on buffered routes (breakpoints, mutate, scripts).
+- Plugin: Settings Apply still writes every other setting from the copy loaded when the dialog opened (pre-0.14).
+- Optional `LearnedPassthrough.client` so the panel can say which device a pin came from.
+- QUALITY-1 leftovers (unused imports / parameters, `errorMessage()` helper, `noUnusedLocals` in base configs).
 
 ## 5. Spikes and decisions before building
 - Dio's async stack depth for request → source (0.3).
