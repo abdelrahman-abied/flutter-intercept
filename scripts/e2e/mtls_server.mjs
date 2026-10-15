@@ -52,6 +52,7 @@ const strict = https.createServer({ ...base, requestCert: true, rejectUnauthoriz
   else json(res, 404, { ok: false });
 });
 const nginx = https.createServer({ ...base, requestCert: true, rejectUnauthorized: false }, (req, res) => {
+  if (process.env.FI_MTLS_LOG) console.error(`nginx ${req.url} authorized=${req.socket.authorized} reused=${req.socket.isSessionReused()} cn=${clientCn(req) ?? '-'} peer=${req.socket.remotePort}`);
   if (!req.socket.authorized) {
     res.writeHead(400, { 'content-type': 'text/html' });
     res.end('<html><head><title>400 No required SSL certificate was sent</title></head><body><center><h1>400 Bad Request</h1></center><center>No required SSL certificate was sent</center></body></html>');

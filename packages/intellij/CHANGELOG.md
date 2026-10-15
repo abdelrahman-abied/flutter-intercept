@@ -10,6 +10,8 @@
   certificate, and Flutter Intercept never tries the server on its own.
 - **Add client certificate…** is offered on such requests even when nothing was passed through. Agents:
   `autoPassthrough` in `get_status`, `needsClientCertificate` on requests.
+- **Fix**: after you remove or change a client certificate, the server no longer sees the old one (connections and TLS
+  sessions opened with it are dropped).
 
 ## 0.14.0 (preview)
 

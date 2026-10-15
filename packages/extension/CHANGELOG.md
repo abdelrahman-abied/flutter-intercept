@@ -17,6 +17,11 @@
 - Agents: `get_status` shows `autoPassthrough`; `list_requests` / `get_request` show `needsClientCertificate`; HAR
   `_needsClientCertificate`.
 
+### Fix
+- After you remove or change a client certificate, the server no longer sees the old one: Flutter Intercept drops
+  the connections and TLS sessions it opened with it (before, a server could still resume such a session for a short
+  while inside VS Code).
+
 ## 0.14.0
 
 ### Apps with their own certificate (mTLS)

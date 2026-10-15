@@ -213,6 +213,8 @@ Owner request: an mTLS app (Dio with a client certificate) fails through the pro
 - Learn `wss://` upgrades to mTLS hosts; detect the nginx 400 on buffered routes (breakpoints, mutate, scripts).
 - Plugin: Settings Apply still writes every other setting from the copy loaded when the dialog opened (pre-0.14).
 - Optional `LearnedPassthrough.client` so the panel can say which device a pin came from.
+- Mirror the app's TLS fingerprint upstream (mockttp `mirrorTlsFingerprint`, native `tls-impersonate`) so a server sees
+  a connection that looks like the app's once a certificate is added; needs a bundling / platform check (owner).
 - QUALITY-1 leftovers (unused imports / parameters, `errorMessage()` helper, `noUnusedLocals` in base configs).
 
 ## 5. Spikes and decisions before building

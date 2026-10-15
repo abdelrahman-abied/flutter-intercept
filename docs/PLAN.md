@@ -323,3 +323,15 @@ after adding the certificate the calls are decrypted), web 8/8, devices on the i
 the Android emulator 11/13 (every failure an external host timing out or resetting — jsonplaceholder also timed out
 with no proxy at all during the run), `verifyPlugin` Compatible. Not verified: physical iPhone, a real customer mTLS
 API, IPv6 targets, nginx 400 on buffered routes.
+
+### v0.14.1 status (2026-10-15)
+Owner request after 0.14.0: tell the developer what the server sees, and let automatic passthrough be turned off
+(CONTRACTS §20.7). The popup gained *What the server sees*; a learned request says the server may have logged one
+refused attempt; `flutterIntercept.autoPassthrough` / the plugin checkbox (default on) — off: no learning, no probe, the
+requests keep failing with the reason, **Add client certificate…** still offered through `needsClientCertificate`. The
+agent suite's new step found a real bug, fixed: after a certificate was removed, a server could still resume a TLS
+session opened with it inside VS Code — a certificate change now retires kept-alive upstream connections and TLS
+sessions (HTTP, upstream proxy, LAN, gRPC). Verified: unit tests (proxy 592, webview 574, extension 2155, cli 115,
+sidecar 52, plugin 106), VS Code default 42/42, agent 12/12 on macOS incl. the three-step mTLS check (passed through →
+decrypted with the added certificate → setting off: every call fails with the reason; the test server logged a fresh,
+unauthenticated session after removal), `verifyPlugin` Compatible.
