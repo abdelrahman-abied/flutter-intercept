@@ -32,7 +32,7 @@ describe('learned-meta (shared with the extension host)', () => {
   it('keys, labels and brackets', () => {
     expect(bracketHost('2001:db8::1')).toBe('[2001:db8::1]');
     expect(bracketHost('api.example')).toBe('api.example');
-    expect(bracketHost('10.0.0.1')).toBe('10.0.0.1');
+    expect(bracketHost('203.0.113.1')).toBe('203.0.113.1');
     expect(learnedKey('2001:db8::1', 443)).toBe('2001:db8::1:443'); // the map's key: no brackets
     expect(hostLabel('api.example', 443)).toBe('api.example');
     expect(hostLabel('api.example', 8443)).toBe('api.example:8443');
@@ -49,7 +49,7 @@ describe('learned-meta (shared with the extension host)', () => {
     expect(learnedKeyOf('[2001:db8::1]', 8443)).toBe('[2001:db8::1]:8443');
     expect(learnedKeyOf('[2001:db8::1]')).toBe('2001:db8::1');
     expect(learnedKeyOf('API.example', 8443)).toBe('api.example:8443');
-    for (const [h, p] of [['2001:db8::1', 443], ['api.example', 8443], ['10.0.0.5', 443], ['[::1]', 9000]] as const) {
+    for (const [h, p] of [['2001:db8::1', 443], ['api.example', 8443], ['203.0.113.5', 443], ['[::1]', 9000]] as const) {
       const parsed = parseLearnedKey(learnedKeyOf(h, p));
       expect(parsed).toEqual({ host: h.replace(/^\[|\]$/g, '').toLowerCase(), port: p });
     }
@@ -76,7 +76,7 @@ describe('refusal servers (learn-flow)', () => {
   it('isSameServer: host and port must both match (REVIEW-14 #1)', () => {
     const named = { host: 'api.example', port: 443 };
     expect(isSameServer(named, { host: 'api.example', port: 443 })).toBe(true);
-    expect(isSameServer(named, { host: '10.0.0.5', port: 443 })).toBe(false);
+    expect(isSameServer(named, { host: '203.0.113.5', port: 443 })).toBe(false);
     expect(isSameServer(named, { host: 'api.example', port: 8443 })).toBe(false);
     expect(isSameServer(named, undefined)).toBe(false);
   });

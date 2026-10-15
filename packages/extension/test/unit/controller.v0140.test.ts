@@ -219,8 +219,8 @@ describe('forgetLearnedPassthrough (CONTRACTS §20.3)', () => {
     await send(c, { type: 'forgetLearnedPassthrough', host: '2001:DB8::1', port: 443 }, reply);
     await send(c, { type: 'forgetLearnedPassthrough', host: '[2001:db8::1]', port: 8443 }, reply);
     await send(c, { type: 'forgetLearnedPassthrough', host: '2001:db8::1' }, reply);
-    await send(c, { type: 'forgetLearnedPassthrough', host: '10.0.0.5', port: 443 }, reply);
-    expect(host.forgotten).toEqual(['[2001:db8::1]:443', '[2001:db8::1]:8443', '2001:db8::1', '10.0.0.5:443']);
+    await send(c, { type: 'forgetLearnedPassthrough', host: '203.0.113.5', port: 443 }, reply);
+    expect(host.forgotten).toEqual(['[2001:db8::1]:443', '[2001:db8::1]:8443', '2001:db8::1', '203.0.113.5:443']);
     expect(replies).toEqual([]);
   });
 
