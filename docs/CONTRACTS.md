@@ -2286,3 +2286,507 @@ extension and the sidecar.
 - **Certificate changes reset upstream connections** (found by the agent suite): `setClientCertificates()` retires
   every kept-alive upstream connection and TLS session (HTTP agents, upstream-proxy agents, the LAN gate's agents, gRPC
   sessions — calls in flight finish), so a server never keeps seeing a removed or replaced certificate.
+
+## 21. v0.15.0 — Mock from a collection (2026-11-19)
+
+Owner request: a developer with no test server points the extension at a Postman collection (or an OpenAPI 3
+document) and every request in it is answered locally from its saved examples. Plan and owners: docs/PLAN.md
+"v0.15.0". Owner decisions (2026-11-19): a request with no example answers **501** and is listed; the link to the
+collection lives in the **shared file** in the repo; requests the collection doesn't know go to the **real server**
+unless the user switches that collection to **fail**; formats: Postman Collection v2.0 / v2.1, Postman environment
+files, OpenAPI 3.0 / 3.1.
+
+No proxy change: a collection becomes ordinary `mock` rules (§3) built by the host. Nothing is sent anywhere.
+
+### 21.1 Model (pure, `packages/extension/src/mocks/**`, no vscode, no fs)
+Shared by the extension, the sidecar and the CLI (imported from source, as `src/rules/**` is).
+
+```ts
+type CollectionFormat = 'postman' | 'openapi';
+
+interface MockExample {
+  name: string;                 // Postman: the example's name; OpenAPI: "200", "200 · <example name>", "default"
+  status: number;               // 100–599
+  headers: Record<string, string>;
+  body: string;                 // text; '' when none
+  /** OpenAPI only: built from the schema (§21.4), no example was written in the document. */
+  generated?: true;
+  /** Postman only: literal query values of the example's `originalRequest` that differ from the request's own. */
+  query?: Record<string, string>;
+}
+
+interface MockEndpoint {
+  /** Stable inside one collection: `<METHOD> <url template as written, without query and fragment>`, e.g.
+   *  `GET {{baseUrl}}/users/:id` (Postman: `url.raw`, else the string URL, else built from the parts; OpenAPI: the
+   *  path key). Two requests with the same key: the first keeps it, later ones get ` #2`, ` #3` (file order). */
+  key: string;
+  method: string;               // upper case
+  name: string;                 // the request's name / operationId / summary
+  folder: string[];             // Postman folders; OpenAPI: the first tag
+  /** Resolved `scheme://host[:port]` (lower-cased host, default port dropped); absent while a variable is unset. */
+  origin?: string;
+  /** Path segments after variables are resolved: a literal, or `{ param: string }` for `:id`, `{id}` and
+   *  unresolved `{{id}}`. */
+  path: (string | { param: string })[];
+  examples: MockExample[];      // file order
+  /** Variables this endpoint's origin still needs (e.g. `baseUrl`). Non-empty → not mocked. */
+  unresolved: string[];
+}
+
+interface ParsedCollection {
+  format: CollectionFormat;
+  name: string;
+  endpoints: MockEndpoint[];
+  /** Every variable used in a URL, with where its value came from. Values are never part of this type. */
+  variables: { name: string; from?: 'link' | 'environment' | 'collection' | 'server' }[];
+  problems: string[];           // readable, one line each
+}
+```
+
+Functions (all pure, synchronous, never throw on bad input — they return `problems`):
+- `detectFormat(doc: unknown): { format?: CollectionFormat; problem?: string }` — Postman: `info.schema` names
+  collection v2.0 / v2.1 (or `info` + `item[]`); OpenAPI: `openapi` starts with `3.`. `swagger: "2.0"` → no format,
+  the problem `Swagger 2.0 isn't supported yet: convert it to OpenAPI 3.` Postman v1 → the same kind of message.
+  (`types.ts` is authoritative for every signature here.)
+- `parsePostman(doc, vars)`, `parseOpenApi(doc, vars)` → `ParsedCollection`; `vars: ReadonlyMap<string, string>` is
+  already merged by the caller in the order link `variables` → environment file → the collection's own `variable[]`
+  (first one that has a non-empty value wins).
+- `parsePostmanEnvironment(doc): { values: Map<string, string>; problems: string[] }` — `values[]` with
+  `enabled !== false`, empty values left out.
+- `toRules(parsed, opts): { rules: Rule[]; stats }` (§21.5).
+- `sanitisePostman(doc): { doc; removed: string[] }` (§21.6).
+
+Limits (over a limit → a problem line, the rest still loads): file ≤ 20 MB; ≤ 2000 endpoints; ≤ 20 examples per
+endpoint; example body ≤ 5 MB; folder depth ≤ 32; a URL ≤ 8 KB. Keys read from the file never become object
+prototypes: variables and headers are kept in `Map`s or null-prototype objects (`__proto__`, `constructor` are data).
+
+### 21.2 Postman (v2.0 and v2.1)
+- Items are walked depth-first; an item with `request` is an endpoint, one with `item[]` is a folder. `request` as a
+  plain string (v2.0) is a GET to that URL. `url` as a string or as the object (`raw`, `protocol`, `host`, `path`,
+  `query`, `variable`); the object's parts win over `raw` when both are present.
+- Variables: `{{name}}` in the scheme / host / port / path is replaced from `vars`. Left unresolved in the host →
+  the endpoint's `unresolved` names it. Left unresolved as a whole path segment → a `param`. Query strings in the
+  request's own URL are ignored for matching (any query matches). Dynamic variables (`{{$guid}}` …) in a host are
+  unresolved; in a path segment they are a `param`.
+- Path variables `:id` → `param`. A host with no scheme → `https`.
+- Examples = `response[]`: `name`, `code` (missing or out of range → 200 with a problem line naming the request),
+  `header[]` (`disabled` ones skipped; names lower-cased; a repeated name: values joined with `, `, except
+  `set-cookie`, where only the first is kept — mock headers hold one value per name), `body` (string; missing → '').
+  No `content-type` header and a non-empty body → from `_postman_previewlanguage`: `json` →
+  `application/json; charset=utf-8`, `xml` → `application/xml`, `html` → `text/html; charset=utf-8`, otherwise
+  `text/plain; charset=utf-8`. An empty body gets no `content-type`.
+- Dropped from example headers (the proxy frames the answer): `content-length`, `content-encoding`,
+  `transfer-encoding`, `connection`, `keep-alive`, `date`, `proxy-*`, `te`, `trailer`, `upgrade`, and HTTP/2
+  pseudo-headers.
+- `MockExample.query`: when the example's `originalRequest` has query parameters with literal values (no `{{…}}`)
+  that the endpoint's own URL doesn't have or has with another value. Lets `?page=1` and `?page=2` have their own
+  answers.
+- Example bodies are served as written: `{{variables}}` inside a body are not replaced (0.15.0).
+- An example whose body is over `exampleBodyBytes` is left out with a problem line (the endpoint and its other
+  examples load). Not cut or emptied: a cut JSON body would fail in the app in a misleading way.
+- Dynamic variables (`{{$guid}}` …) are never listed in `ParsedCollection.variables` (the user can't set them): in a
+  path segment they are a `param`; in the host they make the endpoint `unresolved` (named in `unresolved`).
+- Ignored: `auth`, `event` (scripts are never run), `protocolProfileBehavior`, request bodies.
+
+### 21.3 OpenAPI 3.0 / 3.1
+- JSON and YAML (owner decision 2026-11-19: YAML supported, budget raised). YAML through `src/mocks/yaml.ts`
+  (`parseYaml`, `isYamlFile`, done in WP0): `js-yaml` 4.3.2 (MIT, nodeca), a direct dependency of the extension,
+  44.5 KB minified, required on first use only. `load(text, { schema: JSON_SCHEMA, json: true })`: plain data, no
+  custom tags, no functions, one document per file; problems give the position and reason, never file text. Aliases
+  stay shared references (not copies), and the walk is capped at `COLLECTION_LIMITS.walkNodes` values, so a "billion
+  laughs" document stops with a problem line.
+- Origin: the operation's `servers`, else the path's, else the document's; the **first** entry. Server variables
+  take their `default`; a link `variables` entry of the same name wins. A relative or missing server URL → the
+  origin is the variable `baseUrl` (unresolved until the user sets it); a server path prefix (`/v1`) is kept in
+  front of every path.
+- One endpoint per path × method (`get`, `put`, `post`, `delete`, `patch`, `head`, `options`). `{name}` → `param`.
+  `name` = `operationId`, else `summary`, else `<METHOD> <path>`.
+- Examples, in this order: for each response code in document order (`default` counts as 500 unless it is the only
+  response, then 200; `2XX` → 200, `4XX` → 400, `5XX` → 500), with the media type chosen as `application/json`,
+  else the first `*/json` or `+json`, else the first listed:
+  - `examples` (named) → one `MockExample` each, name `<code> · <key>`, from `value` (`externalValue` is not fetched →
+    skipped with a problem line; when every named example is skipped, the next step applies);
+  - else `example` → name `<code>`;
+  - else the schema's `example` / `examples[0]` → name `<code>`;
+  - else generated from the schema (§21.4) → name `<code>`, `generated: true`;
+  - no content → empty body, name `<code>`.
+  An explicit example (named, `example`, or the schema's) whose JSON text is over `exampleBodyBytes` is skipped
+  with a problem line, like an `externalValue` (same as Postman, §21.2): never cut.
+  `<code>` is the response key as written (`200`, `2XX`, `default`). JSON values are written with 2-space
+  indentation; a string example of a non-JSON media type is the body as it is. `content-type` = the chosen media
+  type (no header when there is no content). Response `headers` with an `example` (or a schema's) are added, names
+  lower-cased.
+- `$ref`: local pointers only (`#/…`), resolved anywhere (path items, responses, schemas, examples, headers);
+  a reference to another file or URL is not followed → a problem line naming it, that part is skipped. Cycles stop.
+
+### 21.4 Generating a body from a schema (pure, deterministic)
+The same schema always gives the same text (no randomness, no clock). Rules, first that applies:
+`example` → `default` → `const` → first `enum` → by `type`:
+- `object`: every property in document order (required and optional). `additionalProperties` with a schema adds
+  one entry `"key"` **only when there are no `properties`** (a map); next to named properties it is ignored (strict
+  models reject unknown keys). Nothing → `{}`.
+- `array`: `max(1, min(minItems, 3))` items; `items` missing → `[]`.
+- `string` by `format`: `date-time` → `2026-01-01T00:00:00Z`, `date` → `2026-01-01`, `time` → `00:00:00Z`,
+  `uuid` → `00000000-0000-4000-8000-000000000000`, `email` → `user@example.com`, `uri` / `url` →
+  `https://example.com`, `hostname` → `example.com`, `ipv4` → `192.0.2.1`, `ipv6` → `2001:db8::1`, `byte` →
+  `AA==`, `binary` → ``; otherwise `string`, repeated then cut to fit `minLength` / `maxLength` (`minLength: 8` →
+  `stringst`, `maxLength: 3` → `str`).
+- `integer` / `number`: `minimum` when given (plus 1 when exclusive), else 0, capped by `maximum`.
+- `boolean`: `true`. `null`: `null`.
+- `type` as a list (3.1) or `nullable: true` (3.0): the first non-null type. No `type`: `properties` → object,
+  `items` → array, else `null`.
+- `allOf`: merged (properties and `required` united, later members win a clash); `oneOf` / `anyOf`: the first member.
+- A schema met again on the way down (cycle) → `null` for a nullable or optional place, else `{}` / `[]` / the
+  scalar's value. Depth ≤ 12, where **every** step down counts — `properties`, `items`, `additionalProperties`
+  and also `allOf` / `oneOf` / `anyOf` members and `$ref`s — so no input can exhaust the call stack (REVIEW: a
+  50 000-deep `allOf` chain crashed the first version). Output ≤ 256 KB (over → cut at the property where the limit
+  is passed, with a problem line).
+- `generateFromSchema` returns JSON text (a string schema gives `"…"`); `parseOpenApi` writes a string value of a
+  non-JSON media type as the raw text (`application/pdf` binary → ``, `text/plain` → `ok`).
+- `writeOnly` properties are left out of responses.
+
+### 21.5 From endpoints to rules
+`toRules(parsed, { id, name, selected, off, unmatched })`:
+- One `mock` rule per usable example slot of every endpoint that has an `origin` and is not in `off`:
+  - id `collection:<id>:<n>` (n = position), `enabled: true`, never persisted, never `shared`;
+  - `name`: `<collection name> › <request name> · <example name>` (≤ 200 chars, cut in the middle);
+  - `match.method` = the method; `match.url` = `/<source>/i`, the source built **only** from escaped literals
+    and these fixed pieces (WP0 checked them against the proxy's `isSafeRegexSource`, REVIEW-4 #2: at most 2
+    unbounded quantifiers, at most 1 on a wide atom, ≤ 256 characters):
+    `^` + escaped origin + `(?::<default port>)?` when the origin has none + per segment `\/` + the literal or
+    `[^/?#]{1,100}` for a `param` (bounded: a value over 100 characters doesn't match) + `\/?` + `(?:[?#]|$)`.
+    In literals (path segments, query names and values) every character outside RFC 3986's unreserved set
+    (`A–Z a–z 0–9 - . _ ~`) is written `(?:<escaped char>|%XX…)` (its UTF-8 percent form): clients encode different
+    sets (`$`, `;`, `'`, non-ASCII …). In a query a space also matches `+`. These groups are never quantified. With example query parameters, `(?:[?#]|$)` becomes `\?` followed by one lookahead per parameter:
+    `(?=(?:[\w.~%+=,;:@!$'()*\/?&-]*&)?<name>=<value>(?:[&#]|$))` (name and value escaped).
+    The `i` flag makes the whole URL case-insensitive: the proxy doesn't lower-case hosts before matching (WP0), and
+    paths that differ only in case are rare in one API. Measured: < 0.01 ms per test on a 4 KB hostile URL.
+  - A source over 256 characters (a long origin + path): the rule uses the glob `<origin>/<segments>*` instead,
+    where a `param` and a literal with any non-unreserved character are `*` (linear, case-sensitive, looser: `*`
+    also crosses `/`); its query examples are dropped (the default example answers); `stats.loose` counts such
+    endpoints and a problem line names each. A query example whose own regex would pass 256 characters is dropped
+    with a problem line;
+  - action `{ kind: 'mock', status, headers, body }`.
+- Which example answers: every example with `query` gets its own rule placed before the endpoint's default rule,
+  its regex also requiring each `name=value` (percent-decoded compare is not attempted: the literal and its
+  `encodeURIComponent` form are both accepted) through one lookahead per parameter, most parameters first.
+  At most 2 parameters per example (`COLLECTION_LIMITS.exampleQueryParams`); an example that differs in more is
+  matched on the first 2 by name, with a problem line.
+  The default rule answers with `selected[key]` when that example exists, else the first example whose status is
+  2xx, else the first example.
+- **No example** → the default rule answers `501`, `content-type: application/json; charset=utf-8`,
+  `x-flutter-intercept: no-example`, body
+  `{"error":"no_example","message":"No example response is saved for <METHOD> <path> in <collection name>. Add an example to the collection, or mock this request with a rule."}`.
+- Order inside one collection: more literal path segments first, then fewer `param`s, then longer paths, then file
+  order — so `/users/me` is tried before `/users/:id`.
+- **Unmatched** (`unmatched: 'fail'`): one last rule per origin of the collection (endpoints that are off
+  included), `/^<origin>(?::<default port>)?(?:[\/?#]|$)/i`, any method, action `{ kind: 'block', mode: 'reset' }`
+  — closed without a response, as replay's `fail` fallback (§12.4) — named `<collection name> › not in the
+  collection`. An endpoint that is off therefore fails too in this mode: nothing reaches the real server.
+  `passthrough` (default): no such rule, and an endpoint that is off goes to the real server.
+- Order between sources (first match wins, as today): shared rules → personal rules → collections in the order
+  they are listed in the file. A rule the user writes therefore always overrides a collection's answer (a fault, a
+  breakpoint, another mock).
+- `stats`: `endpoints` (all), `mocked` (answered by an example), `noExample` (answered 501), `unresolved` (no
+  usable origin), `off`, `generated` (the default example is generated, §21.4), `loose` (glob fallback). Examples
+  with a status outside 100–599 are left out, and header names that aren't tokens or values with CR / LF / NUL
+  are dropped, each with a problem line, so every rule passes the panel's `validateRule` (the parsers should
+  already guarantee this).
+
+### 21.6 The link in the shared file, and personal state
+`.vscode/flutter-intercept.json` gains an optional top-level `collections` array (`version` stays 1; versions before
+0.15.0 keep the key when they write the file, §12.1):
+
+```jsonc
+{ "version": 1, "rules": [],
+  "collections": [
+    { "id": "shop-api",                       // slug, unique in the file: [a-z0-9-]{1,40}
+      "file": "api/shop.postman_collection.json",   // workspace-relative
+      "environment": "api/dev.postman_environment.json", // optional, workspace-relative
+      "variables": { "baseUrl": "https://api.shop.example" }, // optional; values used in URLs only
+      "enabled": true,                        // default for everyone; default true
+      "unmatched": "passthrough",             // or "fail"; default passthrough
+      "selected": { "POST {{baseUrl}}/login": "Wrong password" }, // endpoint key → example name
+      "off": ["GET {{baseUrl}}/health"] } ] }  // endpoint keys that are not mocked
+```
+
+- Files: inside the workspace folder, realpath-checked, regular files (the §12.2 rules). Read by the host only,
+  watched (edits, git checkouts; debounced 300 ms). A missing or broken file → the collection keeps its last good
+  rules for the session if it had any, with the problem shown; at start → no rules, problem shown.
+- **Personal override** (workspaceState, per collection id): `enabled` only. A teammate with a real server turns
+  the collection off for themselves without changing the file. Everything else in the entry is shared.
+- Invalid entries (bad id, a path outside the workspace, unknown `unmatched`) are skipped with a problem line,
+  never guessed. At most 20 collections.
+- **No approval gate**: collection rules only answer locally (`mock`, the unmatched failure). They never forward,
+  rewrite or run a script, so §12.1's gate doesn't apply — the same as shared `mock` rules today.
+- **Environment values** are used to resolve URL variables only. They are never sent to the panel, agents, logs,
+  exports or recordings; the panel and agents see variable **names**, where each value came from, and resolved
+  origins.
+- **Import** (`flutterIntercept.importCollection`, the panel's "Mock from a collection…", the plugin's action):
+  the IDE's own file picker (the panel never names a path). A file inside the workspace is linked where it is. A
+  file outside it must be copied in to be shared: the host offers `.vscode/flutter-intercept/collections/<slug>.json`
+  and asks **Copy without credentials (recommended)** / **Copy as it is** / Cancel. "Without credentials" writes
+  `sanitisePostman(doc)`: every `auth` block removed; values of sensitive request headers (`isSensitiveHeader`,
+  §8) and of variables whose `type` is `secret` or whose name matches
+  `/(secret|token|passw(or)?d|pwd|api[-_]?key|auth|credential|session|cookie|private)/i` replaced by empty strings —
+  everywhere they occur: collection and folder `variable[]`, `url.variable[]`, `url.query[]`, request and
+  `originalRequest` headers (v2.0 string headers included). **Request bodies** (requests and `originalRequest`s;
+  mocking never reads them): `raw` bodies that parse as JSON get the value of every key matching that pattern (at
+  any depth) replaced by `""`, `urlencoded` / `formdata` entries with such keys get empty values, `graphql.variables`
+  is treated like raw JSON; a raw body that isn't JSON is kept as is and named in `removed` as "request body of
+  <request> not checked (not JSON)". File-type `formdata` entries lose their `src`.
+  `event` scripts removed; examples kept (response bodies are shown as written — the dialog says so). OpenAPI
+  documents are copied as they are. A linked file that still holds credentials and is tracked or not ignored by
+  git → one notice naming what was found (names, never values).
+- After import: the collection's variables that are still unset are asked for, offering the origins seen in the
+  session's traffic as choices.
+- **Remove** (IDE-confirmed): deletes the entry, never the collection file.
+
+### 21.7 Host (`src/mocks/core.ts` pure with an fs interface, `src/mocks/service.ts` VS Code)
+```ts
+interface MockCollectionsService {
+  state(): CollectionStatus[];
+  rules(): Rule[];                                   // every enabled collection, in file order (§21.5)
+  onDidChange(l: () => void): { dispose(): void };
+  endpoints(id: string): CollectionEndpointView[];
+  importFile(pick: { file: string; environment?: string; copy?: 'sanitised' | 'as-is' }): Promise<{ id: string }>;
+  update(id: string, patch: { enabled?: boolean; unmatched?: 'passthrough' | 'fail';
+    variable?: { name: string; value: string }; example?: { endpoint: string; name: string };
+    off?: { endpoint: string; off: boolean } }): Promise<void>;
+  remove(id: string): Promise<void>;
+  toRule(id: string, endpoint: string): Rule;        // a personal, editable copy of what answers now
+}
+```
+`ProxyHost` gets `[...shared, ...personal, ...collections.rules()]`; `enabled` (personal) is written to
+workspaceState, everything else to the shared file (formatting kept, §12.1). Rules of a collection are replaced as
+a set; sequence counters and `times` don't apply to them.
+
+### 21.8 Messages (amends §4; both `protocol.ts`; the plugin uses the same ones)
+```ts
+interface CollectionStatus {
+  id: string; name: string; file: string; format?: CollectionFormat;
+  enabled: boolean; unmatched: 'passthrough' | 'fail';
+  endpoints: number; mocked: number; noExample: number; generated: number; off: number;
+  /** Variables with no value yet, and the origins that are resolved. Names and origins only. */
+  unresolved: string[]; origins: string[];
+  problems: string[];
+}
+interface CollectionEndpointView {
+  key: string; method: string; name: string; folder: string[]; url: string;   // origin + path, params as `:name`
+  examples: { name: string; status: number; generated?: true; query?: Record<string, string> }[];
+  selected?: string; off?: true; unresolved?: string[];
+}
+```
+- `Status.collections?: CollectionStatus[]`.
+- Host → webview: `{ type: 'collectionEndpoints'; id; endpoints: CollectionEndpointView[] }`,
+  `{ type: 'collectionExample'; id; endpoint; name; status; headers; body; truncated?: true }` (body ≤ 256 KB here).
+- Webview → host: `importCollection` (opens the picker), `getCollectionEndpoints {id}`,
+  `getCollectionExample {id, endpoint, name}`, `updateCollection {id, patch}` (the §21.7 patch),
+  `removeCollection {id}`, `collectionToRule {id, endpoint}` (opens the rule editor with the copy).
+- An exchange answered by a collection is `mocked` with the rule's name (§21.5), as any mock rule is today.
+- Decisions (2026-11-19, questions from W):
+  - **Which collection answered**: the host never sends collection rules in `rules` (they aren't the user's rules).
+    The panel reads `Exchange.matchedRuleId`: an id `collection:<id>:<n>` → the `CollectionStatus` with that `id` →
+    its `name`; not found → "the collection". `Exchange` is not changed.
+  - **`collectionToRule`**: the host adds the copy as a new personal rule, **first** among the personal rules (as
+    `createRuleFromExchange` does), and broadcasts `rules`; the panel opens the rule that appears (`awaitRule`).
+    No dedicated reply.
+  - **Refreshing endpoints**: the host **pushes** `collectionEndpoints` for every collection the panel asked for
+    with `getCollectionEndpoints` since its last `ready` (at most the 20 most recent ids) whenever that collection
+    is reloaded (file edit, git checkout) or updated (`updateCollection`, an agent's `set_collection`). The panel
+    asks once when a collection is opened and does not re-request on `Status` changes.
+
+### 21.9 Panel
+A **Collections** section next to Rules: one row per collection (name, `42 mocked · 3 without an example · 1 off`,
+on/off for me, the unmatched switch, problems, "Set baseUrl…" while unresolved). Opened: endpoints grouped by
+folder, filter box, per endpoint an example picker (status chip, "generated" tag), on/off, "Edit as a rule".
+A request answered `501 no-example` shows a banner: "No example is saved for this request in <collection>" with
+"Mock it with a rule". Empty state explains the feature in two lines and offers "Mock from a collection…".
+All text plain (no HTML from the file is rendered); names from the file are cut at 200 chars.
+
+### 21.10 Agents (amends §8)
+- `list_collections` (read): the statuses. `get_collection {id, filter?, limit?}` (read): endpoints with example
+  names and statuses; `get_collection_example {id, endpoint, example}` (read): status, headers, body through the
+  agent's redaction and size rules.
+- `import_collection {file, environment?}` (control): workspace-relative files inside the workspace only (no
+  copying in, no picker). `set_collection {id, enabled?, unmatched?, variable?, example?, off?}` (control).
+  `remove_collection` isn't offered to agents.
+- The instructions text gains one paragraph: no test server → import the collection, set `baseUrl`, switch
+  examples to test error paths.
+
+### 21.11 CLI and plugin
+- CLI: collections in the shared file apply like its rules (`--no-rules` turns both off). `--collection <file>`
+  (repeatable; adds one), `--collection-env <file>`, `--collection-var name=value` (repeatable),
+  `--collection-unmatched passthrough|fail`. Problems are printed; unresolved variables with `fail` are a usage
+  error.
+- Sidecar + IntelliJ plugin: the same service core and messages; the file picker and the copy / remove
+  confirmations through the IDE (as §20.3 does for certificates).
+
+### 21.12 Review, performance
+- REVIEW-15 (independent, before release): the parsers on hostile files (size, depth, cycles, prototype keys,
+  YAML aliases), that only escaped literals reach a regex (no ReDoS: fuzz the builder), path checks and symlinks,
+  environment values never leaving the host, the sanitised copy, what agents can import, text shown in the panel.
+- PERF-3: per-request cost with 100 / 500 / 2000 collection rules against the 0.14.1 baseline. Budget: ≤ 0.05 ms
+  added per request at 500 rules. Over budget → the lead proposes a proxy-side index (method + origin) as a
+  contract amendment before any proxy code is written.
+
+### 21.13 WP0 results (2026-11-19)
+- In code: `packages/extension/src/mocks/types.ts` (§21.1, §21.5, §21.6 types, signatures, limits),
+  `src/mocks/link.ts` (`parseCollectionLinks`, `toFileLink`, `relativePath`; tests `test/unit/mocks.link.test.ts`),
+  `serializeSharedFile(rules, previous, collections?)` (keeps the key when only rules are written, as 0.14 does),
+  §21.8 types and messages in both `protocol.ts` with placeholders (`notYet` handlers in `ui/handlers.ts`, no-op
+  cases in the webview's `hostMsg.ts`) for H and W to replace.
+- Fixtures: `packages/extension/test/fixtures/collections/` — `shop.postman_collection.json`,
+  `shop.postman_environment.json`, `shop.openapi.json`, and `shop.expected.json`, the exact output M1 and M2 must
+  produce (endpoints, keys, origins, paths, examples with headers and bodies, generated bodies, variables, problems,
+  what the sanitised copy must and must not contain). A disagreement between the fixture and this contract is
+  raised with the lead, not settled in code.
+- Regex: the first draft (`[^/?#]+` + `(?:[?#].*)?$`) is refused by `isSafeRegexSource` (two unbounded wide
+  atoms), so it would never match; §21.5 now has the checked form. Host case: `matches()` compares the URL as given,
+  hence the `i` flag.
+- Bundle: 2 516 962 bytes of 2 550 000 before this feature. Owner decision: YAML is supported and the budget is
+  raised on purpose to 2 650 000 (`build.mjs`); PERF-3 lowers it to the measured size + 20 KB before release, as
+  PERF-2 did. `shop.openapi.yaml` is the YAML copy of the OpenAPI fixture (same value, tested).
+
+### 21.14 H as built (2026-11-19)
+- **Core** `src/mocks/core.ts` (`MockCollectionsCore`, pure; parsers injected as `CollectionParsers`, the real set in
+  `src/mocks/parsers.ts`): links from `src/rules/core.ts` (`collectionLinks`, `saveCollections` — rules and other keys
+  written back untouched, so no approval changes — `writeWorkspaceFile`, `primaryFolderPath`). Parses are cached by
+  the files' realpath + size + mtime and the link's `variables`; a broken or unreadable file keeps the last good
+  parse with `… — using the last good version`. Environment files: JSON only, ≤ 5 MB. JSON problems give
+  `line L, column C` from the project's own scanner (`rules/jsonc.ts`), never V8's message (it quotes the file).
+  The same link id in a second workspace folder is skipped with a problem. Problems per collection are capped at
+  50 lines (`… and N more problems`).
+- **Credentials notice**: shown first among a Postman collection's problems whenever `sanitisePostman` would remove
+  something (names only) — not limited to git-tracked files (no git check in 0.15.0).
+- **Personal on/off**: workspaceState `flutterIntercept.collectionsEnabled`, `{ "<folder path>\0<id>": boolean }`;
+  an override equal to the file's `enabled` is deleted.
+- **Import (IDE)**: `flutterIntercept.importCollection` / `importCollection` → the IDE's open dialog. A file inside
+  the primary folder is linked where it is; one outside is copied to `.vscode/flutter-intercept/collections/<slug>.<ext>`
+  (`-2`, `-3` … never over a file) after a modal "Copy without credentials" / "Copy as it is". Then each unset URL
+  variable (≤ 5) is asked: the session's traffic origins in a QuickPick, else an input box (http/https URL). The
+  interactive flow doesn't pick an environment file (agents can pass one; the link can be edited). Ids: slug of the
+  collection's name (`info.name` / `info.title`), else of the file name, `-2` … when taken.
+- **Remove** (panel): a modal warning naming the collection and that the file is kept; cancel = nothing changes.
+- **ProxyHost** `setCollectionRules(rules)`: the proxy gets `[...shared, ...personal, ...collections]`; collection
+  rules are never in `getRules()`, the `rules` message or the snapshot.
+- **Controller**: `Status.collections` is present (`[]` when none is linked) whenever the service is wired; problems
+  of the `collections` entries themselves are appended to `Status.sharedRules.problems`. Pushed endpoints (§21.8
+  decision): only when the collection's endpoints differ from what was last sent for that id; a collection that
+  disappears stops being pushed; `ready` forgets every id.
+- **Agents**: `get_collection` `limit` 1–500 (default 100), `filter` on method / URL / name / folder;
+  `get_collection_example` `maxBodyChars` (default 20 000) through the same body view and redaction as `get_request`;
+  service errors "no such collection / request / example" → `not_found`, others `invalid`. MCP: `set_collection` is
+  destructive (unmatched `fail` fails traffic) and idempotent. The instructions gained two lines (cap 62).
+- **Bundle**: 2 661 548 bytes with everything wired (js-yaml ≈45 KB, the feature's own code ≈105 KB); js-yaml's
+  `exports` forbid requiring its loader alone, so its writer (≈10 KB) is bundled too. Budget 2 700 000 until PERF-3.
+
+
+### 21.15 Agent-friendly amendments (2026-11-19, before release)
+
+Owner direction: the tool is built for agents. Reading the §21.10 tools as an agent doing "run the app with no test
+server" found four frictions; these amendments replace the parts of §21.6, §21.7, §21.10 they contradict.
+
+**1. Changes are "for me" by default, not edits to the team's file.** Picking an example to test an error path must
+not leave a diff in a committed file that an agent (or a person) has to remember to undo.
+- `selected`, `off` and `unmatched` get a **personal overlay** in workspaceState (per workspace folder + collection
+  id), on top of the shared file's values, exactly like `enabled` (§21.6). Effective value = overlay if set, else the
+  file's.
+- `CollectionPatch` and `set_collection` gain `scope?: 'me' | 'team'` (default `'me'`). `'team'` writes the file
+  (today's behaviour); `variable` is always `'team'` (a URL is the same for everyone and holds no secret by
+  contract: environment files hold those). Agents need the `control` access level for both scopes, as today.
+- `reset: true` (with `scope: 'me'`) clears this user's overlay for the collection (every endpoint), or for one
+  endpoint with `endpoint`.
+- `CollectionStatus` gains `overrides: number` (personal overlay entries in effect) and `CollectionEndpointView`
+  gains `overridden?: true` (its `selected` / `off` come from the overlay). The panel shows "changed for you" with
+  **Reset** and **Save for the team** (= the same patch with `scope: 'team'`, then reset).
+- The import still writes the link to the team file (that is the point of importing).
+
+**2. Every exchange a collection answered says so, in agent views and the panel.**
+- `toRules` returns, next to the rules, `meta: Map<ruleId, { endpoint: string; example?: string; noExample?: true;
+  unmatched?: true }>` (endpoint = the key; `unmatched` for the `fail` rule).
+- Agent exchange views (`list_requests`, `get_request`, `wait_for_request`, …) add, when `matchedRuleId` is a
+  collection rule: `collection: { id, name, endpoint, example? , noExample?, unmatched? }`. One line, no lookup.
+- HAR / exports unchanged.
+
+**3. Name a request the way the agent knows it.** Wherever a tool takes `endpoint` (`get_collection_example`,
+`set_collection`), it also accepts `request: "<exchange id>"` instead: the endpoint that answered that exchange (from
+§2's meta), or — for an exchange that went to the real server — the collection endpoint whose rule matches its method
+and URL (tested with the proxy's own matcher against this collection's rules only). No match → a readable error
+naming the method and URL ("not in collection shop-api"). Exactly one of `endpoint` / `request`.
+
+**4. Show what the collection is missing.** `list_collections` (and `get_collection` for one id) adds, from the
+session's traffic to the collection's origins: `seen: { notInCollection: [{ method, path, count }], noExample:
+[{ endpoint, count }] }`, paths templated with `pathTemplate` (§9), at most 20 each, most frequent first, counts since
+the proxy started. The panel shows the same two lists in the collection's row ("3 requests not in the collection").
+
+**5. Instructions.** The agent instructions describe the loop in four lines: `import_collection` → set `baseUrl` if
+`unresolved` → `hot_restart` + `wait_for_request` (its `collection` field says which example answered) → error paths
+with `set_collection {request, example}` (for you only; `reset` when done). A 501 `noExample` → `add_mock` for that
+request (rules run before collections). `seen.notInCollection` → tell the user what the collection lacks.
+
+**6. Verification.** The agent suite (`FI_SUITE=agent`) gains a collection step on the demo app with its API host
+unreachable: import the fixture, set `baseUrl`, hot restart, wait for the login request and check its `collection`
+field, switch to "Wrong password" by `request`, check the next login gets 401, `reset`, check `seen.notInCollection`
+lists a request the fixture lacks, and that `.vscode/flutter-intercept.json` has no diff after the `'me'` changes.
+The release's real Claude Code run (`FI_SUITE=claude`) gets one task: "the backend is down; make the app's login
+screen show the wrong-password error".
+
+Owners: lead (toRules meta, host core overlay, agent tools, instructions, agent suite); W follow-up (overlay
+indicators, Reset / Save for the team, the two `seen` lists); I picks up the overlay through the shared core.
+
+### 21.16 REVIEW-15 #1 / #4 — "works at once, safely; full answers after one approval" (2026-11-19)
+
+Replaces §21.6 "No approval gate". Owner direction: keep the UX — importing must work at once, without a wall of
+prompts, and nothing a collection does may surprise the user.
+
+- **Limited until approved.** A collection rule whose answer has an approval reason of shared mocks
+  (`rules/policy.ts` `approvalReasons`: 3xx, `Location`, `Refresh`, CSP, `Set-Cookie`, `Access-Control-*`,
+  `X-Forwarded-*`, active content types / an untyped body starting with `<`) is **not held**: until the collection is
+  approved it answers a *limited* version — those headers removed, an active content type served as
+  `text/plain; charset=utf-8`, a 3xx sent with its status but without `Location` / `Refresh`. Plain JSON answers
+  (most collections) are never affected. So an import always gives working mocks, and nothing that can redirect the
+  app, set cookies, widen CORS or run HTML/JS happens without the user's yes.
+- **One approval per collection, not per rule.** Approval = workspaceState hash of (workspace folder, link id, the
+  collection file's content, the environment file's content, the link's `variables`). An edit, a git checkout or a
+  new `baseUrl` asks again; choosing examples, `off` and `unmatched` don't (they only pick among approved answers).
+  Only the user approves, through an IDE modal that lists what changes and where: "Shop API wants to: set cookies (2
+  answers), redirect (1 answer) on api.shop.example" — **Approve** / Not now. Agents can't approve (closes #4: a
+  collection an agent imports — e.g. built from `export_postman` — stays limited until the user says yes).
+- **Visible, not noisy.**
+  - `CollectionStatus.limited?: { reasons: string[]; answers: number }` (reasons deduplicated, plain words as above,
+    at most 5). The panel's collection row shows one line, "Some answers are limited until you approve: sets cookies,
+    redirects", with **Review & approve** (`approveCollection {id}` → the IDE modal). Nothing else changes in the
+    row; no banner, no notification on import.
+  - An exchange answered by a limited rule: `simulated` note "limited: Set-Cookie removed until the collection is
+    approved" (panel detail pane, one line), and in agent views `collection.limited: ["set-cookie", …]`.
+  - `list_collections` shows `limited`; the agent instructions say: tell the user to approve in the panel if a
+    limited answer matters.
+- New message (both `protocol.ts`): `{ type: 'approveCollection'; id: string }`.
+- Tests: each reason → the limited answer before approval, the full one after; edit / checkout / `baseUrl` change →
+  limited again; selection change → still approved; an agent path can't approve; plain JSON answers untouched.
+
+### 21.17 As built (host, §21.15 / §21.16 and REVIEW-15, 2026-11-19)
+- **Limited answers (§21.16)**: `src/mocks/limit.ts` `limitAnswer`. Instead of a `simulated` note (that would need a
+  proxy change), a limited answer carries the header `x-flutter-intercept: limited; removed=<names>` (a value the
+  collection sets for that header is replaced): the app's logs, the panel's headers and agents all see it. A 3xx keeps
+  its status (without `Location` / `Refresh` nothing follows it). Approvals: workspaceState
+  `flutterIntercept.collectionsApproved`, the last 5 hashes per collection (switching back to a branch is free).
+  `approveCollection` → `MockCollectionsHost.approveWithConfirmation` (IDE modal); hosts without it answer an error.
+- **Overlay (§21.15 #1)**: workspaceState `flutterIntercept.collectionsOverlay` →
+  `{ [folder\0id]: { selected?, off?: {key: boolean}, unmatched? } }` (`off: false` can turn on an endpoint the team
+  turned off). A `team` change also drops the same overlay entries. `reset` with `endpoint` clears that endpoint's
+  `selected` / `off`; `endpoint` is refused without `reset`. Removing a collection drops its overlay.
+- **Exchanges (§21.15 #2)**: every agent exchange view (`list_requests`, `get_request`, `wait_for_request`, …) gets
+  `collection` from `describeRule(matchedRuleId)`, with `limited` (header names) when the answer was limited.
+- **`request` (§21.15 #3)**: `example`, `off`, `get_collection_example` and `reset` accept `request`; exactly one of
+  `endpoint` / `request`. A key shown redacted to agents (REVIEW-15 #5) is accepted back and mapped to the real key
+  when exactly one endpoint has that redacted form.
+- **`seen` (§21.15 #4)**: from the last 5 000 exchanges, cached per finished exchange until the rules change;
+  `get_collection` returns it too. A request a rule of the user's answered is not counted.
+- **REVIEW-15 #4**: links (and environments) under `.dart_tool/` or `build/` are refused (gitignored in Flutter
+  projects, so the committed link would be broken for the team).
+- **REVIEW-15 #8**: a URL variable used in a server position must match `https?://host[:port][/path]` or
+  `host[:port]` (no userinfo). The "passed through without decryption" notice uses the learned hosts (`host:port`) and
+  `tlsPassthrough` entries by exact name (wildcard patterns are not expanded).
+- Agent instructions: the four §21.15 #5 lines (instructions budget 64 lines).
