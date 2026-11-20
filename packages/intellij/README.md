@@ -88,10 +88,29 @@ Settings → Tools → Flutter Intercept turns the automatic part off. Step by s
 
 ## Mock from a collection
 
-No test server? **Tools → Flutter Intercept → Mock from a Collection…** (or the Collections tab) links a Postman
-collection (v2.0 / v2.1) or an OpenAPI 3 document (JSON or YAML); the app's requests are answered from its saved
-examples. Pick which example answers, see what the collection lacks, and approve once before answers that redirect,
-set cookies or serve HTML are sent in full. Same behaviour as the VS Code extension.
+No test server? **Tools → Flutter Intercept → Mock from a Collection…** (or the **Collections** tab) links a Postman
+collection (v2.0 / v2.1), OpenAPI 3 or Swagger 2.0 document (JSON or YAML), Insomnia export (v4 JSON / v5 YAML) or a
+Bruno folder (`bruno.json`); the app's requests are answered from its saved examples (or schema-generated bodies for
+OpenAPI / Swagger). Same panel and behaviour as the VS Code extension:
+
+- **Collections that remember.** REST resources (`GET`/`POST /todos`, `GET`/`PUT`/`PATCH`/`DELETE /todos/:id`) are
+  found automatically and remember what the app sends in memory, while examples decide status, headers, fields and list
+  wrappers. Switch a collection row between **Requests** and **Data** to inspect, edit, add or delete records, click
+  **Reset data**, or use **Snapshots ▾** to save and load named scenarios in `.vscode/flutter-intercept/snapshots/`
+  (secrets blanked).
+- **Fake backend from traffic and out-of-date checks.** Click **Make a fake backend from this session** in the
+  **Collections** tab (or **Make a fake backend** on any recording) to build a sanitised, remembering collection from
+  real traffic (credentials removed, personal data replaced by default; review before committing). While running
+  against the real server, linked collections flag **Out of date** examples with a before/after preview before
+  **Update example**, **Add as a new example** or **Ignore**. The out-of-date check can be turned off in **Settings → Tools → Flutter Intercept** (**Compare real server JSON answers with linked collection examples**).
+- **Sign-in, body matching and made-up values.** Turn on **Sign-in** in **Data** on collections with a login request
+  (any login accepted, no password read or kept, expiring tokens, refresh, `401` without a token, **Sign everyone
+  out**). Examples with differing saved request bodies match automatically, and `{{$randomUUID}}` and friends fill in
+  at answer time (**New every time**, **Same every run** or **Fixed**).
+- **Team-safe defaults.** Pick which example answers (for you only until **Save for the team**), see what the
+  collection lacks, and approve once before answers that redirect, set cookies or serve HTML are sent in full.
+
+Step-by-step walkthroughs: [No test server](../extension/README.md#mock-your-app-from-a-postman-collection-or-openapi-file).
 
 ## Differences from VS Code
 

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.16.0 (preview)
+
+- **Collections that remember**, the same as in the VS Code extension 0.16.0: REST resources in a collection are found
+  automatically and remember what the app sends (`POST`, `GET`, `PUT`, `PATCH`, `DELETE`) in memory, while examples
+  decide status, headers, fields and list wrappers and ids keep their type. A chosen example still wins. Expand a
+  collection and switch to **Data** to inspect or edit records, **Reset data**, or save and load named repo snapshots
+  (**Snapshots ▾**, secrets blanked).
+- **A fake backend from your real traffic** and **Out-of-date collections**: click **Make a fake backend from this
+  session** (Collections tab) or **Make a fake backend** (Recordings tab) to turn real traffic into a working,
+  remembering collection (credentials removed, personal data replaced by default; review before committing). Linked
+  collections also flag **Out of date** examples against real server answers, with a before/after preview for
+  **Update example**, **Add as a new example** and **Ignore**. The out-of-date check can be turned off in **Settings → Tools → Flutter Intercept** (**Compare real server JSON answers with linked collection examples**).
+- **Sign-in that works**, **Examples chosen by the request body** and **Made-up values**: optional **Sign-in** switch
+  in **Data** (any login accepted, no password read or kept, expiring tokens, refresh, `401` without a token, **Sign
+  everyone out**); automatic example matching by request body; `{{$randomUUID}}` and friends (**New every time**,
+  **Same every run** or **Fixed**).
+- **More sources** and **Faster with big collections**: Swagger 2.0 (JSON or YAML), Insomnia (v4 JSON / v5 YAML) and
+  Bruno folders (`bruno.json`), plus indexed rule matching for large collections.
+- **Agents (MCP)**: `get_store`, `set_store`, `store_snapshot`, `mock_from_traffic`, `update_collection_example`
+  (returns the diff only — never writes the team file), and `expire_token` signs everyone out on a collection with
+  sign-in on.
+
 ## 0.15.0 (preview)
 
 - **Mock from a collection**, the same as in the VS Code extension 0.15.0: a Postman collection (v2.0 / v2.1, with an

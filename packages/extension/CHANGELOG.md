@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.16.0
+
+### Collections that remember
+
+- **Your collection now remembers what the app sends.** `POST` adds a record, `GET` lists and reads the current data,
+  `PUT` and `PATCH` change it, and `DELETE` removes it — all in memory while your app keeps calling its real URLs.
+- **Found automatically.** REST list and item routes (such as `/todos` and `/todos/:id`, including nested ones like
+  `/users/:userId/orders`) are detected from the collection and start from its saved examples (or generated bodies
+  when an OpenAPI file has no written example).
+- **Your examples stay in charge.** Examples decide the status code, headers, server-made fields on create, and list
+  wrappers (with total counts recomputed and paging, sorting and exact-match filters respected when the collection uses
+  them). IDs keep their type (integers stay integers, UUIDs stay UUIDs, strings stay strings) so Dart `fromJson`
+  doesn't break.
+- **A chosen example still wins.** Picking an example like "Wrong password" or a `404` still answers with that static
+  example; **Reset** brings remembered data back. Your own rules still run first.
+- **Data view and Reset data.** Expand a collection and switch between **Requests** and **Data** to see the remembered
+  records in a table or as JSON, filter them, edit, add or delete records, turn remembering on or off per resource, or
+  fix an id field (for you only until **Save for the team**). **Reset data** puts everything back to how it started.
+- **Snapshots to share a scenario.** **Snapshots ▾ → Save…** writes the current data to
+  `.vscode/flutter-intercept/snapshots/<collection>/<name>.json`, ready to commit for the team, with secret-looking
+  fields and token-like values blanked automatically. **Load ›** jumps straight to a snapshot, and a collection can
+  start from one instead of its examples.
+
+### A fake backend from your real traffic
+
+- **One click from a session or a recording.** Open **Collections → Make a fake backend from this session** (or
+  **More → Make a fake backend from this session**, **Flutter Intercept: Make a Fake Backend from This Session…**, or
+  **Recordings → Make a fake backend**) to turn what the real server answered into a working, remembering collection.
+- Pick which servers to include (your app's JSON APIs are preselected), name it, and choose whether unrecorded requests
+  fall back to the real server or fail as if offline.
+- **Sanitised by default.** Credentials, auth headers, cookies and signed URL tokens are always removed; personal data
+  (e-mails, phone numbers, addresses, coordinates) is replaced by default (with a switch in the dialog). Example bodies
+  still hold real data from the server — the file opens so you can review it before committing.
+
+### Out-of-date collections
+
+- While your app talks to the real server, Flutter Intercept compares real JSON answers against your linked
+  collections' examples (including collections turned off for you) and shows one quiet line when a collection is out of
+  date (new, removed, retyped or newly nullable fields, or a status with no example).
+- Click the **Out of date** line (or an endpoint's **out of date** badge) to see what changed, then choose **Update
+  example** (opens a diff preview and asks before editing the team file, or copies the updated JSON for YAML /
+  generated examples), **Add as a new example**, or **Ignore** until the server changes again. Turn off with
+  `flutterIntercept.collectionDrift`.
+
+### Sign-in that works
+
+- Collections with a login request gain an optional **Sign-in** switch in the **Data** view (off by default, so a
+  collection never starts rejecting requests on its own).
+- **Light simulation, never passwords.** Any login request is accepted — no password is ever read, stored or kept — and
+  answers with fresh tokens shaped like your login example (JWT-shaped when the example uses a JWT).
+- Tokens expire after a configurable lifetime (60–86 400 s, default 3 600 s); refresh requests trade a known refresh
+  token for a new pair, logout ends the session, and protected requests without a valid token answer `401`.
+- Choose whether only requests the collection marks or **all** (except login, signup, refresh and logout) need a token,
+  and click **Sign everyone out** to expire every access token at once while keeping refresh tokens so you can test
+  token refresh.
+
+### Examples chosen by the request body
+
+- When an endpoint has examples with different saved request bodies (Postman `originalRequest`, OpenAPI paired request
+  and response `examples`, or Bruno request bodies), Flutter Intercept picks the matching example automatically — for
+  instance returning **Wrong password** when the request sends that body.
+- The **Requests** view notes which request fields trigger each example; picking an example by hand still wins.
+
+### Made-up values
+
+- Dynamic placeholders in example bodies and headers (`{{$randomUUID}}`, `{{$guid}}`, `{{$isoTimestamp}}`,
+  `{{$randomEmail}}`, `{{$randomFullName}}`, `{{$randomInt}}` and friends) are filled in at answer time.
+- Pick per collection in **Data → Made-up values**: **New every time** (default in the IDE), **Same every run**
+  (reproducible for tests, default in the CLI), or **Fixed**.
+
+### More sources
+
+- **Swagger 2.0** (JSON or YAML), **Insomnia** (v4 JSON and v5 YAML, including embedded specs and mock routes) and
+  **Bruno** folders (pick `bruno.json`; watched for edits; scripts, tests, secret variables and `.env` are never read).
+  Each collection carries a badge for its source format.
+
+### Faster with big collections
+
+- Matching requests against collections uses a method, host and path index instead of scanning every rule one by one,
+  keeping non-matching requests fast even with thousands of endpoints.
+
+### Agents
+
+- New tools: `get_store`, `set_store`, `store_snapshot`, `mock_from_traffic` (supports `dryRun`) and
+  `update_collection_example` (returns the diff only — agents never change the team's collection file).
+- `expire_token` signs everyone out on a collection with sign-in turned on (expiring access tokens while keeping
+  refresh tokens) instead of adding a temporary 401 rule.
+- `list_collections` and `get_collection` report out-of-date findings (field paths and types only, never values).
+
+### Also
+
+- CLI: `--collection-snapshot`, `--no-collection-store`, `--collection-seed`, `--collection-dynamic`,
+  `--collection-auth`, `--collection-auth-ttl` and `--record-collection`,
+  plus Swagger 2.0, Insomnia and Bruno collections.
+- The Android Studio / IntelliJ plugin gets the same 0.16.0 collection features in the same panel.
+- The extension is about 287 KB larger (the remembered data, the new readers and the traffic tools).
+
 ## 0.15.0
 
 ### Mock from a collection — no test server needed

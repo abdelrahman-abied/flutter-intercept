@@ -40,7 +40,10 @@ Intercept skips all of that:
 | **Request and response details** | Headers and bodies, with gzip/deflate/br decoded, a collapsible JSON tree and image previews. |
 | **Breakpoints** | Pause a request before it's sent or a response before your app gets it. Edit it, then resume or abort. |
 | **Mock** | Answer a request with your own status, headers, body and delay, without calling the server. |
-| **Mock from a collection** | No test server? Point it at your Postman collection or OpenAPI 3 file (JSON or YAML) and requests are answered from the saved examples. Pick which example answers; your changes stay yours until you save them for the team. |
+| **Mock from a collection** | No test server? Point it at a Postman collection, OpenAPI 3 or Swagger 2.0 file (JSON or YAML), Insomnia (v4 / v5) or a Bruno folder (`bruno.json`) and requests are answered from saved examples, chosen by query or request body, with `{{$random…}}` made-up values. Pick which example answers; your changes stay yours until you save them for the team. |
+| **Collections that remember** | `POST` adds, `GET` lists and reads, `PUT` / `PATCH` change and `DELETE` removes — found automatically for REST resources. Inspect or edit records in **Data**, **Reset data**, or save named snapshots in the repo (secrets blanked) to share a scenario. |
+| **Fake backend from traffic** | One click turns a session or a recording into a working, remembering collection (credentials removed, personal data replaced by default). Real traffic is also checked against linked collections so out-of-date examples offer **Update example** with a diff preview. |
+| **Sign-in simulation** | Turn on **Sign-in** on a collection with a login request: any login is accepted (no password read or kept), fresh expiring tokens are issued, protected requests answer `401` without one, refresh and logout work, and **Sign everyone out** tests token refresh. |
 | **Block** | Fail a request with a connection reset or an error status. |
 | **One-click rules** | **Mock this**, **Block this** and **Break on this** on any recorded request. |
 | **Where did it come from?** | Each request shows the line of your code that made it. **Open source** jumps there. |

@@ -439,3 +439,99 @@ collection task $0.32: 200 from the collection, 404 after switching the example,
 - `verifyPlugin` needs network once to fetch the Plugin Verifier (`--offline` fails).
 Not verified: physical iPhone / Android device, Cursor and other editors for 0.15.
 
+
+## v0.16.0 — Stateful mocks: a fake backend that remembers (planned 2026-11-20)
+
+Owner request: after 0.15.0 the app's create → list flows still fail (a collection answers fixed examples). The
+collection's REST resources remember what the app sends. Owner decisions: resources detected automatically and
+editable; data in memory, seeded from the examples, Reset; optional named snapshots in the repo. Contract:
+docs/CONTRACTS.md §22 (the only proxy change is the `handler` action, §22.1).
+
+| WP | Owner area (disjoint files) | Contract | Depends on |
+|---|---|---|---|
+| WP0 (lead, done) | research (4 parallel agents, §22.12); CONTRACTS §22; types: proxy `types.ts` (`handler`, `HandlerRequest/Response`, `RequestHandler`, `setHandler` stub), `mocks/types.ts` (`SchemaHints`, `Resource`, `StoreLink`, `StoreSnapshot`, `STORE_LIMITS`), both `protocol.ts` (`StoreStatus`, `StorePatch`, messages), stubs in `ui/handlers.ts`, webview `host.ts` / `hostMsg.ts` / `rules.ts` / `ruleForm.ts` | §22 | — |
+| P — proxy | `packages/proxy/**` except `types.ts` / `index.ts` | §22.1 | WP0 |
+| S — store core | `extension/src/mocks/{resources,store,snapshot}.ts` (new), `mocks/openapi.ts` (`schemaHints`), their tests | §22.2–§22.5, §22.8 format | WP0 |
+| W — panel | `packages/webview/**` except `protocol.ts` | §22.10, §22.11 panel | WP0 |
+| H — host | `mocks/{core,toRules,service,link}.ts`, `rules/{core,file,service}.ts`, `proxyHost.ts`, `ui/{controller,handlers,validate}.ts`, `extension.ts` | §22.6, §22.7, §22.9 | P, S |
+| A — agents | `agent/**`, `package.json` (`languageModelTools`), `test/bundle/smoke.ts`, integration `suite/agent.ts`, `suite/claude.ts` | §22.11 agents | H |
+| C — CLI + plugin | `packages/cli/**`, `packages/sidecar/**`, `packages/intellij/**` | §22.11 CLI / plugin | H |
+| Lead | REVIEW-16 (independent), PERF-4, devices e2e, README tutorial, changelog, version | §22.13 | all |
+
+Scope change (owner, 2026-11-20): 0.16.0 also ships part 2 (Record → Mock, drift detection; CONTRACTS §23) and part 3
+(auth simulation, example by request body, dynamic values, Swagger 2.0 / Insomnia / Bruno, proxy index for big
+collections; CONTRACTS §24), plus the devices-suite fail-fast fix. Not planned: physical iPhones in CI (risk). Parts
+are built in order (they share `src/mocks/**`), released together: one REVIEW-16, one PERF-4, one device run.
+
+### v0.16.0 status (2026-11-20, in progress)
+- Done: WP0 (CONTRACTS §22), P (proxy `handler`, 610 proxy tests), S (detection, store, snapshots; extension 2416
+  tests at that point), W (panel Data view; webview 656 tests), T (device suite fails fast: `suite/deviceGuard.ts`,
+  bounded start / stop in `suite/helpers.ts`; the 8-hour hang was flutter's `simctl terminate` with no timeout behind
+  an awaited `stopDebugging`). Contracts for part 2 (§23) and part 3 (§24) written; auth simulation in its light form
+  only (owner decision).
+- Running: H (host), A (agents), C (CLI + sidecar), E (rule index + quiet fallback), D (Swagger 2 / Insomnia / Bruno
+  parsers), V (dynamic values, body match, light auth).
+- Next: wire part 3 into the host, build part 2 (after H), REVIEW-16, PERF-4, device run, README, changelog, version.
+
+### v0.16.0 — plan for what is left (2026-11-20)
+
+Built so far: part 1 complete (P, S, W, H, A, C, T); part 3 modules (V: dynamic values, body match, light auth; D:
+Swagger 2.0 / Insomnia / Bruno readers; E: proxy rule index + quiet fallback). Protocol types for parts 2 and 3 are
+in both `protocol.ts` copies. Steps below run in this order; steps in the same row group run in parallel (disjoint
+files).
+
+| # | Step | Owner area | Depends on | Done when |
+|---|---|---|---|---|
+| 1a | **R2** part 2 modules: `fromTraffic.ts`, `drift.ts`, `splice.ts` | new files in `extension/src/mocks` | — (running) | its unit tests; output parses through `parsePostman` |
+| 1b | **X3** part 3 host wiring: new sources load, answer pipeline (auth → query → body → store → default → dynamic → limit), settings, agent tools (`set_store.auth`, `expire_token`) | `extension/src/mocks/{core,toRules,service,link,limit,detect,parsers}.ts`, `ui/*`, `agent/**` | V, D, E (running) | extension unit tests, bundle smoke, sidecar + CLI tests |
+| 1c | **W23** panel for parts 2 and 3 | `packages/webview` | protocol types (running) | webview tests, drift test |
+| 1d | **E2** path trie in the rule index (same-host misses: 0.085 ms → target ≤ 0.01 ms at 2 500 rules) | `packages/proxy` | E | the property test (indexed = linear) extended to the trie; suite green in both modes; bench |
+| 2 | **X2** part 2 host wiring: `mockFromTraffic` (IDE dialogs, copy-in, link), drift tracker on real traffic, Update example (diff preview, hash check, splice), agent tools `mock_from_traffic`, `update_collection_example` (52 tools) | same host files as X3 | R2, X3 | unit tests; no secret or personal value in a generated file (planted-values test) |
+| 3 | **C23** CLI + sidecar + plugin for parts 2 and 3: `--record-collection`, `--collection-seed`, new formats, Bruno folder chooser, auth / drift through the shared core | `packages/cli`, `packages/sidecar`, `packages/intellij` | X2, X3 | CLI / sidecar tests; plugin tests (JBR 25) |
+| 4 | Demo app: `GET /todos` in the batch (so the suites see a list answered by the store), a login + refresh call for the auth check | `samples/demo_app` (lead) | — | `flutter analyze`, builds on Android / iOS / macOS |
+| 5a | **REVIEW-16** independent security review: `handler` action, store + snapshots, light auth, Record → Mock sanitising, Update example writes, the three new readers, agent outputs | read-only reviewer | 2, 3 | docs/REVIEW-16.md |
+| 5b | **PERF-4**: rule index + trie, store hit cost, drift per exchange, parsing the new formats, activation, final bundle budget (measured + 20 KB) | lead | 2, 3 | docs/PERF-4.md, `build.mjs` budget |
+| 6 | Fix every REVIEW-16 / PERF-4 finding (fix rounds per owner area) | per finding | 5 | "Fixes" table in REVIEW-16 |
+| 7 | Integration on the packaged VSIX: default suite, agent suite (v0.16.0 steps), devices (Android emulator, iOS simulator, macOS — with the fail-fast guard), `verifyPlugin`; screenshots of the new panel states (dark / light / high contrast) | lead | 6 | all green; evidence in the session scratchpad |
+| 8 | Real Claude Code run, 3 tasks (mock, collection, store) — **costs credit: ask the owner first** | lead | 7 | 3/3 |
+| 9 | README tutorials (remembered data, fake backend from a session, out-of-date collection, sign-in, new sources), changelogs (extension, plugin, CLI), ROADMAP / PLAN status, version 0.16.0 in every package | lead | 7 | docs review |
+| 10 | Commit (repo author, no attribution, `project.pbxproj` left out), then **ask the owner** before push and before publishing (VS Code Marketplace, JetBrains, Open VSX — owner tokens) | lead + owner | 8, 9 | — |
+
+Steps 3 and 4 have ready briefs for a second coding agent (local, not committed): the demo app can start at any
+time; step 3 only after steps 1b and 2. Security-sensitive steps (2, 5a, 6) and all verification stay with the lead.
+
+Out of 0.16.0: physical iPhones in CI (risk), auth that checks passwords (risk), Bruno OpenCollection YAML,
+sanitised copies of Swagger / Insomnia files from outside the project.
+Not verified by this plan: a physical iPhone / Android device, Cursor and other editors.
+
+- Step 4 done (2026-11-20, second coding agent, reviewed by the lead): the demo batch ends with `GET /todos`
+  (`DEMO_RESULT todos_list status=… count=…`), and `--dart-define=FI_DEMO_AUTH=1` adds a sign-in round (`auth_login`,
+  `auth_get`, `auth_refresh`, `auth_get2`; no token or password logged); panel buttons for both. `flutter analyze`: only
+  the 3 existing infos; 15 new Dart unit tests; `flutter build macos --debug` builds. No suite counts requests exactly,
+  so the extra `GET /todos` doesn't change existing checks.
+
+### v0.16.0 status (2026-11-20, before the verification run)
+- All parts built and wired (extension, webview, proxy, CLI, sidecar, plugin); REVIEW-16 15/15 fixed (docs/REVIEW-16.md
+  "Fixes"); PERF-4 done (docs/PERF-4.md; budget 2 990 000, measured 2 965 016); versions 0.16.0 (extension, CLI,
+  sidecar, plugin); README tutorials / changelogs drafted by the second coding agent and checked by the lead against
+  the code (CLI flags, plugin settings, size line; every internal anchor resolves).
+- Unit tests: extension ~2 830, proxy 637, webview 726, CLI 144, sidecar 72, plugin 113 (JBR 25) — all passing.
+- Running: default + agent suites on the packaged VSIX, devices (Android emulator, iOS 27 simulator, macOS) with the
+  fail-fast guard, real Claude Code (mock, collection, store), `verifyPlugin`.
+
+### v0.16.0 release verification (2026-11-20)
+On the packaged VSIX: default 42/42; agent 13/13 (incl. the v0.16.0 store step: the app's POST remembered, get_store,
+set_store, generate, shape, reset, snapshots, read-only; and the app's own `GET /todos` after emptying holds only the
+record it created next); devices — Android emulator and iOS 27 simulator every case, macOS 10/10 (run alone; in the
+combined run its screenshot case timed out on the VM service while the emulator and the simulator were still up —
+machine load, passed alone twice); real Claude Code 3/3 (mock $0.69, collection $0.38, store $0.38; the store task
+needed a rerun after the fix below); `verifyPlugin` Compatible with AI-262. Found and fixed during the runs:
+- `hot_restart` waited on Dart-Code with no limit (the real Claude store task hung 300 s on macOS): now 60 s with a
+  clear error (`launch.ts`, unit test).
+- The agent suite's v0.16.0 step resent a request the collection had answered (the tool refuses that by design):
+  it now reads the demo app's own `GET /todos`.
+- A REVIEW-16 #2 timing test (200 ms for 5 MB) failed once under load: bound 1 s (the quadratic version took 45 s).
+- The first combined run lost the network for a moment (`verifyPlugin`: "Network is unreachable"; iOS sources missing):
+  the rerun on a stable network passed.
+Screenshots: `media/screenshots/remembered-data-dark.png`, `out-of-date-dark.png` (README tutorials); the Collections
+tab's subtitle now names every source. Not verified: a physical iPhone / Android device, Cursor and other editors.

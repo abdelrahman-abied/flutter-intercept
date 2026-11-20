@@ -238,6 +238,46 @@ re-checked for this feature: do that before the README claims anything.)
 Not in 0.15.0: Swagger 2.0, `{{variables}}` and dynamic variables inside example bodies, choosing an example by the
 request body, `x-mock-response-name` headers, remote `$ref`s, Insomnia / Bruno / HAR as a source.
 
+### 0.16.0 — Stateful mocks: a fake backend that remembers (built 2026-11-20, CONTRACTS §22–§24, docs/REVIEW-16.md, docs/PERF-4.md)
+
+Owner request: an app that adds an item and then lists them never sees it with 0.15's fixed examples. The REST
+resources of a collection remember: `POST` adds, `GET` reads the current data, `PUT` / `PATCH` change, `DELETE`
+removes; seeded from the examples, Reset, named snapshots in the repo. No other tool builds stateful resources from a
+Postman collection or an OpenAPI document, or keeps the app calling its real host (§22.12).
+
+| Item | Notes |
+|---|---|
+| **Detection** | `/users` + `/users/:id` pairs, nested `/users/:id/orders`, id field and type, list wrappers like `{data: [...], total}`; editable (off, id field). |
+| **Semantics** | Examples first (status, headers, wrapper, server-made fields), defaults second: 201 on create, shallow PATCH, 204 DELETE, 404 / 409 / 415, ids keep their type (integers stay integers for Dart). |
+| **Scenarios** | A chosen example (e.g. 404) still wins; agents set data (`set_store {items: []}`, `generate`) and read it (`get_store`). |
+| **Snapshots** | `.vscode/flutter-intercept/snapshots/<collection>/<name>.json`, secrets blanked on save. |
+| **Everywhere** | Panel (Data tab), agents (3 tools), CLI (`--collection-snapshot`), Android Studio plugin. |
+
+### 0.16.0 (part 2) — From real traffic: a fake backend in one click, and a collection that stays true (planned 2026-11-20, CONTRACTS §23)
+
+Owner request (2026-11-20): "do all of these except the risky ones", all in **0.16.0**.
+
+| Item | Notes |
+|---|---|
+| **Record → Mock** | "Make a fake backend from this session": the captured traffic (or a recording) becomes a Postman collection in the repo with real examples (credentials removed like §21.6), linked and stateful (0.16) at once. For flaky or slow test servers and working offline. |
+| **Drift detection** | While the app talks to the real server, compare its answers with the collection's examples (shape, not values): one calm line "Shop API is out of date: GET /users/:id now has avatar" with Update example. Builds on 0.4's contract checks. |
+
+### 0.16.0 (part 3) — Login that works, more sources, big collections (planned 2026-11-20, CONTRACTS §24)
+
+| Item | Notes |
+|---|---|
+| **Auth simulation** | `POST /login` checks the store's users and returns a token; requests without it get 401; tokens expire after a chosen time (with 0.6's expire-token). |
+| **Example by request body** | e.g. a wrong password picks "Wrong password" automatically. |
+| **Dynamic values in examples** | `{{$randomUUID}}`, `{{$timestamp}}`, `{{$randomInt}}` and similar Postman dynamic variables. |
+| **More sources** | Swagger 2.0, Insomnia, Bruno. |
+| **Big collections** | Proxy index by method + origin (PERF-3 follow-up), so 2 000+ endpoints cost like 100. |
+
+**Not planned (risk):** physical iPhones in CI. It needs the LAN listener and device trust outside the editor, without
+a person approving each session — the security cost is higher than the benefit for now.
+
+**Test harness (0.16.0, part 1):** the devices suite fails fast when the app can't build or the simulator stops answering,
+instead of waiting 10 minutes per case.
+
 ## 5. Spikes and decisions before building
 - Dio's async stack depth for request → source (0.3).
 - `http_profile` over the VM service vs OS proxy for native clients (0.5).

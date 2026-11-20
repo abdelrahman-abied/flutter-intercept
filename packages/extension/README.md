@@ -38,15 +38,41 @@ and the traffic shows up.
 - Keyboard navigation and a resizable detail pane.
 
 **Mock from a collection — no test server needed**
-- Point Flutter Intercept at your team's Postman collection (v2.0 / v2.1) or OpenAPI 3 document (JSON or YAML): every
-  request in it is answered from its saved examples, while the app keeps calling its real URLs. OpenAPI operations
-  without an example get a body generated from the schema.
-- Pick which example answers (an error case, for instance). What you change stays on your computer until you choose
+- Point Flutter Intercept at your team's Postman collection (v2.0 / v2.1), OpenAPI 3 or Swagger 2.0 document (JSON or
+  YAML), Insomnia export (v4 JSON / v5 YAML) or Bruno folder (`bruno.json`): every request in it is answered from its
+  saved examples, while the app keeps calling its real URLs. OpenAPI and Swagger operations without an example get a
+  body generated from the schema.
+- Pick which example answers (an error case, for instance), or let examples with different saved request bodies match
+  automatically (for example **Wrong password**). Postman `{{$random…}}` placeholders fill in made-up values at answer
+  time (**New every time**, **Same every run** or **Fixed**). What you change stays on your computer until you choose
   **Save for the team**; the link itself lives in `.vscode/flutter-intercept.json`.
 - A request with no example answers 501 with **Mock it with a rule**; the Collections tab lists the requests your app
   sent that the collection doesn't have.
 - Answers that would redirect, set cookies or serve HTML are sent without those parts until you approve the
   collection once. Your own rules always run first.
+
+**Collections that remember**
+- REST resources in a collection (`GET`/`POST /todos`, `GET`/`PUT`/`PATCH`/`DELETE /todos/:id`, including nested
+  resources) are found automatically and remember what your app sends in memory. `POST` adds a record, `GET` lists and
+  reads the current data, `PUT` / `PATCH` change it and `DELETE` removes it; examples decide the status, headers,
+  fields and list wrapper, and ids keep their type. A chosen example still wins.
+- Switch an expanded collection row from **Requests** to **Data** to inspect, filter, edit, add or delete records,
+  click **Reset data**, or save and load named snapshots in `.vscode/flutter-intercept/snapshots/` (secrets blanked)
+  to share a scenario with the team.
+
+**Fake backend from traffic & out-of-date collections**
+- One click (**Make a fake backend from this session** in **Collections**, or **Make a fake backend** on any
+  recording) turns real traffic into a working, remembering collection: credentials are always removed and personal
+  data is replaced by default (review the file before committing).
+- While running against the real server, linked collections (even ones turned off for you) flag **Out of date**
+  examples when the server adds, removes or changes fields or returns a new status — with **Update example** (diff
+  preview before saving), **Add as a new example** and **Ignore**.
+
+**Sign-in simulation**
+- Collections with a login request gain an optional **Sign-in** switch in **Data** (off by default). Any login is
+  accepted — no password is ever read, stored or kept — and returns fresh expiring tokens (JWT-shaped when your example
+  uses a JWT). Protected requests answer `401` without a valid token, refresh and logout work, and **Sign everyone
+  out** expires access tokens while keeping refresh tokens so you can test token refresh.
 
 ![Collections tab: a Postman collection with its requests, the example that answers each, and what it lacks](media/screenshots/collections-dark.png)
 
@@ -192,8 +218,8 @@ and the traffic shows up.
 - `Intercept: on/off` toggles interception for new sessions. It shows `· LAN` while an iPhone session runs.
 - A pause counter appears while exchanges are waiting at a breakpoint.
 
-The panel has four tabs: **Traffic**, **Rules**, **Recordings** and **Auth**. It follows your VS Code theme: light,
-dark and high contrast.
+The panel has five tabs: **Traffic**, **Rules**, **Collections**, **Recordings** and **Auth**. It follows your VS Code
+theme: light, dark and high contrast.
 
 ![Traffic panel in a light theme](media/screenshots/traffic-light.png)
 
@@ -300,13 +326,18 @@ Cursor, Windsurf, and any client that speaks MCP (Model Context Protocol).
 | Add CORS headers to a real API while developing (Flutter Web) | `add_cors_rule` |
 | Save, list, replay or compare traffic recordings | `save_recording`, `list_recordings`, `replay_recording`, `diff_recordings` |
 | Answer successive requests differently (fail twice, then succeed) | `add_sequence` |
-| Make the next requests get 401, and read the token refresh flows | `expire_token`, `get_auth_flows` |
+| Make the next requests get 401 (or sign everyone out on a collection with sign-in on), and read the token refresh flows | `expire_token`, `get_auth_flows` |
 | Send matching requests and gRPC calls to a local server (agents: local targets only) | `add_map_remote` |
 | Change headers, status or body text of real requests and responses (gRPC: metadata and trailers) | `add_rewrite` |
 | Write the traffic as an OpenAPI 3.1 file or a Postman collection | `export_openapi`, `export_postman` |
 | Take a screenshot of the running app, with the requests just before it (asks you first) | `take_screenshot` |
 | Answer a gRPC method with messages (JSON) and a status | `add_grpc_mock` |
 | Read the app's gRPC methods and message types, with example JSON | `get_grpc_schema` |
+| List linked collections, inspect endpoints and examples, import a collection or change settings (for you) | `list_collections`, `get_collection`, `get_collection_example`, `import_collection`, `set_collection` |
+| Read, edit, generate or reset a collection's remembered data, and control sign-in or made-up values | `get_store`, `set_store` |
+| Save, load or delete a named data snapshot for a collection | `store_snapshot` |
+| Build a fake backend collection from this session or a saved recording | `mock_from_traffic` |
+| Preview the diff to update an out-of-date collection example (never writes the file) | `update_collection_example` |
 
 Over MCP there are also resources (`intercept://exchange/{id}`, `intercept://paused`, `intercept://rules`,
 `intercept://contract/{id}`) and prompts (`debug-failing-request`, `test-error-states`, `verify-change`,
@@ -386,6 +417,8 @@ Running the command again updates it in place, and the rest of the file is left 
 - "Mock the feed endpoint with a 10-second delay and check the loading state."
 - "Pause the next checkout request, change the quantity to 3, and resume it."
 - "The backend is down: mock the app from our Postman collection and show the wrong-password error."
+- "The backend is down: show an empty todo list."
+- "Make a fake backend from what the app just did."
 
 ## Flutter Web
 
@@ -418,109 +451,116 @@ endpoints.
 **No test server**
 
 4. [Mock your app from a Postman collection or OpenAPI file](#mock-your-app-from-a-postman-collection-or-openapi-file)
+5. [Make your mock remember what the app sends](#make-your-mock-remember-what-the-app-sends)
+6. [Save and share a data scenario](#save-and-share-a-data-scenario)
+7. [Make a fake backend from a session](#make-a-fake-backend-from-a-session)
+8. [Keep a collection up to date](#keep-a-collection-up-to-date)
+9. [Test sign-in and token refresh without a server](#test-sign-in-and-token-refresh-without-a-server)
+10. [Answer differently by request body](#answer-differently-by-request-body)
+11. [Use Swagger 2.0, Insomnia or Bruno files](#use-swagger-20-insomnia-or-bruno-files)
 
 **Change what your app sends and receives**
 
-5. [Pause and edit a request or response](#pause-and-edit-a-request-or-response)
-6. [Mock a response](#mock-a-response)
-7. [Block a request](#block-a-request)
-8. [Organize your rules](#organize-your-rules)
-9. [Make a rule remove itself](#make-a-rule-remove-itself)
+12. [Pause and edit a request or response](#pause-and-edit-a-request-or-response)
+13. [Mock a response](#mock-a-response)
+14. [Block a request](#block-a-request)
+15. [Organize your rules](#organize-your-rules)
+16. [Make a rule remove itself](#make-a-rule-remove-itself)
 
 **Debug a request**
 
-10. [Jump from a request to the code that sent it](#jump-from-a-request-to-the-code-that-sent-it)
-11. [Copy a request as cURL, Dart or Dio](#copy-a-request-as-curl-dart-or-dio)
-12. [Resend a request, or edit it and resend](#resend-a-request-or-edit-it-and-resend)
+17. [Jump from a request to the code that sent it](#jump-from-a-request-to-the-code-that-sent-it)
+18. [Copy a request as cURL, Dart or Dio](#copy-a-request-as-curl-dart-or-dio)
+19. [Resend a request, or edit it and resend](#resend-a-request-or-edit-it-and-resend)
 
 **Bad networks**
 
-13. [Simulate a slow, flaky or offline network](#simulate-a-slow-flaky-or-offline-network)
-14. [Slow down or break a single endpoint](#slow-down-or-break-a-single-endpoint)
+20. [Simulate a slow, flaky or offline network](#simulate-a-slow-flaky-or-offline-network)
+21. [Slow down or break a single endpoint](#slow-down-or-break-a-single-endpoint)
 
 **Your models vs the real API**
 
-15. [Check responses against your models](#check-responses-against-your-models)
-16. [Break a field on purpose](#break-a-field-on-purpose)
-17. [Generate a Dart model from traffic](#generate-a-dart-model-from-traffic)
-18. [Generate a fixture test](#generate-a-fixture-test)
+22. [Check responses against your models](#check-responses-against-your-models)
+23. [Break a field on purpose](#break-a-field-on-purpose)
+24. [Generate a Dart model from traffic](#generate-a-dart-model-from-traffic)
+25. [Generate a fixture test](#generate-a-fixture-test)
 
 **Web, sockets and GraphQL**
 
-19. [Run a Flutter Web app in Chrome](#run-a-flutter-web-app-in-chrome)
-20. [Get past CORS errors while you develop](#get-past-cors-errors-while-you-develop)
-21. [Watch WebSocket messages and SSE events](#watch-websocket-messages-and-sse-events)
-22. [Work with GraphQL operations](#work-with-graphql-operations)
-23. [See requests from native clients and background isolates](#see-requests-from-native-clients-and-background-isolates)
+26. [Run a Flutter Web app in Chrome](#run-a-flutter-web-app-in-chrome)
+27. [Get past CORS errors while you develop](#get-past-cors-errors-while-you-develop)
+28. [Watch WebSocket messages and SSE events](#watch-websocket-messages-and-sse-events)
+29. [Work with GraphQL operations](#work-with-graphql-operations)
+30. [See requests from native clients and background isolates](#see-requests-from-native-clients-and-background-isolates)
 
 **Team rules and scenarios**
 
-24. [Share rules with your team](#share-rules-with-your-team)
-25. [Approve rules that came from the repo](#approve-rules-that-came-from-the-repo)
-26. [Keep a mock body in a file](#keep-a-mock-body-in-a-file)
-27. [Answer successive requests differently](#answer-successive-requests-differently)
-28. [Test token refresh with Expire token](#test-token-refresh-with-expire-token)
+31. [Share rules with your team](#share-rules-with-your-team)
+32. [Approve rules that came from the repo](#approve-rules-that-came-from-the-repo)
+33. [Keep a mock body in a file](#keep-a-mock-body-in-a-file)
+34. [Answer successive requests differently](#answer-successive-requests-differently)
+35. [Test token refresh with Expire token](#test-token-refresh-with-expire-token)
 
 **Record, replay and reroute**
 
-29. [Record traffic and replay it](#record-traffic-and-replay-it)
-30. [Compare two recordings](#compare-two-recordings)
-31. [Send requests to another server](#send-requests-to-another-server)
-32. [Change headers, status or body text](#change-headers-status-or-body-text)
-33. [Chain to Charles, Burp or a corporate proxy](#chain-to-charles-burp-or-a-corporate-proxy)
+36. [Record traffic and replay it](#record-traffic-and-replay-it)
+37. [Compare two recordings](#compare-two-recordings)
+38. [Send requests to another server](#send-requests-to-another-server)
+39. [Change headers, status or body text](#change-headers-status-or-body-text)
+40. [Chain to Charles, Burp or a corporate proxy](#chain-to-charles-burp-or-a-corporate-proxy)
 
 **Timing, scripts, exports and CI**
 
-34. [Open the traffic view in its own window](#open-the-traffic-view-in-its-own-window)
-35. [See where a request's time went](#see-where-a-requests-time-went)
-36. [Change requests and responses with a script](#change-requests-and-responses-with-a-script)
-37. [Export traffic as OpenAPI or Postman](#export-traffic-as-openapi-or-postman)
-38. [Get notified when requests fail](#get-notified-when-requests-fail)
-39. [Run integration tests through Flutter Intercept in CI](#run-integration-tests-through-flutter-intercept-in-ci)
+41. [Open the traffic view in its own window](#open-the-traffic-view-in-its-own-window)
+42. [See where a request's time went](#see-where-a-requests-time-went)
+43. [Change requests and responses with a script](#change-requests-and-responses-with-a-script)
+44. [Export traffic as OpenAPI or Postman](#export-traffic-as-openapi-or-postman)
+45. [Get notified when requests fail](#get-notified-when-requests-fail)
+46. [Run integration tests through Flutter Intercept in CI](#run-integration-tests-through-flutter-intercept-in-ci)
 
 **Pinned hosts, certificates and native clients**
 
-40. [Let pinned hosts through without decryption](#let-pinned-hosts-through-without-decryption)
-41. [Apps with their own certificate (mTLS)](#apps-with-their-own-certificate-mtls)
-42. [Route native clients on an Android emulator](#route-native-clients-on-an-android-emulator)
-43. [Find requests that bypass the proxy](#find-requests-that-bypass-the-proxy)
+47. [Let pinned hosts through without decryption](#let-pinned-hosts-through-without-decryption)
+48. [Apps with their own certificate (mTLS)](#apps-with-their-own-certificate-mtls)
+49. [Route native clients on an Android emulator](#route-native-clients-on-an-android-emulator)
+50. [Find requests that bypass the proxy](#find-requests-that-bypass-the-proxy)
 
 **gRPC**
 
-44. [See gRPC calls and their messages](#see-grpc-calls-and-their-messages)
-45. [Mock a gRPC call](#mock-a-grpc-call)
-46. [Pause and edit gRPC messages](#pause-and-edit-grpc-messages)
-47. [Change fields in gRPC responses](#change-fields-in-grpc-responses)
-48. [Record, replay and compare gRPC calls](#record-replay-and-compare-grpc-calls)
-49. [Read gRPC messages with .proto files](#read-grpc-messages-with-proto-files)
-50. [Fail, slow down or block gRPC calls](#fail-slow-down-or-block-grpc-calls)
-51. [See inside gRPC over TLS](#see-inside-grpc-over-tls)
-52. [Change gRPC metadata and trailers](#change-grpc-metadata-and-trailers)
-53. [Change gRPC calls with a script](#change-grpc-calls-with-a-script)
-54. [Send gRPC calls to another server](#send-grpc-calls-to-another-server)
-55. [Resend a gRPC call, or edit it and resend](#resend-a-grpc-call-or-edit-it-and-resend)
-56. [See gRPC-Web calls from Flutter Web](#see-grpc-web-calls-from-flutter-web)
-57. [Copy a gRPC call as grpcurl](#copy-a-grpc-call-as-grpcurl)
-58. [See TLS gRPC on the iOS simulator](#see-tls-grpc-on-the-ios-simulator)
+51. [See gRPC calls and their messages](#see-grpc-calls-and-their-messages)
+52. [Mock a gRPC call](#mock-a-grpc-call)
+53. [Pause and edit gRPC messages](#pause-and-edit-grpc-messages)
+54. [Change fields in gRPC responses](#change-fields-in-grpc-responses)
+55. [Record, replay and compare gRPC calls](#record-replay-and-compare-grpc-calls)
+56. [Read gRPC messages with .proto files](#read-grpc-messages-with-proto-files)
+57. [Fail, slow down or block gRPC calls](#fail-slow-down-or-block-grpc-calls)
+58. [See inside gRPC over TLS](#see-inside-grpc-over-tls)
+59. [Change gRPC metadata and trailers](#change-grpc-metadata-and-trailers)
+60. [Change gRPC calls with a script](#change-grpc-calls-with-a-script)
+61. [Send gRPC calls to another server](#send-grpc-calls-to-another-server)
+62. [Resend a gRPC call, or edit it and resend](#resend-a-grpc-call-or-edit-it-and-resend)
+63. [See gRPC-Web calls from Flutter Web](#see-grpc-web-calls-from-flutter-web)
+64. [Copy a gRPC call as grpcurl](#copy-a-grpc-call-as-grpcurl)
+65. [See TLS gRPC on the iOS simulator](#see-tls-grpc-on-the-ios-simulator)
 
 **Devices**
 
-59. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
-60. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
-61. [Run on a physical iPhone](#run-on-a-physical-iphone)
-62. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
+66. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
+67. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
+68. [Run on a physical iPhone](#run-on-a-physical-iphone)
+69. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
 
 **AI agents**
 
-63. [Connect an AI agent](#connect-an-ai-agent)
-64. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
-65. [Control what agents can see and do](#control-what-agents-can-see-and-do)
-66. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
-67. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
-68. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
-69. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
-70. [Let agents work with gRPC calls](#let-agents-work-with-grpc-calls)
-71. [Let agents mock from a collection](#let-agents-mock-from-a-collection)
+70. [Connect an AI agent](#connect-an-ai-agent)
+71. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
+72. [Control what agents can see and do](#control-what-agents-can-see-and-do)
+73. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
+74. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
+75. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
+76. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
+77. [Let agents work with gRPC calls](#let-agents-work-with-grpc-calls)
+78. [Let agents mock from a collection](#let-agents-mock-from-a-collection)
 
 ### Run your app with interception
 
@@ -595,6 +635,151 @@ collection's row. A request with no saved example answers 501 and offers **Mock 
 settings back. If a line says some answers are limited, click **Review & approve**: until then, answers that would
 redirect, set cookies or serve HTML are sent without those parts. OpenAPI documents work the same way; operations
 without an example answer a body generated from the schema (marked **generated**).
+
+### Make your mock remember what the app sends
+
+![Data in the Collections tab: what the app created, the remembered resources, sign-in and made-up values](media/screenshots/remembered-data-dark.png)
+
+You'll create, edit and delete items in your app and see the collection remember them, with no backend running.
+
+1. Link a collection that has list and item routes (for example `GET /todos`, `POST /todos`, `GET /todos/:id`,
+   `PATCH /todos/:id`, `DELETE /todos/:id`), as in
+   [Mock your app from a Postman collection or OpenAPI file](#mock-your-app-from-a-postman-collection-or-openapi-file).
+2. Expand the collection in the **Collections** tab. A line shows what it remembers, for example
+   `Remembers what the app sends: todos 2`.
+3. Run your app and create, edit or delete an item. Switch the expanded row from **Requests** to **Data** and click a
+   resource name (such as `todos`) to see the live table.
+4. Click **Edit**, **Delete** or **Add** to change records as JSON, or switch to **JSON** view. Click **Reset data** to
+   put everything back to the starting examples.
+
+**You should see:** `POST` adds a record with an id matching your example's type (integer, UUID or string), the next
+`GET` includes it, and each request detail reads `Answered by collection "…" · created todos 3`.
+
+**Tip:** picking a specific example under **Requests** (such as a `404` or `500`) still wins over remembered data until
+you click **Reset**. Under **Data**, you can untick **remembers** for one resource or fix its **id field** (for you
+only until **Save for the team**). Remembered data lives in memory and resets when the proxy stops.
+
+### Save and share a data scenario
+
+You'll save the collection's current remembered data as a named snapshot file your whole team can reuse.
+
+1. Put the collection's remembered data into the state you want — by using the app or by editing records under **Data**
+   (for example an empty cart or a full checkout).
+2. In the collection's expanded row, open **Snapshots ▾** and click **Save…**.
+3. Type a short name (lower-case letters, digits or `-`, such as `checkout`) and press Enter.
+4. Later, open **Snapshots ▾ → Load › checkout** to jump back to that data, or **Delete › checkout…** to remove the
+   file.
+
+**You should see:** a new file at `.vscode/flutter-intercept/snapshots/<collection>/checkout.json`, ready to commit
+with your project. Secret-looking fields and token-like values are blanked automatically.
+
+**Tip:** to make a collection start from a saved snapshot instead of its examples, ask an agent (`set_store` with
+`startsFrom`) or set `"snapshot": "checkout"` under `"stores"` in `.vscode/flutter-intercept.json`; clicking **Start
+from the examples** switches back for you. In CI, pass `--collection-snapshot checkout`.
+
+### Make a fake backend from a session
+
+You'll turn a single run against the real server into a working fake backend you can use offline.
+
+1. Run your app against the real server and walk through the screens you want to work on.
+2. Open the **Collections** tab and click **Make a fake backend from this session** (if you already have collections,
+   open **More → Make a fake backend from this session**, or run **Flutter Intercept: Make a Fake Backend from This
+   Session…**).
+3. Tick the servers to include (your app's JSON APIs are preselected; third-party services are unticked), name the
+   collection, and choose **Replace e-mails, phone numbers and addresses** (recommended) or **Keep them as recorded**.
+4. Choose **Fall back to the real server** or **Offline: fail what wasn't recorded**.
+
+**You should see:** a new collection file under `.vscode/flutter-intercept/collections/` opens for review, it is linked
+in `.vscode/flutter-intercept.json`, and a line reports how many requests it answers and which resources it remembers
+(for example `api.example.com (recorded) answers 23 requests · remembers users, orders`).
+
+**Tip:** credentials, auth headers, cookies and signed URL tokens are always removed and personal data is replaced by
+default, but other fields in example bodies are real data from the server — review the file before committing it. You
+can build one from any saved recording too (**Recordings → Make a fake backend**).
+
+### Keep a collection up to date
+
+![Out of date: the real server's answer has a new field, a changed type and a field that is gone](media/screenshots/out-of-date-dark.png)
+
+You'll spot when the real server's answers no longer match your collection's examples and update the file safely.
+
+1. Run your app against the real server with your collection linked (this works even when the collection is turned
+   **Off (for me)**).
+2. After the server answers a route differently several times (added, removed, retyped or newly nullable fields, or a
+   status the endpoint has no example for), open the **Collections** tab.
+3. Click the **Out of date: …** line on the collection (or the **out of date** badge on an endpoint under **Requests**)
+   to see which fields changed.
+4. Click **Update example** to open a side-by-side diff of the team's file and confirm (or open **▾ → Add as a new
+   example** to keep the old one; for a new status, **Add as a new example** is the main button). Click **Ignore** to
+   hide a difference until the server changes again.
+
+**You should see:** only that example updated in the collection file (for Postman and OpenAPI JSON), with credentials
+removed from the server's values and the rest of the file untouched.
+
+**Tip:** OpenAPI YAML files and generated examples aren't edited automatically — **Update example** offers **Copy the
+updated example** so you can paste it yourself. Turn these checks off with `flutterIntercept.collectionDrift`.
+
+### Test sign-in and token refresh without a server
+
+You'll make login issue fresh expiring tokens, block unauthenticated requests with `401`, and test your app's refresh
+flow offline.
+
+1. Link a collection that includes a login request (for example `POST /auth/login`; refresh and logout routes such as
+   `POST /auth/refresh` and `POST /auth/logout` are picked up automatically).
+2. Expand the collection, switch to **Data**, and turn on **Sign-in: off — any login is accepted when on**.
+3. Optionally change **tokens last … s** (60–86 400 seconds) and choose whether **those the collection marks** or
+   **all** requests require a token.
+4. Run your app: protected requests without a valid `Authorization: Bearer` token get `401`, signing in returns a fresh
+   token (JWT-shaped when your login example uses a JWT), and authenticated requests succeed.
+5. Click **Sign everyone out** to expire every access token while keeping refresh tokens valid, then trigger another
+   request in your app.
+
+**You should see:** request details note `needs sign-in (no token)`, `signed in`, `token expired` or `token refreshed`,
+the **Auth** tab shows the 401 → refresh → retry timeline, and **Signed in: N sessions** updates live.
+
+**Tip:** no password is ever read, stored or checked — any login succeeds unless an
+[example chosen by request body](#answer-differently-by-request-body) (such as **Wrong password**) matches first.
+Sign-in stays active even if you turn remembered data off for yourself.
+
+### Answer differently by request body
+
+You'll have one endpoint return different examples based on what your app sends in the request body, without switching
+examples by hand.
+
+1. Save two or more examples on an endpoint whose saved request bodies differ — for example a Postman `POST /login`
+   request with a default **OK** example and a **Wrong password** example whose saved request body has a different
+   value (OpenAPI paired `requestBody` and response `examples`, and Bruno request bodies, work the same way).
+2. Link the collection and expand it under **Requests**. A line under the endpoint shows which request fields trigger
+   each example (for example `“Wrong password” answers when the request's email matches`).
+3. Send a request from your app whose JSON or form-encoded body matches those fields.
+
+**You should see:** Flutter Intercept answers with the matching example automatically, and falls back to the default
+example (or remembered data) when none matches.
+
+**Tip:** picking an example in the dropdown for yourself overrides body matching until you click **Reset**. Examples
+whose only differing fields are blank secret fields or `{{variables}}` aren't matched by body (a note on the collection
+says why). Example bodies and headers can also use Postman placeholders such as `{{$randomUUID}}`, `{{$isoTimestamp}}`
+and `{{$randomEmail}}` — choose **New every time**, **Same every run** or **Fixed** under **Data → Made-up values**.
+
+### Use Swagger 2.0, Insomnia or Bruno files
+
+You'll mock your app from a Swagger 2.0 file, an Insomnia export or a Bruno folder the same way as Postman or OpenAPI 3.
+
+1. Keep your Swagger 2.0 file (JSON or YAML), Insomnia export (v4 JSON or v5 YAML) or Bruno folder inside your Flutter
+   project.
+2. Open the **Collections** tab and click **Mock from a collection…** (or run **Flutter Intercept: Mock from a
+   Collection…**).
+3. Choose the Swagger or Insomnia file, or choose `bruno.json` inside the Bruno folder.
+4. If an Insomnia or Bruno collection defines environments, pick the environment that holds your server URLs when
+   prompted (only its URL variables are used; values aren't shown).
+
+**You should see:** the collection listed with a **Swagger 2.0**, **Insomnia** or **Bruno** badge, its requests
+answered from saved examples (or schema-generated bodies for Swagger 2.0), and REST resources remembering what the app
+sends.
+
+**Tip:** Swagger 2.0 files, Insomnia files and Bruno folders must already be inside the project (they aren't copied in
+from outside). Bruno scripts, tests, secret variables (`vars:secret`) and `.env` files are never read, and edits inside
+the Bruno folder reload automatically. Insomnia Nunjucks tags (`{% ... %}`) are never evaluated.
 
 ### Pause and edit a request or response
 
@@ -1926,24 +2111,35 @@ and whether every TLS gRPC call is decrypted); no agent tool can add or remove t
 
 ### Let agents mock from a collection
 
-You'll have an agent run your app against a collection when the backend is down, and test error screens with it.
+You'll have an agent run your app against a collection, shape its remembered data, test sign-in or build a fake backend
+from recorded traffic.
 
 1. [Connect your agent](#connect-an-ai-agent), then run **Flutter Intercept: Add AI Agent Instructions** again to
    pick up the collection tools.
 2. Ask, for example:
    - "The backend is down: mock the app from `api/shop.postman_collection.json` and launch it." (`import_collection`,
      `set_collection` with `variable` for `baseUrl`, `launch_app`)
+   - "The backend is down: show an empty todo list." (`set_store` with `items: []`, `hot_restart`)
+   - "Put 50 todos in the mock, save that as a snapshot named `long-list`, and check scrolling." (`set_store` with
+     `generate`, `store_snapshot` with `save`)
+   - "Make a fake backend from what the app just did." (`mock_from_traffic`)
    - "Show the wrong-password error on the login screen." (`set_collection` with `request` and `example`, then
      `hot_restart`)
-   - "Which requests did the app send that the collection doesn't have?" (`list_collections`, `seen`)
-   - "Undo what you changed in the collection." (`set_collection` with `reset`)
+   - "Turn sign-in on for the shop collection, expire everyone's token, and check that the app refreshes it."
+     (`set_store` with `auth: {enabled: true}`, `expire_token`, `get_auth_flows`)
+   - "Which requests did the app send that the collection doesn't have, and are any examples out of date?"
+     (`list_collections`, `update_collection_example`)
+   - "Undo what you changed in the collection and reset its data." (`set_collection` with `reset`, `set_store` with
+     `reset: "data"`)
 3. Approve the changes when the client asks.
 
-**You should see:** each request the agent waits for names the collection and example that answered it, and no
-change in `.vscode/flutter-intercept.json` apart from the link and `baseUrl`.
+**You should see:** each request the agent waits for names the collection, example or remembered-data change that
+answered it; `get_store` reads remembered records with secrets redacted; and `.vscode/flutter-intercept.json` stays
+untouched apart from links and variables you approve.
 
-**Tip:** an agent's changes are for you only, like yours in the panel. Agents can't approve a collection: if a line
-says some answers are limited, approve it yourself in the Collections tab.
+**Tip:** an agent's settings changes are for you only, like yours in the panel. Agents can't approve a collection, and
+agents never edit the team's collection file directly — `update_collection_example` only previews the diff so you can
+apply it with **Update example** in the Collections tab.
 
 ## Settings and commands
 
@@ -1960,6 +2156,7 @@ says some answers are limited, approve it yourself in the Collections tab.
 | `flutterIntercept.backgroundIsolates` | `intercept` | Requests from background isolates (`compute`, `Isolate.run`, `Isolate.spawn`) go through Flutter Intercept too, in debug sessions. `warn` only tells you about them. |
 | `flutterIntercept.notifications` | `errors` | Notify when the app's requests fail while the panel is hidden: `errors` (network errors, 5xx), `all` (also 4xx) or `off`. |
 | `flutterIntercept.contractCheck` | `true` | Check JSON responses against your json_serializable / freezed models and show fields that would make `fromJson` throw. |
+| `flutterIntercept.collectionDrift` | `true` | Compare the real server's JSON answers with the examples of linked collections (including ones turned off for you) and flag out-of-date examples. Only field names and types are kept, never values. |
 | `flutterIntercept.rewriteLocalhost` | `true` | Requests to `10.0.2.2` / `10.0.3.2` (the emulator's names for your Mac) go to your Mac's `localhost`. Never applies to iPhones. |
 | `flutterIntercept.agent.mcpPort` | `47823` | Port of the local MCP server for agents. If it's busy, the next free port is used. |
 | `flutterIntercept.upstreamProxy` | empty | Send intercepted traffic on through another HTTP proxy, such as Charles or Burp at `http://127.0.0.1:8888`, or a corporate proxy. Empty = connect to servers directly. Requests to `localhost` and the emulator aliases always go direct. |
@@ -1980,6 +2177,8 @@ cloned project can't reroute your traffic or widen agent access.
 | **Flutter Intercept: Open Traffic Panel** | Shows the Traffic panel. It also opens by itself on the first intercepted session. |
 | **Flutter Intercept: Open Traffic in Editor** | Opens the traffic view as an editor tab. |
 | **Flutter Intercept: Open Traffic in New Window** | Opens the traffic view in a window of its own (VS Code 1.85+). |
+| **Flutter Intercept: Mock from a Collection…** | Links a Postman, OpenAPI 3, Swagger 2.0, Insomnia or Bruno collection so matching requests are answered locally. |
+| **Flutter Intercept: Make a Fake Backend from This Session…** | Builds a sanitised, remembering collection from the real server's answers in this session. |
 | **Flutter Intercept: Export Traffic as OpenAPI** / **as Postman Collection** | Writes the recorded traffic to an OpenAPI 3.1 file or a Postman collection. |
 | **Flutter Intercept: Set Client Certificate Passphrase…** | Stores (or clears) the passphrase of a client certificate in VS Code's secret storage. |
 | **Flutter Intercept: Save CA Certificate…** | Saves the public CA certificate, for example to trust it in an app's debug network security config. |
