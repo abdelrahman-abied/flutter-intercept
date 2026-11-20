@@ -26,7 +26,7 @@ describe('agent section content', () => {
     const lines = AGENT_SECTION.split('\n');
     expect(lines[0]).toBe(SECTION_START);
     expect(lines.at(-1)).toBe(SECTION_END);
-    expect(lines.length).toBeLessThanOrEqual(60);
+    expect(lines.length).toBeLessThanOrEqual(64); // CONTRACTS §21.10 +2, §21.15 #5 +2 (the collection loop)
     const known = new Set<string>([...READ_TOOLS, ...WRITE_TOOLS]);
     const mentioned = [...AGENT_SECTION.matchAll(/`([a-z]+(?:_[a-z]+)+)`/g)].map((m) => m[1]);
     expect(mentioned.length).toBeGreaterThan(10);

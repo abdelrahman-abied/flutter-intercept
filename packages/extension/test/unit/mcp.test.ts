@@ -208,8 +208,8 @@ describe('MCP server: tools', () => {
     const c = await connect();
     const { tools: listed } = await c.listTools();
     expect(listed.map((t) => t.name).sort()).toEqual([...READ_TOOLS, ...WRITE_TOOLS].sort());
-    const destructive = new Set(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'resend_request', 'simulate_network', 'replay_recording', 'add_map_remote']); // REVIEW-3 #7, REVIEW-6 #12
-    const idempotentWrites = new Set(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'replay_recording']); // §12.7: same input, same replay state
+    const destructive = new Set(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'resend_request', 'simulate_network', 'replay_recording', 'add_map_remote', 'set_collection']); // REVIEW-3 #7, REVIEW-6 #12; §21.10: unmatched "fail" fails traffic
+    const idempotentWrites = new Set(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'replay_recording', 'set_collection']); // §12.7: same input, same replay state; §21.10 same patch, same link
     for (const t of listed) {
       const write = (WRITE_TOOLS as readonly string[]).includes(t.name);
       const confirmed = t.name === 'take_screenshot'; // CONTRACTS §13.8: a read the client must confirm

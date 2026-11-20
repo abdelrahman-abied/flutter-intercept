@@ -178,6 +178,12 @@ export class AgentContext {
     return (p) => cg.routeTemplate(p);
   }
 
+  /** CONTRACTS §21.10 */
+  collectionsOrThrow(): NonNullable<AgentApiDeps['collections']> {
+    if (!this.deps.collections) throw new AgentToolError('mocking from a collection is not available (no Flutter project folder is open)', 'state');
+    return this.deps.collections;
+  }
+
   recordingsOrThrow(): RecordingService {
     if (!this.deps.recordings) throw new AgentToolError('recordings are not available (no Flutter project folder is open)', 'state');
     return this.deps.recordings;

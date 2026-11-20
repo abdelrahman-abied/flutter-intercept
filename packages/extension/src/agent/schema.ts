@@ -159,6 +159,16 @@ const requestEditSchema = z
   })
   .describe('Changes to the recorded request. Omit to send it unchanged.');
 
+// ---- CONTRACTS §21.10
+const collectionId = z
+  .string()
+  .regex(/^[a-z0-9-]{1,40}$/, 'a collection id such as "shop-api"')
+  .describe('A collection id (from list_collections or import_collection).');
+const endpointKey = z.string().min(1).max(8224).describe('A request key as get_collection lists it, e.g. "GET {{baseUrl}}/users/:id".');
+/** CONTRACTS §21.15 #3: a request seen in traffic names the collection request it belongs to. */
+const requestRef = id.describe('Instead of endpoint: the id of a request from the traffic (list_requests / wait_for_request) — the collection request it belongs to.');
+const workspaceFile = z.string().trim().min(1).max(1024).describe('A path relative to the Flutter project folder, inside it (no absolute paths, no "..").');
+
 // ---- CONTRACTS §12.7
 const recordingId = z.string().min(1).max(200).describe('A recording id (from list_recordings or save_recording).');
 const stepCount = z.number().int().min(1).max(1000).optional().describe('How many successive matching requests this step answers (1-1000, default 1).');
@@ -563,6 +573,54 @@ export const toolSchemas = {
     ttlMs: ttlMs.optional(),
     name: ruleName.optional(),
   }),
+  // CONTRACTS §21.10
+  list_collections: z.strictObject({}),
+  get_collection: z.strictObject({
+    id: collectionId,
+    filter: z.string().min(1).max(200).optional().describe('Only requests whose method, URL, name or folder contains this text (case-insensitive).'),
+    limit: z.number().int().min(1).max(500).default(100).describe('Max requests listed (1-500).'),
+  }),
+  get_collection_example: z.strictObject({
+    id: collectionId,
+    endpoint: endpointKey.optional(),
+    request: requestRef.optional(),
+    example: z.string().min(1).max(1000).describe('The example name, as get_collection lists it.'),
+    maxBodyChars: z.number().int().min(0).max(200_000).default(20_000).describe('Cut the body after this many characters.'),
+  }),
+  import_collection: z.strictObject({
+    file: workspaceFile.describe('The Postman collection (v2.0 / v2.1, .json) or OpenAPI 3 document (.json, .yaml, .yml), relative to the Flutter project folder.'),
+    environment: workspaceFile.optional().describe('A Postman environment file (.json) whose values fill {{variables}} in URLs; relative to the Flutter project folder.'),
+  }),
+  set_collection: z.strictObject({
+    id: collectionId,
+    enabled: z.boolean().optional().describe("Mock from this collection (for this user only; the team's setting is unchanged)."),
+    unmatched: z
+      .enum(['passthrough', 'fail'])
+      .optional()
+      .describe('Requests to the collection\'s servers that it has no entry for: "passthrough" (real server) or "fail" (like offline: nothing reaches a real server).'),
+    variable: z
+      .strictObject({
+        name: z.string().regex(/^[A-Za-z0-9_.$-]{1,100}$/).describe('Variable name without braces, e.g. "baseUrl".'),
+        value: z.string().max(2048).describe('The server the app calls for it, e.g. "https://api.example.com"; "" removes the value.'),
+      })
+      .optional()
+      .describe('Set a URL variable (saved for the team in .vscode/flutter-intercept.json).'),
+    example: z
+      .strictObject({ endpoint: endpointKey.optional(), request: requestRef.optional(), name: z.string().min(1).max(1000).describe('The example name.') })
+      .optional()
+      .describe('Which saved example answers that request, e.g. the error case. Give endpoint or request.'),
+    off: z
+      .strictObject({ endpoint: endpointKey.optional(), request: requestRef.optional(), off: z.boolean() })
+      .optional()
+      .describe('off: true = that request is not mocked (it goes to the real server, or fails with unmatched "fail"). Give endpoint or request.'),
+    scope: z
+      .enum(['me', 'team'])
+      .default('me')
+      .describe('"me" (default): example / off / unmatched change for this user only, nothing is written to the repo. "team": saved in .vscode/flutter-intercept.json for everyone. variable is always the team\'s.'),
+    reset: z.boolean().optional().describe('true: undo this user\'s own changes (all of them, or one request with endpoint / request). Not combined with other changes.'),
+    endpoint: endpointKey.optional().describe('With reset: only this request.'),
+    request: requestRef.optional().describe('With reset: only the collection request this traffic request belongs to.'),
+  }),
   get_grpc_schema: z.strictObject({
     method: z
       .string()
@@ -816,6 +874,37 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
     model:
       'Make the app\'s gRPC calls to one method get a fake answer (the real server is not contacted): response messages (JSON objects encoded with the app\'s own generated protobuf code — get the field names from get_grpc_schema\'s responseSkeleton — or base64 protobuf), then a gRPC status (code, default 0 = OK) and optional message. Use it to test error handling ({code: "UNAVAILABLE"}, {code: 16, message: "token expired"}), empty or edge-case responses, and streaming (several messages, gapMs between them). Pass url (a glob ending in "/<package.Service>/<Method>", e.g. "*/shop.v1.CartService/AddItem") or service + method. The rule is inserted first; times (e.g. 1) or ttlMs remove it automatically, otherwise use remove_rule. HTTP mocks (add_mock) never match gRPC calls; add_block, add_sequence (mock steps are HTTP-only) and simulate_network apply to gRPC too. Only decrypted gRPC calls (kind "grpc" in list_requests) can be mocked, not "tunnel" ones.',
     user: 'Add a rule that answers a gRPC method with fake messages and status.',
+  },
+  // CONTRACTS §21.10
+  list_collections: {
+    title: 'List collection mocks',
+    model:
+      'List the Postman collections / OpenAPI documents the app\'s requests are mocked from (linked in .vscode/flutter-intercept.json): id, name, file, format, enabled, unmatched ("passthrough" or "fail"), counts (endpoints, mocked, noExample = answered 501, generated = bodies made from schemas, off), unresolved URL variables (requests using them are not mocked yet), origins, problems, overrides (your own changes in effect), limited (answers served without cookies / redirects / CORS / HTML until the user approves the collection in the panel — only the user can), seen (from this session\'s traffic: notInCollection = requests to its servers it has no entry for, noExample = requests answered 501). Mocks from a collection run after every rule, so add_mock / add_block / simulate_network still override them.',
+    user: 'List the collections requests are mocked from.',
+  },
+  get_collection: {
+    title: 'Get a collection\'s requests',
+    model:
+      'List the requests of one collection: key (pass it to get_collection_example / set_collection — or pass a traffic request id as request instead), method, name, folder, url (origin + path, :params), examples (name, status, generated, query = chosen by these query parameters), selected example, off, overridden (your own change), unresolved variables, and seen (requests the collection lacks / answered 501). filter narrows by text; limit caps the list.',
+    user: 'Show the requests and examples of a mocked collection.',
+  },
+  get_collection_example: {
+    title: 'Get a collection example',
+    model:
+      'Read one saved (or schema-generated) example of a collection request: status, headers and body, exactly what the app gets when that example answers. Secrets are redacted like captured traffic. Use it to know what the app will see before switching examples with set_collection.',
+    user: 'Show one example response of a mocked collection.',
+  },
+  import_collection: {
+    title: 'Mock from a collection',
+    model:
+      'Link a Postman collection (v2.0 / v2.1) or an OpenAPI 3 document (JSON or YAML) that is inside the Flutter project folder, so the app\'s requests to its servers are answered from the saved examples (OpenAPI without examples: bodies generated from the schemas) — no test server needed, the app keeps calling its real URLs. A request with no example answers 501 with a JSON message; requests the collection does not know go to the real server. The link is written to .vscode/flutter-intercept.json (shared with the team). URL variables without a value ({{baseUrl}}) leave those requests unmocked: set them with set_collection variable, or pass a Postman environment file. Files outside the project can only be imported by the user (Mock from a Collection… in the panel or the command palette). Returns the collection\'s status.',
+    user: 'Mock the app\'s requests from a Postman collection or OpenAPI document.',
+  },
+  set_collection: {
+    title: 'Change a collection mock',
+    model:
+      'Change how a linked collection answers: example {request or endpoint, name} picks which saved example answers a request (e.g. "Wrong password" for the login request, to test error handling — request = the id of that request from the traffic); off {request or endpoint, off} stops mocking one request; unmatched "fail" makes requests the collection does not know fail like offline ("passthrough" = real server); enabled turns the whole collection on or off. These change for you only (nothing is written to the repo) unless scope is "team"; reset: true undoes your changes. variable {name, value} sets a server URL such as baseUrl, saved for the team. Requests sent after the change get the new answers (hot_restart to make a running app send them again).',
+    user: 'Change which example a mocked request returns, or turn mocking off for a request or collection.',
   },
   get_grpc_schema: {
     title: 'Get gRPC schema',

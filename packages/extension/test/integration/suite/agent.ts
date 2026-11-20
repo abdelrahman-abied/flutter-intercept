@@ -22,6 +22,8 @@
  * times 1; an error status) after hot restarts, assert_traffic expect.grpcStatus, get_status grpc.
  * v0.14.0 (MCP door, CONTRACTS §20; opt-in FI_AGENT_MTLS=1 with scripts/e2e/mtls_server.mjs running): the demo's mTLS
  * calls pass through once learned, then are decrypted with a client certificate added in user settings.
+ * v0.15.0 (MCP door, CONTRACTS §21.15 #6): import a collection written into the workspace, set baseUrl, the exchange's
+ * `collection` field, an example switched by request id (for me: no repo diff), reset, seen.notInCollection.
  *
  * Two paths, chosen automatically:
  *  - "lm":     the extension registered `flutter_intercept_*` (lead wiring + package.json
@@ -1353,6 +1355,96 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
       } finally {
         await grpcDartCfg.update('flutterRunAdditionalArgs', grpcRunArgsBefore, vscode.ConfigurationTarget.Global).then(undefined, () => undefined);
       }
+    }
+
+    // v0.15.0 (CONTRACTS §21.15 #6) over MCP: mock from a collection, the agent's loop. A Postman collection written
+    // into the demo workspace answers users/1 (two examples); users/3 is not in it. import_collection → set baseUrl
+    // (team) → launch → wait (its `collection` names the example) → set_collection {example: {request}} (for me) →
+    // hot restart → 404 → reset → list_collections (overrides 0, seen.notInCollection has GET /users/{id}) → the shared
+    // file has no diff from the "for me" changes. The workspace is restored afterwards.
+    for (const dev of devices) {
+      const out: RunOutcome = { name: `AGENT ${dev} v0.15.0 collection mocks over MCP: import, example by request, reset, seen, no repo diff`, output: '', proxyHits: [], failures: [], ms: 0 };
+      const f = out.failures;
+      const t0 = Date.now();
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+      const sharedPath = `${root}/.vscode/flutter-intercept.json`;
+      const colRel = 'api/fi-suite.postman_collection.json';
+      const colPath = `${root}/${colRel}`;
+      const sharedBefore = fs.existsSync(sharedPath) ? fs.readFileSync(sharedPath, 'utf8') : undefined;
+      const apiDirExisted = fs.existsSync(`${root}/api`);
+      let sessionId: string | undefined;
+      try {
+        fs.mkdirSync(`${root}/api`, { recursive: true });
+        fs.writeFileSync(
+          colPath,
+          JSON.stringify({
+            info: { name: 'FI suite', schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json' },
+            item: [
+              {
+                name: 'User 1',
+                request: { method: 'GET', url: '{{baseUrl}}/users/1' },
+                response: [
+                  { name: 'From the collection', code: 200, header: [{ key: 'Content-Type', value: 'application/json' }], body: '{"id":1,"name":"fi-collection-user"}' },
+                  { name: 'Not found', code: 404, header: [{ key: 'Content-Type', value: 'application/json' }], body: '{"error":"not_found"}' },
+                ],
+              },
+            ],
+          }),
+        );
+        client = await connect();
+        const imp = await mcpCall('import_collection', { file: colRel });
+        const colId = imp.result.id as string;
+        if (imp.isError || !colId) throw new Error(`import_collection: ${imp.text.slice(0, 300)}`);
+        if (!(imp.result.unresolved ?? []).includes('baseUrl')) f.push(`import: baseUrl not unresolved: ${imp.text.slice(0, 200)}`);
+        const v = await mcpCall('set_collection', { id: colId, variable: { name: 'baseUrl', value: 'https://jsonplaceholder.typicode.com' } });
+        if (v.isError) throw new Error(`set_collection variable: ${v.text.slice(0, 300)}`);
+        const sharedAfterTeam = fs.readFileSync(sharedPath, 'utf8');
+
+        const since = Date.now();
+        const l = await mcpCall('launch_app', { deviceId: dev });
+        sessionId = l.result.sessionId;
+        if (l.isError || !sessionId) throw new Error(`launch_app: ${l.text.slice(0, 200)}`);
+        const w = await mcpCall('wait_for_request', { url: USERS1, method: 'GET', sinceMs: since, timeoutMs: 120_000 });
+        if (w.isError || w.result.timedOut) throw new Error(`wait_for_request: ${w.text.slice(0, 300)}`);
+        if (w.result.status !== 200 || w.result.collection?.example !== 'From the collection') f.push(`first answer: status ${w.result.status}, collection ${JSON.stringify(w.result.collection)}`);
+        const g = await mcpCall('get_request', { id: w.result.id, includeBodies: true });
+        if (!JSON.stringify(g.result).includes('fi-collection-user')) f.push(`get_request body: ${JSON.stringify(g.result.responseBody ?? '').slice(0, 200)}`);
+
+        const sw = await mcpCall('set_collection', { id: colId, example: { request: w.result.id, name: 'Not found' } });
+        if (sw.isError || !String(sw.result.note ?? '').includes('for you only')) f.push(`set_collection example by request: ${sw.text.slice(0, 300)}`);
+        const restartAt = Date.now();
+        const h = await mcpCall('hot_restart', { sessionId });
+        if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+        const w2 = await mcpCall('wait_for_request', { url: USERS1, method: 'GET', sinceMs: restartAt, timeoutMs: 90_000 });
+        if (w2.isError || w2.result.timedOut || w2.result.status !== 404 || w2.result.collection?.example !== 'Not found') f.push(`after switching: ${w2.text.slice(0, 300)}`);
+        if (fs.readFileSync(sharedPath, 'utf8') !== sharedAfterTeam) f.push('a "for me" change wrote .vscode/flutter-intercept.json');
+
+        const rs = await mcpCall('set_collection', { id: colId, reset: true });
+        if (rs.isError) f.push(`reset: ${rs.text.slice(0, 200)}`);
+        const lc = await mcpCall('list_collections');
+        const st = (lc.result.collections ?? []).find((c: any) => c.id === colId);
+        if (!st || st.overrides !== 0) f.push(`after reset: ${JSON.stringify(st).slice(0, 300)}`);
+        const notIn = (st?.seen?.notInCollection ?? []) as { method: string; path: string }[];
+        if (!notIn.some((n) => n.method === 'GET' && n.path === '/users/{id}')) f.push(`seen.notInCollection: ${JSON.stringify(st?.seen).slice(0, 300)}`);
+        if (fs.readFileSync(sharedPath, 'utf8') !== sharedAfterTeam) f.push('reset wrote .vscode/flutter-intercept.json');
+        out.output = `collection ${colId}: first ${w.result.status} (${w.result.collection?.example}), switched ${w2.result.status} (${w2.result.collection?.example}), seen ${JSON.stringify(notIn).slice(0, 120)}`;
+        const s2 = await mcpCall('stop_app', { sessionId });
+        if (!s2.isError) sessionId = undefined;
+      } catch (e) {
+        f.push(`exception: ${(e as Error).message}`);
+      } finally {
+        if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
+        await client?.close().catch(() => undefined);
+        client = undefined;
+        // restore the workspace exactly
+        if (sharedBefore === undefined) fs.rmSync(sharedPath, { force: true });
+        else fs.writeFileSync(sharedPath, sharedBefore);
+        fs.rmSync(colPath, { force: true });
+        if (!apiDirExisted) fs.rmSync(`${root}/api`, { recursive: true, force: true });
+      }
+      out.ms = Date.now() - t0;
+      results.push(out);
+      console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
     }
 
     // v0.14.0 (CONTRACTS §20; opt-in FI_AGENT_MTLS=1 with scripts/e2e/mtls_server.mjs running, FI_MTLS_DIR = its --dir,

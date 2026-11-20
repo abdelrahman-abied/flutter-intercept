@@ -31,6 +31,10 @@ export const READ_TOOLS = [
   'take_screenshot',
   // CONTRACTS §16.4
   'get_grpc_schema',
+  // CONTRACTS §21.10
+  'list_collections',
+  'get_collection',
+  'get_collection_example',
 ] as const;
 
 export const WRITE_TOOLS = [
@@ -60,6 +64,9 @@ export const WRITE_TOOLS = [
   'add_rewrite',
   // CONTRACTS §16.4
   'add_grpc_mock',
+  // CONTRACTS §21.10
+  'import_collection',
+  'set_collection',
 ] as const;
 
 export type ReadToolName = (typeof READ_TOOLS)[number];

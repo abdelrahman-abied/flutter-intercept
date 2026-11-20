@@ -9,6 +9,7 @@ import type { CodegenService } from '../codegen/types';
 import type { ContractResult, ContractService } from '../contract/types';
 import type { AuthAnalysis } from '../analysis/types';
 import type { RecordingService } from '../recordings/types';
+import type { MockCollectionsHost } from '../mocks/service';
 import type { ToOpenApi, ToPostman } from '../export/types';
 import type { Screenshot, ScreenshotTarget } from '../screenshot/types';
 import type { SessionWarning } from '../ui/protocol';
@@ -143,6 +144,10 @@ export interface AgentApiDeps {
   // ---- CONTRACTS §12.7 (v0.6.0). Optional: without them the tools answer with a clear "not available" error.
   /** Recordings (src/recordings/store.ts). */
   recordings?: RecordingService;
+  /** CONTRACTS §21.10: mock from a collection (src/mocks/service.ts). Optional: without it the tools answer a clear error. */
+  collections?: Pick<MockCollectionsHost, 'state' | 'endpoints' | 'example' | 'update' | 'importFile'> &
+    /** CONTRACTS §21.15 #2 / #3: which collection answer an exchange got; a request → its endpoint. */
+    Partial<Pick<MockCollectionsHost, 'describeRule' | 'endpointForRequest'>>;
   /** A recording was saved or replay started/stopped: `controller.refreshRecordings()` (the panel's list). */
   recordingsChanged?(): void;
   /** Auth-flow analysis (src/analysis/auth.ts `analyzeAuth`). */

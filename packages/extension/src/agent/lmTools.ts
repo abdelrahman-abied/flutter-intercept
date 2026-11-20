@@ -176,6 +176,17 @@ export function invocationMessage(tool: ToolName, input: unknown): string {
       return `Adding gRPC mock for ${grpcTarget(i, plain)} → ${grpcCodeText(i.code)}`;
     case 'get_grpc_schema':
       return i.method ? `Reading the gRPC schema of ${plain(i.method)}` : i.message ? `Reading the protobuf type ${plain(i.message)}` : "Listing the app's gRPC methods";
+    // CONTRACTS §21.10
+    case 'list_collections':
+      return 'Listing the collections requests are mocked from';
+    case 'get_collection':
+      return `Reading the requests of collection ${plain(i.id)}`;
+    case 'get_collection_example':
+      return `Reading example ${plain(i.example)} of ${plain(i.endpoint)}`;
+    case 'import_collection':
+      return `Mocking requests from ${plain(i.file)}`;
+    case 'set_collection':
+      return `Changing collection mock ${plain(i.id)}`;
   }
 }
 
@@ -477,6 +488,31 @@ export function confirmationText(
           `Answer gRPC calls to ${code(i.url ?? `${String(i.service ?? '?')}/${String(i.method ?? '?')}`)} with ${n ? `**${n}** message${n === 1 ? '' : 's'}` : 'no messages'}, then status ${grpcCodeText(i.code).replace(/^([^`]+)$/, '**$1**')}${msg}` +
           `${typeof i.delayMs === 'number' && i.delayMs ? `, after ${i.delayMs} ms` : ''}${named}${spendText(i)}.\n\n` +
           'Inserted as the first rule: matching calls from the app get this answer and never reach the server.',
+      };
+    }
+    // CONTRACTS §21.10: what changes for the app, and that the team's file is written.
+    case 'import_collection':
+      return {
+        title: 'Mock from a collection',
+        message:
+          `Answer the app's requests from the examples in ${code(i.file)}${str(i.environment) ? ` (URL variables from ${code(i.environment)})` : ''} instead of the real servers it names. ` +
+          'Requests without an example get a 501; others go to the real server.\n\nThe link is saved in `.vscode/flutter-intercept.json`, shared with the team.',
+      };
+    case 'set_collection': {
+      const parts: string[] = [];
+      if (typeof i.enabled === 'boolean') parts.push(i.enabled ? 'turn mocking from it **on** (for you only)' : 'turn mocking from it **off** (for you only)');
+      if (i.unmatched === 'fail') parts.push('make requests it does not know **fail like offline**');
+      if (i.unmatched === 'passthrough') parts.push('let requests it does not know reach the real server');
+      const v = obj(i.variable);
+      if (str(v.name)) parts.push(v.value === '' ? `remove the value of ${code(`{{${String(v.name)}}}`)}` : `set ${code(`{{${String(v.name)}}}`)} to ${code(v.value)}`);
+      const x = obj(i.example);
+      if (str(x.endpoint)) parts.push(`answer ${code(x.endpoint)} with example ${code(x.name)}`);
+      const o = obj(i.off);
+      if (str(o.endpoint)) parts.push(o.off === true ? `stop mocking ${code(o.endpoint)}` : `mock ${code(o.endpoint)} again`);
+      const shared = i.unmatched !== undefined || str(v.name) || str(x.endpoint) || str(o.endpoint);
+      return {
+        title: 'Change a collection mock',
+        message: `For collection ${code(i.id)}: ${parts.length ? parts.join('; ') : 'no change'}.${shared ? '\n\nSaved in `.vscode/flutter-intercept.json`, shared with the team.' : ''}`,
       };
     }
     // CONTRACTS §13.8: names the device.

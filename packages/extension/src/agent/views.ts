@@ -51,6 +51,26 @@ export class AgentViews extends AgentContext {
     return { text: cut ? text.slice(0, maxChars) : text, ...(cut || b.truncated ? { truncated: true } : {}), ...(cut ? { totalChars: text.length } : {}) };
   }
 
+  /** CONTRACTS §21.15 #2: `collection: {id, name, endpoint, example?, noExample?, unmatched?, limited?}` — one look. */
+  private collectionAnswer(ruleId: string | undefined): { collection?: Record<string, unknown> } {
+    if (!ruleId) return {};
+    let a;
+    try {
+      a = this.deps.collections?.describeRule?.(ruleId);
+    } catch {
+      return {};
+    }
+    if (!a) return {};
+    return { collection: { ...a, ...(a.endpoint ? { endpoint: this.endpointKeyView(a.endpoint) } : {}) } };
+  }
+
+  /** REVIEW-15 #5: a request key as agents see it — the URL part redacted like any captured URL. */
+  endpointKeyView(key: string): string {
+    if (!this.redact) return key;
+    const sp = key.indexOf(' ');
+    return sp < 0 ? key : `${key.slice(0, sp)} ${redactUrl(key.slice(sp + 1))}`;
+  }
+
   summary(e: Exchange): Record<string, unknown> {
     return {
       id: e.id,
@@ -62,6 +82,7 @@ export class AgentViews extends AgentContext {
       startedAt: e.startedAt,
       ...(e.responseBody ? { responseBytes: bodyBytes(e.responseBody) } : {}),
       ...(e.matchedRuleId ? { matchedRuleId: e.matchedRuleId } : {}),
+      ...this.collectionAnswer(e.matchedRuleId),
       ...(e.initiator ? { initiator: e.initiator } : {}),
       ...(e.simulated ? { simulated: e.simulated } : {}),
       // CONTRACTS §11.5

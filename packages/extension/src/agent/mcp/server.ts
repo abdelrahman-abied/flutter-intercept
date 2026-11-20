@@ -40,13 +40,13 @@ const SESSION_IDLE_MS = 60 * 60 * 1000;
  */
 // REVIEW-6 #12: replay_recording (fallback "fail" fails all unmatched traffic) and add_map_remote (sends the app's
 // requests, credentials included, to another server).
-export const DESTRUCTIVE_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'resend_request', 'simulate_network', 'replay_recording', 'add_map_remote']);
+export const DESTRUCTIVE_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'resend_request', 'simulate_network', 'replay_recording', 'add_map_remote', 'set_collection']);
 
 /**
  * CONTRACTS §9.5: write tools whose repeated call with the same input has no further effect. Not
  * simulate_network: with a url every call inserts another rule (REVIEW-3 #7).
  */
-export const IDEMPOTENT_WRITE_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'replay_recording']);
+export const IDEMPOTENT_WRITE_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'replay_recording', 'set_collection']);
 
 /** CONTRACTS §9.5: tools that reach beyond the local proxy (the real backend). */
 export const OPEN_WORLD_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['resend_request', 'add_map_remote']);

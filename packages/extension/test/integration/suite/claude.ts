@@ -1,7 +1,10 @@
 /**
- * Real Claude Code client suite (FI_SUITE=claude, opt-in: FI_CLAUDE=1). Runs ONE headless `claude -p`
+ * Real Claude Code client suite (FI_SUITE=claude, opt-in: FI_CLAUDE=1). Runs headless `claude -p` tasks
  * against the MCP server of the extension under test (VS Code or Cursor host), on samples/demo_app on
  * the macOS desktop device, and asserts from the EXTENSION side that the agent really drove the app.
+ * Tasks (FI_CLAUDE_TASKS, default "mock,collection"): `mock` (add_mock 500 → hot restart → remove), and
+ * v0.15.0 `collection` (CONTRACTS §21.15 #6: "the backend is down" — mock from a Postman collection, switch an
+ * example for this user only, reset).
  *
  * Isolation: temp MCP config (--mcp-config + --strict-mcp-config), no built-in tools (--tools ""),
  * only `mcp__flutter-intercept` allowed, --permission-mode dontAsk (never prompts), no session
@@ -48,11 +51,38 @@ function runClaude(args: string[], cwd: string, timeoutMs: number): Promise<{ co
   });
 }
 
+const COLLECTION_REL = 'api/fi-claude.postman_collection.json';
+const COLLECTION_TASK =
+  'Use only the flutter-intercept tools. The app\'s backend is down, so its requests must be answered from the ' +
+  `Postman collection ${COLLECTION_REL} in the project. Mock the app from that collection; its {{baseUrl}} is ` +
+  'https://jsonplaceholder.typicode.com. Launch the app on device "macos", wait for its GET request to ' +
+  `${USERS1} and confirm the collection answered it. Then make that request return the collection's "Not found" ` +
+  'example — just for you, not for the team — hot restart the app, wait for the app\'s next GET request to that URL ' +
+  '(only requests after the restart) and confirm it got 404. Then undo your change and stop the app. ' +
+  'Reply with only a short JSON summary: {"firstStatus":..., "answeredBy":..., "afterSwitchStatus":..., "undone":..., "stopped":...}.';
+const COLLECTION_REQUIRED = ['import_collection', 'set_collection', 'launch_app', 'wait_for_request', 'hot_restart', 'stop_app'];
+
 export async function runClaudeSuite(): Promise<RunOutcome[]> {
+  const tasks = (process.env.FI_CLAUDE_TASKS || 'mock,collection').split(',').map((t) => t.trim());
+  const results: RunOutcome[] = [];
+  if (tasks.includes('mock')) results.push(...(await runMockTask()));
+  if (tasks.includes('collection')) results.push(await runCollectionTask());
+  return results;
+}
+
+interface ClaudeRun {
+  r: { code: number | null; stdout: string; stderr: string; ms: number };
+  final: any;
+  calls: { tool: string; at: number; ok: boolean }[];
+  since: number;
+  token: string;
+}
+
+/** Shared setup + one headless run: the MCP config with the token is written to a temp dir and removed after. */
+type SuiteApi = Awaited<ReturnType<typeof activateBoth>>['api'];
+
+async function runOneClaude(task: string, tag: string, f: string[]): Promise<{ run?: ClaudeRun; api: SuiteApi; mcp: any; isCursor: boolean; cursorLine?: string }> {
   const host = `${vscode.env.appName} ${vscode.version}`;
-  const out: RunOutcome = { name: `CLAUDE CODE drives Flutter Intercept over MCP in ${host}`, output: '', proxyHits: [], failures: [], ms: 0 };
-  const f = out.failures;
-  const t0 = Date.now();
   registerOutputTracker();
   const { api } = await activateBoth();
   const cfg = vscode.workspace.getConfiguration('flutterIntercept');
@@ -61,9 +91,15 @@ export async function runClaudeSuite(): Promise<RunOutcome[]> {
   const mcp = (api as any).mcp as
     | { url?: string; token(): Thenable<string | undefined>; calls: { tool: string; at: number; ok: boolean }[]; logs: string[] }
     | undefined;
-  if (!mcp) return [{ ...out, failures: ['api.mcp missing (FI_TEST_EXPOSE_MCP_TOKEN not applied)'] }];
+  if (!mcp) {
+    f.push('api.mcp missing (FI_TEST_EXPOSE_MCP_TOKEN not applied)');
+    return { api, mcp, isCursor: false };
+  }
   await waitFor(() => mcp.url || undefined, 30_000, 200).catch(() => undefined);
-  if (!mcp.url) return [{ ...out, failures: ['MCP server not running'] }];
+  if (!mcp.url) {
+    f.push('MCP server not running');
+    return { api, mcp, isCursor: false };
+  }
   await sleep(8_000); // Flutter daemon device discovery (macos)
   // Cursor: the extension registers its MCP server with Cursor itself (vscode.cursor.mcp.registerServer).
   const isCursor = typeof (vscode as any).cursor?.mcp?.registerServer === 'function';
@@ -84,7 +120,7 @@ export async function runClaudeSuite(): Promise<RunOutcome[]> {
   const since = Date.now();
   const args = [
     '-p',
-    TASK,
+    task,
     '--mcp-config',
     mcpConfig,
     '--strict-mcp-config',
@@ -101,12 +137,12 @@ export async function runClaudeSuite(): Promise<RunOutcome[]> {
     '--max-budget-usd',
     process.env.FI_CLAUDE_BUDGET || '1.50',
   ];
-  console.log(`[suite] claude: running headless Claude Code against ${mcp.url} (cwd ${work})`);
+  console.log(`[suite] claude (${tag}): running headless Claude Code against ${mcp.url} (cwd ${work})`);
   const r = await runClaude(args, work, Number(process.env.FI_CLAUDE_TIMEOUT_MS || 600_000));
   fs.rmSync(mcpConfig, { force: true }); // contains the token
-  const tag = (vscode.env.appName || 'host').replace(/\W+/g, '_');
-  fs.writeFileSync(path.join(evidence, `claude-${tag}.stream.jsonl`), r.stdout);
-  if (r.stderr) fs.writeFileSync(path.join(evidence, `claude-${tag}.stderr.txt`), r.stderr);
+  const hostTag = `${(vscode.env.appName || 'host').replace(/\W+/g, '_')}-${tag}`;
+  fs.writeFileSync(path.join(evidence, `claude-${hostTag}.stream.jsonl`), r.stdout);
+  if (r.stderr) fs.writeFileSync(path.join(evidence, `claude-${hostTag}.stderr.txt`), r.stderr);
 
   // ---- what Claude did, from Claude's side (evidence only) ----
   const events = r.stdout
@@ -125,15 +161,26 @@ export async function runClaudeSuite(): Promise<RunOutcome[]> {
     .filter((e: any) => e.type === 'assistant')
     .flatMap((e: any) => (e.message?.content ?? []).filter((c: any) => c.type === 'tool_use').map((c: any) => String(c.name)));
   fs.writeFileSync(
-    path.join(evidence, `claude-${tag}.summary.json`),
+    path.join(evidence, `claude-${hostTag}.summary.json`),
     JSON.stringify({ host, exit: r.code, ms: r.ms, toolUses, result: final?.result, cost: final?.total_cost_usd, turns: final?.num_turns, isError: final?.is_error }, null, 2),
   );
   if (r.code !== 0) f.push(`claude exited ${r.code}: ${r.stderr.slice(0, 300)}`);
   if (!final) f.push('no result event from claude');
   else if (final.is_error) f.push(`claude result is_error: ${String(final.result).slice(0, 300)}`);
+  const calls = mcp.calls.slice(callsBefore);
+  return { run: { r, final, calls, since, token: (await mcp.token()) ?? '<none>' }, api, mcp, isCursor, cursorLine };
+}
+
+async function runMockTask(): Promise<RunOutcome[]> {
+  const host = `${vscode.env.appName} ${vscode.version}`;
+  const out: RunOutcome = { name: `CLAUDE CODE drives Flutter Intercept over MCP in ${host}`, output: '', proxyHits: [], failures: [], ms: 0 };
+  const f = out.failures;
+  const t0 = Date.now();
+  const { run, api, mcp, isCursor, cursorLine } = await runOneClaude(TASK, 'mock', f);
+  if (!run) return [out];
+  const { r, final, calls, since } = run;
 
   // ---- assertions from the EXTENSION side ----
-  const calls = mcp.calls.slice(callsBefore);
   const okTools = new Set(calls.filter((c) => c.ok).map((c) => c.tool));
   const missing = REQUIRED.filter((t) => !okTools.has(t));
   if (missing.length) f.push(`tools not called successfully: ${missing.join(', ')} (seen: ${calls.map((c) => `${c.tool}${c.ok ? '' : '!'}`).join(' ')})`);
@@ -148,8 +195,8 @@ export async function runClaudeSuite(): Promise<RunOutcome[]> {
   await sleep(3000);
   const live = vscode.debug.activeDebugSession;
   if (live && live.configuration?.flutterInterceptOriginalProgram) f.push(`debug session still running: ${live.name}`);
-  const token = (await mcp.token()) ?? '<none>';
-  const leaked = [...SECRETS, token].filter((s) => r.stdout.includes(s) || r.stderr.includes(s) || mcp.logs.some((l) => l.includes(s)));
+  const token = run.token;
+  const leaked = [...SECRETS, token].filter((s) => r.stdout.includes(s) || r.stderr.includes(s) || (mcp.logs as string[]).some((l) => l.includes(s)));
   if (leaked.length) f.push(`secret values in Claude's input/output or the extension log: ${leaked.map((s) => (s === token ? '<MCP token>' : s)).join(', ')}`);
 
   out.ms = Date.now() - t0;
@@ -162,3 +209,78 @@ export async function runClaudeSuite(): Promise<RunOutcome[]> {
   console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms) ${out.mode}${f.length ? '\n         ' + f.join('\n         ') : ''}\n[suite] claude said: ${out.output}`);
   return [out];
 }
+
+/**
+ * v0.15.0 (CONTRACTS §21.15 #6): "the backend is down". The suite writes a Postman collection into the demo
+ * workspace; Claude must import it, set baseUrl, see the collection answer users/1, switch to the "Not found" example
+ * for this user only, see the 404, undo it, stop the app. Asserted from the extension side, and that the team file
+ * never got the example choice. The workspace is restored exactly afterwards.
+ */
+async function runCollectionTask(): Promise<RunOutcome> {
+  const host = `${vscode.env.appName} ${vscode.version}`;
+  const out: RunOutcome = { name: `CLAUDE CODE: the backend is down — mock from a collection, error example for me only (${host})`, output: '', proxyHits: [], failures: [], ms: 0 };
+  const f = out.failures;
+  const t0 = Date.now();
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+  const sharedPath = path.join(root, '.vscode', 'flutter-intercept.json');
+  const colPath = path.join(root, COLLECTION_REL);
+  const sharedBefore = fs.existsSync(sharedPath) ? fs.readFileSync(sharedPath, 'utf8') : undefined;
+  const apiDirExisted = fs.existsSync(path.join(root, 'api'));
+  try {
+    fs.mkdirSync(path.dirname(colPath), { recursive: true });
+    fs.writeFileSync(
+      colPath,
+      JSON.stringify({
+        info: { name: 'FI Claude', schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json' },
+        item: [
+          {
+            name: 'User 1',
+            request: { method: 'GET', url: '{{baseUrl}}/users/1' },
+            response: [
+              { name: 'From the collection', code: 200, header: [{ key: 'Content-Type', value: 'application/json' }], body: '{"id":1,"name":"fi-claude-user"}' },
+              { name: 'Not found', code: 404, header: [{ key: 'Content-Type', value: 'application/json' }], body: '{"error":"not_found"}' },
+            ],
+          },
+        ],
+      }),
+    );
+    const { run, api } = await runOneClaude(COLLECTION_TASK, 'collection', f);
+    if (!run) return out;
+    const { r, final, calls, since } = run;
+    const okTools = new Set(calls.filter((c) => c.ok).map((c) => c.tool));
+    const missing = COLLECTION_REQUIRED.filter((t) => !okTools.has(t));
+    if (missing.length) f.push(`tools not called successfully: ${missing.join(', ')} (seen: ${calls.map((c) => `${c.tool}${c.ok ? '' : '!'}`).join(' ')})`);
+    const ex = api.getExchanges().filter((e) => e.startedAt >= since && e.url === USERS1);
+    const fromCollection = ex.filter((e: any) => e.state === 'mocked' && e.status === 200 && String(e.matchedRuleId ?? '').startsWith('collection:'));
+    const notFound = ex.filter((e: any) => e.state === 'mocked' && e.status === 404 && String(e.matchedRuleId ?? '').startsWith('collection:'));
+    if (!fromCollection.length) f.push(`no users/1 answered 200 by the collection (seen: ${ex.map((e: any) => `${e.state}/${e.status}/${e.matchedRuleId ?? '-'}`).join(', ')})`);
+    else if (!String(fromCollection[0].responseBody?.text ?? '').includes('fi-claude-user')) f.push(`collection body: ${fromCollection[0].responseBody?.text}`);
+    if (!notFound.length) f.push('no users/1 answered 404 by the collection after the switch');
+    // "just for you": the team file may hold the link and baseUrl, never the example choice
+    const shared = fs.existsSync(sharedPath) ? JSON.parse(fs.readFileSync(sharedPath, 'utf8')) : {};
+    const link = (shared.collections ?? []).find((c: any) => c.file === COLLECTION_REL);
+    if (!link) f.push('the collection link is not in .vscode/flutter-intercept.json');
+    else if (link.selected && Object.keys(link.selected).length) f.push(`the example choice was written for the team: ${JSON.stringify(link.selected)}`);
+    const leaked = [...SECRETS, run.token].filter((s) => r.stdout.includes(s) || r.stderr.includes(s));
+    if (leaked.length) f.push(`secret values in Claude's input/output: ${leaked.map((s) => (s === run.token ? '<MCP token>' : s)).join(', ')}`);
+    await sleep(3000);
+    const live = vscode.debug.activeDebugSession;
+    if (live && live.configuration?.flutterInterceptOriginalProgram) f.push(`debug session still running: ${live.name}`);
+    out.mode =
+      `claude ${Math.round(r.ms / 1000)} s, ${final?.num_turns ?? '?'} turns, $${final?.total_cost_usd ?? '?'}; ` +
+      `extension saw ${calls.length} calls [${[...new Set(calls.map((c) => c.tool))].join(', ')}]; users/1: ${fromCollection.length}x 200 from the collection, ${notFound.length}x 404 after the switch; ` +
+      `team file example choice: ${link?.selected && Object.keys(link.selected).length ? 'WRITTEN' : 'none'}`;
+    out.output = String(final?.result ?? '').slice(0, 600);
+  } catch (e) {
+    f.push(`exception: ${(e as Error).message}`);
+  } finally {
+    if (sharedBefore === undefined) fs.rmSync(sharedPath, { force: true });
+    else fs.writeFileSync(sharedPath, sharedBefore);
+    fs.rmSync(colPath, { force: true });
+    if (!apiDirExisted) fs.rmSync(path.join(root, 'api'), { recursive: true, force: true });
+  }
+  out.ms = Date.now() - t0;
+  console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms) ${out.mode ?? ''}${f.length ? '\n         ' + f.join('\n         ') : ''}\n[suite] claude said: ${out.output}`);
+  return out;
+}
+

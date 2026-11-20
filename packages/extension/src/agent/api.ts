@@ -14,6 +14,7 @@ import { exportTools } from './tools/export';
 import { grpcTools } from './tools/grpc';
 import { networkTools } from './tools/network';
 import { recordingsTools } from './tools/recordings';
+import { collectionsTools } from './tools/collections';
 import { rulesTools } from './tools/rules';
 import { trafficTools } from './tools/traffic';
 import type { ToolHandler } from './tools/types';
@@ -34,6 +35,7 @@ const HANDLERS: { [T in ToolName]: ToolHandler<T> } = {
   ...contractTools,
   ...assertTools,
   ...recordingsTools,
+  ...collectionsTools,
   ...exportTools,
   ...grpcTools,
   ...appTools,
