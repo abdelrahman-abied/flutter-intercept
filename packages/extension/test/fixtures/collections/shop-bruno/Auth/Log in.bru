@@ -1,0 +1,82 @@
+meta {
+  name: Log in
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/auth/login
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  X-Api-Key: live-key-123
+}
+
+body:json {
+  {"email":"sara@example.com","password":"hunter2"}
+}
+
+example {
+  name: Success
+  description: Signed in
+
+  request: {
+    url: {{baseUrl}}/auth/login
+    method: post
+    mode: json
+    body:json: {
+      {"email":"sara@example.com","password":"hunter2"}
+    }
+  }
+
+  response: {
+    headers: {
+      Content-Type: application/json
+    }
+
+    status: {
+      code: 200
+      text: OK
+    }
+
+    body: {
+      type: json
+      content: '''
+        {
+          "token": "abc",
+          "user": { "id": 1, "name": "Sara" }
+        }
+      '''
+    }
+  }
+}
+
+example {
+  name: Wrong password
+
+  request: {
+    url: {{baseUrl}}/auth/login
+    method: post
+    mode: json
+    body:json: {
+      {"email":"sara@example.com","password":"wrong-guess"}
+    }
+  }
+
+  response: {
+    status: {
+      code: 401
+      text: Unauthorized
+    }
+
+    body: {
+      type: json
+      content: '''
+        {"error":"invalid_credentials"}
+      '''
+    }
+  }
+}

@@ -49,7 +49,11 @@
             "headers": {
               "content-type": "application/json"
             },
-            "body": "{\n  \"token\": \"abc\",\n  \"user\": { \"id\": 1, \"name\": \"Sara\" }\n}"
+            "body": "{\n  \"token\": \"abc\",\n  \"user\": { \"id\": 1, \"name\": \"Sara\" }\n}",
+            "request": {
+              "contentType": "application/json",
+              "body": "{\"email\":\"sara@example.com\",\"password\":\"hunter2\"}"
+            }
           },
           {
             "name": "Wrong password",
@@ -57,9 +61,18 @@
             "headers": {
               "content-type": "application/json; charset=utf-8"
             },
-            "body": "{\"error\":\"invalid_credentials\"}"
+            "body": "{\"error\":\"invalid_credentials\"}",
+            "request": {
+              "contentType": "application/json",
+              "body": "{\"email\":\"sara@example.com\",\"password\":\"wrong-guess\"}"
+            }
           }
-        ]
+        ],
+        "requestBody": {
+          "contentType": "application/json",
+          "body": "{\"email\":\"sara@example.com\",\"password\":\"hunter2\"}"
+        },
+        "auth": "none"
       },
       {
         "key": "POST {{baseUrl}}/auth/refresh",
@@ -74,7 +87,8 @@
           "refresh"
         ],
         "unresolved": [],
-        "examples": []
+        "examples": [],
+        "auth": "declared"
       },
       {
         "key": "GET {{baseUrl}}/users",
@@ -108,7 +122,11 @@
               "page": "2"
             }
           }
-        ]
+        ],
+        "queryParams": [
+          "page"
+        ],
+        "auth": "declared"
       },
       {
         "key": "GET {{baseUrl}}/users/me",
@@ -132,7 +150,8 @@
             },
             "body": "{\"id\":1,\"name\":\"Sara\"}"
           }
-        ]
+        ],
+        "auth": "declared"
       },
       {
         "key": "GET {{baseUrl}}/users/:id",
@@ -166,7 +185,8 @@
             },
             "body": "{\"error\":\"not_found\"}"
           }
-        ]
+        ],
+        "auth": "declared"
       },
       {
         "key": "DELETE {{baseUrl}}/users/:id",
@@ -190,7 +210,8 @@
             "headers": {},
             "body": ""
           }
-        ]
+        ],
+        "auth": "declared"
       },
       {
         "key": "GET {{baseUrl}}/{{apiVersion}}/orders/{{orderId}}/items",
@@ -219,7 +240,8 @@
             },
             "body": "[{\"sku\":\"A1\",\"qty\":2}]"
           }
-        ]
+        ],
+        "auth": "declared"
       },
       {
         "key": "GET https://CDN.shop.example:443/config.json",
@@ -242,7 +264,8 @@
             },
             "body": "{\"theme\":\"dark\"}"
           }
-        ]
+        ],
+        "auth": "declared"
       },
       {
         "key": "GET {{baseUrl}}/health",
@@ -263,7 +286,8 @@
             },
             "body": "ok"
           }
-        ]
+        ],
+        "auth": "declared"
       },
       {
         "key": "GET {{baseUrl}}/health #2",
@@ -275,7 +299,8 @@
           "health"
         ],
         "unresolved": [],
-        "examples": []
+        "examples": [],
+        "auth": "declared"
       },
       {
         "key": "POST {{analyticsHost}}/collect",
@@ -295,7 +320,8 @@
             "headers": {},
             "body": ""
           }
-        ]
+        ],
+        "auth": "declared"
       }
     ]
   },
@@ -315,7 +341,8 @@
       "refresh-token-literal",
       "literal-in-header",
       "pm.environment.set",
-      "hunter2"
+      "hunter2",
+      "wrong-guess"
     ],
     "mustContain": [
       "\\\"token\\\": \\\"abc\\\"",
@@ -374,7 +401,14 @@
             },
             "body": "[]"
           }
-        ]
+        ],
+        "schemaHints": {
+          "idField": "id",
+          "idType": "integer",
+          "writeOnly": [
+            "password"
+          ]
+        }
       },
       {
         "key": "GET /users/{id}",
@@ -411,7 +445,14 @@
             "body": "{\n  \"code\": 0,\n  \"message\": \"stringst\"\n}",
             "generated": true
           }
-        ]
+        ],
+        "schemaHints": {
+          "idField": "id",
+          "idType": "integer",
+          "writeOnly": [
+            "password"
+          ]
+        }
       },
       {
         "key": "DELETE /users/{id}",

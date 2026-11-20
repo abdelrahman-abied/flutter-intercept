@@ -1,0 +1,28 @@
+meta {
+  name: Analytics
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{analyticsHost}}/collect
+  body: none
+  auth: inherit
+}
+
+example {
+  name: Accepted
+
+  request: {
+    url: {{analyticsHost}}/collect
+    method: post
+    mode: none
+  }
+
+  response: {
+    status: {
+      code: 202
+      text: Accepted
+    }
+  }
+}

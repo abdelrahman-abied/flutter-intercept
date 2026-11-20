@@ -17,6 +17,9 @@ import type { AgentTools } from '../../src/agent/types';
  * PERF-2 #4: the MCP server through this bundle, where the SDK's Zod 3 paths are stubs that throw — every real tool
  * schema converts to JSON Schema, validates good input and rejects bad input on the Zod 4 paths.
  */
+/** CONTRACTS §22.11: 47 tools + get_store, set_store, store_snapshot. */
+const EXPECTED_TOOLS = 52;
+
 async function mcpSmoke(): Promise<string> {
   const calls: string[] = [];
   const tools: AgentTools = {
@@ -30,6 +33,7 @@ async function mcpSmoke(): Promise<string> {
     await client.connect(new StreamableHTTPClientTransport(new URL(server.url), { requestInit: { headers: { Authorization: 'Bearer smoke-token' } } }));
     const listed = (await client.listTools()).tools;
     const want = Object.keys(toolSchemas).length;
+    if (want !== EXPECTED_TOOLS) fail(`MCP: ${want} tool schemas, ${EXPECTED_TOOLS} expected (update EXPECTED_TOOLS with a new tool)`);
     if (listed.length !== want) fail(`MCP: ${listed.length} tools listed, ${want} expected`);
     const bad = listed.filter((t) => t.inputSchema?.type !== 'object');
     if (bad.length) fail(`MCP: tools without an object input schema: ${bad.map((t) => t.name).join(', ')}`);
@@ -37,6 +41,11 @@ async function mcpSmoke(): Promise<string> {
     if (ok.isError || calls[0] !== 'get_request') fail(`MCP: get_request call failed: ${JSON.stringify(ok)}`);
     const refused = await client.callTool({ name: 'get_request', arguments: { id: 42 } }).catch((e: Error) => ({ isError: true, content: [{ type: 'text', text: e.message }] }));
     if (!refused.isError || calls.length !== 1) fail(`MCP: invalid input was not refused: ${JSON.stringify(refused)}`);
+    // CONTRACTS §22.11: the store tools' schemas (records as free JSON, a null startsFrom, an enum action) on the Zod 4 paths
+    const store = await client.callTool({ name: 'set_store', arguments: { id: 'shop-api', resource: 'todos', items: [{ id: 1, tags: ['a'], meta: { n: null } }] } });
+    if (store.isError || calls[1] !== 'set_store') fail(`MCP: set_store call failed: ${JSON.stringify(store)}`);
+    const badSnap = await client.callTool({ name: 'store_snapshot', arguments: { id: 'shop-api', action: 'save', name: '../x' } }).catch((e: Error) => ({ isError: true, content: [{ type: 'text', text: e.message }] }));
+    if (!badSnap.isError || calls.includes('store_snapshot')) fail(`MCP: a bad snapshot name was not refused: ${JSON.stringify(badSnap)}`);
     return `MCP ${listed.length} tools ok`;
   } finally {
     await client.close().catch(() => undefined);

@@ -1,0 +1,25 @@
+meta {
+  name: Refresh
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/auth/refresh
+  body: none
+  auth: bearer
+}
+
+headers {
+  Authorization: Bearer literal-in-header
+}
+
+auth:bearer {
+  token: refresh-token-literal
+}
+
+tests {
+  test("ok", function() {
+    expect(res.status).to.equal(200);
+  });
+}

@@ -1,0 +1,132 @@
+{
+  "swagger": "2.0",
+  "info": { "title": "Shop API", "version": "1.0.0" },
+  "host": "api.shop.example",
+  "basePath": "/v1",
+  "schemes": ["https", "http"],
+  "consumes": ["application/json"],
+  "produces": ["application/json"],
+  "securityDefinitions": {
+    "bearer": { "type": "apiKey", "name": "Authorization", "in": "header" },
+    "oauth": { "type": "oauth2", "flow": "accessCode", "authorizationUrl": "https://auth.shop.example/authorize", "tokenUrl": "https://auth.shop.example/token", "scopes": { "read": "Read" } }
+  },
+  "security": [{ "bearer": [] }],
+  "paths": {
+    "/users": {
+      "get": {
+        "operationId": "listUsers",
+        "tags": ["Users", "Admin"],
+        "parameters": [{ "name": "page", "in": "query", "type": "integer", "x-example": 1 }],
+        "responses": {
+          "200": {
+            "description": "Users",
+            "schema": { "type": "array", "items": { "$ref": "#/definitions/User" } },
+            "examples": { "application/json": [{ "id": 1, "name": "Sara" }, { "id": 2, "name": "Omar" }] }
+          }
+        }
+      }
+    },
+    "/users/{id}": {
+      "parameters": [{ "$ref": "#/parameters/UserId" }],
+      "get": {
+        "operationId": "getUser",
+        "tags": ["Users"],
+        "responses": {
+          "200": { "description": "A user", "schema": { "$ref": "#/definitions/User" } },
+          "404": { "$ref": "#/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a user",
+        "responses": { "204": { "description": "Deleted" } }
+      }
+    },
+    "/orders": {
+      "post": {
+        "operationId": "createOrder",
+        "tags": ["Orders"],
+        "parameters": [
+          { "name": "order", "in": "body", "required": true, "schema": { "$ref": "#/definitions/NewOrder" }, "x-example": { "sku": "A1", "qty": 2 } }
+        ],
+        "responses": {
+          "201": {
+            "description": "Created",
+            "headers": { "Location": { "type": "string", "x-example": "/orders/7" } },
+            "examples": { "application/json": { "id": 7, "status": "pending" } }
+          },
+          "default": { "description": "Error", "schema": { "$ref": "#/definitions/Error" } }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "operationId": "login",
+        "tags": ["Auth"],
+        "security": [],
+        "consumes": ["application/x-www-form-urlencoded"],
+        "parameters": [
+          { "name": "email", "in": "formData", "type": "string", "required": true, "x-example": "sara@example.com" },
+          { "name": "password", "in": "formData", "type": "string", "required": true }
+        ],
+        "responses": {
+          "200": { "description": "Token", "examples": { "application/json": { "token": "abc" } } },
+          "401": { "description": "Wrong password", "examples": { "application/json": { "error": "invalid_credentials" } } }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "produces": ["text/plain"],
+        "security": [],
+        "responses": { "200": { "description": "Up", "examples": { "text/plain": "ok" } } }
+      }
+    },
+    "/reports/{year}": {
+      "get": {
+        "operationId": "report",
+        "produces": ["application/pdf"],
+        "parameters": [{ "name": "year", "in": "path", "required": true, "type": "integer" }],
+        "responses": { "200": { "description": "PDF", "schema": { "type": "file" } } }
+      }
+    }
+  },
+  "parameters": {
+    "UserId": { "name": "id", "in": "path", "required": true, "type": "integer" }
+  },
+  "responses": {
+    "NotFound": { "description": "Not found", "schema": { "$ref": "#/definitions/Error" } }
+  },
+  "definitions": {
+    "User": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "name": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "role": { "type": "string", "enum": ["admin", "member"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "address": { "$ref": "#/definitions/Address" },
+        "manager": { "$ref": "#/definitions/User", "x-nullable": true },
+        "tags": { "type": "array", "items": { "type": "string" }, "minItems": 2 }
+      }
+    },
+    "Address": {
+      "type": "object",
+      "properties": {
+        "city": { "type": "string", "default": "Cairo" },
+        "zip": { "type": "string", "maxLength": 3, "x-nullable": true }
+      }
+    },
+    "NewOrder": {
+      "type": "object",
+      "properties": { "sku": { "type": "string" }, "qty": { "type": "integer" } }
+    },
+    "Error": {
+      "allOf": [
+        { "type": "object", "properties": { "code": { "type": "integer" } } },
+        { "type": "object", "properties": { "message": { "type": "string", "minLength": 8 } } }
+      ]
+    }
+  }
+}

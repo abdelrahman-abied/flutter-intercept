@@ -2,6 +2,7 @@
  * Format detection for mock collections (CONTRACTS §21.1). Pure: no vscode, no fs, no network.
  */
 import { redactUrl } from '../agent/redact';
+import { isInsomniaDoc } from './insomnia';
 import type { DetectFormat } from './types';
 
 type Obj = Record<string, unknown>;
@@ -49,9 +50,15 @@ function isPostmanV1Schema(schema: string): boolean {
   return /collection\/v1(?:\.\d+)*(?:\/|$)/i.test(s) || /^v?1(?:\.\d+)*$/i.test(s);
 }
 
+/** CONTRACTS §24.4: the `bruno.json` of a Bruno collection (the host reads the folder next to it). */
+export function isBrunoJson(doc: unknown): boolean {
+  return isObj(doc) && own(doc, 'type') === 'collection' && typeof own(doc, 'name') === 'string' && own(doc, 'item') === undefined && own(doc, 'info') === undefined;
+}
+
 /**
- * CONTRACTS §21.1: returns `postman` or `openapi`, or a readable one-line `problem`
- * (Swagger 2.0, Postman v1, environment files, unrecognised inputs). Never throws.
+ * CONTRACTS §21.1 / §24.4: returns `postman`, `openapi`, `swagger` (2.0) or `insomnia` (v4 JSON export, v5 YAML), or
+ * a readable one-line `problem` (Postman v1, environment files, unrecognised inputs). A Bruno collection is a folder:
+ * the host knows it by its `bruno.json` (`isBrunoLinkFile`), never from here. Never throws.
  */
 export const detectFormat: DetectFormat = (doc) => {
   if (!isObj(doc)) {
@@ -66,18 +73,24 @@ export const detectFormat: DetectFormat = (doc) => {
     if (openapi.startsWith('3.')) {
       return { format: 'openapi' };
     }
-    if (openapi.startsWith('2.')) {
-      return { problem: formatProblem("Swagger 2.0 isn't supported yet: convert it to OpenAPI 3.") };
-    }
     return { problem: formatProblem(`Unsupported OpenAPI version "${quoteFileText(openapi, 40)}" (expected 3.x).`) };
   }
 
   const swagger = own(doc, 'swagger');
   if (swagger !== undefined) {
+    // CONTRACTS §24.4: Swagger 2.0
     if (typeof swagger === 'string' && swagger.startsWith('2.')) {
-      return { problem: formatProblem("Swagger 2.0 isn't supported yet: convert it to OpenAPI 3.") };
+      return { format: 'swagger' };
     }
-    return { problem: formatProblem("Swagger isn't supported yet: convert it to OpenAPI 3.") };
+    if (swagger === 2) {
+      return { format: 'swagger' }; // `swagger: 2.0` unquoted in YAML reads as the number 2
+    }
+    return { problem: formatProblem('Unsupported Swagger version (expected "2.0"): convert it to OpenAPI 3.') };
+  }
+
+  // CONTRACTS §24.4: an Insomnia v4 export (`_type: "export"`) or v5 file (`type: collection.insomnia.rest/5.0`)
+  if (isInsomniaDoc(doc)) {
+    return { format: 'insomnia' };
   }
 
   const info = own(doc, 'info');
@@ -107,5 +120,9 @@ export const detectFormat: DetectFormat = (doc) => {
     return { problem: formatProblem('This looks like a Postman environment file, not a collection.') };
   }
 
-  return { problem: formatProblem('Unrecognised file format: expected a Postman Collection (v2.0/v2.1) or OpenAPI 3 document.') };
+  if (isBrunoJson(doc)) {
+    return { problem: formatProblem('This is the bruno.json of a Bruno collection: link the file named bruno.json itself (its folder is read).') };
+  }
+
+  return { problem: formatProblem('Unrecognised file format: expected a Postman Collection (v2.0/v2.1), an OpenAPI 3 or Swagger 2.0 document, an Insomnia export or a Bruno collection (bruno.json).') };
 };

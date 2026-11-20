@@ -169,7 +169,21 @@ export type CollectionsDeps = Pick<
   'state' | 'rules' | 'fileProblems' | 'onDidChange' | 'endpoints' | 'example' | 'toRule' | 'update' | 'removeWithConfirmation' | 'importInteractive'
 > &
   /** CONTRACTS §21.16: the IDE's approval prompt (absent in hosts that have none: `approveCollection` answers an error). */
-  Partial<Pick<MockCollectionsHost, 'approveWithConfirmation'>>;
+  Partial<Pick<MockCollectionsHost, 'approveWithConfirmation'>> &
+  /** CONTRACTS §22.9 / §22.10: stateful mocks (absent: the store messages answer an error). */
+  Partial<Pick<MockCollectionsHost, 'storeStatus' | 'storeItems' | 'updateStore' | 'storeSnapshot' | 'onDidChangeStore'>> &
+  /** CONTRACTS §24.9: the number of signed-in sessions of a collection changed (Status follows). */
+  Partial<Pick<MockCollectionsHost, 'onDidChangeAuth'>> &
+  /** CONTRACTS §23 (part 2): fake backend from traffic, drift, Update example (absent: those messages answer an error). */
+  Partial<Pick<MockCollectionsHost, 'mockFromTrafficInteractive' | 'updateExampleInteractive' | 'ignoreDrift' | 'onDidChangeDrift'>>;
+
+/** CONTRACTS §22.10: `storeItems` pages, and how long the host waits before pushing a changed resource again. */
+export const STORE_ITEMS_PAGE = 200;
+export const STORE_PUSH_DEBOUNCE_MS = 200;
+/** CONTRACTS §24.9: how long the host waits before re-sending `status` after a session count changed. */
+export const AUTH_STATUS_DEBOUNCE_MS = 500;
+/** At most this many records are pushed again (offset 0) for what the panel has loaded. */
+const STORE_PUSH_MAX = 1000;
 
 /** CONTRACTS §21.8: collections the panel opened since its last `ready` whose endpoints are pushed on changes. */
 export const MAX_WATCHED_COLLECTIONS = 20;
@@ -384,13 +398,20 @@ export class InterceptController {
     this.grpcSub = deps.grpc?.onDidChange?.(() => this.broadcastStatus());
     // CONTRACTS §21.5 / §21.8
     this.collectionsSub = deps.collections?.onDidChange(() => this.onCollectionsChanged());
+    this.storeSub = deps.collections?.onDidChangeStore?.((id, resource) => this.onStoreChanged(id, resource));
+    this.sessionsSub = deps.collections?.onDidChangeAuth?.(() => this.onSessionsChanged());
+    // CONTRACTS §23.3: drift findings arrive with traffic (already debounced by the host)
+    this.driftSub = deps.collections?.onDidChangeDrift?.(() => this.refreshCollectionViews());
     if (deps.collections) deps.host.setCollectionRules?.(this.collectionRules());
     this.modelsSub = deps.contract?.onDidChangeModels(() => this.recheckContracts());
   }
 
   attach(sink: Sink): () => void {
     this.sinks.add(sink);
-    return () => this.sinks.delete(sink);
+    return () => {
+      this.storeWatches.delete(sink);
+      return this.sinks.delete(sink);
+    };
   }
 
   get pausedCount(): number {
@@ -576,12 +597,95 @@ export class InterceptController {
     this.deps.host.setCollectionRules?.(this.collectionRules());
     this.broadcastStatus();
     this.pushCollectionEndpoints();
+    // a rebuilt store (new id field, snapshot, …): open tables follow
+    for (const w of this.storeWatches.values()) w.dirty = true;
+    this.scheduleStorePush(false);
+  }
+
+  private driftSub?: { dispose(): void };
+
+  /** @internal (handlers, drift) Status again and fresh endpoints for the open collections (CONTRACTS §23). */
+  refreshCollectionViews(): void {
+    this.broadcastStatus();
+    this.pushCollectionEndpoints();
   }
 
   /** @internal (handlers) `ready`: the panel starts over, nothing is open. */
-  resetCollectionViews(): void {
+  resetCollectionViews(sink?: Sink): void {
     this.watchedCollections = [];
     this.pushedEndpoints.clear();
+    if (sink) this.storeWatches.delete(sink);
+    else this.storeWatches.clear();
+  }
+
+  // ------------------------------------------------------------------ CONTRACTS §22.10 (stateful mocks)
+
+  private storeSub?: { dispose(): void };
+  /** Per panel: the last resource it asked records for (pushed again while its data changes). */
+  private readonly storeWatches = new Map<Sink, { id: string; resource: string; filter?: string; upTo: number; dirty: boolean }>();
+  private storeTimer?: NodeJS.Timeout;
+  private storeStatusDirty = false;
+
+  /** @internal (handlers) `getStoreItems`: answers one page and remembers the resource for this panel. */
+  watchStoreItems(id: string, resource: string, offset: number, filter: string | undefined, reply: Sink): void {
+    const svc = this.deps.collections;
+    if (!svc?.storeItems) throw new Error("Stateful mocks aren't available here.");
+    const page = svc.storeItems(id, resource, { offset, limit: STORE_ITEMS_PAGE, ...(filter ? { filter } : {}) });
+    const prev = this.storeWatches.get(reply);
+    const same = prev && prev.id === id && prev.resource === resource && prev.filter === filter;
+    const upTo = Math.min(STORE_PUSH_MAX, Math.max(same ? prev.upTo : 0, offset + STORE_ITEMS_PAGE));
+    this.storeWatches.set(reply, { id, resource, ...(filter ? { filter } : {}), upTo, dirty: false });
+    this.send(reply, { type: 'storeItems', id, resource, offset, total: page.total, items: page.items, ...(page.truncated ? { truncated: true as const } : {}) });
+  }
+
+  private onStoreChanged(id: string, resource: string | undefined): void {
+    this.storeStatusDirty = true;
+    for (const w of this.storeWatches.values()) if (w.id === id && (resource === undefined || w.resource === resource)) w.dirty = true;
+    this.scheduleStorePush(true);
+  }
+
+  private sessionsSub?: { dispose(): void };
+  private sessionsTimer?: NodeJS.Timeout;
+
+  /** CONTRACTS §24.9: sessions are pushed live — `status` again, debounced (500 ms; a burst of logins is one push). */
+  private onSessionsChanged(): void {
+    if (this.sessionsTimer) return;
+    this.sessionsTimer = setTimeout(() => {
+      this.sessionsTimer = undefined;
+      this.broadcastStatus();
+    }, AUTH_STATUS_DEBOUNCE_MS);
+    this.sessionsTimer.unref?.();
+  }
+
+  /** Debounced (200 ms): the counts in Status, and the open tables whose data changed. */
+  private scheduleStorePush(status: boolean): void {
+    if (status) this.storeStatusDirty = true;
+    if (this.storeTimer) return;
+    this.storeTimer = setTimeout(() => {
+      this.storeTimer = undefined;
+      if (this.storeStatusDirty) {
+        this.storeStatusDirty = false;
+        this.broadcastStatus();
+      }
+      this.pushStoreItems();
+    }, STORE_PUSH_DEBOUNCE_MS);
+    this.storeTimer.unref?.();
+  }
+
+  private pushStoreItems(): void {
+    const svc = this.deps.collections;
+    if (!svc?.storeItems) return;
+    for (const [sink, w] of this.storeWatches) {
+      if (!w.dirty || !this.sinks.has(sink)) continue;
+      w.dirty = false;
+      let page: { total: number; items: unknown[]; truncated?: true };
+      try {
+        page = svc.storeItems(w.id, w.resource, { offset: 0, limit: w.upTo, ...(w.filter ? { filter: w.filter } : {}) });
+      } catch {
+        page = { total: 0, items: [] }; // the store stopped (turned off, collection gone): an empty table
+      }
+      this.send(sink, { type: 'storeItems', id: w.id, resource: w.resource, offset: 0, total: page.total, items: page.items, ...(page.truncated ? { truncated: true as const } : {}) });
+    }
   }
 
   /** @internal (handlers) `getCollectionEndpoints`: remember the id (at most MAX_WATCHED_COLLECTIONS) and answer. */
@@ -993,6 +1097,14 @@ export class InterceptController {
     this.modelsSub?.dispose();
     this.grpcSub?.dispose();
     this.collectionsSub?.dispose();
+    this.storeSub?.dispose();
+    this.sessionsSub?.dispose();
+    this.driftSub?.dispose();
+    if (this.sessionsTimer) clearTimeout(this.sessionsTimer);
+    this.sessionsTimer = undefined;
+    if (this.storeTimer) clearTimeout(this.storeTimer);
+    this.storeTimer = undefined;
+    this.storeWatches.clear();
     if (this.authTimer) clearTimeout(this.authTimer);
     this.authTimer = undefined;
     this.sinks.clear();

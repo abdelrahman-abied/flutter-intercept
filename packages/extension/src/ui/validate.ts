@@ -64,9 +64,25 @@ export function checkStatus(v: unknown, where: string): number {
   return v;
 }
 
-export function checkHeaderValue(v: unknown, where: string): void {
+/** What Node can send in a header value (`http.validateHeaderValue`): tab, printable ASCII and Latin-1. */
+const SENDABLE_HEADER_VALUE = /^[\t\x20-\x7e\x80-\xff]*$/;
+/** Control characters (tab excepted). */
+const HEADER_CONTROL = /[\x00-\x08\x0a-\x1f\x7f]/;
+/** Headers whose parameters the proxy writes as RFC 8187 ext-values (`filename*=UTF-8''…`) when they hold other text. */
+const PARAMETERISED_HEADERS = new Set(['content-disposition', 'link']);
+
+/**
+ * REVIEW-16 #14: a header value HTTP can send — no CR / LF / NUL or other control characters, and only Latin-1 text
+ * (`content-disposition` / `link` may hold any text: the proxy encodes their parameters). Node refuses anything
+ * else when the answer is sent, so it is refused here with a message that says why.
+ */
+export function checkHeaderValue(v: unknown, where: string, name?: string): void {
   if (typeof v !== 'string') fail(where, 'header values must be strings');
   if (/[\r\n\0]/.test(v)) fail(where, 'header values must not contain CR, LF or NUL');
+  if (HEADER_CONTROL.test(v)) fail(where, 'header values must not contain control characters');
+  if (!SENDABLE_HEADER_VALUE.test(v) && !(name !== undefined && PARAMETERISED_HEADERS.has(name.toLowerCase()))) {
+    fail(where, 'header values must be Latin-1 text: HTTP can\'t send characters such as Arabic letters or emoji in a header (put them in the body, or percent-encode them)');
+  }
 }
 
 /** `Record<string, string>` (mock headers) or, with `multi`, `Record<string, string | string[]>` (edits). */
@@ -74,8 +90,8 @@ export function checkHeaders(v: unknown, where: string, multi: boolean): void {
   if (!isObj(v)) fail(where, 'headers must be an object');
   for (const [name, value] of Object.entries(v)) {
     if (!TOKEN.test(name)) fail(where, `invalid header name "${name}"`);
-    if (multi && Array.isArray(value)) value.forEach((x) => checkHeaderValue(x, `${where} "${name}"`));
-    else checkHeaderValue(value, `${where} "${name}"`);
+    if (multi && Array.isArray(value)) value.forEach((x) => checkHeaderValue(x, `${where} "${name}"`, name));
+    else checkHeaderValue(value, `${where} "${name}"`, name);
   }
 }
 
@@ -318,6 +334,10 @@ export function validateAction(a: unknown, aw: string, inStep: boolean): RuleAct
       if (typeof a.code === 'string' && Buffer.byteLength(a.code, 'utf8') > MAX_SCRIPT_BYTES) fail(aw, 'code must be at most 256 KB');
       return { ...a, code: (a.code as string | undefined) ?? '' } as RuleAction;
     }
+    case 'handler':
+      // CONTRACTS §22.1: only the host builds these (a collection's remembered resources); never a user / agent / file rule
+      fail(aw, 'a stateful mock ("handler") is built by Flutter Intercept from a collection; it can\'t be written as a rule (use a mock instead)');
+      break;
     default:
       fail(aw, `unknown kind ${JSON.stringify(a.kind)}`);
   }

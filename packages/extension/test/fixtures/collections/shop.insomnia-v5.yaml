@@ -1,0 +1,126 @@
+type: collection.insomnia.rest/5.0
+schema_version: "5.1"
+name: Shop API
+meta:
+  id: wrk_shop
+authentication:
+  type: bearer
+  token: "{{ _.token }}"
+collection:
+  - name: Auth
+    meta:
+      id: fld_auth
+      sortKey: -100
+    children:
+      - url: "{{ _.baseUrl }}/auth/login"
+        name: Log in
+        meta:
+          id: req_login
+          sortKey: -10
+        method: POST
+        body:
+          mimeType: application/json
+          text: '{"email":"sara@example.com","password":"hunter2"}'
+        headers:
+          - name: Content-Type
+            value: application/json
+        authentication:
+          type: none
+      - url: "{{ _.baseUrl }}/auth/refresh"
+        name: Refresh
+        meta:
+          id: req_refresh
+          sortKey: -9
+        method: POST
+        authentication:
+          type: bearer
+          token: refresh-token-literal
+  - name: Users
+    meta:
+      id: fld_users
+      sortKey: -90
+    authentication:
+      type: bearer
+      token: "{{ _.token }}"
+    children:
+      - url: "{{ _.baseUrl }}/users"
+        name: List users
+        meta:
+          id: req_list
+        method: GET
+        parameters:
+          - name: page
+            value: "1"
+      - url: "{{ _.baseUrl }}/users/me"
+        name: Me
+        meta:
+          id: req_me
+        method: GET
+      - url: "{{ _.baseUrl }}/users/:id"
+        name: User by id
+        meta:
+          id: req_user
+        method: GET
+        pathParameters:
+          - name: id
+            value: "42"
+      - url: "{{ _.baseUrl }}/users/:id"
+        name: Delete user
+        meta:
+          id: req_delete
+        method: DELETE
+      - name: Orders
+        meta:
+          id: fld_orders
+        children:
+          - url: "{{ _.baseUrl }}/{{ _.apiVersion }}/orders/{{ orderId }}/items"
+            name: Order items
+            meta:
+              id: req_items
+            method: GET
+  - url: https://CDN.shop.example:443/config.json
+    name: Remote config
+    meta:
+      id: req_config
+    method: GET
+  - url: "{{ _.baseUrl }}/health"
+    name: Health
+    meta:
+      id: req_health
+    method: GET
+  - url: "{{ _.baseUrl }}/health"
+    name: Health (copy)
+    meta:
+      id: req_health2
+    method: GET
+  - url: "{{ _.analyticsHost }}/collect"
+    name: Analytics
+    meta:
+      id: req_analytics
+    method: POST
+  - url: wss://live.shop.example/socket
+    name: Live updates
+    meta:
+      id: ws-req_live
+cookieJar:
+  name: Default Jar
+  meta:
+    id: jar_shop
+environments:
+  name: Base Environment
+  meta:
+    id: env_base
+  data:
+    apiVersion: v2
+  subEnvironments:
+    - name: Shop dev
+      meta:
+        id: env_dev
+      data:
+        baseUrl: https://api.shop.example
+        token: env-token-must-never-leave-the-host
+    - name: Staging
+      meta:
+        id: env_staging
+      data:
+        baseUrl: https://staging.shop.example

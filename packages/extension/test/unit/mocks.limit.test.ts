@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Rule } from '@flutter-intercept/proxy';
 import { approvalReasons } from '../../src/rules/policy';
-import { cleanLine, limitAnswer } from '../../src/mocks/limit';
+import { cleanLine, isLimitedHeader, limitAnswer, limitHeaders } from '../../src/mocks/limit';
 
 const mock = (status: number, headers: Record<string, string>, body = '{}'): Rule => ({ id: 'collection:c:1', enabled: true, match: { url: '*' }, action: { kind: 'mock', status, headers, body } });
 
@@ -56,5 +56,21 @@ describe('cleanLine', () => {
     expect(cleanLine('see https://bot:hunter2@api.example/x and ftp://u@h')).toBe('see https://***@api.example/x and ftp://***@h');
     expect(cleanLine('x'.repeat(400))).toHaveLength(300);
     expect(cleanLine('x'.repeat(400)).endsWith('…')).toBe(true);
+  });
+});
+
+// CONTRACTS §24.3 (part 3)
+describe('limitHeaders reasons, isLimitedHeader', () => {
+  it('limitHeaders says why (for the approval prompt of answers chosen at request time)', () => {
+    expect(limitHeaders(200, { 'content-type': 'application/json' }, '{}')).toEqual({ headers: { 'content-type': 'application/json' }, removed: [], reasons: [] });
+    const l = limitHeaders(302, { Location: 'https://x.example', 'Set-Cookie': 'a=1', 'content-type': 'application/json' }, '{}');
+    expect(l.removed.sort()).toEqual(['location', 'set-cookie']);
+    expect(l.reasons).toEqual(['redirects', 'sets cookies']);
+    expect(Object.keys(l.headers).map((k) => k.toLowerCase())).not.toContain('set-cookie');
+  });
+
+  it('headers an approval is about (and the content type, our marker) are never rendered', () => {
+    for (const h of ['Location', 'refresh', 'Set-Cookie', 'Access-Control-Allow-Origin', 'Content-Security-Policy-Report-Only', 'X-Forwarded-Host', 'Content-Type', 'x-flutter-intercept']) expect(isLimitedHeader(h), h).toBe(true);
+    for (const h of ['X-Request-Id', 'etag', 'x-total-count', 'cache-control']) expect(isLimitedHeader(h), h).toBe(false);
   });
 });

@@ -24,6 +24,7 @@
         {
           "name": "Log in",
           "request": {
+            "auth": { "type": "noauth" },
             "method": "POST",
             "header": [
               { "key": "Content-Type", "value": "application/json" },
@@ -35,7 +36,7 @@
           "response": [
             {
               "name": "Success",
-              "originalRequest": { "method": "POST", "header": [], "url": { "raw": "{{baseUrl}}/auth/login", "host": ["{{baseUrl}}"], "path": ["auth", "login"] } },
+              "originalRequest": { "method": "POST", "header": [], "body": { "mode": "raw", "raw": "{\"email\":\"sara@example.com\",\"password\":\"hunter2\"}" }, "url": { "raw": "{{baseUrl}}/auth/login", "host": ["{{baseUrl}}"], "path": ["auth", "login"] } },
               "status": "OK",
               "code": 200,
               "_postman_previewlanguage": "json",
@@ -44,7 +45,7 @@
             },
             {
               "name": "Wrong password",
-              "originalRequest": { "method": "POST", "header": [], "url": { "raw": "{{baseUrl}}/auth/login", "host": ["{{baseUrl}}"], "path": ["auth", "login"] } },
+              "originalRequest": { "method": "POST", "header": [], "body": { "mode": "raw", "raw": "{\"email\":\"sara@example.com\",\"password\":\"wrong-guess\"}" }, "url": { "raw": "{{baseUrl}}/auth/login", "host": ["{{baseUrl}}"], "path": ["auth", "login"] } },
               "status": "Unauthorized",
               "code": 401,
               "_postman_previewlanguage": "json",

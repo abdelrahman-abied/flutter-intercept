@@ -1,0 +1,46 @@
+meta {
+  name: Remote config
+  type: http
+  seq: 3
+}
+
+get {
+  url: https://CDN.shop.example:443/config.json
+  body: none
+  auth: inherit
+}
+
+example {
+  name: OK
+
+  request: {
+    url: https://CDN.shop.example:443/config.json
+    method: get
+    mode: none
+  }
+
+  response: {
+    headers: {
+      Content-Type: application/json
+      Content-Length: 17
+      Date: Thu, 19 Nov 2026 10:00:00 GMT
+      X-Tag: a
+      X-Tag: b
+      Set-Cookie: a=1
+      Set-Cookie: b=2
+      ~X-Off: x
+    }
+
+    status: {
+      code: 200
+      text: OK
+    }
+
+    body: {
+      type: json
+      content: '''
+        {"theme":"dark"}
+      '''
+    }
+  }
+}

@@ -1,0 +1,15 @@
+auth {
+  mode: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+vars:pre-request {
+  apiVersion: v2
+}
+
+script:pre-request {
+  bru.setVar("ts", Date.now());
+}

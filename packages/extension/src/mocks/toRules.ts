@@ -1,6 +1,10 @@
 /**
  * From a parsed collection to `mock` rules (CONTRACTS §21.5). Pure: no vscode, no fs.
  *
+ * CONTRACTS §22.6 / §24: with `stateful` / `pipeline`, an endpoint that needs the host at request time (a store
+ * operation, the auth gate, an example chosen by the request body, dynamic values) gets a `handler` rule in the same
+ * position, with the static answer as its `fallback`; every other endpoint stays a plain `mock` rule.
+ *
  * Every regex is built only from escaped literals and the fixed pieces below, which pass the proxy's
  * `isSafeRegexSource` (REVIEW-4 #2): at most 2 unbounded quantifiers, at most 1 on a wide atom, ≤ 256 characters.
  * An endpoint whose regex would be longer is not mocked (REVIEW-15 #3: the old glob fallback could turn one request
@@ -8,6 +12,8 @@
  * methods become rules.
  */
 import type { Rule } from '@flutter-intercept/proxy';
+import { hasPlaceholders, renderDynamic } from './dynamic';
+import { isLimitedHeader } from './limit';
 import {
   COLLECTION_LIMITS,
   COLLECTION_RULE_PREFIX,
@@ -16,11 +22,53 @@ import {
   type MockEndpoint,
   type MockExample,
   type ParsedCollection,
-  type ToRules,
   type ToRulesOptions,
   type ToRulesStats,
   type CollectionRuleMeta,
+  type Resource,
+  type StoreOp,
 } from './types';
+
+/**
+ * CONTRACTS §22.6: the resources whose operation endpoints a store answers (`handler` rules). Absent → 0.15 rules
+ * exactly (store off, or a host with no handler).
+ */
+export interface StatefulRulesOptions {
+  /** `collection:<linkId>`. */
+  handlerId: string;
+  /** Resources that remember (the ones turned off are left out by the caller). */
+  resources: readonly Resource[];
+}
+
+/**
+ * CONTRACTS §24 (the answer pipeline): what else needs the host's handler at request time. Absent → no auth gate, no
+ * examples by body, no dynamic values (0.15 / §22 rules exactly).
+ */
+export interface PipelineRulesOptions {
+  /** `collection:<linkId>`. */
+  handlerId: string;
+  /** §24.1, auth simulation on: endpoint keys behind the gate — protected requests and the login / refresh / logout requests. */
+  auth?: ReadonlySet<string>;
+  /** §24.2: endpoint keys with at least one example chosen by the request body. */
+  body?: ReadonlySet<string>;
+  /** §24.3: link variables + the collection's own (never environment values): a `{{name}}` among them is filled in at answer time. */
+  vars?: ReadonlyMap<string, string>;
+}
+
+/** What the host's handler needs to know about a rule (internal: never shown). */
+export interface PipelineRuleMeta extends CollectionRuleMeta {
+  /** Why the rule is a `handler` rule besides a store operation. */
+  needs?: { auth?: true; body?: true; dynamic?: true };
+  /** A query-example rule: its own example answers (after the auth gate). */
+  query?: true;
+}
+
+export interface ToRulesResult {
+  rules: Rule[];
+  stats: ToRulesStats;
+  problems: string[];
+  meta: Map<string, PipelineRuleMeta>;
+}
 
 /** Longest regex source the proxy accepts (`MAX_REGEX_SOURCE` in packages/proxy/src/rules.ts). */
 export const MAX_SOURCE = 256;
@@ -129,7 +177,7 @@ function headerObject(entries: [string, string][]): Record<string, string> {
 }
 
 /** Example headers that a rule can carry: valid names, no CR / LF / NUL. Skipped names go to `dropped`. */
-function cleanHeaders(h: Readonly<Record<string, string>>, dropped: string[]): Record<string, string> {
+export function cleanHeaders(h: Readonly<Record<string, string>>, dropped: string[]): Record<string, string> {
   const ok: [string, string][] = [];
   for (const [k, v] of Object.entries(h)) {
     if (TOKEN.test(k) && typeof v === 'string' && !BAD_HEADER_VALUE.test(v)) ok.push([k, v]);
@@ -138,7 +186,32 @@ function cleanHeaders(h: Readonly<Record<string, string>>, dropped: string[]): R
   return headerObject(ok);
 }
 
-const is2xx = (x: MockExample) => x.status >= 200 && x.status <= 299;
+export const is2xx = (x: Pick<MockExample, 'status'>): boolean => x.status >= 200 && x.status <= 299;
+
+/** Whether an answer's body is JSON (dynamic values inside its strings are escaped, §24.3). */
+export function isJsonAnswer(headers: Readonly<Record<string, string>>, body: string): boolean {
+  const ct = Object.entries(headers).find(([k]) => k.toLowerCase() === 'content-type')?.[1];
+  if (typeof ct === 'string' && ct.trim()) return /json/i.test(ct);
+  return /^\s*[{[]/.test(body);
+}
+
+/**
+ * CONTRACTS §24.3: would filling in dynamic values / variables change this answer (its body, or a header that is not
+ * one an approval is about)? Checked with the fixed values, so it costs one pass and is deterministic.
+ */
+function dynamicNeed(x: MockExample, headers: Readonly<Record<string, string>>, vars: PipelineRulesOptions['vars'], problems: string[]): boolean {
+  let need = false;
+  if (hasPlaceholders(x.body)) {
+    const r = renderDynamic(x.body, { mode: 'fixed', ...(vars ? { vars } : {}), json: isJsonAnswer(headers, x.body) });
+    if (r.text !== x.body) need = true;
+    problems.push(...r.problems);
+  }
+  for (const [k, v] of Object.entries(headers)) {
+    if (isLimitedHeader(k) || !hasPlaceholders(v)) continue;
+    if (renderDynamic(v, { mode: 'fixed', ...(vars ? { vars } : {}), json: false }).text !== v) need = true;
+  }
+  return need;
+}
 
 /** Examples a rule can answer with (the parsers guarantee this; checked again because rules reach the proxy). */
 function usable(x: MockExample): boolean {
@@ -146,7 +219,7 @@ function usable(x: MockExample): boolean {
 }
 
 /** §21.5: the example the endpoint's default rule answers with. */
-function defaultExample(e: MockEndpoint, selected: string | undefined): { example: MockExample; missingSelection: boolean } | undefined {
+export function defaultExample(e: MockEndpoint, selected: string | undefined): { example: MockExample; missingSelection: boolean } | undefined {
   if (!e.examples.length) return undefined;
   if (selected !== undefined) {
     const chosen = e.examples.find((x) => x.name === selected);
@@ -172,10 +245,21 @@ interface Draft {
   match: Rule['match'];
   action: Rule['action'];
   name: string;
-  meta: CollectionRuleMeta;
+  meta: PipelineRuleMeta;
 }
 
-export const toRules: ToRules = (parsed: ParsedCollection, opts: ToRulesOptions) => {
+/** Endpoint key → the resource operation it is (CONTRACTS §22.6). */
+function statefulOps(st: StatefulRulesOptions | undefined): Map<string, { resource: string; op: StoreOp }> {
+  const out = new Map<string, { resource: string; op: StoreOp }>();
+  for (const r of st?.resources ?? []) {
+    for (const [op, key] of Object.entries(r.ops) as [StoreOp, string | undefined][]) if (key !== undefined && !out.has(key)) out.set(key, { resource: r.name, op });
+  }
+  return out;
+}
+
+export function toRules(parsed: ParsedCollection, opts: ToRulesOptions & { stateful?: StatefulRulesOptions; pipeline?: PipelineRulesOptions }): ToRulesResult {
+  const stateful = statefulOps(opts.stateful);
+  const pipe = opts.pipeline;
   const stats: ToRulesStats = { endpoints: parsed.endpoints.length, mocked: 0, noExample: 0, unresolved: 0, off: 0, generated: 0, tooLong: 0 };
   const problems: string[] = [];
   const off = new Set(opts.off);
@@ -221,12 +305,28 @@ export const toRules: ToRules = (parsed: ParsedCollection, opts: ToRulesOptions)
     const dropped: string[] = [];
     const ruleName = (exampleName: string) => cutMiddle(`${prefix}${e.name} · ${exampleName}`);
 
+    // CONTRACTS §22.6: a resource operation is answered by the store, unless an example is chosen for it explicitly
+    const selectedName = opts.selected[e.key];
+    const explicit = selectedName !== undefined && e.examples.some((x) => x.name === selectedName);
+    const op = opts.stateful && !explicit ? stateful.get(e.key) : undefined;
+    // CONTRACTS §24: what else the host decides at request time. A chosen example stays static (it beats the auth
+    // gate and the examples by body), except for its dynamic values.
+    const gated = !!pipe?.auth?.has(e.key);
+    const dynamicProblems: string[] = [];
+    const withNeeds = (d: Draft, needs: NonNullable<PipelineRuleMeta['needs']>, query: boolean): Draft => {
+      if (!pipe || d.action.kind !== 'mock' || !Object.keys(needs).length) return d;
+      return { ...d, action: { kind: 'handler', handlerId: pipe.handlerId, fallback: d.action }, meta: { ...d.meta, needs, ...(query ? { query: true as const } : {}) } };
+    };
+
     // Examples chosen by query parameters (§21.5): their own rules, before the default one.
     const byQuery = e.examples
       .map((x, i) => ({ x, i, keys: x.query ? Object.keys(x.query).sort() : [] }))
       .filter((q) => q.keys.length > 0)
       .sort((a, b) => b.keys.length - a.keys.length || a.i - b.i);
-    {
+    if (op && byQuery.length) {
+      problems.push(`${label}: examples chosen by query parameters aren't used while ${op.resource} remembers (the remembered data answers)`);
+    }
+    if (!op) {
       for (const { x, keys } of byQuery) {
         const used = keys.slice(0, COLLECTION_LIMITS.exampleQueryParams);
         if (keys.length > used.length) {
@@ -237,24 +337,30 @@ export const toRules: ToRules = (parsed: ParsedCollection, opts: ToRulesOptions)
           problems.push(`${label}: example "${x.name.slice(0, 60)}" can't be chosen by its query parameters (too long); the default example answers instead`);
           continue;
         }
-        drafts.push({
+        const headers = cleanHeaders(x.headers, dropped);
+        const draft: Draft = {
           match: { method, url: `/${source}/i` },
-          action: { kind: 'mock', status: x.status, headers: cleanHeaders(x.headers, dropped), body: x.body },
+          action: { kind: 'mock', status: x.status, headers, body: x.body },
           name: ruleName(x.name),
           meta: { endpoint: e.key, example: x.name },
-        });
+        };
+        // §24: gated like the rest of the endpoint when auth simulation is on; its own example is the answer
+        drafts.push(withNeeds(draft, { ...(gated ? { auth: true as const } : {}), ...(pipe && dynamicNeed(x, headers, pipe.vars, dynamicProblems) ? { dynamic: true as const } : {}) }, true));
       }
     }
 
     // The default rule.
     const url = `/${base}${PATH_END}/i`;
     const chosen = defaultExample(e, opts.selected[e.key]);
+    let dynamic = false;
     if (chosen) {
       if (chosen.missingSelection) {
         problems.push(`${label}: the selected example "${opts.selected[e.key].slice(0, 60)}" isn't in the collection any more; "${chosen.example.name.slice(0, 60)}" answers instead`);
       }
       const x = chosen.example;
-      drafts.push({ match: { method, url }, action: { kind: 'mock', status: x.status, headers: cleanHeaders(x.headers, dropped), body: x.body }, name: ruleName(x.name), meta: { endpoint: e.key, example: x.name } });
+      const headers = cleanHeaders(x.headers, dropped);
+      dynamic = !!pipe && !op && dynamicNeed(x, headers, pipe.vars, dynamicProblems);
+      drafts.push({ match: { method, url }, action: { kind: 'mock', status: x.status, headers, body: x.body }, name: ruleName(x.name), meta: { endpoint: e.key, example: x.name } });
       stats.mocked++;
       if (x.generated) stats.generated++;
     } else {
@@ -274,6 +380,22 @@ export const toRules: ToRules = (parsed: ParsedCollection, opts: ToRulesOptions)
       });
       stats.noExample++;
     }
+    const needs: NonNullable<PipelineRuleMeta['needs']> = {
+      ...(gated && !explicit ? { auth: true as const } : {}),
+      ...(pipe?.body?.has(e.key) && !explicit ? { body: true as const } : {}),
+      ...(dynamic ? { dynamic: true as const } : {}),
+    };
+    if (op) {
+      // the same position; the 0.15 answer stays as the fallback (a host with no store running answers it)
+      const d = drafts[drafts.length - 1];
+      if (d.action.kind === 'mock') {
+        const meta: PipelineRuleMeta = { endpoint: e.key, resource: op.resource, op: op.op, ...(pipe && Object.keys(needs).length ? { needs } : {}) };
+        drafts[drafts.length - 1] = { ...d, name: ruleName('remembered data'), action: { kind: 'handler', handlerId: opts.stateful!.handlerId, fallback: d.action }, meta };
+      }
+    } else {
+      drafts[drafts.length - 1] = withNeeds(drafts[drafts.length - 1], needs, false);
+    }
+    for (const p of [...new Set(dynamicProblems)].slice(0, 3)) problems.push(`${label}: ${p}`);
     if (dropped.length) {
       problems.push(`${label}: header${dropped.length > 1 ? 's' : ''} ${[...new Set(dropped)].slice(0, 5).map((d) => `"${d}"`).join(', ')} can't be sent (invalid name or value) and ${dropped.length > 1 ? 'were' : 'was'} left out`);
     }
@@ -298,11 +420,11 @@ export const toRules: ToRules = (parsed: ParsedCollection, opts: ToRulesOptions)
     }
   }
 
-  const meta = new Map<string, CollectionRuleMeta>();
+  const meta = new Map<string, PipelineRuleMeta>();
   const rules: Rule[] = drafts.map((d, i) => {
     const id = `${COLLECTION_RULE_PREFIX}${opts.id}:${i + 1}`;
     meta.set(id, d.meta);
     return { id, enabled: true, name: d.name, match: d.match, action: d.action };
   });
   return { rules, stats, problems, meta };
-};
+}

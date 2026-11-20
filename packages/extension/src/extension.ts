@@ -316,8 +316,31 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     // CONTRACTS §21.15 #4 (`seen`) and REVIEW-15 #8 (hosts passed through without decryption aren't mocked)
     exchanges: () => proxyHost.getExchanges(),
     passthroughHosts: () => [...proxyHost.learnedPassthrough.map((l) => `${l.host}:${l.port}`), ...proxyHost.tlsPassthrough],
+    // CONTRACTS §22.9: stateful mocks answer through the proxy's handler; their data is dropped when the proxy stops
+    setHandler: (id, fn) => proxyHost.setHandler(id, fn),
+    onProxyStopped: (listener) => {
+      const l = (running: unknown) => {
+        if (running === false) listener();
+      };
+      proxyHost.on('state', l);
+      return { dispose: () => void proxyHost.off('state', l) };
+    },
+    // CONTRACTS §23: a fake backend from a recording; drift from finished exchanges (a throttle-only rule's still count)
+    loadRecording: async (id) => (await recordings.load(id)).entries,
+    onExchange: (listener) => {
+      const l = (e: Exchange) => listener(e);
+      proxyHost.on('exchange', l);
+      return { dispose: () => void proxyHost.off('exchange', l) };
+    },
+    isThrottleOnlyRule: (ruleId) => proxyHost.getRules().find((r) => r.id === ruleId)?.action.kind === 'throttle',
+    driftEnabled: () => vscode.workspace.getConfiguration('flutterIntercept').get<boolean>('collectionDrift', true) !== false,
   });
   context.subscriptions.push(collections);
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('flutterIntercept.collectionDrift')) collections.refreshDrift();
+    }),
+  );
   context.subscriptions.push({ dispose: disposeRecordingDiffs });
   let upstreamProblemShown: string | undefined;
   const applyUpstreamProxy = () => {
@@ -843,6 +866,14 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     vscode.commands.registerCommand('flutterIntercept.exportOpenApi', () => exportCommand('openapi')),
     vscode.commands.registerCommand('flutterIntercept.exportPostman', () => exportCommand('postman')),
     vscode.commands.registerCommand('flutterIntercept.importCollection', () => collections.importInteractive()),
+    // CONTRACTS §23.2: the panel shows the result line; from the palette only errors are shown
+    vscode.commands.registerCommand('flutterIntercept.mockFromTraffic', async () => {
+      try {
+        await collections.mockFromTrafficInteractive({ session: {} });
+      } catch (e) {
+        void vscode.window.showErrorMessage(`Flutter Intercept: ${(e as Error).message}`);
+      }
+    }),
     vscode.commands.registerCommand('flutterIntercept.clear', () => controller.clear()),
     vscode.commands.registerCommand('flutterIntercept.debugWithIntercept', () => debugWithIntercept(deps)),
   );

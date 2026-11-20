@@ -2,6 +2,7 @@
  * Credential stripping for "Copy without credentials" (CONTRACTS §21.6, REVIEW-15 #2/#6/#7). Pure: no vscode, no fs, no network.
  */
 import { isSensitiveHeader, redactUrl } from '../agent/redact';
+import { isSecretHeaderName, isSecretName, isSecretQueryName } from './secrets';
 import { COLLECTION_LIMITS, type SanitisePostman } from './types';
 
 type Obj = Record<string, unknown>;
@@ -18,11 +19,52 @@ const BIDI_CONTROLS = /[\u202A-\u202E\u2066-\u2069]/g;
 const FORM_KEY = /^[A-Za-z0-9_.~%+-]+$/;
 
 const MAX_CLONE_DEPTH = 64;
-const TOO_LARGE_NOTICE = 'the rest of the collection was not copied (too large)';
+/** In `removed` when the walk stopped at its budget (the copy is cut). */
+export const SANITISE_TOO_LARGE = 'the rest of the collection was not copied (too large)';
+const TOO_LARGE_NOTICE = SANITISE_TOO_LARGE;
 
 interface WalkBudget {
   visited: number;
   exceeded: boolean;
+  /** Visits allowed: `COLLECTION_LIMITS.walkNodes`, more for a plain tree (REVIEW-16 #12). */
+  limit: number;
+}
+
+/** A plain tree (no object reached twice) of at most this many values gets a budget sized to it. */
+const MAX_TREE_NODES = 8_000_000;
+
+/**
+ * REVIEW-16 #12: the number of values in `doc` when it is a plain tree (what `JSON.parse` gives: no object reached
+ * twice) of at most `MAX_TREE_NODES` values, else undefined. Stops at the first shared object (a YAML alias DAG keeps
+ * the REVIEW-15 #2a budget) or past the cap, so it costs at most what the walk itself would.
+ */
+function treeSize(doc: unknown): number | undefined {
+  const seen = new WeakSet<object>();
+  let n = 0;
+  let ok = true;
+  const walk = (v: unknown, depth: number): void => {
+    if (!ok) return;
+    if (++n > MAX_TREE_NODES) {
+      ok = false;
+      return;
+    }
+    if (v === null || typeof v !== 'object' || depth > MAX_CLONE_DEPTH + 1) return;
+    if (seen.has(v)) {
+      ok = false;
+      return;
+    }
+    seen.add(v);
+    if (Array.isArray(v)) {
+      for (let i = 0; i < v.length && ok; i++) walk(v[i], depth + 1);
+    } else {
+      for (const k of Object.keys(v)) {
+        if (!ok) return;
+        walk(own(v as Obj, k), depth + 1);
+      }
+    }
+  };
+  walk(doc, 0);
+  return ok ? n : undefined;
 }
 
 function isObj(v: unknown): v is Obj {
@@ -60,7 +102,7 @@ function addRemoved(removed: Set<string>, name: string): void {
 function touchNode(budget: WalkBudget, removed: Set<string>, cost = 1): boolean {
   if (budget.exceeded) return false;
   budget.visited += cost;
-  if (budget.visited > COLLECTION_LIMITS.walkNodes) {
+  if (budget.visited > budget.limit) {
     budget.exceeded = true;
     addRemoved(removed, TOO_LARGE_NOTICE);
     return false;
@@ -68,17 +110,18 @@ function touchNode(budget: WalkBudget, removed: Set<string>, cost = 1): boolean 
   return true;
 }
 
+/** REVIEW-16 #4–#6: this copy's own substring rule, plus the shared word rule (`sid`, `otp`, `verificationCode`, `csrf` …). */
 function isSecretKeyName(name: string): boolean {
-  return SECRET_KEY.test(name) || SECRET_KEY_SUFFIX.test(name);
+  return SECRET_KEY.test(name) || SECRET_KEY_SUFFIX.test(name) || isSecretName(name);
 }
 
 function isSecretQueryKeyName(name: string): boolean {
-  return isSecretKeyName(name) || SECRET_QUERY_EXACT.test(name);
+  return isSecretKeyName(name) || SECRET_QUERY_EXACT.test(name) || isSecretQueryName(name);
 }
 
 function isSanitiseSensitiveHeader(name: string): boolean {
   const trimmed = name.trim();
-  return isSensitiveHeader(trimmed) || SENSITIVE_HEADER_EXTRA.test(trimmed);
+  return isSensitiveHeader(trimmed) || SENSITIVE_HEADER_EXTRA.test(trimmed) || isSecretHeaderName(trimmed);
 }
 
 /**
@@ -509,7 +552,8 @@ function sanitiseJsonString(raw: string, reqLabel: string, removed: Set<string>,
   if (raw.trim() === '') return raw;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    // REVIEW-16 #3: a leading BOM doesn't hide the body from the name rules
+    parsed = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
   } catch {
     const formSanitised = trySanitiseFormEncodedRaw(raw, removed);
     if (formSanitised !== undefined) return formSanitised;
@@ -622,6 +666,23 @@ function sanitiseBody(
 
 // ------------------------------------------------------------------ requests, responses, items
 
+/**
+ * CONTRACTS §24.1: an `auth` block keeps only its `type` (so auth simulation still knows which requests are protected
+ * in a copy without credentials); every value under it is dropped and `auth` is named in `removed`. A missing or odd
+ * type → the block is dropped as before.
+ */
+function authTypeOnly(v: unknown, removed: Set<string>): Obj | undefined {
+  const type = isObj(v) ? own(v, 'type') : undefined;
+  if (isObj(v) && Object.keys(v).some((k) => k !== 'type')) addRemoved(removed, 'auth');
+  if (typeof type !== 'string' || !/^[a-z0-9]{1,20}$/i.test(type)) {
+    if (v !== undefined && v !== null && !(isObj(v) && Object.keys(v).length === 0)) addRemoved(removed, 'auth');
+    return undefined;
+  }
+  const out = dict();
+  setKey(out, 'type', type);
+  return out;
+}
+
 function shouldDropBlock(key: string, v: unknown, removed: Set<string>): boolean {
   if (key === 'auth' || key === 'certificate' || key === 'certificates' || key === 'proxy') {
     if (Array.isArray(v) ? v.length > 0 : v !== undefined && v !== null) addRemoved(removed, key);
@@ -651,6 +712,11 @@ function sanitiseRequest(
   for (const k of Object.keys(rawReq)) {
     if (budget.exceeded) break;
     const v = own(rawReq, k);
+    if (k === 'auth') {
+      const kept = authTypeOnly(v, removed);
+      if (kept) setKey(out, k, kept);
+      continue;
+    }
     if (shouldDropBlock(k, v, removed)) continue;
     let val: unknown;
     if (k === 'header') {
@@ -741,6 +807,11 @@ function sanitiseItems(
     for (const k of Object.keys(entry)) {
       if (budget.exceeded) break;
       const v = own(entry, k);
+      if (k === 'auth') {
+        const kept = authTypeOnly(v, removed);
+        if (kept) setKey(copy, k, kept);
+        continue;
+      }
       if (shouldDropBlock(k, v, removed)) continue;
       let val: unknown;
       if (k === 'item') {
@@ -765,14 +836,19 @@ function sanitiseItems(
 }
 
 /**
- * CONTRACTS §21.6: returns a deep copy of a Postman collection with `auth`, `event`, `certificate` and `proxy`
- * blocks removed, sensitive request headers, variables, URL credentials, query parameters, request bodies and
- * example cookies cleared, and file `src` paths removed. Stops at `COLLECTION_LIMITS.walkNodes` without copying
- * unsanitised content. Never mutates its input and never throws; `removed` holds names only.
+ * CONTRACTS §21.6: returns a deep copy of a Postman collection with `event`, `certificate` and `proxy` blocks
+ * removed, `auth` blocks cut to their `type` (§24.1), sensitive request headers, variables, URL credentials, query parameters, request bodies and
+ * example cookies cleared, and file `src` paths removed. Stops at `COLLECTION_LIMITS.walkNodes` (a plain tree of up to
+ * 8 M values: a budget sized to it, REVIEW-16 #12) without copying unsanitised content (`removed` then holds
+ * `SANITISE_TOO_LARGE`). Never mutates its input and never throws; `removed` holds names only.
  */
 export const sanitisePostman: SanitisePostman = (doc) => {
   const removed = new Set<string>();
-  const budget: WalkBudget = { visited: 0, exceeded: false };
+  // REVIEW-16 #12: a plain tree (a parsed JSON file, a generated collection) gets a budget sized to it, so a large
+  // collection is copied whole; a YAML alias DAG keeps COLLECTION_LIMITS.walkNodes
+  const size = treeSize(doc);
+  const limit = size === undefined ? COLLECTION_LIMITS.walkNodes : Math.max(COLLECTION_LIMITS.walkNodes, size * 3 + 1000);
+  const budget: WalkBudget = { visited: 0, exceeded: false, limit };
   const active = new WeakSet<object>();
 
   if (!isObj(doc)) {
@@ -786,6 +862,11 @@ export const sanitisePostman: SanitisePostman = (doc) => {
   for (const k of Object.keys(doc)) {
     if (budget.exceeded) break;
     const v = own(doc, k);
+    if (k === 'auth') {
+      const kept = authTypeOnly(v, removed);
+      if (kept) setKey(out, k, kept);
+      continue;
+    }
     if (shouldDropBlock(k, v, removed)) continue;
     let val: unknown;
     if (k === 'variable') {

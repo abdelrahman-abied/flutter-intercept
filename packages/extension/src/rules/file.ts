@@ -251,17 +251,23 @@ export function serializeSharedFile(
   rules: unknown[],
   previous?: Pick<ParsedSharedFile, 'json' | 'indent' | 'eol'>,
   collections?: unknown[],
+  stores?: unknown[],
 ): string {
   const out: Record<string, unknown> = {};
   const prev = previous?.json ?? {};
   const dropCollections = collections !== undefined && collections.length === 0;
+  // CONTRACTS §22.7: `stores` is written only when given (a save of rules or collections keeps it as it is)
+  const dropStores = stores !== undefined && stores.length === 0;
   if (!('version' in prev)) out.version = FILE_VERSION;
   for (const k of Object.keys(prev)) {
     if (k === 'collections' && dropCollections) continue;
-    out[k] = k === 'version' ? FILE_VERSION : k === 'rules' ? rules : k === 'collections' && collections ? collections : prev[k];
+    if (k === 'stores' && dropStores) continue;
+    out[k] =
+      k === 'version' ? FILE_VERSION : k === 'rules' ? rules : k === 'collections' && collections ? collections : k === 'stores' && stores ? stores : prev[k];
   }
   if (!('rules' in prev)) out.rules = rules;
   if (collections?.length && !('collections' in prev)) out.collections = collections;
+  if (stores?.length && !('stores' in prev)) out.stores = stores;
   const eol = previous?.eol ?? '\n';
   const text = JSON.stringify(out, null, previous?.indent ?? '  ');
   return `${eol === '\n' ? text : text.replace(/\n/g, eol)}${eol}`;

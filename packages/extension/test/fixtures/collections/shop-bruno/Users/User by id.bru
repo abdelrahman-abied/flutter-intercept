@@ -1,0 +1,66 @@
+meta {
+  name: User by id
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/users/:id
+  body: none
+  auth: inherit
+}
+
+params:path {
+  id: 42
+}
+
+example {
+  name: Found
+
+  request: {
+    url: {{baseUrl}}/users/:id
+    method: get
+    mode: none
+    params:path: {
+      id: 42
+    }
+  }
+
+  response: {
+    status: {
+      code: 200
+      text: OK
+    }
+
+    body: {
+      type: json
+      content: '''
+        {"id":42,"name":"Lina"}
+      '''
+    }
+  }
+}
+
+example {
+  name: Not found
+
+  request: {
+    url: {{baseUrl}}/users/:id
+    method: get
+    mode: none
+  }
+
+  response: {
+    status: {
+      code: 404
+      text: Not Found
+    }
+
+    body: {
+      type: json
+      content: '''
+        {"error":"not_found"}
+      '''
+    }
+  }
+}

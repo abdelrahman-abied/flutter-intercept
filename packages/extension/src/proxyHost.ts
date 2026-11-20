@@ -39,7 +39,7 @@
  */
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
-import type { ClientCertificate, Exchange, GrpcBreakerEvent, LearnedPassthrough, GrpcEdit, RequestEdit, ResponseEdit, GrpcProxyCodec, InterceptProxy, InterceptProxyOptions, ReplayEntry, ReplayOptions, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
+import type { ClientCertificate, Exchange, GrpcBreakerEvent, LearnedPassthrough, GrpcEdit, RequestEdit, ResponseEdit, GrpcProxyCodec, InterceptProxy, InterceptProxyOptions, ReplayEntry, ReplayOptions, RequestHandler, Rule, RuleAction, SendRequest } from '@flutter-intercept/proxy';
 // PERF-1 #1: the dependency-free subpath, so activation never evaluates the proxy (and mockttp).
 import { parseHostPattern } from '@flutter-intercept/proxy/hosts';
 import { targetsProxy } from '@flutter-intercept/proxy/grpc-meta';
@@ -68,7 +68,7 @@ export type ProxyLike = Pick<
   | 'send' | 'setNetworkProfile' | 'setAppPackages' | 'record' | 'update' | 'setWebSessionActive'
   | 'setReplay' | 'resetSequences' | 'setUpstreamProxy' | 'upstreamProxy'
   | 'setTlsPassthrough' | 'tlsPassthrough' | 'setClientCertificates'
-  | 'setGrpcDecryptHosts' | 'grpcSupport' | 'setGrpcDecryptAll' | 'setGrpcCodec' | 'setHttpPinLearning'
+  | 'setGrpcDecryptHosts' | 'grpcSupport' | 'setGrpcDecryptAll' | 'setGrpcCodec' | 'setHttpPinLearning' | 'setHandler'
   | 'learnedPassthrough' | 'forgetLearnedPassthrough' | 'setAutoPassthrough' | 'autoPassthrough'
 >;
 
@@ -511,6 +511,8 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   private grpcCheck?: { ok: boolean; problem?: string };
   private grpcEncoder?: GrpcMessageEncoder;
   private grpcCodec?: GrpcProxyCodec;
+  /** CONTRACTS §22.1: request handlers by id (stateful mocks), re-applied to every new proxy. */
+  private readonly handlers = new Map<string, RequestHandler>();
   // CONTRACTS §19.3
   private decryptAll = false;
   private httpPinLearning = true;
@@ -608,6 +610,7 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
       if (!this.httpPinLearning) this.applyHttpPinLearning(proxy);
       if (!this.autoPass) this.applyAutoPassthrough(proxy);
       if (this.grpcCodec) this.applyGrpcCodec(proxy);
+      for (const [id, fn] of this.handlers) this.applyHandler(proxy, id, fn);
       if (this.clientCerts.length) this.applyClientCertificates(proxy);
       // REVIEW-12 #1: the port is known now — re-check Map Remote targets against it
       const recheck = this.rules.some((r) => mapTargets(r).length > 0);
@@ -804,6 +807,24 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   setGrpcCodec(codec: GrpcProxyCodec | undefined): void {
     this.grpcCodec = codec;
     if (this.proxy) this.applyGrpcCodec(this.proxy);
+  }
+
+  /**
+   * CONTRACTS §22.1: registers (fn) or removes (undefined) the function a `handler` rule with this id calls. Kept and
+   * re-applied after a restart (the proxy clears its own on stop).
+   */
+  setHandler(id: string, fn: RequestHandler | undefined): void {
+    if (fn) this.handlers.set(id, fn);
+    else this.handlers.delete(id);
+    if (this.proxy) this.applyHandler(this.proxy, id, fn);
+  }
+
+  private applyHandler(proxy: ProxyLike, id: string, fn: RequestHandler | undefined): void {
+    try {
+      proxy.setHandler(id, fn);
+    } catch (e) {
+      this.opts.log?.(`handler ${id} not applied: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   private applyGrpcCodec(proxy: ProxyLike): void {

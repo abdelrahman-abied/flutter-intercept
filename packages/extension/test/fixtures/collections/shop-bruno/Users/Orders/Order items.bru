@@ -1,0 +1,35 @@
+meta {
+  name: Order items
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/{{apiVersion}}/orders/{{orderId}}/items
+  body: none
+  auth: inherit
+}
+
+example {
+  name: OK
+
+  request: {
+    url: {{baseUrl}}/{{apiVersion}}/orders/{{orderId}}/items
+    method: get
+    mode: none
+  }
+
+  response: {
+    status: {
+      code: 200
+      text: OK
+    }
+
+    body: {
+      type: json
+      content: '''
+        [{"sku":"A1","qty":2}]
+      '''
+    }
+  }
+}

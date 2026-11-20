@@ -1,0 +1,32 @@
+meta {
+  name: Delete user
+  type: http
+  seq: 4
+}
+
+delete {
+  url: {{baseUrl}}/users/:id
+  body: none
+  auth: inherit
+}
+
+params:path {
+  id: 42
+}
+
+example {
+  name: No content
+
+  request: {
+    url: {{baseUrl}}/users/:id
+    method: delete
+    mode: none
+  }
+
+  response: {
+    status: {
+      code: 204
+      text: No Content
+    }
+  }
+}

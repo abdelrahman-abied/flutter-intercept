@@ -412,3 +412,94 @@ describe('fuzz: every generated rule is safe, valid, matches its own URL and sta
     expect((performance.now() - t) / (10 * hostile.length)).toBeLessThan(5);
   });
 });
+
+// CONTRACTS §24 preamble (part 3): which rules get a handler for the answer pipeline.
+describe('pipeline option (§24)', () => {
+  const handlerId = 'collection:shop';
+  const kinds = (rules: Rule[]) => rules.map((r) => r.action.kind);
+  const login = (): MockEndpoint => ({ ...ep(['auth', 'login'], [ex('Success'), ex('Wrong password', 401)]), key: 'POST /auth/login', method: 'POST', name: 'Log in' });
+
+  it('without the option, or when nothing needs the host: plain mock rules', () => {
+    const c = collection([ep(['health']), login()]);
+    expect(kinds(toRules(c, opts()).rules)).toEqual(['mock', 'mock']);
+    const r = toRules(c, { ...opts(), pipeline: { handlerId, auth: new Set(), body: new Set(), vars: new Map() } });
+    expect(kinds(r.rules)).toEqual(['mock', 'mock']);
+    expect([...r.meta.values()].every((m) => m.needs === undefined)).toBe(true);
+    expect(r.rules.map((x) => x.id)).toEqual(toRules(c, opts()).rules.map((x) => x.id));
+  });
+
+  it('auth, body and dynamic each make the default rule a handler rule with the static answer as fallback', () => {
+    const c = collection([
+      ep(['health']),
+      login(),
+      ep(['me']),
+      ep(['config'], [ex('OK', 200, { body: '{"id":"{{$guid}}"}', headers: { 'content-type': 'application/json' } })]),
+      ep(['plain'], [ex('OK', 200, { body: '{"note":"{{unknown}} stays"}' })]),
+      ep(['hdr'], [ex('OK', 200, { headers: { 'x-request-id': '{{$guid}}' } })]),
+      ep(['cookie'], [ex('OK', 200, { headers: { 'set-cookie': 'sid={{$guid}}' } })]),
+      ep(['var'], [ex('OK', 200, { body: 'at {{region}}' })]),
+    ]);
+    const r = toRules(c, { ...opts(), pipeline: { handlerId, auth: new Set(['GET /me', 'POST /auth/login']), body: new Set(['POST /auth/login']), vars: new Map([['region', 'eu']]) } });
+    const by = (key: string) => {
+      const [id, meta] = [...r.meta].find(([, m]) => m.endpoint === key)!;
+      return { rule: r.rules.find((x) => x.id === id)!, meta };
+    };
+    expect(by('GET /health').rule.action.kind).toBe('mock');
+    expect(by('GET /plain').rule.action.kind).toBe('mock'); // a {{name}} nobody can fill in needs no handler
+    expect(by('GET /cookie').rule.action.kind).toBe('mock'); // a header an approval is about is never rendered
+    expect(by('POST /auth/login')).toMatchObject({ rule: { name: 'Shop API › Log in · Success', action: { kind: 'handler', handlerId, fallback: { kind: 'mock', status: 200, body: 'Success' } } }, meta: { example: 'Success', needs: { auth: true, body: true } } });
+    expect(by('GET /me').meta.needs).toEqual({ auth: true });
+    expect(by('GET /config').meta.needs).toEqual({ dynamic: true });
+    expect(by('GET /hdr').meta.needs).toEqual({ dynamic: true });
+    expect(by('GET /var').meta.needs).toEqual({ dynamic: true });
+    // same ids and order as the static rules; every rule is one the proxy accepts
+    expect(r.rules.map((x) => x.id)).toEqual(toRules(c, opts()).rules.map((x) => x.id));
+    for (const rule of r.rules) expect(isInvalidMatcher(rule.match), rule.name).toBe(false);
+  });
+
+  it('a chosen example stays static (it beats the gate and the examples by body) but keeps its dynamic values', () => {
+    const c = collection([login(), ep(['config'], [ex('OK', 200, { body: '{{$guid}}' }), ex('Down', 503)])]);
+    const pipeline = { handlerId, auth: new Set(['POST /auth/login', 'GET /config']), body: new Set(['POST /auth/login']), vars: new Map<string, string>() };
+    const r = toRules(c, { ...opts({ selected: { 'POST /auth/login': 'Wrong password', 'GET /config': 'OK' } }), pipeline });
+    expect(kinds(r.rules)).toEqual(['mock', 'handler']);
+    expect([...r.meta.values()].map((m) => m.needs)).toEqual([undefined, { dynamic: true }]);
+    // a selection that names no example is no choice
+    expect(kinds(toRules(c, { ...opts({ selected: { 'POST /auth/login': 'Gone' } }), pipeline }).rules)).toEqual(['handler', 'handler']);
+  });
+
+  it('query examples keep their own rules: static, unless gated or dynamic (then a handler whose answer is their own example)', () => {
+    const search = ep(['search'], [ex('Hits'), ex('None', 200, { query: { q: 'none' } }), ex('Rand', 200, { query: { q: 'rand' }, body: '{{$randomInt}}' })]);
+    const c = collection([search]);
+    const open = toRules(c, { ...opts(), pipeline: { handlerId, vars: new Map() } });
+    expect(open.rules.map((r) => [r.action.kind, open.meta.get(r.id)!.example, open.meta.get(r.id)!.query])).toEqual([['mock', 'None', undefined], ['handler', 'Rand', true], ['mock', 'Hits', undefined]]);
+    const gated = toRules(c, { ...opts(), pipeline: { handlerId, auth: new Set(['GET /search']), vars: new Map() } });
+    expect(gated.rules.map((r) => [r.action.kind, gated.meta.get(r.id)!.needs])).toEqual([['handler', { auth: true }], ['handler', { auth: true, dynamic: true }], ['handler', { auth: true }]]);
+    expect(gated.meta.get(gated.rules[0].id)).toMatchObject({ example: 'None', query: true });
+    expect(gated.rules[0].action).toMatchObject({ fallback: { body: 'None' } });
+  });
+
+  it('a store operation keeps its rule; the gate and body examples ride on it; no-example endpoints can be gated too', () => {
+    const list = ep(['users'], [ex('OK', 200, { body: '[{"id":1}]' })]);
+    const create = { ...ep(['users'], [ex('Created', 201, { body: '{"id":2}' })]), key: 'POST /users', method: 'POST' };
+    const item = ep(['users', { param: 'id' }], [ex('OK', 200, { body: '{"id":1}' })]);
+    const bare = ep(['bare'], []);
+    const resources = [{ name: 'users', origin: 'https://api.test', listPath: ['users'], itemParam: 'id', scopeParams: [], idField: 'id', idKind: 'integer' as const, ops: { list: 'GET /users', create: 'POST /users', get: 'GET /users/:id' }, list: {}, writeOnly: [], detected: true as const }];
+    const r = toRules(collection([list, create, item, bare]), {
+      ...opts(),
+      stateful: { handlerId, resources },
+      pipeline: { handlerId, auth: new Set(['GET /users', 'POST /users', 'GET /users/:id', 'GET /bare']), body: new Set(['POST /users']), vars: new Map() },
+    });
+    const meta = (key: string) => [...r.meta.values()].find((m) => m.endpoint === key)!;
+    expect(meta('POST /users')).toEqual({ endpoint: 'POST /users', resource: 'users', op: 'create', needs: { auth: true, body: true } });
+    expect(meta('GET /users')).toEqual({ endpoint: 'GET /users', resource: 'users', op: 'list', needs: { auth: true } });
+    expect(meta('GET /bare')).toEqual({ endpoint: 'GET /bare', noExample: true, needs: { auth: true } });
+    expect(r.rules.every((x) => x.action.kind === 'handler')).toBe(true);
+    expect(r.rules.find((x) => r.meta.get(x.id)!.endpoint === 'GET /bare')!.action).toMatchObject({ fallback: { status: 501 } });
+  });
+
+  it('names what can\'t be filled in, once per endpoint', () => {
+    const c = collection([ep(['img'], [ex('OK', 200, { body: '{"a":"{{$randomImage}}","b":"{{$randomImage}}","id":"{{$guid}}"}' })])]);
+    const r = toRules(c, { ...opts(), pipeline: { handlerId, vars: new Map() } });
+    expect(r.problems).toEqual(['GET /img: Dynamic values not supported (left as written): $randomImage.']);
+  });
+});

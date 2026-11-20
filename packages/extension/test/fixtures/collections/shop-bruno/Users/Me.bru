@@ -1,0 +1,35 @@
+meta {
+  name: Me
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/users/me
+  body: none
+  auth: inherit
+}
+
+example {
+  name: OK
+
+  request: {
+    url: {{baseUrl}}/users/me
+    method: get
+    mode: none
+  }
+
+  response: {
+    status: {
+      code: 200
+      text: OK
+    }
+
+    body: {
+      type: json
+      content: '''
+        {"id":1,"name":"Sara"}
+      '''
+    }
+  }
+}

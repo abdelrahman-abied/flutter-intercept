@@ -284,6 +284,7 @@ describe('parsePostman', () => {
       origin: 'https://example.com',
       path: ['ping'],
       unresolved: [],
+      queryParams: ['x'],
       examples: [
         {
           name: 'OK',
@@ -301,6 +302,7 @@ describe('parsePostman', () => {
       origin: 'http://localhost',
       path: ['users', { param: 'id' }],
       unresolved: [],
+      queryParams: ['tab'],
       examples: [
         {
           name: 'Saved',
@@ -383,6 +385,7 @@ describe('parsePostman', () => {
       origin: 'https://new.example:8443',
       path: ['right', { param: '$guid' }],
       unresolved: [],
+      queryParams: ['a'],
       examples: [
         {
           name: 'Html',
@@ -479,5 +482,30 @@ describe('parsePostman', () => {
     expect(totalBytes).toBe(16 * 4 * 1024 * 1024);
     expect(parsed.problems).toHaveLength(1);
     expect(parsed.problems[0]).toContain('64 MB');
+  });
+});
+
+describe('parsePostman: queryParams (CONTRACTS §22.2)', () => {
+  const parse = (url: unknown) =>
+    parsePostman({ info: { name: 'Q' }, item: [{ name: 'R', request: { method: 'GET', url } }] }, emptyVars()).endpoints[0];
+
+  it('url.query keys in file order, disabled ones included; else the raw query string; none → absent', () => {
+    expect(
+      parse({
+        raw: 'https://q.test/items?page=1&ignored=1',
+        host: ['q', 'test'],
+        path: ['items'],
+        query: [{ key: 'page', value: '1' }, { key: 'limit', value: '10', disabled: true }, { key: 'page', value: '2' }, { value: 'no key' }],
+      }).queryParams,
+    ).toEqual(['page', 'limit']);
+    expect(parse('https://q.test/items?sort=name&order=desc').queryParams).toEqual(['sort', 'order']);
+    expect('queryParams' in parse('https://q.test/items')).toBe(false);
+  });
+
+  it('at most 20 names, each at most 100 characters', () => {
+    const query = [{ key: 'y'.repeat(101) }, ...Array.from({ length: 30 }, (_, i) => ({ key: `k${i}` }))];
+    const qp = parse({ raw: 'https://q.test/items', query }).queryParams;
+    expect(qp).toHaveLength(20);
+    expect(qp?.[0]).toBe('k0');
   });
 });

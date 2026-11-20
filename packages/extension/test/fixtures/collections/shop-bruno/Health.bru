@@ -1,0 +1,35 @@
+meta {
+  name: Health
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/health
+  body: none
+  auth: inherit
+}
+
+example {
+  name: Up
+
+  request: {
+    url: {{baseUrl}}/health
+    method: get
+    mode: none
+  }
+
+  response: {
+    status: {
+      code: 200
+      text: OK
+    }
+
+    body: {
+      type: text
+      content: '''
+        ok
+      '''
+    }
+  }
+}

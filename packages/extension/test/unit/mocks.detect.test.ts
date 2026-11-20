@@ -39,10 +39,21 @@ describe('detectFormat', () => {
     expect(detectFormat({ openapi: '3.1.0' })).toEqual({ format: 'openapi' });
   });
 
-  it('returns a clear problem for Swagger 2.0 and Postman v1', () => {
-    const swagger = detectFormat({ swagger: '2.0', info: { title: 'Old', version: '1' }, paths: {} });
-    expect(swagger.format).toBeUndefined();
-    expect(swagger.problem).toBe("Swagger 2.0 isn't supported yet: convert it to OpenAPI 3.");
+  it('CONTRACTS §24.4: Swagger 2.0 and Insomnia (v4 export, v5 file) are formats; other Swagger versions and a bare bruno.json get a clear problem', () => {
+    expect(detectFormat({ swagger: '2.0', info: { title: 'Old', version: '1' }, paths: {} })).toEqual({ format: 'swagger' });
+    // `swagger: 2.0` unquoted in YAML reads as the number 2
+    expect(detectFormat({ swagger: 2, paths: {} })).toEqual({ format: 'swagger' });
+    expect(detectFormat({ swagger: '1.2', apis: [] }).problem).toMatch(/Unsupported Swagger version/);
+    expect(detectFormat({ _type: 'export', __export_format: 4, resources: [] })).toEqual({ format: 'insomnia' });
+    expect(detectFormat({ type: 'collection.insomnia.rest/5.0', name: 'Shop', collection: [] })).toEqual({ format: 'insomnia' });
+    // an OpenAPI document stays one even when exported by Insomnia-like tools
+    expect(detectFormat({ openapi: '3.0.3', _type: 'export', paths: {} })).toEqual({ format: 'openapi' });
+    const bruno = detectFormat({ version: '1', name: 'Shop API', type: 'collection' });
+    expect(bruno.format).toBeUndefined();
+    expect(bruno.problem).toMatch(/bruno\.json/);
+  });
+
+  it('returns a clear problem for Postman v1', () => {
 
     const v1Schema = detectFormat({
       info: { name: 'Old', schema: 'https://schema.getpostman.com/json/collection/v1.0.0/collection.json' },

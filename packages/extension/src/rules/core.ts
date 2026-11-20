@@ -30,7 +30,7 @@ import * as path from 'path';
 import type { Rule } from '@flutter-intercept/proxy';
 import type { SharedRulesState } from './types';
 import type { CollectionLink } from '../mocks/types';
-import { parseCollectionLinks, toFileLink } from '../mocks/link';
+import { parseCollectionLinks, parseStoreLinks, toFileLink, withStoreEntry, type StoreSettingsLink } from '../mocks/link';
 import {
   BodyFileError,
   bodyFileActions,
@@ -187,6 +187,8 @@ export interface FolderCollectionLinks {
   label: string;
   links: CollectionLink[];
   problems: string[];
+  /** CONTRACTS §22.7 / §24.1: the file's valid `stores` entries, with `auth` / `dynamic` (absent = none). */
+  stores?: StoreSettingsLink[];
 }
 
 export interface SharedRulesStatus {
@@ -680,7 +682,12 @@ export class SharedRulesCore {
     const links: FolderCollectionLinks[] = this.folderStates.flatMap((f) => {
       if (!f.good) return [];
       const { links: l, problems } = parseCollectionLinks(f.good.json, f.folder.label);
-      return l.length || problems.length ? [{ folderPath: f.folder.info.path, label: f.folder.label, links: l, problems }] : [];
+      // CONTRACTS §22.7: the stateful-mock settings of those collections
+      const st = parseStoreLinks(f.good.json, f.folder.label);
+      problems.push(...st.problems);
+      return l.length || problems.length || st.stores.length
+        ? [{ folderPath: f.folder.info.path, label: f.folder.label, links: l, problems, ...(st.stores.length ? { stores: st.stores } : {}) }]
+        : [];
     });
     const changed = canonicalJson(s) !== canonicalJson(this.current) || canonicalJson(links) !== canonicalJson(this.links);
     this.current = s;
@@ -904,6 +911,27 @@ export class SharedRulesCore {
       const rules = Array.isArray(fresh?.json.rules) ? (fresh!.json.rules as unknown[]) : [];
       const text = serializeSharedFile(rules, fresh, links.map(toFileLink));
       if (fresh && contentHash(JSON.parse(text)) === fresh.hash) return;
+      if (fresh?.hadComments) this.deps.log?.(`shared rules: comments in ${f.folder.label} are not kept when Flutter Intercept writes it`);
+      await this.atomicWrite(f.folder, text);
+      await this.reloadNow();
+    });
+  }
+
+  /**
+   * CONTRACTS §22.7: replaces the `stores` entry of `collection` in the file of `folderPath` (removes it when `entry` is
+   * undefined or holds only defaults). Every other entry, key and the rules are written back as they are.
+   */
+  saveStore(folderPath: string, collection: string, entry: StoreSettingsLink | undefined): Promise<void> {
+    return this.serial(async () => {
+      if (!this.folderStates.length) await this.reloadNow();
+      const f = this.folderStates.find((st) => st.folder.info.path === folderPath);
+      if (!f) throw new Error('That workspace folder is no longer open');
+      const fresh = await this.freshParse(f.folder);
+      const rules = Array.isArray(fresh?.json.rules) ? (fresh!.json.rules as unknown[]) : [];
+      const stores = withStoreEntry(fresh?.json.stores, collection, entry);
+      const text = serializeSharedFile(rules, fresh, undefined, stores);
+      if (fresh && contentHash(JSON.parse(text)) === fresh.hash) return;
+      if (!fresh && !stores.length) return;
       if (fresh?.hadComments) this.deps.log?.(`shared rules: comments in ${f.folder.label} are not kept when Flutter Intercept writes it`);
       await this.atomicWrite(f.folder, text);
       await this.reloadNow();

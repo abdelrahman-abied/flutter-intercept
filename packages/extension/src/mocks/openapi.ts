@@ -9,6 +9,7 @@ import {
   type MockExample,
   type ParseOpenApi,
   type PathSegment,
+  type SchemaHints,
   type VariableSource,
 } from './types';
 import {
@@ -27,6 +28,7 @@ import {
   type WalkBudget,
 } from './ref';
 import { generateSchemaBody } from './generate';
+import { REQUEST_BODY_BYTES } from './bodyMatch';
 
 const HTTP_METHODS = new Set(['get', 'put', 'post', 'delete', 'patch', 'head', 'options']);
 /** Cap on total example body text across one OpenAPI document (REVIEW-15 #2b). */
@@ -164,7 +166,13 @@ export const parseOpenApi: ParseOpenApi = (doc, vars) => {
       const folder = readFirstTag(rawOp);
       const path = [...resolved.prefixSegments, ...parsePathSegments(pathKey)];
       const key = uniqueKey(baseKey, usedKeys);
-      const examples = parseResponses(rawOp, doc, problemCtx, budget, bodyBudget, cache, problems);
+      const reqBody = readRequestBody(rawOp, doc, problemCtx, budget, problems);
+      const examples = parseResponses(rawOp, doc, problemCtx, budget, bodyBudget, cache, problems, reqBody.named);
+      const auth = readSecurity(rawOp, doc);
+      const lastSeg = path[path.length - 1];
+      const itemParam = lastSeg !== undefined && typeof lastSeg !== 'string' ? lastSeg.param : undefined;
+      const schemaHints = readSchemaHints(rawOp, doc, itemParam, budget, problems);
+      const queryParams = readQueryParams(pathItem, rawOp, doc, budget, problems);
 
       const endpoint: MockEndpoint = {
         key,
@@ -175,6 +183,10 @@ export const parseOpenApi: ParseOpenApi = (doc, vars) => {
         path,
         examples,
         unresolved: resolved.unresolved,
+        ...(schemaHints ? { schemaHints } : {}),
+        ...(queryParams.length > 0 ? { queryParams } : {}),
+        ...(reqBody.own ? { requestBody: reqBody.own } : {}),
+        ...(auth !== undefined ? { auth } : {}),
       };
       endpoints.push(endpoint);
     }
@@ -574,6 +586,7 @@ function parseResponses(
   bodyBudget: BodyBudget,
   cache: ExampleCache,
   problems: string[],
+  requestExamples?: ReadonlyMap<string, RequestBody>,
 ): MockExample[] {
   if (!hasOwn(op, 'responses') || op['responses'] === undefined) {
     addProblem(problems, `${endpointCtx}: missing "responses" object`);
@@ -755,11 +768,13 @@ function parseResponses(
               handled = true;
               break;
             }
+            const request = requestExamples?.get(exKey);
             examples.push({
               name: `${code} · ${exKey}`,
               status,
               headers: cloneHeadersWithContentType(baseHeaders, chosenMt),
               body: formatted.text,
+              ...(request ? { request } : {}),
             });
             addedNamed += 1;
           } else if (hasOwn(exObj, 'externalValue') && exObj['externalValue'] !== undefined) {
@@ -883,4 +898,273 @@ function parseResponses(
   }
 
   return examples;
+}
+
+// ------------------------------------------------------------------ request bodies and security (CONTRACTS §24.1, §24.2)
+
+type RequestBody = { contentType: string; body: string };
+
+/** §24.1: the operation's `security`, else the document's; `[]` (or an empty requirement `{}`) → 'none'. */
+function readSecurity(op: Dict, doc: Dict): 'none' | 'declared' | undefined {
+  const sec = hasOwn(op, 'security') && Array.isArray(op['security']) ? op['security'] : Array.isArray(doc['security']) ? doc['security'] : undefined;
+  if (sec === undefined) return undefined;
+  if (sec.length === 0 || sec.some((r) => isObj(r) && Object.keys(r).length === 0)) return 'none';
+  return 'declared';
+}
+
+/** A request example value as body text for `mediaType` (JSON, urlencoded from a flat object, or a string as is). */
+function requestBodyText(
+  value: unknown,
+  mediaType: string,
+  budget: WalkBudget,
+  problems: string[],
+  ctx: string,
+): { text?: string; tooBig?: true } {
+  const base = mediaType.split(';')[0].trim().toLowerCase();
+  if (base === 'application/x-www-form-urlencoded' && isObj(value)) {
+    const parts: string[] = [];
+    let bytes = 0;
+    for (const k of Object.keys(value)) {
+      if (!touchNode(budget, problems, ctx)) return {};
+      const v = value[k];
+      if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') continue;
+      const part = `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`;
+      bytes += part.length + 1;
+      if (bytes > REQUEST_BODY_BYTES) return { tooBig: true };
+      parts.push(part);
+    }
+    return parts.length > 0 ? { text: parts.join('&') } : {};
+  }
+  if (!isJsonMediaType(mediaType) && typeof value === 'string') {
+    return utf8Bytes(value) > REQUEST_BODY_BYTES ? { tooBig: true } : { text: value };
+  }
+  if (!isJsonMediaType(mediaType)) return {};
+  return quietly(problems, (scratch) => {
+    const res = formatJsonChecked(value, REQUEST_BODY_BYTES, budget, scratch, ctx);
+    if (budget.exceeded) return {};
+    return res.cut ? { tooBig: true } : { text: res.text };
+  });
+}
+
+/**
+ * §24.2: the operation's own request body (`example`, else the schema's `example` / `examples[0]`) and its named
+ * `examples` by key (paired with response examples of the same key — Microcks convention). The media type is chosen
+ * as for responses (§21.3). Bodies over `REQUEST_BODY_BYTES` are left out with a problem line.
+ */
+function readRequestBody(
+  op: Dict,
+  doc: unknown,
+  endpointCtx: string,
+  budget: WalkBudget,
+  problems: string[],
+): { own?: RequestBody; named?: Map<string, RequestBody> } {
+  if (!hasOwn(op, 'requestBody') || op['requestBody'] === undefined) return {};
+  const ctx = `${endpointCtx} request body`;
+  const rb = deref(op['requestBody'], doc, budget, problems, ctx);
+  if (!rb.ok || !isObj(rb.value) || !isObj(rb.value['content'])) return {};
+  const content = rb.value['content'];
+  const mt = pickMediaType(content);
+  if (!mt) return {};
+  const m = deref(content[mt], doc, budget, problems, ctx);
+  if (!m.ok || !isObj(m.value)) return {};
+  const mtObj = m.value;
+  const contentType = mt;
+  const tooBig = (where: string): void =>
+    addProblem(problems, `${where}: request body over ${REQUEST_BODY_BYTES / 1024} KB, not used for choosing by body`);
+
+  const out: { own?: RequestBody; named?: Map<string, RequestBody> } = {};
+  let ownValue: unknown;
+  if (hasOwn(mtObj, 'example') && mtObj['example'] !== undefined) {
+    ownValue = mtObj['example'];
+  } else if (hasOwn(mtObj, 'schema')) {
+    const sd = quietly(problems, (scratch) => deref(mtObj['schema'], doc, budget, scratch));
+    if (sd.ok && isObj(sd.value)) {
+      const schema = sd.value;
+      if (hasOwn(schema, 'example') && schema['example'] !== undefined) ownValue = schema['example'];
+      else if (Array.isArray(schema['examples']) && schema['examples'].length > 0) ownValue = schema['examples'][0];
+    }
+  }
+  if (ownValue !== undefined) {
+    const t = requestBodyText(ownValue, mt, budget, problems, ctx);
+    if (t.tooBig) tooBig(ctx);
+    else if (t.text !== undefined) out.own = { contentType, body: t.text };
+  }
+
+  const exMap = mtObj['examples'];
+  if (isObj(exMap)) {
+    const named = new Map<string, RequestBody>();
+    for (const key of Object.keys(exMap)) {
+      if (budget.exceeded) break;
+      const exCtx = `${endpointCtx} request example "${quoteFileText(key)}"`;
+      const ed = deref(exMap[key], doc, budget, problems, exCtx);
+      if (!ed.ok || !isObj(ed.value) || !hasOwn(ed.value, 'value') || ed.value['value'] === undefined) continue;
+      const t = requestBodyText(ed.value['value'], mt, budget, problems, exCtx);
+      if (t.tooBig) tooBig(exCtx);
+      else if (t.text !== undefined) named.set(key, { contentType, body: t.text });
+    }
+    if (named.size > 0) out.named = named;
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------ stateful hints (CONTRACTS §22.2)
+
+const MAX_QUERY_PARAMS = 20;
+const MAX_QUERY_PARAM_CHARS = 100;
+const MAX_WRITE_ONLY = 50;
+const MAX_ALLOF_DEPTH = 4;
+const ID_LIKE = /(?:^id$|^_id$|^uuid$|[a-z0-9]Id$|_id$)/;
+
+/** Runs `fn` with a scratch problems list (the same `$ref`s were already reported by `parseResponses`); only a walk
+ *  budget overrun is copied, so the reason the parse stopped stays visible. */
+function quietly<T>(problems: string[], fn: (scratch: string[]) => T): T {
+  const scratch: string[] = [];
+  const out = fn(scratch);
+  for (const line of scratch) if (line.includes('document walk exceeded')) problems.push(line);
+  return out;
+}
+
+/** `in: query` parameter names of the path item and the operation (file order, unique, ≤ 20, each ≤ 100 chars). */
+function readQueryParams(pathItem: Dict, op: Dict, doc: unknown, budget: WalkBudget, problems: string[]): string[] {
+  return quietly(problems, (scratch) => {
+    const names: string[] = [];
+    const seen = new Set<string>();
+    for (const list of [pathItem['parameters'], op['parameters']]) {
+      if (!Array.isArray(list)) continue;
+      for (const raw of list) {
+        if (budget.exceeded || names.length >= MAX_QUERY_PARAMS) return names;
+        const d = deref(raw, doc, budget, scratch);
+        if (!d.ok || !isObj(d.value)) continue;
+        const p = d.value;
+        if (p['in'] !== 'query' || typeof p['name'] !== 'string') continue;
+        const name = p['name'];
+        if (!name || name.length > MAX_QUERY_PARAM_CHARS || seen.has(name)) continue;
+        seen.add(name);
+        names.push(name);
+      }
+    }
+    return names;
+  });
+}
+
+/** The first 2xx JSON response schema of an operation, after `$ref`; an array's item schema. */
+function recordSchema(op: Dict, doc: unknown, budget: WalkBudget, scratch: string[]): Dict | undefined {
+  const responses = op['responses'];
+  if (!isObj(responses)) return undefined;
+  const codes = Object.keys(responses).filter((k) => !k.startsWith('x-'));
+  const onlyDefault = codes.length === 1 && codes[0] === 'default';
+  for (const code of codes) {
+    if (budget.exceeded) return undefined;
+    const status = parseStatusCode(code, onlyDefault);
+    if (status === undefined || status < 200 || status > 299) continue;
+    const r = deref(responses[code], doc, budget, scratch);
+    if (!r.ok || !isObj(r.value) || !isObj(r.value['content'])) continue;
+    const content = r.value['content'];
+    const mt = pickMediaType(content);
+    if (!mt || !isJsonMediaType(mt)) continue;
+    const m = deref(content[mt], doc, budget, scratch);
+    if (!m.ok || !isObj(m.value)) continue;
+    const s = deref(m.value['schema'], doc, budget, scratch);
+    if (!s.ok || !isObj(s.value)) continue;
+    let schema = s.value;
+    if (schema['type'] === 'array' || (schema['type'] === undefined && hasOwn(schema, 'items'))) {
+      const items = deref(schema['items'], doc, budget, scratch);
+      if (!items.ok || !isObj(items.value)) return undefined;
+      schema = items.value;
+    }
+    return schema;
+  }
+  return undefined;
+}
+
+/** Properties of an object schema with `allOf` members merged (later members win), in document order. */
+function collectProperties(
+  schema: Dict,
+  doc: unknown,
+  budget: WalkBudget,
+  scratch: string[],
+  out: Map<string, unknown>,
+  depth: number,
+  active: Set<object>,
+): void {
+  if (depth > MAX_ALLOF_DEPTH || active.has(schema) || budget.exceeded) return;
+  active.add(schema);
+  const props = schema['properties'];
+  if (isObj(props)) {
+    for (const k of Object.keys(props)) {
+      if (!touchNode(budget, scratch)) break;
+      out.set(k, props[k]);
+    }
+  }
+  const allOf = schema['allOf'];
+  if (Array.isArray(allOf)) {
+    for (const member of allOf) {
+      if (budget.exceeded) break;
+      const d = deref(member, doc, budget, scratch);
+      if (d.ok && isObj(d.value)) collectProperties(d.value, doc, budget, scratch, out, depth + 1, active);
+    }
+  }
+  active.delete(schema);
+}
+
+function firstType(t: unknown): string | undefined {
+  if (typeof t === 'string') return t;
+  if (Array.isArray(t)) return t.find((x): x is string => typeof x === 'string' && x !== 'null');
+  return undefined;
+}
+
+/**
+ * CONTRACTS §22.2 / §22.3: id field, its type / format and the `writeOnly` properties of the record an operation
+ * answers with (its first 2xx JSON response; for an array, the item schema). Id field: a `readOnly` id-like property
+ * (`id`, `_id`, `uuid`, `…Id`, `…_id`), else `id`, else the property named like the item path param.
+ */
+function readSchemaHints(
+  op: Dict,
+  doc: unknown,
+  itemParam: string | undefined,
+  budget: WalkBudget,
+  problems: string[],
+): SchemaHints | undefined {
+  return quietly(problems, (scratch) => {
+    const schema = recordSchema(op, doc, budget, scratch);
+    if (!schema) return undefined;
+    const props = new Map<string, unknown>();
+    collectProperties(schema, doc, budget, scratch, props, 0, new Set());
+    if (props.size === 0) return undefined;
+
+    const resolved = new Map<string, Dict>();
+    const propSchema = (name: string): Dict | undefined => {
+      if (resolved.has(name)) return resolved.get(name);
+      const d = deref(props.get(name), doc, budget, scratch);
+      const v = d.ok && isObj(d.value) ? d.value : undefined;
+      if (v) resolved.set(name, v);
+      return v;
+    };
+
+    let idField: string | undefined;
+    const writeOnly: string[] = [];
+    for (const name of props.keys()) {
+      if (budget.exceeded) break;
+      const ps = propSchema(name);
+      if (!ps) continue;
+      if (ps['writeOnly'] === true && writeOnly.length < MAX_WRITE_ONLY) writeOnly.push(name);
+      if (idField === undefined && ps['readOnly'] === true && ID_LIKE.test(name)) idField = name;
+    }
+    if (idField === undefined && props.has('id')) idField = 'id';
+    if (idField === undefined && itemParam !== undefined && props.has(itemParam)) idField = itemParam;
+
+    const hints: SchemaHints = {};
+    if (idField !== undefined) {
+      hints.idField = idField;
+      const ps = propSchema(idField);
+      if (ps) {
+        const t = firstType(ps['type']);
+        if (t === 'integer') hints.idType = 'integer';
+        else if (t === 'string') hints.idType = 'string';
+        if (typeof ps['format'] === 'string' && ps['format'].length > 0 && ps['format'].length <= 40) hints.idFormat = ps['format'];
+      }
+    }
+    if (writeOnly.length > 0) hints.writeOnly = writeOnly;
+    return Object.keys(hints).length > 0 ? hints : undefined;
+  });
 }

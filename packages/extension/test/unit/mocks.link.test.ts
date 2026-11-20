@@ -1,6 +1,6 @@
 // CONTRACTS §21.6: the `collections` key of the shared file (WP0).
 import { describe, expect, it } from 'vitest';
-import { parseCollectionLinks, relativePath, toFileLink } from '../../src/mocks/link';
+import { checkStoreAuth, isBrunoLinkFile, parseCollectionLinks, parseStoreLinks, relativePath, toFileLink, withStoreEntry } from '../../src/mocks/link';
 import { parseSharedFile, serializeSharedFile } from '../../src/rules/file';
 import type { Rule } from '@flutter-intercept/proxy';
 
@@ -161,5 +161,77 @@ describe('serializeSharedFile with collections', () => {
     const s = serializeSharedFile([], undefined, [{ id: 'a', file: 'a.json' }]);
     expect(Object.keys(JSON.parse(s))).toEqual(['version', 'rules', 'collections']);
     expect(Object.keys(JSON.parse(serializeSharedFile([], undefined)))).toEqual(['version', 'rules']);
+  });
+});
+
+// CONTRACTS §24.1 / §24.3 / §24.4 (part 3)
+describe('part 3: environment by name, stores[].auth and stores[].dynamic', () => {
+  it('a Bruno link is known by its file name and takes an environment name; other formats a path or a path-shaped name', () => {
+    expect(isBrunoLinkFile('api/shop/bruno.json')).toBe(true);
+    expect(isBrunoLinkFile('bruno.json')).toBe(true);
+    expect(isBrunoLinkFile('api\\shop\\Bruno.JSON')).toBe(true);
+    expect(isBrunoLinkFile('api/shop/my-bruno.json')).toBe(false);
+    const { links, problems } = parseCollectionLinks(
+      {
+        collections: [
+          { id: 'b1', file: 'api/shop/bruno.json', environment: 'Staging / EU' },
+          { id: 'b2', file: 'api/shop2/bruno.json', environment: 'x'.repeat(101) },
+          { id: 'b3', file: 'api/shop3/bruno.json', environment: 'two\nlines' },
+          { id: 'i1', file: 'api/insomnia.yaml', environment: 'Staging EU' },
+          { id: 'p1', file: 'api/shop.json', environment: 'api/dev.postman_environment.json' },
+          { id: 'p2', file: 'api/shop2.json', environment: '../dev.json' },
+        ],
+      },
+      L,
+    );
+    expect(links.map((l) => [l.id, l.environment])).toEqual([
+      ['b1', 'Staging / EU'],
+      ['i1', 'Staging EU'],
+      ['p1', 'api/dev.postman_environment.json'],
+    ]);
+    expect(problems).toHaveLength(3);
+    for (const p of problems) expect(p).toMatch(/"environment" must be a path inside the workspace \(Postman\) or an environment name \(Insomnia, Bruno\) \(skipped\)$/);
+    expect(toFileLink(links[0])).toEqual({ id: 'b1', file: 'api/shop/bruno.json', environment: 'Staging / EU' });
+  });
+
+  it('parseStoreLinks reads auth and dynamic; an invalid one skips the entry with a line (never guessed)', () => {
+    const { stores, problems } = parseStoreLinks(
+      {
+        stores: [
+          { collection: 'a', auth: { enabled: true, ttlSeconds: 60, protect: 'all', login: 'POST {{baseUrl}}/login', refresh: 'POST {{baseUrl}}/refresh' }, dynamic: 'seeded' },
+          { collection: 'b', auth: {} },
+          { collection: 'c', auth: { ttlSeconds: 59 } },
+          { collection: 'd', auth: { ttlSeconds: 86401 } },
+          { collection: 'e', auth: { protect: 'none' } },
+          { collection: 'f', auth: { password: 'hunter2' } },
+          { collection: 'g', auth: { login: 7 } },
+          { collection: 'h', dynamic: 'chaos' },
+          { collection: 'i', auth: { enabled: 'yes' } },
+          { collection: 'j', auth: { ttlSeconds: 86400, enabled: false } },
+        ],
+      },
+      L,
+    );
+    expect(stores).toEqual([
+      { collection: 'a', auth: { enabled: true, ttlSeconds: 60, protect: 'all', login: 'POST {{baseUrl}}/login', refresh: 'POST {{baseUrl}}/refresh' }, dynamic: 'seeded' },
+      { collection: 'b' },
+      { collection: 'j', auth: { ttlSeconds: 86400, enabled: false } },
+    ]);
+    expect(problems).toHaveLength(7);
+    expect(problems.join('\n')).toMatch(/stores entry 6 "f": "auth": unknown field "password" \(a password or token is never stored here\) \(skipped\)/);
+    expect(problems.join('\n')).not.toContain('hunter2');
+    expect(checkStoreAuth({ ttlSeconds: 90.5 }).problem).toMatch(/whole number 60–86400/);
+  });
+
+  it('withStoreEntry writes auth and dynamic without defaults, keeps the rest, and drops an entry that holds nothing', () => {
+    const raw = [{ collection: 'other', auth: { enabled: true }, note: 'kept' }, { collection: 'shop', resources: { users: { off: true } }, custom: 1, auth: { enabled: true }, dynamic: 'fixed' }];
+    const next = withStoreEntry(raw, 'shop', { collection: 'shop', resources: { users: { off: true } }, auth: { enabled: true, ttlSeconds: 3600, protect: 'all' }, dynamic: 'seeded' });
+    expect(next).toEqual([raw[0], { collection: 'shop', custom: 1, resources: { users: { off: true } }, auth: { enabled: true, protect: 'all' }, dynamic: 'seeded' }]);
+    // off, default ttl, no mode → the keys go
+    expect(withStoreEntry(raw, 'shop', { collection: 'shop', auth: { enabled: false, ttlSeconds: 3600 } })).toEqual([raw[0], { collection: 'shop', custom: 1 }]);
+    expect(withStoreEntry([{ collection: 'shop', auth: { enabled: true } }], 'shop', { collection: 'shop', auth: { enabled: false } })).toEqual([]);
+    expect(withStoreEntry(undefined, 'shop', { collection: 'shop', auth: { ttlSeconds: 120 } })).toEqual([{ collection: 'shop', auth: { ttlSeconds: 120 } }]);
+    // round trip through the parser
+    expect(parseStoreLinks({ stores: next }, L).stores[1]).toEqual({ collection: 'shop', resources: { users: { off: true } }, auth: { enabled: true, protect: 'all' }, dynamic: 'seeded' });
   });
 });

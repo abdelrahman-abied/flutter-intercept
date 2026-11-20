@@ -22,7 +22,8 @@ import {
 } from './clientCertUi';
 import { GRPC_WEB_RESEND, grpcMockRuleFromExchange, grpcResendMessages, resolveGrpcEdit, resolveSendGrpc } from './grpcHost';
 import type { ViewMsg } from './protocol';
-import { LINK_ID } from '../mocks/types';
+import { LINK_ID, SNAPSHOT_NAME, STORE_LIMITS } from '../mocks/types';
+import { SnapshotCancelled } from '../mocks/core';
 import { checkBodyFile, checkId, checkRuleId, checkScriptFile, fail, isInt, isObj, MAX_BODY_FILE_BYTES, MAX_SCRIPT_BYTES, onlyKeys, sanitizeGrpcSendHeaders, validateEdit, validateRule, validateSendDraft } from './validate';
 import { contractSummary, needsOwnCertificate, readOnlyReason, recordingSummary, RULE_KINDS, ruleFromExchangeErrorMessage, snippetFor, tunnelBlockRule } from './views';
 
@@ -47,7 +48,7 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
   return {
     ready: async (msg, reply) => {
       c.readyCount++;
-      c.resetCollectionViews(); // CONTRACTS §21.8: the panel asks again for what it opens
+      c.resetCollectionViews(reply); // CONTRACTS §21.8: the panel asks again for what it opens
       c.flush();
       c.send(reply, c.snapshot());
       const current = c.deps.host.getExchanges();
@@ -430,15 +431,100 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
       if (!svc.approveWithConfirmation) throw new Error('Approving a collection is not available here.');
       await svc.approveWithConfirmation(id);
     },
+    // CONTRACTS §22.10
+    getStoreItems: (msg, reply) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'id', 'resource', 'offset', 'filter'], 'getStoreItems');
+      const id = checkCollectionId(msg.id, 'getStoreItems');
+      const resource = checkCollectionText(msg.resource, 'resource', MAX_RESOURCE_NAME, 'getStoreItems');
+      if (!isInt(msg.offset, 0, STORE_LIMITS.recordsPerResource)) fail('getStoreItems', `offset must be 0–${STORE_LIMITS.recordsPerResource}`);
+      if (msg.filter !== undefined && (typeof msg.filter !== 'string' || msg.filter.length > MAX_STORE_FILTER)) fail('getStoreItems', `filter must be a string (at most ${MAX_STORE_FILTER} characters)`);
+      storeOrThrow(c);
+      c.watchStoreItems(id, resource, msg.offset, msg.filter?.trim() || undefined, reply);
+    },
+    updateStore: async (msg) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'id', 'patch'], 'updateStore');
+      const id = checkCollectionId(msg.id, 'updateStore');
+      if (!isObj(msg.patch)) fail('updateStore', 'patch must be an object');
+      // the service checks every field of the patch (CONTRACTS §22.10)
+      await storeOrThrow(c).updateStore!(id, msg.patch);
+    },
+    storeSnapshot: async (msg) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'id', 'action', 'name'], 'storeSnapshot');
+      const id = checkCollectionId(msg.id, 'storeSnapshot');
+      if (msg.action !== 'save' && msg.action !== 'load' && msg.action !== 'delete') fail('storeSnapshot', 'action must be "save", "load" or "delete"');
+      if (msg.name !== undefined && (typeof msg.name !== 'string' || !SNAPSHOT_NAME.test(msg.name))) fail('storeSnapshot', 'name must be 1–40 lower-case letters, digits or "-"');
+      if (msg.name === undefined && msg.action !== 'save') fail('storeSnapshot', `${msg.action} needs a name`);
+      try {
+        await storeOrThrow(c).storeSnapshot!(id, msg.action, msg.name);
+      } catch (e) {
+        if (e instanceof SnapshotCancelled) return; // the user closed the name prompt
+        throw e;
+      }
+    },
+    // CONTRACTS §23.2: the host runs the dialogs (the panel never names a path); the panel shows the result line
+    mockFromTraffic: async (msg) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'source'], 'mockFromTraffic');
+      let source: { session: Record<string, never> } | { recording: string };
+      if (msg.source === 'session') source = { session: {} };
+      else if (isObj(msg.source)) {
+        onlyKeys(msg.source as unknown as Record<string, unknown>, ['recording'], 'mockFromTraffic.source');
+        source = { recording: checkId((msg.source as { recording?: unknown }).recording, 'mockFromTraffic') };
+        if (source.recording.length > MAX_RECORDING_ID) fail('mockFromTraffic', 'recording must be a recording id');
+      } else fail('mockFromTraffic', 'source must be "session" or {recording}');
+      const svc = collectionsOrThrow(c);
+      if (!svc.mockFromTrafficInteractive) throw new Error('Making a fake backend from traffic is not available here.');
+      try {
+        await svc.mockFromTrafficInteractive(source);
+      } finally {
+        c.refreshCollectionViews();
+      }
+    },
+    // CONTRACTS §23.4: diff preview + the user's confirmation in the IDE; `merge` needs an example of that status (§24.9)
+    updateExample: async (msg) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'id', 'endpoint', 'status', 'mode'], 'updateExample');
+      const id = checkCollectionId(msg.id, 'updateExample');
+      const endpoint = checkCollectionText(msg.endpoint, 'endpoint', MAX_ENDPOINT_KEY, 'updateExample');
+      if (!isInt(msg.status, 100, 599)) fail('updateExample', 'status must be 100–599');
+      if (msg.mode !== undefined && msg.mode !== 'merge' && msg.mode !== 'add') fail('updateExample', 'mode must be "merge" or "add"');
+      const svc = collectionsOrThrow(c);
+      if (!svc.updateExampleInteractive) throw new Error('Updating an example is not available here.');
+      try {
+        await svc.updateExampleInteractive(id, endpoint, msg.status, msg.mode ?? 'merge');
+      } finally {
+        c.refreshCollectionViews();
+      }
+    },
+    // CONTRACTS §23.3 / §24.9: without endpoint = every finding of the collection
+    ignoreDrift: async (msg) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'id', 'endpoint', 'status'], 'ignoreDrift');
+      const id = checkCollectionId(msg.id, 'ignoreDrift');
+      const endpoint = msg.endpoint === undefined ? undefined : checkCollectionText(msg.endpoint, 'endpoint', MAX_ENDPOINT_KEY, 'ignoreDrift');
+      if (msg.status !== undefined && !isInt(msg.status, 100, 599)) fail('ignoreDrift', 'status must be 100–599');
+      if (msg.status !== undefined && endpoint === undefined) fail('ignoreDrift', 'status needs an endpoint');
+      const svc = collectionsOrThrow(c);
+      if (!svc.ignoreDrift) throw new Error('Ignoring a difference is not available here.');
+      await svc.ignoreDrift(id, endpoint, msg.status);
+      c.refreshCollectionViews();
+    },
   };
 }
 
 const MAX_ENDPOINT_KEY = 8 * 1024 + 32;
+const MAX_RECORDING_ID = 200;
 const MAX_EXAMPLE_NAME = 1000;
 
 function collectionsOrThrow(c: InterceptController): NonNullable<InterceptController['deps']['collections']> {
   if (!c.deps.collections) throw new Error('Mocking from a collection needs the Flutter project folder open.');
   return c.deps.collections;
+}
+
+const MAX_RESOURCE_NAME = 100;
+const MAX_STORE_FILTER = 200;
+
+function storeOrThrow(c: InterceptController): NonNullable<InterceptController['deps']['collections']> {
+  const svc = collectionsOrThrow(c);
+  if (!svc.storeItems || !svc.updateStore || !svc.storeSnapshot) throw new Error("Stateful mocks aren't available here.");
+  return svc;
 }
 
 function checkCollectionId(v: unknown, where: string): string {

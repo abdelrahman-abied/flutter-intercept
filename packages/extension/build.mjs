@@ -72,8 +72,11 @@ const jsYamlLoaderOnlyPlugin = {
 /** Bundle budgets (PERF-1 #7, PERF-2 #4): fail the build when the extension grows past them or a locale / Zod 3 slips back in.
  * CONTRACTS §21.13 (0.15.0) / PERF-3: 2 550 000 → 2 675 000 on purpose for collection mocks (2 652 908 measured with
  * js-yaml's loader only, + 20 KB); 2 700 000 after the REVIEW-15 fixes and §21.15 / §21.16 (2 678 420 + 20 KB,
- * docs/PERF-3.md §6). Raise it again only on purpose. */
-const MAX_EXTENSION_BYTES = 2_700_000;
+ * docs/PERF-3.md §6). 0.16.0 (CONTRACTS §22–§24: store, resources, snapshots, agent tools, Record → Mock, drift,
+ * sign-in, body examples, dynamic values, Swagger 2.0 / Insomnia / Bruno, the proxy's rule index and handler action):
+ * 3 000 000 while the release was built, then 2 990 000 (2 965 016 measured + 20 KB, docs/PERF-4.md §3.4; all of the
+ * +286 543 bytes is first-party code, no new dependency). Raise it again only on purpose. */
+const MAX_EXTENSION_BYTES = 2_990_000;
 function assertBudget(metafile, outfile) {
   const out = Object.entries(metafile.outputs).find(([k]) => k.endsWith(outfile));
   const bytes = out ? out[1].bytes : 0;

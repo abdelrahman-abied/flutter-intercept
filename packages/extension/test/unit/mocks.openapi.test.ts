@@ -713,3 +713,57 @@ describe('parseOpenApi', () => {
     expect(res.problems.some((p) => p.includes('https://schemas.example/r.yaml#/x'))).toBe(true);
   });
 });
+
+describe('parseOpenApi: stateful hints (CONTRACTS §22.2)', () => {
+  const vars = (): CollectionVars => ({ values: new Map(), sources: new Map() });
+  const doc = (schema: unknown, extra: Record<string, unknown> = {}) => ({
+    openapi: '3.1.0',
+    info: { title: 'H' },
+    servers: [{ url: 'https://h.test' }],
+    paths: {
+      '/things/{thingId}': {
+        parameters: [{ name: 'thingId', in: 'path', required: true }],
+        get: { responses: { '404': { description: 'no' }, '200': { description: 'ok', content: { 'application/json': { schema } } } } },
+      },
+    },
+    components: { schemas: { Base: { type: 'object', properties: { uuid: { type: 'string', format: 'uuid', readOnly: true } } } } },
+    ...extra,
+  });
+
+  it('id field: a readOnly id-like property, else id, else the item param; type and format; writeOnly', () => {
+    const hints = (schema: unknown) => parseOpenApi(doc(schema), vars()).endpoints[0].schemaHints;
+    expect(hints({ allOf: [{ $ref: '#/components/schemas/Base' }, { properties: { id: { type: 'integer' }, pin: { type: 'string', writeOnly: true } } }] })).toEqual({
+      idField: 'uuid',
+      idType: 'string',
+      idFormat: 'uuid',
+      writeOnly: ['pin'],
+    });
+    expect(hints({ type: 'object', properties: { id: { type: ['integer', 'null'], format: 'int64' }, createdAt: { type: 'string', readOnly: true } } })).toEqual({
+      idField: 'id',
+      idType: 'integer',
+      idFormat: 'int64',
+    });
+    expect(hints({ type: 'object', properties: { thingId: { type: 'string' } } })).toEqual({ idField: 'thingId', idType: 'string' });
+    expect(hints({ type: 'object', properties: { name: { type: 'string' } } })).toBeUndefined();
+    expect(hints({ type: 'string' })).toBeUndefined();
+  });
+
+  it('hints never add problems, and a broken $ref in a schema is reported once', () => {
+    const res = parseOpenApi(doc({ $ref: '#/components/schemas/Missing' }), vars());
+    expect(res.endpoints[0].schemaHints).toBeUndefined();
+    expect(res.problems.filter((p) => p.includes('Missing'))).toHaveLength(1);
+  });
+
+  it('queryParams: path-level and operation parameters with in: query, unique, ≤ 20, ≤ 100 chars', () => {
+    const params = [
+      ...Array.from({ length: 25 }, (_, i) => ({ name: `q${i}`, in: 'query' })),
+      { name: 'x'.repeat(101), in: 'query' },
+    ];
+    const d = doc({ type: 'object' });
+    (d.paths['/things/{thingId}'].get as Record<string, unknown>).parameters = [{ name: 'q0', in: 'query' }, { name: 'h', in: 'header' }, ...params];
+    const qp = parseOpenApi(d, vars()).endpoints[0].queryParams;
+    expect(qp).toHaveLength(20);
+    expect(qp?.[0]).toBe('q0');
+    expect(new Set(qp).size).toBe(20);
+  });
+});

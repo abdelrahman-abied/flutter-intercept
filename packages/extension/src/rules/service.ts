@@ -16,7 +16,7 @@ import type { SharedRulesService, SharedRulesState } from './types';
 import type { RulesFs } from './bodyFile';
 import type { ValidateRule } from './file';
 import { FolderCollectionLinks, PendingSnapshot, SharedRulesCore, SharedRulesStatus } from './core';
-import type { CollectionLink } from '../mocks/types';
+import type { CollectionLink, StoreLink } from '../mocks/types';
 
 export { mergeRules, toPersonalRule } from './core';
 export type { FolderCollectionLinks, PendingItem, PendingScript, PendingSnapshot } from './core';
@@ -95,6 +95,8 @@ export interface SharedRulesHost extends SharedRulesService, vscode.Disposable {
   primaryFolderPath(): Promise<string | undefined>;
   /** Makes `links` the `collections` of the file in `folderPath`; rules and other keys are kept as they are. */
   saveCollections(folderPath: string, links: CollectionLink[]): Promise<void>;
+  /** CONTRACTS §22.7: replaces (or removes) the `stores` entry of one collection; everything else is kept as it is. */
+  saveStore(folderPath: string, collection: string, entry: StoreLink | undefined): Promise<void>;
   /** Writes a workspace file atomically, never through a symlink that leaves the folder (collection copies). */
   writeWorkspaceFile(folderPath: string, rel: string, text: string): Promise<void>;
 }
@@ -266,6 +268,7 @@ export function createSharedRulesService(deps: SharedRulesDeps): SharedRulesHost
     onDidChangeCollections: (listener) => linksChanged.event(listener),
     primaryFolderPath: () => core.primaryFolderPath(),
     saveCollections: (folderPath, links) => after(core.saveCollections(folderPath, links)),
+    saveStore: (folderPath, collection, entry) => after(core.saveStore(folderPath, collection, entry)),
     writeWorkspaceFile: (folderPath, rel, text) => core.writeWorkspaceFile(folderPath, rel, text),
     dispose: () => {
       disposed = true;

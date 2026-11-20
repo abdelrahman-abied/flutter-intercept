@@ -36,6 +36,13 @@ export interface LimitedAnswer {
  */
 export function limitAnswer(rule: Rule): LimitedAnswer | undefined {
   const a = rule.action;
+  // CONTRACTS §22.6: a stateful rule answers its fallback (the example) when no store runs: limit that one
+  if (a.kind === 'handler') {
+    if (!a.fallback) return undefined;
+    const inner = limitAnswer({ ...rule, action: a.fallback });
+    if (!inner || inner.rule.action.kind !== 'mock') return undefined;
+    return { ...inner, rule: { ...rule, action: { ...a, fallback: inner.rule.action } } };
+  }
   if (a.kind !== 'mock' || !approvalReasons(rule).length) return undefined;
   const removed: string[] = [];
   const reasons = new Set<LimitReason>();
@@ -73,6 +80,39 @@ export function limitAnswer(rule: Rule): LimitedAnswer | undefined {
     removed: [...new Set(removed)],
     reasons: LIMIT_REASONS.filter((r) => reasons.has(r)),
   };
+}
+
+/**
+ * CONTRACTS §22.4 / §21.16: the headers of an answer a stateful mock computed, limited like a collection rule's until
+ * the collection is approved. `removed` is empty (and `headers` unchanged) when nothing needed approval.
+ */
+export function limitHeaders(status: number, headers: Record<string, string>, body: string): { headers: Record<string, string>; removed: string[]; reasons: LimitReason[] } {
+  const l = limitAnswer({ id: 'store', enabled: true, match: { url: '*' }, action: { kind: 'mock', status, headers, body } });
+  if (!l || l.rule.action.kind !== 'mock') return { headers, removed: [], reasons: [] };
+  const out = l.rule.action.headers ?? {};
+  // the store's own marker (`truncated`) stays next to the limited one
+  const own = Object.entries(headers).find(([k]) => k.toLowerCase() === NO_EXAMPLE_HEADER)?.[1];
+  if (own && out[NO_EXAMPLE_HEADER] !== undefined) setHeader(out, NO_EXAMPLE_HEADER, `${own}, ${out[NO_EXAMPLE_HEADER]}`);
+  return { headers: out, removed: l.removed, reasons: l.reasons };
+}
+
+/**
+ * CONTRACTS §24.3: headers whose value is never rendered (dynamic values, `{{variables}}`): the ones an approval is
+ * about (§21.16) — what was approved is the text in the file — plus the content type and our own marker.
+ */
+export function isLimitedHeader(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    lower === 'location' ||
+    lower === 'refresh' ||
+    lower === 'set-cookie' ||
+    lower === 'set-cookie2' ||
+    lower === 'content-type' ||
+    lower === NO_EXAMPLE_HEADER ||
+    lower.startsWith('access-control-') ||
+    lower.startsWith('content-security-policy') ||
+    lower.startsWith('x-forwarded-')
+  );
 }
 
 // ------------------------------------------------------------------ problem lines

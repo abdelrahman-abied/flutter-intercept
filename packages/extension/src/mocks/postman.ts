@@ -2,6 +2,7 @@
  * Postman Collection v2.0 / v2.1 parser (CONTRACTS §21.1, §21.2). Pure: no vscode, no fs, no network.
  */
 import { redactUrl } from '../agent/redact';
+import { REQUEST_BODY_BYTES } from './bodyMatch';
 import {
   COLLECTION_LIMITS,
   type CollectionVars,
@@ -350,6 +351,43 @@ function extractQueryArray(
   return out;
 }
 
+const MAX_QUERY_PARAMS = 20;
+const MAX_QUERY_PARAM_CHARS = 100;
+/** Entries of `url.query` looked at for names (the array was already walked by `extractQueryArray`). */
+const MAX_QUERY_ENTRIES_SCANNED = 1000;
+
+/**
+ * CONTRACTS §22.2: the query parameter names a request declares — `url.query` keys (disabled ones included), else the
+ * keys of the raw URL's query string; file order, unique, ≤ 20, each ≤ 100 chars.
+ */
+function queryParamNames(rawUrl: unknown): string[] {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  const add = (k: unknown): void => {
+    if (typeof k !== 'string' || k.length === 0 || k.length > MAX_QUERY_PARAM_CHARS || seen.has(k)) return;
+    if (names.length >= MAX_QUERY_PARAMS) return;
+    seen.add(k);
+    names.push(k);
+  };
+  let raw: unknown = rawUrl;
+  if (isObj(rawUrl)) {
+    const q = own(rawUrl, 'query');
+    if (Array.isArray(q)) {
+      const n = Math.min(q.length, MAX_QUERY_ENTRIES_SCANNED);
+      for (let i = 0; i < n; i++) {
+        const entry: unknown = q[i];
+        if (isObj(entry)) add(own(entry, 'key'));
+      }
+      return names;
+    }
+    raw = own(rawUrl, 'raw');
+  }
+  if (typeof raw === 'string' && raw.length <= COLLECTION_LIMITS.urlChars) {
+    for (const k of parseUrlString(raw).queryMap.keys()) add(k);
+  }
+  return names;
+}
+
 interface ExtractedUrl {
   keyTemplate: string;
   scheme?: string;
@@ -659,6 +697,70 @@ function buildPath(
   return out;
 }
 
+// ------------------------------------------------------------------ request bodies and auth (CONTRACTS §24.1, §24.2)
+
+const FORM_CONTENT_TYPE = 'application/x-www-form-urlencoded';
+const JSON_CONTENT_TYPE = 'application/json';
+
+/**
+ * §24.2: a Postman `body` as `{ contentType, body }` — `raw` text that parses as JSON, or `urlencoded` entries
+ * (enabled ones, re-encoded). Other modes (formdata, file, graphql) and non-JSON raw text → undefined. Over
+ * `REQUEST_BODY_BYTES` → undefined with `tooBig`.
+ */
+function postmanRequestBody(
+  rawBody: unknown,
+  budget: WalkBudget,
+  problems: string[],
+): { value?: { contentType: string; body: string }; tooBig?: true } {
+  if (!isObj(rawBody) || own(rawBody, 'disabled') === true) return {};
+  if (!touchNode(budget, problems)) return {};
+  const mode = own(rawBody, 'mode');
+  const raw = own(rawBody, 'raw');
+  if ((mode === 'raw' || mode === undefined) && typeof raw === 'string') {
+    if (raw.trim() === '') return {};
+    if (utf8ByteLength(raw) > REQUEST_BODY_BYTES) return { tooBig: true };
+    try {
+      JSON.parse(raw);
+    } catch {
+      return {};
+    }
+    return { value: { contentType: JSON_CONTENT_TYPE, body: raw } };
+  }
+  if (mode === 'urlencoded') {
+    const list = own(rawBody, 'urlencoded');
+    if (!Array.isArray(list)) return {};
+    const parts: string[] = [];
+    let bytes = 0;
+    for (const entry of list) {
+      if (!touchNode(budget, problems)) return {};
+      if (!isObj(entry) || own(entry, 'disabled') === true) continue;
+      const key = own(entry, 'key');
+      if (typeof key !== 'string' || key === '') continue;
+      const rawVal = own(entry, 'value');
+      const val =
+        typeof rawVal === 'string'
+          ? rawVal
+          : (typeof rawVal === 'number' && Number.isFinite(rawVal)) || typeof rawVal === 'boolean'
+            ? String(rawVal)
+            : '';
+      const part = `${encodeURIComponent(key)}=${encodeURIComponent(val)}`;
+      bytes += part.length + 1;
+      if (bytes > REQUEST_BODY_BYTES) return { tooBig: true };
+      parts.push(part);
+    }
+    return parts.length > 0 ? { value: { contentType: FORM_CONTENT_TYPE, body: parts.join('&') } } : {};
+  }
+  return {};
+}
+
+/** §24.1: a Postman `auth` block → 'none' (`noauth`), 'declared' (any other type), undefined (absent / inherit). */
+function postmanAuth(rawAuth: unknown): 'none' | 'declared' | undefined {
+  if (!isObj(rawAuth)) return undefined;
+  const type = own(rawAuth, 'type');
+  if (typeof type !== 'string' || type === '' || type === 'inherit') return undefined;
+  return type === 'noauth' ? 'none' : 'declared';
+}
+
 // ------------------------------------------------------------------ examples (responses)
 
 function previewContentType(lang: unknown): string {
@@ -840,8 +942,17 @@ function parseExamples(
       problems,
       budget,
     );
-    const query = extractExampleQuery(own(res, 'originalRequest'), reqQuery, budget, problems);
+    const originalRequest = own(res, 'originalRequest');
+    const query = extractExampleQuery(originalRequest, reqQuery, budget, problems);
     if (budget.exceeded) break;
+    const request = isObj(originalRequest) ? postmanRequestBody(own(originalRequest, 'body'), budget, problems) : {};
+    if (budget.exceeded) break;
+    if (request.tooBig) {
+      pushProblem(
+        problems,
+        `Request "${safeReq}" example "${safeEx}": request body over ${REQUEST_BODY_BYTES / 1024} KB, not used for choosing by body.`,
+      );
+    }
 
     examples.push({
       name: exName,
@@ -849,6 +960,7 @@ function parseExamples(
       headers,
       body,
       ...(query ? { query } : {}),
+      ...(request.value ? { request: request.value } : {}),
     });
   }
   return examples;
@@ -927,7 +1039,7 @@ export const parsePostman: ParsePostman = (doc, vars) => {
     return candidate;
   };
 
-  const walkItems = (items: unknown[], folder: string[]) => {
+  const walkItems = (items: unknown[], folder: string[], inheritedAuth: 'none' | 'declared' | undefined) => {
     if (!touchNode(budget, problems)) return;
     for (const item of items) {
       if (endpointLimitHit || budget.exceeded) return;
@@ -978,6 +1090,13 @@ export const parsePostman: ParsePostman = (doc, vars) => {
         const examples = parseExamples(own(item, 'response'), extracted.queryMap, name, problems, budget, bodyBudget);
         if (budget.exceeded) return;
         const key = uniqueKey(`${method} ${extracted.keyTemplate}`);
+        const queryParams = queryParamNames(rawUrl);
+        const auth = (isObj(req) ? postmanAuth(own(req, 'auth')) : undefined) ?? inheritedAuth;
+        const ownBody = isObj(req) ? postmanRequestBody(own(req, 'body'), budget, problems) : {};
+        if (budget.exceeded) return;
+        if (ownBody.tooBig) {
+          pushProblem(problems, `Request "${quoteFileText(name)}": request body over ${REQUEST_BODY_BYTES / 1024} KB (ignored).`);
+        }
 
         endpoints.push({
           key,
@@ -988,6 +1107,9 @@ export const parsePostman: ParsePostman = (doc, vars) => {
           path,
           examples,
           unresolved,
+          ...(queryParams.length > 0 ? { queryParams } : {}),
+          ...(ownBody.value ? { requestBody: ownBody.value } : {}),
+          ...(auth !== undefined ? { auth } : {}),
         });
         continue;
       }
@@ -1011,7 +1133,7 @@ export const parsePostman: ParsePostman = (doc, vars) => {
           continue;
         }
         activeFolders.add(item);
-        walkItems(childItems, [...folder, itemName ?? 'Unnamed folder']);
+        walkItems(childItems, [...folder, itemName ?? 'Unnamed folder'], postmanAuth(own(item, 'auth')) ?? inheritedAuth);
         activeFolders.delete(item);
         continue;
       }
@@ -1020,7 +1142,7 @@ export const parsePostman: ParsePostman = (doc, vars) => {
     }
   };
 
-  walkItems(rootItems, []);
+  walkItems(rootItems, [], postmanAuth(own(doc, 'auth')));
 
   const variables = [...usedVars.entries()].map(([name, from]) => (from !== undefined ? { name, from } : { name }));
   return { format: 'postman', name: collName, endpoints, variables, problems };

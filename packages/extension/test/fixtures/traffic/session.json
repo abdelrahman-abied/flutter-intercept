@@ -1,0 +1,614 @@
+{
+  "exchanges": [
+    {
+      "id": "e1",
+      "startedAt": 1700000001000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/users/42",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8",
+        "set-cookie": [
+          "session=s3cr3tCookieValue42; HttpOnly; Path=/",
+          "theme=dark"
+        ],
+        "content-security-policy": "default-src 'self'",
+        "x-request-id": "req-abc-123-trace",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "date": "Fri, 20 Nov 2026 10:00:00 GMT",
+        "strict-transport-security": "max-age=63072000",
+        "access-control-allow-origin": "*",
+        "cache-control": "no-store"
+      },
+      "responseBody": {
+        "text": "{\"id\":42,\"name\":\"Ada Lovelace\",\"email\":\"ada@lovelace.dev\",\"phone\":\"+44 20 7946 0958\",\"rating\":4.0,\"address\":{\"street\":\"12 Analytical Way\",\"city\":\"London\",\"zip\":\"NW1 6XE\"},\"lat\":51.5072,\"lng\":-0.1276,\"avatarUrl\":\"https://bucket.s3.amazonaws.com/a.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAPLANTEDCRED%2F20261120&X-Amz-Signature=deadbeefcafef00d1234567890abcdef0042\",\"bio\":\"Write to ada@lovelace.dev or call\",\"big\":12345678901234567890}",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e2",
+      "startedAt": 1700000002000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/users/7",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"id\":7,\"name\":\"Charles Babbage\",\"email\":\"charles@engine.dev\",\"phone\":\"+44 20 7946 0001\",\"rating\":3.5}",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e3",
+      "startedAt": 1700000003000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/users/999",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 404,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"error\":\"not_found\",\"message\":\"No user 999\"}",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e4",
+      "startedAt": 1700000004000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/users/42",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 304,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e5",
+      "startedAt": 1700000005000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/users?page=2&limit=20",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "[{\"id\":42,\"name\":\"Ada Lovelace\"},{\"id\":7,\"name\":\"Charles Babbage\"}]",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e6",
+      "startedAt": 1700000006000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/orders/550e8400-e29b-41d4-a716-446655440000",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"id\":\"550e8400-e29b-41d4-a716-446655440000\",\"total\":12.5,\"items\":[]}",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e7",
+      "startedAt": 1700000007000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/products/shoes",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"slug\":\"shoes\",\"title\":\"Shoes\",\"price\":49.99}",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e8",
+      "startedAt": 1700000008000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/products/hats",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"slug\":\"hats\",\"title\":\"Hats\",\"price\":19.99}",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e9",
+      "startedAt": 1700000009000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/products/bags",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"slug\":\"bags\",\"title\":\"Bags\",\"price\":89}",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e10",
+      "startedAt": 1700000010000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/categories",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "[{\"code\":\"c1\",\"label\":\"Shoes\"}]",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e11",
+      "startedAt": 1700000011000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/brands",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "[{\"brandId\":1,\"logo\":\"x.png\",\"country\":\"IT\"}]",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e12",
+      "startedAt": 1700000012000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/stores",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "[{\"storeNo\":9,\"open\":true}]",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e13",
+      "startedAt": 1700000013000,
+      "durationMs": 12,
+      "method": "POST",
+      "url": "https://api.shop.example/auth/login",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip",
+        "content-type": "application/json"
+      },
+      "requestBody": {
+        "text": "{\"email\":\"ada@lovelace.dev\",\"password\":\"Hunter2!PlantedPw\"}",
+        "encoding": "utf8"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"access_token\":\"eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0.eyJzdWIiOiI0MiIsInNjb3BlIjoic2hvcCIsImV4cCI6MTkwMDAwMDYwMH0.Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg\",\"refresh_token\":\"rt_9f8e7d6c5b4a39281706f5e4d3c2b1a0ZZqq\",\"expires_in\":3600,\"user\":{\"id\":42,\"email\":\"ada@lovelace.dev\"}}",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e14",
+      "startedAt": 1700000014000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/health",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "text/plain"
+      },
+      "responseBody": {
+        "text": "ok",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e15",
+      "startedAt": 1700000015000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/settings",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"theme\":\"dark\"}",
+        "encoding": "utf8"
+      },
+      "state": "completed",
+      "matchedRuleId": "throttle-only"
+    },
+    {
+      "id": "e16",
+      "startedAt": 1700000016000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/rewritten",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"a\":1}",
+        "encoding": "utf8"
+      },
+      "state": "completed",
+      "matchedRuleId": "rewrite-1"
+    },
+    {
+      "id": "e17",
+      "startedAt": 1700000017000,
+      "durationMs": 12,
+      "method": "POST",
+      "url": "https://api.shop.example/graphql",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"data\":{\"me\":{\"id\":42}}}",
+        "encoding": "utf8"
+      },
+      "state": "completed",
+      "graphql": {
+        "operationName": "Me",
+        "operationType": "query"
+      }
+    },
+    {
+      "id": "e18",
+      "startedAt": 1700000018000,
+      "durationMs": 12,
+      "method": "POST",
+      "url": "https://api.shop.example/shop.v1.Shop/GetCart",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/grpc"
+      },
+      "state": "completed",
+      "kind": "grpc"
+    },
+    {
+      "id": "e19",
+      "startedAt": 1700000019000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/events",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "text/event-stream"
+      },
+      "state": "completed",
+      "kind": "sse"
+    },
+    {
+      "id": "e20",
+      "startedAt": 1700000020000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/ws",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 101,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "state": "completed",
+      "kind": "websocket"
+    },
+    {
+      "id": "e21",
+      "startedAt": 1700000021000,
+      "durationMs": 12,
+      "method": "CONNECT",
+      "url": "https://pinned.example:443",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "state": "completed",
+      "kind": "tunnel"
+    },
+    {
+      "id": "e22",
+      "startedAt": 1700000022000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/mocked",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"mocked\":true}",
+        "encoding": "utf8"
+      },
+      "state": "mocked",
+      "matchedRuleId": "collection:x:1"
+    },
+    {
+      "id": "e23",
+      "startedAt": 1700000023000,
+      "durationMs": 12,
+      "method": "OPTIONS",
+      "url": "https://api.shop.example/users/42",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 204,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e24",
+      "startedAt": 1700000024000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://update.googleapis.example/check",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"ok\":true}",
+        "encoding": "utf8"
+      },
+      "state": "completed",
+      "browserInternal": true
+    },
+    {
+      "id": "e25",
+      "startedAt": 1700000025000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/slow",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "state": "pending"
+    },
+    {
+      "id": "e26",
+      "startedAt": 1700000026000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/cut",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "state": "completed",
+      "responseBody": {
+        "text": "{\"a\":",
+        "encoding": "utf8",
+        "truncated": true
+      }
+    },
+    {
+      "id": "e27",
+      "startedAt": 1700000027000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://feed.media.example:8443/images/1.png",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "image/png"
+      },
+      "state": "completed",
+      "responseBody": {
+        "text": "iVBORw0KGgo=",
+        "encoding": "base64"
+      }
+    },
+    {
+      "id": "e28",
+      "startedAt": 1700000028000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://feed.media.example:8443/v1/feed?page=2&token=qTok3nPlantedValue99",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8"
+      },
+      "responseBody": {
+        "text": "{\"items\":[{\"id\":1,\"title\":\"Hello\",\"contact\":\"bob@corp.example.net\",\"mobile\":\"+1 415 555 0100\"}],\"next\":\"https://feed.media.example:8443/v1/feed?page=3&sig=PlantedSig0001&lang=en\"}",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    },
+    {
+      "id": "e29",
+      "startedAt": 1700000029000,
+      "durationMs": 12,
+      "method": "GET",
+      "url": "https://api.shop.example/users/42",
+      "requestHeaders": {
+        "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJBZGEiLCJleHAiOjE5MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "user-agent": "Dart/3.9 (dart:io)",
+        "accept-encoding": "gzip"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json; charset=utf-8",
+        "x-api-token": "tkPlantedHeader0042"
+      },
+      "responseBody": {
+        "text": "{\"id\":42,\"name\":\"Ada Lovelace\",\"email\":\"ada@lovelace.dev\",\"phone\":\"+44 20 7946 0958\",\"rating\":4.0,\"seen\":2,\"address\":{\"street\":\"12 Analytical Way\",\"city\":\"London\",\"zip\":\"NW1 6XE\"},\"lat\":51.5072,\"lng\":-0.1276,\"avatarUrl\":\"https://bucket.s3.amazonaws.com/a.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAPLANTEDCRED%2F20261120&X-Amz-Signature=deadbeefcafef00d1234567890abcdef0042\",\"bio\":\"Write to ada@lovelace.dev or call\",\"big\":12345678901234567890}",
+        "encoding": "utf8"
+      },
+      "state": "completed"
+    }
+  ]
+}
