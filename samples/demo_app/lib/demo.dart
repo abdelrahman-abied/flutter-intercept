@@ -11,6 +11,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'api/auth_api.dart';
 import 'api/catalog_api.dart';
 import 'api/local_api.dart';
 import 'api/orders_api.dart';
@@ -57,6 +58,10 @@ const coverage = bool.fromEnvironment('COVERAGE', defaultValue: true);
 /// --dart-define=COVERAGE_REPEAT_SECONDS=n : re-run the coverage batch every n seconds (e.g. to see
 /// native-client requests made after a debugger or tool attached).
 const coverageRepeatSeconds = int.fromEnvironment('COVERAGE_REPEAT_SECONDS');
+
+/// --dart-define=FI_DEMO_AUTH=1 : run the sign-in round (login → GET → refresh → GET) after the batch
+/// (CONTRACTS §24.1). Off by default so existing runs and request counts do not change.
+const demoAuth = String.fromEnvironment('FI_DEMO_AUTH') == '1';
 
 const _customClient = appFindProxy != '' || appPinning != '';
 
@@ -113,6 +118,7 @@ final _users = UsersApi(Dio(_dioOptions())..httpClientAdapter = _dioAdapter());
 
 final _httpClient = _customClient ? IOClient(appHttpClient()) : http.Client();
 final _orders = OrdersApi(_httpClient);
+final _auth = AuthApi(_httpClient);
 
 int _batch = 0;
 
@@ -209,6 +215,12 @@ Future<void> ordersCreate() => _timed('orders_create', () async {
       final r = await _orders.createOrder(item: 'coffee beans', quantity: 2);
       return (r.statusCode, r.body);
     });
+
+Future<void> todosList() async {
+  log(await runTodosList(_orders));
+}
+
+Future<void> authRound() => runAuthRound(_auth, log: log);
 
 Future<void> retrofitUser() => _timed('retrofit_user', () async {
       // Throws (ERR "type 'Null' is not a subtype of type 'String' …") when the response breaks
@@ -313,6 +325,10 @@ Future<void> runBatch() async {
     if (localPort > 0) localHealth(),
     if (evilUrl.isNotEmpty) attack(),
   ]);
+  // CONTRACTS §22.5: list the collection after POST /todos so a remembering store includes the created item.
+  await todosList();
+  // CONTRACTS §24.1: sign-in / refresh round when opted in via --dart-define=FI_DEMO_AUTH=1.
+  if (demoAuth) await authRound();
   log('DEMO_BATCH done $_batch');
 }
 
@@ -322,7 +338,8 @@ void runDemo({required String flavor}) {
       'pinning=${appPinning.isEmpty ? '-' : appPinning} repeat=$repeatSeconds'
       '${localPort > 0 ? ' local=$localHealthUrl' : ''}'
       '${grpcPort > 0 ? ' grpc=$grpcHost:$grpcPort' : ''}'
-      '${mtlsPort > 0 ? ' mtls=$mtlsHost:$mtlsPort' : ''}');
+      '${mtlsPort > 0 ? ' mtls=$mtlsHost:$mtlsPort' : ''}'
+      '${demoAuth ? ' auth=1' : ''}');
   if (appSetsOverrides) HttpOverrides.global = AppHttpOverrides();
 
   void start() {
@@ -378,6 +395,8 @@ class DemoApp extends StatelessWidget {
               ('http GET plain http://', httpPlain),
               ('Dio GET album (interceptors)', catalogAlbum),
               ('http POST order', ordersCreate),
+              ('http GET todos list', todosList),
+              ('Auth sign-in round', authRound),
               ('Retrofit GET user (models)', retrofitUser),
               if (localPort > 0) ('GET host server /health', localHealth),
               ('WebSocket echo', wsEcho),
