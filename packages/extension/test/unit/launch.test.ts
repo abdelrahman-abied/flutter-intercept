@@ -31,6 +31,8 @@ interface FakeOpts {
   resolve?: (config: Record<string, any>) => Record<string, any> | null;
   startOk?: boolean;
   hotRestart?: (id: string) => Promise<void>;
+  /** stopDebugging rejects with "Canceled": true = the session still ends, 'hang' = it never ends. */
+  stopRejects?: true | 'hang';
 }
 
 function fake(o: FakeOpts = {}) {
@@ -74,7 +76,8 @@ function fake(o: FakeOpts = {}) {
       },
       stopDebugging: async (s: any) => {
         stopped.push(s.id);
-        setTimeout(() => term.forEach((l) => l(s)), 5);
+        if (o.stopRejects !== 'hang') setTimeout(() => term.forEach((l) => l(s)), 5);
+        if (o.stopRejects) throw new Error('Canceled');
       },
       onDidStartDebugSession: on(start),
       onDidTerminateDebugSession: on(term),
@@ -193,6 +196,23 @@ describe('AppLauncher sessions / stop / hotRestart', () => {
     expect(f.stopped).toEqual(['s1', 's2']);
     expect(await l.stop()).toEqual({ stopped: 0 });
     await expect(l.stop('nope')).rejects.toThrow(/No running intercepted session nope/);
+    l.dispose();
+  });
+
+  it('stop() succeeds when stopDebugging rejects with "Canceled" but the session ends', async () => {
+    const f = fake({ stopRejects: true });
+    const l = createAppLauncher({ vscode: f.vs });
+    await l.launch({ deviceId: 'a' });
+    expect(await l.stop()).toEqual({ stopped: 1 });
+    expect(l.sessions()).toEqual([]);
+    l.dispose();
+  });
+
+  it('stop() surfaces the rejection when the session does not end', async () => {
+    const f = fake({ stopRejects: 'hang' });
+    const l = createAppLauncher({ vscode: f.vs, stopTimeoutMs: 30 });
+    await l.launch({ deviceId: 'a' });
+    await expect(l.stop()).rejects.toThrow(/Canceled/);
     l.dispose();
   });
 

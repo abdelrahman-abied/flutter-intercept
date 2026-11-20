@@ -215,8 +215,18 @@ export function createAppLauncher(deps: LauncherDeps = {}): AgentAppLauncher {
               resolve(false);
             });
           });
-          await vs.debug.stopDebugging(s);
-          if (await ended) stopped++;
+          // VS Code can reject stopDebugging with "Canceled" when the session ends while it is being stopped
+          // (seen with Dart-Code on macOS). What counts is whether the session ended: only a rejection for a
+          // session that is still running is an error.
+          let stopError: unknown;
+          try {
+            await vs.debug.stopDebugging(s);
+          } catch (e) {
+            stopError = e;
+          }
+          const done = await ended;
+          if (!done && stopError !== undefined) throw stopError;
+          if (done) stopped++;
           live.delete(s.id);
         }),
       );
