@@ -39,8 +39,10 @@ const SESSION_IDLE_MS = 60 * 60 * 1000;
  * simulate_network can cut off all of the app's traffic ("offline") (REVIEW-3 #7).
  */
 // REVIEW-6 #12: replay_recording (fallback "fail" fails all unmatched traffic) and add_map_remote (sends the app's
-// requests, credentials included, to another server).
-export const DESTRUCTIVE_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'resend_request', 'simulate_network', 'replay_recording', 'add_map_remote', 'set_collection']);
+// requests, credentials included, to another server). CONTRACTS §22.11: set_store replaces / removes the data the app
+// sees; store_snapshot overwrites or deletes a file and load replaces data (neither is idempotent: generate adds, save
+// stamps the time).
+export const DESTRUCTIVE_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['remove_rule', 'abort_request', 'clear_requests', 'stop_app', 'resend_request', 'simulate_network', 'replay_recording', 'add_map_remote', 'set_collection', 'set_store', 'store_snapshot']);
 
 /**
  * CONTRACTS §9.5: write tools whose repeated call with the same input has no further effect. Not

@@ -35,6 +35,10 @@ export const READ_TOOLS = [
   'list_collections',
   'get_collection',
   'get_collection_example',
+  // CONTRACTS §22.11
+  'get_store',
+  // CONTRACTS §23.5 (the diff only: agents never write the team's collection file)
+  'update_collection_example',
 ] as const;
 
 export const WRITE_TOOLS = [
@@ -67,6 +71,11 @@ export const WRITE_TOOLS = [
   // CONTRACTS §21.10
   'import_collection',
   'set_collection',
+  // CONTRACTS §22.11
+  'set_store',
+  'store_snapshot',
+  // CONTRACTS §23.5
+  'mock_from_traffic',
 ] as const;
 
 export type ReadToolName = (typeof READ_TOOLS)[number];

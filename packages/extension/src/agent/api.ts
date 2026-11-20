@@ -15,6 +15,7 @@ import { grpcTools } from './tools/grpc';
 import { networkTools } from './tools/network';
 import { recordingsTools } from './tools/recordings';
 import { collectionsTools } from './tools/collections';
+import { storeTools } from './tools/store';
 import { rulesTools } from './tools/rules';
 import { trafficTools } from './tools/traffic';
 import type { ToolHandler } from './tools/types';
@@ -36,6 +37,7 @@ const HANDLERS: { [T in ToolName]: ToolHandler<T> } = {
   ...assertTools,
   ...recordingsTools,
   ...collectionsTools,
+  ...storeTools,
   ...exportTools,
   ...grpcTools,
   ...appTools,
@@ -62,7 +64,9 @@ export class AgentApi extends AgentViews implements AgentTools {
     try {
       const access = this.access;
       if (access === 'off') throw new AgentToolError('Flutter Intercept agent access is off (setting flutterIntercept.agent.access).', 'access');
-      if (isWriteTool(tool) && access !== 'readWrite') {
+      // CONTRACTS §23.5: mock_from_traffic's dry run writes nothing (counts and names only): allowed read-only
+      const dryRun = tool === 'mock_from_traffic' && input?.dryRun === true;
+      if (isWriteTool(tool) && access !== 'readWrite' && !dryRun) {
         throw new AgentToolError(`"${tool}" changes app traffic or sessions, but agent access is read-only (setting flutterIntercept.agent.access).`, 'access');
       }
       let parsed: unknown;

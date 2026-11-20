@@ -230,6 +230,14 @@ describe('AppLauncher sessions / stop / hotRestart', () => {
     l.dispose();
   });
 
+  it('hotRestart() gives up when the debugger never answers', async () => {
+    const f = fake({ hotRestart: () => new Promise<void>(() => undefined) });
+    const l = createAppLauncher({ vscode: f.vs, hotRestartTimeoutMs: 30 });
+    await l.launch({ deviceId: 'a' });
+    await expect(l.hotRestart()).rejects.toThrow(/no answer from the debugger after 0 s/);
+    l.dispose();
+  });
+
   it('hotRestart() surfaces adapter errors', async () => {
     const f = fake({ hotRestart: async () => Promise.reject(new Error('app not started yet')) });
     const l = createAppLauncher({ vscode: f.vs });

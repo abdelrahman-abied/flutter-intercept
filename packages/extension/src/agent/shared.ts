@@ -147,7 +147,13 @@ export interface AgentApiDeps {
   /** CONTRACTS §21.10: mock from a collection (src/mocks/service.ts). Optional: without it the tools answer a clear error. */
   collections?: Pick<MockCollectionsHost, 'state' | 'endpoints' | 'example' | 'update' | 'importFile'> &
     /** CONTRACTS §21.15 #2 / #3: which collection answer an exchange got; a request → its endpoint. */
-    Partial<Pick<MockCollectionsHost, 'describeRule' | 'endpointForRequest'>>;
+    Partial<Pick<MockCollectionsHost, 'describeRule' | 'endpointForRequest'>> &
+    /** CONTRACTS §22.11: stateful mocks (get_store / set_store / store_snapshot; `collection.store` in exchange views). */
+    Partial<Pick<MockCollectionsHost, 'storeStatus' | 'storeItems' | 'updateStore' | 'storeSnapshot' | 'storeOpOf'>> &
+    /** CONTRACTS §24: which example the answer pipeline chose / what the auth gate did; `expire_token` on a collection with sign-in simulation. */
+    Partial<Pick<MockCollectionsHost, 'answerOf' | 'expireSessions' | 'authCollectionFor'>> &
+    /** CONTRACTS §23.5: mock_from_traffic, update_collection_example (preview only), drift in list_collections / get_collection. */
+    Partial<Pick<MockCollectionsHost, 'mockFromTraffic' | 'previewExampleUpdate' | 'drift'>>;
   /** A recording was saved or replay started/stopped: `controller.refreshRecordings()` (the panel's list). */
   recordingsChanged?(): void;
   /** Auth-flow analysis (src/analysis/auth.ts `analyzeAuth`). */

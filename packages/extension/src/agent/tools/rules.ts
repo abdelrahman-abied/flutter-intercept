@@ -192,6 +192,30 @@ export function addSequence(ag: AgentViews, i: ToolInput<'add_sequence'>): ToolR
 
 
 export function expireToken(ag: AgentViews, i: ToolInput<'expire_token'>): ToolResult {
+  // CONTRACTS §24.1: on a collection with sign-in simulation on, the sessions expire instead (a [401 × n, passthrough]
+  // rule would send the next request to the real server, past the collection). Counts only: never a token.
+  const svc = ag.deps.collections;
+  let collection: string | undefined;
+  try {
+    collection = svc?.authCollectionFor?.(i.url);
+  } catch {
+    collection = undefined;
+  }
+  if (collection !== undefined && svc?.expireSessions) {
+    let expired: number;
+    try {
+      expired = svc.expireSessions(collection);
+    } catch (e) {
+      throw new AgentToolError((e as Error).message, 'state');
+    }
+    return {
+      expired,
+      collection,
+      note: expired
+        ? "every access token of this collection's sign-in simulation is expired (refresh tokens still work): the app's next request gets 401 and should refresh — get_auth_flows shows what it did. No rule was added."
+        : 'nobody is signed in to this collection\'s sign-in simulation, so nothing expired (sign in from the app first). No rule was added.',
+    };
+  }
   let rule: Rule;
   try {
     rule = expireTokenRule(ag.newId(), i.url, i.count, { namePrefix: AGENT_RULE_PREFIX });

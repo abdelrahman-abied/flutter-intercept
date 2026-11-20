@@ -133,7 +133,8 @@ describe('REVIEW-4 #9: credential-looking values, whatever the key', () => {
 
   it('in JSON bodies under any key (byte-exact elsewhere), headers, query values, URL paths and text bodies', () => {
     const body = `{"access": "${JWT}", "jwt":{"v":"${OPAQUE}"}, "n": 1.0, "msg": "Bearer abcdef0123456789xyz", "sha": "da39a3ee5e6b4b0d3255bfef95601890afd80709"}`;
-    expect(redactJsonText(body)).toBe(`{"access": "${REDACTED}", "jwt":{"v":"${REDACTED}"}, "n": 1.0, "msg": "Bearer ${REDACTED}", "sha": "da39a3ee5e6b4b0d3255bfef95601890afd80709"}`);
+    // REVIEW-16 #5: `jwt` is a secret name now (the shared check), so its whole value is redacted
+    expect(redactJsonText(body)).toBe(`{"access": "${REDACTED}", "jwt":"${REDACTED}", "n": 1.0, "msg": "Bearer ${REDACTED}", "sha": "da39a3ee5e6b4b0d3255bfef95601890afd80709"}`);
     expect(redactHeaders({ 'x-id-jwt': JWT, 'x-forwarded': `Bearer ${OPAQUE}`, etag: '"abc123"' })).toEqual({ 'x-id-jwt': REDACTED, 'x-forwarded': `Bearer ${REDACTED}`, etag: '"abc123"' });
     expect(redactQueryString(`code=${OPAQUE}&page=2`)).toBe(`code=${REDACTED}&page=2`);
     expect(redactUrl(`https://a.example/reset/${JWT}?x=1#f`)).toBe(`https://a.example/reset/${REDACTED}?x=1#f`);
@@ -173,5 +174,23 @@ describe('redactLogLine (CONTRACTS §13.4, REVIEW-7 #8)', () => {
     ['status 200 for GET /users/1', 'status 200 for GET /users/1'],
   ])('%s → %s', (line, want) => {
     expect(redactLogLine(line)).toBe(want);
+  });
+});
+
+describe('REVIEW-16 #9: tokens in webhook and bot URL paths', () => {
+  it('redacts a Telegram bot token segment', () => {
+    const out = redactUrl('https://api.telegram.org/bot123456789:AAHk9plantedTOKENvalue_abcdefgh/getMe');
+    expect(out).not.toContain('AAHk9planted');
+    expect(out).toContain('/getMe');
+  });
+  it('redacts Slack and Discord webhook paths after the marker', () => {
+    const slack = redactUrl('https://hooks.slack.com/services/T0001/B0002/plantedSlackSecret');
+    expect(slack).not.toContain('plantedSlackSecret');
+    expect(slack.startsWith('https://hooks.slack.com/services/')).toBe(true);
+    const discord = redactUrl('https://discord.com/api/webhooks/1234567890/plantedDiscordToken');
+    expect(discord).not.toContain('plantedDiscordToken');
+  });
+  it('leaves ordinary paths alone', () => {
+    expect(redactUrl('https://api.example.com/services/users/42')).toBe('https://api.example.com/services/users/42');
   });
 });

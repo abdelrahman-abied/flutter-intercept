@@ -169,6 +169,18 @@ const endpointKey = z.string().min(1).max(8224).describe('A request key as get_c
 const requestRef = id.describe('Instead of endpoint: the id of a request from the traffic (list_requests / wait_for_request) — the collection request it belongs to.');
 const workspaceFile = z.string().trim().min(1).max(1024).describe('A path relative to the Flutter project folder, inside it (no absolute paths, no "..").');
 
+// ---- CONTRACTS §22.11 (stateful mocks)
+/** Records per resource (STORE_LIMITS.recordsPerResource / generateCount). */
+export const MAX_STORE_ITEMS = 5000;
+export const STORE_SNAPSHOT_NAME = /^[a-z0-9-]{1,40}$/;
+const storeResource = z.string().min(1).max(200).describe('A resource name as get_store lists it, e.g. "todos" or "users.orders" (nested).');
+const storeScope = z
+  .record(z.string().regex(/^[A-Za-z0-9_.$-]{1,100}$/, 'a path parameter name such as userId'), z.string().min(1).max(100))
+  .refine((o) => Object.keys(o).length <= 10, 'at most 10 parent ids')
+  .describe('Nested resources only: the parent ids by path parameter name, e.g. {"userId": "1"} for /users/1/orders. Omit to see every parent\'s records.');
+const snapshotName = z.string().regex(STORE_SNAPSHOT_NAME, 'a snapshot name: 1-40 lowercase letters, digits or "-", e.g. "empty-cart"');
+const storeRecord = z.record(z.string(), z.unknown()).describe('One record as a JSON object (the shape get_store shows).');
+
 // ---- CONTRACTS §12.7
 const recordingId = z.string().min(1).max(200).describe('A recording id (from list_recordings or save_recording).');
 const stepCount = z.number().int().min(1).max(1000).optional().describe('How many successive matching requests this step answers (1-1000, default 1).');
@@ -588,8 +600,8 @@ export const toolSchemas = {
     maxBodyChars: z.number().int().min(0).max(200_000).default(20_000).describe('Cut the body after this many characters.'),
   }),
   import_collection: z.strictObject({
-    file: workspaceFile.describe('The Postman collection (v2.0 / v2.1, .json) or OpenAPI 3 document (.json, .yaml, .yml), relative to the Flutter project folder.'),
-    environment: workspaceFile.optional().describe('A Postman environment file (.json) whose values fill {{variables}} in URLs; relative to the Flutter project folder.'),
+    file: workspaceFile.describe('The Postman collection (v2.0 / v2.1), OpenAPI 3 or Swagger 2.0 document, Insomnia export (v4 JSON, v5 YAML) or the bruno.json of a Bruno collection folder, relative to the Flutter project folder.'),
+    environment: workspaceFile.optional().describe('Postman / OpenAPI / Swagger: a Postman environment file (.json) whose values fill {{variables}} in URLs, relative to the Flutter project folder. Insomnia / Bruno: the NAME of one of the collection\'s own environments (an unknown name is refused with the list).'),
   }),
   set_collection: z.strictObject({
     id: collectionId,
@@ -620,6 +632,84 @@ export const toolSchemas = {
     reset: z.boolean().optional().describe('true: undo this user\'s own changes (all of them, or one request with endpoint / request). Not combined with other changes.'),
     endpoint: endpointKey.optional().describe('With reset: only this request.'),
     request: requestRef.optional().describe('With reset: only the collection request this traffic request belongs to.'),
+  }),
+  // CONTRACTS §22.11
+  get_store: z.strictObject({
+    id: collectionId,
+    resource: storeResource.optional().describe('Read the records of this resource. Omit for the overview: every resource with its count, id field and whether it remembers, saved snapshots, problems.'),
+    scope: storeScope.optional(),
+    filter: z.string().trim().min(1).max(200).optional().describe('Only records whose JSON contains this text (case-insensitive; matched against the records as you see them).'),
+    offset: z.number().int().min(0).max(MAX_STORE_ITEMS).default(0).describe('Skip this many records (paging: pass the previous answer\'s next).'),
+    limit: z.number().int().min(1).max(200).default(20).describe('Max records returned (1-200).'),
+    fields: z.array(z.string().min(1).max(200)).min(1).max(50).optional().describe('Only these top-level fields of each record (the id field is always kept).'),
+    shape: z.boolean().optional().describe('true: the structure of the records (keys, types, counts) instead of the records — cheap for large lists.'),
+  }),
+  set_store: z.strictObject({
+    id: collectionId,
+    resource: storeResource.optional().describe('The resource to change. Required for items / put / remove / generate / remembers / idField.'),
+    items: z.array(storeRecord).max(MAX_STORE_ITEMS).optional().describe('Replace ALL records of the resource with these ([] = empty list). "[redacted]" values keep the stored value of the record with the same id.'),
+    put: storeRecord.optional().describe('Add one record, or replace the record with the same id. "[redacted]" values keep the stored value.'),
+    remove: z.union([z.string().min(1).max(100), z.number().int()]).optional().describe('Remove the record with this id.'),
+    generate: z
+      .strictObject({ count: z.number().int().min(1).max(MAX_STORE_ITEMS).describe('How many records (1-5000).') })
+      .optional()
+      .describe('Add this many records copied from the first seeded record, each with a new id (long lists, paging, performance).'),
+    remembers: z.boolean().optional().describe('Setting: false = this resource answers from the collection\'s fixed examples again; true = it remembers.'),
+    idField: z.string().min(1).max(100).optional().describe('Setting: the record field that holds the id (when it was detected wrong).'),
+    enabled: z.boolean().optional().describe('Setting: false = no resource of this collection remembers (fixed examples, as before).'),
+    startsFrom: z.union([snapshotName, z.null()]).optional().describe('Setting: start (and reset) from this saved snapshot instead of the collection\'s examples; null = the examples.'),
+    auth: z
+      .strictObject({
+        enabled: z.boolean().optional().describe('Setting: true = sign-in simulation on (the collection needs a login request).'),
+        ttlSeconds: z.number().int().min(60).max(86400).optional().describe('Setting: how long an access token stays valid, in seconds (60-86400, default 3600).'),
+        protect: z.enum(['declared', 'all']).optional().describe('Setting: which requests need a token — "declared" = the ones the collection marks as authenticated, "all" = every request but login / refresh / logout / register.'),
+        expire: z.literal('all').optional().describe('Data: "all" = every access token expires now (refresh tokens stay valid), to test the app\'s refresh.'),
+      })
+      .optional()
+      .describe('Sign-in simulation of the collection: the login request answers its example with a fresh token, other requests need that token (401 without it). No password is read or stored.'),
+    dynamic: z.enum(['random', 'seeded', 'fixed']).optional().describe('Setting: how {{$randomInt}}-style values in examples are filled in — "random" (default), "seeded" (the same run gives the same values), "fixed" (constants).'),
+    reset: z
+      .enum(['data', 'settings'])
+      .optional()
+      .describe('"data": put the records back to how they started (one resource, or all; all also signs everyone out); "settings": undo your own settings. Not combined with other changes.'),
+    scope: z
+      .enum(['me', 'team'])
+      .optional()
+      .describe('Settings only: "me" (default) = for this user, nothing is written to the repo; "team" = saved in .vscode/flutter-intercept.json. Data changes are never saved to a file.'),
+  }),
+  store_snapshot: z.strictObject({
+    id: collectionId,
+    action: z.enum(['save', 'load', 'delete']).describe('"save" the current records to a file, "load" a saved file into the data now, or "delete" the file.'),
+    name: snapshotName.describe('The snapshot name, e.g. "empty-cart" (file .vscode/flutter-intercept/snapshots/<id>/<name>.json).'),
+  }),
+  // CONTRACTS §23.5
+  mock_from_traffic: z.strictObject({
+    name: z.string().trim().min(1).max(100).optional().describe('A name for the collection, e.g. "Shop API (recorded)". Default "<host> (recorded)" of the busiest server.'),
+    recording: recordingId.optional().describe('Build it from this saved recording (list_recordings) instead of this session\'s traffic.'),
+    url: z.string().min(1).max(8192).optional().describe('This session only: requests whose URL matches this glob (`*` = any characters).'),
+    sinceMs: z.number().int().min(0).optional().describe('This session only: requests that started at or after this time (epoch ms).'),
+    origins: z
+      .array(z.string().min(1).max(300))
+      .min(1)
+      .max(50)
+      .optional()
+      .describe('Only these servers ("https://api.example.com"). Default: the servers that answered JSON, known third-party services (analytics, crash reporting, …) left out.'),
+    unmatched: z
+      .enum(['passthrough', 'fail'])
+      .default('passthrough')
+      .describe('Requests the recording has no answer for: "passthrough" (the real server, default) or "fail" (like offline: nothing reaches a real server).'),
+    replacePersonalData: z.boolean().default(true).describe('Ignored for agents: personal data is always replaced (e-mail addresses, phone numbers and addresses in the answers become placeholders).'),
+    dryRun: z.boolean().optional().describe('true: return what would be made (counts, file name, resources, what was removed) without writing or linking anything.'),
+  }),
+  update_collection_example: z.strictObject({
+    id: collectionId,
+    endpoint: endpointKey.optional(),
+    request: requestRef.optional(),
+    status: z.number().int().min(100).max(599).describe('The status whose example is out of date (drift[].status).'),
+    mode: z
+      .enum(['merge', 'add'])
+      .default('merge')
+      .describe('"merge" (default): the example keeps its values, gains the new fields (values from the server, sanitised), loses the removed ones, converts changed types. "add": the server\'s answer as a new example (also for a status the request has no example for).'),
   }),
   get_grpc_schema: z.strictObject({
     method: z
@@ -844,7 +934,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   },
   expire_token: {
     title: 'Expire the auth token',
-    model: 'Simulate an expired access token: the next count (default 1) requests matching url get 401 {"error":"token_expired"}; after that the real server answers again. Use it to test the app\'s token refresh: expire_token on the authenticated API, trigger a request, then get_auth_flows (did it refresh once and retry?) or assert_traffic. Inserted first; remove it with remove_rule when done.',
+    model: 'Simulate an expired access token: the next count (default 1) requests matching url get 401 {"error":"token_expired"}; after that the real server answers again. Use it to test the app\'s token refresh: expire_token on the authenticated API, trigger a request, then get_auth_flows (did it refresh once and retry?) or assert_traffic. Inserted first; remove it with remove_rule when done. When url is on a linked collection with sign-in simulation on (get_store shows auth.enabled), no rule is added: every signed-in session\'s access token expires instead (refresh tokens stay valid) and the answer is {expired, collection}; count is not used.',
     user: 'Make matching requests fail with 401 "token expired" for a while.',
   },
   add_map_remote: {
@@ -879,13 +969,13 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   list_collections: {
     title: 'List collection mocks',
     model:
-      'List the Postman collections / OpenAPI documents the app\'s requests are mocked from (linked in .vscode/flutter-intercept.json): id, name, file, format, enabled, unmatched ("passthrough" or "fail"), counts (endpoints, mocked, noExample = answered 501, generated = bodies made from schemas, off), unresolved URL variables (requests using them are not mocked yet), origins, problems, overrides (your own changes in effect), limited (answers served without cookies / redirects / CORS / HTML until the user approves the collection in the panel — only the user can), seen (from this session\'s traffic: notInCollection = requests to its servers it has no entry for, noExample = requests answered 501). Mocks from a collection run after every rule, so add_mock / add_block / simulate_network still override them.',
+      'List the Postman collections / OpenAPI documents the app\'s requests are mocked from (linked in .vscode/flutter-intercept.json): id, name, file, format, enabled, unmatched ("passthrough" or "fail"), counts (endpoints, mocked, noExample = answered 501, generated = bodies made from schemas, off), unresolved URL variables (requests using them are not mocked yet), origins, problems, overrides (your own changes in effect), limited (answers served without cookies / redirects / CORS / HTML until the user approves the collection in the panel — only the user can), seen (from this session\'s traffic: notInCollection = requests to its servers it has no entry for, noExample = requests answered 501), drift (≤ 20: where the real server\'s answers no longer match an example — field paths and kinds, never values; the collection is stale: tell the user, update_collection_example shows the change). Mocks from a collection run after every rule, so add_mock / add_block / simulate_network still override them.',
     user: 'List the collections requests are mocked from.',
   },
   get_collection: {
     title: 'Get a collection\'s requests',
     model:
-      'List the requests of one collection: key (pass it to get_collection_example / set_collection — or pass a traffic request id as request instead), method, name, folder, url (origin + path, :params), examples (name, status, generated, query = chosen by these query parameters), selected example, off, overridden (your own change), unresolved variables, and seen (requests the collection lacks / answered 501). filter narrows by text; limit caps the list.',
+      'List the requests of one collection: key (pass it to get_collection_example / set_collection — or pass a traffic request id as request instead), method, name, folder, url (origin + path, :params), examples (name, status, generated, query = chosen by these query parameters), selected example, off, overridden (your own change), unresolved variables, drift (where the real server\'s answers differ from an example), and seen (requests the collection lacks / answered 501). filter narrows by text; limit caps the list.',
     user: 'Show the requests and examples of a mocked collection.',
   },
   get_collection_example: {
@@ -897,7 +987,7 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
   import_collection: {
     title: 'Mock from a collection',
     model:
-      'Link a Postman collection (v2.0 / v2.1) or an OpenAPI 3 document (JSON or YAML) that is inside the Flutter project folder, so the app\'s requests to its servers are answered from the saved examples (OpenAPI without examples: bodies generated from the schemas) — no test server needed, the app keeps calling its real URLs. A request with no example answers 501 with a JSON message; requests the collection does not know go to the real server. The link is written to .vscode/flutter-intercept.json (shared with the team). URL variables without a value ({{baseUrl}}) leave those requests unmocked: set them with set_collection variable, or pass a Postman environment file. Files outside the project can only be imported by the user (Mock from a Collection… in the panel or the command palette). Returns the collection\'s status.',
+      'Link a Postman collection (v2.0 / v2.1), an OpenAPI 3 or Swagger 2.0 document (JSON or YAML), an Insomnia export or a Bruno collection (its bruno.json) that is inside the Flutter project folder, so the app\'s requests to its servers are answered from the saved examples (OpenAPI without examples: bodies generated from the schemas) — no test server needed, the app keeps calling its real URLs. A request with no example answers 501 with a JSON message; requests the collection does not know go to the real server. The link is written to .vscode/flutter-intercept.json (shared with the team). URL variables without a value ({{baseUrl}}) leave those requests unmocked: set them with set_collection variable, or pass a Postman environment file. Files outside the project can only be imported by the user (Mock from a Collection… in the panel or the command palette). Returns the collection\'s status.',
     user: 'Mock the app\'s requests from a Postman collection or OpenAPI document.',
   },
   set_collection: {
@@ -905,6 +995,38 @@ export const TOOL_DOCS: Record<ToolName, ToolDoc> = {
     model:
       'Change how a linked collection answers: example {request or endpoint, name} picks which saved example answers a request (e.g. "Wrong password" for the login request, to test error handling — request = the id of that request from the traffic); off {request or endpoint, off} stops mocking one request; unmatched "fail" makes requests the collection does not know fail like offline ("passthrough" = real server); enabled turns the whole collection on or off. These change for you only (nothing is written to the repo) unless scope is "team"; reset: true undoes your changes. variable {name, value} sets a server URL such as baseUrl, saved for the team. Requests sent after the change get the new answers (hot_restart to make a running app send them again).',
     user: 'Change which example a mocked request returns, or turn mocking off for a request or collection.',
+  },
+  // CONTRACTS §22.11
+  get_store: {
+    title: 'Get stateful mock data',
+    model:
+      'Read the data a collection\'s fake backend remembers. A linked collection\'s REST resources (GET/POST /todos + GET/PUT/PATCH/DELETE /todos/:id) remember what the app sends: POST adds, GET lists and reads, PUT/PATCH change, DELETE removes — starting from the collection\'s examples. Without resource: the overview {enabled, resources [{name, path, idField, count, remembers}], snapshots, startsFrom, changed, problems, auth {available, enabled, login, refresh, ttlSeconds, protect, sessions (a count), problems} = sign-in simulation, dynamic = how {{$random…}} values are filled in}. With resource: {resource, total, items, more, next} (offset / limit page; filter by text; fields keeps only some keys; scope picks the parent of a nested resource), or shape: true for the structure only (use it for large lists). Secrets in records are redacted like captured traffic. Exchanges the store answered carry collection.store {resource, op, itemId} in list_requests / wait_for_request.',
+    user: 'Show the data a collection mock remembers.',
+  },
+  set_store: {
+    title: 'Change stateful mock data',
+    model:
+      'Change the data a collection\'s fake backend remembers, to set up a scenario the app then sees on its next requests (hot_restart to make it fetch again). One data change per call, always with resource: items (replace every record; [] = an empty list), put (add or replace one record by id), remove (one id), generate {count} (many records). Data stays in memory (never in a file) until reset: "data" (back to how it started) or the proxy stops. Settings: remembers (one resource), idField, enabled (the whole collection), startsFrom (a snapshot), auth {enabled, ttlSeconds, protect} (sign-in simulation: login answers a fresh token, other requests get 401 without it; no password is read), dynamic — for you only unless scope is "team"; reset: "settings" undoes them. auth {expire: "all"} expires every access token now (data, like expire_token). Returns counts only {resource, count, note}; read records with get_store.',
+    user: 'Change the data a collection mock remembers (empty list, generated records, reset).',
+  },
+  store_snapshot: {
+    title: 'Save or load a data snapshot',
+    model:
+      'Save the data a collection\'s fake backend remembers as a named snapshot file (.vscode/flutter-intercept/snapshots/<id>/<name>.json, for the team to commit; secret-looking fields are blanked), load one into the data now (the resources it names are replaced, others kept), or delete one. Returns {path, resources, records, blanked}. set_store {startsFrom: name} makes a snapshot the starting data.',
+    user: 'Save, load or delete a named snapshot of collection mock data.',
+  },
+  // CONTRACTS §23.5
+  mock_from_traffic: {
+    title: 'Make a fake backend from traffic',
+    model:
+      'No test server, but the app worked against the real one earlier: build a collection from the real answers recorded in this session (or a saved recording) and mock from it at once — one request per endpoint (ids become :params), the newest answer per status as its examples, REST resources remember what the app writes. Credentials are always removed (tokens become an unsigned placeholder JWT, cookies and secret headers dropped, signed URLs cleaned); e-mails, phones and addresses are always replaced (replacePersonalData is ignored for agents: personal data is always replaced); other values are real data. Written to .vscode/flutter-intercept/collections/<name>.json (never over a file) and linked in .vscode/flutter-intercept.json for the team. Returns {id, file, endpoints, examples, resources, skipped (what was not used: GraphQL, redirects, …), removed (names, never values), limited}. dryRun: true returns the same without writing (allowed with read-only access). Then hot_restart; the collection tools (get_collection, set_collection, get_store) work on it.',
+    user: "Make a collection from the app's recorded traffic and mock from it.",
+  },
+  update_collection_example: {
+    title: 'Preview a collection example update',
+    model:
+      'When list_collections / get_collection show drift (the real server\'s answers no longer look like a collection example: added / removed / retyped / nullable fields, or a status without an example), show what updating the example would change: returns {id, endpoint, status, mode, file, diff} where diff is a unified diff of the example body (the server\'s values sanitised; secrets redacted like captured traffic). It never writes: the collection file belongs to the team, so tell the user to apply it from the panel ("Update example"). mode "merge" needs an example of that status; use "add" otherwise.',
+    user: 'Show how a drifted collection example would be updated (nothing is written).',
   },
   get_grpc_schema: {
     title: 'Get gRPC schema',

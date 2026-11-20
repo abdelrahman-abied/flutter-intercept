@@ -8,6 +8,7 @@ describe('tool schemas', () => {
   it('cover exactly the tools in types.ts, each with docs', () => {
     expect(Object.keys(toolSchemas).sort()).toEqual([...READ_TOOLS, ...WRITE_TOOLS].sort());
     expect(Object.keys(TOOL_DOCS).sort()).toEqual([...ALL_TOOLS].sort());
+    expect(ALL_TOOLS).toHaveLength(52); // CONTRACTS §22.11: + get_store, set_store, store_snapshot; §23.5: + mock_from_traffic, update_collection_example
     for (const t of ALL_TOOLS) {
       expect(TOOL_DOCS[t].model.length).toBeGreaterThan(40);
       expect(TOOL_DOCS[t].user.length).toBeGreaterThan(5);

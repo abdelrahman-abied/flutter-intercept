@@ -2,9 +2,10 @@
  * Real Claude Code client suite (FI_SUITE=claude, opt-in: FI_CLAUDE=1). Runs headless `claude -p` tasks
  * against the MCP server of the extension under test (VS Code or Cursor host), on samples/demo_app on
  * the macOS desktop device, and asserts from the EXTENSION side that the agent really drove the app.
- * Tasks (FI_CLAUDE_TASKS, default "mock,collection"): `mock` (add_mock 500 → hot restart → remove), and
+ * Tasks (FI_CLAUDE_TASKS, default "mock,collection,store"): `mock` (add_mock 500 → hot restart → remove),
  * v0.15.0 `collection` (CONTRACTS §21.15 #6: "the backend is down" — mock from a Postman collection, switch an
- * example for this user only, reset).
+ * example for this user only, reset), and v0.16.0 `store` (CONTRACTS §22.11: "the backend is down; make the todo
+ * list empty" — set_store on the collection's stateful mock, the app's next GET answered by the store, data reset).
  *
  * Isolation: temp MCP config (--mcp-config + --strict-mcp-config), no built-in tools (--tools ""),
  * only `mcp__flutter-intercept` allowed, --permission-mode dontAsk (never prompts), no session
@@ -16,6 +17,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { activateBoth, freePort, registerOutputTracker, RunOutcome, sleep, waitFor } from './helpers';
 
 const SECRETS = ['demo-secret-123', 'demo-key-456'];
@@ -62,11 +65,24 @@ const COLLECTION_TASK =
   'Reply with only a short JSON summary: {"firstStatus":..., "answeredBy":..., "afterSwitchStatus":..., "undone":..., "stopped":...}.';
 const COLLECTION_REQUIRED = ['import_collection', 'set_collection', 'launch_app', 'wait_for_request', 'hot_restart', 'stop_app'];
 
+const STORE_REL = 'api/fi-claude-store.postman_collection.json';
+const TODOS = 'https://jsonplaceholder.typicode.com/todos';
+const TODO1 = `${TODOS}/1`;
+const STORE_TASK =
+  'Use only the flutter-intercept tools. The app\'s backend is down, so its requests must be answered from the ' +
+  `Postman collection ${STORE_REL} in the project; its {{baseUrl}} is https://jsonplaceholder.typicode.com. Mock the ` +
+  `app from that collection. Launch the app on device "macos" and wait for its GET request to ${TODO1}. Then make ` +
+  'the todo list empty, hot restart the app, wait for the app\'s next GET request to that URL (only requests after ' +
+  'the restart) and confirm the todo is gone. Then put the todo data back the way it was and stop the app. ' +
+  'Reply with only a short JSON summary: {"firstStatus":..., "afterEmptyStatus":..., "dataRestored":..., "stopped":...}.';
+const STORE_REQUIRED = ['import_collection', 'set_store', 'launch_app', 'wait_for_request', 'hot_restart', 'stop_app'];
+
 export async function runClaudeSuite(): Promise<RunOutcome[]> {
-  const tasks = (process.env.FI_CLAUDE_TASKS || 'mock,collection').split(',').map((t) => t.trim());
+  const tasks = (process.env.FI_CLAUDE_TASKS || 'mock,collection,store').split(',').map((t) => t.trim());
   const results: RunOutcome[] = [];
   if (tasks.includes('mock')) results.push(...(await runMockTask()));
   if (tasks.includes('collection')) results.push(await runCollectionTask());
+  if (tasks.includes('store')) results.push(await runStoreTask());
   return results;
 }
 
@@ -284,3 +300,120 @@ async function runCollectionTask(): Promise<RunOutcome> {
   return out;
 }
 
+
+/** The suite's own MCP call (after Claude finished): reads the store the way an agent sees it. */
+async function suiteMcpCall(url: string, token: string, name: string, args: Record<string, unknown>): Promise<{ result: any; isError: boolean; text: string }> {
+  const client = new Client({ name: 'fi-claude-suite', version: '0.0.0' });
+  await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
+  try {
+    const r: any = await client.callTool({ name, arguments: args });
+    const text = (r.content ?? []).map((c: any) => c.text ?? '').join('');
+    let result: any;
+    try {
+      result = JSON.parse(text);
+    } catch {
+      result = { text };
+    }
+    return { result, isError: !!r.isError, text };
+  } finally {
+    await client.close().catch(() => undefined);
+  }
+}
+
+/**
+ * v0.16.0 (CONTRACTS §22.11): "the backend is down; make the todo list empty". The suite writes a collection with
+ * GET/POST /todos and GET/PATCH/DELETE /todos/:id (seed: todos 1 and 2) into the demo workspace; the demo GETs
+ * /todos/1 and POSTs /todos in every batch. Claude must import it, empty the todos with set_store, see the app's next
+ * GET /todos/1 answered by the store as gone (or a list GET answered []), put the data back and stop the app.
+ * Asserted from the extension side: set_store succeeded, the store answered the app, the data is back afterwards
+ * (todo 1 is in the store again), and the team file holds no store setting. The workspace is restored afterwards.
+ */
+async function runStoreTask(): Promise<RunOutcome> {
+  const host = `${vscode.env.appName} ${vscode.version}`;
+  const out: RunOutcome = { name: `CLAUDE CODE: the backend is down — empty the todo list on the stateful mock, then reset (${host})`, output: '', proxyHits: [], failures: [], ms: 0 };
+  const f = out.failures;
+  const t0 = Date.now();
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+  const sharedPath = path.join(root, '.vscode', 'flutter-intercept.json');
+  const colPath = path.join(root, STORE_REL);
+  const sharedBefore = fs.existsSync(sharedPath) ? fs.readFileSync(sharedPath, 'utf8') : undefined;
+  const apiDirExisted = fs.existsSync(path.join(root, 'api'));
+  const fiDirExisted = fs.existsSync(path.join(root, '.vscode', 'flutter-intercept'));
+  try {
+    const json = [{ key: 'Content-Type', value: 'application/json' }];
+    const todoUrl = (p: string[]) => ({ raw: `{{baseUrl}}/${p.join('/')}`, host: ['{{baseUrl}}'], path: p, ...(p.includes(':id') ? { variable: [{ key: 'id', value: '1' }] } : {}) });
+    const seed = [
+      { id: 1, title: 'fi-claude seeded todo', completed: false, userId: 1 },
+      { id: 2, title: 'fi-claude second todo', completed: true, userId: 1 },
+    ];
+    fs.mkdirSync(path.dirname(colPath), { recursive: true });
+    fs.writeFileSync(
+      colPath,
+      JSON.stringify({
+        info: { name: 'FI Claude store', schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json' },
+        item: [
+          { name: 'List todos', request: { method: 'GET', url: todoUrl(['todos']) }, response: [{ name: 'OK', code: 200, header: json, body: JSON.stringify(seed) }] },
+          {
+            name: 'Create todo',
+            request: { method: 'POST', header: json, body: { mode: 'raw', raw: '{"title":"x","completed":false,"userId":1}' }, url: todoUrl(['todos']) },
+            response: [{ name: 'Created', code: 201, header: json, body: '{"id":201,"title":"x","completed":false,"userId":1}' }],
+          },
+          { name: 'Get todo', request: { method: 'GET', url: todoUrl(['todos', ':id']) }, response: [{ name: 'OK', code: 200, header: json, body: JSON.stringify(seed[0]) }] },
+          {
+            name: 'Update todo',
+            request: { method: 'PATCH', header: json, body: { mode: 'raw', raw: '{"completed":true}' }, url: todoUrl(['todos', ':id']) },
+            response: [{ name: 'OK', code: 200, header: json, body: JSON.stringify({ ...seed[0], completed: true }) }],
+          },
+          { name: 'Delete todo', request: { method: 'DELETE', url: todoUrl(['todos', ':id']) }, response: [{ name: 'Deleted', code: 204, header: [], body: '' }] },
+        ],
+      }),
+    );
+    const { run, api, mcp } = await runOneClaude(STORE_TASK, 'store', f);
+    if (!run) return out;
+    const { r, final, calls, since } = run;
+    const okTools = new Set(calls.filter((c) => c.ok).map((c) => c.tool));
+    const missing = STORE_REQUIRED.filter((t) => !okTools.has(t));
+    if (missing.length) f.push(`tools not called successfully: ${missing.join(', ')} (seen: ${calls.map((c) => `${c.tool}${c.ok ? '' : '!'}`).join(' ')})`);
+    const byStore = (e: any) => e.state === 'mocked' && e.simulated === 'Stateful mock' && String(e.matchedRuleId ?? '').startsWith('collection:');
+    const ex = api.getExchanges().filter((e) => e.startedAt >= since && e.method === 'GET' && (e.url === TODO1 || e.url === TODOS));
+    const read = ex.filter((e: any) => byStore(e) && e.url === TODO1 && e.status === 200);
+    const gone = ex.filter((e: any) => byStore(e) && ((e.url === TODO1 && e.status === 404) || (e.url === TODOS && String(e.responseBody?.text ?? '').trim() === '[]')));
+    if (!read.length) f.push(`no GET /todos/1 answered 200 by the store (seen: ${ex.map((e: any) => `${e.url.slice(-8)} ${e.state}/${e.status}/${e.simulated ?? '-'}`).join(', ')})`);
+    else if (!String(read[0].responseBody?.text ?? '').includes('fi-claude seeded todo')) f.push(`store body: ${read[0].responseBody?.text}`);
+    if (!gone.length) f.push('no app GET answered by the store with the todo gone (404) or an empty list ([]) after set_store');
+    else if (read.length && gone[0].startedAt < read[0].startedAt) f.push('the "gone" answer came before the first read');
+    // the agent put the data back: todo 1 is in the store again (the app may have added more since)
+    let restored = 'unknown';
+    const shared = fs.existsSync(sharedPath) ? JSON.parse(fs.readFileSync(sharedPath, 'utf8')) : {};
+    const link = (shared.collections ?? []).find((c: any) => c.file === STORE_REL);
+    if (!link) f.push('the collection link is not in .vscode/flutter-intercept.json');
+    else if (mcp?.url) {
+      const items = await suiteMcpCall(mcp.url, run.token, 'get_store', { id: link.id, resource: 'todos', limit: 200 }).catch((e: Error) => ({ result: {}, isError: true, text: e.message }));
+      restored = items.isError ? `error: ${items.text.slice(0, 120)}` : String((items.result.items ?? []).some((t: any) => t.id === 1));
+      if (restored !== 'true') f.push(`the todo data was not put back (get_store todos: ${items.text.slice(0, 300)})`);
+    }
+    if (shared.stores !== undefined && JSON.stringify(shared.stores) !== JSON.stringify(sharedBefore ? JSON.parse(sharedBefore).stores : undefined)) {
+      f.push(`a store setting was written for the team: ${JSON.stringify(shared.stores).slice(0, 200)}`);
+    }
+    const leaked = [...SECRETS, run.token].filter((s) => r.stdout.includes(s) || r.stderr.includes(s));
+    if (leaked.length) f.push(`secret values in Claude's input/output: ${leaked.map((s) => (s === run.token ? '<MCP token>' : s)).join(', ')}`);
+    await sleep(3000);
+    const live = vscode.debug.activeDebugSession;
+    if (live && live.configuration?.flutterInterceptOriginalProgram) f.push(`debug session still running: ${live.name}`);
+    out.mode =
+      `claude ${Math.round(r.ms / 1000)} s, ${final?.num_turns ?? '?'} turns, $${final?.total_cost_usd ?? '?'}; ` +
+      `extension saw ${calls.length} calls [${[...new Set(calls.map((c) => c.tool))].join(', ')}]; todos/1: ${read.length}x read by the store, ${gone.length}x gone after emptying; data restored: ${restored}`;
+    out.output = String(final?.result ?? '').slice(0, 600);
+  } catch (e) {
+    f.push(`exception: ${(e as Error).message}`);
+  } finally {
+    if (sharedBefore === undefined) fs.rmSync(sharedPath, { force: true });
+    else fs.writeFileSync(sharedPath, sharedBefore);
+    fs.rmSync(colPath, { force: true });
+    if (!apiDirExisted) fs.rmSync(path.join(root, 'api'), { recursive: true, force: true });
+    if (!fiDirExisted) fs.rmSync(path.join(root, '.vscode', 'flutter-intercept'), { recursive: true, force: true });
+  }
+  out.ms = Date.now() - t0;
+  console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms) ${out.mode ?? ''}${f.length ? '\n         ' + f.join('\n         ') : ''}\n[suite] claude said: ${out.output}`);
+  return out;
+}

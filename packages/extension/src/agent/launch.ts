@@ -39,6 +39,8 @@ export interface LauncherDeps {
   startTimeoutMs?: number;
   /** Max wait for a stopped session to terminate. Default 15 s. */
   stopTimeoutMs?: number;
+  /** How long `hotRestart` waits for Dart-Code to answer (default 60 000 ms). */
+  hotRestartTimeoutMs?: number;
   fs?: FsLike;
   log?: (msg: string) => void;
 }
@@ -245,7 +247,22 @@ export function createAppLauncher(deps: LauncherDeps = {}): AgentAppLauncher {
           continue;
         }
         try {
-          await s.customRequest('hotRestart');
+          // Dart-Code can fail to answer a hot restart (seen on macOS while the network dropped): never wait forever.
+          const limit = deps.hotRestartTimeoutMs ?? 60_000;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              Promise.resolve(s.customRequest('hotRestart')),
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error(`no answer from the debugger after ${Math.round(limit / 1000)} s (the app may still have restarted: check its requests)`)),
+                  limit,
+                );
+              }),
+            ]);
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
           restarted++;
         } catch (e) {
           errors.push(`${s.id}: ${(e as Error)?.message ?? String(e)}`);

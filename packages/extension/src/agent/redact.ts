@@ -26,37 +26,38 @@
  *   their own content-type; also when the body was recorded as binary (`redactBody`). Unparseable → the text rules.
  */
 import type { Body } from '@flutter-intercept/proxy';
+import { AUTH_SCHEME, isOpaqueToken, isPrefixedToken, isSecretName, JWT_ANY } from '../mocks/secrets';
+
+export { isOpaqueToken } from '../mocks/secrets';
 
 export const REDACTED = '[redacted]';
 
 const HEADER_EXACT = /^(authorization|proxy-authorization|cookie|set-cookie)$/i;
 const HEADER_CONTAINS = /(token|secret|api[-_]?key|session|password|auth)/i;
 const FIELD = /(pass(word)?|token|secret|api[-_]?key|session|auth|credential|client[-_]?secret)/i;
+/** Key headers by name (the copy's generic `-key` suffix rule is not used here: `Idempotency-Key` stays settable). */
+const HEADER_KEYS = /^(?:ocp-apim-subscription-key|x-functions-key)$/i;
 
+/** REVIEW-16 #5: also every name the shared check (`mocks/secrets.ts` `isSecretName`) calls secret (`x-request-sig`, `x-csrf`, `x-access-key`). */
 export function isSensitiveHeader(name: string): boolean {
-  return HEADER_EXACT.test(name) || HEADER_CONTAINS.test(name);
+  return HEADER_EXACT.test(name) || HEADER_CONTAINS.test(name) || HEADER_KEYS.test(name) || isSecretName(name);
 }
 
+/** REVIEW-16 #5: the substring rule, plus the shared word rule (`pin`, `otp`, `sid`, `verificationCode`, `csrf`, `ssn` …). */
 export function isSensitiveField(name: string): boolean {
-  return FIELD.test(name);
+  return FIELD.test(name) || isSecretName(name);
 }
 
-const JWT = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g;
-const AUTH_SCHEME = /\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+\/=-]{16,})/gi;
-const OPAQUE = /^[A-Za-z0-9_\-.~+/=]{32,}$/;
-
-/** A whole value that is a long opaque token (mixed upper, lower and digits; see the header). */
-export function isOpaqueToken(v: string): boolean {
-  return OPAQUE.test(v) && /[A-Z]/.test(v) && /[a-z]/.test(v) && /\d/.test(v);
-}
+/** REVIEW-16 #7: linear (one attempt per base64url run), shared with the traffic sanitiser. */
+const JWT = JWT_ANY;
 
 /**
  * `text` with credential-looking values blanked (REVIEW-4 #9). `whole` = the text is one value (a header,
  * query or JSON string value), so a long opaque token as the entire value is redacted too.
  */
 export function redactSecretValues(text: string, whole = false): string {
-  if (whole && isOpaqueToken(text)) return REDACTED;
-  if (!text.includes('eyJ') && !/bearer|basic/i.test(text)) return text;
+  if (whole && (isOpaqueToken(text) || isPrefixedToken(text))) return REDACTED;
+  if (!text.includes('eyJ') && !/bearer|basic|token|api-?key/i.test(text)) return text;
   // a credential after the scheme has a digit (prose like "basic informational" is kept)
   return text.replace(JWT, REDACTED).replace(AUTH_SCHEME, (m, scheme: string, sp: string, cred: string) => (/\d/.test(cred) ? `${scheme}${sp}${REDACTED}` : m));
 }
@@ -303,10 +304,22 @@ export function redactGraphqlDocument(doc: string): string {
 }
 
 /** Path segments that are JWTs / opaque tokens (e.g. `/reset/eyJ…`) → "[redacted]". */
-function redactPath(p: string): string {
-  return p
-    .split('/')
-    .map((seg) => {
+/** REVIEW-16 #9: a Telegram bot token as a path segment (`/bot123456:AAH…/getMe`). */
+const TELEGRAM_BOT_SEGMENT = /^bot\d{5,}:[A-Za-z0-9_-]{20,}$/;
+/** REVIEW-16 #9: webhook URLs whose path after a marker is the credential (Slack, Discord). */
+const WEBHOOK_PATHS: { host: RegExp; marker: string }[] = [
+  { host: /^hooks\.slack\.com$/i, marker: 'services' },
+  { host: /^(?:[a-z0-9-]+\.)?discord(?:app)?\.com$/i, marker: 'webhooks' },
+];
+
+function redactPath(p: string, host = ''): string {
+  const segs = p.split('/');
+  const hook = WEBHOOK_PATHS.find((w) => w.host.test(host));
+  const after = hook ? segs.indexOf(hook.marker) : -1;
+  return segs
+    .map((seg, i) => {
+      if (after !== -1 && i > after && seg) return REDACTED;
+      if (TELEGRAM_BOT_SEGMENT.test(seg)) return `bot${REDACTED}`;
       let v = seg;
       try {
         v = decodeURIComponent(seg);
@@ -334,7 +347,8 @@ export function redactUrl(url: string): string {
     const start = rawAuth.indexOf('//') + 2;
     auth = `${rawAuth.slice(0, start)}${REDACTED}@${rawAuth.slice(at + 1)}`;
   }
-  let out = auth + redactPath(main.slice(rawAuth.length, pathEnd));
+  const host = (rawAuth.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split('@').pop() ?? '').replace(/:\d+$/, '');
+  let out = auth + redactPath(main.slice(rawAuth.length, pathEnd), host);
   if (q !== -1) out += `?${redactQueryString(main.slice(q + 1))}`;
   if (hashAt !== -1) out += `#${redactFragment(url.slice(hashAt + 1))}`;
   return out;

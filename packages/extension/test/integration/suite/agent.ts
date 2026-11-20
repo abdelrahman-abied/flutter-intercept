@@ -24,6 +24,9 @@
  * calls pass through once learned, then are decrypted with a client certificate added in user settings.
  * v0.15.0 (MCP door, CONTRACTS §21.15 #6): import a collection written into the workspace, set baseUrl, the exchange's
  * `collection` field, an example switched by request id (for me: no repo diff), reset, seen.notInCollection.
+ * v0.16.0 (MCP door, CONTRACTS §22.11): stateful mocks on GET/POST /todos + GET/PATCH/DELETE /todos/:id — the app's
+ * POST remembered (collection.store.op "create"), its next GET reads it, set_store {items: []} / generate / shape /
+ * reset "data", a snapshot round trip without secrets, read-only refuses set_store, no repo diff from "me" changes.
  *
  * Two paths, chosen automatically:
  *  - "lm":     the extension registered `flutter_intercept_*` (lead wiring + package.json
@@ -1442,6 +1445,219 @@ export async function runAgentSuite(): Promise<RunOutcome[]> {
         fs.rmSync(colPath, { force: true });
         if (!apiDirExisted) fs.rmSync(`${root}/api`, { recursive: true, force: true });
       }
+      out.ms = Date.now() - t0;
+      results.push(out);
+      console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);
+    }
+
+    // v0.16.0 (CONTRACTS §22.11) over MCP: stateful mocks, the agent's loop. A Postman collection with GET/POST /todos
+    // and GET/PATCH/DELETE /todos/:id (seed: one todo with id 0, so the app's first POST creates id 1, the record its
+    // GET /todos/1 reads) is imported; the demo POSTs /todos and GETs /todos/1 in every batch. get_store lists the seed
+    // → the app's POST is answered by the store (collection.store.op "create") → get_store has it → after a hot restart
+    // the app's GET /todos/1 returns it → set_store {items: []} → a GET of the list (resend_request of the app's GET to
+    // /todos) answers [] → the app's GET /todos/1 answers 404 → generate 500 → get_store {shape: true} stays small →
+    // reset "data" → a snapshot save / load round trip (a record with a token-named field: the file and every tool
+    // output stay free of SECRETS) → read-only access refuses set_store → "me" settings leave the shared file unchanged.
+    // The workspace (shared file, collection, snapshot files) is restored afterwards.
+    for (const dev of devices) {
+      const out: RunOutcome = { name: `AGENT ${dev} v0.16.0 stateful mocks over MCP: get_store, the app's POST remembered, set_store, generate, shape, reset, snapshots, read-only`, output: '', proxyHits: [], failures: [], ms: 0 };
+      const f = out.failures;
+      const t0 = Date.now();
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+      const sharedPath = `${root}/.vscode/flutter-intercept.json`;
+      const colRel = 'api/fi-store.postman_collection.json';
+      const colPath = `${root}/${colRel}`;
+      const sharedBefore = fs.existsSync(sharedPath) ? fs.readFileSync(sharedPath, 'utf8') : undefined;
+      const apiDirExisted = fs.existsSync(`${root}/api`);
+      const fiDirExisted = fs.existsSync(`${root}/.vscode/flutter-intercept`);
+      const TODOS = 'https://jsonplaceholder.typicode.com/todos';
+      const TODO1 = `${TODOS}/1`;
+      const agentCfg = vscode.workspace.getConfiguration('flutterIntercept');
+      let colId: string | undefined;
+      let sessionId: string | undefined;
+      const notes: string[] = [];
+      /** get_request until the exchange is final (a resend resolves once it is recorded). */
+      const finished = async (id: string): Promise<any> => {
+        const end = Date.now() + 30_000;
+        for (;;) {
+          const g = await mcpCall('get_request', { id, includeBodies: true });
+          if (g.isError) throw new Error(`get_request ${id}: ${g.text.slice(0, 200)}`);
+          if (!['pending', 'paused-request', 'paused-response'].includes(g.result.state) || Date.now() > end) return g.result;
+          await sleep(300);
+        }
+      };
+      const todosCount = async (): Promise<number | undefined> => {
+        const s = await mcpCall('get_store', { id: colId });
+        return (s.result.resources ?? []).find((r: any) => r.name === 'todos')?.count;
+      };
+      try {
+        const json = [{ key: 'Content-Type', value: 'application/json' }];
+        const todoUrl = (path: string[]) => ({ raw: `{{baseUrl}}/${path.join('/')}`, host: ['{{baseUrl}}'], path, ...(path.includes(':id') ? { variable: [{ key: 'id', value: '0' }] } : {}) });
+        // a token-named field in the seed: get_store, exchange bodies and the snapshot must never show its value
+        const seed = { id: 0, title: 'fi-store seeded todo', completed: false, userId: 1, apiToken: SECRETS[1] };
+        fs.mkdirSync(`${root}/api`, { recursive: true });
+        fs.writeFileSync(
+          colPath,
+          JSON.stringify({
+            info: { name: 'FI store', schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json' },
+            item: [
+              { name: 'List todos', request: { method: 'GET', url: todoUrl(['todos']) }, response: [{ name: 'OK', code: 200, header: json, body: JSON.stringify([seed]) }] },
+              {
+                name: 'Create todo',
+                request: { method: 'POST', header: json, body: { mode: 'raw', raw: '{"title":"x","completed":false,"userId":1}' }, url: todoUrl(['todos']) },
+                response: [{ name: 'Created', code: 201, header: json, body: '{"id":201,"title":"x","completed":false,"userId":1}' }],
+              },
+              { name: 'Get todo', request: { method: 'GET', url: todoUrl(['todos', ':id']) }, response: [{ name: 'OK', code: 200, header: json, body: JSON.stringify(seed) }] },
+              {
+                name: 'Update todo',
+                request: { method: 'PATCH', header: json, body: { mode: 'raw', raw: '{"completed":true}' }, url: todoUrl(['todos', ':id']) },
+                response: [{ name: 'OK', code: 200, header: json, body: JSON.stringify({ ...seed, completed: true }) }],
+              },
+              { name: 'Delete todo', request: { method: 'DELETE', url: todoUrl(['todos', ':id']) }, response: [{ name: 'Deleted', code: 204, header: [], body: '' }] },
+            ],
+          }),
+        );
+        client = await connect();
+        const imp = await mcpCall('import_collection', { file: colRel });
+        colId = imp.result.id as string;
+        if (imp.isError || !colId) throw new Error(`import_collection: ${imp.text.slice(0, 300)}`);
+        const v = await mcpCall('set_collection', { id: colId, variable: { name: 'baseUrl', value: 'https://jsonplaceholder.typicode.com' } });
+        if (v.isError) throw new Error(`set_collection variable: ${v.text.slice(0, 300)}`);
+        const sharedAfterTeam = fs.readFileSync(sharedPath, 'utf8');
+
+        // get_store: the overview, then the seeded records (redacted)
+        const st = await mcpCall('get_store', { id: colId });
+        const todosView = (st.result.resources ?? []).find((r: any) => r.name === 'todos');
+        if (st.isError || !todosView?.remembers) throw new Error(`get_store: todos does not remember: ${st.text.slice(0, 300)}`);
+        const seedCount = todosView.count as number;
+        const seeded = await mcpCall('get_store', { id: colId, resource: 'todos' });
+        if (seeded.result.total !== seedCount || seeded.result.items?.[0]?.apiToken !== '[redacted]') f.push(`get_store todos: ${seeded.text.slice(0, 300)}`);
+
+        // the app's POST is answered by the store and remembered
+        const since = Date.now();
+        const l = await mcpCall('launch_app', { deviceId: dev });
+        sessionId = l.result.sessionId;
+        if (l.isError || !sessionId) throw new Error(`launch_app: ${l.text.slice(0, 200)}`);
+        const post = await mcpCall('wait_for_request', { url: TODOS, method: 'POST', sinceMs: since, timeoutMs: 120_000 });
+        if (post.isError || post.result.timedOut) throw new Error(`wait_for_request POST: ${post.text.slice(0, 300)}`);
+        const created = post.result.collection?.store;
+        if (post.result.status !== 201 || created?.op !== 'create' || created?.resource !== 'todos' || !created?.itemId) f.push(`the app's POST: status ${post.result.status}, collection ${JSON.stringify(post.result.collection)}`);
+        if (created?.itemId !== '1') f.push(`created id ${created?.itemId} (expected 1: the seed's max id is 0)`);
+        await mcpCall('wait_for_request', { url: TODO1, method: 'GET', sinceMs: since, timeoutMs: 60_000 }); // the batch's GET, before or after the POST
+        const has = await mcpCall('get_store', { id: colId, resource: 'todos', filter: 'coffee beans' });
+        if (!(has.result.items ?? []).some((r: any) => String(r.id) === String(created?.itemId))) f.push(`get_store after the POST: ${has.text.slice(0, 300)}`);
+
+        // hot restart: the app's GET /todos/1 reads what it created
+        let restartAt = Date.now();
+        let h = await mcpCall('hot_restart', { sessionId });
+        if (h.isError) f.push(`hot_restart: ${h.text.slice(0, 200)}`);
+        const read = await mcpCall('wait_for_request', { url: TODO1, method: 'GET', sinceMs: restartAt, timeoutMs: 90_000 });
+        await mcpCall('wait_for_request', { url: TODOS, method: 'POST', sinceMs: restartAt, timeoutMs: 60_000 }); // that batch's POST, so it can't land later
+        if (read.isError || read.result.timedOut || read.result.status !== 200 || read.result.collection?.store?.op !== 'get') f.push(`GET /todos/1 after the restart: ${read.text.slice(0, 300)}`);
+        else {
+          const g = await mcpCall('get_request', { id: read.result.id, includeBodies: true });
+          if (!JSON.stringify(g.result.responseBody ?? '').includes('coffee beans')) f.push(`GET /todos/1 body: ${JSON.stringify(g.result.responseBody ?? '').slice(0, 200)}`);
+        }
+
+        // set_store {items: []}: counts only (the app's own GET /todos after the next restart shows the list)
+        const empty = await mcpCall('set_store', { id: colId, resource: 'todos', items: [] });
+        if (empty.isError || empty.result.count !== 0 || empty.result.items !== undefined) f.push(`set_store items []: ${empty.text.slice(0, 300)}`);
+        restartAt = Date.now();
+        h = await mcpCall('hot_restart', { sessionId });
+        if (h.isError) f.push(`hot_restart 2: ${h.text.slice(0, 200)}`);
+        const gone = await mcpCall('wait_for_request', { url: TODO1, method: 'GET', sinceMs: restartAt, timeoutMs: 90_000 });
+        const post2 = await mcpCall('wait_for_request', { url: TODOS, method: 'POST', sinceMs: restartAt, timeoutMs: 60_000 });
+        if (gone.isError || gone.result.timedOut || gone.result.status !== 404 || gone.result.collection?.store?.op !== 'get') f.push(`GET /todos/1 after emptying: ${gone.text.slice(0, 300)}`);
+        // The batch lists the todos after its POST: the emptied list now holds only that new record.
+        const listed = await mcpCall('wait_for_request', { url: TODOS, method: 'GET', sinceMs: restartAt, timeoutMs: 60_000 });
+        if (listed.isError || listed.result.timedOut || listed.result.status !== 200 || listed.result.collection?.store?.op !== 'list') f.push(`the app's GET /todos after emptying: ${listed.text.slice(0, 300)}`);
+        else {
+          const lg = await mcpCall('get_request', { id: listed.result.id, includeBodies: true });
+          let items: any[] | undefined;
+          try {
+            const raw = lg.result.responseBody;
+            items = JSON.parse(typeof raw === 'string' ? raw : String(raw?.text ?? ''));
+          } catch {
+            items = undefined;
+          }
+          const newId = post2.result?.collection?.store?.itemId;
+          if (!Array.isArray(items) || items.length !== 1 || String(items[0]?.id) !== String(newId)) f.push(`the app's GET /todos after emptying: expected only the new record ${newId}, got ${JSON.stringify(items ?? lg.result.responseBody).slice(0, 200)}`);
+        }
+
+        // generate 500, then a shape: small output
+        const gen = await mcpCall('set_store', { id: colId, resource: 'todos', generate: { count: 500 } });
+        if (gen.isError || !(gen.result.count >= 500)) f.push(`generate: ${gen.text.slice(0, 300)}`);
+        const shape = await mcpCall('get_store', { id: colId, resource: 'todos', shape: true });
+        if (shape.isError || shape.result.items !== undefined || !shape.result.shape || !(shape.result.total >= 500) || shape.text.length > 4000) f.push(`get_store shape (${shape.text.length} chars): ${shape.text.slice(0, 300)}`);
+
+        // reset "data": back to the seed
+        const reset = await mcpCall('set_store', { id: colId, resource: 'todos', reset: 'data' });
+        if (reset.isError || reset.result.count !== seedCount) f.push(`reset data: ${reset.text.slice(0, 300)}`);
+
+        // snapshot round trip with a token-named field
+        const put = await mcpCall('set_store', { id: colId, resource: 'todos', put: { id: 900, title: 'fi-store secret holder', completed: false, userId: 1, accessToken: SECRETS[0] } });
+        if (put.isError) f.push(`set_store put: ${put.text.slice(0, 200)}`);
+        const shown = await mcpCall('get_store', { id: colId, resource: 'todos', filter: 'secret holder' });
+        if (shown.result.items?.[0]?.accessToken !== '[redacted]') f.push(`get_store of the put record: ${shown.text.slice(0, 200)}`);
+        const before = await todosCount();
+        const save = await mcpCall('store_snapshot', { id: colId, action: 'save', name: 'fi-suite' });
+        const snapRel = `.vscode/flutter-intercept/snapshots/${colId}/fi-suite.json`;
+        if (save.isError || save.result.path !== snapRel) f.push(`snapshot save: ${save.text.slice(0, 300)}`);
+        const snapText = fs.existsSync(`${root}/${snapRel}`) ? fs.readFileSync(`${root}/${snapRel}`, 'utf8') : undefined;
+        if (snapText === undefined) f.push(`no snapshot file at ${snapRel}`);
+        else {
+          const inFile = SECRETS.filter((s) => snapText.includes(s));
+          if (inFile.length) f.push(`snapshot file holds ${inFile.join(', ')}`);
+          if (!snapText.includes('fi-store secret holder')) f.push('snapshot file lacks the put record');
+        }
+        await mcpCall('set_store', { id: colId, resource: 'todos', items: [] });
+        const load = await mcpCall('store_snapshot', { id: colId, action: 'load', name: 'fi-suite' });
+        if (load.isError) f.push(`snapshot load: ${load.text.slice(0, 300)}`);
+        const afterLoad = await todosCount();
+        if (afterLoad !== before) f.push(`after load: ${afterLoad} todos, ${before} saved`);
+        const del = await mcpCall('store_snapshot', { id: colId, action: 'delete', name: 'fi-suite' });
+        if (del.isError || fs.existsSync(`${root}/${snapRel}`)) f.push(`snapshot delete: ${del.text.slice(0, 200)}`);
+
+        // "me" settings and data changes leave the shared file alone
+        const off = await mcpCall('set_store', { id: colId, resource: 'todos', remembers: false });
+        if (off.isError || off.result.remembers !== false) f.push(`remembers false: ${off.text.slice(0, 200)}`);
+        if (fs.readFileSync(sharedPath, 'utf8') !== sharedAfterTeam) f.push('a "me" store change or a data change wrote .vscode/flutter-intercept.json');
+        const undo = await mcpCall('set_store', { id: colId, reset: 'settings' });
+        if (undo.isError) f.push(`reset settings: ${undo.text.slice(0, 200)}`);
+        if (fs.readFileSync(sharedPath, 'utf8') !== sharedAfterTeam) f.push('reset settings wrote .vscode/flutter-intercept.json');
+        await mcpCall('set_store', { id: colId, reset: 'data' });
+
+        const s2 = await mcpCall('stop_app', { sessionId });
+        if (!s2.isError) sessionId = undefined;
+
+        // read-only access refuses the two writes, get_store still answers
+        await client.close().catch(() => undefined);
+        await agentCfg.update('agent.access', 'readOnly', vscode.ConfigurationTarget.Global);
+        await sleep(500);
+        client = await connect();
+        const ro = await mcpCall('set_store', { id: colId, resource: 'todos', items: [] });
+        if (!ro.isError || !/access|read-?only/i.test(ro.text)) f.push(`set_store under readOnly: isError=${ro.isError} ${ro.text.slice(0, 200)}`);
+        const roSnap = await mcpCall('store_snapshot', { id: colId, action: 'save', name: 'fi-ro' });
+        if (!roSnap.isError || fs.existsSync(`${root}/.vscode/flutter-intercept/snapshots/${colId}/fi-ro.json`)) f.push(`store_snapshot under readOnly: ${roSnap.text.slice(0, 200)}`);
+        const roRead = await mcpCall('get_store', { id: colId });
+        if (roRead.isError) f.push(`get_store under readOnly: ${roRead.text.slice(0, 200)}`);
+        notes.push(`seed ${seedCount}, created ${created?.itemId}, read ${read.result.status}, emptied → ${gone.result.status}, shape ${shape.text.length} chars, snapshot ${save.result.records ?? '?'} records (blanked ${JSON.stringify(save.result.blanked ?? [])})`);
+      } catch (e) {
+        f.push(`exception: ${(e as Error).message}`);
+      } finally {
+        await agentCfg.update('agent.access', undefined, vscode.ConfigurationTarget.Global).then(undefined, () => undefined);
+        if (sessionId) await launcher.stop(sessionId).catch(() => undefined);
+        await client?.close().catch(() => undefined);
+        client = undefined;
+        // restore the workspace exactly
+        if (sharedBefore === undefined) fs.rmSync(sharedPath, { force: true });
+        else fs.writeFileSync(sharedPath, sharedBefore);
+        fs.rmSync(colPath, { force: true });
+        if (!apiDirExisted) fs.rmSync(`${root}/api`, { recursive: true, force: true });
+        if (colId) fs.rmSync(`${root}/.vscode/flutter-intercept/snapshots/${colId}`, { recursive: true, force: true });
+        if (!fiDirExisted) fs.rmSync(`${root}/.vscode/flutter-intercept`, { recursive: true, force: true });
+      }
+      out.output = notes.join('; ');
       out.ms = Date.now() - t0;
       results.push(out);
       console.log(`[suite] ${f.length ? 'FAIL' : 'ok  '} ${out.name} (${out.ms} ms)${f.length ? '\n         ' + f.join('\n         ') : ''}\n         ${out.output}`);

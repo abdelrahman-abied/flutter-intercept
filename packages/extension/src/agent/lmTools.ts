@@ -9,6 +9,7 @@ import { corsPolicyText } from './corsPolicy';
 import { ALL_TOOLS, LM_TOOL_PREFIX } from './schema';
 import { AgentToolError, AgentTools, isWriteTool, needsConfirmation, toolImages, ToolName, ToolResult } from './types';
 import { GRPC_CODE_NAMES } from '../grpc/service';
+import { slugId } from '../mocks/core';
 
 // QUALITY-1 Q5: one definition (schema.ts), re-exported for importers of this module.
 export { ALL_TOOLS, LM_TOOL_PREFIX } from './schema';
@@ -187,6 +188,18 @@ export function invocationMessage(tool: ToolName, input: unknown): string {
       return `Mocking requests from ${plain(i.file)}`;
     case 'set_collection':
       return `Changing collection mock ${plain(i.id)}`;
+    // CONTRACTS §22.11
+    case 'get_store':
+      return i.resource !== undefined ? `Reading the ${plain(i.resource)} data of collection ${plain(i.id)}` : `Reading the data collection ${plain(i.id)} remembers`;
+    case 'set_store':
+      return `Changing the data collection ${plain(i.id)} remembers${i.resource !== undefined ? ` (${plain(i.resource)})` : ''}`;
+    case 'store_snapshot':
+      return `${i.action === 'load' ? 'Loading' : i.action === 'delete' ? 'Deleting' : 'Saving'} snapshot ${plain(i.name)} of collection ${plain(i.id)}`;
+    // CONTRACTS §23.5
+    case 'mock_from_traffic':
+      return `${i.dryRun === true ? 'Previewing' : 'Making'} a fake backend from ${str(i.recording) ? `recording ${plain(i.recording)}` : "this session's traffic"}`;
+    case 'update_collection_example':
+      return `Previewing an update of the ${plain(i.status)} example of ${plain(i.endpoint ?? i.request)} in collection ${plain(i.id)}`;
   }
 }
 
@@ -462,7 +475,7 @@ export function confirmationText(
     case 'expire_token':
       return {
         title: 'Expire the auth token',
-        message: `The next **${typeof i.count === 'number' ? i.count : 1}** request(s) matching ${code(i.url ?? '*')} get **401** \`{"error":"token_expired"}\`; then the real server answers again. Inserted as the first rule.`,
+        message: `The next **${typeof i.count === 'number' ? i.count : 1}** request(s) matching ${code(i.url ?? '*')} get **401** \`{"error":"token_expired"}\`; then the real server answers again. Inserted as the first rule.\n\nIf a linked collection simulates sign-in for that server, its signed-in sessions expire instead and no rule is added.`,
       };
     case 'add_map_remote':
       return {
@@ -513,6 +526,85 @@ export function confirmationText(
       return {
         title: 'Change a collection mock',
         message: `For collection ${code(i.id)}: ${parts.length ? parts.join('; ') : 'no change'}.${shared ? '\n\nSaved in `.vscode/flutter-intercept.json`, shared with the team.' : ''}`,
+      };
+    }
+    // CONTRACTS §22.11: what changes for the app; data never reaches a file, settings are for you unless "team".
+    case 'set_store': {
+      const res = str(i.resource) ? code(i.resource) : 'every resource';
+      const parts: string[] = [];
+      let data = false;
+      if (Array.isArray(i.items)) {
+        data = true;
+        parts.push(i.items.length ? `replace all records of ${res} with **${i.items.length}** record${i.items.length === 1 ? '' : 's'}` : `**empty** ${res} (no records)`);
+      }
+      if (i.put !== undefined) {
+        data = true;
+        parts.push(`add or replace one record in ${res}`);
+      }
+      if (i.remove !== undefined) {
+        data = true;
+        parts.push(`remove record ${code(i.remove)} from ${res}`);
+      }
+      const g = obj(i.generate);
+      if (typeof g.count === 'number') {
+        data = true;
+        parts.push(`add **${g.count}** generated record${g.count === 1 ? '' : 's'} to ${res}`);
+      }
+      if (i.reset === 'data') {
+        data = true;
+        parts.push(`put the data of ${res} back to how it started`);
+      }
+      if (i.reset === 'settings') parts.push('undo your own store settings');
+      if (typeof i.enabled === 'boolean') parts.push(i.enabled ? 'let its resources **remember** what the app sends' : '**stop** remembering (fixed examples answer)');
+      if (typeof i.remembers === 'boolean') parts.push(i.remembers ? `let ${res} remember` : `stop ${res} remembering (fixed examples answer)`);
+      if (str(i.idField)) parts.push(`use field ${code(i.idField)} as the id of ${res}`);
+      const au = obj(i.auth);
+      if (au.expire === 'all') {
+        data = true;
+        parts.push('**expire** every access token of its sign-in simulation (the app must refresh or sign in again)');
+      }
+      if (typeof au.enabled === 'boolean') parts.push(au.enabled ? 'turn **sign-in simulation** on (requests without a token from its login get 401)' : 'turn sign-in simulation off');
+      if (typeof au.ttlSeconds === 'number') parts.push(`let access tokens live **${au.ttlSeconds}** s`);
+      if (str(au.protect)) parts.push(au.protect === 'all' ? 'ask for a token on every request but login / refresh / logout / register' : 'ask for a token only where the collection declares auth');
+      if (str(i.dynamic)) parts.push(`fill dynamic values in examples in ${code(i.dynamic)} mode`);
+      if (i.startsFrom === null) parts.push("start from the collection's examples");
+      else if (str(i.startsFrom)) parts.push(`start from snapshot ${code(i.startsFrom)}`);
+      const settings = i.reset === undefined && !data && parts.length > 0;
+      const where = data
+        ? "\n\nIn memory only: the app's next requests see it; nothing is written to a file."
+        : settings
+          ? i.scope === 'team'
+            ? '\n\nSaved in `.vscode/flutter-intercept.json`, shared with the team.'
+            : '\n\nFor you only: nothing is written to the repo.'
+          : '';
+      return {
+        title: 'Change stateful mock data',
+        message: `For collection ${code(i.id)}: ${parts.length ? parts.join('; ') : 'no change'}.${where}`,
+      };
+    }
+    // CONTRACTS §23.5: names the file it writes (a new one; a taken name gets -2, -3, …)
+    case 'mock_from_traffic': {
+      const from = str(i.recording) ? `recording ${code(i.recording)}` : `this session's traffic${str(i.url) ? ` to ${code(i.url)}` : ''}`;
+      if (i.dryRun === true) return { title: 'Preview a fake backend from traffic', message: `Build a collection from ${from} and report what it would hold. Nothing is written.` };
+      const stem = str(i.name) ? slugId(String(i.name), new Set()) : '<server>-recorded';
+      return {
+        title: 'Make a fake backend from traffic',
+        message:
+          `Build a collection from ${from} and write it to ${code(`.vscode/flutter-intercept/collections/${stem}.json`)} (a new file: -2, -3, … if the name is taken), linked in \`.vscode/flutter-intercept.json\` for the team; ` +
+          `the app's requests to ${Array.isArray(i.origins) && i.origins.length ? i.origins.slice(0, 5).map(code).join(', ') : 'its own servers'} are then answered from it. ` +
+          `Requests it has no answer for ${i.unmatched === 'fail' ? '**fail like offline**' : 'go to the real server'}.\n\n` +
+          `Credentials are removed, e-mails, phones and addresses replaced; other values in the example bodies are real data — review the file before committing it.`,
+      };
+    }
+    case 'store_snapshot': {
+      const file = code(`.vscode/flutter-intercept/snapshots/${String(i.id ?? '?')}/${String(i.name ?? '?')}.json`);
+      if (i.action === 'load') {
+        return { title: 'Load a data snapshot', message: `Replace the data of collection ${code(i.id)} with the records in ${file} (resources it does not name are kept). The app's next requests see it.` };
+      }
+      if (i.action === 'delete') return { title: 'Delete a data snapshot', message: `Delete the file ${file}.` };
+      return {
+        title: 'Save a data snapshot',
+        message: `Save the data collection ${code(i.id)} remembers now to ${file} (a snapshot with that name is replaced). Secret-looking fields are blanked.\n\nThe file is in the repo, for the team to commit.`,
       };
     }
     // CONTRACTS §13.8: names the device.

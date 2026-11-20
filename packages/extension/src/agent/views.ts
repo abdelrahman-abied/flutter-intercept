@@ -51,17 +51,58 @@ export class AgentViews extends AgentContext {
     return { text: cut ? text.slice(0, maxChars) : text, ...(cut || b.truncated ? { truncated: true } : {}), ...(cut ? { totalChars: text.length } : {}) };
   }
 
-  /** CONTRACTS §21.15 #2: `collection: {id, name, endpoint, example?, noExample?, unmatched?, limited?}` — one look. */
-  private collectionAnswer(ruleId: string | undefined): { collection?: Record<string, unknown> } {
-    if (!ruleId) return {};
+  /**
+   * CONTRACTS §21.15 #2: `collection: {id, name, endpoint, example?, noExample?, unmatched?, limited?}` — one look;
+   * CONTRACTS §22.10: `collection.store: {resource, op, itemId?}` when the collection's stateful mock answered it.
+   * CONTRACTS §24: `collection.example` is the example that really answered (chosen by the request body, the 401 of the
+   * auth gate), with `byBody: true` / `auth: "signed in" | "refreshed" | "401 no token" | "401 expired"`. Never a token
+   * or a request body.
+   */
+  private collectionAnswer(e: Pick<Exchange, 'id' | 'matchedRuleId'>): { collection?: Record<string, unknown> } {
+    if (!e.matchedRuleId) return {};
     let a;
     try {
-      a = this.deps.collections?.describeRule?.(ruleId);
+      a = this.deps.collections?.describeRule?.(e.matchedRuleId);
     } catch {
       return {};
     }
     if (!a) return {};
-    return { collection: { ...a, ...(a.endpoint ? { endpoint: this.endpointKeyView(a.endpoint) } : {}) } };
+    const store = this.storeOpView(e.id);
+    let picked;
+    try {
+      picked = this.deps.collections?.answerOf?.(e.id);
+    } catch {
+      picked = undefined;
+    }
+    const { example: _own, ...rest } = a;
+    // an auth answer without an example of its own (the built-in 401) has none to name
+    const example = picked?.example !== undefined ? picked.example : picked?.auth?.startsWith('401') ? undefined : a.example;
+    return {
+      collection: {
+        ...rest,
+        ...(example !== undefined ? { example } : {}),
+        ...(a.endpoint ? { endpoint: this.endpointKeyView(a.endpoint) } : {}),
+        ...(picked?.byBody ? { byBody: true } : {}),
+        ...(picked?.auth ? { auth: picked.auth } : {}),
+        ...(store ? { store } : {}),
+      },
+    };
+  }
+
+  /** CONTRACTS §22.10: which store operation answered an exchange (the item id redacted when it looks like a credential). */
+  private storeOpView(exchangeId: string): Record<string, unknown> | undefined {
+    let op;
+    try {
+      op = this.deps.collections?.storeOpOf?.(exchangeId);
+    } catch {
+      return undefined;
+    }
+    if (!op) return undefined;
+    return {
+      resource: op.resource,
+      op: op.op,
+      ...(op.itemId !== undefined ? { itemId: this.redact ? redactSecretValues(String(op.itemId), true) : op.itemId } : {}),
+    };
   }
 
   /** REVIEW-15 #5: a request key as agents see it — the URL part redacted like any captured URL. */
@@ -82,7 +123,7 @@ export class AgentViews extends AgentContext {
       startedAt: e.startedAt,
       ...(e.responseBody ? { responseBytes: bodyBytes(e.responseBody) } : {}),
       ...(e.matchedRuleId ? { matchedRuleId: e.matchedRuleId } : {}),
-      ...this.collectionAnswer(e.matchedRuleId),
+      ...this.collectionAnswer(e),
       ...(e.initiator ? { initiator: e.initiator } : {}),
       ...(e.simulated ? { simulated: e.simulated } : {}),
       // CONTRACTS §11.5

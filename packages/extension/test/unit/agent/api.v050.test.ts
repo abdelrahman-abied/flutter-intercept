@@ -336,7 +336,7 @@ describe('redaction helpers (v0.5.0)', () => {
 
   it('redactGraphqlDocument keeps variable definitions and non-sensitive arguments', () => {
     expect(redactGraphqlDocument('query($token: String!) { me(token: $token, id: "42") { name } }')).toBe('query($token: String!) { me(token: $token, id: "42") { name } }');
-    expect(redactGraphqlDocument('{ a(sessionToken: "x\\"y", pin: 1) }')).toBe('{ a(sessionToken: "[redacted]", pin: 1) }');
+    expect(redactGraphqlDocument('{ a(sessionToken: "x\\"y", pin: 1) }')).toBe('{ a(sessionToken: "[redacted]", pin: "[redacted]") }'); // REVIEW-16 #5: `pin` is secret (shared check)
     expect(redactGraphqlDocument('{ a(clientSecret: 99) }')).toBe('{ a(clientSecret: "[redacted]") }');
     expect(redactGraphqlDocument('{ a(password: """multi\nline""", b: "ok") # token: "c"\n }')).toBe('{ a(password: "[redacted]", b: "ok") # token: "c"\n }');
     expect(redactGraphqlDocument('{ a(input: {apiKey: "K", list: [1]}, mode: SECRET_ENUM_KEPT, pass: null) }')).toBe(
