@@ -14,6 +14,7 @@ import * as path from 'path';
 import type { Rule } from '@flutter-intercept/proxy';
 import { SharedRulesCore } from '../../extension/src/rules/core';
 import type { FolderCollectionLinks, PendingSnapshot, SharedRulesStatus } from '../../extension/src/rules/core';
+import type { StoreSettingsLink } from '../../extension/src/mocks/link';
 import type { CollectionLink } from '../../extension/src/mocks/types';
 import type { RulesFs } from '../../extension/src/rules/bodyFile';
 import type { ValidateRule } from '../../extension/src/rules/file';
@@ -242,6 +243,8 @@ export function createNodeSharedRules(deps: NodeSharedRulesDeps) {
     onDidChangeCollections: (listener: () => void) => linksChanged.event(listener),
     primaryFolderPath: () => core.primaryFolderPath(),
     saveCollections: (folderPath: string, links: CollectionLink[]) => after(core.saveCollections(folderPath, links)),
+    /** CONTRACTS §22.7 / §24: writes (or removes) a collection's `stores` entry ("Save for the team"). */
+    saveStore: (folderPath: string, collection: string, entry: StoreSettingsLink | undefined) => after(core.saveStore(folderPath, collection, entry)),
     writeWorkspaceFile: (folderPath: string, rel: string, text: string) => core.writeWorkspaceFile(folderPath, rel, text),
     /** Project roots changed: re-watch and reload. */
     rootsChanged: () => {

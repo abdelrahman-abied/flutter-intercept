@@ -7,7 +7,13 @@ import type { InitParams, SidecarSettings } from './types';
 export const DEFAULT_PORT = 8899;
 export const DEFAULT_MCP_PORT = 47823;
 
-export const DEFAULT_SETTINGS: SidecarSettings = {
+/** SidecarSettings with every optional switch resolved to its default. */
+export type EffectiveSidecarSettings = SidecarSettings & {
+  /** CONTRACTS §23.3: compare real server JSON answers with linked collections' examples. Default true. */
+  collectionDrift: boolean;
+};
+
+export const DEFAULT_SETTINGS: EffectiveSidecarSettings = {
   enabled: true,
   port: DEFAULT_PORT,
   captureSource: true,
@@ -16,6 +22,7 @@ export const DEFAULT_SETTINGS: SidecarSettings = {
   backgroundIsolates: 'intercept',
   notifications: 'errors',
   contractCheck: true,
+  collectionDrift: true,
   rewriteLocalhost: true,
   upstreamProxyIgnoreCertErrors: false,
   tlsPassthrough: [],
@@ -33,7 +40,7 @@ const str = (v: unknown, max = 2048): string | undefined => (typeof v === 'strin
 const strList = (v: unknown, maxItems = 200, maxLen = 300): string[] =>
   Array.isArray(v) ? v.filter((s): s is string => typeof s === 'string' && s.length > 0 && s.length <= maxLen).slice(0, maxItems) : [];
 
-export function normalizeSettings(raw: unknown): SidecarSettings {
+export function normalizeSettings(raw: unknown): EffectiveSidecarSettings {
   const s = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
   const a = s.agent && typeof s.agent === 'object' ? (s.agent as Record<string, unknown>) : {};
   const d = DEFAULT_SETTINGS;
@@ -62,6 +69,7 @@ export function normalizeSettings(raw: unknown): SidecarSettings {
     backgroundIsolates: oneOf(s.backgroundIsolates, ['intercept', 'warn'] as const, d.backgroundIsolates),
     notifications: oneOf(s.notifications, ['errors', 'all', 'off'] as const, d.notifications),
     contractCheck: bool(s.contractCheck, d.contractCheck),
+    collectionDrift: bool(s.collectionDrift, d.collectionDrift),
     rewriteLocalhost: bool(s.rewriteLocalhost, d.rewriteLocalhost),
     ...(upstream ? { upstreamProxy: upstream } : {}),
     upstreamProxyIgnoreCertErrors: bool(s.upstreamProxyIgnoreCertErrors, d.upstreamProxyIgnoreCertErrors),

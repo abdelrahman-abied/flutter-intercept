@@ -15,6 +15,9 @@ import dev.flutterintercept.settings.InterceptSettings
 import dev.flutterintercept.sidecar.RpcException
 import dev.flutterintercept.sidecar.SIDECAR_PATH_PROPERTY
 import dev.flutterintercept.sidecar.SidecarProcess
+import dev.flutterintercept.ui.PickManyDialog
+import dev.flutterintercept.ui.PickManyItem
+import dev.flutterintercept.ui.PickManyRequest
 import dev.flutterintercept.ui.UiRequestHandler
 import java.awt.datatransfer.DataFlavor
 import java.io.File
@@ -91,6 +94,8 @@ class PluginPlatformTest : BasePlatformTestCase() {
             "ui.confirmCopyCollection" to """{"fileName":"a/b.json"}""",
             "ui.askCollectionVariable" to """{"name":"bad name"}""",
             "ui.confirmRemoveCollection" to """{"name":"","file":"a.json"}""",
+            "ui.pickMany" to """{}""",
+            "ui.pickMany" to """{"items":[]}""",
         )) {
             val e = try { handle(method, json); null } catch (e: ExecutionException) { e.cause }
             assertTrue("$method: $e", e is RpcException && e.code == "invalid")
@@ -101,6 +106,38 @@ class PluginPlatformTest : BasePlatformTestCase() {
         val e = try { handle("ui.nope", "{}"); null } catch (e: ExecutionException) { e.cause }
         assertTrue(e is RpcException)
         assertEquals("unknown_method", (e as RpcException).code)
+    }
+
+    fun testPickManyDialogDisablesHtmlAndTracksSelection() {
+        val req = PickManyRequest(
+            title = "Make a fake backend (1/3)",
+            placeholder = "<html><b>Choose servers</b></html>",
+            items = listOf(
+                PickManyItem("<html>api.shop.example", "5 requests", "https://api.shop.example", picked = true),
+                PickManyItem("analytics.google.com", "2 requests", "https://analytics.google.com", picked = false),
+            ),
+            okButton = "Continue",
+        )
+        val dialog = PickManyDialog(project, req)
+        try {
+            assertTrue(dialog.isOKActionEnabled)
+            val boxes = dialog.checkBoxes
+            assertEquals(2, boxes.size)
+            assertEquals(true, boxes[0].getClientProperty("html.disable"))
+            assertEquals(true, boxes[1].getClientProperty("html.disable"))
+            assertTrue(boxes[0].isSelected)
+            assertFalse(boxes[1].isSelected)
+            assertEquals(listOf("https://api.shop.example"), dialog.selectedValues())
+            // Unchecking all disables OK; checking one re-enables it.
+            boxes[0].isSelected = false
+            assertFalse(dialog.isOKActionEnabled)
+            assertEquals(emptyList<String>(), dialog.selectedValues())
+            boxes[1].isSelected = true
+            assertTrue(dialog.isOKActionEnabled)
+            assertEquals(listOf("https://analytics.google.com"), dialog.selectedValues())
+        } finally {
+            dialog.close(com.intellij.openapi.ui.DialogWrapper.CANCEL_EXIT_CODE)
+        }
     }
 
     fun testSidecarSecretsRoundTrip() {

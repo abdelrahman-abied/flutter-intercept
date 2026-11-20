@@ -11,6 +11,10 @@ const FIXTURES = path.resolve(__dirname, '..', '..', 'extension', 'test', 'fixtu
 const SHOP_COLLECTION = path.join(FIXTURES, 'shop.postman_collection.json');
 const SHOP_ENV = path.join(FIXTURES, 'shop.postman_environment.json');
 const SHOP_OPENAPI_YAML = path.join(FIXTURES, 'shop.openapi.yaml');
+const SHOP_SWAGGER2 = path.join(FIXTURES, 'shop.swagger2.json');
+const SHOP_INSOMNIA_V4 = path.join(FIXTURES, 'shop.insomnia-v4.json');
+const SHOP_INSOMNIA_V5 = path.join(FIXTURES, 'shop.insomnia-v5.yaml');
+const SHOP_BRUNO = path.join(FIXTURES, 'shop-bruno', 'bruno.json');
 
 let dir: string;
 beforeEach(() => {
@@ -112,5 +116,77 @@ describe('loadCollections', () => {
     const cols = await loadCollections({ files: [SHOP_COLLECTION], envFile: SHOP_ENV, vars, cwd: dir });
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
     expect(cols.collections[0].name).toBe('Shop API');
+  });
+
+  it('loads Swagger 2.0, Insomnia v4 JSON, Insomnia v5 YAML and Bruno collections (CONTRACTS §24.4)', async () => {
+    const sw = await loadCollections({ files: [SHOP_SWAGGER2], cwd: dir, store: { folder: dir } });
+    expect(sw.collections[0]).toMatchObject({ name: 'Shop API', format: 'swagger' });
+    expect(sw.rules.some((r) => r.match.url.includes('api\\.shop\\.example') && r.match.url.includes('v1'))).toBe(true);
+
+    // Insomnia v4: `--collection-env` is an environment name (not a file path); env secrets never leak.
+    const ins4 = await loadCollections({ files: [SHOP_INSOMNIA_V4], envFile: 'Shop dev', cwd: dir });
+    expect(ins4.collections[0]).toMatchObject({ name: 'Shop API', format: 'insomnia' });
+    expect(ins4.rules.some((r) => r.match.url.includes('api\\.shop\\.example'))).toBe(true);
+    expect(JSON.stringify(ins4)).not.toContain('env-token-must-never-leave-the-host');
+
+    const ins4Staging = await loadCollections({ files: [SHOP_INSOMNIA_V4], envFile: 'Staging', cwd: dir });
+    expect(ins4Staging.rules.some((r) => r.match.url.includes('staging\\.shop\\.example'))).toBe(true);
+
+    // Insomnia v5 YAML with environment name.
+    const ins5 = await loadCollections({ files: [SHOP_INSOMNIA_V5], envFile: 'Shop dev', cwd: dir });
+    expect(ins5.collections[0]).toMatchObject({ name: 'Shop API', format: 'insomnia' });
+    expect(ins5.rules.some((r) => r.match.url.includes('api\\.shop\\.example'))).toBe(true);
+    expect(JSON.stringify(ins5)).not.toContain('env-token-must-never-leave-the-host');
+
+    // Bruno: `bruno.json` walks the folder via MockCollectionsCore; `--collection-env` is an environment name.
+    const bruno = await loadCollections({ files: [SHOP_BRUNO], envFile: 'dev', cwd: dir, store: { folder: dir } });
+    expect(bruno.collections[0]).toMatchObject({ name: 'Shop API', format: 'bruno' });
+    expect(bruno.collections[0].mocked).toBeGreaterThan(0);
+    expect(bruno.rules.some((r) => r.match.url.includes('api\\.shop\\.example'))).toBe(true);
+    expect(JSON.stringify(bruno)).not.toContain('env-token-must-never-leave-the-host');
+
+    const brunoStaging = await loadCollections({ files: [SHOP_BRUNO], envFile: 'staging', cwd: dir });
+    expect(brunoStaging.rules.some((r) => r.match.url.includes('staging\\.shop\\.example'))).toBe(true);
+  });
+
+  it('loads Bruno linked in .vscode/flutter-intercept.json and refuses symlinked bruno.json (CONTRACTS §24.4)', async () => {
+    const dest = path.join(dir, 'api', 'shop-bruno');
+    fs.cpSync(path.dirname(SHOP_BRUNO), dest, { recursive: true });
+    write('.vscode/flutter-intercept.json', {
+      version: 1,
+      collections: [{ id: 'shop-bruno', file: 'api/shop-bruno/bruno.json', environment: 'dev' }],
+    });
+    const loaded = await loadRules({ approve: false, projectRoot: dir, cwd: dir });
+    const cols = await loadCollections({ sharedLinks: loaded.collectionLinks, cwd: dir, store: { folder: dir } });
+    expect(cols.collections[0]).toMatchObject({ id: 'shop-bruno', name: 'Shop API', format: 'bruno' });
+    expect(cols.rules.some((r) => r.match.url.includes('api\\.shop\\.example'))).toBe(true);
+
+    // Symlinked bruno.json is refused by MockCollectionsCore.walkBruno.
+    if (process.platform !== 'win32') {
+      const symDir = path.join(dir, 'sym-bruno');
+      fs.mkdirSync(symDir, { recursive: true });
+      fs.copyFileSync(path.join(dest, 'bruno.json'), path.join(symDir, 'real.json'));
+      fs.symlinkSync(path.join(symDir, 'real.json'), path.join(symDir, 'bruno.json'));
+      await expect(loadCollections({ files: [path.join(symDir, 'bruno.json')], cwd: dir })).rejects.toThrow(/symbolic link/);
+    }
+  });
+
+  it('refuses --collection-auth when no loaded collection has a login request (CONTRACTS §24.1)', async () => {
+    const todo = path.join(__dirname, 'fixtures', 'todo.openapi.json');
+    await expect(loadCollections({ files: [todo], auth: true, cwd: dir })).rejects.toThrow(/no login request was found/i);
+    await expect(loadCollections({ files: [], auth: true, cwd: dir })).rejects.toThrow(/no collection is loaded/);
+  });
+
+  it('never limits collection answers in headless CLI runs (CONTRACTS §22.17)', async () => {
+    const cols = await loadCollections({ files: [SHOP_COLLECTION], envFile: SHOP_ENV, cwd: dir });
+    const cfgRule = cols.rules.find((r) => r.match.url.includes('config\\.json'));
+    expect(cfgRule).toBeDefined();
+    expect(cfgRule?.action.kind).toBe('mock');
+    if (cfgRule?.action.kind === 'mock') {
+      const headers = cfgRule.action.headers ?? {};
+      const keys = Object.keys(headers).map((k) => k.toLowerCase());
+      expect(keys).toContain('set-cookie');
+      expect(keys).not.toContain('x-flutter-intercept');
+    }
   });
 });

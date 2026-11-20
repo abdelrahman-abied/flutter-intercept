@@ -35,11 +35,22 @@ Options:
       --approve-shared-rules     Also apply shared rules that need approval in the editor (map remote to
                                  another host, request header rewrites, scripts, …). Without it they are
                                  skipped with the reason printed.
-      --collection <file>        Mock from a Postman collection or OpenAPI 3 file (repeatable; added after
-                                 any collections in the shared file).
-      --collection-env <file>    Postman environment file for collection URL variables.
+      --collection <file>        Mock from a Postman, OpenAPI 3, Swagger 2.0, Insomnia or Bruno
+                                 (bruno.json) collection (repeatable; added after shared-file links).
+      --collection-env <file>    Postman environment file, or environment name for Insomnia / Bruno.
       --collection-var k=v       Set a collection URL variable (repeatable, e.g. baseUrl=https://api.example.com).
       --collection-unmatched <m> Unmatched requests to a collection's host: passthrough (default) or fail.
+      --collection-snapshot <s>  Start the collections' remembered data from a snapshot: a name (from
+                                 .vscode/flutter-intercept/snapshots/<collection>/<name>.json) or a file.
+      --no-collection-store      Collections answer only their saved examples (resources don't remember
+                                 what the app sends; as in 0.15).
+      --collection-seed <n>      Seed for dynamic values in seeded mode (0–4294967295; default 1).
+      --collection-dynamic <m>   Dynamic values in collection examples: seeded (default), random or fixed.
+      --collection-auth          Turn sign-in simulation on for the run (needs a login request).
+      --collection-auth-ttl <s>  Sign-in session TTL in seconds (60–86400; default 3600).
+      --record-collection <name> Write a collection from the run's traffic to
+                                 .vscode/flutter-intercept/collections/<slug>.json (personal data replaced,
+                                 never overwrites).
       --replay <id|file>         Answer requests from a recording (id in
                                  .dart_tool/flutter_intercept/recordings, or a file path).
       --replay-fallback <mode>   Unmatched requests while replaying: passthrough (default) or fail.
@@ -70,10 +81,15 @@ Examples:
   flutter-intercept test -d emulator-5554 --har build/traffic.har --assert ci/expect.json --junit build/assert.xml
   flutter-intercept test integration_test/login_test.dart -d macos --replay login --replay-fallback fail
   flutter-intercept test -d macos --collection api/shop.postman_collection.json --collection-env api/dev.postman_environment.json
+  flutter-intercept test -d macos --collection api/shop.postman_collection.json --collection-snapshot checkout
   flutter-intercept run -d macos --network-profile slow-3g`;
 
 const COLLECTION_VAR_NAME = /^[A-Za-z0-9_.$-]{1,100}$/;
 const MAX_COLLECTION_VAR_VALUE = 2048;
+export const COLLECTION_DYNAMIC_MODES = ['random', 'seeded', 'fixed'] as const;
+const MIN_AUTH_TTL_SECONDS = 60;
+const MAX_AUTH_TTL_SECONDS = 86_400;
+const MAX_COLLECTION_SEED = 0xffffffff;
 
 type ValueKey =
   | 'project'
@@ -89,8 +105,13 @@ type ValueKey =
   | 'junit'
   | 'flutter'
   | 'collectionEnv'
-  | 'collectionUnmatched';
-type FlagKey = 'noRules' | 'approveSharedRules' | 'noRedact' | 'noGrpc' | 'trustSimulator' | 'help' | 'version';
+  | 'collectionUnmatched'
+  | 'collectionSnapshot'
+  | 'collectionSeed'
+  | 'collectionDynamic'
+  | 'collectionAuthTtl'
+  | 'recordCollection';
+type FlagKey = 'noRules' | 'approveSharedRules' | 'noRedact' | 'noGrpc' | 'trustSimulator' | 'noCollectionStore' | 'collectionAuth' | 'help' | 'version';
 
 const VALUE_OPTIONS: Record<string, ValueKey> = {
   '--project': 'project',
@@ -110,6 +131,11 @@ const VALUE_OPTIONS: Record<string, ValueKey> = {
   '--flutter': 'flutter',
   '--collection-env': 'collectionEnv',
   '--collection-unmatched': 'collectionUnmatched',
+  '--collection-snapshot': 'collectionSnapshot',
+  '--collection-seed': 'collectionSeed',
+  '--collection-dynamic': 'collectionDynamic',
+  '--collection-auth-ttl': 'collectionAuthTtl',
+  '--record-collection': 'recordCollection',
 };
 
 const FLAG_OPTIONS: Record<string, FlagKey> = {
@@ -118,6 +144,8 @@ const FLAG_OPTIONS: Record<string, FlagKey> = {
   '--no-redact': 'noRedact',
   '--no-grpc': 'noGrpc',
   '--trust-simulator': 'trustSimulator',
+  '--no-collection-store': 'noCollectionStore',
+  '--collection-auth': 'collectionAuth',
   '--help': 'help',
   '-h': 'help',
   '--version': 'version',
@@ -263,6 +291,48 @@ export function parseArgs(argv: string[]): ParsedArgs {
       throw new UsageError(`--collection-unmatched must be passthrough or fail, got "${values.collectionUnmatched}"`);
     }
     options.collectionUnmatched = values.collectionUnmatched;
+  }
+  // CONTRACTS §22.11: stateful mocks
+  if (flags.has('noCollectionStore')) {
+    if (values.collectionSnapshot !== undefined) throw new UsageError('--collection-snapshot and --no-collection-store cannot be combined');
+    options.collectionStore = false;
+  }
+  if (values.collectionSnapshot !== undefined) {
+    if (/[\0\r\n]/.test(values.collectionSnapshot) || values.collectionSnapshot.length > 1024) throw new UsageError('--collection-snapshot must be a snapshot name or a file path');
+    options.collectionSnapshot = values.collectionSnapshot;
+  }
+  // CONTRACTS §24.1 / §24.3: dynamic values & sign-in simulation
+  if (values.collectionDynamic !== undefined) {
+    if (!(COLLECTION_DYNAMIC_MODES as readonly string[]).includes(values.collectionDynamic)) {
+      throw new UsageError(`--collection-dynamic must be random, seeded or fixed, got "${values.collectionDynamic}"`);
+    }
+    options.collectionDynamic = values.collectionDynamic as CliOptions['collectionDynamic'];
+  }
+  if (values.collectionSeed !== undefined) {
+    const n = Number(values.collectionSeed);
+    if (!/^\d+$/.test(values.collectionSeed) || !Number.isInteger(n) || n < 0 || n > MAX_COLLECTION_SEED) {
+      throw new UsageError(`--collection-seed must be a whole number from 0 to ${MAX_COLLECTION_SEED}, got "${values.collectionSeed}"`);
+    }
+    if (options.collectionDynamic !== undefined && options.collectionDynamic !== 'seeded') {
+      throw new UsageError(`--collection-seed only applies to seeded mode (cannot be combined with --collection-dynamic ${options.collectionDynamic})`);
+    }
+    options.collectionSeed = n;
+  }
+  if (flags.has('collectionAuth')) options.collectionAuth = true;
+  if (values.collectionAuthTtl !== undefined) {
+    const n = Number(values.collectionAuthTtl);
+    if (!/^\d+$/.test(values.collectionAuthTtl) || !Number.isInteger(n) || n < MIN_AUTH_TTL_SECONDS || n > MAX_AUTH_TTL_SECONDS) {
+      throw new UsageError(`--collection-auth-ttl must be a whole number of seconds from ${MIN_AUTH_TTL_SECONDS} to ${MAX_AUTH_TTL_SECONDS}, got "${values.collectionAuthTtl}"`);
+    }
+    options.collectionAuthTtl = n;
+  }
+  // CONTRACTS §23.6: record a collection from the run's traffic
+  if (values.recordCollection !== undefined) {
+    const trimmed = values.recordCollection.trim();
+    if (!trimmed || trimmed.length > 100 || /[\u0000-\u001f\u007f]/.test(trimmed)) {
+      throw new UsageError('--record-collection must be a collection name (1–100 characters, one line)');
+    }
+    options.recordCollection = trimmed;
   }
   return { kind: 'options', options };
 }

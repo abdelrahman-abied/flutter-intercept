@@ -45,4 +45,11 @@ describe('settings', () => {
     expect(normalizeSettings({ autoPassthrough: 0 }).autoPassthrough).toBe(true);
     expect(normalizeSettings({ autoPassthrough: false }).autoPassthrough).toBe(false);
   });
+
+  it('collectionDrift defaults to true; only a boolean false turns it off (CONTRACTS §23.3)', () => {
+    expect(DEFAULT_SETTINGS.collectionDrift).toBe(true);
+    expect(normalizeSettings({}).collectionDrift).toBe(true);
+    expect(normalizeSettings({ collectionDrift: 0 }).collectionDrift).toBe(true);
+    expect(normalizeSettings({ collectionDrift: false }).collectionDrift).toBe(false);
+  });
 });

@@ -34,6 +34,8 @@ class InterceptSettingsState {
     var backgroundIsolates: String = "intercept"     // intercept | warn
     var notifications: String = "errors"             // errors | all | off
     var contractCheck: Boolean = true
+    /** CONTRACTS §23.3: compare real server JSON answers with linked collections' examples. */
+    var collectionDrift: Boolean = true
     var rewriteLocalhost: Boolean = true
     var upstreamProxy: String = ""
     var upstreamProxyIgnoreCertErrors: Boolean = false
@@ -87,6 +89,7 @@ class InterceptSettingsState {
             "backgroundIsolates" to oneOf(backgroundIsolates, BACKGROUND_ISOLATES, "intercept"),
             "notifications" to oneOf(notifications, NOTIFICATIONS, "errors"),
             "contractCheck" to contractCheck,
+            "collectionDrift" to collectionDrift,
             "rewriteLocalhost" to rewriteLocalhost,
         )
         upstreamProxy.trim().takeIf { it.isNotEmpty() }?.let { out["upstreamProxy"] = it }

@@ -53,6 +53,7 @@ class InterceptConfigurable : BoundConfigurable("Flutter Intercept") {
                 row { checkBox("Record which line of code made each request").bindSelected(working::captureSource) }
                 row { checkBox("Intercept Flutter Web apps").bindSelected(working::webEnabled) }
                 row { checkBox("Check JSON responses against json_serializable / freezed models").bindSelected(working::contractCheck) }
+                row { checkBox("Compare real server JSON answers with linked collection examples (flag out-of-date examples)").bindSelected(working::collectionDrift) }
                 row { checkBox("Send requests to 10.0.2.2 / 10.0.3.2 to this computer's localhost").bindSelected(working::rewriteLocalhost) }
                 row("Native HTTP clients:") {
                     comboBox(InterceptSettingsState.NATIVE_CLIENTS).bindItem(working::nativeClients.toNullableProperty())

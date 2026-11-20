@@ -126,4 +126,76 @@ describe('parseArgs', () => {
       expect(() => parseArgs(argv)).toThrow(pattern);
     }
   });
+
+  it('parses stateful-mock options (CONTRACTS §22.11)', () => {
+    expect(opts(['test', '--collection', 'a.json', '--collection-snapshot', 'checkout']).collectionSnapshot).toBe('checkout');
+    expect(opts(['test', '--collection-snapshot=ci/scenario.json']).collectionSnapshot).toBe('ci/scenario.json');
+    expect(opts(['test', '--no-collection-store']).collectionStore).toBe(false);
+    expect(opts(['test']).collectionStore).toBeUndefined();
+    expect(HELP).toContain('--collection-snapshot <s>');
+    expect(HELP).toContain('--no-collection-store');
+    for (const [argv, pattern] of [
+      [['test', '--collection-snapshot'], /--collection-snapshot needs a value/],
+      [['test', '--collection-snapshot', 'a', '--collection-snapshot', 'b'], /given twice/],
+      [['test', '--collection-snapshot', 'a', '--no-collection-store'], /cannot be combined/],
+      [['test', '--no-collection-store=yes'], /takes no value/],
+      [['test', '--collection-snapshot', 'a\nb'], /snapshot name or a file path/],
+    ] as [string[], RegExp][]) {
+      expect(() => parseArgs(argv)).toThrow(UsageError);
+      expect(() => parseArgs(argv)).toThrow(pattern);
+    }
+  });
+
+  it('parses part 3 & --record-collection options and rejects invalid values (CONTRACTS §23.6, §24)', () => {
+    const o = opts([
+      'test',
+      '--collection', 'api/shop-bruno/bruno.json',
+      '--collection-env', 'dev',
+      '--collection-seed', '42',
+      '--collection-dynamic', 'seeded',
+      '--collection-auth',
+      '--collection-auth-ttl', '120',
+      '--record-collection', 'Shop API (CI)',
+    ]);
+    expect(o.collectionSeed).toBe(42);
+    expect(o.collectionDynamic).toBe('seeded');
+    expect(o.collectionAuth).toBe(true);
+    expect(o.collectionAuthTtl).toBe(120);
+    expect(o.recordCollection).toBe('Shop API (CI)');
+    expect(opts(['test', '--collection-seed=0']).collectionSeed).toBe(0);
+    expect(opts(['test', '--collection-dynamic=random']).collectionDynamic).toBe('random');
+    expect(opts(['test', '--collection-dynamic=fixed']).collectionDynamic).toBe('fixed');
+    expect(opts(['test', '--collection-auth-ttl=60']).collectionAuthTtl).toBe(60);
+    expect(opts(['test', '--collection-auth-ttl=86400']).collectionAuthTtl).toBe(86400);
+
+    expect(HELP).toContain('--collection-seed <n>');
+    expect(HELP).toContain('--collection-dynamic <m>');
+    expect(HELP).toContain('--collection-auth');
+    expect(HELP).toContain('--collection-auth-ttl <s>');
+    expect(HELP).toContain('--record-collection <name>');
+    expect(HELP).toContain('bruno.json');
+
+    for (const [argv, pattern] of [
+      [['test', '--collection-seed'], /--collection-seed needs a value/],
+      [['test', '--collection-seed', '-1'], /--collection-seed must be/],
+      [['test', '--collection-seed', 'abc'], /--collection-seed must be/],
+      [['test', '--collection-seed', '4294967296'], /--collection-seed must be/],
+      [['test', '--collection-seed', '5', '--collection-dynamic', 'random'], /only applies to seeded mode/],
+      [['test', '--collection-seed', '5', '--collection-dynamic', 'fixed'], /only applies to seeded mode/],
+      [['test', '--collection-dynamic'], /--collection-dynamic needs a value/],
+      [['test', '--collection-dynamic', 'bogus'], /random, seeded or fixed/],
+      [['test', '--collection-auth=yes'], /takes no value/],
+      [['test', '--collection-auth-ttl'], /--collection-auth-ttl needs a value/],
+      [['test', '--collection-auth-ttl', '59'], /60 to 86400/],
+      [['test', '--collection-auth-ttl', '86401'], /60 to 86400/],
+      [['test', '--collection-auth-ttl', '12.5'], /60 to 86400/],
+      [['test', '--record-collection'], /--record-collection needs a value/],
+      [['test', '--record-collection', '   '], /collection name/],
+      [['test', '--record-collection', 'a\nb'], /collection name/],
+      [['test', '--record-collection', 'x'.repeat(101)], /collection name/],
+    ] as [string[], RegExp][]) {
+      expect(() => parseArgs(argv)).toThrow(UsageError);
+      expect(() => parseArgs(argv)).toThrow(pattern);
+    }
+  });
 });

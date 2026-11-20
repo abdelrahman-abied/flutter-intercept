@@ -56,10 +56,10 @@ import { createSidecarCollections, type SidecarCollections } from './collections
 import { createNodeContractService, DONT_CHECK, type NodeContractService } from './contract';
 import { prepareLaunch, type LaunchRecord } from './launch';
 import { RpcFailure } from './rpc';
-import { normalizeSettings, normalizeTheme } from './settings';
+import { normalizeSettings, normalizeTheme, type EffectiveSidecarSettings } from './settings';
 import { createNodeSharedRules, type NodeSharedRules } from './sharedRules';
 import { JsonStateStore } from './state';
-import type { InitParams, InitResult, PrepareLaunchParams, SessionEndedParams, SessionStartedParams, SidecarSettings } from './types';
+import type { InitParams, InitResult, PrepareLaunchParams, SessionEndedParams, SessionStartedParams } from './types';
 import { UiServer } from './uiServer';
 import { createSidecarVm, type SidecarVm } from './vm';
 
@@ -227,7 +227,7 @@ export async function loadMcpToken(dataDir: string, link: Pick<PluginLink, 'requ
 
 export class SidecarHost {
   private initialized = false;
-  private settings: SidecarSettings = normalizeSettings({});
+  private settings: EffectiveSidecarSettings = normalizeSettings({});
   private theme: InitParams['theme'] = 'dark';
   private folders: string[] = [];
   private dataDir = '';
@@ -465,7 +465,27 @@ export class SidecarHost {
     this.proxyHost.setBodyFileResolver((p, id) => this.shared.resolveBodyFile(p, id));
     this.proxyHost.setScriptFileResolver((p, id) => this.shared.resolveScriptFile(p, id));
     this.shared.onDidChangeBodyFile((p) => this.proxyHost.refreshBodyFiles(p));
-    // CONTRACTS §21: mock from a collection (links in the shared file; rules go to the proxy after the user's)
+    this.applyUpstreamProxy();
+    this.proxyHost.setTlsPassthrough(this.settings.tlsPassthrough);
+    this.proxyHost.setAutoPassthrough(this.settings.autoPassthrough); // CONTRACTS §20.7
+    void this.applyClientCertificates();
+    // CONTRACTS §16.4: gRPC decrypt hosts and the schema from the app's generated `*.pb*.dart`.
+    this.proxyHost.setGrpcDecryptHosts(this.settings.grpc?.decryptHosts ?? []);
+    void this.simTrust.recover().then(() => this.publishSimTrust(), (e: unknown) => log(`simulator trust recovery failed: ${String(e)}`)); // repairs a crashed run
+    const grpc = (this.grpc = createGrpcSchemaService({
+      codec: grpcCodec,
+      roots: () => this.folders,
+      enabled: () => this.settings.grpc?.enabled !== false,
+      log,
+    }));
+    this.disposers.push(() => grpc.dispose());
+    this.proxyHost.setGrpcMessageEncoder(grpcMockEncoder(grpc));
+    this.proxyHost.setGrpcCodec(grpcProxyCodec(grpc));
+    const recordings = createRecordingService({ root: () => this.projectRoot(), grpc });
+    const grpcSub = grpc.onDidChange(() => this.proxyHost.refreshGrpcMocks());
+    this.disposers.push(() => grpcSub.dispose());
+    void grpc.ready();
+    // CONTRACTS §21 / §22 / §23 / §24: mock from a collection (links in the shared file; rules go to the proxy after the user's)
     this.collections = createSidecarCollections({
       shared: this.shared,
       roots: () => this.folders,
@@ -487,29 +507,30 @@ export class SidecarHost {
         }
         return [...out];
       },
+      // CONTRACTS §21.15 #4 (`seen`), REVIEW-15 #8 (hosts passed through undecrypted aren't mocked)
+      exchanges: () => this.proxyHost.getExchanges(),
+      passthroughHosts: () => [...this.proxyHost.learnedPassthrough.map((l) => `${l.host}:${l.port}`), ...this.proxyHost.tlsPassthrough],
+      // CONTRACTS §22.9: stateful mocks — one proxy handler per collection; the data lives as long as the proxy runs
+      setHandler: (id, fn) => this.proxyHost.setHandler(id, fn),
+      onProxyStopped: (listener) => {
+        const onState = (running: boolean) => {
+          if (!running) listener();
+        };
+        this.proxyHost.on('state', onState);
+        return { dispose: () => void this.proxyHost.off('state', onState) };
+      },
+      // CONTRACTS §23: fake backend from a recording; drift from finished exchanges (a throttle-only rule's still count)
+      loadRecording: async (id) => (await recordings.load(id)).entries,
+      onExchange: (listener) => {
+        const l = (e: Exchange) => listener(e);
+        this.proxyHost.on('exchange', l);
+        return { dispose: () => void this.proxyHost.off('exchange', l) };
+      },
+      isThrottleOnlyRule: (ruleId) => this.proxyHost.getRules().find((r) => r.id === ruleId)?.action.kind === 'throttle',
+      driftEnabled: () => this.settings.collectionDrift,
       log,
     });
     this.disposers.push(() => this.collections.dispose());
-    this.applyUpstreamProxy();
-    this.proxyHost.setTlsPassthrough(this.settings.tlsPassthrough);
-    this.proxyHost.setAutoPassthrough(this.settings.autoPassthrough); // CONTRACTS §20.7
-    void this.applyClientCertificates();
-    // CONTRACTS §16.4: gRPC decrypt hosts and the schema from the app's generated `*.pb*.dart`.
-    this.proxyHost.setGrpcDecryptHosts(this.settings.grpc?.decryptHosts ?? []);
-    void this.simTrust.recover().then(() => this.publishSimTrust(), (e: unknown) => log(`simulator trust recovery failed: ${String(e)}`)); // repairs a crashed run
-    const grpc = (this.grpc = createGrpcSchemaService({
-      codec: grpcCodec,
-      roots: () => this.folders,
-      enabled: () => this.settings.grpc?.enabled !== false,
-      log,
-    }));
-    this.disposers.push(() => grpc.dispose());
-    this.proxyHost.setGrpcMessageEncoder(grpcMockEncoder(grpc));
-    this.proxyHost.setGrpcCodec(grpcProxyCodec(grpc));
-    const recordings = createRecordingService({ root: () => this.projectRoot(), grpc });
-    const grpcSub = grpc.onDidChange(() => this.proxyHost.refreshGrpcMocks());
-    this.disposers.push(() => grpcSub.dispose());
-    void grpc.ready();
 
     const exporters = { openapi: toOpenApi, postman: toPostman };
     const shared = this.shared;
@@ -827,10 +848,10 @@ export class SidecarHost {
     }
   }
 
-  private async applySettings(next: SidecarSettings): Promise<void> {
+  private async applySettings(next: EffectiveSidecarSettings): Promise<void> {
     const prev = this.settings;
     this.settings = next;
-    const changed = (k: keyof SidecarSettings) => JSON.stringify(prev[k]) !== JSON.stringify(next[k]);
+    const changed = (k: keyof EffectiveSidecarSettings) => JSON.stringify(prev[k]) !== JSON.stringify(next[k]);
     if (changed('upstreamProxy') || changed('upstreamProxyIgnoreCertErrors') || changed('ideHttpProxy')) {
       this.upstreamProblemShown = undefined;
       this.applyUpstreamProxy();
@@ -846,6 +867,7 @@ export class SidecarHost {
     // Always re-load: a passphrase changed in the IDE's password store arrives as a `settings` call (REVIEW-9 #7).
     await this.applyClientCertificates();
     if (changed('contractCheck')) this.controller.recheckContracts();
+    if (changed('collectionDrift')) this.collections.refreshDrift();
     if (changed('notifications')) this.notifications.refreshLevel();
     if (changed('agent')) await this.reconcileMcp();
     this.emitStatus();
@@ -927,6 +949,10 @@ export class SidecarHost {
       case 'importCollection': {
         const imported = await this.collections.importInteractive();
         return { id: imported?.id ?? null };
+      }
+      case 'mockFromTraffic': {
+        const created = await this.collections.mockFromTrafficInteractive({ session: {} });
+        return { id: created?.id ?? null };
       }
       default:
         throw new RpcFailure(`unknown command ${String(name).slice(0, 60)}`, 'invalid');

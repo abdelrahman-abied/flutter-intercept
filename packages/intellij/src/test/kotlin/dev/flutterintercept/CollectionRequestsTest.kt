@@ -3,6 +3,8 @@ package dev.flutterintercept
 import com.google.gson.JsonParser
 import dev.flutterintercept.sidecar.RpcException
 import dev.flutterintercept.ui.Collections
+import dev.flutterintercept.ui.PickManyDialog
+import dev.flutterintercept.ui.PickManyItem
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -118,5 +120,54 @@ class CollectionRequestsTest {
             Collections.removeDetail("api/shop.json"),
         )
         assertEquals("Remove", Collections.REMOVE_BUTTON)
+    }
+
+    @Test
+    fun pickManyRequestValidatesItemsBoundsAndDefaults() {
+        val req = PickManyDialog.parseRequest(
+            obj(
+                """{
+                    "title": "Make a fake backend (1/3)",
+                    "placeholder": "Pick servers\nLine 2",
+                    "okButton": "Continue",
+                    "items": [
+                        {"label": "api.shop.example", "description": "12 requests", "value": "https://api.shop.example", "picked": true},
+                        {"label": "analytics.google.com", "description": "3 requests · third-party", "value": "https://analytics.google.com", "picked": false},
+                        {"label": "plain.example"},
+                        {"description": "missing label skipped"}
+                    ]
+                }""",
+            ),
+        )
+        assertEquals("Make a fake backend (1/3)", req.title)
+        assertEquals("Pick servers\nLine 2", req.placeholder)
+        assertEquals("Continue", req.okButton)
+        assertEquals(
+            listOf(
+                PickManyItem("api.shop.example", "12 requests", "https://api.shop.example", true),
+                PickManyItem("analytics.google.com", "3 requests · third-party", "https://analytics.google.com", false),
+                PickManyItem("plain.example", null, "plain.example", false),
+            ),
+            req.items,
+        )
+        assertEquals("api.shop.example — 12 requests", PickManyDialog.formatItemText(req.items[0]))
+        assertEquals("plain.example", PickManyDialog.formatItemText(req.items[2]))
+
+        // Defaults when optional fields omitted, and control characters sanitized.
+        val minimal = PickManyDialog.parseRequest(obj("""{"items":[{"label":"a\nb\tc","value":"https://a.example\n"}]}"""))
+        assertEquals(PickManyDialog.DEFAULT_TITLE, minimal.title)
+        assertNull(minimal.placeholder)
+        assertEquals(PickManyDialog.DEFAULT_OK_BUTTON, minimal.okButton)
+        assertEquals("a b c", minimal.items[0].label)
+        assertEquals("a b c", minimal.items[0].value) // control char in value falls back to sanitized label
+
+        // Caps at MAX_ITEMS.
+        val many = (1..250).joinToString(",") { """{"label":"h$it.example","value":"https://h$it.example","picked":true}""" }
+        assertEquals(PickManyDialog.MAX_ITEMS, PickManyDialog.parseRequest(obj("""{"items":[$many]}""")).items.size)
+
+        // Refuses missing, non-array, empty or all-invalid items.
+        for (bad in listOf("""{}""", """{"items":null}""", """{"items":"a"}""", """{"items":[]}""", """{"items":[{"label":"  "}]}""")) {
+            refused { PickManyDialog.parseRequest(obj(bad)) }
+        }
     }
 }

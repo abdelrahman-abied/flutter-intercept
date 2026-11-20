@@ -11,7 +11,7 @@ import { execFileSync, spawn as nodeSpawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { InterceptProxy, type Exchange } from '@flutter-intercept/proxy';
+import { InterceptProxy, type Exchange, type Rule } from '@flutter-intercept/proxy';
 import { presetProfile, type NetworkPresetId, type NetworkProfile } from '@flutter-intercept/proxy/network';
 import { loadOrCreateCa } from '../../extension/src/ca';
 import { findPubspecRoot, hasPubspec, PROXY_DEFINE, readPubspec } from '../../extension/src/entry/generator';
@@ -23,12 +23,13 @@ import { evaluateExpectations, readExpectations, type AssertionResult, type Expe
 import { kindFromId, listFlutterDevices, pickDevice, proxyRouteFor, type FlutterDevice, type PickedDevice } from './devices';
 import { isIntegrationTestPath, prepareEntries, resolveRunTargets, resolveTestTargets, type PreparedEntries } from './entries';
 import { toJunitXml } from './junit';
-import { loadReplay, writeHarFile, writeOutput, writeRecording } from './outputs';
+import { loadReplay, writeHarFile, writeOutput, writeRecordedCollection, writeRecording } from './outputs';
 import { isVerboseFlutter, LAN_NOTES, lanAddressForIphone, lanProxyAddress, newRunToken, resolveLanHost, withoutProxyAuthorization, type LanAddress } from './lan';
 import { lanDefinesContent } from '../../extension/src/debug/rewrite';
 import { newLanDefinesPath, removeLanDefines, writeLanDefines } from '../../extension/src/debug/lanPrepare';
-import { loadCollections } from './collections';
-import { loadRules } from './rules';
+import { loadCollections, type LoadedCollectionSummary } from './collections';
+import { loadRules, rulesLocation } from './rules';
+import { authSummary, storeSummary, type CollectionStore } from './stores';
 import { assertionsTable, trafficTable } from './summary';
 import type { CliOptions, CliResult } from './types';
 
@@ -73,6 +74,8 @@ export interface RunDeps {
   lanAddress?(): Promise<LanAddress>;
   /** The LAN token (default: 32 random bytes, base64url). */
   newToken?(): string;
+  /** CONTRACTS §24.1 / §24.3: clock for sign-in sessions and dynamic values (default `Date.now`). */
+  now?(): number;
 }
 
 export function defaultDeps(version: string): RunDeps {
@@ -277,6 +280,9 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
 
   let flutterCode: number | undefined;
   let exchanges: Exchange[] = [];
+  let stores: CollectionStore[] = [];
+  let authCollections: LoadedCollectionSummary[] = [];
+  let allRules: Rule[] = [];
   try {
     const ca = await loadOrCreateCa(tmp);
     proxy = new InterceptProxy({
@@ -346,7 +352,7 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
     for (const s of loaded.skipped) log(`rules: skipped (needs approval; pass --approve-shared-rules to apply): ${s}`);
     for (const s of loaded.approved) log(`rules: applied with --approve-shared-rules: ${s}`);
 
-    // CONTRACTS §21.11: collections from the shared file (skipped by --no-rules) + --collection flags, after shared rules.
+    // CONTRACTS §21.11 / §22.11 / §24: collections from the shared file (skipped by --no-rules) + --collection flags, after shared rules.
     let loadedCollections;
     try {
       loadedCollections = await loadCollections({
@@ -355,6 +361,21 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
         envFile: o.collectionEnv,
         vars: o.collectionVars,
         unmatched: o.collectionUnmatched,
+        // CONTRACTS §22.11: resources remember what the app sends (off with --no-collection-store)
+        ...(o.collectionStore !== false
+          ? {
+              store: {
+                folder: loaded.file ? rulesLocation(loaded.file, projectRoot).folder : projectRoot,
+                ...(o.collectionSnapshot !== undefined ? { snapshot: o.collectionSnapshot } : {}),
+              },
+            }
+          : {}),
+        // CONTRACTS §24.1 / §24.3: dynamic values & sign-in simulation
+        ...(o.collectionDynamic !== undefined ? { dynamic: o.collectionDynamic } : {}),
+        ...(o.collectionSeed !== undefined ? { seed: o.collectionSeed } : {}),
+        ...(o.collectionAuth ? { auth: true } : {}),
+        ...(o.collectionAuthTtl !== undefined ? { authTtl: o.collectionAuthTtl } : {}),
+        ...(deps.now ? { now: deps.now } : {}),
         cwd: deps.cwd,
       });
     } catch (e) {
@@ -362,11 +383,19 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
     }
     for (const c of loadedCollections.collections) {
       log(
-        `rules: collection "${c.name}" (${c.mocked} mocked${c.noExample ? `, ${c.noExample} without an example → 501` : ''}${c.unresolved.length ? `, unresolved: ${c.unresolved.join(', ')}` : ''}; unmatched: ${c.unmatched})`,
+        `rules: collection "${c.name}" (${c.mocked} mocked${c.noExample ? `, ${c.noExample} without an example → 501` : ''}${c.unresolved.length ? `, unresolved: ${c.unresolved.join(', ')}` : ''}; unmatched: ${c.unmatched}${c.auth ? '; sign-in: on' : ''})`,
       );
     }
     for (const p of loadedCollections.problems) log(`rules: ${p}`);
-    const allRules = [...loaded.rules, ...loadedCollections.rules];
+    authCollections = loadedCollections.collections.filter((c) => c.auth);
+    stores = loadedCollections.stores;
+    // Register every handler from MockCollectionsCore (stores, sign-in gate, body examples, dynamic values).
+    for (const [id, handler] of loadedCollections.handlers) proxy.setHandler(id, handler);
+    for (const s of stores) {
+      const names = s.resources.map((r) => r.name);
+      log(`store: "${s.name}" remembers ${names.slice(0, 10).join(', ')}${names.length > 10 ? ` and ${names.length - 10} more` : ''}${s.startsFrom ? ` (starting from ${s.startsFrom})` : ''}`);
+    }
+    allRules = [...loaded.rules, ...loadedCollections.rules];
     if (allRules.length) proxy.setRules(allRules);
 
     if (o.replay) {
@@ -464,6 +493,19 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
       log(`recording not saved: ${(e as Error).message}`);
     }
   }
+  // CONTRACTS §23.6: write a Postman v2.1 collection from the run's traffic (personal data replaced, never overwrites).
+  if (o.recordCollection) {
+    try {
+      const throttleIds = new Set(allRules.filter((r) => r.action.kind === 'throttle').map((r) => r.id));
+      const r = await writeRecordedCollection(o.recordCollection, exchanges, projectRoot, { isThrottleOnlyRule: (id) => throttleIds.has(id) });
+      result.outputs.collection = r.path;
+      log(`collection: ${r.endpoints} endpoint${r.endpoints === 1 ? '' : 's'}, ${r.examples} example${r.examples === 1 ? '' : 's'} → ${r.path}`);
+      if (r.skipped.length) log(`collection skipped: ${r.skipped.join(', ')}`);
+      if (r.removed.length) log(`collection removed: ${r.removed.join(', ')}`);
+    } catch (e) {
+      log(`collection not saved: ${(e as Error).message}`);
+    }
+  }
   let results: AssertionResult[] = [];
   if (expectations) {
     results = await evaluateExpectations(expectations, exchanges, { redact });
@@ -481,6 +523,24 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
   const inFlight = exchanges.length - done.length;
   if (inFlight) deps.out(`${inFlight} request(s) were still in flight when the run ended`);
   if (expectations) deps.out(`\n${assertionsTable(results)}`);
+  // CONTRACTS §22.11 / §24.1: the final count of each remembered resource and sign-in sessions per collection.
+  const summaryLines = [...storeSummary(stores), ...authSummary(authCollections)];
+  if (summaryLines.length) {
+    deps.out('');
+    for (const line of summaryLines) deps.out(line);
+  }
+  if (stores.length) {
+    result.stores = stores.flatMap((s) => {
+      const counts = s.counts();
+      return s.resources.map((r) => {
+        const c = s.changes.get(r.name);
+        return { collection: s.id, resource: r.name, records: counts[r.name] ?? 0, created: c?.created ?? 0, updated: c?.updated ?? 0, deleted: c?.deleted ?? 0 };
+      });
+    });
+  }
+  if (authCollections.length) {
+    result.auth = authCollections.map((c) => ({ collection: c.id, sessions: c.sessions() }));
+  }
 
   if (interrupted && o.command === 'test') result.exitCode = 128 + SIGNALS[interrupted];
   else if (flutterCode !== undefined && flutterCode !== 0) result.exitCode = flutterCode;

@@ -50,6 +50,20 @@ export interface CliOptions {
   collectionVars?: Record<string, string>;
   /** CONTRACTS §21.11: unmatched requests for collections (`--collection-unmatched passthrough|fail`). */
   collectionUnmatched?: 'passthrough' | 'fail';
+  /** CONTRACTS §22.11: `--no-collection-store` = false (collections answer only their examples, as in 0.15). Default true. */
+  collectionStore?: boolean;
+  /** CONTRACTS §22.11: `--collection-snapshot <name|file>`: the remembered data starts from this snapshot. */
+  collectionSnapshot?: string;
+  /** CONTRACTS §24.3: `--collection-seed <n>` (seeded mode; default 1). */
+  collectionSeed?: number;
+  /** CONTRACTS §24.3: `--collection-dynamic random|seeded|fixed` (CLI default: `seeded`). */
+  collectionDynamic?: 'random' | 'seeded' | 'fixed';
+  /** CONTRACTS §24.1: `--collection-auth`: turn sign-in simulation on for the run. */
+  collectionAuth?: boolean;
+  /** CONTRACTS §24.1: `--collection-auth-ttl <60-86400>`: sign-in session TTL in seconds. */
+  collectionAuthTtl?: number;
+  /** CONTRACTS §23.6: `--record-collection <name>`: write a collection from the run's traffic. */
+  recordCollection?: string;
 }
 
 export interface CliResult {
@@ -57,5 +71,9 @@ export interface CliResult {
   exitCode: number;
   exchanges: number;
   assertions: { passed: number; failed: number };
-  outputs: { har?: string; record?: string; junit?: string };
+  outputs: { har?: string; record?: string; junit?: string; collection?: string };
+  /** CONTRACTS §22.11: the final count of each remembered resource (absent when no collection remembers data). */
+  stores?: { collection: string; resource: string; records: number; created: number; updated: number; deleted: number }[];
+  /** CONTRACTS §24.1: collections with sign-in simulation on and their active session counts at the end of the run. */
+  auth?: { collection: string; sessions: number }[];
 }

@@ -388,6 +388,291 @@ describe('runCli (fake flutter)', () => {
   });
 });
 
+/** HTTPS through the proxy (CONNECT + TLS, the run's temp CA not checked), with an optional JSON body and headers. */
+function httpsJsonViaProxy(
+  proxy: string,
+  method: string,
+  url: string,
+  json?: unknown,
+  extraHeaders: Record<string, string> = {},
+): Promise<{ status: number; body: string }> {
+  const [proxyHost, proxyPort] = proxy.split(':');
+  const u = new URL(url);
+  const targetPort = Number(u.port) || 443;
+  const payload = json === undefined ? undefined : Buffer.from(JSON.stringify(json));
+  return new Promise((resolve, reject) => {
+    const connect = http.request({ host: proxyHost === 'localhost' ? '127.0.0.1' : proxyHost, port: Number(proxyPort), method: 'CONNECT', path: `${u.hostname}:${targetPort}` });
+    connect.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        return reject(new Error(`CONNECT failed: ${res.statusCode}`));
+      }
+      const tlsSocket = tls.connect({ socket, servername: u.hostname, rejectUnauthorized: false }, () => {
+        const headers: Record<string, string | number> = { host: u.host, connection: 'close', ...extraHeaders };
+        if (payload) Object.assign(headers, { 'content-type': 'application/json', 'content-length': payload.length });
+        const req = http.request({ method, host: u.hostname, port: targetPort, path: `${u.pathname}${u.search}`, createConnection: () => tlsSocket, headers }, (r) => {
+          const chunks: Buffer[] = [];
+          r.on('data', (c: Buffer) => chunks.push(c));
+          r.on('end', () => resolve({ status: r.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
+          r.on('error', reject);
+        });
+        req.on('error', reject);
+        req.end(payload);
+      });
+      tlsSocket.on('error', reject);
+    });
+    connect.on('error', reject);
+    connect.end();
+  });
+}
+
+describe('runCli: stateful mocks (CONTRACTS §22.11)', () => {
+  const todo = path.join(__dirname, 'fixtures', 'todo.openapi.json');
+
+  it('POST then GET through the proxy: the created record is listed, and the summary prints the final count', async () => {
+    let got: { created?: { status: number; body: string }; list?: { status: number; body: string } } = {};
+    const f = fake(async (args, child) => {
+      const proxy = proxyOf(args);
+      const created = await httpsJsonViaProxy(proxy, 'POST', 'https://api.todo.example/todos', { title: 'Walk the dog' });
+      const list = await httpsJsonViaProxy(proxy, 'GET', 'https://api.todo.example/todos');
+      got = { created, list };
+      child.exit(0);
+    });
+    const r = await runCli(base({ collections: [todo] }), f.deps);
+    expect(r.exitCode).toBe(0);
+    expect(got.created?.status).toBe(201);
+    expect(JSON.parse(got.created!.body)).toEqual({ id: 2, title: 'Walk the dog', done: false });
+    expect(got.list?.status).toBe(200);
+    expect(JSON.parse(got.list!.body)).toEqual([
+      { id: 1, title: 'Buy milk', done: false },
+      { id: 2, title: 'Walk the dog', done: false },
+    ]);
+    expect(f.logs).toContain('store: "Todo API" remembers todos');
+    expect(f.out).toContain('store todos: 2 records (1 created)');
+    expect(r.stores).toEqual([{ collection: 'todo-api', resource: 'todos', records: 2, created: 1, updated: 0, deleted: 0 }]);
+  });
+
+  it('--no-collection-store answers the examples (0.15): the list never changes', async () => {
+    let list: unknown;
+    const f = fake(async (args, child) => {
+      const proxy = proxyOf(args);
+      await httpsJsonViaProxy(proxy, 'POST', 'https://api.todo.example/todos', { title: 'Walk the dog' });
+      list = JSON.parse((await httpsJsonViaProxy(proxy, 'GET', 'https://api.todo.example/todos')).body);
+      child.exit(0);
+    });
+    const r = await runCli(base({ collections: [todo], collectionStore: false }), f.deps);
+    expect(r.exitCode).toBe(0);
+    expect(list).toEqual([{ id: 1, title: 'Buy milk', done: false }]);
+    expect(r.stores).toBeUndefined();
+    expect(f.out.some((l) => l.startsWith('store '))).toBe(false);
+  });
+
+  it('--collection-snapshot that is not found is a setup error before flutter runs', async () => {
+    const f = fake((_a, c) => c.exit(0));
+    await expect(runCli(base({ collections: [todo], collectionSnapshot: 'missing' }), f.deps)).rejects.toBeInstanceOf(SetupError);
+    expect(f.calls).toHaveLength(0);
+  });
+});
+
+describe('runCli: part 3 pipeline (sign-in, seeded dynamic values) & --record-collection (CONTRACTS §23.6, §24)', () => {
+  const shopFixtures = path.resolve(__dirname, '..', '..', 'extension', 'test', 'fixtures', 'collections');
+
+  it('sign-in simulation through the real proxy: login → token → protected GET 200 → GET without token 401 → TTL expiry', async () => {
+    const col = path.join(shopFixtures, 'shop.postman_collection.json');
+    const envFile = path.join(shopFixtures, 'shop.postman_environment.json');
+    let clock = Date.UTC(2026, 5, 1, 12, 0, 0);
+    let got: {
+      unauth?: number;
+      login?: { status: number; token?: string };
+      authed?: { status: number; body: unknown };
+      expired?: number;
+    } = {};
+
+    const f = fake(async (args, child) => {
+      const proxy = proxyOf(args);
+      const unauth = await httpsJsonViaProxy(proxy, 'GET', 'https://api.shop.example/users/me');
+      const loginRes = await httpsJsonViaProxy(proxy, 'POST', 'https://api.shop.example/auth/login', { email: 'sara@example.com', password: 'any' });
+      const loginJson = JSON.parse(loginRes.body) as { token?: string };
+      const authed = await httpsJsonViaProxy(proxy, 'GET', 'https://api.shop.example/users/me', undefined, { authorization: `Bearer ${loginJson.token}` });
+      // Advance clock past TTL (60s) → token expires → 401.
+      clock += 61_000;
+      const expired = await httpsJsonViaProxy(proxy, 'GET', 'https://api.shop.example/users/me', undefined, { authorization: `Bearer ${loginJson.token}` });
+      got = {
+        unauth: unauth.status,
+        login: { status: loginRes.status, token: loginJson.token },
+        authed: { status: authed.status, body: JSON.parse(authed.body) },
+        expired: expired.status,
+      };
+      child.exit(0);
+    });
+    f.deps.now = () => clock;
+
+    const r = await runCli(base({ collections: [col], collectionEnv: envFile, collectionAuth: true, collectionAuthTtl: 60 }), f.deps);
+    expect(r.exitCode).toBe(0);
+    expect(got.unauth).toBe(401);
+    expect(got.login?.status).toBe(200);
+    expect(got.login?.token).toMatch(/^fi\./);
+    expect(got.authed).toEqual({ status: 200, body: { id: 1, name: 'Sara' } });
+    expect(got.expired).toBe(401);
+    expect(f.out).toContain('collection "Shop API": sign-in: 1 session');
+    expect(r.auth).toEqual([{ collection: 'shop-api', sessions: 1 }]);
+  });
+
+  it('--collection-auth without a login request is a setup error before flutter runs', async () => {
+    const todo = path.join(__dirname, 'fixtures', 'todo.openapi.json');
+    const f = fake((_a, c) => c.exit(0));
+    await expect(runCli(base({ collections: [todo], collectionAuth: true }), f.deps)).rejects.toBeInstanceOf(SetupError);
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it('seeded dynamic values are identical across two runs with the same seed and differ with another seed', async () => {
+    const dynFile = path.join(dir, 'dyn.postman_collection.json');
+    fs.writeFileSync(
+      dynFile,
+      JSON.stringify({
+        info: { name: 'Dyn API', schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json' },
+        item: [
+          {
+            name: 'Ticket',
+            request: { method: 'GET', url: 'https://dyn.example/ticket' },
+            response: [
+              {
+                name: 'OK',
+                code: 200,
+                header: [{ key: 'Content-Type', value: 'application/json' }],
+                body: '{"id":"{{$guid}}","n":{{$randomInt}},"email":"{{$randomEmail}}"}',
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    const runWith = async (opts: Partial<CliOptions>) => {
+      const bodies: string[] = [];
+      const f = fake(async (args, child) => {
+        const proxy = proxyOf(args);
+        bodies.push((await httpsJsonViaProxy(proxy, 'GET', 'https://dyn.example/ticket')).body);
+        bodies.push((await httpsJsonViaProxy(proxy, 'GET', 'https://dyn.example/ticket')).body);
+        child.exit(0);
+      });
+      const r = await runCli(base({ collections: [dynFile], ...opts }), f.deps);
+      expect(r.exitCode).toBe(0);
+      return bodies.map((b) => JSON.parse(b) as { id: string; n: number; email: string });
+    };
+
+    const run1 = await runWith({ collectionSeed: 77 });
+    const run2 = await runWith({ collectionSeed: 77 });
+    const run3 = await runWith({ collectionSeed: 88 });
+    const fixed = await runWith({ collectionDynamic: 'fixed' });
+
+    expect(run1).toEqual(run2);
+    expect(run1[0].id).not.toBe(run1[1].id);
+    expect(run1[0].id).not.toBe(run3[0].id);
+    expect(fixed[0]).toEqual(fixed[1]);
+    expect(fixed[0].email).toBe('user@example.com');
+  });
+
+  it('--record-collection writes a sanitised collection without planted secrets, parses back and never overwrites (CONTRACTS §23.1, §23.6)', async () => {
+    const plantedJwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJwbGFudGVkLXVzZXItOTkiLCJleHAiOjE5MDAwMDAwMDB9.realSignatureBytes1234567890';
+    const planted = [
+      plantedJwt,
+      'super-secret-password-999',
+      'sk_live_plantedKey123',
+      'alice.real@corp-private.test',
+      '+44-7700-900123',
+      '742 Evergreen Terrace',
+      '24.7136',
+      'planted-cookie-val-xyz',
+      'planted-s3-sig-abcdef123456',
+    ];
+    const secretServer = http.createServer((req, res) => {
+      if (req.url === '/api/profile') {
+        res.setHeader('content-type', 'application/json');
+        res.setHeader('set-cookie', 'sid=planted-cookie-val-xyz; HttpOnly');
+        res.end(
+          JSON.stringify({
+            id: 1,
+            name: 'Alice',
+            email: 'alice.real@corp-private.test',
+            phone: '+44-7700-900123',
+            streetAddress: '742 Evergreen Terrace',
+            lat: 24.7136,
+            password: 'super-secret-password-999',
+            accessToken: plantedJwt,
+            avatarUrl: 'https://cdn.example/a.png?X-Amz-Signature=planted-s3-sig-abcdef123456',
+          }),
+        );
+        return;
+      }
+      res.statusCode = 302;
+      res.setHeader('location', '/api/profile');
+      res.end();
+    });
+    await new Promise<void>((r) => secretServer.listen(0, '127.0.0.1', () => r()));
+    const srvOrigin = `http://127.0.0.1:${(secretServer.address() as AddressInfo).port}`;
+
+    try {
+      const hitOnce = () =>
+        fake(async (args, child) => {
+          const proxy = proxyOf(args);
+          const [host, port] = proxy.split(':');
+          const reqOne = (p: string) =>
+            new Promise<void>((resolve, reject) => {
+              const req = http.request(
+                {
+                  host: host === 'localhost' ? '127.0.0.1' : host,
+                  port: Number(port),
+                  path: `${srvOrigin}${p}`,
+                  headers: {
+                    host: new URL(srvOrigin).host,
+                    authorization: `Bearer ${plantedJwt}`,
+                    'x-api-key': 'sk_live_plantedKey123',
+                  },
+                },
+                (res) => {
+                  res.resume();
+                  res.on('end', resolve);
+                },
+              );
+              req.on('error', reject);
+              req.end();
+            });
+          await reqOne('/api/profile');
+          await reqOne('/redirect');
+          child.exit(0);
+        });
+
+      const f1 = hitOnce();
+      const r1 = await runCli(base({ recordCollection: 'My App' }), f1.deps);
+      expect(r1.exitCode).toBe(0);
+      const out1 = r1.outputs.collection!;
+      expect(out1).toBe(path.join(dir, '.vscode', 'flutter-intercept', 'collections', 'my-app.json'));
+      const text1 = fs.readFileSync(out1, 'utf8');
+
+      for (const secret of planted) expect(text1).not.toContain(secret);
+      expect(f1.logs.some((l) => l.includes('1 endpoint, 1 example') && l.includes(out1))).toBe(true);
+      expect(f1.logs.some((l) => l.startsWith('collection skipped:'))).toBe(true);
+      expect(f1.logs.some((l) => l.startsWith('collection removed:'))).toBe(true);
+
+      // Parses back cleanly as a Postman collection through loadCollections.
+      const { loadCollections } = await import('../src/collections');
+      const reloaded = await loadCollections({ files: [out1], cwd: dir });
+      expect(reloaded.collections).toHaveLength(1);
+      expect(reloaded.collections[0]).toMatchObject({ name: 'My App', format: 'postman', endpoints: 1, mocked: 1 });
+
+      // A second run with the same name never overwrites: writes my-app-2.json.
+      const f2 = hitOnce();
+      const r2 = await runCli(base({ recordCollection: 'My App' }), f2.deps);
+      expect(r2.outputs.collection).toBe(path.join(dir, '.vscode', 'flutter-intercept', 'collections', 'my-app-2.json'));
+      expect(fs.existsSync(out1)).toBe(true);
+      expect(fs.existsSync(r2.outputs.collection!)).toBe(true);
+    } finally {
+      await new Promise<void>((r) => secretServer.close(() => r()));
+    }
+  });
+});
+
 describe('physical iPhone: LAN listener (CONTRACTS §7, §14.1)', () => {
   const IPHONE = [{ id: 'IPHONE', name: 'Test iPhone', targetPlatform: 'ios', emulator: false }];
   const lanIp = lanIPv4Addresses().find((a) => !a.startsWith('169.254.'));

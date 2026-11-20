@@ -1,0 +1,40 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Todo API", "version": "1" },
+  "servers": [{ "url": "https://api.todo.example" }],
+  "paths": {
+    "/todos": {
+      "get": {
+        "operationId": "listTodos",
+        "responses": {
+          "200": { "description": "ok", "content": { "application/json": { "example": [{ "id": 1, "title": "Buy milk", "done": false }] } } }
+        }
+      },
+      "post": {
+        "operationId": "createTodo",
+        "responses": {
+          "201": { "description": "created", "content": { "application/json": { "example": { "id": 99, "title": "x", "done": false } } } }
+        }
+      }
+    },
+    "/todos/{id}": {
+      "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+      "get": {
+        "operationId": "getTodo",
+        "responses": {
+          "200": { "description": "ok", "content": { "application/json": { "example": { "id": 1, "title": "Buy milk", "done": false } } } }
+        }
+      },
+      "delete": {
+        "operationId": "deleteTodo",
+        "responses": { "204": { "description": "gone" } }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "responses": { "200": { "description": "ok", "content": { "application/json": { "example": { "ok": true } } } } }
+      }
+    }
+  }
+}

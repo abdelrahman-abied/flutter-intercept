@@ -31,6 +31,8 @@ export interface SidecarSettings {
   ideHttpProxy?: { url?: string; noProxy?: string[] };
   /** CONTRACTS §16.4. Absent = enabled, no decrypt hosts (older plugins). */
   grpc?: { enabled: boolean; decryptHosts: string[]; trustOnSimulator?: boolean };
+  /** CONTRACTS §23.3: compare real server JSON answers with linked collections' examples. Absent = on (older plugins). */
+  collectionDrift?: boolean;
 }
 
 export type DeviceKind = 'android-emulator' | 'android-device' | 'ios-simulator' | 'ios-device' | 'macos' | 'linux' | 'windows' | 'web' | 'other';
@@ -85,7 +87,7 @@ export type PluginRequest =
   | { method: 'sessionStarted'; params: SessionStartedParams }  // → { intercepted: boolean }
   | { method: 'sessionEnded'; params: SessionEndedParams }
   | { method: 'connectAgent'; params: { client: 'claude' | 'cursor' | 'gemini' | 'windsurf' | 'other' } } // → { text: string } to copy; error code `unavailable` when agent access is off
-  | { method: 'command'; params: { name: 'clear' | 'toggle' | 'exportOpenApi' | 'exportPostman' | 'saveCaCertificate' | 'importCollection' } } // → { enabled } | { path } | { id } | {}
+  | { method: 'command'; params: { name: 'clear' | 'toggle' | 'exportOpenApi' | 'exportPostman' | 'saveCaCertificate' | 'importCollection' | 'mockFromTraffic' } } // → { enabled } | { path } | { id } | {} (CONTRACTS §23.2: mockFromTraffic)
   // Added while building (sidecar report):
   | { method: 'workspaceFolders'; params: { workspaceFolders: string[] } } // a project window opened / closed
   | { method: 'uiVisible'; params: { visible: boolean } }                  // the tool window is on screen (no failure notifications then)
@@ -101,6 +103,8 @@ export type SidecarRequest =
   | { method: 'ui.clipboard'; params: { text: string } }
   | { method: 'ui.pick'; params: { title?: string; placeholder?: string; items: { label: string; description?: string; value: string }[] } } // → value | null
   | { method: 'ui.input'; params: { prompt: string; password?: boolean; value?: string } }                                                  // → string | null
+  /** CONTRACTS §23.2: choose several (servers for a fake backend); `picked` items start selected. */
+  | { method: 'ui.pickMany'; params: { title: string; placeholder?: string; items: { label: string; description?: string; value: string; picked?: boolean }[]; okButton?: string } } // → value[] | null
   | { method: 'ui.save'; params: { defaultPath: string; filters?: Record<string, string[]> } }                                              // → path | null
   | { method: 'ui.confirm'; params: { message: string; detail?: string; buttons: string[]; modal?: boolean } }                              // → button | null
   | { method: 'ui.notify'; params: { level: 'info' | 'warning' | 'error'; message: string; buttons?: string[] } }                           // → button | null

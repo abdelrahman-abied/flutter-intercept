@@ -28,6 +28,7 @@ class SettingsTest {
         agentAccess = "readOnly"
         agentMcpPort = 50000
         autoPassthrough = false
+        collectionDrift = false
         nodePath = "/opt/homebrew/bin/node"
     }
 
@@ -39,6 +40,7 @@ class SettingsTest {
         assertEquals(s.toSidecarSettings(null), back.toSidecarSettings(null))
         assertEquals("/opt/homebrew/bin/node", back.nodePath)
         assertFalse(back.autoPassthrough)
+        assertFalse(back.collectionDrift)
         assertEquals(2, back.clientCertificates.size)
         assertEquals("/k.pem", back.clientCertificates[1].key)
         assertEquals(s, back)
@@ -57,6 +59,7 @@ class SettingsTest {
         assertFalse(m.containsKey("ideHttpProxy"))
         assertEquals(mapOf("enabled" to true, "decryptHosts" to emptyList<String>(), "trustOnSimulator" to false), m["grpc"])
         assertEquals("CONTRACTS §20.7: on by default", true, m["autoPassthrough"])
+        assertEquals("CONTRACTS §23.3: on by default", true, m["collectionDrift"])
     }
 
     @Test
@@ -64,13 +67,14 @@ class SettingsTest {
         val json = JsonLineRpc.GSON.toJsonTree(sample().toSidecarSettings(IdeHttpProxy("http://proxy.corp:3128", listOf("localhost")))).asJsonObject
         assertEquals(
             setOf("enabled", "port", "captureSource", "webEnabled", "nativeClients", "backgroundIsolates", "notifications", "contractCheck",
-                "rewriteLocalhost", "upstreamProxy", "upstreamProxyIgnoreCertErrors", "tlsPassthrough", "autoPassthrough", "clientCertificates", "grpc", "agent",
+                "collectionDrift", "rewriteLocalhost", "upstreamProxy", "upstreamProxyIgnoreCertErrors", "tlsPassthrough", "autoPassthrough", "clientCertificates", "grpc", "agent",
                 "ideHttpProxy"),
             json.keySet(),
         )
         assertEquals("http://127.0.0.1:8888", json.get("upstreamProxy").asString)
         assertEquals(listOf("*.bank.example", "pinned.example"), json.getAsJsonArray("tlsPassthrough").map { it.asString })
         assertFalse(json.get("autoPassthrough").asBoolean)
+        assertFalse(json.get("collectionDrift").asBoolean)
         val certs = json.getAsJsonArray("clientCertificates")
         assertEquals(setOf("host", "pfx"), (certs[0] as JsonObject).keySet())
         assertEquals(setOf("host", "cert", "key"), (certs[1] as JsonObject).keySet())

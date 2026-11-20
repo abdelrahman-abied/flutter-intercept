@@ -50,6 +50,16 @@ node packages/cli/dist/cli.js test -d macos --network-profile slow-3g -- --flavo
 | `--approve-shared-rules` | Also apply rules that need approval in the editor. |
 | `--replay <id\|file>` | Answer requests from a recording (an id in `.dart_tool/flutter_intercept/recordings`, or a path). |
 | `--replay-fallback passthrough\|fail` | What unmatched requests do while replaying (default `passthrough`). |
+| `--collection <file>` | Mock from a Postman, OpenAPI 3, Swagger 2.0, Insomnia or Bruno (`bruno.json`) collection (repeatable). Collections linked in the shared rules file apply too, unless `--no-rules`. |
+| `--collection-env <file\|name>` / `--collection-var name=value` | URL variables for collections (a Postman environment file, or an environment name for Insomnia / Bruno; single values, repeatable). |
+| `--collection-unmatched passthrough\|fail` | Requests to a collection's host that match none of its requests: sent on (default) or failed. |
+| `--collection-snapshot <name\|file>` | Start the data the collections remember from a snapshot: a name from `.vscode/flutter-intercept/snapshots/<collection>/<name>.json`, or a snapshot file. |
+| `--no-collection-store` | Collections answer only their saved examples: `POST`, `PUT`, `PATCH` and `DELETE` don't change what later `GET`s return (sign-in simulation and dynamic values still apply). |
+| `--collection-seed <n>` | Seed for dynamic `{{$…}}` values in seeded mode (`0`–`4294967295`; default `1`). |
+| `--collection-dynamic random\|seeded\|fixed` | Dynamic `{{$…}}` values in collection examples: `seeded` (default in the CLI), `random`, or `fixed`. |
+| `--collection-auth` | Turn sign-in simulation on for the run (refused before the run starts when the collection has no login request). |
+| `--collection-auth-ttl <60-86400>` | Sign-in session lifetime in seconds (default `3600`). |
+| `--record-collection <name>` | After the run, write a Postman v2.1 collection built from the run's real traffic (`unmatched: passthrough`, credentials and personal data replaced) to `.vscode/flutter-intercept/collections/<slug>.json` (never overwrites). |
 | `--network-profile <id>` | `offline`, `slow-3g`, `fast-3g` or `flaky`. |
 | `--har <file>` | Write a HAR of the run. Secrets are redacted unless you pass `--no-redact`. |
 | `--record <name\|file>` | Save the run as a recording: a name goes to the project's recordings, a `.json` path is written there. |
@@ -85,6 +95,20 @@ headers, and every script rule. The CLI skips those and prints why, for example:
 Pass `--approve-shared-rules` in a pipeline you control to apply them anyway. Breakpoint rules are always off,
 because nobody can resume a paused request in a headless run. A `--rules` file must be inside the repository (or
 the project).
+
+## Collections that remember
+
+The REST resources of a collection (`GET /todos`, `POST /todos`, `GET`/`PUT`/`PATCH`/`DELETE /todos/{id}`) remember
+what the app sends for the length of the run: a `POST` adds a record that later `GET`s list and read. The data
+starts from the collection's examples, or from a snapshot saved in the editor (`--collection-snapshot checkout`, or
+the shared file's `stores` setting). An example chosen in the editor still answers its request as before. At the end
+the run prints one line per resource:
+
+```
+store todos: 12 records (3 created, 1 deleted)
+```
+
+Answers from collections are never limited in CLI runs (there is no one to approve them).
 
 ## Expectations
 

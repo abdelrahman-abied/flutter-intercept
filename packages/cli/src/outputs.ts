@@ -7,6 +7,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { Exchange, ReplayEntry, ReplayOptions } from '@flutter-intercept/proxy';
 import { buildHar } from '../../extension/src/agent/har';
+import { MockCollectionsCore } from '../../extension/src/mocks/core';
+import { collectionParsers } from '../../extension/src/mocks/parsers';
+import type { RulesFs } from '../../extension/src/rules/bodyFile';
+import type { FolderCollectionLinks, MementoLike } from '../../extension/src/rules/core';
 import { createRecordingService, recordedExchange, serializeRecording, slugify, DEFAULT_MAX_RECORDING_BYTES } from '../../extension/src/recordings/store';
 import { replayOptionsFor, toReplay } from '../../extension/src/recordings/replay';
 import { validateRecording } from '../../extension/src/recordings/validate';
@@ -119,4 +123,80 @@ export function writeRedactedRecordingCopy(src: string, dest: string): number {
   const text = serializeRecording({ id: rec.id, name: rec.name, createdAt: rec.createdAt, exchanges: entries.length, redacted: true }, entries, DEFAULT_MAX_RECORDING_BYTES);
   writeOutput(dest, text);
   return entries.length;
+}
+
+export interface RecordedCollectionOutput {
+  path: string;
+  endpoints: number;
+  examples: number;
+  skipped: string[];
+  removed: string[];
+}
+
+/**
+ * CONTRACTS §23.1 / §23.6: builds a Postman v2.1 collection from the run's traffic through the shared
+ * `MockCollectionsCore.mockFromTraffic` (`unmatched: 'passthrough'`, personal data replaced) and writes it to
+ * `<projectRoot>/.vscode/flutter-intercept/collections/<slug>.json`, never overwriting an existing file (`-2`, `-3`, …).
+ */
+export async function writeRecordedCollection(
+  name: string,
+  exchanges: readonly Exchange[],
+  projectRoot: string,
+  opts: { isThrottleOnlyRule?: (ruleId: string) => boolean } = {},
+): Promise<RecordedCollectionOutput> {
+  const root = path.resolve(projectRoot);
+  const nodeFs: RulesFs = {
+    readFile: (p) => fs.promises.readFile(p),
+    writeFile: (p, data) => fs.promises.writeFile(p, data, 'utf8'),
+    rename: (a, b) => fs.promises.rename(a, b),
+    unlink: (p) => fs.promises.unlink(p),
+    mkdir: async (p) => {
+      await fs.promises.mkdir(p, { recursive: true });
+    },
+    stat: (p) => fs.promises.stat(p),
+    readdir: (p) => fs.promises.readdir(p, { withFileTypes: true }),
+    realpathSync: (p) => fs.realpathSync.native(p),
+  };
+  const mem = new Map<string, unknown>();
+  const memento: MementoLike = {
+    get: <T>(key: string) => mem.get(key) as T | undefined,
+    update: async (key: string, value: unknown) => {
+      mem.set(key, value);
+    },
+  };
+  let links: FolderCollectionLinks[] = [];
+  let rid = 0;
+  const core = new MockCollectionsCore({
+    links: () => links,
+    // CLI writes the collection file only (keeps `.vscode/flutter-intercept.json` untouched during headless runs).
+    saveLinks: async (folderPath, next) => {
+      links = [{ folderPath, label: path.basename(folderPath), links: next, problems: [] }];
+    },
+    primaryFolderPath: async () => root,
+    writeWorkspaceFile: async (folderPath, rel, text) => {
+      const abs = path.join(folderPath, ...rel.split('/'));
+      await fs.promises.mkdir(path.dirname(abs), { recursive: true });
+      // REVIEW-15 #8: exclusive create never overwrites an existing file or writes through a planted symlink.
+      await fs.promises.writeFile(abs, text, { flag: 'wx', mode: 0o644 });
+    },
+    workspaceRoots: () => [root],
+    fs: nodeFs,
+    memento,
+    parsers: collectionParsers,
+    newRuleId: () => `cli_rec_${++rid}`,
+    exchanges: () => exchanges,
+    ...(opts.isThrottleOnlyRule ? { isThrottleOnlyRule: opts.isThrottleOnlyRule } : {}),
+  });
+  const built = await core.mockFromTraffic({
+    source: { session: {} },
+    name,
+    unmatched: 'passthrough',
+  });
+  return {
+    path: path.join(root, ...built.file.split('/')),
+    endpoints: built.endpoints,
+    examples: built.examples,
+    skipped: built.skipped,
+    removed: built.removed,
+  };
 }

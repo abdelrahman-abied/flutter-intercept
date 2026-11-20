@@ -64,6 +64,8 @@ object UiRequestHandler {
                 null
             }
             "ui.pick" -> pick(p)
+            // CONTRACTS §23.2 / §23.6: generic multi-choice modal (e.g. servers for fake backend from traffic).
+            "ui.pickMany" -> pickMany(p)
             "ui.input" -> onEdt { input(p) }
             "ui.save" -> onEdt { save(p) }
             "ui.confirm" -> confirm(p)
@@ -213,8 +215,17 @@ object UiRequestHandler {
         return result
     }
 
+    private fun pickMany(p: JsonObject): CompletableFuture<Any?> {
+        val req = try {
+            PickManyDialog.parseRequest(p)
+        } catch (e: RpcException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return onEdt { PickManyDialog(focusActiveProject(), req).ask() }
+    }
+
     private fun input(p: JsonObject): Any? {
-        val project = activeProject()
+        val project = focusActiveProject()
         val prompt = p.optString("prompt") ?: ""
         return if (p.optBoolean("password") == true) {
             Messages.showPasswordDialog(project, prompt, "Flutter Intercept", null)
@@ -404,7 +415,7 @@ object UiRequestHandler {
         if (p.optBoolean("modal") == false) {
             return notifyWithButtons(NotificationType.WARNING, listOfNotNull(message, detail).joinToString("\n"), buttons)
         }
-        return onEdt { ConfirmDialog(activeProject(), message, detail, buttons).ask() }
+        return onEdt { ConfirmDialog(focusActiveProject(), message, detail, buttons).ask() }
     }
 
     private fun notify(p: JsonObject): CompletableFuture<Any?> {
