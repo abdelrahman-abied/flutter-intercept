@@ -28,10 +28,13 @@ import {
   type HeaderBag,
 } from './body';
 import {
+  baseMatches,
   compileRules,
+  ruleCandidates,
   grpcApplicable,
   grpcEditProblem,
   grpcMockProblem,
+  handlerProblem,
   isInvalidMatcher,
   mapRemoteUrl,
   pickSequenceStep,
@@ -100,6 +103,7 @@ import type {
   Exchange,
   GrpcEdit,
   GrpcProxyCodec,
+  RequestHandler,
   InterceptProxyOptions,
   LearnedPassthrough,
   ReplayEntry,
@@ -123,6 +127,7 @@ import { WsFlow } from './ws-flow';
 import { ReplayFlow } from './replay-flow';
 import { HttpEdits } from './http-edits';
 import { HttpTaps } from './http-taps';
+import { HandlerFlow } from './handler-flow';
 import type {
   Applied,
   ScriptAction,
@@ -306,6 +311,7 @@ export class InterceptProxy extends EventEmitter {
   private readonly replays: ReplayFlow;
   private readonly edits: HttpEdits;
   private readonly taps: HttpTaps;
+  private readonly handlerFlow: HandlerFlow;
 
   constructor(private readonly opts: InterceptProxyOptions) {
     super();
@@ -326,6 +332,7 @@ export class InterceptProxy extends EventEmitter {
     this.replays = new ReplayFlow(this.ctx);
     this.edits = new HttpEdits(this.ctx);
     this.taps = new HttpTaps(this.ctx);
+    this.handlerFlow = new HandlerFlow(this.ctx);
     this.host = opts.host ?? '127.0.0.1';
     this.breakpointTimeoutMs = opts.breakpointTimeoutMs ?? DEFAULT_BREAKPOINT_TIMEOUT_MS;
     if (opts.upstreamProxy) this.upstreamSpec = parseUpstreamProxy(opts.upstreamProxy);
@@ -363,6 +370,9 @@ export class InterceptProxy extends EventEmitter {
       },
       get edits() {
         return self.edits;
+      },
+      get handlerFlow() {
+        return self.handlerFlow;
       },
       emit: (event, ...args) => self.emit(event, ...args),
       get grpc() {
@@ -784,6 +794,7 @@ export class InterceptProxy extends EventEmitter {
     for (const { ex } of [...this.book.live.values()]) this.book.fail(ex, 'Proxy stopped');
     for (const p of paused) p.settle({ kind: 'gone' });
     for (const settle of [...this.holds.values()]) settle(false);
+    this.handlerFlow.clear();
     for (const c of this.sendClients) c.destroy();
     this.sendClients.clear();
     for (const t of this.connect.tunnelSockets) t.destroy();
@@ -925,6 +936,7 @@ export class InterceptProxy extends EventEmitter {
     const refused: { id: string; problem: string }[] = [];
     const problemOf = (a: RuleAction | undefined): string | undefined => {
       if (a?.kind === 'grpcMock') return grpcMockProblem(a);
+      if (a?.kind === 'handler') return handlerProblem(a); // CONTRACTS §22.1
       if (a?.kind === 'sequence' && Array.isArray(a.steps)) {
         for (let i = 0; i < a.steps.length; i++) {
           const st = a.steps[i]?.action;
@@ -1227,6 +1239,14 @@ export class InterceptProxy extends EventEmitter {
     if (isLoopbackHost(h) || HOST_ALIASES[h] || h === '0.0.0.0' || h === '::') return true;
     if (h === normalizeIp(this.host) || h === this.lanGate?.address?.host) return true;
     return lanIPv4Addresses().includes(h);
+  }
+
+  /**
+   * CONTRACTS §22.1: registers (fn) or removes (undefined) the function a `handler` rule with this id calls. Kept across
+   * setRules; cleared by stop() (which also aborts the signals of calls still waiting).
+   */
+  setHandler(id: string, fn: RequestHandler | undefined): void {
+    this.handlerFlow.set(id, fn);
   }
 
   /**
@@ -1566,9 +1586,14 @@ export class InterceptProxy extends EventEmitter {
     const now = Date.now();
     let note: string | undefined;
     let names: string[] | undefined;
-    for (let i = 0; i < this.compiled.length; i++) {
-      const { rule, base, graphqlOperation: op } = this.compiled[i];
-      if (!rule.enabled || this.spentReason(rule, now) || !base(method, url)) continue;
+    // CONTRACTS §24.5: only the rules that could match (by method × origin), in order; the method upper-cased once.
+    const M = method.toUpperCase();
+    const order = ruleCandidates(this.compiled, M, url);
+    const n = order ? order.length : this.compiled.length;
+    for (let k = 0; k < n; k++) {
+      const c = this.compiled[order ? order[k] : k];
+      const { rule, graphqlOperation: op } = c;
+      if (!rule.enabled || this.spentReason(rule, now) || !baseMatches(c, M, url)) continue;
       if (o.grpc) {
         // CONTRACTS §16.2: other actions never match a gRPC call; the next rule is tried.
         if (op !== undefined) continue;
@@ -1591,7 +1616,7 @@ export class InterceptProxy extends EventEmitter {
             note ??= `GraphQL rule skipped: ${why}, so the operation name could not be read and the request was not matched against it.`;
             continue;
           }
-          return { deferred: true, needsResponseHook: this.responseHookFrom(i, method, url, now), note };
+          return { deferred: true, needsResponseHook: this.responseHookFrom(order, k, M, url, now), note };
         }
         if (!names.includes(op)) continue;
       }
@@ -1655,12 +1680,16 @@ export class InterceptProxy extends EventEmitter {
     return undefined;
   }
 
-  /** Could a rule from index `from` on (method + URL match) need the response hook? */
-  private responseHookFrom(from: number, method: string, url: string, now: number): boolean {
-    for (let i = from; i < this.compiled.length; i++) {
-      const { rule, base } = this.compiled[i];
-      if (!rule.enabled || this.spentReason(rule, now) || !base(method, url)) continue;
-      if (needsResponseHook(rule.action)) return true;
+  /**
+   * Could a rule from position `from` on (method + URL match) need the response hook? `order`: matchRule's candidates
+   * (undefined = every rule); `method` upper-cased.
+   */
+  private responseHookFrom(order: readonly number[] | undefined, from: number, method: string, url: string, now: number): boolean {
+    const n = order ? order.length : this.compiled.length;
+    for (let k = from; k < n; k++) {
+      const c = this.compiled[order ? order[k] : k];
+      if (!c.rule.enabled || this.spentReason(c.rule, now) || !baseMatches(c, method, url)) continue;
+      if (needsResponseHook(c.rule.action)) return true;
     }
     return false;
   }
@@ -1739,7 +1768,7 @@ export class InterceptProxy extends EventEmitter {
       const pm = this.matchRule(asked, req.url, { count: false, ignoreGraphql: true, grpcWeb: askedWeb });
       const pre = pm.rule;
       const a = pm.action;
-      if (pre && a && (a.kind === 'mock' || a.kind === 'block' || a.kind === 'cors' || a.kind === 'grpcMock')) {
+      if (pre && a && (a.kind === 'mock' || a.kind === 'block' || a.kind === 'cors' || a.kind === 'grpcMock' || a.kind === 'handler')) {
         const o = a.kind === 'cors' ? corsOptions(a) : {};
         // Only for an origin the proxy may allow (loopback, or the cors rule's allowOrigin): otherwise the
         // server answers its own preflight (REVIEW-5 #3).
@@ -2036,19 +2065,12 @@ export class InterceptProxy extends EventEmitter {
         this.book.addPhase(ex, 'delayMs', performance.now() - from);
         if (ex.state !== 'pending') return { response: 'close' }; // client left during the delay
       }
-      const headers: HeaderBag = { ...(action.headers ?? {}) };
-      this.edits.addCorsToLocalResponse(ex, headers);
-      const decoded = Buffer.from(action.body ?? '', 'utf8');
-      const rawBody = frameBody(decoded, headers);
-      ex.status = action.status;
-      ex.responseHeaders = cleanHeaders(headers);
-      ex.responseBody = await decodeForDisplay(decoded, undefined, true);
-      if (isEventStream(getHeader(headers, 'content-type'))) this.taps.setSseFrames(ex, decoded);
-      this.book.finish(ex, 'mocked');
-      return {
-        response: { statusCode: action.status, statusMessage: STATUS_CODES[action.status], headers, rawBody },
-      };
+      const failed = (why: string) => `Mock ${flow.rule?.name || flow.rule?.id || ''}: answer ${why}`;
+      return { response: await this.edits.localAnswer(ex, action.status, { ...(action.headers ?? {}) }, action.body ?? '', failed) };
     }
+
+    // CONTRACTS §22.1: a stateful mock, answered by the host's function (handler-flow.ts).
+    if (action?.kind === 'handler') return this.handlerFlow.answer(ex, flow, action, body);
 
     if (action?.kind === 'block') {
       this.book.track(ex, flow);
@@ -2176,7 +2198,7 @@ export class InterceptProxy extends EventEmitter {
     if (flow.fault || flow.localError || flow.preflight || flow.refused || flow.replay) return false;
     if (flow.route !== 'plain' && flow.route !== 'h1' && flow.route !== 'h2') return false;
     const k = flow.action?.kind;
-    return k !== 'mock' && k !== 'block';
+    return k !== 'mock' && k !== 'block' && k !== 'handler';
   }
 
   /**

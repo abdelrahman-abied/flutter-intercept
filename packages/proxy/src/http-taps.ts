@@ -281,6 +281,7 @@ export class HttpTaps {
   }
 
   onAbort(id: string, message: string | undefined): void {
+    this.px.handlerFlow.clientGone(id); // CONTRACTS §22.1: a waiting stateful mock call's signal aborts
     const live = this.px.book.live.get(id);
     if (!live) {
       this.px.book.flows.delete(id);

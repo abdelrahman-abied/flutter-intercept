@@ -19,6 +19,7 @@ import type { GrpcLocal } from './grpc-local';
 import type { GrpcHooks } from './grpc-hooks';
 import type { GrpcWebFlow } from './grpc-web-flow';
 import type { HttpEdits } from './http-edits';
+import type { HandlerFlow } from './handler-flow';
 import type { HttpTaps } from './http-taps';
 import type { LearnFlow } from './learn-flow';
 import type { Decision, SendMeta, Flow, MatchOptions, MatchResult, ReqMeta, Paused, LoadedCert } from './flow-types';
@@ -37,6 +38,8 @@ export interface ProxyContext {
   connectHook: boolean;
   readonly connRequest: WeakMap<object, string>;
   readonly edits: HttpEdits;
+  /** CONTRACTS §22.1: stateful mocks (the `handler` action). */
+  readonly handlerFlow: HandlerFlow;
   emit(event: string | symbol, ...args: unknown[]): boolean;
   readonly grpc: GrpcRelay;
   readonly grpcCheck: GrpcSupport;

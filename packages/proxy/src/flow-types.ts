@@ -32,6 +32,8 @@ export type RewriteAction = Extract<RuleAction, { kind: 'rewrite' }>;
 
 export type ScriptAction = Extract<RuleAction, { kind: 'script' }>;
 
+export type HandlerAction = Extract<RuleAction, { kind: 'handler' }>;
+
 export interface RewriteFlow {
   request?: RewriteSpec;
   response?: RewriteSpec & { status?: number };

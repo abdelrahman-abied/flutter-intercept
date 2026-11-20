@@ -133,9 +133,22 @@ export function isGrpcCall(req: OngoingRequest): boolean {
   return requestInternals(req).httpVersion === '2.0' && isGrpcContentType((req.headers as HeaderBag)['content-type']);
 }
 
-/** A note of at most MAX_NOTE_CHARS characters (CONTRACTS §19.4). */
+/** Control characters (C0, DEL, C1, U+2028 / U+2029), with the white space around them. */
+const LINE_BREAKERS = /\s*[\u0000-\u001f\u007f-\u009f\u2028\u2029]+\s*/g;
+/** Bidi controls (embeddings, overrides, isolates, marks): text that reads differently from what it says. */
+const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+/**
+ * One line of plain text for a note or an error (REVIEW-16 #15b): every control character run becomes one space and
+ * bidi controls are removed, whatever produced the text (a host's handler, a script, a server).
+ */
+export function flattenLine(text: string): string {
+  return String(text).replace(BIDI_CONTROLS, '').replace(LINE_BREAKERS, ' ').trim();
+}
+
+/** A note of at most MAX_NOTE_CHARS characters (CONTRACTS §19.4), on one line (flattenLine). */
 export function clipNote(text: string): string {
-  const t = String(text).trim();
+  const t = flattenLine(text);
   return t.length > MAX_NOTE_CHARS ? `${t.slice(0, MAX_NOTE_CHARS - 1)}…` : t;
 }
 

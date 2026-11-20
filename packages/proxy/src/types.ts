@@ -272,11 +272,58 @@ export type RuleAction =
   | { kind: 'grpcMock'; code?: number; message?: string; messages?: string[];
       /** Host-only: JSON messages the host encodes into `messages` with the app's schema (like `mock.bodyFile`). */
       messagesJson?: unknown[];
-      headers?: Record<string, string>; trailers?: Record<string, string>; delayMs?: number; gapMs?: number };
+      headers?: Record<string, string>; trailers?: Record<string, string>; delayMs?: number; gapMs?: number }
+  // CONTRACTS §22.1 (v0.16.0)
+  /**
+   * The answer is computed at request time by a host function registered with `setHandler(handlerId, fn)`.
+   * Host-built only (collection resources): users, agents, the shared file and the panel can't author it.
+   */
+  | { kind: 'handler'; handlerId: string;
+      /** Answered when no handler is registered or it returns undefined (0.15 behaviour for collections). */
+      fallback?: { kind: 'mock'; status: number; headers?: Record<string, string>; body: string; delayMs?: number };
+      /** Default 10 000, 1–60 000. */
+      timeoutMs?: number };
+
+/** CONTRACTS §22.1: what a `handler` rule's function receives. */
+export interface HandlerRequest {
+  exchangeId: string;
+  ruleId: string;
+  method: string;
+  /** Absolute URL as the app sent it. */
+  url: string;
+  headers: Record<string, string | string[]>;
+  /** Decoded as for mocks; `truncated: true` past 5 MB. */
+  body?: Body;
+}
+
+/** CONTRACTS §22.1: what a handler answers. */
+export interface HandlerResponse {
+  status: number;
+  headers?: Record<string, string | string[]>;
+  /** ≤ 5 MB. */
+  body?: string;
+  /** ≤ 60 000. */
+  delayMs?: number;
+  /** One line, ≤ 300 chars → Exchange.notes. */
+  note?: string;
+}
+
+/** CONTRACTS §24 (amends §22.1): answer the rule's `fallback` quietly (no "had no answer" note). */
+export interface HandlerFallback {
+  fallback: true;
+  /** One line, ≤ 300 chars → Exchange.notes. */
+  note?: string;
+}
+
+/** CONTRACTS §22.1. Return undefined to answer the rule's `fallback` (with a note), or a `HandlerFallback`. */
+export type RequestHandler = (
+  req: HandlerRequest,
+  signal: AbortSignal,
+) => HandlerResponse | HandlerFallback | undefined | Promise<HandlerResponse | HandlerFallback | undefined>;
 
 export interface SequenceStep {
   /** Any action except `sequence`, `breakpoint` and `script`; `{kind:'passthrough'}` = the real server. */
-  action: Exclude<RuleAction, { kind: 'sequence' } | { kind: 'breakpoint' } | { kind: 'script' }> | { kind: 'passthrough' };
+  action: Exclude<RuleAction, { kind: 'sequence' } | { kind: 'breakpoint' } | { kind: 'script' } | { kind: 'handler' }> | { kind: 'passthrough' };
   /** How many matching requests this step answers (default 1). */
   count?: number;
 }

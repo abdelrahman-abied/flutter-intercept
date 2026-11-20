@@ -487,7 +487,7 @@ const HTTP_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
 /** Validated header set (string values; finite numbers are accepted as text). Throws a readable message. */
-function scriptHeaders(v: unknown, where: string): Record<string, string | string[]> {
+export function scriptHeaders(v: unknown, where: string): Record<string, string | string[]> {
   if (!isObject(v)) throw new Error(`${where}.headers must be an object`);
   const out: Record<string, string | string[]> = {};
   const text = (x: unknown, name: string): string => {
@@ -503,13 +503,13 @@ function scriptHeaders(v: unknown, where: string): Record<string, string | strin
   return out;
 }
 
-function scriptBodyText(v: unknown, where: string): string {
+export function scriptBodyText(v: unknown, where: string): string {
   if (typeof v !== 'string') throw new Error(`${where}.body must be a string`);
   if (utf8Bytes(v) > BODY_CAP_BYTES) throw new Error(`${where}.body is larger than ${BODY_CAP_BYTES / 1024 / 1024} MB`);
   return v;
 }
 
-function scriptStatus(v: unknown, where: string): number {
+export function scriptStatus(v: unknown, where: string): number {
   if (!Number.isInteger(v) || (v as number) < 100 || (v as number) > 599) throw new Error(`${where}.status must be an integer 100–599, got ${JSON.stringify(v)}`);
   return v as number;
 }

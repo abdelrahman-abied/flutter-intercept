@@ -83,6 +83,10 @@ export type {
   GrpcProxyCodec,
   GrpcScriptMessage,
   GrpcScriptStatus,
+  HandlerFallback,
+  HandlerRequest,
+  HandlerResponse,
+  RequestHandler,
 } from './types';
 // v0.10.0 (CONTRACTS §16.2)
 export {

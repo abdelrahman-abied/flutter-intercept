@@ -2,6 +2,7 @@
 // (`@flutter-intercept/proxy/rules`) so its preview can never disagree with the proxy.
 import type { Exchange, Matcher, Rule, RuleAction, SequenceStep } from './types';
 import { graphqlOperationNames } from './graphql';
+import { globIndexKey, type IndexKey, regexIndexKey, RuleIndex, scanClass } from './rule-index';
 import {
   type GrpcMetadataSide,
   GRPC_STATUS_MESSAGE_MAX_BYTES,
@@ -30,6 +31,7 @@ export {
 } from './grpc-meta';
 
 export { detectGraphql, graphqlOperationNames, scanOperations } from './graphql';
+export { RuleIndex, requestOriginKey, scanClass } from './rule-index';
 export type { GraphqlDetection, GraphqlOperationRef, GraphqlRequest } from './graphql';
 export { isIdSegment, pathTemplate, routeTemplate } from './template';
 
@@ -45,8 +47,29 @@ const REGEX_LITERAL = /^\/(.+)\/([a-z]*)$/s;
 export const MAX_REGEX_SOURCE = 256;
 /** Unbounded quantifiers (`*`, `+`, `{n,}`, `{n,m}` with m > 100) allowed in one regex… */
 const MAX_UNBOUNDED_QUANTIFIERS = 2;
-/** …of which on a "wide" atom (`.`, `\S`, `\W`, `\D`, `[^…]`, or a group containing one). */
+/** …of which on a "wide" atom (`.`, `\S`, `\W`, `\D`, `[^…]`, `[^]`, `[\s\S]`, or a group containing one). */
 const MAX_UNBOUNDED_WIDE = 1;
+
+/**
+ * The escape at `i` (`\`) outside a class, read as JavaScript reads it: the index after it and whether it's a wide
+ * atom, or undefined when refused (a backreference, a trailing `\`, an unclosed `\u{` / `\p{`). Without `u` / `v`,
+ * `\u{` is `u` and then a literal `{` (REVIEW-16 #1), and `\p` is `p`.
+ */
+function escapeAt(src: string, i: number, unicode: boolean): { next: number; wide: boolean } | undefined {
+  const e = src[i + 1];
+  if (e === undefined) return undefined;
+  if ((e >= '1' && e <= '9') || e === 'k') return undefined; // backreference
+  if (e === 'S' || e === 'W' || e === 'D') return { next: i + 2, wide: true };
+  if (unicode && (e === 'u' || e === 'p' || e === 'P') && src[i + 2] === '{') {
+    const close = src.indexOf('}', i + 3);
+    if (close < 0) return undefined;
+    return { next: close + 1, wide: e !== 'u' }; // a property counts as wide
+  }
+  if (e === 'u' && /^[0-9a-fA-F]{4}$/.test(src.slice(i + 2, i + 6))) return { next: i + 6, wide: false };
+  if (e === 'x' && /^[0-9a-fA-F]{2}$/.test(src.slice(i + 2, i + 4))) return { next: i + 4, wide: false };
+  if (e === 'c' && /^[A-Za-z]$/.test(src[i + 2] ?? '')) return { next: i + 3, wide: false };
+  return { next: i + 2, wide: false };
+}
 
 /**
  * Whether a regex source is safe to run on every request (REVIEW-4 #2: no RegExp timeout in Node 20, and
@@ -56,13 +79,16 @@ const MAX_UNBOUNDED_WIDE = 1;
  * - a repeated group (`*`, `+`, `{n,}`, `{n,m>1}`) that contains a quantifier or an alternation
  *   (`(.+)+`, `(a*)*`, `(a|a)*`, `(\d+)?` is fine);
  * - two unbounded quantified atoms in a row (`.*.*`, `\w+\d*`);
- * - more than 2 unbounded quantifiers, or more than 1 on a wide atom (`.`, `\S`, `\W`, `\D`, `[^…]`).
+ * - more than 2 unbounded quantifiers, or more than 1 on a wide atom (`.`, `\S`, `\W`, `\D`, `[^…]`, `[^]`, a class
+ *   holding one of those escapes or a range of ≥ 94 code points, a Unicode property).
+ * Classes and escapes are read as JavaScript reads them under `flags` (`rule-index.ts` `scanClass`; REVIEW-16 #1).
  * Unanchored, k unbounded quantifiers cost up to n^(k+1) on a hostile URL: measured, `.*a.*a.*b` takes
  * 439 ms on 218 chars and `.*a.*b` 1.2 s on 2048. What's accepted is at worst ~n^3 with narrow overlapping
  * atoms on an unusual URL (`\d+1\d+x` on 2048 digits: ~1 s); typical rules (`\/users\/\d+$`) are linear.
  */
-export function isSafeRegexSource(src: string): boolean {
+export function isSafeRegexSource(src: string, flags = ''): boolean {
   if (typeof src !== 'string' || src.length === 0 || src.length > MAX_REGEX_SOURCE) return false;
+  const unicode = typeof flags === 'string' && /[uv]/.test(flags);
   interface Frame {
     complex: boolean; // contains a quantifier or an alternation
     wide: boolean; // contains a wide atom
@@ -84,22 +110,18 @@ export function isSafeRegexSource(src: string): boolean {
   while (i < src.length) {
     const c = src[i];
     if (c === '\\') {
-      const e = src[i + 1];
-      if (e === undefined) return false;
-      if ((e >= '1' && e <= '9') || e === 'k') return false; // backreference
-      startAtom(false, e === 'S' || e === 'W' || e === 'D');
-      i += e === 'u' && src[i + 2] === '{' ? src.indexOf('}', i) + 1 || src.length : 2;
+      const e = escapeAt(src, i, unicode);
+      if (!e) return false;
+      startAtom(false, e.wide);
+      i = e.next;
       continue;
     }
     if (c === '[') {
-      let j = i + 1;
-      const negated = src[j] === '^';
-      if (negated) j++;
-      if (src[j] === ']') j++;
-      while (j < src.length && src[j] !== ']') j += src[j] === '\\' ? 2 : 1;
-      if (j >= src.length) return false;
-      startAtom(false, negated);
-      i = j + 1;
+      // JavaScript's reading (REVIEW-16 #1): `[]` matches nothing, `[^]` any character (wide)
+      const cls = scanClass(src, i, typeof flags === 'string' ? flags : '');
+      if (!cls) return false;
+      startAtom(false, cls.wide);
+      i = cls.end;
       continue;
     }
     if (c === '(') {
@@ -233,10 +255,16 @@ export function compileMatcher(m: Matcher): CompiledMatcher {
 
 /** Method + URL only (ignores `graphqlOperation`). */
 export function compileBase(m: Matcher): (method: string, url: string) => boolean {
-  const wantMethod = (m.method ?? '').trim().toUpperCase();
-  const anyMethod = wantMethod === '' || wantMethod === '*';
+  const wantMethod = matcherMethod(m);
+  const anyMethod = wantMethod === '*';
   const urlTest = compileUrl(m.url ?? '');
   return (method, url) => (anyMethod || method.toUpperCase() === wantMethod) && urlTest(url);
+}
+
+/** The matcher's method, upper-cased; `*` = any (undefined, '' or '*'). */
+function matcherMethod(m: Matcher): string {
+  const want = (m.method ?? '').trim().toUpperCase();
+  return want === '' ? '*' : want;
 }
 
 /** The matcher's GraphQL operation name, or undefined when it has none (empty / whitespace = none). */
@@ -264,7 +292,7 @@ function compileUrl(pattern: string): UrlTest {
     if (lit) {
       test = () => false;
       const src = simplifyRegexSource(lit[1]);
-      if (isSafeRegexSource(src)) {
+      if (isSafeRegexSource(src, lit[2])) {
         try {
           const re = new RegExp(src, lit[2].replace(/[gy]/g, ''));
           test = (url) => re.test(url);
@@ -283,7 +311,7 @@ function compileUrl(pattern: string): UrlTest {
 export function isInvalidMatcher(m: Matcher): boolean {
   const lit = REGEX_LITERAL.exec((m.url ?? '').trim());
   if (!lit) return false;
-  if (!isSafeRegexSource(simplifyRegexSource(lit[1]))) return true;
+  if (!isSafeRegexSource(simplifyRegexSource(lit[1]), lit[2])) return true;
   try {
     new RegExp(lit[1], lit[2]);
     return false;
@@ -299,18 +327,84 @@ export interface CompiledRule {
   base: (method: string, url: string) => boolean;
   /** Matcher.graphqlOperation, trimmed (undefined = none). */
   graphqlOperation?: string;
+  /** The matcher's method upper-cased, `*` = any: `base` is `(method === '*' || method === M) && url(U)` with M upper-cased. */
+  method: string;
+  /** The URL half of `base`. */
+  url: (url: string) => boolean;
 }
 
-export function compileRules(rules: Rule[]): CompiledRule[] {
-  return rules.map((rule) => {
+/** compileRules' result: the rules in order, plus the method × origin index (CONTRACTS §24.5) unless forced linear. */
+export type CompiledRules = CompiledRule[] & { readonly index?: RuleIndex };
+
+/** `FI_PROXY_LINEAR=1` in the environment: no index (every request tests every rule, the 0.15 behaviour). */
+export function linearMatchingForced(): boolean {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+  return env?.FI_PROXY_LINEAR === '1';
+}
+
+/**
+ * Where a matcher URL sits in the rule index (CONTRACTS §24.5): the origin keys it can match and its place in their
+ * path tries, or undefined when the origin can't be proven (wildcard). See rule-index.ts for the shapes recognised.
+ */
+export function urlIndexKey(pattern: string | undefined): IndexKey | undefined {
+  const p = (pattern ?? '').trim();
+  if (p === '' || p === '*') return undefined;
+  const lit = REGEX_LITERAL.exec(p);
+  return lit ? regexIndexKey(simplifyRegexSource(lit[1]), lit[2]) : globIndexKey(p);
+}
+
+/** The origin keys a matcher URL can match, or undefined when it can't be proven (wildcard). */
+export function urlOriginKeys(pattern: string | undefined): string[] | undefined {
+  return urlIndexKey(pattern)?.origins;
+}
+
+/** `linear`: no index. `maxTrieNodes`: the index's path-trie budget (tests; 0 = method × origin only). */
+export function compileRules(rules: Rule[], o: { linear?: boolean; maxTrieNodes?: number } = {}): CompiledRules {
+  const out: CompiledRules = rules.map((rule) => {
     const op = graphqlOperationOf(rule.match);
-    return { rule, test: compileMatcher(rule.match), base: compileBase(rule.match), ...(op !== undefined ? { graphqlOperation: op } : {}) };
+    return {
+      rule,
+      test: compileMatcher(rule.match),
+      base: compileBase(rule.match),
+      ...(op !== undefined ? { graphqlOperation: op } : {}),
+      method: matcherMethod(rule.match),
+      url: compileUrl(rule.match.url ?? ''),
+    };
   });
+  if (o.linear ?? linearMatchingForced()) return out;
+  const index = new RuleIndex(out.length, o.maxTrieNodes);
+  for (let i = 0; i < out.length; i++) {
+    const key = urlIndexKey(out[i].rule.match.url);
+    index.add(i, out[i].method, key?.origins, key?.path);
+  }
+  Object.defineProperty(out, 'index', { value: index, enumerable: false });
+  return out;
+}
+
+/**
+ * The indexes of the rules that could match a request, in order (CONTRACTS §24.5), or undefined: test every rule (no
+ * index, or the list isn't the one it was built for). `method` already upper-cased.
+ */
+export function ruleCandidates(rules: CompiledRule[], method: string, url: string): readonly number[] | undefined {
+  const index = (rules as CompiledRules).index;
+  return index && index.size === rules.length ? index.candidates(method, url) : undefined;
+}
+
+/** Method + URL of a compiled rule, the request's method already upper-cased (`base` without its per-rule toUpperCase). */
+export function baseMatches(r: CompiledRule, method: string, url: string): boolean {
+  return (r.method === '*' || r.method === method) && r.url(url);
 }
 
 /** First enabled matching rule wins. */
 export function findRule(rules: CompiledRule[], method: string, url: string, body?: string): Rule | undefined {
-  for (const r of rules) if (r.rule.enabled && r.test(method, url, body)) return r.rule;
+  const M = method.toUpperCase();
+  const order = ruleCandidates(rules, M, url);
+  const n = order ? order.length : rules.length;
+  for (let k = 0; k < n; k++) {
+    const r = rules[order ? order[k] : k];
+    if (!r.rule.enabled || !baseMatches(r, M, url)) continue;
+    if (r.graphqlOperation === undefined || graphqlOperationNames(method, url, body).includes(r.graphqlOperation)) return r.rule;
+  }
   return undefined;
 }
 
@@ -579,7 +673,7 @@ function sseEventText(f: { event?: string; id?: string; text?: string }): string
 // ---------------------------------------------------------------- v0.6.0 (CONTRACTS §12.3, §12.6)
 
 /** Actions a sequence step may not use. */
-const NOT_A_STEP: ReadonlySet<string> = new Set(['sequence', 'breakpoint', 'script']);
+const NOT_A_STEP: ReadonlySet<string> = new Set(['sequence', 'breakpoint', 'script', 'handler']);
 
 /** What a sequence step does: an action, or `undefined` = the real server (`passthrough`). */
 export type StepAction = Exclude<SequenceStep['action'], { kind: 'passthrough' }> | undefined;
@@ -699,6 +793,7 @@ function utf8Length(s: string): number {
 function actionProblem(a: RuleAction | undefined): string | undefined {
   if (!a || typeof a !== 'object') return undefined;
   if (a.kind === 'grpcMock') return grpcMockProblem(a);
+  if (a.kind === 'handler') return handlerProblem(a);
   if (a.kind === 'script') {
     if (typeof a.code !== 'string' || a.code.trim() === '') return 'A script rule needs code (define onRequest and / or onResponse).';
     if (utf8Length(a.code) > MAX_SCRIPT_BYTES) return `A script can be at most ${MAX_SCRIPT_BYTES / 1024} KB.`;
@@ -738,6 +833,52 @@ function actionProblem(a: RuleAction | undefined): string | undefined {
     const st = a.response?.status;
     if (st !== undefined && (!Number.isInteger(st) || st < 200 || st > 599)) return `Rewrite status must be 200–599, got ${st}.`;
     return undefined;
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------- v0.16.0 (CONTRACTS §22.1)
+
+/** A `handler` rule's default timeout (ms). */
+export const HANDLER_TIMEOUT_DEFAULT_MS = 10_000;
+/** A `handler` rule's longest timeout (ms). */
+export const HANDLER_TIMEOUT_MAX_MS = 60_000;
+/** Longest `handlerId`. */
+export const HANDLER_ID_MAX_CHARS = 200;
+/** A mock body (and a handler's answer body) is at most this many UTF-8 bytes (BODY_CAP_BYTES). */
+const MOCK_BODY_MAX_BYTES = 5 * 1024 * 1024;
+const MOCK_DELAY_MAX_MS = 600_000;
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+/** Problems with a mock action's values (a handler rule's `fallback`). */
+function mockProblem(m: unknown): string | undefined {
+  if (!m || typeof m !== 'object' || Array.isArray(m)) return 'must be a mock action.';
+  const a = m as Record<string, unknown>;
+  if (a.kind !== 'mock') return 'must be a mock action.';
+  if (!Number.isInteger(a.status) || (a.status as number) < 100 || (a.status as number) > 599) return `status must be an integer 100–599, got ${String(a.status)}.`;
+  if (a.body !== undefined && typeof a.body !== 'string') return 'body must be text.';
+  if (typeof a.body === 'string' && utf8Length(a.body) > MOCK_BODY_MAX_BYTES) return `body can be at most ${MOCK_BODY_MAX_BYTES / 1024 / 1024} MB.`;
+  if (a.headers !== undefined) {
+    if (!a.headers || typeof a.headers !== 'object' || Array.isArray(a.headers)) return 'headers must be an object.';
+    for (const [k, v] of Object.entries(a.headers)) {
+      if (!HEADER_NAME.test(k)) return `invalid header name ${JSON.stringify(k).slice(0, 100)}.`;
+      if (typeof v !== 'string' || /[\r\n\0]/.test(v)) return `header "${k}" has an invalid value.`;
+    }
+  }
+  const d = a.delayMs;
+  if (d !== undefined && (!Number.isInteger(d) || (d as number) < 0 || (d as number) > MOCK_DELAY_MAX_MS)) return `delayMs must be an integer 0–${MOCK_DELAY_MAX_MS}.`;
+  return undefined;
+}
+
+/** Why a handler action can't be used (setRules refuses it: kept but never matched), or undefined. */
+export function handlerProblem(a: Extract<RuleAction, { kind: 'handler' }>): string | undefined {
+  if (typeof a.handlerId !== 'string' || a.handlerId.trim() === '') return 'A stateful mock rule needs a handlerId.';
+  if (a.handlerId.length > HANDLER_ID_MAX_CHARS) return `handlerId can be at most ${HANDLER_ID_MAX_CHARS} characters.`;
+  const t = a.timeoutMs;
+  if (t !== undefined && (!Number.isInteger(t) || t < 1 || t > HANDLER_TIMEOUT_MAX_MS)) return `timeoutMs must be an integer 1–${HANDLER_TIMEOUT_MAX_MS}, got ${String(t)}.`;
+  if (a.fallback !== undefined) {
+    const why = mockProblem(a.fallback);
+    if (why) return `fallback ${why}`;
   }
   return undefined;
 }

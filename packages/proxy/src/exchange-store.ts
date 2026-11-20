@@ -10,7 +10,7 @@ import { elapsed, type TimingPatch } from './timing';
 import type { Body, Exchange, Frame } from './types';
 import { grpcWebExchangeFields } from './grpc-web-flow';
 import type { Flow, RequestTimingEvents, Live } from './flow-types';
-import { bodySize, FRAME_EMIT_INTERVAL_MS, clipNote, snapshot, graphqlOf, sanitizeRecord } from './proxy-util';
+import { bodySize, FRAME_EMIT_INTERVAL_MS, clipNote, flattenLine, snapshot, graphqlOf, sanitizeRecord } from './proxy-util';
 import type { ProxyContext } from './proxy-context';
 
 /** The exchange store: ring buffer, live exchanges, frames, byte budget and change events. */
@@ -347,6 +347,7 @@ export class ExchangeStore {
         p.settle({ kind: 'gone' });
       }
     }
+    if (typeof ex.error === 'string') ex.error = flattenLine(ex.error); // REVIEW-16 #15b: one line, no bidi controls
     ex.state = state;
     ex.durationMs = Date.now() - ex.startedAt;
     delete ex.pausedAt;

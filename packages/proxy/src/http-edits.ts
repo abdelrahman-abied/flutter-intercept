@@ -40,7 +40,8 @@ import type {
   PassThroughResponse,
   Flow,
 } from './flow-types';
-import { SEND_HEADER, FAULT_LABELS, decodeFull, sleep, isEventStream, copyHeaders, isEmptyEdit } from './proxy-util';
+import { SEND_HEADER, FAULT_LABELS, decodeFull, sleep, isEventStream, copyHeaders, isEmptyEdit, flattenLine } from './proxy-util';
+import { answerStatusProblem, prepareAnswerHeaders, type AnswerHeaderChanges } from './answer-headers';
 import {
   rewriteSets,
   rewriteHostOf,
@@ -56,16 +57,62 @@ import type { ProxyContext } from './proxy-context';
 export class HttpEdits {
   constructor(private readonly px: ProxyContext) {}
 
-  /** A 502 answered by the proxy (`Flutter Intercept: <error>`); the exchange ends 'error' with `error`. */
-  localFailure(ex: Exchange, error: string): CallbackResponseMessageResult & { statusCode: number } {
+  /**
+   * A 502 answered by the proxy (`Flutter Intercept: <error>`); the exchange ends 'error' with `error`. `status`: another
+   * status the proxy answers its own failure with (503 for a busy stateful mock), `extra`: more response headers.
+   */
+  localFailure(ex: Exchange, error: string, status = 502, extra?: HeaderBag): CallbackResponseMessageResult & { statusCode: number } {
+    error = flattenLine(error); // REVIEW-16 #15b: the body says what the exchange records
     const text = `Flutter Intercept: ${error}`;
-    const headers: HeaderBag = { 'content-type': 'text/plain; charset=utf-8' };
+    const headers: HeaderBag = { 'content-type': 'text/plain; charset=utf-8', ...extra };
     const rawBody = frameBody(Buffer.from(text, 'utf8'), headers);
-    ex.status = 502;
+    ex.status = status;
     ex.responseHeaders = cleanHeaders(headers);
     ex.responseBody = { text, encoding: 'utf8' };
     this.px.book.fail(ex, error);
-    return { statusCode: 502, statusMessage: STATUS_CODES[502], headers, rawBody };
+    return { statusCode: status, statusMessage: STATUS_CODES[status], headers, rawBody };
+  }
+
+  /**
+   * A response the proxy makes up (mock, script `respond`, stateful mock): CORS for browser requests, the body framed
+   * for its headers, the exchange ends 'mocked'. `headers` is changed in place. REVIEW-16 #14 / #15a: what Node or the
+   * app's connection can't take is checked first, so the exchange records what is sent: a 1xx status or a header Node
+   * refuses → 502 with `failed(<why>)` as the error; hop-by-hop headers are left out and a non-Latin-1 parameter of
+   * `content-disposition` / `link` is RFC 8187-encoded (with a note); a 204 / 304 is sent without a body.
+   */
+  async localAnswer(
+    ex: Exchange,
+    status: number,
+    headers: HeaderBag,
+    body: string,
+    failed: (why: string) => string = (why) => `Mock answer: ${why}`,
+  ): Promise<CallbackResponseMessageResult & { statusCode: number }> {
+    const statusProblem = answerStatusProblem(status);
+    if (statusProblem) return this.localFailure(ex, failed(statusProblem));
+    let changes: AnswerHeaderChanges;
+    try {
+      changes = prepareAnswerHeaders(headers);
+    } catch (e) {
+      return this.localFailure(ex, failed((e as Error).message));
+    }
+    if (changes.dropped.length) this.px.book.addNote(ex, `Left out connection headers a made-up answer can't send: ${changes.dropped.join(', ')}.`);
+    if (changes.encoded.length) this.px.book.addNote(ex, `Encoded non-Latin-1 text in ${changes.encoded.join(', ')} as RFC 8187 (UTF-8'') parameters.`);
+    if (status === 204 || status === 304) {
+      // no body on the wire (Node drops it), so none in the record either
+      if (body !== '') this.px.book.addNote(ex, `A ${status} answer has no body; its body was left out.`);
+      body = '';
+      deleteHeader(headers, 'content-encoding');
+    }
+    this.addCorsToLocalResponse(ex, headers);
+    const decoded = Buffer.from(body, 'utf8');
+    const rawBody = frameBody(decoded, headers);
+    if (status === 204 || status === 304) deleteHeader(headers, 'content-length'); // RFC 9110 §8.6
+    ex.status = status;
+    ex.responseHeaders = cleanHeaders(headers);
+    ex.responseBody = await decodeForDisplay(decoded, undefined, true);
+    if (isEventStream(getHeader(headers, 'content-type'))) this.px.taps.setSseFrames(ex, decoded);
+    this.px.book.finish(ex, 'mocked');
+    return { statusCode: status, statusMessage: STATUS_CODES[status] ?? 'Unknown', headers, rawBody };
   }
 
   // ---------------------------------------------------------------- script rules (CONTRACTS §13.4)
@@ -112,16 +159,8 @@ export class HttpEdits {
     }
     if (error !== undefined) return { response: this.localFailure(ex, this.scriptError(ex, flow, error)) };
     if (plan?.kind === 'respond') {
-      const headers: HeaderBag = { ...plan.headers };
-      this.addCorsToLocalResponse(ex, headers);
-      const decoded = Buffer.from(plan.body, 'utf8');
-      const rawBody = frameBody(decoded, headers);
-      ex.status = plan.status;
-      ex.responseHeaders = cleanHeaders(headers);
-      ex.responseBody = await decodeForDisplay(decoded, undefined, true);
-      if (isEventStream(getHeader(headers, 'content-type'))) this.px.taps.setSseFrames(ex, decoded);
-      this.px.book.finish(ex, 'mocked');
-      return { response: { statusCode: plan.status, statusMessage: STATUS_CODES[plan.status] ?? 'Unknown', headers, rawBody } };
+      const failed = (why: string) => this.scriptError(ex, flow, `response ${why}`);
+      return { response: await this.localAnswer(ex, plan.status, { ...plan.headers }, plan.body, failed) };
     }
     let result: CallbackRequestResult | undefined;
     if (plan) {
