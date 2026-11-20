@@ -83,4 +83,47 @@ describe('parseArgs', () => {
     expect(opts(['test']).trustSimulator).toBeUndefined();
     expect(() => parseArgs(['test', '--trust-simulator', '--no-grpc'])).toThrow(/cannot be combined/);
   });
+
+  it('parses collection options and rejects invalid usage (CONTRACTS §21.11)', () => {
+    const o = opts([
+      'test',
+      '--collection', 'api/shop.postman_collection.json',
+      '--collection=api/extra.openapi.yaml',
+      '--collection-env', 'api/dev.postman_environment.json',
+      '--collection-var', 'baseUrl=https://api.shop.example',
+      '--collection-var=token=a=b=c',
+      '--collection-var', 'baseUrl=https://staging.shop.example',
+      '--collection-unmatched', 'fail',
+    ]);
+    expect(o.collections).toEqual(['api/shop.postman_collection.json', 'api/extra.openapi.yaml']);
+    expect(o.collectionEnv).toBe('api/dev.postman_environment.json');
+    expect(o.collectionVars).toEqual({ baseUrl: 'https://staging.shop.example', token: 'a=b=c' });
+    expect(o.collectionUnmatched).toBe('fail');
+    expect(opts(['test', '--no-rules', '--collection', 'a.json']).rules).toBe(false);
+    expect(opts(['test', '--collection-unmatched=passthrough']).collectionUnmatched).toBe('passthrough');
+
+    expect(HELP).toContain('--collection <file>');
+    expect(HELP).toContain('--collection-env <file>');
+    expect(HELP).toContain('--collection-var');
+    expect(HELP).toContain('--collection-unmatched');
+
+    for (const [argv, pattern] of [
+      [['test', '--collection'], /--collection needs a value/],
+      [['test', '--collection='], /--collection needs a value/],
+      [['test', '--collection-env'], /--collection-env needs a value/],
+      [['test', '--collection-env', 'a.json', '--collection-env', 'b.json'], /given twice/],
+      [['test', '--collection-var'], /--collection-var needs a value/],
+      [['test', '--collection-var', 'noequals'], /must be name=value/],
+      [['test', '--collection-var', '=https://a.example'], /must be name=value/],
+      [['test', '--collection-var', 'bad name=https://a.example'], /invalid variable name/],
+      [['test', '--collection-var', 'baseUrl='], /needs a value/],
+      [['test', '--collection-var', `baseUrl=${'a'.repeat(2049)}`], /at most 2048/],
+      [['test', '--collection-var', 'baseUrl=https://a.example\nfoo'], /one line/],
+      [['test', '--collection-unmatched'], /--collection-unmatched needs a value/],
+      [['test', '--collection-unmatched', 'block'], /passthrough or fail/],
+    ] as [string[], RegExp][]) {
+      expect(() => parseArgs(argv)).toThrow(UsageError);
+      expect(() => parseArgs(argv)).toThrow(pattern);
+    }
+  });
 });

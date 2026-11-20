@@ -85,7 +85,7 @@ export type PluginRequest =
   | { method: 'sessionStarted'; params: SessionStartedParams }  // → { intercepted: boolean }
   | { method: 'sessionEnded'; params: SessionEndedParams }
   | { method: 'connectAgent'; params: { client: 'claude' | 'cursor' | 'gemini' | 'windsurf' | 'other' } } // → { text: string } to copy; error code `unavailable` when agent access is off
-  | { method: 'command'; params: { name: 'clear' | 'toggle' | 'exportOpenApi' | 'exportPostman' | 'saveCaCertificate' } } // → { enabled } | { path } | {}
+  | { method: 'command'; params: { name: 'clear' | 'toggle' | 'exportOpenApi' | 'exportPostman' | 'saveCaCertificate' | 'importCollection' } } // → { enabled } | { path } | { id } | {}
   // Added while building (sidecar report):
   | { method: 'workspaceFolders'; params: { workspaceFolders: string[] } } // a project window opened / closed
   | { method: 'uiVisible'; params: { visible: boolean } }                  // the tool window is on screen (no failure notifications then)
@@ -118,7 +118,16 @@ export type SidecarRequest =
   /** Store the passphrase for a host pattern in the password safe (key as `secrets.clientCertPassphrase`); absent / '' deletes it. */
   | { method: 'secrets.setClientCertPassphrase'; params: { host: string; passphrase?: string } }                                          // → null
   /** REVIEW-14 #4: a native modal "Remove the client certificate for <host>? Its passphrase is deleted too." (Remove / Cancel). */
-  | { method: 'ui.confirmRemoveClientCertificate'; params: { host: string } };                                                            // → true to remove
+  | { method: 'ui.confirmRemoveClientCertificate'; params: { host: string } }                                                             // → true to remove
+  // CONTRACTS §21.6 / §21.11 ("Mock from a collection…" in the panel and plugin; src/collections.ts). Both sides check what they receive.
+  /** The IDE's file chooser for a Postman collection or OpenAPI 3 document; cancelled → null. */
+  | { method: 'ui.chooseCollectionFile'; params: { defaultDir?: string } }                                                                // → absolute path | null
+  /** Native modal for a collection outside the project: Copy without credentials / Copy as it is / Cancel. */
+  | { method: 'ui.confirmCopyCollection'; params: { fileName: string } }                                                                  // → 'sanitised' | 'as-is' | null
+  /** Ask for an unset URL variable (e.g. `baseUrl`), offering origins seen in the session's traffic; cancelled → null. */
+  | { method: 'ui.askCollectionVariable'; params: { name: string; origins: string[] } }                                                   // → url string | null
+  /** Native modal warning before removing a collection link from `.vscode/flutter-intercept.json` (the file is kept). */
+  | { method: 'ui.confirmRemoveCollection'; params: { name: string; file: string } };                                                     // → true to remove
 
 // ── sidecar → plugin events ──────────────────────────────────────────────────────────────────────────────
 export type SidecarEvent =

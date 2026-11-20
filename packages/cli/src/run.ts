@@ -27,6 +27,7 @@ import { loadReplay, writeHarFile, writeOutput, writeRecording } from './outputs
 import { isVerboseFlutter, LAN_NOTES, lanAddressForIphone, lanProxyAddress, newRunToken, resolveLanHost, withoutProxyAuthorization, type LanAddress } from './lan';
 import { lanDefinesContent } from '../../extension/src/debug/rewrite';
 import { newLanDefinesPath, removeLanDefines, writeLanDefines } from '../../extension/src/debug/lanPrepare';
+import { loadCollections } from './collections';
 import { loadRules } from './rules';
 import { assertionsTable, trafficTable } from './summary';
 import type { CliOptions, CliResult } from './types';
@@ -344,7 +345,29 @@ export async function runCli(o: CliOptions, deps: RunDeps): Promise<CliResult> {
     for (const p of loaded.problems) log(`rules: ${p}`);
     for (const s of loaded.skipped) log(`rules: skipped (needs approval; pass --approve-shared-rules to apply): ${s}`);
     for (const s of loaded.approved) log(`rules: applied with --approve-shared-rules: ${s}`);
-    if (loaded.rules.length) proxy.setRules(loaded.rules);
+
+    // CONTRACTS §21.11: collections from the shared file (skipped by --no-rules) + --collection flags, after shared rules.
+    let loadedCollections;
+    try {
+      loadedCollections = await loadCollections({
+        sharedLinks: loaded.collectionLinks,
+        files: o.collections,
+        envFile: o.collectionEnv,
+        vars: o.collectionVars,
+        unmatched: o.collectionUnmatched,
+        cwd: deps.cwd,
+      });
+    } catch (e) {
+      throw new SetupError((e as Error).message);
+    }
+    for (const c of loadedCollections.collections) {
+      log(
+        `rules: collection "${c.name}" (${c.mocked} mocked${c.noExample ? `, ${c.noExample} without an example → 501` : ''}${c.unresolved.length ? `, unresolved: ${c.unresolved.join(', ')}` : ''}; unmatched: ${c.unmatched})`,
+      );
+    }
+    for (const p of loadedCollections.problems) log(`rules: ${p}`);
+    const allRules = [...loaded.rules, ...loadedCollections.rules];
+    if (allRules.length) proxy.setRules(allRules);
 
     if (o.replay) {
       let replay;

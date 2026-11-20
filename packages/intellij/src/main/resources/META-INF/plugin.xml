@@ -72,6 +72,10 @@
                     text="Export Traffic as OpenAPI…" description="Write the recorded traffic to an OpenAPI 3.1 file"/>
             <action id="FlutterIntercept.ExportPostman" class="dev.flutterintercept.actions.ExportPostmanAction"
                     text="Export Traffic as Postman Collection…" description="Write the recorded traffic to a Postman collection"/>
+            <action id="FlutterIntercept.ImportCollection" class="dev.flutterintercept.actions.ImportCollectionAction"
+                    text="Mock from a Collection…" description="Answer matching app requests locally from a Postman collection or OpenAPI 3 document">
+                <synonym text="Flutter Intercept: Mock from a Collection…"/>
+            </action>
             <action id="FlutterIntercept.SaveCaCertificate" class="dev.flutterintercept.actions.SaveCaCertificateAction"
                     text="Save CA Certificate…" description="Save the public CA certificate of the local proxy"/>
             <action id="FlutterIntercept.SetPassphrase" class="dev.flutterintercept.actions.SetPassphraseAction"

@@ -50,7 +50,9 @@ import { matchesProxyExchange } from '../../extension/src/vm/profile';
 import type { WebSocketCtor } from '../../extension/src/vm/transport';
 import { webScreenshot } from '../../extension/src/web/screenshot';
 import { createPathDecision } from '../../extension/src/rules/createPolicy';
+import { collectionParsers } from '../../extension/src/mocks/parsers';
 import { createSidecarClientCertPlatform } from './clientCerts';
+import { createSidecarCollections, type SidecarCollections } from './collections';
 import { createNodeContractService, DONT_CHECK, type NodeContractService } from './contract';
 import { prepareLaunch, type LaunchRecord } from './launch';
 import { RpcFailure } from './rpc';
@@ -249,6 +251,7 @@ export class SidecarHost {
   private proxyHost!: InterceptProxyHost;
   private controller!: InterceptController;
   private shared!: NodeSharedRules;
+  private collections!: SidecarCollections;
   private grpc!: GrpcSchemaService;
   private contract!: NodeContractService;
   private vm!: SidecarVm;
@@ -462,6 +465,31 @@ export class SidecarHost {
     this.proxyHost.setBodyFileResolver((p, id) => this.shared.resolveBodyFile(p, id));
     this.proxyHost.setScriptFileResolver((p, id) => this.shared.resolveScriptFile(p, id));
     this.shared.onDidChangeBodyFile((p) => this.proxyHost.refreshBodyFiles(p));
+    // CONTRACTS §21: mock from a collection (links in the shared file; rules go to the proxy after the user's)
+    this.collections = createSidecarCollections({
+      shared: this.shared,
+      roots: () => this.folders,
+      memento: this.state,
+      parsers: collectionParsers,
+      newRuleId: () => `rule_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      request: (method, params) => this.ask(method, params),
+      notify: (level, message) => this.notify(level, message),
+      seenOrigins: () => {
+        const out = new Set<string>();
+        for (const e of this.proxyHost.getExchanges()) {
+          try {
+            const u = new URL(e.url);
+            if (u.protocol === 'http:' || u.protocol === 'https:') out.add(`${u.protocol}//${u.host}`);
+          } catch {
+            // not an absolute URL
+          }
+          if (out.size >= 20) break;
+        }
+        return [...out];
+      },
+      log,
+    });
+    this.disposers.push(() => this.collections.dispose());
     this.applyUpstreamProxy();
     this.proxyHost.setTlsPassthrough(this.settings.tlsPassthrough);
     this.proxyHost.setAutoPassthrough(this.settings.autoPassthrough); // CONTRACTS §20.7
@@ -551,6 +579,7 @@ export class SidecarHost {
         await this.ask('ui.diff', { title: `Recordings: ${a.name} ↔ ${b.name}`, left: { name: `${a.name}.txt`, content: diffText(a) }, right: { name: `${b.name}.txt`, content: diffText(b) } });
       },
       analyzeAuth: (ex) => analyzeAuth(ex),
+      collections: this.collections,
       clientCertUi: createClientCertUi(
         createSidecarClientCertPlatform({
           request: (method, params) => this.ask(method, params),
@@ -598,6 +627,7 @@ export class SidecarHost {
       resolveFrames: (frames) => resolveFrames(frames, this.projectRoots()),
       recordings,
       recordingsChanged: () => void this.controller.refreshRecordings(),
+      collections: this.collections, // CONTRACTS §21.10
       analyzeAuth: (ex) => analyzeAuth(ex),
       contract: this.contract,
       contractResult: (id) => this.controller.contractResult(id),
@@ -683,6 +713,7 @@ export class SidecarHost {
     if (JSON.stringify(folders) === JSON.stringify(this.folders)) return;
     this.folders = folders;
     this.shared.rootsChanged();
+    void this.collections.reload();
     this.contract.rootsChanged();
     this.grpc.rootsChanged();
     this.refreshAppPackages();
@@ -892,6 +923,10 @@ export class SidecarHost {
         await fs.promises.writeFile(target, (await this.ca.get()).cert, { encoding: 'utf8' });
         void this.notify('info', `Flutter Intercept: saved the CA certificate (public part only) to ${target}. Only debug builds should trust it.`);
         return { path: target };
+      }
+      case 'importCollection': {
+        const imported = await this.collections.importInteractive();
+        return { id: imported?.id ?? null };
       }
       default:
         throw new RpcFailure(`unknown command ${String(name).slice(0, 60)}`, 'invalid');

@@ -88,6 +88,9 @@ class PluginPlatformTest : BasePlatformTestCase() {
             "ui.confirmRemoveClientCertificate" to """{"host":" "}""",
             "ui.chooseClientCertificateFile" to """{"role":"ca"}""",
             "settings.writeClientCertificates" to """{"entries":[{"host":"x.example","pfx":"relative.p12"}]}""",
+            "ui.confirmCopyCollection" to """{"fileName":"a/b.json"}""",
+            "ui.askCollectionVariable" to """{"name":"bad name"}""",
+            "ui.confirmRemoveCollection" to """{"name":"","file":"a.json"}""",
         )) {
             val e = try { handle(method, json); null } catch (e: ExecutionException) { e.cause }
             assertTrue("$method: $e", e is RpcException && e.code == "invalid")

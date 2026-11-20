@@ -6,6 +6,7 @@ import type { AddressInfo } from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import * as net from 'net';
+import * as tls from 'tls';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { lanIPv4Addresses } from '@flutter-intercept/proxy';
 import { flutterExecutable, flutterTestArgs, networkProfileFor, runCli, SetupError, stripOwnDefines, type ChildLike, type RunDeps } from '../src/run';
@@ -261,6 +262,129 @@ describe('runCli (fake flutter)', () => {
     await expect(runCli(base({ targets: ['integration_test/missing_test.dart'] }), f.deps)).rejects.toThrow(/not found/);
     await expect(runCli(base({ project: os.tmpdir() }), f.deps)).rejects.toThrow(/no pubspec\.yaml/);
     expect(f.calls).toHaveLength(0);
+  });
+
+  it('mocks from a Postman collection + environment: example answers, no-example gets 501, shared rules win, and --collection-unmatched fail blocks unknown paths', async () => {
+    const fixtures = path.resolve(__dirname, '..', '..', 'extension', 'test', 'fixtures', 'collections');
+    const collectionFile = path.join(fixtures, 'shop.postman_collection.json');
+    const envFile = path.join(fixtures, 'shop.postman_environment.json');
+
+    /** HTTPS request through the proxy via CONNECT + TLS (rejectUnauthorized: false for the run's temp CA). */
+    const httpsViaProxy = (
+      proxy: string,
+      method: string,
+      url: string,
+    ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> => {
+      const [proxyHost, proxyPort] = proxy.split(':');
+      const u = new URL(url);
+      const targetPort = Number(u.port) || 443;
+      return new Promise((resolve, reject) => {
+        const connect = http.request({
+          host: proxyHost === 'localhost' ? '127.0.0.1' : proxyHost,
+          port: Number(proxyPort),
+          method: 'CONNECT',
+          path: `${u.hostname}:${targetPort}`,
+        });
+        connect.on('connect', (res, socket) => {
+          if (res.statusCode !== 200) {
+            socket.destroy();
+            return reject(new Error(`CONNECT failed: ${res.statusCode}`));
+          }
+          const tlsSocket = tls.connect({ socket, servername: u.hostname, rejectUnauthorized: false }, () => {
+            const req = http.request(
+              {
+                method,
+                host: u.hostname,
+                port: targetPort,
+                path: `${u.pathname}${u.search}`,
+                createConnection: () => tlsSocket,
+                headers: { host: u.host, connection: 'close' },
+              },
+              (r) => {
+                const chunks: Buffer[] = [];
+                r.on('data', (c: Buffer) => chunks.push(c));
+                r.on('end', () => resolve({ status: r.statusCode ?? 0, headers: r.headers, body: Buffer.concat(chunks).toString('utf8') }));
+                r.on('error', reject);
+              },
+            );
+            req.on('error', reject);
+            req.end();
+          });
+          tlsSocket.on('error', reject);
+        });
+        connect.on('error', reject);
+        connect.end();
+      });
+    };
+
+    // Shared rule on /users/me must override the collection's own /users/me example.
+    fs.mkdirSync(path.join(dir, '.vscode'));
+    fs.writeFileSync(
+      path.join(dir, '.vscode', 'flutter-intercept.json'),
+      JSON.stringify({
+        version: 1,
+        rules: [{ id: 'override-me', name: 'Override Me', match: { url: 'https://api.shop.example/users/me' }, action: { kind: 'mock', status: 202, body: '{"override":true}' } }],
+      }),
+    );
+
+    // Unresolved analyticsHost with --collection-unmatched fail → usage/setup error (exit code 2), flutter never runs.
+    const unresolvedFail = fake((_a, c) => c.exit(0));
+    await expect(
+      runCli(base({ collections: [collectionFile], collectionEnv: envFile, collectionUnmatched: 'fail' }), unresolvedFail.deps),
+    ).rejects.toThrow(/unresolved URL variable\(s\).*analyticsHost/);
+    expect(unresolvedFail.calls).toHaveLength(0);
+
+    // With analyticsHost provided and --collection-unmatched fail:
+    //  - GET /users/42 answered from the collection example (200)
+    //  - GET /users/me answered by the shared rule (202, ahead of the collection)
+    //  - POST /auth/refresh (no saved example) answered 501 with x-flutter-intercept: no-example
+    //  - GET /unknown-path blocked (connection reset) by unmatched=fail
+    let got: {
+      user?: { status: number; body: string };
+      overrideMe?: { status: number; body: string };
+      noExample?: { status: number; header: string | string[] | undefined; body: string };
+      unknownBlocked?: boolean;
+    } = {};
+
+    const f = fake(async (args, child) => {
+      const proxy = proxyOf(args);
+      const user = await httpsViaProxy(proxy, 'GET', 'https://api.shop.example/users/42');
+      const overrideMe = await httpsViaProxy(proxy, 'GET', 'https://api.shop.example/users/me');
+      const noExample = await httpsViaProxy(proxy, 'POST', 'https://api.shop.example/auth/refresh');
+      let unknownBlocked = false;
+      try {
+        await httpsViaProxy(proxy, 'GET', 'https://api.shop.example/unknown-path');
+      } catch {
+        unknownBlocked = true;
+      }
+      got = {
+        user: { status: user.status, body: user.body },
+        overrideMe: { status: overrideMe.status, body: overrideMe.body },
+        noExample: { status: noExample.status, header: noExample.headers['x-flutter-intercept'], body: noExample.body },
+        unknownBlocked,
+      };
+      child.exit(0);
+    });
+
+    const r = await runCli(
+      base({
+        collections: [collectionFile],
+        collectionEnv: envFile,
+        collectionVars: { analyticsHost: 'https://stats.shop.example' },
+        collectionUnmatched: 'fail',
+      }),
+      f.deps,
+    );
+
+    expect(r.exitCode).toBe(0);
+    expect(got.user).toEqual({ status: 200, body: '{"id":42,"name":"Lina"}' });
+    expect(got.overrideMe).toEqual({ status: 202, body: '{"override":true}' });
+    expect(got.noExample?.status).toBe(501);
+    expect(got.noExample?.header).toBe('no-example');
+    expect(JSON.parse(got.noExample?.body ?? '{}')).toMatchObject({ error: 'no_example' });
+    expect(got.unknownBlocked).toBe(true);
+    expect(f.logs.some((l) => l.startsWith('rules: collection "Shop API"'))).toBe(true);
+    expect(f.logs.join('\n')).not.toContain('env-token-must-never-leave-the-host');
   });
 });
 

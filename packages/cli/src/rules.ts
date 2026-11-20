@@ -6,7 +6,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Rule } from '@flutter-intercept/proxy';
-import { SharedRulesCore, type MementoLike } from '../../extension/src/rules/core';
+import { SharedRulesCore, type FolderCollectionLinks, type MementoLike } from '../../extension/src/rules/core';
 import type { RulesFs } from '../../extension/src/rules/bodyFile';
 import { SHARED_FILE } from '../../extension/src/rules/file';
 import { ruleLabel } from '../../extension/src/rules/policy';
@@ -23,6 +23,8 @@ export interface LoadedRules {
   approved: string[];
   /** Problems: parse errors, invalid rules, unreadable body / script files. */
   problems: string[];
+  /** CONTRACTS §21.11: collection links from the shared file (omitted when none). */
+  collectionLinks?: FolderCollectionLinks[];
 }
 
 /** Read-only node fs for SharedRulesCore (the editor's `nodeRulesFs` lives in a vscode module). A run never writes. */
@@ -182,5 +184,13 @@ export async function loadRules(o: LoadRulesOptions): Promise<LoadedRules> {
   // Nobody can resume a paused request in a headless run: breakpoints would only hold requests until they time out.
   const rules = resolved.rules.filter((r) => r.action.kind !== 'breakpoint');
   const breakpoints = resolved.rules.filter((r) => r.action.kind === 'breakpoint').map((r) => `Rule ${ruleLabel(r)} is off: breakpoints need the editor`);
-  return { file, rules, skipped, approved, problems: [...state.problems, ...resolved.problems, ...breakpoints] };
+  const collectionLinks = core.collectionLinks();
+  return {
+    file,
+    rules,
+    skipped,
+    approved,
+    problems: [...state.problems, ...resolved.problems, ...breakpoints],
+    ...(collectionLinks.length ? { collectionLinks } : {}),
+  };
 }

@@ -13,7 +13,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { Rule } from '@flutter-intercept/proxy';
 import { SharedRulesCore } from '../../extension/src/rules/core';
-import type { PendingSnapshot, SharedRulesStatus } from '../../extension/src/rules/core';
+import type { FolderCollectionLinks, PendingSnapshot, SharedRulesStatus } from '../../extension/src/rules/core';
+import type { CollectionLink } from '../../extension/src/mocks/types';
 import type { RulesFs } from '../../extension/src/rules/bodyFile';
 import type { ValidateRule } from '../../extension/src/rules/file';
 import type { SharedRulesState } from '../../extension/src/rules/types';
@@ -72,6 +73,8 @@ export function createNodeSharedRules(deps: NodeSharedRulesDeps) {
   const pollMs = deps.pollMs ?? 1000;
   const changed = new Emitter<SharedRulesState>();
   const bodyChanged = new Emitter<string>();
+  const linksChanged = new Emitter<void>();
+  const linksKey = () => JSON.stringify(core.collectionLinks());
   let disposed = false;
 
   const dirWatchers = new Map<string, { watcher?: fs.FSWatcher; files: Map<string, Set<string>> }>();
@@ -134,8 +137,10 @@ export function createNodeSharedRules(deps: NodeSharedRulesDeps) {
 
   const reload = async () => {
     if (disposed) return;
+    const linksBefore = linksKey();
     try {
       if (await core.reload()) changed.fire(core.state());
+      if (linksKey() !== linksBefore) linksChanged.fire();
     } catch (e) {
       log(`shared rules: reload failed: ${(e as Error).message}`);
     }
@@ -195,10 +200,12 @@ export function createNodeSharedRules(deps: NodeSharedRulesDeps) {
 
   const after = async <T>(p: Promise<T>): Promise<T> => {
     const before = JSON.stringify(core.state());
+    const linksBefore = linksKey();
     try {
       return await p;
     } finally {
       if (JSON.stringify(core.state()) !== before) changed.fire(core.state());
+      if (linksKey() !== linksBefore) linksChanged.fire();
     }
   };
 
@@ -230,6 +237,12 @@ export function createNodeSharedRules(deps: NodeSharedRulesDeps) {
     createScriptFile: (rule: Rule, code?: string) => core.createScriptFile(rule, code),
     checkScriptFileContent: (code: string) => core.checkScriptFileContent(code),
     bodyFilePath: (bodyFile: string, ruleId?: string) => core.bodyFilePath(bodyFile, ruleId),
+    /** CONTRACTS §21.6: the `collections` of every shared file, primary folder first. */
+    collectionLinks: (): FolderCollectionLinks[] => core.collectionLinks(),
+    onDidChangeCollections: (listener: () => void) => linksChanged.event(listener),
+    primaryFolderPath: () => core.primaryFolderPath(),
+    saveCollections: (folderPath: string, links: CollectionLink[]) => after(core.saveCollections(folderPath, links)),
+    writeWorkspaceFile: (folderPath: string, rel: string, text: string) => core.writeWorkspaceFile(folderPath, rel, text),
     /** Project roots changed: re-watch and reload. */
     rootsChanged: () => {
       watchFolders();

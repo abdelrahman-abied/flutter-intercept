@@ -26,6 +26,7 @@ import com.intellij.openapi.fileTypes.PlainTextFileType
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
+import com.intellij.openapi.ui.InputValidator
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.popup.JBPopupFactory
 import com.intellij.openapi.ui.popup.JBPopupListener
@@ -77,6 +78,11 @@ object UiRequestHandler {
             "settings.writeClientCertificates" -> writeClientCertificates(p)
             "ui.confirmRemoveClientCertificate" -> confirmRemoveClientCertificate(p)
             "secrets.setClientCertPassphrase" -> setClientCertPassphrase(p)
+            // CONTRACTS §21.6 / §21.11: "Mock from a collection…" (the sidecar's collections service).
+            "ui.chooseCollectionFile" -> chooseCollectionFile(p)
+            "ui.confirmCopyCollection" -> confirmCopyCollection(p)
+            "ui.askCollectionVariable" -> askCollectionVariable(p)
+            "ui.confirmRemoveCollection" -> confirmRemoveCollection(p)
             // The sidecar's own secrets (e.g. `flutterIntercept.mcpToken`) in the IDE's password safe; values never logged.
             "secrets.get" -> CompletableFuture.supplyAsync({ secretGet(p.requireString("key")) }, AppExecutorUtil.getAppExecutorService())
             "secrets.set" -> CompletableFuture.supplyAsync({
@@ -303,6 +309,89 @@ object UiRequestHandler {
         next.clientCertificates = ClientCertificates.entriesFromSidecar(p.get("entries"), next.clientCertificates).toMutableList()
         settings.update(next)
         null
+    }
+
+    // ── collections (CONTRACTS §21.6, §21.11) ───────────────────────────────────────────────────────────────────
+
+    private val choosingCollection = AtomicBoolean(false)
+
+    /** The IDE's file chooser for a Postman collection or OpenAPI 3 document → absolute path, or null when cancelled. */
+    private fun chooseCollectionFile(p: JsonObject): CompletableFuture<Any?> {
+        if (!choosingCollection.compareAndSet(false, true)) {
+            return CompletableFuture.failedFuture(RpcException("A file chooser is already open in the IDE.", "busy"))
+        }
+        val dirPath = Collections.defaultDir(p)
+        return onEdt {
+            val project = focusActiveProject()
+            val startPath = dirPath ?: project?.basePath
+            val toSelect = startPath?.let { LocalFileSystem.getInstance().findFileByPath(it) }
+            val file = FileChooser.chooseFile(Collections.chooserDescriptor(), project, toSelect) ?: return@onEdt null
+            if (!file.isInLocalFileSystem) throw RpcException("Choose a file on this computer.", "invalid")
+            val chosen = file.toNioPath().toAbsolutePath().toString()
+            Collections.pathProblem(chosen)?.let { throw RpcException(it, "invalid") }
+            chosen
+        }.whenComplete { _, _ -> choosingCollection.set(false) }
+    }
+
+    /** Native modal for copying an outside collection into `.vscode/flutter-intercept/collections/` (plain text). */
+    private fun confirmCopyCollection(p: JsonObject): CompletableFuture<Any?> {
+        val fileName = try {
+            Collections.copyRequest(p)
+        } catch (e: RpcException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return onEdt {
+            val project = focusActiveProject()
+            val clicked = ConfirmDialog(
+                project,
+                Collections.copyMessage(fileName),
+                Collections.COPY_DETAIL,
+                listOf(Collections.COPY_SANITISED_BUTTON, Collections.COPY_AS_IS_BUTTON),
+            ).ask()
+            Collections.copyChoiceResult(clicked)
+        }
+    }
+
+    /** Asks for an unset URL variable, offering origins seen in traffic or a plain input box (plain text). */
+    private fun askCollectionVariable(p: JsonObject): CompletableFuture<Any?> {
+        val (name, origins) = try {
+            Collections.variableRequest(p)
+        } catch (e: RpcException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        val validator = object : InputValidator {
+            override fun checkInput(inputString: String?): Boolean = Collections.isValidVariableUrl(inputString)
+            override fun canClose(inputString: String?): Boolean = Collections.isValidVariableUrl(inputString)
+        }
+        return onEdt {
+            val project = focusActiveProject()
+            val title = Collections.variableTitle(name)
+            val prompt = Collections.variablePrompt(name, origins.isNotEmpty())
+            val answer = if (origins.isNotEmpty()) {
+                Messages.showEditableChooseDialog(prompt, title, Messages.getQuestionIcon(), origins.toTypedArray(), origins.first(), validator)
+            } else {
+                Messages.showInputDialog(project, prompt, title, Messages.getQuestionIcon(), "", validator)
+            }
+            answer?.trim()?.takeIf { Collections.isValidVariableUrl(it) }
+        }
+    }
+
+    /** Native modal warning before removing a collection link from `.vscode/flutter-intercept.json` (plain text). */
+    private fun confirmRemoveCollection(p: JsonObject): CompletableFuture<Any?> {
+        val (name, file) = try {
+            Collections.removeRequest(p)
+        } catch (e: RpcException) {
+            return CompletableFuture.failedFuture(e)
+        }
+        return onEdt {
+            val project = focusActiveProject()
+            ConfirmDialog(
+                project,
+                Collections.removeMessage(name),
+                Collections.removeDetail(file),
+                listOf(Collections.REMOVE_BUTTON),
+            ).ask() == Collections.REMOVE_BUTTON
+        }
     }
 
     // ── ui.confirm / ui.notify ───────────────────────────────────────────────────────────────────────────────────

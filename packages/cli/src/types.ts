@@ -42,6 +42,14 @@ export interface CliOptions {
   grpcDecryptHosts?: string[];
   /** CONTRACTS §19.3: make the iOS simulator trust this run's CA (`--trust-simulator`); removed at the end of the run. */
   trustSimulator?: boolean;
+  /** CONTRACTS §21.11: collection files to mock from (`--collection`, repeatable; added after any in the shared file). */
+  collections?: string[];
+  /** CONTRACTS §21.11: Postman environment file for URL variables (`--collection-env`). */
+  collectionEnv?: string;
+  /** CONTRACTS §21.11: URL variables for collections (`--collection-var name=value`, repeatable). */
+  collectionVars?: Record<string, string>;
+  /** CONTRACTS §21.11: unmatched requests for collections (`--collection-unmatched passthrough|fail`). */
+  collectionUnmatched?: 'passthrough' | 'fail';
 }
 
 export interface CliResult {

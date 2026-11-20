@@ -100,6 +100,10 @@ class SaveCaCertificateAction : InterceptAction() {
     override fun actionPerformed(e: AnActionEvent) = runCommand(e.project, "saveCaCertificate")
 }
 
+class ImportCollectionAction : InterceptAction() {
+    override fun actionPerformed(e: AnActionEvent) = runCommand(e.project, "importCollection")
+}
+
 class RestartSidecarAction : InterceptAction() {
     override fun actionPerformed(e: AnActionEvent) = SidecarProcess.getInstance().restart()
 }

@@ -31,10 +31,15 @@ Options:
   -p, --project <dir>            Flutter project root (default: nearest pubspec.yaml from the cwd).
       --port <n>                 Proxy port on 127.0.0.1 (default: a free port).
       --rules <file>             Shared rules file (default: .vscode/flutter-intercept.json when present).
-      --no-rules                 Use no rules.
+      --no-rules                 Use no rules (also turns off collections linked in the shared file).
       --approve-shared-rules     Also apply shared rules that need approval in the editor (map remote to
                                  another host, request header rewrites, scripts, …). Without it they are
                                  skipped with the reason printed.
+      --collection <file>        Mock from a Postman collection or OpenAPI 3 file (repeatable; added after
+                                 any collections in the shared file).
+      --collection-env <file>    Postman environment file for collection URL variables.
+      --collection-var k=v       Set a collection URL variable (repeatable, e.g. baseUrl=https://api.example.com).
+      --collection-unmatched <m> Unmatched requests to a collection's host: passthrough (default) or fail.
       --replay <id|file>         Answer requests from a recording (id in
                                  .dart_tool/flutter_intercept/recordings, or a file path).
       --replay-fallback <mode>   Unmatched requests while replaying: passthrough (default) or fail.
@@ -64,9 +69,27 @@ Exit code: flutter's when it fails; else 1 when an assertion failed; else 0. 2 =
 Examples:
   flutter-intercept test -d emulator-5554 --har build/traffic.har --assert ci/expect.json --junit build/assert.xml
   flutter-intercept test integration_test/login_test.dart -d macos --replay login --replay-fallback fail
+  flutter-intercept test -d macos --collection api/shop.postman_collection.json --collection-env api/dev.postman_environment.json
   flutter-intercept run -d macos --network-profile slow-3g`;
 
-type ValueKey = 'project' | 'device' | 'port' | 'rules' | 'replay' | 'replayFallback' | 'networkProfile' | 'har' | 'record' | 'assert' | 'junit' | 'flutter';
+const COLLECTION_VAR_NAME = /^[A-Za-z0-9_.$-]{1,100}$/;
+const MAX_COLLECTION_VAR_VALUE = 2048;
+
+type ValueKey =
+  | 'project'
+  | 'device'
+  | 'port'
+  | 'rules'
+  | 'replay'
+  | 'replayFallback'
+  | 'networkProfile'
+  | 'har'
+  | 'record'
+  | 'assert'
+  | 'junit'
+  | 'flutter'
+  | 'collectionEnv'
+  | 'collectionUnmatched';
 type FlagKey = 'noRules' | 'approveSharedRules' | 'noRedact' | 'noGrpc' | 'trustSimulator' | 'help' | 'version';
 
 const VALUE_OPTIONS: Record<string, ValueKey> = {
@@ -85,6 +108,8 @@ const VALUE_OPTIONS: Record<string, ValueKey> = {
   '--assert': 'assert',
   '--junit': 'junit',
   '--flutter': 'flutter',
+  '--collection-env': 'collectionEnv',
+  '--collection-unmatched': 'collectionUnmatched',
 };
 
 const FLAG_OPTIONS: Record<string, FlagKey> = {
@@ -108,6 +133,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
   const flags = new Set<FlagKey>();
   const positionals: string[] = [];
   const grpcDecryptHosts: string[] = [];
+  const collections: string[] = [];
+  const collectionVars = new Map<string, string>();
   let flutterArgs: string[] = [];
   let command: CliOptions['command'] | undefined;
 
@@ -133,6 +160,28 @@ export function parseArgs(argv: string[]): ParsedArgs {
           grpcDecryptHosts.push(requireValue(name, argv[i + 1]));
           i++;
         }
+        continue;
+      }
+      if (name === '--collection') {
+        if (inline !== undefined) collections.push(requireValue(name, inline));
+        else {
+          collections.push(requireValue(name, argv[i + 1]));
+          i++;
+        }
+        continue;
+      }
+      if (name === '--collection-var') {
+        const raw = inline !== undefined ? requireValue(name, inline) : (i++, requireValue(name, argv[i]));
+        const sep = raw.indexOf('=');
+        if (sep <= 0) throw new UsageError('--collection-var must be name=value (e.g. --collection-var baseUrl=https://api.example.com)');
+        const varName = raw.slice(0, sep);
+        const varValue = raw.slice(sep + 1);
+        if (!COLLECTION_VAR_NAME.test(varName)) throw new UsageError(`--collection-var: invalid variable name "${varName}"`);
+        if (!varValue) throw new UsageError(`--collection-var ${varName}= needs a value`);
+        if (varValue.length > MAX_COLLECTION_VAR_VALUE || /[\r\n\0]/.test(varValue)) {
+          throw new UsageError(`--collection-var ${varName}: value must be one line of at most ${MAX_COLLECTION_VAR_VALUE} characters`);
+        }
+        collectionVars.set(varName, varValue);
         continue;
       }
       const key = VALUE_OPTIONS[name];
@@ -202,5 +251,18 @@ export function parseArgs(argv: string[]): ParsedArgs {
     options.trustSimulator = true;
   }
   if (grpcDecryptHosts.length) options.grpcDecryptHosts = [...new Set(grpcDecryptHosts)];
+  if (collections.length) options.collections = collections;
+  if (values.collectionEnv !== undefined) options.collectionEnv = values.collectionEnv;
+  if (collectionVars.size) {
+    const out: Record<string, string> = {};
+    for (const [k, v] of collectionVars) Object.defineProperty(out, k, { value: v, enumerable: true, configurable: true, writable: true });
+    options.collectionVars = out;
+  }
+  if (values.collectionUnmatched !== undefined) {
+    if (values.collectionUnmatched !== 'passthrough' && values.collectionUnmatched !== 'fail') {
+      throw new UsageError(`--collection-unmatched must be passthrough or fail, got "${values.collectionUnmatched}"`);
+    }
+    options.collectionUnmatched = values.collectionUnmatched;
+  }
   return { kind: 'options', options };
 }
