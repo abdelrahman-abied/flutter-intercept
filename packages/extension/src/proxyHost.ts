@@ -486,6 +486,8 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
   // CONTRACTS §12
   /** What the proxy actually got: `rules` with file-backed bodies resolved (rules whose file failed are left out). */
   private proxyRules: Rule[] = [];
+  /** CONTRACTS §21.5: rules built from linked collections, after the user's rules; never in `getRules()`. */
+  private collectionRules: Rule[] = [];
   private rulesGen = 0;
   private rulesApplied: Promise<void> = Promise.resolve();
   private bodyResolver?: FileResolver;
@@ -749,6 +751,15 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     this.applyRules();
   }
 
+  /**
+   * CONTRACTS §21.5: the rules of the enabled collections. The proxy gets them after the shared and personal rules
+   * (first match wins, so the user's own rules override a collection); they are not part of `getRules()`.
+   */
+  setCollectionRules(rules: Rule[]): void {
+    this.collectionRules = rules;
+    this.applyRules();
+  }
+
   /** Resolves when the latest `setRules` / body-file refresh reached the proxy. */
   rulesReady(): Promise<void> {
     return this.rulesApplied;
@@ -834,8 +845,8 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     const gen = ++this.rulesGen;
     const { kept: rules, problems: selfProblems } = this.dropSelfMaps(this.rules);
     if (!rules.some(needsResolve)) {
-      this.proxyRules = rules;
-      this.proxy?.setRules(rules);
+      this.proxyRules = [...rules, ...this.collectionRules];
+      this.proxy?.setRules(this.proxyRules);
       this.setBodyWarnings(selfProblems);
       this.rulesApplied = Promise.resolve();
       return;
@@ -843,8 +854,8 @@ export class InterceptProxyHost extends EventEmitter implements ProxyHost {
     this.rulesApplied = this.resolveBodies(rules).then(
       ({ resolved, problems }) => {
         if (gen !== this.rulesGen) return;
-        this.proxyRules = resolved;
-        this.proxy?.setRules(resolved);
+        this.proxyRules = [...resolved, ...this.collectionRules];
+        this.proxy?.setRules(this.proxyRules);
         this.setBodyWarnings([...selfProblems, ...problems]);
       },
       (e: unknown) => this.opts.log?.(`applying rules failed: ${e instanceof Error ? e.message : String(e)}`),

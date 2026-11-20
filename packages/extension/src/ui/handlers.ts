@@ -22,6 +22,7 @@ import {
 } from './clientCertUi';
 import { GRPC_WEB_RESEND, grpcMockRuleFromExchange, grpcResendMessages, resolveGrpcEdit, resolveSendGrpc } from './grpcHost';
 import type { ViewMsg } from './protocol';
+import { LINK_ID } from '../mocks/types';
 import { checkBodyFile, checkId, checkRuleId, checkScriptFile, fail, isInt, isObj, MAX_BODY_FILE_BYTES, MAX_SCRIPT_BYTES, onlyKeys, sanitizeGrpcSendHeaders, validateEdit, validateRule, validateSendDraft } from './validate';
 import { contractSummary, needsOwnCertificate, readOnlyReason, recordingSummary, RULE_KINDS, ruleFromExchangeErrorMessage, snippetFor, tunnelBlockRule } from './views';
 
@@ -46,6 +47,7 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
   return {
     ready: async (msg, reply) => {
       c.readyCount++;
+      c.resetCollectionViews(); // CONTRACTS §21.8: the panel asks again for what it opens
       c.flush();
       c.send(reply, c.snapshot());
       const current = c.deps.host.getExchanges();
@@ -383,5 +385,68 @@ export function createViewHandlers(c: InterceptController): ViewHandlers {
       // REVIEW-14 #5: the proxy's key form — `[v6]:port` for IPv6, `host:port` otherwise, a bare host = every port.
       h.forgetLearnedPassthrough(learnedKeyOf(msg.host, msg.port));
     },
+    // CONTRACTS §21.8
+    importCollection: async (msg) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type'], 'importCollection');
+      await collectionsOrThrow(c).importInteractive();
+    },
+    getCollectionEndpoints: (msg, reply) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'id'], 'getCollectionEndpoints');
+      collectionsOrThrow(c);
+      c.watchCollection(checkCollectionId(msg.id, 'getCollectionEndpoints'), reply);
+    },
+    getCollectionExample: (msg, reply) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'id', 'endpoint', 'name'], 'getCollectionExample');
+      const id = checkCollectionId(msg.id, 'getCollectionExample');
+      const endpoint = checkCollectionText(msg.endpoint, 'endpoint', MAX_ENDPOINT_KEY, 'getCollectionExample');
+      const name = checkCollectionText(msg.name, 'name', MAX_EXAMPLE_NAME, 'getCollectionExample');
+      const x = collectionsOrThrow(c).example(id, endpoint, name);
+      c.send(reply, { type: 'collectionExample', id, endpoint, name, status: x.status, headers: x.headers, body: x.body, ...(x.truncated ? { truncated: true as const } : {}) });
+    },
+    updateCollection: async (msg) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'id', 'patch'], 'updateCollection');
+      const id = checkCollectionId(msg.id, 'updateCollection');
+      if (!isObj(msg.patch)) fail('updateCollection', 'patch must be an object');
+      // the service checks every field of the patch (CONTRACTS §21.7)
+      await collectionsOrThrow(c).update(id, msg.patch);
+    },
+    removeCollection: async (msg) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'id'], 'removeCollection');
+      await collectionsOrThrow(c).removeWithConfirmation(checkCollectionId(msg.id, 'removeCollection'));
+    },
+    collectionToRule: (msg) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'id', 'endpoint'], 'collectionToRule');
+      const id = checkCollectionId(msg.id, 'collectionToRule');
+      const endpoint = checkCollectionText(msg.endpoint, 'endpoint', MAX_ENDPOINT_KEY, 'collectionToRule');
+      const rule = validateRule(collectionsOrThrow(c).toRule(id, endpoint));
+      // §21.8 decision: a new personal rule, first among the personal rules (as createRuleFromExchange); `rules` follows
+      c.applyRules([rule, ...c.deps.host.getRules()]);
+    },
+    approveCollection: async (msg) => {
+      onlyKeys(msg as unknown as Record<string, unknown>, ['type', 'id'], 'approveCollection');
+      const id = checkCollectionId(msg.id, 'approveCollection');
+      const svc = collectionsOrThrow(c);
+      // CONTRACTS §21.16: only the IDE's own modal approves (agents have no path here)
+      if (!svc.approveWithConfirmation) throw new Error('Approving a collection is not available here.');
+      await svc.approveWithConfirmation(id);
+    },
   };
+}
+
+const MAX_ENDPOINT_KEY = 8 * 1024 + 32;
+const MAX_EXAMPLE_NAME = 1000;
+
+function collectionsOrThrow(c: InterceptController): NonNullable<InterceptController['deps']['collections']> {
+  if (!c.deps.collections) throw new Error('Mocking from a collection needs the Flutter project folder open.');
+  return c.deps.collections;
+}
+
+function checkCollectionId(v: unknown, where: string): string {
+  if (typeof v !== 'string' || !LINK_ID.test(v)) fail(where, 'id must be a collection id such as "shop-api"');
+  return v;
+}
+
+function checkCollectionText(v: unknown, field: string, max: number, where: string): string {
+  if (typeof v !== 'string' || !v || v.length > max) fail(where, `${field} must be a non-empty string (at most ${max} characters)`);
+  return v;
 }

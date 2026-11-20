@@ -4,6 +4,7 @@ import { build } from 'esbuild';
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const withTests = process.argv.includes('--tests');
@@ -50,8 +51,29 @@ const zodLocalesPlugin = {
   },
 };
 
-/** Bundle budgets (PERF-1 #7, PERF-2 #4): fail the build when the extension grows past them or a locale / Zod 3 slips back in. */
-const MAX_EXTENSION_BYTES = 2_550_000;
+// PERF-3: the collection importer only reads YAML (src/mocks/yaml.ts uses `load` and `JSON_SCHEMA`). js-yaml's `exports`
+// block deep imports, so `js-yaml` resolves to this shim with the loader and the JSON schema only: its writer
+// (dumper.js) stays out of the bundle. Tests (vitest) load the full package; the behaviour is the same.
+const jsYamlLoaderOnlyPlugin = {
+  name: 'flutter-intercept-js-yaml-loader-only',
+  setup(b) {
+    b.onResolve({ filter: /^js-yaml$/ }, () => ({ path: 'js-yaml', namespace: 'fi-js-yaml' }));
+    b.onLoad({ filter: /.*/, namespace: 'fi-js-yaml' }, () => {
+      const lib = path.join(path.dirname(createRequire(import.meta.url).resolve('js-yaml')), 'lib'); // the CommonJS entry
+      return {
+        contents: `module.exports = { load: require(${JSON.stringify(path.join(lib, 'loader.js'))}).load, JSON_SCHEMA: require(${JSON.stringify(path.join(lib, 'schema', 'json.js'))}) };\n`,
+        loader: 'js',
+        resolveDir: lib,
+      };
+    });
+  },
+};
+
+/** Bundle budgets (PERF-1 #7, PERF-2 #4): fail the build when the extension grows past them or a locale / Zod 3 slips back in.
+ * CONTRACTS §21.13 (0.15.0) / PERF-3: 2 550 000 → 2 675 000 on purpose for collection mocks (2 652 908 measured with
+ * js-yaml's loader only, + 20 KB); 2 700 000 after the REVIEW-15 fixes and §21.15 / §21.16 (2 678 420 + 20 KB,
+ * docs/PERF-3.md §6). Raise it again only on purpose. */
+const MAX_EXTENSION_BYTES = 2_700_000;
 function assertBudget(metafile, outfile) {
   const out = Object.entries(metafile.outputs).find(([k]) => k.endsWith(outfile));
   const bytes = out ? out[1].bytes : 0;
@@ -110,7 +132,7 @@ await build({
   minify: !dev,
   keepNames: true,
   metafile: true,
-  plugins: [stubPlugin, zodLocalesPlugin],
+  plugins: [stubPlugin, zodLocalesPlugin, jsYamlLoaderOnlyPlugin],
 }).then((r) => {
   fs.writeFileSync(path.join(here, 'dist', 'meta.json'), JSON.stringify(r.metafile));
   assertNothingForbidden(r.metafile);
@@ -124,7 +146,7 @@ for (const f of ['webview.js', 'webview.css']) fs.copyFileSync(path.join(here, '
 if (withTests) {
   // runTest.js runs in plain Node and launches VS Code; suite/index.js runs inside VS Code.
   await build({ ...common, entryPoints: ['test/integration/runTest.ts'], outfile: 'dist-test/runTest.js', external: ['vscode'] });
-  await build({ ...common, entryPoints: ['test/integration/suite/index.ts'], outfile: 'dist-test/suite/index.js', external: ['vscode', ...optionalExternals], plugins: [stubPlugin, zodLocalesPlugin] });
+  await build({ ...common, entryPoints: ['test/integration/suite/index.ts'], outfile: 'dist-test/suite/index.js', external: ['vscode', ...optionalExternals], plugins: [stubPlugin, zodLocalesPlugin, jsYamlLoaderOnlyPlugin] });
 }
 
 if (withSmoke) {
@@ -137,6 +159,6 @@ if (withSmoke) {
     minify: !dev,
     keepNames: true,
     metafile: true,
-    plugins: [stubPlugin, zodLocalesPlugin],
+    plugins: [stubPlugin, zodLocalesPlugin, jsYamlLoaderOnlyPlugin],
   }).then((r) => assertNothingForbidden(r.metafile));
 }

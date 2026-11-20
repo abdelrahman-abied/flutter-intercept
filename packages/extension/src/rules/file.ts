@@ -244,14 +244,24 @@ export function toFileRule(rule: Rule, fileId: string): Record<string, unknown> 
 
 /**
  * The new file text. `previous` = the current file (its other top-level keys, their order, indentation and line
- * endings are kept), `rules` = the elements of `rules` in order.
+ * endings are kept), `rules` = the elements of `rules` in order. `collections` (CONTRACTS §21.6, entries from
+ * `toFileLink`) replaces that key when given — an empty list removes it; when omitted the file's own is kept.
  */
-export function serializeSharedFile(rules: unknown[], previous?: Pick<ParsedSharedFile, 'json' | 'indent' | 'eol'>): string {
+export function serializeSharedFile(
+  rules: unknown[],
+  previous?: Pick<ParsedSharedFile, 'json' | 'indent' | 'eol'>,
+  collections?: unknown[],
+): string {
   const out: Record<string, unknown> = {};
   const prev = previous?.json ?? {};
+  const dropCollections = collections !== undefined && collections.length === 0;
   if (!('version' in prev)) out.version = FILE_VERSION;
-  for (const k of Object.keys(prev)) out[k] = k === 'version' ? FILE_VERSION : k === 'rules' ? rules : prev[k];
+  for (const k of Object.keys(prev)) {
+    if (k === 'collections' && dropCollections) continue;
+    out[k] = k === 'version' ? FILE_VERSION : k === 'rules' ? rules : k === 'collections' && collections ? collections : prev[k];
+  }
   if (!('rules' in prev)) out.rules = rules;
+  if (collections?.length && !('collections' in prev)) out.collections = collections;
   const eol = previous?.eol ?? '\n';
   const text = JSON.stringify(out, null, previous?.indent ?? '  ');
   return `${eol === '\n' ? text : text.replace(/\n/g, eol)}${eol}`;

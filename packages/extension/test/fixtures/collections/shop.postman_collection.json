@@ -1,0 +1,206 @@
+{
+  "info": {
+    "_postman_id": "00000000-0000-4000-8000-000000000001",
+    "name": "Shop API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }]
+  },
+  "event": [
+    { "listen": "prerequest", "script": { "type": "text/javascript", "exec": ["pm.environment.set('ts', Date.now());"] } }
+  ],
+  "variable": [
+    { "key": "baseUrl", "value": "" },
+    { "key": "apiVersion", "value": "v2" },
+    { "key": "token", "value": "collection-token-should-be-removed", "type": "secret" },
+    { "key": "clientSecret", "value": "another-secret-value" }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Log in",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Api-Key", "value": "live-key-123" }
+            ],
+            "body": { "mode": "raw", "raw": "{\"email\":\"sara@example.com\",\"password\":\"hunter2\"}" },
+            "url": { "raw": "{{baseUrl}}/auth/login", "host": ["{{baseUrl}}"], "path": ["auth", "login"] }
+          },
+          "response": [
+            {
+              "name": "Success",
+              "originalRequest": { "method": "POST", "header": [], "url": { "raw": "{{baseUrl}}/auth/login", "host": ["{{baseUrl}}"], "path": ["auth", "login"] } },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"token\": \"abc\",\n  \"user\": { \"id\": 1, \"name\": \"Sara\" }\n}"
+            },
+            {
+              "name": "Wrong password",
+              "originalRequest": { "method": "POST", "header": [], "url": { "raw": "{{baseUrl}}/auth/login", "host": ["{{baseUrl}}"], "path": ["auth", "login"] } },
+              "status": "Unauthorized",
+              "code": 401,
+              "_postman_previewlanguage": "json",
+              "header": [],
+              "body": "{\"error\":\"invalid_credentials\"}"
+            }
+          ]
+        },
+        {
+          "name": "Refresh",
+          "request": {
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "refresh-token-literal", "type": "string" }] },
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer literal-in-header" }],
+            "url": { "raw": "{{baseUrl}}/auth/refresh", "host": ["{{baseUrl}}"], "path": ["auth", "refresh"] }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Users",
+      "item": [
+        {
+          "name": "List users",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/users?page=1",
+              "host": ["{{baseUrl}}"],
+              "path": ["users"],
+              "query": [{ "key": "page", "value": "1" }]
+            }
+          },
+          "response": [
+            {
+              "name": "Page 1",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": { "raw": "{{baseUrl}}/users?page=1", "host": ["{{baseUrl}}"], "path": ["users"], "query": [{ "key": "page", "value": "1" }] }
+              },
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json; charset=utf-8" }],
+              "body": "[{\"id\":1,\"name\":\"Sara\"},{\"id\":2,\"name\":\"Omar\"}]"
+            },
+            {
+              "name": "Page 2",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": { "raw": "{{baseUrl}}/users?page=2", "host": ["{{baseUrl}}"], "path": ["users"], "query": [{ "key": "page", "value": "2" }] }
+              },
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json; charset=utf-8" }],
+              "body": "[]"
+            }
+          ]
+        },
+        {
+          "name": "Me",
+          "request": { "method": "GET", "header": [], "url": { "raw": "{{baseUrl}}/users/me", "host": ["{{baseUrl}}"], "path": ["users", "me"] } },
+          "response": [
+            {
+              "name": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [],
+              "body": "{\"id\":1,\"name\":\"Sara\"}"
+            }
+          ]
+        },
+        {
+          "name": "User by id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/users/:id",
+              "host": ["{{baseUrl}}"],
+              "path": ["users", ":id"],
+              "variable": [{ "key": "id", "value": "42" }]
+            }
+          },
+          "response": [
+            { "name": "Found", "code": 200, "_postman_previewlanguage": "json", "header": [], "body": "{\"id\":42,\"name\":\"Lina\"}" },
+            { "name": "Not found", "code": 404, "_postman_previewlanguage": "json", "header": [], "body": "{\"error\":\"not_found\"}" }
+          ]
+        },
+        {
+          "name": "Delete user",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/users/:id", "host": ["{{baseUrl}}"], "path": ["users", ":id"], "variable": [{ "key": "id", "value": "42" }] }
+          },
+          "response": [{ "name": "No content", "code": 204, "header": [], "body": "" }]
+        },
+        {
+          "name": "Orders",
+          "item": [
+            {
+              "name": "Order items",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/{{apiVersion}}/orders/{{orderId}}/items",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["{{apiVersion}}", "orders", "{{orderId}}", "items"]
+                }
+              },
+              "response": [{ "name": "OK", "code": 200, "_postman_previewlanguage": "json", "header": [], "body": "[{\"sku\":\"A1\",\"qty\":2}]" }]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Remote config",
+      "request": "https://CDN.shop.example:443/config.json",
+      "response": [
+        {
+          "name": "OK",
+          "code": 200,
+          "header": [
+            { "key": "Content-Type", "value": "application/json" },
+            { "key": "Content-Length", "value": "17" },
+            { "key": "Date", "value": "Thu, 19 Nov 2026 10:00:00 GMT" },
+            { "key": "X-Tag", "value": "a" },
+            { "key": "X-Tag", "value": "b" },
+            { "key": "Set-Cookie", "value": "a=1" },
+            { "key": "Set-Cookie", "value": "b=2" },
+            { "key": "X-Off", "value": "x", "disabled": true }
+          ],
+          "body": "{\"theme\":\"dark\"}"
+        }
+      ]
+    },
+    {
+      "name": "Health",
+      "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/health" },
+      "response": [{ "name": "Up", "header": [], "body": "ok", "_postman_previewlanguage": "text" }]
+    },
+    {
+      "name": "Health (copy)",
+      "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/health" },
+      "response": []
+    },
+    {
+      "name": "Analytics",
+      "request": { "method": "POST", "header": [], "url": { "raw": "{{analyticsHost}}/collect", "host": ["{{analyticsHost}}"], "path": ["collect"] } },
+      "response": [{ "name": "Accepted", "code": 202, "header": [], "body": "" }]
+    }
+  ]
+}

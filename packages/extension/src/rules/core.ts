@@ -29,6 +29,8 @@
 import * as path from 'path';
 import type { Rule } from '@flutter-intercept/proxy';
 import type { SharedRulesState } from './types';
+import type { CollectionLink } from '../mocks/types';
+import { parseCollectionLinks, toFileLink } from '../mocks/link';
 import {
   BodyFileError,
   bodyFileActions,
@@ -177,6 +179,16 @@ interface PreparedWrite {
   hadComments: boolean;
 }
 
+/** CONTRACTS §21.6: the `collections` of one shared file. */
+export interface FolderCollectionLinks {
+  /** The workspace folder (absolute); collection files are relative to it. */
+  folderPath: string;
+  /** The file's label, for problems. */
+  label: string;
+  links: CollectionLink[];
+  problems: string[];
+}
+
 export interface SharedRulesStatus {
   file?: string;
   count: number;
@@ -243,6 +255,8 @@ export class SharedRulesCore {
   private personalRules: Rule[] = [];
   /** Personal rule ids seen only through `readScriptFile` (not passed to `setPersonalRules`) → their script file. */
   private unknownPersonal = new Map<string, string>();
+  /** CONTRACTS §21.6: the `collections` of every file, from the last recompute. */
+  private links: FolderCollectionLinks[] = [];
 
   constructor(private readonly deps: SharedRulesCoreDeps) {}
 
@@ -662,8 +676,15 @@ export class SharedRulesCore {
       }
     }
     if (labels.length) s.file = labels.join(', ');
-    const changed = canonicalJson(s) !== canonicalJson(this.current);
+    // CONTRACTS §21.6: a change to `collections` alone is a change too (the collections service listens)
+    const links: FolderCollectionLinks[] = this.folderStates.flatMap((f) => {
+      if (!f.good) return [];
+      const { links: l, problems } = parseCollectionLinks(f.good.json, f.folder.label);
+      return l.length || problems.length ? [{ folderPath: f.folder.info.path, label: f.folder.label, links: l, problems }] : [];
+    });
+    const changed = canonicalJson(s) !== canonicalJson(this.current) || canonicalJson(links) !== canonicalJson(this.links);
     this.current = s;
+    this.links = links;
     return changed;
   }
 
@@ -856,6 +877,48 @@ export class SharedRulesCore {
       }
       for (const w of writes) await this.commit(w);
       await this.reloadNow();
+    });
+  }
+
+  /** CONTRACTS §21.6: the collections linked in every shared file, primary folder first (last good versions). */
+  collectionLinks(): FolderCollectionLinks[] {
+    return this.links;
+  }
+
+  /** The folder new collection links go to (the primary folder), or undefined with no workspace folder. */
+  async primaryFolderPath(): Promise<string | undefined> {
+    if (!this.folderStates.length) await this.serial(() => this.reloadNow());
+    return this.folderStates[0]?.folder.info.path;
+  }
+
+  /**
+   * CONTRACTS §21.6: makes `links` the `collections` of the file in `folderPath` (an empty list removes the key).
+   * Rules and every other key are written back exactly as they are (no approval changes); a broken file is refused.
+   */
+  saveCollections(folderPath: string, links: CollectionLink[]): Promise<void> {
+    return this.serial(async () => {
+      if (!this.folderStates.length) await this.reloadNow();
+      const f = this.folderStates.find((st) => st.folder.info.path === folderPath);
+      if (!f) throw new Error('That workspace folder is no longer open');
+      const fresh = await this.freshParse(f.folder);
+      const rules = Array.isArray(fresh?.json.rules) ? (fresh!.json.rules as unknown[]) : [];
+      const text = serializeSharedFile(rules, fresh, links.map(toFileLink));
+      if (fresh && contentHash(JSON.parse(text)) === fresh.hash) return;
+      if (fresh?.hadComments) this.deps.log?.(`shared rules: comments in ${f.folder.label} are not kept when Flutter Intercept writes it`);
+      await this.atomicWrite(f.folder, text);
+      await this.reloadNow();
+    });
+  }
+
+  /** Writes a file inside the workspace folder `folderPath` (atomic, never through a symlink out of it). */
+  writeWorkspaceFile(folderPath: string, rel: string, text: string): Promise<void> {
+    return this.serial(async () => {
+      if (!this.folderStates.length) await this.reloadNow();
+      const f = this.folderStates.find((st) => st.folder.info.path === folderPath);
+      if (!f) throw new Error('That workspace folder is no longer open');
+      const target = path.resolve(folderPath, rel);
+      if (!within(target, folderPath)) throw new Error(`${rel} is outside the workspace folder; not written`);
+      await this.atomicWrite(f.folder, text, target);
     });
   }
 

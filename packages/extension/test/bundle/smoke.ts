@@ -10,6 +10,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { startMcpServer } from '../../src/agent/mcp/server';
 import { toolDescriptions, toolSchemas } from '../../src/agent/schema';
+import { parseYaml } from '../../src/mocks/yaml';
 import type { AgentTools } from '../../src/agent/types';
 
 /**
@@ -120,5 +121,9 @@ async function viaTunnel(proxyPort: number, target: string, path: string): Promi
   await proxy.stop();
   origin.close();
   const mcp = await mcpSmoke();
-  console.log(`[bundle-smoke] ok: bound ${addr.address}, pool active, 5 tunnels -> ${upstreamConns} upstream conn, mock + 502 ok, start ${startMs} ms, ${mcp}`);
+  // PERF-3: js-yaml is bundled as its loader only (build.mjs jsYamlLoaderOnlyPlugin) — the shim must still parse.
+  const y = parseYaml('openapi: 3.1.0\npaths:\n  /a:\n    get: {responses: {200: {description: ok}}}\nlist: &l [1, 2]\ncopy: *l\n', 'smoke.yaml');
+  if (y.problem || JSON.stringify(y.value) !== '{"openapi":"3.1.0","paths":{"/a":{"get":{"responses":{"200":{"description":"ok"}}}}},"list":[1,2],"copy":[1,2]}') fail(`YAML loader shim: ${y.problem ?? JSON.stringify(y.value)}`);
+  if (!parseYaml('a: !!js/function "f"', 'x.yaml').problem) fail('YAML loader shim accepted a custom tag');
+  console.log(`[bundle-smoke] ok: bound ${addr.address}, pool active, 5 tunnels -> ${upstreamConns} upstream conn, mock + 502 ok, start ${startMs} ms, ${mcp}, yaml ok`);
 })().catch((e) => fail(String(e?.stack ?? e)));

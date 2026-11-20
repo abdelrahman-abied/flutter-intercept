@@ -1,0 +1,522 @@
+{
+  "$comment": "CONTRACTS §21 WP0: what the parsers must return for these fixtures. M1/M2 tests compare their output to this (endpoint order, keys, origins, paths, example names / statuses / headers / bodies, variables). problemsContain: each string appears in one problem line; problemCount: the exact number of problems.",
+  "postman": {
+    "input": {
+      "collection": "shop.postman_collection.json",
+      "environment": "shop.postman_environment.json",
+      "linkVariables": {}
+    },
+    "format": "postman",
+    "name": "Shop API",
+    "variables": [
+      {
+        "name": "baseUrl",
+        "from": "environment"
+      },
+      {
+        "name": "apiVersion",
+        "from": "collection"
+      },
+      {
+        "name": "orderId"
+      },
+      {
+        "name": "analyticsHost"
+      }
+    ],
+    "problemCount": 1,
+    "problemsContain": [
+      "Health"
+    ],
+    "endpoints": [
+      {
+        "key": "POST {{baseUrl}}/auth/login",
+        "method": "POST",
+        "name": "Log in",
+        "folder": [
+          "Auth"
+        ],
+        "origin": "https://api.shop.example",
+        "path": [
+          "auth",
+          "login"
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "Success",
+            "status": 200,
+            "headers": {
+              "content-type": "application/json"
+            },
+            "body": "{\n  \"token\": \"abc\",\n  \"user\": { \"id\": 1, \"name\": \"Sara\" }\n}"
+          },
+          {
+            "name": "Wrong password",
+            "status": 401,
+            "headers": {
+              "content-type": "application/json; charset=utf-8"
+            },
+            "body": "{\"error\":\"invalid_credentials\"}"
+          }
+        ]
+      },
+      {
+        "key": "POST {{baseUrl}}/auth/refresh",
+        "method": "POST",
+        "name": "Refresh",
+        "folder": [
+          "Auth"
+        ],
+        "origin": "https://api.shop.example",
+        "path": [
+          "auth",
+          "refresh"
+        ],
+        "unresolved": [],
+        "examples": []
+      },
+      {
+        "key": "GET {{baseUrl}}/users",
+        "method": "GET",
+        "name": "List users",
+        "folder": [
+          "Users"
+        ],
+        "origin": "https://api.shop.example",
+        "path": [
+          "users"
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "Page 1",
+            "status": 200,
+            "headers": {
+              "content-type": "application/json; charset=utf-8"
+            },
+            "body": "[{\"id\":1,\"name\":\"Sara\"},{\"id\":2,\"name\":\"Omar\"}]"
+          },
+          {
+            "name": "Page 2",
+            "status": 200,
+            "headers": {
+              "content-type": "application/json; charset=utf-8"
+            },
+            "body": "[]",
+            "query": {
+              "page": "2"
+            }
+          }
+        ]
+      },
+      {
+        "key": "GET {{baseUrl}}/users/me",
+        "method": "GET",
+        "name": "Me",
+        "folder": [
+          "Users"
+        ],
+        "origin": "https://api.shop.example",
+        "path": [
+          "users",
+          "me"
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "OK",
+            "status": 200,
+            "headers": {
+              "content-type": "application/json; charset=utf-8"
+            },
+            "body": "{\"id\":1,\"name\":\"Sara\"}"
+          }
+        ]
+      },
+      {
+        "key": "GET {{baseUrl}}/users/:id",
+        "method": "GET",
+        "name": "User by id",
+        "folder": [
+          "Users"
+        ],
+        "origin": "https://api.shop.example",
+        "path": [
+          "users",
+          {
+            "param": "id"
+          }
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "Found",
+            "status": 200,
+            "headers": {
+              "content-type": "application/json; charset=utf-8"
+            },
+            "body": "{\"id\":42,\"name\":\"Lina\"}"
+          },
+          {
+            "name": "Not found",
+            "status": 404,
+            "headers": {
+              "content-type": "application/json; charset=utf-8"
+            },
+            "body": "{\"error\":\"not_found\"}"
+          }
+        ]
+      },
+      {
+        "key": "DELETE {{baseUrl}}/users/:id",
+        "method": "DELETE",
+        "name": "Delete user",
+        "folder": [
+          "Users"
+        ],
+        "origin": "https://api.shop.example",
+        "path": [
+          "users",
+          {
+            "param": "id"
+          }
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "No content",
+            "status": 204,
+            "headers": {},
+            "body": ""
+          }
+        ]
+      },
+      {
+        "key": "GET {{baseUrl}}/{{apiVersion}}/orders/{{orderId}}/items",
+        "method": "GET",
+        "name": "Order items",
+        "folder": [
+          "Users",
+          "Orders"
+        ],
+        "origin": "https://api.shop.example",
+        "path": [
+          "v2",
+          "orders",
+          {
+            "param": "orderId"
+          },
+          "items"
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "OK",
+            "status": 200,
+            "headers": {
+              "content-type": "application/json; charset=utf-8"
+            },
+            "body": "[{\"sku\":\"A1\",\"qty\":2}]"
+          }
+        ]
+      },
+      {
+        "key": "GET https://CDN.shop.example:443/config.json",
+        "method": "GET",
+        "name": "Remote config",
+        "folder": [],
+        "origin": "https://cdn.shop.example",
+        "path": [
+          "config.json"
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "OK",
+            "status": 200,
+            "headers": {
+              "content-type": "application/json",
+              "x-tag": "a, b",
+              "set-cookie": "a=1"
+            },
+            "body": "{\"theme\":\"dark\"}"
+          }
+        ]
+      },
+      {
+        "key": "GET {{baseUrl}}/health",
+        "method": "GET",
+        "name": "Health",
+        "folder": [],
+        "origin": "https://api.shop.example",
+        "path": [
+          "health"
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "Up",
+            "status": 200,
+            "headers": {
+              "content-type": "text/plain; charset=utf-8"
+            },
+            "body": "ok"
+          }
+        ]
+      },
+      {
+        "key": "GET {{baseUrl}}/health #2",
+        "method": "GET",
+        "name": "Health (copy)",
+        "folder": [],
+        "origin": "https://api.shop.example",
+        "path": [
+          "health"
+        ],
+        "unresolved": [],
+        "examples": []
+      },
+      {
+        "key": "POST {{analyticsHost}}/collect",
+        "method": "POST",
+        "name": "Analytics",
+        "folder": [],
+        "path": [
+          "collect"
+        ],
+        "unresolved": [
+          "analyticsHost"
+        ],
+        "examples": [
+          {
+            "name": "Accepted",
+            "status": 202,
+            "headers": {},
+            "body": ""
+          }
+        ]
+      }
+    ]
+  },
+  "environment": {
+    "input": "shop.postman_environment.json",
+    "values": {
+      "baseUrl": "https://api.shop.example",
+      "token": "env-token-must-never-leave-the-host"
+    }
+  },
+  "sanitise": {
+    "input": "shop.postman_collection.json",
+    "mustNotContain": [
+      "collection-token-should-be-removed",
+      "another-secret-value",
+      "live-key-123",
+      "refresh-token-literal",
+      "literal-in-header",
+      "pm.environment.set",
+      "hunter2"
+    ],
+    "mustContain": [
+      "\\\"token\\\": \\\"abc\\\"",
+      "invalid_credentials",
+      "{{baseUrl}}/auth/login",
+      "Wrong password",
+      "sara@example.com"
+    ]
+  },
+  "openapi": {
+    "input": {
+      "document": "shop.openapi.json",
+      "linkVariables": {}
+    },
+    "format": "openapi",
+    "name": "Shop API",
+    "variables": [
+      {
+        "name": "region",
+        "from": "server"
+      }
+    ],
+    "problemCount": 2,
+    "problemsContain": [
+      "legacy.yaml",
+      "externalValue"
+    ],
+    "endpoints": [
+      {
+        "key": "GET /users",
+        "method": "GET",
+        "name": "listUsers",
+        "folder": [
+          "Users"
+        ],
+        "origin": "https://api.shop.example",
+        "path": [
+          "v1",
+          "users"
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "200 · two users",
+            "status": 200,
+            "headers": {
+              "content-type": "application/json"
+            },
+            "body": "[\n  {\n    \"id\": 1,\n    \"name\": \"Sara\"\n  },\n  {\n    \"id\": 2,\n    \"name\": \"Omar\"\n  }\n]"
+          },
+          {
+            "name": "200 · empty",
+            "status": 200,
+            "headers": {
+              "content-type": "application/json"
+            },
+            "body": "[]"
+          }
+        ]
+      },
+      {
+        "key": "GET /users/{id}",
+        "method": "GET",
+        "name": "getUser",
+        "folder": [
+          "Users"
+        ],
+        "origin": "https://api.shop.example",
+        "path": [
+          "v1",
+          "users",
+          {
+            "param": "id"
+          }
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "200",
+            "status": 200,
+            "headers": {
+              "content-type": "application/json"
+            },
+            "body": "{\n  \"id\": 1,\n  \"name\": \"string\",\n  \"email\": \"user@example.com\",\n  \"role\": \"admin\",\n  \"createdAt\": \"2026-01-01T00:00:00Z\",\n  \"address\": {\n    \"city\": \"Cairo\",\n    \"zip\": \"str\"\n  },\n  \"manager\": null,\n  \"tags\": [\n    \"string\",\n    \"string\"\n  ]\n}",
+            "generated": true
+          },
+          {
+            "name": "404",
+            "status": 404,
+            "headers": {
+              "content-type": "application/json"
+            },
+            "body": "{\n  \"code\": 0,\n  \"message\": \"stringst\"\n}",
+            "generated": true
+          }
+        ]
+      },
+      {
+        "key": "DELETE /users/{id}",
+        "method": "DELETE",
+        "name": "Delete a user",
+        "folder": [],
+        "origin": "https://api.shop.example",
+        "path": [
+          "v1",
+          "users",
+          {
+            "param": "id"
+          }
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "204",
+            "status": 204,
+            "headers": {},
+            "body": ""
+          }
+        ]
+      },
+      {
+        "key": "POST /orders",
+        "method": "POST",
+        "name": "createOrder",
+        "folder": [
+          "Orders"
+        ],
+        "origin": "https://orders.shop.example",
+        "path": [
+          "orders"
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "201",
+            "status": 201,
+            "headers": {
+              "content-type": "application/json",
+              "location": "/orders/7"
+            },
+            "body": "{\n  \"id\": 7,\n  \"status\": \"pending\"\n}"
+          },
+          {
+            "name": "default",
+            "status": 500,
+            "headers": {
+              "content-type": "application/problem+json"
+            },
+            "body": "{\n  \"code\": 0,\n  \"message\": \"stringst\"\n}",
+            "generated": true
+          }
+        ]
+      },
+      {
+        "key": "GET /health",
+        "method": "GET",
+        "name": "GET /health",
+        "folder": [],
+        "origin": "https://api.shop.example",
+        "path": [
+          "v1",
+          "health"
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "2XX",
+            "status": 200,
+            "headers": {
+              "content-type": "text/plain"
+            },
+            "body": "ok"
+          }
+        ]
+      },
+      {
+        "key": "GET /reports/{year}",
+        "method": "GET",
+        "name": "report",
+        "folder": [],
+        "origin": "https://api.shop.example",
+        "path": [
+          "v1",
+          "reports",
+          {
+            "param": "year"
+          }
+        ],
+        "unresolved": [],
+        "examples": [
+          {
+            "name": "200",
+            "status": 200,
+            "headers": {
+              "content-type": "application/pdf"
+            },
+            "body": "",
+            "generated": true
+          }
+        ]
+      }
+    ]
+  }
+}

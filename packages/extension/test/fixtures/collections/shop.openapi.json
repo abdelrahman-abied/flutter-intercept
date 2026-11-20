@@ -1,0 +1,121 @@
+{
+  "openapi": "3.1.0",
+  "info": { "title": "Shop API", "version": "1.0.0" },
+  "servers": [
+    { "url": "https://{region}.shop.example/v1", "variables": { "region": { "default": "api", "enum": ["api", "eu"] } } },
+    { "url": "https://staging.shop.example/v1" }
+  ],
+  "paths": {
+    "/users": {
+      "get": {
+        "operationId": "listUsers",
+        "tags": ["Users", "Admin"],
+        "responses": {
+          "200": {
+            "description": "Users",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/User" } },
+                "examples": {
+                  "two users": { "value": [{ "id": 1, "name": "Sara" }, { "id": 2, "name": "Omar" }] },
+                  "empty": { "value": [] }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{id}": {
+      "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+      "get": {
+        "operationId": "getUser",
+        "tags": ["Users"],
+        "responses": {
+          "200": { "description": "A user", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/User" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a user",
+        "responses": { "204": { "description": "Deleted" } }
+      }
+    },
+    "/orders": {
+      "post": {
+        "operationId": "createOrder",
+        "tags": ["Orders"],
+        "servers": [{ "url": "https://orders.shop.example" }],
+        "responses": {
+          "201": {
+            "description": "Created",
+            "headers": { "Location": { "schema": { "type": "string" }, "example": "/orders/7" } },
+            "content": { "application/json": { "example": { "id": 7, "status": "pending" } } }
+          },
+          "default": {
+            "description": "Error",
+            "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": { "responses": { "2XX": { "description": "Up", "content": { "text/plain": { "example": "ok" } } } } }
+    },
+    "/reports/{year}": {
+      "get": {
+        "operationId": "report",
+        "responses": {
+          "200": {
+            "description": "PDF",
+            "content": {
+              "application/pdf": {
+                "schema": { "type": "string", "format": "binary" },
+                "examples": { "sample": { "externalValue": "https://files.shop.example/report.pdf" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/legacy": { "$ref": "legacy.yaml#/paths/~1legacy" }
+  },
+  "components": {
+    "schemas": {
+      "User": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id": { "type": "integer", "minimum": 1 },
+          "name": { "type": "string" },
+          "email": { "type": "string", "format": "email" },
+          "role": { "enum": ["admin", "member"] },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "address": { "$ref": "#/components/schemas/Address" },
+          "manager": { "oneOf": [{ "$ref": "#/components/schemas/User" }, { "type": "null" }] },
+          "password": { "type": "string", "writeOnly": true },
+          "tags": { "type": "array", "items": { "type": "string" }, "minItems": 2 }
+        }
+      },
+      "Address": {
+        "type": "object",
+        "properties": {
+          "city": { "type": "string", "default": "Cairo" },
+          "zip": { "type": ["string", "null"], "maxLength": 3 }
+        }
+      },
+      "Error": {
+        "allOf": [
+          { "type": "object", "properties": { "code": { "type": "integer" } } },
+          { "type": "object", "properties": { "message": { "type": "string", "minLength": 8 } } }
+        ]
+      }
+    },
+    "responses": {
+      "NotFound": {
+        "description": "Not found",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    }
+  }
+}

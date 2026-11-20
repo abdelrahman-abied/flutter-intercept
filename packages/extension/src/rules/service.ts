@@ -15,10 +15,11 @@ import type { Rule } from '@flutter-intercept/proxy';
 import type { SharedRulesService, SharedRulesState } from './types';
 import type { RulesFs } from './bodyFile';
 import type { ValidateRule } from './file';
-import { PendingSnapshot, SharedRulesCore, SharedRulesStatus } from './core';
+import { FolderCollectionLinks, PendingSnapshot, SharedRulesCore, SharedRulesStatus } from './core';
+import type { CollectionLink } from '../mocks/types';
 
 export { mergeRules, toPersonalRule } from './core';
-export type { PendingItem, PendingScript, PendingSnapshot } from './core';
+export type { FolderCollectionLinks, PendingItem, PendingScript, PendingSnapshot } from './core';
 export { isSharedRuleId } from './file';
 
 export interface SharedRulesDeps {
@@ -86,6 +87,16 @@ export interface SharedRulesHost extends SharedRulesService, vscode.Disposable {
   files(): { path: string; label: string; folder: string }[];
   /** Re-reads the files now. */
   reload(): Promise<void>;
+  /** CONTRACTS §21.6: the `collections` of every shared file, primary folder first. */
+  collectionLinks(): FolderCollectionLinks[];
+  /** Fires when any file's `collections` changed (edits, git checkouts, `saveCollections`). */
+  onDidChangeCollections(listener: () => void): vscode.Disposable;
+  /** The folder new links go to (primary), undefined without a workspace folder. */
+  primaryFolderPath(): Promise<string | undefined>;
+  /** Makes `links` the `collections` of the file in `folderPath`; rules and other keys are kept as they are. */
+  saveCollections(folderPath: string, links: CollectionLink[]): Promise<void>;
+  /** Writes a workspace file atomically, never through a symlink that leaves the folder (collection copies). */
+  writeWorkspaceFile(folderPath: string, rel: string, text: string): Promise<void>;
 }
 
 export const nodeRulesFs: RulesFs = {
@@ -109,7 +120,9 @@ export function createSharedRulesService(deps: SharedRulesDeps): SharedRulesHost
   const debounceMs = deps.debounceMs ?? 300;
   const changed = new vscode.EventEmitter<SharedRulesState>();
   const bodyChanged = new vscode.EventEmitter<string>();
-  const disposables: vscode.Disposable[] = [changed, bodyChanged];
+  const linksChanged = new vscode.EventEmitter<void>();
+  const disposables: vscode.Disposable[] = [changed, bodyChanged, linksChanged];
+  const linksKey = () => JSON.stringify(core.collectionLinks());
   let disposed = false;
 
   // REVIEW-6 #12: a body file path may contain glob characters ("[id].json", "**"), so it is never used as a glob:
@@ -170,8 +183,10 @@ export function createSharedRulesService(deps: SharedRulesDeps): SharedRulesHost
 
   const reload = async () => {
     if (disposed) return;
+    const linksBefore = linksKey();
     try {
       if (await core.reload()) changed.fire(core.state());
+      if (linksKey() !== linksBefore) linksChanged.fire();
     } catch (e) {
       log(`shared rules: reload failed: ${(e as Error).message}`);
     }
@@ -209,10 +224,12 @@ export function createSharedRulesService(deps: SharedRulesDeps): SharedRulesHost
 
   const after = async <T>(p: Promise<T>): Promise<T> => {
     const before = JSON.stringify(core.state());
+    const linksBefore = linksKey();
     try {
       return await p;
     } finally {
       if (JSON.stringify(core.state()) !== before) changed.fire(core.state());
+      if (linksKey() !== linksBefore) linksChanged.fire();
     }
   };
 
@@ -245,6 +262,11 @@ export function createSharedRulesService(deps: SharedRulesDeps): SharedRulesHost
     checkScriptFileContent: (code) => core.checkScriptFileContent(code),
     bodyFilePath: (bodyFile, ruleId) => core.bodyFilePath(bodyFile, ruleId),
     reload,
+    collectionLinks: () => core.collectionLinks(),
+    onDidChangeCollections: (listener) => linksChanged.event(listener),
+    primaryFolderPath: () => core.primaryFolderPath(),
+    saveCollections: (folderPath, links) => after(core.saveCollections(folderPath, links)),
+    writeWorkspaceFile: (folderPath, rel, text) => core.writeWorkspaceFile(folderPath, rel, text),
     dispose: () => {
       disposed = true;
       clearTimeout(timer);

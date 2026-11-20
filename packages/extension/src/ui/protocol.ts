@@ -33,6 +33,8 @@ export interface Status {
   autoPassthrough?: boolean;            // CONTRACTS §20.7: false = servers are never passed through on their own
   /** CONTRACTS §16.4: gRPC interception and the schema read from the app's generated `*.pb*.dart`. */
   grpc?: GrpcStatus;
+  /** CONTRACTS §21.8: collections linked in the shared file. */
+  collections?: CollectionStatus[];
 }
 
 export interface AgentStatus {
@@ -64,7 +66,10 @@ export type HostMsg =
   | { type: 'grpcDecoded'; id: string; decoded: GrpcDecoded }          // answer to 'decodeGrpc'
   // CONTRACTS §20.3 (never a path, never the passphrase)
   | { type: 'clientCertificateFile'; role: ClientCertFileRole; file?: { token: string; name: string }; problem?: string } // answer to 'chooseClientCertificateFile'; no file + no problem = cancelled
-  | { type: 'clientCertificateSaved'; host: string; problem?: string }; // answer to 'addClientCertificate'
+  | { type: 'clientCertificateSaved'; host: string; problem?: string } // answer to 'addClientCertificate'
+  // CONTRACTS §21.8
+  | { type: 'collectionEndpoints'; id: string; endpoints: CollectionEndpointView[] }   // answer to 'getCollectionEndpoints'
+  | { type: 'collectionExample'; id: string; endpoint: string; name: string; status: number; headers: Record<string, string>; body: string; truncated?: true }; // ≤ 256 KB body
 
 // webview → host
 export type ViewMsg =
@@ -106,7 +111,15 @@ export type ViewMsg =
   | { type: 'chooseClientCertificateFile'; role: ClientCertFileRole }   // host answers 'clientCertificateFile'
   | { type: 'addClientCertificate'; host: string; pfx?: string; cert?: string; key?: string; passphrase?: string } // file tokens; host answers 'clientCertificateSaved'
   | { type: 'removeClientCertificate'; host: string }
-  | { type: 'forgetLearnedPassthrough'; host?: string; port?: number }; // none = all
+  | { type: 'forgetLearnedPassthrough'; host?: string; port?: number } // none = all
+  // CONTRACTS §21.8
+  | { type: 'importCollection' }                                       // host opens the IDE's file picker
+  | { type: 'getCollectionEndpoints'; id: string }
+  | { type: 'getCollectionExample'; id: string; endpoint: string; name: string }
+  | { type: 'updateCollection'; id: string; patch: CollectionPatch }
+  | { type: 'removeCollection'; id: string }                           // the IDE confirms; the collection file is kept
+  | { type: 'collectionToRule'; id: string; endpoint: string }
+  | { type: 'approveCollection'; id: string };                         // CONTRACTS §21.16: the IDE asks (modal)        // opens the rule editor with a personal copy
 
 /** CONTRACTS §20.3: which file the picker is for. */
 export type ClientCertFileRole = 'pfx' | 'cert' | 'key';
@@ -179,4 +192,57 @@ export interface GrpcDecodedMessage {
   size: number;
   truncated?: true;
   error?: string;
+}
+
+/** CONTRACTS §21.8: a collection linked in the shared file, as the panel shows it (names and origins, never values). */
+export interface CollectionStatus {
+  id: string;
+  name: string;
+  file: string;
+  format?: 'postman' | 'openapi';
+  enabled: boolean;
+  unmatched: 'passthrough' | 'fail';
+  endpoints: number;
+  mocked: number;
+  noExample: number;
+  generated: number;
+  off: number;
+  unresolved: string[];
+  origins: string[];
+  problems: string[];
+  /** CONTRACTS §21.16: answers served limited (risky headers / types removed) until the user approves the collection. */
+  limited?: { reasons: string[]; answers: number };
+  /** CONTRACTS §21.15: this user's own overlay entries in effect (selected / off / unmatched). */
+  overrides: number;
+  /** CONTRACTS §21.15: from this session's traffic to the collection's origins (top 20 each, most frequent first). */
+  seen?: { notInCollection: { method: string; path: string; count: number }[]; noExample: { endpoint: string; count: number }[] };
+}
+
+/** CONTRACTS §21.8: one endpoint of a collection (url = origin + path, params as `:name`). */
+export interface CollectionEndpointView {
+  key: string;
+  method: string;
+  name: string;
+  folder: string[];
+  url: string;
+  examples: { name: string; status: number; generated?: true; query?: Record<string, string> }[];
+  selected?: string;
+  off?: true;
+  unresolved?: string[];
+  /** CONTRACTS §21.15: `selected` / `off` come from this user's overlay. */
+  overridden?: true;
+}
+
+/** CONTRACTS §21.7: what `updateCollection` may change (one or more). */
+export interface CollectionPatch {
+  enabled?: boolean;
+  unmatched?: 'passthrough' | 'fail';
+  variable?: { name: string; value: string };
+  example?: { endpoint: string; name: string };
+  off?: { endpoint: string; off: boolean };
+  /** CONTRACTS §21.15: 'me' (default) = this user's overlay; 'team' = the shared file. `variable` is always 'team'. */
+  scope?: 'me' | 'team';
+  /** CONTRACTS §21.15 (scope 'me'): clear this user's overlay — the whole collection, or one endpoint with `endpoint`. */
+  reset?: true;
+  endpoint?: string;
 }

@@ -72,6 +72,7 @@ import { mapRemoteSelfProblem } from '../proxyHost';
 import { createViewHandlers, type ViewHandlers } from './handlers';
 import { LEARNED_SHOWN_MAX } from '@flutter-intercept/proxy/learned-meta';
 import type { ClientCertUi } from './clientCertUi';
+import type { MockCollectionsHost } from '../mocks/service';
 import type { AgentStatus, AuthFlowSummary, ContractSummary, ExportFormat, GrpcDecoded, GrpcStatus, HostMsg, SessionWarning, Status, ViewMsg } from './protocol';
 
 export type { GrpcDecoded, GrpcDecodedMessage, GrpcStatus } from './protocol';
@@ -158,7 +159,20 @@ export interface ControllerHost {
   readonly simulatorTrust?: NonNullable<Status['grpc']>['simulatorTrust'];
   /** REVIEW-12 #1 (InterceptProxyHost.ownListeners): the proxy's own ports / LAN address — Map Remote may not target them. */
   readonly ownListeners?: { ports: number[]; hosts: string[] };
+  /** CONTRACTS §21.5 (InterceptProxyHost.setCollectionRules): rules after the user's, never in `getRules()`. */
+  setCollectionRules?(rules: Rule[]): void;
 }
+
+/** CONTRACTS §21.7: what the controller needs of the collections service (src/mocks/service.ts). */
+export type CollectionsDeps = Pick<
+  MockCollectionsHost,
+  'state' | 'rules' | 'fileProblems' | 'onDidChange' | 'endpoints' | 'example' | 'toRule' | 'update' | 'removeWithConfirmation' | 'importInteractive'
+> &
+  /** CONTRACTS §21.16: the IDE's approval prompt (absent in hosts that have none: `approveCollection` answers an error). */
+  Partial<Pick<MockCollectionsHost, 'approveWithConfirmation'>>;
+
+/** CONTRACTS §21.8: collections the panel opened since its last `ready` whose endpoints are pushed on changes. */
+export const MAX_WATCHED_COLLECTIONS = 20;
 
 /**
  * CONTRACTS §12.1: what the controller needs of SharedRulesService. `save` keeps held-back (pending) and invalid
@@ -220,6 +234,8 @@ export interface ControllerDeps {
   shared?: SharedRulesDeps;
   /** Recordings (src/recordings/**). */
   recordings?: RecordingService;
+  /** CONTRACTS §21.7: mock from a collection (src/mocks/service.ts). Without it the §21.8 messages answer an `error`. */
+  collections?: CollectionsDeps;
   /** CONTRACTS §20.3: adding / removing client certificates from the panel. Absent → those messages answer with an `error`. */
   clientCertUi?: ClientCertUi;
   /** Opens a side-by-side diff of two recordings (`vscode.diff` over `RecordingService.diffText`). */
@@ -366,6 +382,9 @@ export class InterceptController {
     deps.host.on('autoPassthrough', () => this.broadcastStatus());
     deps.host.on('grpc', () => this.broadcastStatus());
     this.grpcSub = deps.grpc?.onDidChange?.(() => this.broadcastStatus());
+    // CONTRACTS §21.5 / §21.8
+    this.collectionsSub = deps.collections?.onDidChange(() => this.onCollectionsChanged());
+    if (deps.collections) deps.host.setCollectionRules?.(this.collectionRules());
     this.modelsSub = deps.contract?.onDidChangeModels(() => this.recheckContracts());
   }
 
@@ -396,6 +415,7 @@ export class InterceptController {
       ...(this.deps.host.warnings?.length ? { warnings: this.deps.host.warnings } : {}),
       ...this.replayStatus(),
       ...this.sharedStatus(),
+      ...this.collectionsStatus(),
       ...this.upstreamStatus(),
       ...this.tlsStatus(),
       ...this.grpcStatus(),
@@ -486,7 +506,17 @@ export class InterceptController {
     } catch (e) {
       this.deps.log?.(`shared rules state failed: ${e instanceof Error ? e.message : String(e)}`);
     }
-    const s = sharedRulesStatus(st);
+    let s = sharedRulesStatus(st);
+    // CONTRACTS §21.6: problems of the file's `collections` entries are problems of the file
+    let linkProblems: string[] = [];
+    try {
+      linkProblems = this.deps.collections?.fileProblems() ?? [];
+    } catch (e) {
+      this.deps.log?.(`collection link problems failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (linkProblems.length) {
+      s = s ? { ...s, problems: [...s.problems, ...linkProblems].slice(0, 50) } : { count: 0, problems: linkProblems.slice(0, 50), pendingApproval: 0 };
+    }
     if (!s) return {};
     if (s.pendingApproval > 0 && this.deps.shared?.pendingReasons) {
       try {
@@ -526,6 +556,74 @@ export class InterceptController {
   }
 
   private grpcSub?: { dispose(): void };
+  private collectionsSub?: { dispose(): void };
+  /** CONTRACTS §21.8: ids the panel asked endpoints for since its last `ready` (most recent last). */
+  private watchedCollections: string[] = [];
+  /** The endpoints last pushed per watched id (nothing is sent when they didn't change). */
+  private pushedEndpoints = new Map<string, string>();
+
+  private collectionRules(): Rule[] {
+    try {
+      return this.deps.collections?.rules() ?? [];
+    } catch (e) {
+      this.deps.log?.(`collection rules failed: ${e instanceof Error ? e.message : String(e)}`);
+      return [];
+    }
+  }
+
+  /** The collections reloaded or changed: new rules to the proxy, the status, fresh endpoints for open collections. */
+  private onCollectionsChanged(): void {
+    this.deps.host.setCollectionRules?.(this.collectionRules());
+    this.broadcastStatus();
+    this.pushCollectionEndpoints();
+  }
+
+  /** @internal (handlers) `ready`: the panel starts over, nothing is open. */
+  resetCollectionViews(): void {
+    this.watchedCollections = [];
+    this.pushedEndpoints.clear();
+  }
+
+  /** @internal (handlers) `getCollectionEndpoints`: remember the id (at most MAX_WATCHED_COLLECTIONS) and answer. */
+  watchCollection(id: string, reply: Sink): void {
+    const endpoints = this.deps.collections!.endpoints(id);
+    this.watchedCollections = [...this.watchedCollections.filter((x) => x !== id), id].slice(-MAX_WATCHED_COLLECTIONS);
+    for (const k of [...this.pushedEndpoints.keys()]) if (!this.watchedCollections.includes(k)) this.pushedEndpoints.delete(k);
+    this.pushedEndpoints.set(id, JSON.stringify(endpoints));
+    this.send(reply, { type: 'collectionEndpoints', id, endpoints });
+  }
+
+  private pushCollectionEndpoints(): void {
+    const c = this.deps.collections;
+    if (!c) return;
+    for (const id of [...this.watchedCollections]) {
+      let endpoints;
+      try {
+        endpoints = c.endpoints(id);
+      } catch {
+        // removed (or renamed) since: stop pushing it
+        this.watchedCollections = this.watchedCollections.filter((x) => x !== id);
+        this.pushedEndpoints.delete(id);
+        continue;
+      }
+      const json = JSON.stringify(endpoints);
+      if (this.pushedEndpoints.get(id) === json) continue;
+      this.pushedEndpoints.set(id, json);
+      this.broadcast({ type: 'collectionEndpoints', id, endpoints });
+    }
+  }
+
+  /** CONTRACTS §21.8: `Status.collections` (only with the collections service wired; [] = none linked). */
+  private collectionsStatus(): Pick<Status, 'collections'> {
+    const c = this.deps.collections;
+    if (!c) return {};
+    try {
+      return { collections: c.state() };
+    } catch (e) {
+      this.deps.log?.(`collections state failed: ${e instanceof Error ? e.message : String(e)}`);
+      return { collections: [] };
+    }
+  }
 
   snapshot(): HostMsg {
     return { type: 'snapshot', exchanges: this.deps.host.getExchanges().map(uiExchange), rules: this.rulesView(), status: this.status() };
@@ -894,6 +992,7 @@ export class InterceptController {
     this.contractGen++;
     this.modelsSub?.dispose();
     this.grpcSub?.dispose();
+    this.collectionsSub?.dispose();
     if (this.authTimer) clearTimeout(this.authTimer);
     this.authTimer = undefined;
     this.sinks.clear();

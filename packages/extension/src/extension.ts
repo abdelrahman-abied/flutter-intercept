@@ -44,6 +44,8 @@ import { analyzeAuth } from './analysis/auth';
 import { createRecordingService } from './recordings/store';
 import { disposeRecordingDiffs, openRecordingDiff } from './recordings/vscodeDiff';
 import { createSharedRulesService } from './rules/service';
+import { createMockCollectionsService } from './mocks/service';
+import { collectionParsers } from './mocks/parsers';
 import { toOpenApi, toPostman } from './export';
 import { registerNotifications } from './notify';
 import { clientCertHosts, loadClientCertificates, PASSPHRASE_SECRET_PREFIX, passphraseSecretKey } from './ui/clientCerts';
@@ -291,6 +293,31 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
   proxyHost.setBodyFileResolver((p, id) => shared.resolveBodyFile(p, id));
   proxyHost.setScriptFileResolver((p, id) => shared.resolveScriptFile(p, id));
   context.subscriptions.push(shared.onDidChangeBodyFile((p) => proxyHost.refreshBodyFiles(p)));
+  // CONTRACTS §21: mock from a collection (links in the shared file; rules go to the proxy after the user's)
+  const collections = createMockCollectionsService({
+    shared,
+    workspaceState: context.workspaceState,
+    parsers: collectionParsers,
+    newRuleId: () => `rule_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    log,
+    seenOrigins: () => {
+      const out = new Set<string>();
+      for (const e of proxyHost.getExchanges()) {
+        try {
+          const u = new URL(e.url);
+          if (u.protocol === 'http:' || u.protocol === 'https:') out.add(`${u.protocol}//${u.host}`);
+        } catch {
+          // not an absolute URL
+        }
+        if (out.size >= 20) break;
+      }
+      return [...out];
+    },
+    // CONTRACTS §21.15 #4 (`seen`) and REVIEW-15 #8 (hosts passed through without decryption aren't mocked)
+    exchanges: () => proxyHost.getExchanges(),
+    passthroughHosts: () => [...proxyHost.learnedPassthrough.map((l) => `${l.host}:${l.port}`), ...proxyHost.tlsPassthrough],
+  });
+  context.subscriptions.push(collections);
   context.subscriptions.push({ dispose: disposeRecordingDiffs });
   let upstreamProblemShown: string | undefined;
   const applyUpstreamProxy = () => {
@@ -584,6 +611,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     recordings,
     openDiff: (a, b) => openRecordingDiff(a, b),
     analyzeAuth: (ex) => analyzeAuth(ex),
+    collections,
   });
   void shared.ready.then(async () => {
     await shared.setPersonalRules(controller.personalRules()); // REVIEW-7 #1: personal script files need approval too
@@ -666,6 +694,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     resolveFrames: (frames) => resolveFrames(frames, flutterProjectRoots()),
     recordings,
     recordingsChanged: () => void controller.refreshRecordings(),
+    collections, // CONTRACTS §21.10
     analyzeAuth: (ex) => analyzeAuth(ex),
     contract,
     contractResult: (id) => controller.contractResult(id),
@@ -813,6 +842,7 @@ export function activate(context: vscode.ExtensionContext): FlutterInterceptApi 
     vscode.commands.registerCommand('flutterIntercept.openInNewWindow', () => editorPanel.openInNewWindow()),
     vscode.commands.registerCommand('flutterIntercept.exportOpenApi', () => exportCommand('openapi')),
     vscode.commands.registerCommand('flutterIntercept.exportPostman', () => exportCommand('postman')),
+    vscode.commands.registerCommand('flutterIntercept.importCollection', () => collections.importInteractive()),
     vscode.commands.registerCommand('flutterIntercept.clear', () => controller.clear()),
     vscode.commands.registerCommand('flutterIntercept.debugWithIntercept', () => debugWithIntercept(deps)),
   );
