@@ -110,6 +110,7 @@ export function describeAction(a: RuleAction): string {
     case 'rewrite': return describeRewrite(a);
     case 'script': return describeScript(a);
     case 'grpcMock': return describeGrpcMock(a);
+    case 'handler': return 'Stateful mock (collection)';
   }
 }
 

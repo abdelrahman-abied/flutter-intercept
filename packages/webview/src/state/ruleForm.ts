@@ -464,6 +464,9 @@ export function fieldsToAction(kind: Exclude<RuleAction['kind'], 'sequence'> | S
       if (f.grpcGapMs.trim() && Number(f.grpcGapMs) > 0) action.gapMs = Number(f.grpcGapMs);
       return action;
     }
+    case 'handler':
+      // CONTRACTS §22.1: host-built only (collection resources); the editor never offers it.
+      throw new Error('A stateful mock rule is built by the collection and can\'t be edited here.');
   }
 }
 

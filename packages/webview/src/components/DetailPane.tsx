@@ -3,6 +3,7 @@ import { useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Exchange } from '../protocol';
 import { clipName, collectionIdFromRuleId, isNoExampleExchange, limitedRemoved, noExampleCollectionName } from '../collections';
+import { authNoteOfExchange, STATEFUL_SIMULATED, storeOpOfExchange } from '../store';
 import { clientGaveUp, describeAction, findExchange, initiatorLabel, isAgentRule, ruleDisplayName } from '../state';
 import { formatBytes, formatDuration, formatTime, fullFrameLocation, isFrameworkFrame, isPaused, shortFrameLocation } from '../util';
 import { normalizePath } from '../jsonpath';
@@ -46,6 +47,14 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
   const ruleIndex = rule ? state.rules.indexOf(rule) : -1;
   const colId = !rule ? collectionIdFromRuleId(ex.matchedRuleId) : undefined;
   const matchedCol = colId ? state.status.collections?.find((c) => c.id === colId) : undefined;
+  // CONTRACTS §22.11: what the collection's data did ("created users 7"), on the collection's own line.
+  const storeOp = matchedCol ? storeOpOfExchange(ex, state.status.collections) : undefined;
+  // CONTRACTS §24.1: what sign-in did ("needs sign-in (no token)"), on the same line — never a second banner.
+  const signIn = matchedCol ? authNoteOfExchange(ex) : undefined;
+  const notes = storeOp?.note !== undefined || signIn
+    ? ex.notes?.filter((n) => n !== storeOp?.note && n !== signIn?.note)
+    : ex.notes;
+  const stateful = !!storeOp && ex.simulated === STATEFUL_SIMULATED;
   const actions = useExchangeActions(ex);
   const create = actions.createRule;
   const sentBy = initiatorLabel(ex);
@@ -130,9 +139,12 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             {!rule && matchedCol && (
               <>
                 {' · '}
+                {(storeOp || signIn) && 'Answered by '}
                 <button type="button" class="link" onClick={() => dispatch({ type: 'setView', view: 'collections' })}>
                   collection “{clipName(matchedCol.name)}”
                 </button>
+                {signIn && <span class="store-op sign-in-op">{' · '}{signIn.text}</span>}
+                {storeOp && <span class="store-op">{' · '}{storeOp.text}</span>}
               </>
             )}
             {!rule && !matchedCol && ex.matchedRuleId && ' · matched a rule that no longer exists'}
@@ -147,7 +159,7 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
                   : ' from an exchange no longer listed')}
               </>
             )}
-            {ex.simulated && (
+            {ex.simulated && !stateful && (
               <>
                 {' · '}
                 <span class="badge sim-badge" title="A throttle / fault rule or the network profile affected this exchange">simulated</span>{' '}
@@ -225,10 +237,10 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
             </div>
           );
         })()}
-        {ex.notes && ex.notes.length > 0 && (
+        {notes && notes.length > 0 && (
           // CONTRACTS §19.4: informational notes (never errors) — e.g. "mutate: no schema for /pkg.Svc/Method".
           <ul class="msg info exchange-notes" aria-label="Notes">
-            {ex.notes.map((n, i) => <li key={i}>{n}</li>)}
+            {notes.map((n, i) => <li key={i}>{n}</li>)}
           </ul>
         )}
         {ex.scriptLog && ex.scriptLog.length > 0 && <ScriptLog key={ex.id} ex={ex} />}

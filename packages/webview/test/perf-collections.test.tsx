@@ -4,6 +4,7 @@ import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { filterEndpoints } from '../src/collections';
+import { driftedEndpoints, DRIFT_VIEW_LIMITS } from '../src/drift';
 import { App } from '../src/components/App';
 import type { Host } from '../src/host';
 import type { CollectionEndpointView, CollectionStatus, HostMsg } from '../src/protocol';
@@ -125,5 +126,52 @@ describe('collections at scale: 2000 endpoints (CONTRACTS §21.9)', () => {
       more.click();
     });
     expect(root.querySelectorAll('.ep-item').length).toBe(300);
+  });
+});
+
+// CONTRACTS §23.3 / §24.2: every one of 2000 endpoints out of date (20 changes each) with examples chosen by the
+// request's body — the rows stay capped, the "Out of date" list shows 20 endpoints, and opening it stays quick.
+describe('2000 endpoints, all out of date (CONTRACTS §23.3)', () => {
+  const endpoints: CollectionEndpointView[] = buildEndpoints(2000).map((ep) => ({
+    ...ep,
+    examples: [
+      { name: 'Success', status: 200 },
+      { name: 'Refused', status: 403, byBody: ['role', 'tenant', 'region', 'plan'] },
+    ],
+    drift: [{
+      endpoint: ep.key, status: 200, samples: 5, since: 1_700_000_000_000,
+      changes: Array.from({ length: 20 }, (_, j) => ({ kind: 'added' as const, path: `data.items[].field${j}`, to: 'string' })),
+    }],
+  }));
+  const staleStatus: CollectionStatus = { ...bigStatus, drift: { endpoints: 2000, line: 'GET /v1/r0/item_0 now has data.items[].field0 (and 39999 more)' } };
+
+  it('finds the out-of-date endpoints of 2000 in under 20 ms', () => {
+    const ms = median(() => { expect(driftedEndpoints(endpoints)).toHaveLength(2000); });
+    console.log(`[collections perf] driftedEndpoints (2000 × 20 changes): ${ms.toFixed(2)} ms`);
+    expect(ms).toBeLessThan(20);
+  });
+
+  it('rows and the "Out of date" list render capped; opening the list < 50 ms', async () => {
+    await act(() => { render(<App host={host} />, root); });
+    await emit({ type: 'snapshot', exchanges: [], rules: [], status: { ...status, collections: [staleStatus] } });
+    await act(() => { root.querySelector<HTMLElement>('.collection-title-btn')!.click(); });
+    const t0 = performance.now();
+    await emit({ type: 'collectionEndpoints', id: 'big', endpoints });
+    const renderMs = performance.now() - t0;
+    expect(root.querySelectorAll('.ep-item').length).toBe(100);
+    expect(root.querySelectorAll('.ep-drift').length).toBe(100);
+    expect(root.querySelectorAll('.ep-by-body').length).toBe(100);
+    // closed by default: no change is rendered until asked for
+    expect(root.querySelectorAll('.ood').length).toBe(0);
+
+    const toggle = root.querySelector<HTMLElement>('.collection-drift > .link')!;
+    const t1 = performance.now();
+    await act(() => { toggle.click(); });
+    const openMs = performance.now() - t1;
+    expect(root.querySelectorAll('.ood-items > li').length).toBe(DRIFT_VIEW_LIMITS.endpoints);
+    expect(root.querySelectorAll('.ood-changes li').length).toBe(DRIFT_VIEW_LIMITS.endpoints * DRIFT_VIEW_LIMITS.changes);
+    expect(root.querySelector('.ood-foot')!.textContent).toContain('and 1980 more');
+    console.log(`[collections perf] 2000 out-of-date endpoints: capped render ${renderMs.toFixed(1)} ms; opening "Out of date" ${openMs.toFixed(1)} ms`);
+    expect(openMs).toBeLessThan(50);
   });
 });

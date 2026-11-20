@@ -1581,6 +1581,112 @@ body.vscode-high-contrast .collection-example,
 body.vscode-high-contrast .collection-var-form { outline: 1px solid var(--fi-hc-border); }
 body.vscode-high-contrast .collection-title-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
 
+/* ------------------------------------------------------------------ v0.16.0 data a collection remembers (CONTRACTS §22.11) */
+
+.store-line .store-summary { overflow-wrap: anywhere; }
+.store-line .store-starts { color: var(--fi-muted); }
+.store-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; flex-basis: 100%; padding: 4px 6px;
+  border: 1px solid var(--fi-border); border-radius: 3px; background: var(--vscode-editorWidget-background, transparent); }
+.store-confirm > span { color: var(--vscode-foreground); }
+.collection-side { margin-top: 6px; }
+
+.store-head { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 4px; }
+.store-overrides { margin-left: 0; }
+.store-resources { list-style: none; margin: 0 0 6px; padding: 0; }
+.store-res { padding: 3px 4px; border-bottom: 1px solid var(--fi-border); }
+.store-res:last-child { border-bottom: none; }
+.store-res:hover { background: var(--vscode-list-hoverBackground); }
+.store-res.selected { background: var(--vscode-list-inactiveSelectionBackground, var(--vscode-list-hoverBackground)); }
+.store-res.off .store-res-name, .store-res.off .store-res-path, .store-res.off .store-res-count { opacity: 0.6; }
+.store-res-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 12px; }
+.store-res-name { font-weight: 600; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0; }
+.store-res-path { overflow-wrap: anywhere; min-width: 0; }
+.store-res-count { font-variant-numeric: tabular-nums; }
+.store-res-id { display: inline-flex; align-items: center; gap: 4px; }
+.store-res-id input { width: 110px; }
+.store-res-generated { font-style: italic; }
+.store-problem { font-size: 12px; margin: 2px 0; overflow-wrap: anywhere; }
+.store-res .store-problem { margin-left: 4px; }
+
+.store-table-box { margin-top: 6px; border-top: 1px solid var(--fi-border); padding-top: 6px; }
+.store-count { font-size: 12px; font-variant-numeric: tabular-nums; }
+.store-editor { display: flex; flex-direction: column; gap: 4px; margin: 0 0 6px; }
+.store-editor-text { width: 100%; box-sizing: border-box; min-height: 120px; tab-size: 2; white-space: pre; }
+.store-editor-error { color: var(--vscode-errorForeground); font-size: 12px; overflow-wrap: anywhere; }
+.store-editor-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; }
+.store-table-scroll { overflow: auto; max-height: 420px; }
+table.store-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+table.store-table th, table.store-table td {
+  text-align: left; vertical-align: top; padding: 2px 8px 2px 0; max-width: 240px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text;
+}
+table.store-table td { font-family: var(--fi-mono); font-size: var(--fi-mono-size); }
+table.store-table th { font-weight: 600; color: var(--fi-muted); border-bottom: 1px solid var(--fi-border); position: sticky; top: 0;
+  background: var(--vscode-editor-background, var(--fi-bg)); }
+table.store-table tr:hover td { background: var(--vscode-list-hoverBackground); }
+table.store-table .store-actions { font-family: var(--vscode-font-family); text-align: right; }
+table.store-table .store-actions .link + .link { margin-left: 8px; }
+.store-json { max-height: 420px; overflow: auto; background: var(--vscode-textCodeBlock-background, transparent); }
+.store-op { white-space: normal; }
+
+body.vscode-high-contrast .store-res.selected,
+body.vscode-high-contrast .store-confirm,
+body.vscode-high-contrast .store-editor-text { outline: 1px solid var(--fi-hc-border); }
+body.vscode-high-contrast .store-res-name:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+
+/* ------------------------------------------------------------------ v0.16.0 parts 2 and 3 (CONTRACTS §23.2 – §23.4, §24.1 – §24.4) */
+
+.collection-empty-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px 8px; margin-top: 8px; }
+.collection-empty .collection-empty-actions .btn { margin-top: 0; }
+.collection-more .btn { display: inline-flex; align-items: center; gap: 2px; }
+.collection-more .menu { right: 0; left: auto; }
+.rec-line .rule-buttons { flex-wrap: wrap; justify-content: flex-end; }
+
+/* "Out of date": one calm line; what changed opens under it (never a warning colour). */
+.collection-drift > .link { padding-left: 0; text-align: left; overflow-wrap: anywhere; }
+.ood-list { flex-basis: 100%; margin-top: 2px; }
+.ood-items { list-style: none; margin: 0; padding: 0; }
+.ood-items > li { padding: 4px 0; border-top: 1px solid var(--fi-border); }
+.ood-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding-top: 2px; }
+.ood { font-size: 12px; }
+.ep-item > .ood { margin: 4px 0 2px 20px; }
+.ood-endpoint { overflow-wrap: anywhere; }
+.ood-status { margin: 2px 0; }
+.ood-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.ood-head .badge.mini { margin-left: 0; }
+.ood-actions { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-left: auto; }
+.ood-actions .btn { font-size: 12px; }
+.ood-more .btn { padding-left: 4px; padding-right: 4px; min-width: 0; }
+.ood-more .menu { right: 0; left: auto; }
+.ood-changes { list-style: none; margin: 2px 0 0; padding: 0 0 0 4px; color: var(--vscode-foreground); }
+.ood-changes li { padding: 1px 0; overflow-wrap: anywhere; }
+button.ep-drift {
+  font-family: inherit;
+  cursor: pointer;
+  background: transparent;
+  color: var(--vscode-foreground);
+  border: 1px solid var(--fi-muted);
+}
+button.ep-drift:hover { background: var(--vscode-toolbar-hoverBackground); }
+button.ep-drift:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.ep-by-body { font-size: 12px; margin: 2px 0 0 20px; overflow-wrap: anywhere; }
+
+/* Sign-in and made-up values, on the Data side. */
+.store-setting { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-size: 12px; margin: 4px 0; }
+.store-setting label { display: inline-flex; align-items: center; gap: 4px; }
+.store-setting .btn { font-size: 12px; }
+.store-auth-sessions { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
+.store-auth-ttl input { width: 72px; }
+.store-auth-protect { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.store-auth .store-problem { flex-basis: 100%; margin: 0; }
+.store-dynamic select { max-width: 200px; }
+.store-dynamic code { font-size: 11px; }
+
+body.vscode-high-contrast button.ep-drift { border-color: var(--fi-hc-border); }
+body.vscode-high-contrast .ood-items > li { border-top-color: var(--fi-hc-border); }
+
 @media (max-width: 720px) {
   .collection-vars, .collection-problems, .collection-body, .collection-note { margin-left: 8px; }
+  .ep-item > .ood, .ep-by-body { margin-left: 4px; }
+  .ood-actions { margin-left: 0; }
 }

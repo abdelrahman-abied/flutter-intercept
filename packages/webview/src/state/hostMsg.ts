@@ -1,5 +1,6 @@
 /** Applying host messages (CONTRACTS §4) to the state. Split out of ../state.ts (QUALITY-1 Q6). */
-import { COLLECTION_LIMITS, collectionExampleCacheKey, type CollectionExampleView } from '../collections';
+import { COLLECTION_LIMITS, collectionExampleCacheKey, fakeBackendResultText, type CollectionExampleView } from '../collections';
+import { mergeStoreItems, storeItemsKey, type StoreItemsView } from '../store';
 import { EXPORT_LABEL } from '../exporting';
 import { hasMessagesTab } from '../frames';
 import { type GrpcDecodeEntry, grpcPauseKey } from '../grpc';
@@ -28,6 +29,18 @@ export function visibleWarnings(state: Pick<State, 'status' | 'dismissedWarnings
 }
 
 
+/**
+ * CONTRACTS §23.2: after `mockFromTraffic`, the collection that wasn't there before is the fake backend — show the
+ * Collections tab with its result line ("Shop API (recorded) answers 23 requests · remembers users, orders").
+ */
+function fakeBackendArrived(state: State): State {
+  const waiting = state.awaitingFakeBackend;
+  if (!waiting) return state;
+  const made = (state.status.collections ?? []).find((c) => !waiting.knownIds.includes(c.id));
+  if (!made) return state;
+  return { ...state, awaitingFakeBackend: undefined, view: 'collections', notice: notice(fakeBackendResultText(made)) };
+}
+
 /** Select `id` (a request the host just sent) and close the composer that sent it. */
 function selectSent(state: State, id: string): State {
   const composer = state.composer?.sending ? undefined : state.composer;
@@ -53,6 +66,7 @@ export function applyHostMsg(state: State, msg: HostMsg): State {
         contracts: pick(state.contracts, byId),
         grpcDecoded: pick(state.grpcDecoded, byId),
         ...pruneCollections(state.collectionEndpoints, state.collectionExamples, state.collectionRequested, msg.status.collections),
+        storeItems: pruneStoreItems(state.storeItems, msg.status.collections),
         collectionRequested: new Set(),
         snapshotSeq: state.snapshotSeq + 1,
       };
@@ -75,7 +89,7 @@ export function applyHostMsg(state: State, msg: HostMsg): State {
           next.detailTab = tabFor(paused, state.detailTab);
         }
       }
-      return next;
+      return fakeBackendArrived(next);
     }
 
     case 'exchange': {
@@ -157,12 +171,13 @@ export function applyHostMsg(state: State, msg: HostMsg): State {
     }
 
     case 'status':
-      return {
+      return fakeBackendArrived({
         ...state,
         status: msg.status,
         dismissedWarnings: pruneDismissed(state.dismissedWarnings, msg.status),
         ...pruneCollections(state.collectionEndpoints, state.collectionExamples, state.collectionRequested, msg.status.collections),
-      };
+        storeItems: pruneStoreItems(state.storeItems, msg.status.collections),
+      });
 
     case 'contract': {
       if (!msg.results.length) return state;
@@ -200,6 +215,7 @@ export function applyHostMsg(state: State, msg: HostMsg): State {
         hostErrors: [...state.hostErrors, { id: nextErrorId(), message: msg.message }].slice(-MAX_HOST_ERRORS),
         resolving: {},
         awaitingRule: undefined,
+        awaitingFakeBackend: undefined,
         composer: state.composer?.sending ? { ...state.composer, sending: false } : state.composer,
         // e.g. "Adding client certificates isn't available here.": the popup stops waiting (and shows it inline).
         certDialog: state.certDialog && (state.certDialog.saving || state.certDialog.picking)
@@ -268,6 +284,16 @@ export function applyHostMsg(state: State, msg: HostMsg): State {
       return { ...state, collectionEndpoints: next };
     }
 
+    // CONTRACTS §22.10: offset 0 replaces, a later offset appends; only for collections still listed.
+    case 'storeItems': {
+      if (typeof msg.id !== 'string' || typeof msg.resource !== 'string') return state;
+      const cols = state.status.collections;
+      if (cols !== undefined && !cols.some((c) => c.id === msg.id)) return state;
+      const key = storeItemsKey(msg.id, msg.resource);
+      const next = new Map(state.storeItems);
+      next.set(key, mergeStoreItems(state.storeItems.get(key), msg));
+      return { ...state, storeItems: next };
+    }
     case 'collectionExample': {
       const cols = state.status.collections;
       if (cols !== undefined && !cols.some((c) => c.id === msg.id)) return state;
@@ -284,6 +310,22 @@ export function applyHostMsg(state: State, msg: HostMsg): State {
       return { ...state, collectionExamples: next };
     }
   }
+}
+
+/** Drop records of collections no longer listed, or of resources their store no longer has (CONTRACTS §22.10). */
+function pruneStoreItems(items: ReadonlyMap<string, StoreItemsView>, collections: Status['collections']): ReadonlyMap<string, StoreItemsView> {
+  if (!items.size) return items;
+  const live = new Map((collections ?? []).map((c) => [c.id, c]));
+  const keep = (v: StoreItemsView) => {
+    const col = live.get(v.id);
+    return !!col && (!col.store || (col.store.resources ?? []).some((r) => r.name === v.resource));
+  };
+  let changed = false;
+  for (const v of items.values()) if (!keep(v)) { changed = true; break; }
+  if (!changed) return items;
+  const m = new Map<string, StoreItemsView>();
+  for (const [k, v] of items) if (keep(v)) m.set(k, v);
+  return m;
 }
 
 /** Drop cached endpoints / examples / request tracking for collections no longer in Status.collections. */

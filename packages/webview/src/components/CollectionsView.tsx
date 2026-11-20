@@ -2,17 +2,23 @@
  * v0.15.0 (CONTRACTS §21.9): the Collections section — mock requests from Postman collections or OpenAPI 3
  * documents. Personal on/off, unmatched passthrough/fail switch, inline unresolved-variable inputs, endpoint
  * browser grouped by folder, case-insensitive filter, example picker, read-only example viewer, and "Edit as a rule".
+ * v0.16.0 parts 2 and 3 (CONTRACTS §23.2 – §23.4, §24.2, §24.4): "Make a fake backend from this session", the
+ * "Out of date: …" line and tag, examples that answer by what the request sends, and the source badges.
  */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
-  activeExampleOf, clipName, COLLECTION_LIMITS, collectionCountsText, collectionExampleCacheKey,
-  ENDPOINT_INITIAL_CAP, ENDPOINT_PAGE_STEP, exchangeForSeen, filterEndpoints, formatExampleBody, groupEndpointsByFolder,
+  activeExampleOf, byBodyHint, byBodyLine, clipName, COLLECTION_LIMITS, collectionCountsText, collectionExampleCacheKey,
+  ENDPOINT_INITIAL_CAP, ENDPOINT_PAGE_STEP, exchangeForSeen, FAKE_BACKEND_NOTHING, FAKE_BACKEND_SESSION, FAKE_BACKEND_TIP,
+  filterEndpoints, formatExampleBody, formatLabel, groupEndpointsByFolder, hasFinishedRequest,
   knownRequestOrigins, limitedText, overridesText, seenSummaryText, statusClassSuffix, type CollectionExampleView,
 } from '../collections';
 import { useApp } from '../context';
-import type { CollectionEndpointView, CollectionPatch, CollectionStatus } from '../protocol';
-import { Button } from './bits';
+import { driftCountText, driftLineText, driftsOf } from '../drift';
+import type { CollectionEndpointView, CollectionPatch, CollectionStatus, DriftView } from '../protocol';
+import { Button, MenuButton } from './bits';
 import { Icon } from './Icon';
+import { OutOfDateDetails, OutOfDateList } from './OutOfDate';
+import { hasStoreData, StoreDataPanel, StoreLine } from './StoreView';
 import { copyText, HeadersTable } from './Viewers';
 
 const EXPLAIN_LINE_1 =
@@ -21,11 +27,20 @@ const EXPLAIN_LINE_2 =
   'The link lives in .vscode/flutter-intercept.json for your team. What you change here (on or off, which example answers) stays on this computer until you choose Save for the team. Your rules still run first.';
 /** CONTRACTS §21.15: one explanation, shown as a tooltip on every "for you" control. */
 const FOR_YOU_TIP = 'Only on this computer. Save for the team writes it to .vscode/flutter-intercept.json.';
+const NO_DRIFT: DriftView[] = [];
 
 export function CollectionsView() {
   const { state, dispatch, post } = useApp();
   const collections = state.status.collections ?? [];
   const [openIds, setOpenIds] = useState<Set<string>>(() => new Set());
+  // CONTRACTS §23.2: collections whose "Out of date" line is open (it lists endpoints, so it needs them too).
+  const [driftIds, setDriftIds] = useState<Set<string>>(() => new Set());
+  // CONTRACTS §23.2: a fake backend needs at least one finished request the real server answered.
+  const canFake = useMemo(() => hasFinishedRequest(state.exchanges), [state.exchanges]);
+  const fakeFromSession = () => {
+    dispatch({ type: 'awaitFakeBackend' });
+    post({ type: 'mockFromTraffic', source: 'session' });
+  };
   const origins = useMemo(() => knownRequestOrigins(state.exchanges), [state.exchanges]);
   const lastSnapshotSeq = useRef(state.snapshotSeq);
 
@@ -33,9 +48,9 @@ export function CollectionsView() {
   useEffect(() => {
     if (state.snapshotSeq === lastSnapshotSeq.current) return;
     lastSnapshotSeq.current = state.snapshotSeq;
-    if (!openIds.size) return;
+    if (!openIds.size && !driftIds.size) return;
     const live = new Set(collections.map((c) => c.id));
-    for (const id of openIds) {
+    for (const id of new Set([...openIds, ...driftIds])) {
       if (live.has(id)) {
         dispatch({ type: 'collectionRequested', id });
         post({ type: 'getCollectionEndpoints', id });
@@ -43,52 +58,74 @@ export function CollectionsView() {
     }
   }, [state.snapshotSeq]);
 
-  // Prune removed ids from openIds when collections disappear.
+  // Prune removed ids from openIds / driftIds when collections disappear (or are no longer out of date).
   useEffect(() => {
-    if (!openIds.size) return;
+    if (!openIds.size && !driftIds.size) return;
     const live = new Set(collections.map((c) => c.id));
-    let changed = false;
-    for (const id of openIds) if (!live.has(id)) { changed = true; break; }
-    if (!changed) return;
-    const next = new Set<string>();
-    for (const id of openIds) if (live.has(id)) next.add(id);
-    setOpenIds(next);
+    const stale = new Set(collections.filter((c) => !c.drift).map((c) => c.id));
+    const keep = (ids: Set<string>, ok: (id: string) => boolean) => {
+      for (const id of ids) if (!ok(id)) return new Set([...ids].filter(ok));
+      return ids;
+    };
+    const nextOpen = keep(openIds, (id) => live.has(id));
+    if (nextOpen !== openIds) setOpenIds(nextOpen);
+    const nextDrift = keep(driftIds, (id) => live.has(id) && !stale.has(id));
+    if (nextDrift !== driftIds) setDriftIds(nextDrift);
   }, [collections]);
 
-  const toggleOpen = (id: string) => {
-    const next = new Set(openIds);
+  // CONTRACTS §21.8: request once per collection since the last `ready`; host pushes updates on its own.
+  const needEndpoints = (id: string) => {
+    if (state.collectionRequested.has(id)) return;
+    dispatch({ type: 'collectionRequested', id });
+    post({ type: 'getCollectionEndpoints', id });
+  };
+  const toggleIn = (ids: Set<string>, set: (next: Set<string>) => void, id: string) => {
+    const next = new Set(ids);
     if (next.has(id)) {
       next.delete(id);
     } else {
       next.add(id);
-      // CONTRACTS §21.8: request once per collection since the last `ready`; host pushes updates on its own.
-      if (!state.collectionRequested.has(id)) {
-        dispatch({ type: 'collectionRequested', id });
-        post({ type: 'getCollectionEndpoints', id });
-      }
+      needEndpoints(id);
     }
-    setOpenIds(next);
+    set(next);
   };
+  const toggleOpen = (id: string) => toggleIn(openIds, setOpenIds, id);
+  const toggleDrift = (id: string) => toggleIn(driftIds, setDriftIds, id);
 
   return (
     <div class="collections-view">
       <div class="rules-head">
         <span class="muted">
-          Mock requests locally from a Postman collection or OpenAPI 3 document — your rules still run first.
+          Answer requests from a Postman, OpenAPI, Swagger, Insomnia or Bruno collection — your rules still run first.
         </span>
         <span class="spacer" />
         <Button kind="primary" onClick={() => post({ type: 'importCollection' })}
           title="Import a Postman collection or OpenAPI 3 document">
           <Icon name="plus" /> Mock from a collection…
         </Button>
+        {collections.length > 0 && (
+          <MenuButton label="More ways to mock" title="More ways to mock" class="collection-more"
+            items={[{
+              label: FAKE_BACKEND_SESSION, disabled: !canFake, title: canFake ? FAKE_BACKEND_TIP : FAKE_BACKEND_NOTHING,
+              onSelect: fakeFromSession,
+            }]}>
+            More <Icon name="chevronDown" />
+          </MenuButton>
+        )}
       </div>
       {collections.length === 0 ? (
         <div class="empty small collection-empty">
           <p>{EXPLAIN_LINE_1}</p>
           <p class="muted">{EXPLAIN_LINE_2}</p>
-          <Button kind="primary" onClick={() => post({ type: 'importCollection' })}>
-            <Icon name="plus" /> Mock from a collection…
-          </Button>
+          <div class="collection-empty-actions">
+            <Button kind="primary" onClick={() => post({ type: 'importCollection' })}>
+              <Icon name="plus" /> Mock from a collection…
+            </Button>
+            {/* CONTRACTS §23.2: no collection file? The traffic the app already made is enough. */}
+            <Button onClick={fakeFromSession} disabled={!canFake} title={canFake ? FAKE_BACKEND_TIP : FAKE_BACKEND_NOTHING}>
+              {FAKE_BACKEND_SESSION}
+            </Button>
+          </div>
         </div>
       ) : (
         <ul class="collection-items" aria-label="Collections">
@@ -98,6 +135,8 @@ export function CollectionsView() {
               col={col}
               open={openIds.has(col.id)}
               onToggleOpen={() => toggleOpen(col.id)}
+              showDrift={driftIds.has(col.id)}
+              onToggleDrift={() => toggleDrift(col.id)}
               endpoints={state.collectionEndpoints.get(col.id)}
               origins={origins}
             />
@@ -108,10 +147,12 @@ export function CollectionsView() {
   );
 }
 
-function CollectionRow({ col, open, onToggleOpen, endpoints, origins }: {
+function CollectionRow({ col, open, onToggleOpen, showDrift, onToggleDrift, endpoints, origins }: {
   col: CollectionStatus;
   open: boolean;
   onToggleOpen: () => void;
+  showDrift: boolean;
+  onToggleDrift: () => void;
   endpoints: CollectionEndpointView[] | undefined;
   origins: string[];
 }) {
@@ -120,9 +161,15 @@ function CollectionRow({ col, open, onToggleOpen, endpoints, origins }: {
   const [editingVar, setEditingVar] = useState<string | undefined>();
   const [showSeen, setShowSeen] = useState(false);
   const [saveWhenLoaded, setSaveWhenLoaded] = useState(false);
+  // CONTRACTS §22.11: Requests (the endpoints) | Data (what the collection remembers).
+  const [side, setSide] = useState<'requests' | 'data'>('requests');
+  const store = hasStoreData(col.store) ? col.store : undefined;
+  const showData = side === 'data' && !!store;
   const limited = limitedText(col.limited);
   const overrides = overridesText(col.overrides);
   const seen = seenSummaryText(col.seen);
+  const outOfDate = driftLineText(col.drift);
+  const format = formatLabel(col.format);
   const unresolved = col.unresolved ?? [];
   const problems = col.problems ?? [];
   const colOrigins = col.origins ?? [];
@@ -175,9 +222,7 @@ function CollectionRow({ col, open, onToggleOpen, endpoints, origins }: {
             <button type="button" class="collection-title-btn" aria-expanded={open} onClick={onToggleOpen}>
               <span class="collection-title" title={col.name}>{displayName}</span>
             </button>
-            {col.format && (
-              <span class="badge mini collection-format">{col.format === 'postman' ? 'Postman' : 'OpenAPI'}</span>
-            )}
+            {format && <span class="badge mini collection-format">{format}</span>}
             {problems.length > 0 && (
               <span class="badge warn collection-problem-badge">{problems.length} problem{problems.length === 1 ? '' : 's'}</span>
             )}
@@ -213,6 +258,17 @@ function CollectionRow({ col, open, onToggleOpen, endpoints, origins }: {
           </Button>
         </div>
       </div>
+
+      {outOfDate && (
+        // CONTRACTS §23.2: one calm line; what changed (and what to do about it) opens under it.
+        <div class="collection-note collection-drift">
+          <button type="button" class="link" aria-expanded={showDrift} onClick={onToggleDrift}
+            title="The real server's answers no longer look like the saved examples. Show what changed.">
+            {outOfDate}
+          </button>
+          {showDrift && <OutOfDateList col={col} endpoints={endpoints} />}
+        </div>
+      )}
 
       {limited && (
         // CONTRACTS §21.16: one calm line; the IDE shows what changes and asks (never the panel).
@@ -278,7 +334,18 @@ function CollectionRow({ col, open, onToggleOpen, endpoints, origins }: {
         </ul>
       )}
 
-      {open && <CollectionEndpointsPanel col={col} endpoints={endpoints} />}
+      {open && store && <StoreLine col={col} store={store} />}
+      {open && store && (
+        <div class="collection-note collection-side">
+          <div class="seg small" role="group" aria-label={`Show the requests or the data of ${displayName}`}>
+            <button type="button" class="seg-btn" aria-pressed={!showData} onClick={() => setSide('requests')}>Requests</button>
+            <button type="button" class="seg-btn" aria-pressed={showData} onClick={() => setSide('data')}>Data</button>
+          </div>
+        </div>
+      )}
+      {open && (showData && store
+        ? <StoreDataPanel col={col} store={store} />
+        : <CollectionEndpointsPanel col={col} endpoints={endpoints} />)}
     </li>
   );
 }
@@ -424,6 +491,7 @@ function CollectionEndpointsPanel({ col, endpoints }: {
                   return (
                     <EndpointRow
                       key={ep.key}
+                      col={col}
                       ep={ep}
                       active={active}
                       viewing={isViewing}
@@ -457,7 +525,8 @@ function CollectionEndpointsPanel({ col, endpoints }: {
   );
 }
 
-function EndpointRow({ ep, active, viewing, viewingName, exData, onToggle, onSelectExample, onView, onEditAsRule, onReset, onCloseView }: {
+function EndpointRow({ col, ep, active, viewing, viewingName, exData, onToggle, onSelectExample, onView, onEditAsRule, onReset, onCloseView }: {
+  col: CollectionStatus;
   ep: CollectionEndpointView;
   active: CollectionEndpointView['examples'][number] | undefined;
   viewing: boolean;
@@ -473,6 +542,15 @@ function EndpointRow({ ep, active, viewing, viewingName, exData, onToggle, onSel
   const displayName = clipName(ep.name);
   const examples = (ep.examples ?? []).slice(0, COLLECTION_LIMITS.examplesPerEndpoint);
   const unresolved = ep.unresolved ?? [];
+  // CONTRACTS §23.3: the real server's answers no longer look like this endpoint's examples.
+  const drifts = useMemo(() => (ep.drift ? driftsOf(ep) : NO_DRIFT), [ep.drift]);
+  const [showDrift, setShowDrift] = useState(false);
+  // CONTRACTS §24.2: other examples that answer by what the request sends (field names only).
+  const bodyLine = useMemo(
+    () => (examples.some((e) => e.byBody) ? byBodyLine(ep, active?.name) : undefined),
+    [ep.examples, active?.name],
+  );
+  const activeHint = active?.byBody ? byBodyHint(active.byBody) : undefined;
 
   return (
     <li class={`ep-item${ep.off ? ' ep-off' : ''}${unresolved.length ? ' ep-unresolved' : ''}`}>
@@ -488,6 +566,13 @@ function EndpointRow({ ep, active, viewing, viewingName, exData, onToggle, onSel
           <span class="badge warn ep-unresolved-badge" title={`Set ${unresolved.join(', ')} to mock this endpoint`}>
             needs {unresolved.map((u) => clipName(u)).join(', ')}
           </span>
+        )}
+        {drifts.length > 0 && (
+          <button type="button" class="badge mini ep-drift" aria-expanded={showDrift}
+            title={`The real server now answers differently (${driftCountText(drifts)}). Show what changed.`}
+            onClick={() => setShowDrift(!showDrift)}>
+            out of date
+          </button>
         )}
         <span class="spacer" />
         {ep.overridden && (
@@ -512,12 +597,12 @@ function EndpointRow({ ep, active, viewing, viewingName, exData, onToggle, onSel
                   onChange={(e) => onSelectExample((e.target as HTMLSelectElement).value)}>
                   {examples.map((opt) => (
                     <option key={opt.name} value={opt.name}>
-                      {clipName(opt.name)} ({opt.status}){opt.generated ? ' · generated' : ''}
+                      {clipName(opt.name)} ({opt.status}){opt.generated ? ' · generated' : ''}{opt.byBody ? byBodyOption(opt.byBody) : ''}
                     </option>
                   ))}
                 </select>
               ) : (
-                <span class="ep-example-name" title={active.name}>{clipName(active.name)}</span>
+                <span class="ep-example-name" title={activeHint ? `${clipName(active.name)} — ${activeHint}` : active.name}>{clipName(active.name)}</span>
               )}
               <Button pressed={viewing} onClick={onView} title={`View ${clipName(active.name)} status, headers and body`}>
                 View
@@ -530,6 +615,9 @@ function EndpointRow({ ep, active, viewing, viewingName, exData, onToggle, onSel
         </div>
       </div>
 
+      {bodyLine && <div class="ep-by-body muted">{bodyLine}</div>}
+      {showDrift && drifts.length > 0 && <OutOfDateDetails col={col} ep={ep} />}
+
       {viewing && (
         exData ? (
           <ExampleViewer data={exData} generated={!!active?.generated} onClose={onCloseView} />
@@ -541,6 +629,12 @@ function EndpointRow({ ep, active, viewing, viewingName, exData, onToggle, onSel
       )}
     </li>
   );
+}
+
+/** " · answers when the request's password matches" for an option of the example picker. */
+function byBodyOption(byBody: string[]): string {
+  const hint = byBodyHint(byBody);
+  return hint ? ` · ${hint}` : '';
 }
 
 function ExampleViewer({ data, generated, onClose }: {

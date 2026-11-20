@@ -1,6 +1,7 @@
 /** Core state types, the initial state, persistence and the Action union. Split out of ../state.ts (QUALITY-1 Q6). */
 import type { CollectionExampleView } from '../collections';
 import type { GrpcDecodeEntry } from '../grpc';
+import type { StoreItemsView } from '../store';
 import type { AuthFlowSummary, ClientCertFileRole, CollectionEndpointView, CollectionPatch, ContractSummary, Exchange, HostMsg, RecordingSummary, Rule, RuleAction, Status } from '../protocol';
 import type { StatusClass } from '../util';
 
@@ -93,6 +94,11 @@ export interface State {
   editingRuleId?: string;               // rule id, or NEW_RULE
   /** A rule the host is about to create (createRuleFromExchange / mutateField); `label` = the notice text. */
   awaitingRule?: { kind: RuleAction['kind']; knownIds: string[]; label?: string };
+  /**
+   * CONTRACTS §23.2: `mockFromTraffic` was posted; the IDE is asking its questions. The collection that appears next
+   * is the fake backend (shown with its result line). Dropped when the user moves on or the host reports an error.
+   */
+  awaitingFakeBackend?: { knownIds: string[] };
   /** Contract-check results by exchange id (CONTRACTS §10.5); dropped with the exchange. */
   contracts: Record<string, ContractSummary>;
   notice?: Notice;
@@ -124,6 +130,8 @@ export interface State {
   collectionRequested: ReadonlySet<string>;
   /** Bumped on every `snapshot` (initial `ready` and reconnects) so open collections re-subscribe. */
   snapshotSeq: number;
+  /** CONTRACTS §22.10: records of the resources the panel opened, by `storeItemsKey(id, resource)`. */
+  storeItems: ReadonlyMap<string, StoreItemsView>;
 }
 
 export const NEW_RULE = '__new__';
@@ -156,6 +164,7 @@ export function initialState(): State {
     collectionExamples: new Map(),
     collectionRequested: new Set(),
     snapshotSeq: 0,
+    storeItems: new Map(),
   };
 }
 
@@ -188,6 +197,8 @@ export type Action =
   | { type: 'setRules'; rules: Rule[]; notice?: string; undoable?: boolean }
   | { type: 'editRule'; id?: string }
   | { type: 'awaitRule'; kind: RuleAction['kind']; label?: string }
+  /** CONTRACTS §23.2: `mockFromTraffic` posted — show the new collection when it arrives. */
+  | { type: 'awaitFakeBackend' }
   | { type: 'notice'; text?: string; short?: boolean }
   | { type: 'dismissErrors' }
   | { type: 'setSplit'; pct: number }

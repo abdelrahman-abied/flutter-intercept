@@ -82,7 +82,8 @@ export function reducer(state: State, action: Action): State {
     }
 
     case 'setView':
-      return { ...state, view: action.view };
+      // Moving on also stops waiting for a fake backend (the IDE's questions may have been cancelled).
+      return { ...state, view: action.view, awaitingFakeBackend: undefined };
 
     case 'setDetailTab':
       return { ...state, detailTab: action.tab };
@@ -127,6 +128,9 @@ export function reducer(state: State, action: Action): State {
 
     case 'awaitRule':
       return { ...state, awaitingRule: { kind: action.kind, knownIds: state.rules.map((r) => r.id), label: action.label } };
+
+    case 'awaitFakeBackend':
+      return { ...state, awaitingFakeBackend: { knownIds: (state.status.collections ?? []).map((c) => c.id) } };
 
     case 'notice':
       return { ...state, notice: action.text ? notice(action.text, undefined, action.short) : undefined };

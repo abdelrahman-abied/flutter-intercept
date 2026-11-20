@@ -37,7 +37,7 @@ export type ConnectionState = 'connecting' | 'open' | 'reconnecting';
 const HOST_TYPE_LIST = {
   snapshot: true, exchange: true, rules: true, status: true, removed: true, error: true, cleared: true, sent: true,
   contract: true, recordings: true, authFlows: true, select: true, exported: true, grpcDecoded: true,
-  clientCertificateFile: true, clientCertificateSaved: true, collectionEndpoints: true, collectionExample: true,
+  clientCertificateFile: true, clientCertificateSaved: true, collectionEndpoints: true, collectionExample: true, storeItems: true,
 } satisfies Record<HostMsg['type'], true>;
 const HOST_TYPES = new Set<string>(Object.keys(HOST_TYPE_LIST));
 

@@ -174,7 +174,8 @@ export function MenuList({ items, onClose, label, at }: {
   const ref = useRef<HTMLDivElement>(null);
   const enabled = () => Array.from(ref.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not([disabled])') ?? []);
   useLayoutEffect(() => {
-    enabled()[0]?.focus();
+    // With nothing to choose (every item disabled) the menu itself takes focus, so Escape still closes it.
+    (enabled()[0] ?? ref.current)?.focus();
     const onDown = (e: Event) => { if (ref.current && !ref.current.contains(e.target as Node)) onClose(false); };
     document.addEventListener('pointerdown', onDown, true);
     return () => document.removeEventListener('pointerdown', onDown, true);
@@ -202,10 +203,11 @@ export function MenuList({ items, onClose, label, at }: {
     }
     e.preventDefault();
     e.stopPropagation();
+    if (!list.length) return;
     list[next]?.focus();
   };
   return (
-    <div ref={ref} class={`menu${at ? ' context' : ''}`} role="menu" aria-label={label} onKeyDown={onKeyDown}
+    <div ref={ref} class={`menu${at ? ' context' : ''}`} role="menu" aria-label={label} tabIndex={-1} onKeyDown={onKeyDown}
       style={at ? { left: `${at.x}px`, top: `${at.y}px` } : undefined}>
       {items.map((it) => (
         <Fragment key={it.label}>
@@ -220,15 +222,16 @@ export function MenuList({ items, onClose, label, at }: {
   );
 }
 
-/** A button that opens a MenuList below it. */
-export function MenuButton({ label, title, items, children, class: cls, disabled }: {
+/** A button that opens a MenuList below it. `buttonLabel` names the button when its content is only a mark ("▾"). */
+export function MenuButton({ label, title, items, children, class: cls, disabled, buttonLabel }: {
   label: string; title?: string; items: MenuItem[]; children: ComponentChildren; class?: string; disabled?: boolean;
+  buttonLabel?: string;
 }) {
   const [open, setOpen] = useState(false);
   const btn = useRef<HTMLButtonElement>(null);
   return (
     <span class={`menu-anchor${cls ? ' ' + cls : ''}`}>
-      <button ref={btn} type="button" class="btn btn-secondary" title={title} aria-haspopup="menu" aria-expanded={open && !disabled}
+      <button ref={btn} type="button" class="btn btn-secondary" title={title} aria-label={buttonLabel} aria-haspopup="menu" aria-expanded={open && !disabled}
         disabled={disabled}
         onClick={() => setOpen(!open)}
         onKeyDown={(e) => { if (e.key === 'ArrowDown' && !open) { e.preventDefault(); setOpen(true); } }}>

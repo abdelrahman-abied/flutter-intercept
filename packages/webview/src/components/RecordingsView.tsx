@@ -1,5 +1,6 @@
 // CONTRACTS §12.4–12.5: save the current traffic, replay a recording, diff two, delete.
 import { useMemo, useState } from 'preact/hooks';
+import { clipName, FAKE_BACKEND_RECORDING, FAKE_BACKEND_TIP } from '../collections';
 import { useApp } from '../context';
 import {
   defaultRecordingName, diffPair, FALLBACK_LABEL, formatDate, isRecordable, isReplaying, MAX_RECORDING_NAME, recordingCountText,
@@ -170,6 +171,16 @@ function RecordingRow({ rec, picked, replaying, otherReplay }: {
               <Icon name="play" /> Replay…
             </Button>
           )}
+          {/* CONTRACTS §23.2: the IDE asks for the name and which servers; the panel never names a path. */}
+          <button type="button" class="btn btn-secondary rec-fake" disabled={!rec.exchanges}
+            aria-label={`${FAKE_BACKEND_RECORDING} “${clipName(rec.name)}”`}
+            title={rec.exchanges ? `${FAKE_BACKEND_RECORDING}. ${FAKE_BACKEND_TIP}` : 'This recording has no finished requests'}
+            onClick={() => {
+              dispatch({ type: 'awaitFakeBackend' });
+              post({ type: 'mockFromTraffic', source: { recording: rec.id } });
+            }}>
+            Make a fake backend
+          </button>
           <Button kind="icon" title={`Delete “${rec.name}”`} onClick={() => setMode(mode === 'delete' ? 'idle' : 'delete')}>
             <Icon name="clear" />
           </Button>

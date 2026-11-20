@@ -281,3 +281,90 @@ export function limitedRemoved(ex: Pick<Exchange, 'responseHeaders'>): string[] 
   const m = /removed=([^;]*)/i.exec(v);
   return (m ? m[1].split(',') : []).map((s) => clipName(s.trim(), 60)).filter((s) => s && s !== 'none').slice(0, 8);
 }
+
+// ------------------------------------------------------------------ v0.16.0 parts 2 and 3 (CONTRACTS §23.2, §24.2, §24.4)
+
+const FORMAT_LABEL: Record<NonNullable<CollectionStatus['format']>, string> = {
+  postman: 'Postman', openapi: 'OpenAPI', swagger: 'Swagger 2.0', insomnia: 'Insomnia', bruno: 'Bruno',
+};
+
+/** CONTRACTS §24.4: the badge for where a collection came from (undefined: no badge). */
+export function formatLabel(format: unknown): string | undefined {
+  return typeof format === 'string' && Object.prototype.hasOwnProperty.call(FORMAT_LABEL, format)
+    ? FORMAT_LABEL[format as keyof typeof FORMAT_LABEL]
+    : undefined;
+}
+
+/** Field names of a by-body example that are worth naming (strings, cut at 60, no duplicates). */
+function bodyFields(byBody: unknown): string[] {
+  if (!Array.isArray(byBody)) return [];
+  const seen = new Set<string>();
+  for (const f of byBody) {
+    if (typeof f !== 'string') continue;
+    const name = clipName(f.trim(), 60);
+    if (name) seen.add(name);
+  }
+  return [...seen];
+}
+
+/**
+ * CONTRACTS §24.2: "answers when the request's email, password match" — an example chosen by what the request
+ * sends. Field names only, three at most, then "and N more" (undefined: the example isn't chosen by the body).
+ */
+export function byBodyHint(byBody: unknown): string | undefined {
+  const fields = bodyFields(byBody);
+  if (!fields.length) return undefined;
+  const named = fields.slice(0, 3);
+  const more = fields.length - named.length;
+  const many = fields.length > 1;
+  return `answers when the request's ${named.join(', ')}${more > 0 ? ` and ${more} more` : ''} ${many ? 'match' : 'matches'}`;
+}
+
+/**
+ * The quiet line under an endpoint whose other examples answer by what the request sends: "“Wrong password”
+ * answers when the request's password matches". Two examples named, then "and N more" (undefined: none).
+ */
+export function byBodyLine(ep: Pick<CollectionEndpointView, 'examples'>, activeName: string | undefined): string | undefined {
+  const parts: string[] = [];
+  let count = 0;
+  for (const e of (ep.examples ?? []).slice(0, COLLECTION_LIMITS.examplesPerEndpoint)) {
+    if (e.name === activeName) continue;
+    const hint = byBodyHint(e.byBody);
+    if (!hint) continue;
+    count++;
+    if (parts.length < 2) parts.push(`“${clipName(e.name, 60)}” ${hint}`);
+  }
+  if (!parts.length) return undefined;
+  const more = count - parts.length;
+  return parts.join(' · ') + (more > 0 ? ` · and ${more} more` : '');
+}
+
+/**
+ * CONTRACTS §23.1 / §23.2: is there anything in the list a fake backend could be made from — a finished request the
+ * real server answered (not mocked or replayed, not a stream, tunnel or gRPC call)? The host decides the rest.
+ */
+export function hasFinishedRequest(
+  exchanges: readonly Pick<Exchange, 'state' | 'status' | 'kind' | 'simulated' | 'captured'>[],
+): boolean {
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const ex = exchanges[i];
+    if (ex.state === 'completed' && typeof ex.status === 'number' && !ex.kind && !ex.simulated && !ex.captured) return true;
+  }
+  return false;
+}
+
+export const FAKE_BACKEND_SESSION = 'Make a fake backend from this session';
+export const FAKE_BACKEND_RECORDING = 'Make a fake backend from this recording';
+export const FAKE_BACKEND_TIP =
+  'Saves what the real server answered as a collection, so the app keeps working without the server. Asks for a name and which servers first.';
+export const FAKE_BACKEND_NOTHING = 'Run the app against the real server first';
+
+/** CONTRACTS §23.2: "Shop API (recorded) answers 23 requests · remembers users, orders". */
+export function fakeBackendResultText(col: Pick<CollectionStatus, 'name' | 'mocked' | 'store'>): string {
+  const n = typeof col.mocked === 'number' && Number.isFinite(col.mocked) && col.mocked >= 0 ? Math.floor(col.mocked) : 0;
+  const names = (col.store?.resources ?? []).filter((r) => r && r.remembers && typeof r.name === 'string').map((r) => clipName(r.name, 60));
+  const named = names.slice(0, 6);
+  const more = names.length - named.length;
+  const remembers = named.length ? ` · remembers ${named.join(', ')}${more > 0 ? ` and ${more} more` : ''}` : '';
+  return `${clipName(col.name) || 'The fake backend'} answers ${n} request${n === 1 ? '' : 's'}${remembers}`;
+}

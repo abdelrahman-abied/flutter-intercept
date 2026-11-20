@@ -34,7 +34,9 @@ export type HostMsg =
   | { type: 'clientCertificateSaved'; host: string; problem?: string } // answer to 'addClientCertificate'
   // CONTRACTS §21.8
   | { type: 'collectionEndpoints'; id: string; endpoints: CollectionEndpointView[] }   // answer to 'getCollectionEndpoints'
-  | { type: 'collectionExample'; id: string; endpoint: string; name: string; status: number; headers: Record<string, string>; body: string; truncated?: true }; // ≤ 256 KB body
+  | { type: 'collectionExample'; id: string; endpoint: string; name: string; status: number; headers: Record<string, string>; body: string; truncated?: true } // ≤ 256 KB body
+  // CONTRACTS §22.10
+  | { type: 'storeItems'; id: string; resource: string; offset: number; total: number; items: unknown[]; truncated?: true }; // answer to 'getStoreItems'; pushed again while open
 export interface Status {
   proxyRunning: boolean; port?: number; interceptEnabled: boolean; sessions: number;
   lan?: { host: string; port: number; peer?: string }; // present while the LAN listener is open (never the token); peer = the pinned iPhone address
@@ -114,7 +116,15 @@ export type ViewMsg =
   | { type: 'updateCollection'; id: string; patch: CollectionPatch }
   | { type: 'removeCollection'; id: string }                           // the IDE confirms; the collection file is kept
   | { type: 'collectionToRule'; id: string; endpoint: string }
-  | { type: 'approveCollection'; id: string };                         // CONTRACTS §21.16: the IDE asks (modal)        // opens the rule editor with a personal copy
+  | { type: 'approveCollection'; id: string }
+  // CONTRACTS §22.10
+  | { type: 'getStoreItems'; id: string; resource: string; offset: number; filter?: string }
+  | { type: 'updateStore'; id: string; patch: StorePatch }
+  | { type: 'storeSnapshot'; id: string; action: 'save' | 'load' | 'delete'; name?: string } // save without a name → the IDE's input box
+  // CONTRACTS §23.2 / §23.3 (the host runs the IDE dialogs; the panel never names a path)
+  | { type: 'mockFromTraffic'; source: 'session' | { recording: string } }
+  | { type: 'updateExample'; id: string; endpoint: string; status: number; mode?: 'merge' | 'add' } // diff preview + confirm in the IDE
+  | { type: 'ignoreDrift'; id: string; endpoint?: string; status?: number };                         // CONTRACTS §21.16: the IDE asks (modal)        // opens the rule editor with a personal copy
 
 /** CONTRACTS §20.3: which file the picker is for. */
 export type ClientCertFileRole = 'pfx' | 'cert' | 'key';
@@ -182,7 +192,7 @@ export interface CollectionStatus {
   id: string;
   name: string;
   file: string;
-  format?: 'postman' | 'openapi';
+  format?: 'postman' | 'openapi' | 'swagger' | 'insomnia' | 'bruno';
   enabled: boolean;
   unmatched: 'passthrough' | 'fail';
   endpoints: number;
@@ -199,6 +209,10 @@ export interface CollectionStatus {
   overrides: number;
   /** CONTRACTS §21.15: from this session's traffic to the collection's origins (top 20 each, most frequent first). */
   seen?: { notInCollection: { method: string; path: string; count: number }[]; noExample: { endpoint: string; count: number }[] };
+  /** CONTRACTS §22.10: the collection's stateful resources. */
+  store?: StoreStatus;
+  /** CONTRACTS §23.3: the real server's answers no longer look like the examples. */
+  drift?: { endpoints: number; line: string };
 }
 
 /** CONTRACTS §21.8: one endpoint of a collection (url = origin + path, params as `:name`). */
@@ -208,12 +222,31 @@ export interface CollectionEndpointView {
   name: string;
   folder: string[];
   url: string;
-  examples: { name: string; status: number; generated?: true; query?: Record<string, string> }[];
+  examples: { name: string; status: number; generated?: true; query?: Record<string, string>; /** CONTRACTS §24.2: request-body field names this example is chosen by. */ byBody?: string[] }[];
   selected?: string;
   off?: true;
   unresolved?: string[];
   /** CONTRACTS §21.15: `selected` / `off` come from this user's overlay. */
   overridden?: true;
+  /** CONTRACTS §23.3 */
+  drift?: DriftView[];
+}
+
+/** CONTRACTS §23.3: one difference between the real server's answers and an example (paths and kinds, never values). */
+export interface DriftChange {
+  kind: 'added' | 'removed' | 'type' | 'nullable' | 'status';
+  path: string;
+  from?: string;
+  to?: string;
+}
+
+/** CONTRACTS §23.3 */
+export interface DriftView {
+  endpoint: string;
+  status: number;
+  samples: number;
+  changes: DriftChange[];
+  since: number;
 }
 
 /** CONTRACTS §21.7: what `updateCollection` may change (one or more). */
@@ -228,4 +261,78 @@ export interface CollectionPatch {
   /** CONTRACTS §21.15 (scope 'me'): clear this user's overlay — the whole collection, or one endpoint with `endpoint`. */
   reset?: true;
   endpoint?: string;
+}
+
+/** CONTRACTS §22.10: a collection's stateful resources, as the panel shows them (counts only, never records). */
+export interface StoreStatus {
+  enabled: boolean;
+  resources: StoreResourceView[];
+  /** Snapshot names saved for this collection. */
+  snapshots: string[];
+  /** The snapshot the data starts from instead of the seed. */
+  startsFrom?: string;
+  /** The data differs from what it started from (the app or someone changed it). */
+  changed: boolean;
+  /** CONTRACTS §22.7: this user's own store settings are in effect. */
+  overridden?: true;
+  problems: string[];
+  /** CONTRACTS §24.1: sign-in simulation (sessions only; never a password or token). */
+  auth?: StoreAuthStatus;
+  /** CONTRACTS §24.3: how `{{$random…}}` values in examples are produced. */
+  dynamic?: 'random' | 'seeded' | 'fixed';
+}
+
+/** CONTRACTS §24.1 */
+export interface StoreAuthStatus {
+  /** A login request was found in the collection. */
+  available: boolean;
+  enabled: boolean;
+  login?: string;
+  refresh?: string;
+  ttlSeconds: number;
+  protect: 'declared' | 'all';
+  /** Signed-in sessions right now (a count, never tokens). */
+  sessions: number;
+  problems: string[];
+}
+
+/** CONTRACTS §22.10: one resource (e.g. users) of a collection's store. */
+export interface StoreResourceView {
+  name: string;
+  /** "/users/:id" */
+  path: string;
+  idField: string;
+  count: number;
+  remembers: boolean;
+  detected: boolean;
+  overridden?: true;
+  generatedSeed?: true;
+  problem?: string;
+}
+
+/** CONTRACTS §22.10: what `updateStore` may change (data never reaches a file; settings follow `scope`). */
+export interface StorePatch {
+  resource?: string;
+  enabled?: boolean;
+  remembers?: boolean;
+  idField?: string;
+  put?: { item: unknown };
+  remove?: { itemId: string };
+  replace?: unknown[];
+  /** ≤ 5 000 copies of the seed's first record with new ids. */
+  generate?: { count: number };
+  startsFrom?: string | null;
+  scope?: 'me' | 'team';
+  reset?: 'data' | 'settings';
+  /** CONTRACTS §24.1: settings follow `scope`; `expire` is a data change (signs everyone out). */
+  auth?: { enabled?: boolean; ttlSeconds?: number; protect?: 'declared' | 'all'; expire?: 'all' };
+  /** CONTRACTS §24.3 */
+  dynamic?: 'random' | 'seeded' | 'fixed';
+}
+
+/** CONTRACTS §22.10: which store operation answered an exchange. */
+export interface StoreOpView {
+  resource: string;
+  op: 'list' | 'create' | 'get' | 'replace' | 'patch' | 'delete';
+  itemId?: string;
 }
