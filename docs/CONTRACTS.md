@@ -2790,3 +2790,820 @@ prompts, and nothing a collection does may surprise the user.
   `host[:port]` (no userinfo). The "passed through without decryption" notice uses the learned hosts (`host:port`) and
   `tlsPassthrough` entries by exact name (wildcard patterns are not expanded).
 - Agent instructions: the four §21.15 #5 lines (instructions budget 64 lines).
+
+## 22. v0.16.0 — Stateful mocks: a fake backend that remembers (2026-11-20)
+
+Owner request: a collection (§21) answers with fixed examples, so an app that adds an item and then lists them never
+sees it. 0.16.0 makes the REST resources of a collection **remember**: `POST` adds, `GET` lists and reads the current
+data, `PUT` / `PATCH` change, `DELETE` removes. Owner decisions (2026-11-20): resources are **detected automatically
+and editable** (turn one off, fix its id field); the data lives **in memory** in the host, seeded from the
+collection's examples, kept until **Reset** or until the proxy stops; a **named snapshot** of the data can be saved
+as a file in the repo to share a scenario. Plan and owners: docs/PLAN.md "v0.16.0". WP0 research (proxy, host,
+agents/UI, prior art) is summarised in §22.12.
+
+Prior art (§22.12): Mockoon, json-server, MockServer, Beeceptor, MS Dev Proxy and WireMock's extensions keep CRUD
+data, but every one needs resources declared by hand (or a `db.json`); Prism and Postman's example mocks are
+stateless. None builds stateful resources from an OpenAPI document or a Postman collection, and none does it while
+the app keeps calling its real host.
+
+### 22.1 Proxy: the `handler` action (amends §3; `packages/proxy`)
+The only proxy change. A rule whose answer a host function computes at request time.
+
+```ts
+// types.ts — a new RuleAction kind
+| { kind: 'handler';
+    handlerId: string;                                   // 1–200 chars; the host registers it (collections: `collection:<linkId>`)
+    fallback?: Extract<RuleAction, { kind: 'mock' }>;    // answered when no handler is registered or it returns undefined
+    timeoutMs?: number }                                 // default 10 000, 1–60 000
+
+export interface HandlerRequest {
+  exchangeId: string; ruleId: string;
+  method: string; url: string;                           // absolute URL as the app sent it
+  headers: Record<string, string | string[]>;
+  body?: Body;                                           // decoded as for mocks; `truncated: true` past 5 MB
+}
+export interface HandlerResponse {
+  status: number;                                        // 100–599
+  headers?: Record<string, string | string[]>;
+  body?: string;                                         // ≤ 5 MB
+  delayMs?: number;                                      // ≤ 60 000
+  note?: string;                                         // ≤ 300 chars, one line → Exchange.notes
+}
+export type RequestHandler = (req: HandlerRequest, signal: AbortSignal)
+  => HandlerResponse | undefined | Promise<HandlerResponse | undefined>;
+
+interface InterceptProxy {
+  /** Registers (fn) or removes (undefined). Kept across setRules / setCollectionRules; cleared by stop(). */
+  setHandler(id: string, fn: RequestHandler | undefined): void;
+}
+```
+- **Route**: `h1` with the body buffered, like `mock` (not `bodyLimitReason`-skipped like `script`). gRPC, WebSocket
+  and tunnels never match it (not in `GRPC_ACTIONS` / `WEBSOCKET_ACTIONS`). CORS preflight: answered like `mock`
+  (add the kind to the preflight list). Network profiles: like `mock` (`reachesNetwork` false).
+- **Answer**: in `onRequest` next to `mock`; framed by the same code as mock / script `respond`. State `mocked`,
+  `simulated: 'Stateful mock'`, `matchedRuleId` the rule id, `note` appended to `notes`.
+- **Errors**: no handler registered or `undefined` returned → `fallback` (+ note "answered from the example") or, without
+  one, `502`. Throw / reject / invalid value → `502` local failure, state `error`, `error: "Handler <ruleId>: <msg>"`
+  (message one line, ≤ 300). Timeout → the signal aborts, `502` "timed out after N ms". Client gone → the signal aborts,
+  the result is dropped (a change the host already made stands, like a real server). More than 256 in flight → `503`
+  with a note.
+- **Validation**: `actionProblem` checks `handlerId`, `timeoutMs`, and `fallback` as a mock; `handler` is in
+  `NOT_A_STEP` (never a sequence step). The host's `validateAction` (`ui/validate.ts`) keeps refusing it: users, agents,
+  the shared file and the panel can't author a `handler` rule — only host-built collection rules carry one. The panel
+  and agent views show it read-only ("Stateful mock (collection …)").
+- `InterceptProxyHost.setHandler` stores handlers and re-applies them in `doStart`; `ProxyLike` gains `setHandler`.
+
+### 22.2 Model (pure, `packages/extension/src/mocks/**`, no vscode, no fs)
+```ts
+// types.ts additions
+interface MockEndpoint {
+  …                                                      // §21.1 unchanged
+  /** OpenAPI only: hints from the 2xx response schema (after $ref / allOf). */
+  schemaHints?: { idField?: string; idType?: 'integer' | 'string'; idFormat?: string; writeOnly?: string[] };
+  /** Query parameter names the request declares (Postman `url.query` keys, OpenAPI `in: query`); ≤ 20, ≤ 100 chars. */
+  queryParams?: string[];
+}
+
+type StoreOp = 'list' | 'create' | 'get' | 'replace' | 'patch' | 'delete';
+
+interface Resource {
+  name: string;                                          // "users"; nested: "users.orders"; unique per collection (#2, #3)
+  origin: string;
+  /** The list path, e.g. ['api', 'users'] or ['users', {param:'userId'}, 'orders']. */
+  listPath: (string | { param: string })[];
+  itemParam: string;                                     // ":id" name in the item path
+  scopeParams: string[];                                 // earlier params (nested resources), outermost first
+  idField: string;
+  idKind: 'integer' | 'uuid' | 'string';
+  /** Endpoint key per operation found in the collection. */
+  ops: Partial<Record<StoreOp, string>>;
+  /** The list example's shape: a bare array, or an object with the records at `path` and counters to recompute. */
+  list: { wrapper?: { path: string[]; template: unknown; totals: string[] } };
+  writeOnly: string[];
+  detected: true | 'override';
+  /** The seed came from generated bodies only (OpenAPI with no written example). */
+  generatedSeed?: true;
+}
+
+interface ResourceOverride { off?: boolean; idField?: string }
+type ResourceOverrides = Record<string /* resource name */, ResourceOverride>;
+
+function detectResources(endpoints: MockEndpoint[], overrides: ResourceOverrides):
+  { resources: Resource[]; problems: string[] };
+```
+`src/mocks/resources.ts` (detection), `src/mocks/store.ts` (data + operations), `src/mocks/snapshot.ts` (file format).
+
+### 22.3 Detection (`detectResources`)
+1. **Pairs.** An item endpoint has a path whose last segment is a param and the one before it a literal; its list path
+   is that path minus the param, same origin. It is a resource when the item path has `GET`, `PUT`, `PATCH` or `DELETE`
+   **and** the list path has `GET` or `POST`. Everything else (actions like `/auth/login`, `/reports/{year}` with no
+   list route, create-only `POST /orders`) stays static.
+2. **Nested.** Params before the item param become `scopeParams`: records are kept per parent (`/users/1/orders` and
+   `/users/2/orders` are different lists). A record that has a field named after the scope param (`userId`,
+   `user_id`) gets it filled on create.
+3. **Literal siblings** (`/users/me`) stay static (they already sort before `:id`).
+4. **Id field**, first match: the override; OpenAPI `schemaHints.idField` (`readOnly` / named `id` / the item param);
+   the item param name when it is a top-level key of the item example; `id`; `<singular>Id` / `<singular>_id`; `_id`;
+   `uuid`. None → not a resource, one problem line "<name>: set its id field to make it remember".
+5. **Id kind**: `schemaHints.idType`/`idFormat` first, else the seeded ids (all integers → `integer`; all UUIDs →
+   `uuid`; else `string`).
+6. **List shape**: a JSON array → bare. An object with exactly one array property whose elements are objects holding
+   the id field (any depth ≤ 3, e.g. `data`, `items`, `results`, `content`, `data.items`) → `wrapper` with that path;
+   numeric siblings named `total`, `count`, `totalCount`, `total_count`, `totalItems` are recomputed. Anything else →
+   static, problem line.
+7. **Duplicates** of a resource name get ` #2`; more than 100 resources per collection → the rest static, one line.
+Pure and deterministic; ≤ 50 ms for 2 000 endpoints.
+
+### 22.4 Seed and store
+- **Seed**: the first written (non-generated) 2xx list example with records, then every 2xx item example merged in by
+  id (item examples are usually fuller). Generated bodies only when nothing is written (`generatedSeed`). Query-chosen
+  examples (`?page=2` → `[]`) are not seeds. `writeOnly` fields are removed. No seed → an empty list.
+- **Store** (one per link, in the host): `Map<resource, Map<scopeKey, Record[]>>` (insertion order). Records are plain
+  JSON objects (`JSON.parse` output; `__proto__` keys dropped, null-prototype objects), depth ≤ 32.
+- **Limits** (`STORE_LIMITS` in types.ts): record ≤ 1 MB serialised; ≤ 5 000 records per resource (all scopes); store
+  ≤ 32 MB; id ≤ 100 chars (`paramChars`); list answer ≤ 5 MB (past it the answer keeps the records that fit, with the
+  header `x-flutter-intercept: truncated` and a note). A create past a limit answers `507` with
+  `{"error":"store_full","message":…}` and a problem line; nothing is ever evicted silently.
+- **Lifetime**: built from the seed when the collection is (re)parsed with a new cache key (file content, environment,
+  variables, overrides of that resource); kept across selection / overlay / approval rebuilds; dropped on Reset, on
+  proxy stop, when the collection is removed or its link turned off.
+- All operations are synchronous at call time (concurrent requests can't interleave a change).
+
+**Store API** (`src/mocks/store.ts`, pure; S builds it, H uses it):
+```ts
+interface StoreRequest {
+  resource: string; op: StoreOp;
+  params: Record<string, string>;            // path params by name (scope params + item param), percent-decoded
+  query: [string, string][];                 // in order, decoded
+  body?: { text: string; truncated?: boolean };
+  contentType?: string;
+}
+interface StoreAnswer {
+  status: number; headers: Record<string, string>; body: string;
+  note: string;                              // one line (§22.5)
+  itemId?: string;
+}
+class ResourceStore {
+  constructor(resources: Resource[], endpoints: MockEndpoint[]);   // seeds (§22.4) from the endpoints' examples
+  handle(req: StoreRequest): StoreAnswer;                          // never throws; 4xx / 5xx answers instead
+  items(resource: string, opts?: { offset?: number; limit?: number; filter?: string; scope?: Record<string, string> })
+    : { total: number; items: unknown[]; truncated?: true };
+  replace(resource: string, items: unknown[], scope?: Record<string, string>): string[];   // problems
+  put(resource: string, item: unknown, scope?: Record<string, string>): string[];
+  remove(resource: string, itemId: string, scope?: Record<string, string>): boolean;
+  generate(resource: string, count: number, scope?: Record<string, string>): string[];
+  reset(resource?: string): void;                                  // back to the seed
+  counts(): Record<string, number>;                                // records per resource, all scopes
+  readonly changed: boolean;                                       // differs from what it started from
+  dump(): StoreSnapshot;                                           // unredacted; snapshot.ts redacts on save
+  load(s: StoreSnapshot): string[];                                // whole snapshot validated first; problems
+}
+```
+Headers in a `StoreAnswer` are the operation example's headers (minus `content-length`, `transfer-encoding`,
+`content-encoding`) plus `content-type: application/json` and `x-total-count` on lists; H passes them through
+`limitAnswer` (§21.16) before answering. `snapshot.ts`: `parseSnapshot(text): {snapshot?, problems}` (validation
+only) and `snapshotText(dump, endpoints?): {text, blanked: string[]}` (redaction as §21.6, stable key order, 2-space
+JSON).
+
+### 22.5 Semantics (examples first, defaults second)
+The collection's examples override these defaults: an operation's written 2xx example gives its **status**, its
+**headers** (through `limitAnswer`, §21.16) and, for list answers, the **wrapper**.
+
+| Request | Answer |
+|---|---|
+| `GET` list | `200` (or the example's 2xx), records of that scope in insertion order, in the wrapper; `X-Total-Count` header. Query: paging only for parameter names the collection itself uses on that list (`page`+`limit`/`per_page`/`size`/`pageSize`, `offset`+`limit`, `_page`/`_limit`; 1-based pages); sorting for `sort`/`order`/`_sort`/`_order` when used; other parameters are **exact-match filters only when every record of the list has that field**, otherwise ignored (an unknown `?lang=en` never empties a list). Wrapper counters set to the total; `page`/`per_page` echoed when present |
+| `GET` item | `200` record; missing → `404` |
+| `POST` list | `201` (or the example's 2xx). Record = the POST example's response body (server-made fields such as `createdAt`, `status`) ⊕ the request body (shallow) ⊕ id; scope field filled. Id: the client's when given and free (taken → `409`); else integer → max + 1 (seeded max, never reused after delete); uuid → a UUID-v4-shaped id from a per-store counter (reproducible); string → `<resource>-<n>`. No `Location` is added (it is a limited header, §21.16); an example's own `Location` stays subject to approval. Body not a JSON object → `400` |
+| `PUT` item | Replace (id kept, the URL's id wins over the body's) → `200` record (or the example's 2xx); missing → `404` (no upsert) |
+| `PATCH` item | Shallow merge; `null` sets `null`; id kept → `200` record; missing → `404`. `application/json-patch+json` → `415` (later) |
+| `DELETE` item | `204` empty, or the example's 2xx with its body; missing → `404`. Children (nested resources) are kept |
+
+- **404 body**: the item's written 404 example, else `{"error":"not_found","message":"<resource> <id> not found"}`.
+  Errors are JSON (`content-type: application/json`) with `{error, message}`.
+- **Answers** never include `writeOnly` fields; a record's `password`-like fields are left as the app sent them in the
+  app's own answers (it is the app's data) but redacted for agents and snapshots (§22.8).
+- A request body over 5 MB (`truncated`) → `413`. Non-JSON request bodies → `415` for create / replace / patch.
+- The note on every answer (fixed format; the panel reads it, §22.14): `"<resource>: listed 12 of 40"`,
+  `"<resource>: created 7"`, `"<resource>: read 7"`, `"<resource>: updated 7"`, `"<resource>: deleted 7"`,
+  `"<resource>: 7 not found"`; errors `"<resource>: <short reason>"`.
+
+### 22.6 Rules (amends §21.5)
+- `toRules` gives each **resource operation endpoint's default rule** a `handler` action (`handlerId:
+  'collection:<linkId>'`, `fallback` = the static mock 0.15 would have answered, or the 501 rule) in the same sorted
+  position; the rule's `CollectionRuleMeta` gains `resource` and `op`. Endpoints of a resource with no example (501 in
+  0.15) are answered by the store.
+- **A chosen example wins**: an endpoint with an explicit `selected` example (team or personal) keeps the **static**
+  example rule, so "Wrong password" / 404 tests keep working; `reset` brings the store back. Query-example rules of a
+  stateful list are not built (one problem line per list).
+- `off` endpoints build no rule (as 0.15). User rules run first (§21.5): a fault or breakpoint still wins.
+- Sidecar and CLI hosts without a registered handler answer `fallback`: exactly 0.15.0 behaviour.
+
+### 22.7 Settings: shared and personal (amends §21.6)
+A new **top-level** key in `.vscode/flutter-intercept.json` (0.15 writers keep unknown top-level keys; an unknown
+per-link field would be dropped by a 0.15 "Save for the team"):
+```jsonc
+"stores": [
+  { "collection": "shop-api",                           // link id (§21.6)
+    "enabled": true,                                    // default true: a collection's resources remember
+    "snapshot": "checkout",                              // optional: start from this snapshot instead of the seed
+    "resources": { "users": { "idField": "userId" }, "orders": { "off": true } } }
+]
+```
+- Personal by default (§21.15): `enabled`, per-resource `off` / `idField` and the starting snapshot changed from the
+  panel or by agents go to workspaceState `flutterIntercept.storesOverlay` (`{ [folder\0linkId]: {…same shape} }`);
+  `scope: 'team'` writes the shared file and drops the same overlay entries; `reset: true` clears the overlay.
+- Entries whose `collection` matches no link are kept as written and ignored. ≤ 20 entries; ≤ 100 resources each.
+- Turning a store on or off, or changing its overrides, does not need re-approval (§21.16).
+
+### 22.8 Snapshots
+- Path: `.vscode/flutter-intercept/snapshots/<linkId>/<name>.json`, `name` `/^[a-z0-9-]{1,40}$/`. Written through the
+  rules fs (`RulesFs`) with the §21.6 folder checks: realpath inside the workspace folder, no symlinked file or parent
+  outside it, not under `.dart_tool/` or `build/`; ≤ 32 MB; ≤ 50 snapshots per collection.
+- Format: `{ "version": 1, "collection": "<linkId>", "savedAt": "<ISO>", "resources": { "<name>": [ { "scope":
+  {"userId": "1"}?, "records": [ … ] } ] }, "next": { "<name>": 8 } }`.
+- **Save** redacts like the sanitised copy (§21.6): fields whose names are secret-like (`SECRET_KEY`), opaque-token
+  values and credential-looking strings become `""`; one line in the result lists the fields blanked. A snapshot never
+  contains request headers or environment values (the store never holds them).
+- **Load** validates the whole file (version, shapes, limits, `__proto__`), replaces the data of the resources it
+  names, keeps the others, and reports unknown resources as problem lines. A broken file changes nothing.
+- Snapshots are files the team commits; the panel says so once in the Save prompt.
+
+### 22.9 Host (`src/mocks/core.ts` + `service.ts`; amends §21.7)
+`MockCollectionsCore` owns the stores: `Entry` gains `resources`, `resourceProblems`, `store`. One proxy handler per
+link (`collection:<linkId>`) registered through `ProxyHost.setHandler`, dispatching by `ruleId` → meta → resource/op.
+New core methods (also on `MockCollectionsHost`):
+```ts
+storeStatus(id): StoreStatus | undefined;
+storeItems(id, resource, opts: { offset?: number; limit?: number; filter?: string; scope?: Record<string,string> })
+  : { total: number; items: unknown[]; truncated?: true };
+updateStore(id, patch: StorePatch): Promise<void>;
+storeSnapshot(id, action: 'save' | 'load' | 'delete', name: string): Promise<{ path: string; resources: number; records: number; blanked?: string[] }>;
+storeOpOf(exchangeId): { resource: string; op: StoreOp; itemId?: string } | undefined;   // last 5 000 exchanges
+```
+`StoreStatus`, `StoreResourceView` and `StorePatch` are the protocol types of §22.10.
+
+### 22.10 Messages (amends §4 / §21.8; both `protocol.ts`; the plugin uses the same ones)
+```ts
+interface CollectionStatus { …; store?: StoreStatus }    // counts only, never records
+interface StoreStatus { enabled: boolean; resources: StoreResourceView[]; snapshots: string[]; startsFrom?: string;
+  changed: boolean; overridden?: true; problems: string[] }
+interface StoreResourceView { name: string; path: string /* "/users/:id" */; idField: string; count: number;
+  remembers: boolean; detected: boolean; overridden?: true; generatedSeed?: true; problem?: string }
+interface StorePatch { resource?: string; enabled?: boolean; remembers?: boolean; idField?: string;
+  put?: { item: unknown }; remove?: { itemId: string }; replace?: unknown[]; generate?: { count: number };
+  startsFrom?: string | null; scope?: 'me' | 'team'; reset?: 'data' | 'settings' }
+// webview → host
+{ type: 'getStoreItems'; id: string; resource: string; offset: number; filter?: string }
+{ type: 'updateStore'; id: string; patch: StorePatch }
+{ type: 'storeSnapshot'; id: string; action: 'save' | 'load' | 'delete'; name?: string }   // save without a name → IDE input box
+// host → webview
+{ type: 'storeItems'; id: string; resource: string; offset: number; total: number; items: unknown[]; truncated?: true }
+```
+- `put` / `remove` / `replace` / `generate` change **data** (never a file). `generate.count` ≤ 5 000: copies of the
+  seed's first record with new ids (string fields that equal the record's name-like field get ` <n>`). `reset: 'data'`
+  → back to the seed (or `startsFrom`); `reset: 'settings'` → clears the personal overlay of that store.
+- The host pushes `storeItems` again (debounced 200 ms) while a resource is open and its data changes.
+- `Exchange` views (panel and agents) gain `collection.store?: { resource, op, itemId? }`.
+
+### 22.11 Panel, agents, CLI, plugin
+- **Panel** (inside the collection row, UX first): one line "Remembers what the app sends: users 10 · orders 2 ·
+  cart 0" with **Reset data** and **Snapshots ▾** (Save…, Load ›, Delete ›); a **Requests | Data** switch in the
+  expanded row; Data lists resources (count, remembers switch, id field picker, "changed for you" tag) and a capped
+  table of the selected resource (columns: top-level scalar keys of the first 50 records; Show more; JSON view; edit a
+  record as JSON validated before sending; Add; Delete). Detail pane: "Answered by collection Shop API · created
+  users 7". No banners; problems as one quiet line each.
+- **Agents** (three new tools, 47 → 50):
+  - `get_store {id, resource?, scope?, filter?, offset=0, limit=20 (≤ 200), fields?: string[], shape?: boolean}` (read)
+    → without `resource`: `StoreStatus`; with it: `{resource, total, items, more?}` (records through the agent
+    redaction; `shape: true` → the body shape instead of records).
+  - `set_store {id, resource?, items? | put? | remove? | generate?, remembers?, idField?, enabled?, startsFrom?,
+    reset?: 'data' | 'settings', scope?: 'me' | 'team'}` (write; destructive) → counts only `{resource, count, note}`.
+  - `store_snapshot {id, action: 'save' | 'load' | 'delete', name}` (write; confirmed in Copilot) → `{path, resources,
+    records, blanked?}`.
+  - Read-only access blocks the two writes. Agents still can't approve or remove a collection. Instructions: one line
+    "Data the app writes is remembered: get_store to see it, set_store {items: []} / generate for a scenario,
+    reset: 'data' when done" (budget 64 lines kept).
+- **CLI**: the handler is registered by default; `--collection-snapshot <name|file>` seeds from a snapshot;
+  `--no-collection-store` keeps 0.15 behaviour; the summary prints one line per resource with its final count.
+- **Plugin / sidecar**: the sidecar's core and proxy host get it from the shared code; snapshot names through the
+  generic `ui.input`; no Kotlin change expected beyond strings.
+
+### 22.12 WP0 research (2026-11-20)
+- **Proxy**: breakpoints can't answer without the server (a request edit has no status; a missed deadline forwards);
+  scripts are synchronous, 200 ms, in a worker the host can't read, and agents can't create them. Hence `handler`
+  (§22.1); the proxy is in-process in every host (extension, sidecar, CLI); precedent `setGrpcCodec`.
+- **Host**: parsers drop request bodies and schemas today → `schemaHints` (OpenAPI only). A per-link field would be
+  stripped by a 0.15 "Save for the team" (`toFileLink`) → top-level `stores`. Static example chosen → static wins.
+- **Prior art**: semantics in §22.5 follow MockServer / Beeceptor / Dev Proxy (201 on create, shallow PATCH, 204
+  DELETE) and avoid known pitfalls: ids flipping type (json-server v1 made them strings — fatal for Dart `int`),
+  envelope mismatch (keep the example's wrapper), unrelated query parameters emptying lists, created records missing
+  server-made fields (Mockoon #1256), silent eviction at a cap (Beeceptor).
+
+### 22.13 Review, performance
+- Independent security review (owner rule): the `handler` action (timeouts, in-flight cap, errors), snapshot files
+  (paths, symlinks, redaction on save, validation on load), record limits and prototype safety, agent outputs.
+- Performance: per-request matching cost unchanged (`handler` rules replace `mock` rules one for one); a store hit ≤ 1
+  ms for 1 000 records (list + serialise); detection ≤ 50 ms for 2 000 endpoints; webview table of 5 000 records
+  capped, filter < 50 ms. Bundle budget re-measured.
+
+### 22.14 W as built, and decisions on its questions (2026-11-20)
+- The panel's `Exchange` (the proxy type) has no collection field, so the panel reads a store op from `simulated ===
+  'Stateful mock'` + a `collection:<id>:<n>` `matchedRuleId` + the §22.5 note (resource must be one of that
+  collection's). The host keeps the label and the note format exactly; agent views get `collection.store` (§22.10).
+- Data patches (`put` / `remove` / `replace` / `generate`) carry no `scope` (data never reaches a file); settings
+  patches do.
+- Nested resources: `getStoreItems` lists every parent's records (each record keeps its scope field when the resource
+  has one). `remove` / `put` without a scope act on the record with that id in the first scope that has it (insertion
+  order); a `put` of a new record takes its scope from the record's scope field (`userId`), else it is refused with
+  "<resource>: set <param> to say which parent it belongs to".
+- `getStoreItems` pages are 200 records; the host pushes `storeItems` again (debounced 200 ms) for the last resource
+  asked for, until another is asked for or the panel closes.
+- Re-sending an unchanged setting (e.g. `startsFrom` in Save for the team) changes nothing and reloads nothing.
+- Records travel parsed; integers past 2^53 lose precision in the panel editor (documented, not fixed).
+
+### 22.15 P as built (proxy, 2026-11-20)
+`packages/proxy/src/handler-flow.ts` (`HandlerFlow`; `HANDLER_MAX_IN_FLIGHT = 256`, `STATEFUL_MOCK_LABEL`);
+`http-edits.ts` `localAnswer()` frames every made-up response (mock, script `respond`, handler). Accepted decisions:
+- A too long / multi-line `note` is flattened and clipped (never a 502); a non-text note is invalid.
+- Busy → `503` with `retry-after: 1`, state `error`, an `error` and a note.
+- A `fallback` answer reads as a plain 0.15 mock (no `simulated`) and carries the note "No stateful mock is running for
+  this rule; answered from the example." / "The stateful mock had no answer; answered from the example."
+- `setRules` refuses an invalid `handler` rule (kept in the list, never matched, in `refusedRules`, like `grpcMock`).
+- CORS preflight to a handler rule → `204` locally, the handler isn't called; network profiles don't apply.
+- Existing mocks with a non-standard status now get the status message "Unknown" (shared framing).
+
+### 22.16 S as built (store core, 2026-11-20)
+`src/mocks/resources.ts`, `store.ts`, `snapshot.ts`; `openapi.ts` fills `schemaHints` / `queryParams`, `postman.ts`
+`queryParams`. Decisions:
+- `detectResources` leaves `off` resources out; the host calls it without `off` overrides and applies `off` itself.
+  Item paths match with params normalised (`/users/:id` = `/users/{userId}`); the host takes path params by position.
+  A repeated param name, a non-object item example or a list of non-objects → static with a problem line. No example
+  record → id `id`, kind `integer`. `schemaHints.idField`: an id-like `readOnly` property, then `id`, then the item param.
+  Wrapper counters are JSON Pointers found next to the records, at the root, or in root `meta` / `pagination` /
+  `paging` (`totalElements` too).
+- Seed merges GET-item examples only. Nested scopes are seeded on first read and stored on first change (counts and
+  `dump` cover changed parents). `writeOnly` fields are never stored.
+- JSON request bodies are accepted whatever the content-type (Dart `http` sends `text/plain`); `415` for json-patch,
+  form, multipart and unparsable non-JSON types; empty body = `{}` on create, `400` on PUT / PATCH.
+- Lists: `page` alone → 20 per page; `_limit`, `offset` + `limit` alone work; sort `sort=-f`, `f,desc`, `f:desc`;
+  filters compare scalars as text, repeated parameters = any of.
+- `ResourceStore.load(s, {asStart: true})` makes a snapshot the starting point (`startsFrom`); `problems` (≤ 20).
+- Snapshot redaction (narrower than the §21.6 copy, owner-approved by the lead): a field is secret when one word or an
+  adjacent word pair of its name (camelCase / snake / kebab split) is password, passwd, pwd, passcode, secret, token,
+  apikey / api key, authorization, auth, credential(s), cookie, privatekey / private key, otp, pin, sessionid / session
+  id / token / key, refresh token, access token, client secret, signature, ssn, cvv / cvc, card number — so `author`,
+  `sessionCount`, `pinned`, `tokenizer` are kept. Credential-looking values (JWT, Bearer / Basic, opaque tokens) are
+  blanked whatever the name.
+
+## 23. v0.16.0 part 2 — From real traffic: a fake backend in one click, and a collection that stays true (2026-11-20)
+
+Owner request (2026-11-20): ship with §22 in 0.16.0. Research: R17 (reuse map below). Decisions on R17's open
+questions were taken by the lead in the project's interest (owner: "take the right decision for the project").
+
+Reuse: recordings (`recordings/store.ts`, `diff.ts` `compareShapes`, `codegen/infer.ts` `inferShape`), export
+(`export/common.ts` `selectExchanges` / `templatePath`, `export/postman.ts` `toPostman`), `mocks/sanitise.ts`
+`sanitisePostman`, `mocks/snapshot.ts` value redaction, `mocks/core.ts` `copyIn` + `addLink` (write and link, never
+overwrite), `matcherOf` / `classify` / `seen`. One path templater for everything: `codegen/route.ts` `isIdSegment`
+(`seen`'s `contract/mapping.ts` `pathTemplate` moves to it).
+
+### 23.1 Record → Mock (pure `src/mocks/fromTraffic.ts`)
+```ts
+interface FromTrafficOptions { name: string; origins?: string[]; unmatched?: 'passthrough' | 'fail';
+  maxExampleBytes?: number /* default 1 MB, ≤ COLLECTION_LIMITS.exampleBodyBytes */; replacePersonalData?: boolean /* default true */ }
+interface FromTrafficResult { text: string; endpoints: number; examples: number; origins: string[];
+  skipped: string[] /* "12 GraphQL requests", … */; removed: string[] /* field / header names, never values */ }
+function collectionFromTraffic(exchanges: readonly Exchange[], o: FromTrafficOptions): FromTrafficResult;
+```
+- **Taken**: `completed`, a status, no `matchedRuleId` (a throttle-only rule is fine). **Skipped** (counted): mocked /
+  replayed, 1xx / 3xx / 304, `OPTIONS`, GraphQL, gRPC, WebSocket, SSE, tunnels, browser-internal, truncated, binary /
+  non-text bodies. Skipped endpoints are not in the collection (they pass through, or fail offline).
+- **Templating**: `templatePath` (`isIdSegment`) plus a sibling collapse (≥ 3 distinct literals at one position, same
+  method and parent → a param); params named `<singular of the previous literal>Id`, else `id`, `id2`.
+- **Examples**: the newest per status per endpoint, ≤ 20; a body over `maxExampleBytes` is dropped (never cut, with
+  a skipped note); file ≤ 20 MB (largest examples dropped first); ≤ 2 000 endpoints.
+- **Sanitising, always on**: `toPostman`'s request redaction; response bodies through the snapshot value redaction
+  (§22.16), except that a JWT-looking value becomes a fixed unsigned placeholder `eyJhbGciOiJub25lIn0.eyJzdWIiOiJmaSIsImV4cCI6NDEwMjQ0NDgwMH0.`
+  (`{"alg":"none"}` / `{"sub":"fi","exp":4102444800}`) so apps that decode `exp` keep working, and other credentials
+  become `""`; response headers lose `set-cookie`, `access-control-*`, CSP, `date`, `age`, request / trace ids,
+  `alt-svc`, `report-to`, `nel`, `strict-transport-security`; query values blanked (names kept, so §22.5 paging works);
+  request bodies ≤ 64 KB; finally `sanitisePostman` via `copyIn(…, 'sanitised')`.
+- **Personal data** (default on, switch in the dialog): e-mail addresses → `user<n>@example.com`, values of fields named
+  like phone / mobile / msisdn → `+10000000<n>`, fields named like address / street / lat / lng / latitude / longitude
+  → `""` / `0`. Consistent per run (the same value → the same replacement). Everything else is real data: the dialog
+  says "review before committing" with Open file.
+- **No invented endpoints**: only what was recorded (no CRUD ops added).
+- **File and link**: `.vscode/flutter-intercept/collections/<slug>.json` via `copyIn` (§21.6 rules, never overwrite),
+  then `addLink` with the chosen `unmatched` (default `passthrough`, the dialog offers "Offline: fail what wasn't
+  recorded") and `baseUrl` values in the collection's own `variable[]`. Stateful by default (§22.7). Not approved by
+  default (§21.16); after the header stripping above it rarely matters.
+
+### 23.2 Host, panel, messages (amends §21.8)
+- `MockCollectionsHost.mockFromTraffic({source: {session: {sinceMs?: number; url?: string}} | {recording: string},
+  name, origins?, unmatched?, replacePersonalData?}) → {id, file, endpoints, examples, resources: string[], skipped,
+  removed}`; command `flutterIntercept.mockFromTraffic`. IDE flow: origins QuickPick (JSON origins preselected,
+  third-party ones listed unselected), name, a modal with the two `unmatched` choices, the personal-data switch and
+  "Credentials removed; example bodies are real data — review before committing" + Open file.
+- Panel: "Make a fake backend from this session" in the Collections empty state and menu, and on each recording row;
+  result line "Shop API (recorded) answers 23 requests · remembers users, orders".
+- Webview → host: `{ type: 'mockFromTraffic'; source: 'session' | { recording: string } }` (the host runs the dialogs;
+  the panel never names a path).
+
+### 23.3 Drift (pure `src/mocks/drift.ts` + core)
+- **Qualify**: as §23.1 taken, plus a JSON response ≤ 1 MB, origin one of the collection's, `matcherOf` finds the
+  endpoint, and the endpoint has a JSON example with that status (query-matching example first, else the default).
+  Runs for every linked collection with a good parse, also ones turned off for this user (the main case).
+- **State**: per (link, endpoint, status) the last 5 sample shapes (no bodies); example shapes cached by the parse
+  cache key; ≤ 500 windows per link (LRU).
+- **Findings** (N = 3): `added` (in all of the last 3 samples, not in the example), `removed` (in the example, in none
+  of the last 3; never for `generated` examples), `type` (another non-null kind in all 3; int → double counts, double →
+  int ignored), `nullable` (null in ≥ 2 where the example has a value), `status` (the server answered a status the
+  endpoint has no example for, 3 times). Never: optional fields, map-like objects, empty arrays, values. Depth ≤ 8,
+  ≤ 20 changes per endpoint; a finding clears when newer samples disagree.
+- **Ignore**: workspaceState `flutterIntercept.driftIgnored[folder\0id\0endpoint\0status] = fingerprint`; it returns
+  only when the set of changes differs. Setting `flutterIntercept.collectionDrift` (default true).
+- **Cost**: classification cached per exchange; queue debounced 500 ms, ≤ 50 exchanges per tick; ≤ 2 ms per 100 KB body.
+```ts
+interface DriftChange { kind: 'added' | 'removed' | 'type' | 'nullable' | 'status'; path: string; from?: string; to?: string }
+interface DriftView { endpoint: string; status: number; samples: number; changes: DriftChange[]; since: number }
+CollectionStatus.drift?: { endpoints: number; line: string }   // "GET /users/:id now has avatar (and 2 more)"
+CollectionEndpointView.drift?: DriftView[]
+// webview → host
+{ type: 'updateExample'; id: string; endpoint: string; status: number }
+{ type: 'ignoreDrift'; id: string; endpoint?: string; status?: number }
+```
+
+### 23.4 Update example (the team file; the user confirms)
+- **Merge** (default): start from the existing example body; add `added` fields with values from the newest sample
+  (sanitised as §23.1; arrays of objects: every element), drop `removed`, convert `type`. The team's values stay.
+- **Splice** only that string value in the file (position-aware locator); every other byte is unchanged. Postman: the
+  example's `body`; OpenAPI JSON: the chosen `example` / `examples[k].value`. OpenAPI YAML and generated examples are
+  not edited: "Copy the updated example" instead.
+- **Preview**: `vscode.diff` before / after, then a modal ("Update example" / Cancel) that says the shared file changes,
+  the collection's remembered data restarts (§22.4) and re-approval applies if answers were limited. The file is
+  re-read and the write refused if its hash changed since the preview.
+- Mode `add` (panel menu): insert a new example "<status> (from the server, <date>)" before the old one.
+
+### 23.5 Agents (50 → 52)
+- `list_collections` / `get_collection` gain `drift: DriftView[]` (≤ 20, paths only, never values).
+- `mock_from_traffic {name?, recording?, url?, sinceMs?, origins?, unmatched?, replacePersonalData?, dryRun?}` (write;
+  Copilot confirms the file) → `{id, file, endpoints, examples, resources, skipped, removed, limited?}`; `dryRun`
+  returns the same without writing. Redaction always on.
+- `update_collection_example {id, endpoint | request, status, mode?: 'merge' | 'add'}` (read) → the diff text only.
+  **Agents never write the team file**: the user applies it from the panel ("Update example").
+- Instructions (one line): "No test server but the app worked earlier: mock_from_traffic. drift in list_collections =
+  the collection is stale: tell the user (update_collection_example shows the change)."
+
+### 23.6 CLI and plugin
+- CLI `--record-collection <name>` writes a collection from the run's traffic (same rules; `unmatched` passthrough).
+- Plugin / sidecar: the same core; origins, name and confirmations through `ui.input` / modals; the diff preview as
+  a plain before / after text dialog.
+
+### 23.7 Risks kept in view (REVIEW-16)
+Credentials under innocuous names and signed URLs inside bodies (URL-in-text redaction of `X-Amz-Signature`,
+`sig=`, `token=` query parts in string values); personal data beyond the replaced kinds (the review note); internal
+host names as `baseUrl` values; drift noise (N = 3 + Ignore).
+
+## 24. v0.16.0 part 3 — Login that works, examples by body, dynamic values, more sources, big collections (2026-11-20)
+
+Owner request (2026-11-20), research R18. Owner decision: auth simulation in its **light** form only (the full form —
+storing and comparing passwords — was rated high risk and is not built). Other open questions decided by the lead.
+
+All of A–C run inside the §22.1 `handler` (it already receives headers and body). One host **answer pipeline** per
+request on a collection origin: chosen example (§22.6) → auth gate (§24.1) → query example (§21.5) → body example
+(§24.2) → store (§22) → default example → dynamic values (§24.3) → `limitAnswer` (§21.16). Rules whose endpoint needs
+none of auth / body examples / dynamic values / the store stay plain `mock` rules (no handler cost).
+
+**Proxy amendment (§22.1):** a handler may return `{ fallback: true, note?: string }` → the rule's `fallback` is
+answered quietly (no "had no answer" note; `note` appended if given).
+
+### 24.1 Auth simulation, light (sessions, never credentials)
+- **Detection**: login = `POST` whose last literal segment is `login|signin|sign-in|authenticate|token|session(s)`;
+  refresh = `refresh|refresh-token|refresh_token`, or `/oauth/token` with `grant_type=refresh_token` in the body;
+  logout = `logout|signout|sign-out`. Off unless a login endpoint is found **and** the user turns it on (panel / agent
+  / `stores[].auth.enabled`): a collection never starts rejecting requests by itself.
+- **Login**: any request accepted — **no password is read, stored or compared**. Exception: a body example (§24.2)
+  that matches (e.g. "Wrong password") answers instead. The answer follows the login 2xx example: fields named like
+  `access_token|token|jwt|id_token` → a new token, `refresh_token` → a new refresh token, `expires_in` → the TTL,
+  `expires_at` → now + TTL; a nested `user` object is kept as written. A JWT-looking example token → a JWT-shaped token
+  (`{"alg":"none"}`, the example's claims + `sub` from the login field value's hash, `iat`, `exp`, empty signature);
+  else `fi.<random>` (`fi.<n>` in seeded mode). Tokens ≤ 4 KB.
+- **Sessions** (`AuthSessions`, host memory only; never in the store, dumps, snapshots, panel or agent outputs except
+  as counts): token → expiry; ≤ 1 000 per collection (oldest dropped, one note); cleared on Reset, proxy stop, auth off.
+  Refresh with a known refresh token → a new pair; unknown → the refresh endpoint's 401 example. Logout drops it.
+- **Protected requests**: OpenAPI `security` (`[]` = public); Postman inherited `auth.type` (`noauth` = public) — the
+  sanitiser keeps `auth.type` (values still blanked); otherwise (`protect: 'all'`) every request on the collection's
+  origins except login / refresh / logout / register / forgot-password. Missing / unknown / expired `Authorization:
+  Bearer` → the endpoint's 401 example, else the login endpoint's 401 example, else `{"error":"unauthorized"}`.
+  Default `protect`: `'declared'` when the collection declares any auth, else `'all'`.
+- **Settings**: `stores[].auth { enabled, ttlSeconds (60–86 400, default 3 600), protect?: 'declared' | 'all', login?,
+  refresh? }` — never a password or token; personal overlay as §22.7.
+- **Messages**: `StoreStatus.auth?: { available: boolean; enabled: boolean; login?: string; refresh?: string;
+  ttlSeconds: number; protect: 'declared' | 'all'; sessions: number; problems: string[] }`; `StorePatch.auth?: {
+  enabled?; ttlSeconds?; protect?; expire?: 'all' }`. Notes: `"auth: 401 no token"`, `"auth: 401 expired"`,
+  `"auth: signed in"`, `"auth: refreshed"`.
+- **Agents**: `get_store` / `set_store` gain `auth` (settings + `expire: 'all'`); `expire_token` on an origin with auth
+  simulation on expires the sessions (`{expired}`) instead of its `[401 × n, passthrough]` preset.
+
+### 24.2 Example by request body
+- `MockExample.request?: { contentType: string; body: string }` (≤ 64 KB; larger → not used for choosing, problem
+  line); `MockEndpoint.requestBody?: { contentType: string; body: string }`. Sources: Postman `originalRequest.body`
+  (raw JSON, urlencoded) and the request's own `body`; OpenAPI `requestBody.content[mt].examples` paired with response
+  `examples` of the same key (Microcks convention); Bruno `example.request.body`. Bodies stay in the host (never in the
+  panel or agent outputs; field names only).
+- **Matching**: discriminators = JSON leaf paths where the example's request body differs from the endpoint's own body
+  (all leaves when there is none); depth ≤ 8, ≤ 32 leaves; strict JSON equality; leaves that are `""` with a secret-like
+  name or a `{{var}}` are ignored. Most discriminators wins, then file order. No discriminator left → not chosen by
+  body (problem line naming the field). urlencoded bodies compare as flat objects.
+- Panel / agents: `examples[].byBody?: string[]` (field names).
+
+### 24.3 Dynamic values in examples
+- Supported (seeded PRNG mulberry32 + ~2 KB word lists, no dependency): `$guid`, `$randomUUID`, `$timestamp`,
+  `$isoTimestamp`, `$randomInt` (0–1000), `$randomBoolean`, `$randomAlphaNumeric`, `$randomEmail`, `$randomExampleEmail`,
+  `$randomUserName`, `$randomFirstName`, `$randomLastName`, `$randomFullName`, `$randomPhoneNumber`, `$randomCity`,
+  `$randomStreetAddress`, `$randomCountry`, `$randomCountryCode`, `$randomLatitude`, `$randomLongitude`, `$randomPrice`,
+  `$randomProductName`, `$randomCompanyName`, `$randomJobTitle`, `$randomWord`, `$randomWords`, `$randomLoremWord`,
+  `$randomLoremSentence`, `$randomLoremParagraph`, `$randomDateFuture`, `$randomDatePast`, `$randomDateRecent`,
+  `$randomColor`, `$randomHexColor`, `$randomCurrencyCode`, `$randomIP`, `$randomIPV6`, `$randomDomainName`, `$randomUrl`
+  (always example.com). Others (images, finance, passwords, user agents) are left as written.
+- Evaluated at answer time in bodies and non-limited header values; inside JSON strings the value is JSON-escaped;
+  ≤ 1 000 placeholders per body; output ≤ `exampleBodyBytes`. Store seeds are evaluated once (stable ids).
+- Plain `{{var}}`: link `variables` and the collection's own `variable[]` only — **never** environment-file values
+  (§21.6).
+- Mode: `'random'` (IDE default), `'seeded'` (CLI default; `--collection-seed <n>`), `'fixed'` (§21.4 constants);
+  per collection `stores[].dynamic`. `collectionToRule` renders once with a note.
+
+### 24.4 More sources
+`CollectionFormat = 'postman' | 'openapi' | 'swagger' | 'insomnia' | 'bruno'` (both protocol copies; the panel badge
+and the plugin map each).
+- **Swagger 2.0**: in-house pure, bounded `swagger2ToOas3(doc)` then `parseOpenApi` (`host` + `basePath` + `schemes[0]`
+  → `servers`; `definitions` / `parameters` / `responses` → `components`, local `$ref`s rewritten; response `schema` +
+  `examples{mime}` + `produces` → `content`; `in: body` / `formData` → `requestBody`; `x-example` → `example`). Same
+  walk / size budgets as §21.3.
+- **Insomnia**: v4 JSON (`resources[]`, `_type` request / request_group / environment / api_spec) and v5 YAML
+  (`collection.insomnia.rest/5.0`, `spec.…` → embedded OpenAPI, `mock.insomnia.rest/5.0` routes → examples). Only
+  `{{ _.x }}` / `{{ x }}` variables; Nunjucks `{% %}` tags are never evaluated (in a host → unresolved; in a path → a
+  param). Requests without responses → 501 or the store.
+- **Bruno**: the link points at `bruno.json`; folder walk realpath-checked, no symlinks, ≤ 2 000 files, depth ≤ 32,
+  total ≤ 20 MB; cache key = hash of paths, sizes, mtimes; the folder is watched. Hand-written bounded `.bru` reader
+  (`meta`, method blocks, `params:path`, `params:query`, `headers`, `body:*`, `example`); scripts, tests, auth values,
+  `vars:secret` and `.env` are never read; `environments/*.bru` `vars` like a Postman environment. Bruno's YAML
+  (OpenCollection) is not in this release.
+- Pickers: VS Code accepts `bruno.json`; the plugin's chooser too.
+
+### 24.5 Big collections: a rule index (proxy)
+- `compileRules` builds a `RuleIndex`: key = upper-cased method (or `*`) × origin (lower-case, default port dropped)
+  from a conservative literal-prefix extractor (globs with no `*` in the authority; regexes `^scheme:\/\/host` ending
+  in `\/`, `(?::port)?`, `:port`, `(?:[\/?#]|$)` or `$`); everything else in a wildcard list. Request key from
+  `^([a-z][a-z0-9+.-]*):\/\/([^/?#]*)`; unparsable → wildcard rules only. Candidates = a k-way merge by original index,
+  so first-match-wins, notes and `responseHookFrom` are unchanged. `method.toUpperCase()` once per request. A path
+  trie under each (method, origin) bucket was added in the same release (§24.11).
+- Proof: a seeded property test (random rule sets incl. `toRules` regexes, globs, user regexes, lower-case and `*`
+  methods, disabled / spent / graphql / sequence rules, hostile URLs) — indexed result equals the linear scan; the whole
+  proxy suite once with a forced-linear flag; PERF-3 re-run (target: a miss at 2 500 rules ≤ +0.01 ms).
+
+### 22.17 H, A, C as built (2026-11-20)
+- **Host** (`mocks/core.ts` store section, `toRules.ts` `stateful` option, `limit.ts` `limitHeaders`, `link.ts`
+  `parseStoreLinks` / `withStoreEntry`, `rules/*` `stores` + `saveStore`, `proxyHost.ts` `setHandler`,
+  `ui/controller.ts` `watchStoreItems`, `ui/handlers.ts`): without a `setHandler` dep the rules are exactly 0.15's.
+  Handler rules are named "… · remembered data". Changing an id field rebuilds that collection's store from its seed;
+  `remembers: false` keeps the data (hidden from the rules); link or store off drops it. A personal value equal to the
+  team's is not stored (unchanged re-send = no-op). `startsFrom: null` in the overlay overrides a team snapshot. A patch
+  may mix settings with one data change; `reset` stands alone; `put` / `remove` / `generate` failures throw; skipped
+  records show in `StoreStatus.problems`. Any symlink on a snapshot path is refused; `startsFrom` must name an
+  existing snapshot; save fails past 50 unless it replaces a name. Errors: `No collection "x" is linked`, `no such
+  resource "x" in collection "id"`, `no such snapshot "x" in collection "id"`.
+- **Agents** (`agent/tools/store.ts`): 50 tools. `set_store` = one data change per call, no `scope` on data;
+  `[redacted]` values in `put` / `items` keep the stored value; `get_store` filters on what the agent sees when redaction
+  is on; `shape` from ≤ 1 000 records under 4 000 chars; `store_snapshot` marked destructive in MCP.
+- **CLI / sidecar** (`cli/src/stores.ts`, `sidecar/src/collections.ts`): CLI never limits answers (as 0.15);
+  `--collection-snapshot` overrides `stores[].snapshot`; setup errors exit 2. Sidecar save without a name asks via
+  `ui.input`. No Kotlin change.
+- Bundle budget raised to 3 000 000 while 0.16.0 is built (PERF-4 sets the final number).
+
+### 24.6 V as built (dynamic values, body match, light auth, 2026-11-20)
+`src/mocks/dynamic.ts` (`renderDynamic(text, {mode, seed?, vars?, json, nowMs?})`), `bodyMatch.ts`
+(`buildBodyMatchers`, `chooseByBody`; `REQUEST_BODY_BYTES` 64 KB, `MATCH_REQUEST_BYTES` 1 MB), `auth.ts`
+(`detectAuth`, `AuthSessions`, `isProtected`, `defaultProtect`, `loginIdentifier`, `unauthorizedExample`). Accepted:
+- **Supersedes §21.2's "Ignored: auth, request bodies"**: Postman `auth` (collection → folder → request; `noauth` →
+  `'none'`, other types → `'declared'`) and request bodies (raw JSON, urlencoded; ≤ 64 KB) are now read; the sanitised
+  copy keeps `auth: {type}` only.
+- Dynamic: seeded mode is a pure function of (text, seed, `nowMs`); without `nowMs` the clock is 2026-01-01. Fixed
+  mode = PRNG 0 + that clock + §21.4 constants. E-mails / URLs / domains always on example.com / .net / .org.
+- Body match: an example whose request body equals the endpoint's own is not a candidate (no line); a problem line
+  only when blank secrets / `{{var}}`s left a non-default example without a discriminator.
+- Auth: `auth: 'none'` is public even with `protect: 'all'`; public in `'all'` mode also register / signup /
+  forgot- / reset-password; one access token per login written into every token-like field; the JWT adds `jti`;
+  `expireAll` expires access tokens and **keeps refresh tokens** (so the app's refresh path can be tested); refresh
+  spends the old refresh token. The pipeline passes `loginIdentifier(parsedBody)` (allow-listed names only) to
+  `login` — never the raw body. A test proves the password key is never read.
+
+### 24.7 D as built (Swagger 2.0, Insomnia, Bruno, 2026-11-20)
+`src/mocks/swagger2.ts` (`swagger2ToOas3`, `parseSwagger2`, `parseSwagger2Doc`), `insomnia.ts` (`parseInsomnia`,
+`parseInsomniaDoc`, `isInsomniaDoc`), `bruno.ts` (`parseBruno(files)`, `brunoLimits`), `viaPostman.ts` (Insomnia and
+Bruno are rewritten as Postman v2.1 and go through `parsePostman`: one policy for URLs, variables, examples, bodies,
+auth, limits, keys and problem lines; `SourceParsed` returns environment names only). Accepted:
+- Swagger: one host per document (operation `schemes` change only the scheme); one example per media type (names
+  `"200"`); `collectionFormat` dropped; `x-nullable` → `nullable`; external `$ref`s not followed.
+- Insomnia: an API spec with ≥ 1 endpoint wins over the requests; mock routes are served on `{{baseUrl}}<path>` and
+  routes with the same method + path become one endpoint with several examples; keys use the normalised template
+  (equal to Postman keys); Nunjucks tags / filters become `{{$tag}}` (never evaluated); folder environments merge at
+  collection level; private sub-environments, gRPC / WebSocket / Socket.IO / MCP requests and `spec.file` references
+  are skipped.
+- Bruno: never read — scripts, tests, `auth:*` values (only `mode`), `vars:secret`, `.env`, request / folder vars,
+  hidden or ignored folders (`{{process.env.X}}` stays unresolved); bodies used for matching only when JSON or
+  urlencoded; gRPC / WebSocket files and OpenCollection YAML not supported.
+- Variables referring to variables expand up to three rounds; a value still templated after that is dropped
+  (unresolved).
+- Wiring (lead): `detect.ts` routes `swagger: "2.x"` → `parseSwagger2Doc` and `isInsomniaDoc` → `parseInsomniaDoc`;
+  the host walks a Bruno folder from `bruno.json` with `brunoLimits` and the §21.6 path rules.
+
+### 24.8 E as built (rule index, quiet fallback, 2026-11-20)
+- `HandlerFallback { fallback: true; note? }` in `types.ts`; `{fallback: true}` on a rule without a fallback → `502`
+  "asked for the example, and the rule has no example to fall back to".
+- `packages/proxy/src/rule-index.ts` (`RuleIndex`): method → `{origins, wild}`; candidates = (method | `*`) × (origin |
+  wildcard) merged by rule position (merge cached per bucket + origin, ≤ 256). A rule gets an origin only when every
+  URL it can match has that origin as its key (globs: `scheme://authority` closed by `/ ? #` before the first `*`;
+  regexes: `^` + plain ASCII `scheme://authority`, flags only from `igysd`, no top-level `|`, optional `(?::port)?`,
+  then a proven terminator); everything else is wildcard. `compileRules(rules, {linear?})`; `FI_PROXY_LINEAR=1` forces
+  the linear scan. `findRule` (also used by the extension's `mocks/core.ts`) uses the index.
+- Proof: property test, 3 000 seeded rule sets, indexed = linear for candidates, `findRule` and the proxy's
+  `matchRule` (rule, action, step, note, deferred, response hook) with sequence / times state; removing any safeguard
+  makes it fail. The whole proxy suite passes in both modes (618 tests).
+- Bench (`test/perf/rule-match.ts`, ms per call): a request to another host at 2 500 rules 0.0897 → 0.00019
+  (`matchRule`), 0.1478 → 0.00021 (`findRule`): target ≤ +0.01 ms met. A request to the collection's own host that
+  matches nothing still scanned that host's rules for its method (0.110 → 0.085) — fixed by the path trie (§24.11).
+  `compileRules` 3.3 → 6.7 ms at 2 500 rules (once per reload).
+- The property test copies the `toRules` regex shapes (the proxy can't import the extension): update the copy when
+  `toRules` changes shape; an unproven shape is wildcard (slower, never wrong).
+
+### 23.8 R2 as built (Record → Mock, drift, splice modules, 2026-11-20)
+`src/mocks/fromTraffic.ts` (`collectionFromTraffic`, `TrafficSanitiser`, `JWT_PLACEHOLDER`), `drift.ts`
+(`DriftTracker`, `driftSummary`, `driftFingerprint`, `DRIFT_LIMITS`), `splice.ts` (`spliceValue`, `insertBefore`,
+`mergeExample`, `postmanExamplePath`). Decisions (accepted by the lead):
+- `FromTrafficOptions.isThrottleOnlyRule?(ruleId)`: the host passes it (it knows the rules); without it any matched
+  exchange is skipped. Mocked / replayed = `state === 'mocked'`.
+- Sibling collapse only when no literal is a collection name and ≥ 2 JSON answers have record keys overlapping
+  ≥ 80 % (Jaccard ≥ 0.5): `/api/users`, `/api/orders` never merge; text-only siblings never collapse.
+- An oversized example falls back to an older answer with the same status that fits; an endpoint with no example
+  left is not in the collection (passes through, never 501).
+- Redaction keeps JSON types (secret string → `""`, number → `0`; secret objects keep their shape with strings
+  blanked); secret / credential response headers are dropped; `removed` lists names and kinds ("e-mail addresses",
+  "X-Amz-Signature (in URLs)"), noise headers silently. `sanitisePostman` runs inside, so `text` is final (dry run =
+  what would be written).
+- Drift: `observe(sample, undefined)` when the endpoint has no example for that status (feeds `status` findings);
+  **5xx never produce a `status` finding**; map-like objects (id-like keys) are not judged inside; ≥ 2 000 paths in one
+  answer → added / removed not judged; a type change hides findings under the old value. `DriftChange` / `DriftView`
+  are the protocol types (§23.3): the host maps R2's local types onto them; the host computes fingerprints (the view
+  doesn't carry one; the panel sends `ignoreDrift {id, endpoint, status}`).
+- Splice: a repeated key targets the last one (what `JSON.parse` keeps); a new value stays on one line when the old
+  one was and the result is ≤ 120 chars, else the file's indentation; `\u` escaping kept when the old literal used
+  it; `mergeExample` keeps the example's own formatting and starts a fresh personal-data mapping
+  (`user1@example.com`).
+
+### 24.9 W23 as built (panel for parts 2 and 3), and decisions on its questions (2026-11-20)
+New `webview/src/drift.ts`, `components/OutOfDate.tsx`; Data side shows when a collection has resources, sign-in
+available or `dynamic` defined. Decisions:
+- **Fake backend result**: the panel owns the result line (built from the new `CollectionStatus` after
+  `mockFromTraffic`); the IDE shows no extra notification after success (its modal before writing is the only one;
+  errors arrive as `error`).
+- **A status the endpoint has no example for**: `updateExample` with `mode: 'add'` only; the host refuses `merge` there.
+- **Sessions are pushed live**: the host re-sends `status` (debounced 500 ms) when a collection's session count changes.
+- **Store off for this user** (`store.enabled: false`): sign-in simulation and made-up values still apply — they are
+  part of the answer pipeline, not of the remembered data.
+- **`protect: 'declared'` on a collection that declares no auth**: the host adds the `auth.problems` line "The
+  collection marks no request as needing a token, so none is checked. Choose all." (the default for such a collection
+  is `'all'`, §24.1).
+- `ignoreDrift {id}` without an endpoint = everything in that collection. Drift `from` / `to` are the kind names
+  `drift.ts` emits (bool, int, double, string, list, object, mixed, null; `status`: the code); the panel never shows
+  anything else.
+- Auth notes other than the four fixed ones stay in the exchange's notes list.
+
+### 24.10 X3 as built (part 3 in the host and the agents, 2026-11-20)
+- **Sources**: `detect.ts` routes Swagger 2.0 / Insomnia; `parsers.ts` gains the three readers (optional on
+  `CollectionParsers`); the core walks a Bruno folder from `bruno.json` (realpath at every entry, hidden folders and
+  `node_modules` skipped, ≤ 2 000 files, depth ≤ 32, ≤ 20 MB, ≤ 20 000 walk entries; past a limit the collection is
+  refused whole and the last good version kept; symlinked entries skipped with a line, a symlinked `bruno.json`
+  refused). For Insomnia / Bruno `environment` is a name the collection must have. Swagger / Insomnia files and Bruno
+  folders outside the project are refused with what to do (nothing copied). The service watches Bruno folders.
+- **Pipeline**: `toRules` `pipeline` option — an endpoint is a `handler` rule only when it needs the auth gate, a
+  body example or a dynamic value (checked with a fixed-mode render), or a store op; otherwise `mock`. `handle`:
+  auth → query example → body example → store → default → `renderDynamic` → `limitHeaders`; `{fallback: true}` when
+  the rule's own example answers unrendered. Handlers are registered for every enabled link with a handler rule.
+- **Auth**: per-link sessions in the core; missing / unknown token and a failed refresh all note "auth: 401 no
+  token"; the "more than 1 000 sessions" line goes to `auth.problems`; refresh also accepts the refresh token as a
+  Bearer header; `auth.enabled: true` without a login request is refused. `StoreStatus.auth` is always present on a
+  handler host (`available: false` without a login request).
+- **Body examples** note `example: <name> (by body)`. **Dynamic**: headers an approval is about (Location, Refresh,
+  Set-Cookie, Access-Control-*, CSP, X-Forwarded-*, Content-Type, our marker) are never rendered; seeded mode = hash(link
+  id) + host seed + a per-link answer counter (reset on proxy stop and Reset data); link `variables` win over the
+  collection's own (Postman only). A chosen example's default rule stays static but its dynamic values render.
+- **Limited count** includes pipeline-only answers (body-chosen examples, the gate's 401).
+- **Settings**: `link.ts` `StoreSettingsLink` / `checkStoreAuth`; team save leaves out `protect` / `dynamic` equal to the
+  default when the file had none.
+- **Agents**: `get_store` / `set_store` with `auth` and `dynamic`; `expire_token` on an origin with auth on returns
+  `{expired, collection, note}` and adds no rule (the panel's expire-token preset is unchanged); exchange views carry
+  the example that really answered, `byBody`, `auth`.
+
+### 24.11 E2 as built (path trie in the rule index, 2026-11-20)
+- `rule-index.ts`: each (method, origin) bucket is a trie of **literal path segments** (`TrieNode`: `open` = this path
+  and deeper, `exact` = this path ± one trailing slash, children by lower-cased segment). A segment is keyed only when
+  the pattern proves it whole (opened by an unquantified `/`, printable ASCII literals, then only `/ ? #` or the end);
+  the extractor stops at the first segment it can't prove, so an unknown rule sits at the bucket root as `open` (the
+  old bucket). Globs: segments closed by `/ ? #` before the first `*`. Lookup walks the raw URL (no decoding, `%` keyed
+  like any character on both sides), collects `open` of every node passed and `exact` of the last when the path ends
+  there; `//` stops the walk. Caps: 20 000 nodes (past it a rule stays open at the deepest node reached), depth 16,
+  merge cache ≤ 4 096 lists / 262 144 positions. `compileRules(rules, {linear?, maxTrieNodes?})`.
+- Left at a shallower level on purpose: encoding alternations and non-ASCII segments, segments after a parameter
+  (`/:tenant/users` stays at the root), odd separators and counted quantifiers.
+- The origin proof now checks printable ASCII on `scheme://authority` only (a non-ASCII literal path gets its origin
+  and stops at that segment instead of going wildcard).
+- Proof: the 3 000 seeded sets plus 3 000 path-heavy sets (shared prefixes, params anywhere, encodings, case with and
+  without `i`, `ς σ Σ K ſ`, dot segments, `%2F`, doubled slashes, query / fragment after any segment) — candidates
+  superset and ordered, trie ⊆ origin list, `findRule` and `matchRule` equal linear; full index, a starved trie (1–5
+  nodes) and no trie. Mutation check: 24 of 25 mutants killed; the survivor is equivalent (a second guard). Suite: 623
+  tests in both modes.
+- Bench at 2 500 rules (`matchRule`, ms): same host no match 0.094 → 0.00024; known prefix no match 0.093 → 0.00037;
+  last GET hit 0.094 → 0.00036; the last rule 0.066 → 0.00036; other host 0.0002 (unchanged). `compileRules` 6.4 →
+  8.1 ms (1.3×). The property test also copies `toRules`' `flexibleLiteral` (update it when `toRules` changes shape).
+
+### 23.9 X2 as built (part 2 in the host and the agents, 2026-11-20)
+- **Core** (`mocks/core.ts`): `trafficOrigins(source)`, `mockFromTraffic(req)` (session with `sinceMs` / `url` glob, or a
+  recording; `collectionFromTraffic` with `isThrottleOnlyRule` → `copyIn(…, 'sanitised')` → `addLink` with
+  `unmatched`; the link limit is checked before writing; `dryRun` writes nothing; nothing usable → "Run the app against
+  the real server first"). Drift: a `DriftTracker` per core fed by `observeExchange` (500 ms batches, ≤ 50 per tick,
+  each exchange once, also for collections off for this user); findings cleared when the parse key changes; ignored
+  fingerprints in workspaceState (≤ 2 000). Update example: `exampleUpdate` (preview) / `applyExampleUpdate` (re-read,
+  hash check, BOM kept, reload); the newest real answer goes through `TrafficSanitiser` first.
+- **Service**: IDE flow = servers (multi-pick; JSON, non-third-party preselected) → name ("<host> (recorded)") →
+  personal data (replace by default) → modal (fallback choice + review warning, Open file opens a preview without
+  focus); one flow at a time; the diff uses read-only documents under the scheme `flutter-intercept-example` (no temp
+  file in the project). Command `flutterIntercept.mockFromTraffic`; setting `flutterIntercept.collectionDrift`.
+- **Update example rules**: merge refused with no answer in this session, no example for that status (§24.9), or only a
+  `status` finding; Postman add inserts before the example of that status (or the first); OpenAPI add needs a named
+  `examples` map (key "from the server, <date>", " (2)" if taken); schema-level, `$ref`'d, YAML and generated
+  examples are copy-only.
+- **Drift views**: a path segment that looks like data (contains `@`, a phone number, a credential) shows as `*`;
+  `from` / `to` are kind names or the status code only.
+- **Agents (52)**: `mock_from_traffic` (write; its dry run is allowed under read-only access — it writes nothing and
+  returns counts and names; not marked destructive), `update_collection_example` (read; `{id, endpoint, status, mode,
+  file, diff, note}`, the diff of the re-indented example bodies, never the file). Without `origins`, agents get the
+  servers the IDE would preselect; an origin not in the traffic is refused with the list. Agent `drift` = the list of
+  findings.
+- `TrafficSanitiser` keeps the number kind of replaced numbers (`0.0` for a literal with a fraction / exponent), so
+  redacted coordinates never cause drift.
+
+### 24.12 C3 and C2 as built (CLI, sidecar, plugin for parts 2 and 3; second coding agent, reviewed by the lead, 2026-11-20)
+- **CLI** runs the host's `MockCollectionsCore` headless (`cli/src/collections.ts`; no copy of the pipeline) and
+  registers its handlers; new formats (Swagger 2.0, Insomnia, Bruno folders); flags `--collection-seed`,
+  `--collection-dynamic`, `--collection-auth`, `--collection-auth-ttl`, `--record-collection` (through the core's
+  `mockFromTraffic`, `outputs.ts`). Headless runs never limit answers (§22.17): the loaded collections are approved in
+  the core's in-memory memento; the CLI README says so.
+- **Sidecar**: drift (`collectionDrift` setting, absent = on), `mockFromTraffic` flow through `ui.pickMany` (servers),
+  `ui.input`, `ui.confirm`; Update example through `ui.diff` + confirm; plugin command `mockFromTraffic`. Types in
+  `sidecar/src/types.ts`: `SidecarSettings.collectionDrift?`, `SidecarRequest` `ui.pickMany`, `command` name
+  `mockFromTraffic`.
+- **Plugin**: `PickManyDialog.kt`, the drift switch in Settings, `ui.pickMany` in `UiRequestHandler.kt`.
+- Checks (lead): CLI 144 tests, sidecar 72, plugin 113 (JBR 25, `--rerun`), all passing.
+
+### 24.13 REVIEW-16 fixes that change behaviour (F1, F2; 2026-11-20)
+- **Proxy (F1)**: `isSafeRegexSource` reads character classes as JavaScript does (`[]` empty, `[^]` any character;
+  shared scanner with the rule index); `[\s\S]` and `[^]` are wide atoms, so `[\s\S]*a[\s\S]*b` is refused like
+  `.*a.*b`. Made-up answers (mock, script `respond`, handler): status 100–199 → `502`; hop-by-hop headers left out
+  with a note; non-Latin-1 parameters of `content-disposition` / `link` encoded per RFC 8187; any other header Node
+  can't send → `502` naming it, recorded as sent; `204` / `304` sent and recorded without a body. Notes and errors are
+  flattened for every control character and stripped of bidi controls.
+- **One secret check** (`src/mocks/secrets.ts`, F2): used by snapshots (§22.8, replaces §22.16's word list), the
+  traffic sanitiser (§23.1), the sanitised copy (§21.6, added on top of its own wider rule) and the agent redaction.
+  Whole words (password, passwd, pwd, passcode, passphrase, pass, secret, token, apikey, authorization, auth, oauth,
+  credential, cookie, privatekey, otp / totp / hotp, pin, sessionid, sessid, sid, signature, sig, ssn, cvv, cvc, csrf,
+  xsrf, hmac, nonce, bearer, jwt, mnemonic, and the joined token / key names), word pairs (api key, private key, secret
+  key, access key, signing key, encryption key, session id / token / key / secret, refresh / access / id / auth token,
+  client secret, card number, security / secret answer, seed / recovery phrase), `<verification|otp|sms|reset|…> code`,
+  and joined lower-case runs. Kept (tested): author, authority, sessionCount, sessionStart, tokenizer, pinned,
+  passenger, passport, compass, secretary, keyboard, code, countryCode, privateNote. `session` / `sessions` / `pass`
+  count only when the value is a string. Values: JWTs (linear regex), Bearer / Basic / Token / ApiKey schemes, opaque
+  tokens, known key prefixes (`ghp_`, `github_pat_`, `sk_live` / `rk_`, `xox?-`, `AKIA…`, `AIza`, `sk-`, `glpat-`,
+  `npm_`), PEM private keys, URLs with userinfo or secret query values, JSON inside strings.
+- **Store vs sign-in (§22.5, §24.1)**: a `POST` that `detectAuth` or the settings name as login / refresh is never a
+  store operation (with sign-in on or off; it answers by its examples). Secret-named fields at any depth are stripped
+  from JSON bodies on create / replace / patch: a password sent to any endpoint is never stored, listed or answered
+  back.
+- **From traffic (§23.1)**: bodies with a BOM / XSSI prefix are read past it; NDJSON line by line; a JSON-ish body that
+  still can't be parsed and holds a secret-named field is left out (skipped line); phone numbers, short tokens and
+  one-time codes in paths become params; numeric variable values over 7 digits blanked; e-mail / phone object keys
+  replaced; `removed` shows kinds for keys that are personal data; a budget overrun refuses ("too large to write as one
+  collection") instead of writing an empty file. Agents can't turn personal-data replacement off.
+- **Update example (§23.4)**: reads past a BOM / XSSI guard; NDJSON, JSONP, NaN or too deep → refused ("isn't plain
+  JSON"); the new example has no prefix.
+- **Sign-in (§24.1, §24.6)**: random-mode tokens from `crypto.randomBytes` (`fi.` + 32 [a-z0-9]); the JWT `sub` is an
+  HMAC with a random key per session store (not stable across restarts).
+- **F3 (REVIEW-16 #2, #8–#10, #13, #14)**: Insomnia / Bruno variable values over 8 KB are dropped; their chosen
+  environment's values are host-only and used for masking; environment values are masked once at resource detection
+  (names, store keys, notes, snapshot keys, displayed paths; string ids get the prefix `item-N`), so per-resource
+  settings saved under an old unmasked name no longer apply. Snapshot: an empty scope entry counts as one record and
+  scope text counts against the byte limit. Store: a numeric id past 2^53 → `400` ("too large to keep exactly — send
+  it as text"); only safe integers advance the counter; counter used up → `507`. Store answers drop example headers
+  that are invalid, hop-by-hop, `proxy-*`, or carry control / non-Latin-1 characters (except `content-disposition` /
+  `link`, which the proxy encodes); the rule editor refuses such header values. `__proto__` / `constructor` /
+  `prototype` work as resource names. Number text from the seed or the app is kept in answers (where the host's
+  `JSON.parse` exposes the source text).
