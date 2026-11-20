@@ -3,6 +3,7 @@ import * as net from 'net';
 import { AddressInfo } from 'net';
 import * as vscode from 'vscode';
 import type { FlutterInterceptApi } from '../../../src/extension';
+import { withTimeout } from './deviceGuard';
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -89,6 +90,16 @@ export interface SessionRun {
 }
 
 /**
+ * Asks VS Code to stop `session` without waiting on the call itself (it can hang forever: the Flutter debug adapter
+ * waits for app.stop, which runs `simctl terminate` unbounded); callers wait for the session end, bounded.
+ */
+function requestStop(session: vscode.DebugSession, ms: number): void {
+  void withTimeout(vscode.debug.stopDebugging(session), ms, `stopDebugging(${session.name})`).then(undefined, (e: unknown) =>
+    console.log(`[suite] stopDebugging(${session.name}): ${String(e)}`),
+  );
+}
+
+/**
  * Starts a session and waits for it to end (or, with `stopAfterStart`, stops it right after
  * it started). Matches sessions by name prefix because Dart-Code appends " (<device>)" to
  * Flutter session names.
@@ -117,18 +128,19 @@ export async function runSession(
       }
     });
   });
-  const ok = await vscode.debug.startDebugging(folder, config);
+  const ok = await withTimeout(vscode.debug.startDebugging(folder, config), START_DEBUGGING_MS, `startDebugging(${name})`);
   if (!ok) throw new Error(`startDebugging returned false for ${name}`);
   const started = await Promise.race([startedP, sleep(timeoutMs).then(() => undefined)]);
   if (!started) throw new Error(`session ${name} did not start`);
   if (opts.stopAfterStart) {
-    await vscode.debug.stopDebugging(started);
+    requestStop(started, 15_000);
     await Promise.race([endedP, sleep(15_000)]);
     return { session: started, output: outputs.get(started.id) ?? '' };
   }
   const ended = await Promise.race([endedP.then(() => true), sleep(timeoutMs).then(() => false)]);
   if (!ended) {
-    await vscode.debug.stopDebugging(started);
+    requestStop(started, 30_000);
+    await Promise.race([endedP, sleep(30_000)]);
     throw new Error(`session ${name} did not terminate within ${timeoutMs} ms; output: ${JSON.stringify((outputs.get(started.id) ?? '').slice(-800))}`);
   }
   await sleep(300); // trailing output events
@@ -164,6 +176,9 @@ export function outputOf(session: vscode.DebugSession): string {
   return outputs.get(session.id) ?? '';
 }
 
+/** Bound on `vscode.debug.startDebugging` itself (Dart-Code asks the flutter daemon for the device first). */
+export const START_DEBUGGING_MS = 240_000;
+
 /** Starts a session and resolves when it has started (it keeps running). */
 export async function startSession(folder: vscode.WorkspaceFolder, config: vscode.DebugConfiguration, timeoutMs = 120_000): Promise<vscode.DebugSession> {
   const name = config.name as string;
@@ -176,24 +191,27 @@ export async function startSession(folder: vscode.WorkspaceFolder, config: vscod
       }
     });
   });
-  const ok = await vscode.debug.startDebugging(folder, config);
+  const ok = await withTimeout(vscode.debug.startDebugging(folder, config), START_DEBUGGING_MS, `startDebugging(${name})`);
   if (!ok) throw new Error(`startDebugging returned false for ${name}`);
   const s = await Promise.race([startedP, sleep(timeoutMs).then(() => undefined)]);
   if (!s) throw new Error(`session ${name} did not start`);
   return s;
 }
 
-/** Stops a session and waits for it to terminate. */
+/**
+ * Stops a session and waits (at most `timeoutMs`) for it to terminate. stopDebugging is not awaited on its own:
+ * it can hang forever (the Flutter debug adapter waits for app.stop, which runs `simctl terminate` unbounded).
+ */
 export async function stopSession(session: vscode.DebugSession, timeoutMs = 30_000): Promise<boolean> {
+  let d: vscode.Disposable | undefined;
   const ended = new Promise<void>((resolve) => {
-    const d = vscode.debug.onDidTerminateDebugSession((s) => {
-      if (s.id === session.id) {
-        d.dispose();
-        resolve();
-      }
+    d = vscode.debug.onDidTerminateDebugSession((s) => {
+      if (s.id === session.id) resolve();
     });
   });
   // VS Code rejects with "Canceled" when the adapter is already shutting the session down; what counts is that it ends.
-  await vscode.debug.stopDebugging(session).then(undefined, (e: unknown) => console.log(`[suite] stopDebugging(${session.name}): ${String(e)}`));
-  return Promise.race([ended.then(() => true), sleep(timeoutMs).then(() => false)]);
+  requestStop(session, timeoutMs);
+  const done = await Promise.race([ended.then(() => true), sleep(timeoutMs).then(() => false)]);
+  d?.dispose();
+  return done;
 }

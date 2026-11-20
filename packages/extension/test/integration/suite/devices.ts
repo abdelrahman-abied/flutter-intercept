@@ -47,6 +47,17 @@
  *  A also asserts host = the Mac's default-route IPv4, a single `FLUTTER_INTERCEPT_PROXY=flutter-intercept:<token>@<lanIp>:<port>`
  *    define (token only there), `flutterInterceptLan`, the LAN listener open and shown in Status;
  *  C asserts the LAN listener closes after the last iPhone session; F/G (profile/release) run too.
+ *
+ * Guards (deviceGuard.ts), so a broken build or a wedged device costs seconds, not hours:
+ *  - before a device's cases: one health round trip (adb `shell echo ok` 10 s / `simctl getenv HOME` 30 s); if it
+ *    fails every case of that device is reported FAIL "device not responding: …" without running;
+ *  - every wait for the app's marker line ends at once when the debug session ended or the tool output shows a
+ *    build / launch failure (quoting the session's last lines); the long timeouts are only outer bounds;
+ *  - calls into VS Code / Dart-Code that have no bound of their own (startDebugging, stopDebugging, hotRestart,
+ *    callService) are bounded; a stop that does not end the session in 30 s kills the device tool flutter is
+ *    stuck on (`simctl terminate <udid>`, flutter_tools SimControl.stopApp has no timeout);
+ *  - each case has an outer watchdog (its own waits + 6 min) that fails it and stops its session;
+ *  - after a failed case: leftover sessions stopped, leftover adb reverse removed, the device re-checked.
  */
 import { execFile, execFileSync, spawn } from 'child_process';
 import * as fs from 'fs';
@@ -63,7 +74,14 @@ import { createVmWatcher, vmCallService } from '../../../src/vm';
 import { AndroidGlobalProxy } from '../../../src/adb';
 import { caFingerprint, defaultExec as simExec, IosSimTrust, nodeFs, parseSimulators, readTrustRow, SQLITE3, trustStorePath, XCRUN } from '../../../src/iosSimTrust';
 import type { SessionWarning } from '../../../src/ui/protocol';
-import { activateBoth, freePort, freePortPair, outputOf, registerOutputTracker, RunOutcome, sleep, startSession, stopSession, waitFor } from './helpers';
+import { activateBoth, freePort, freePortPair, outputOf, registerOutputTracker, RunOutcome, sleep, startSession, waitFor } from './helpers';
+import { checkDeviceHealth, type DeviceKind, killDeviceTools, runWithWatchdog, waitForMarker, withTimeout } from './deviceGuard';
+
+/** Outer watchdog per case: the case's own longest wait plus this. */
+const WATCHDOG_MARGIN_MS = 6 * 60_000;
+/** stopDebugging → session end; then the hung device tool is killed and the end awaited this long again. */
+const STOP_MS = 30_000;
+const START_MS = 240_000;
 
 const JP = 'https://jsonplaceholder.typicode.com';
 const URLS = {
@@ -124,7 +142,7 @@ function adbPath(): string {
 
 function adbDevices(): string[] {
   try {
-    return execFileSync(adbPath(), ['devices'], { encoding: 'utf8', timeout: 10_000 })
+    return execFileSync(adbPath(), ['devices'], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' })
       .split('\n')
       .map((l) => /^(\S+)\s+device\b/.exec(l.trim())?.[1])
       .filter((x): x is string => !!x && x !== 'List');
@@ -135,9 +153,18 @@ function adbDevices(): string[] {
 
 function adbReverseList(serial: string): string {
   try {
-    return execFileSync(adbPath(), ['-s', serial, 'reverse', '--list'], { encoding: 'utf8', timeout: 10_000 });
+    return execFileSync(adbPath(), ['-s', serial, 'reverse', '--list'], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' });
   } catch (e) {
     return `adb failed: ${String(e)}`;
+  }
+}
+
+function adbReverseRemove(serial: string, port: number): string | undefined {
+  try {
+    execFileSync(adbPath(), ['-s', serial, 'reverse', '--remove', `tcp:${port}`], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' });
+    return undefined;
+  } catch (e) {
+    return String(e);
   }
 }
 
@@ -148,10 +175,34 @@ const releaseOk = (r: DemoResult) =>
   /^2\d\d$/.test(r.status) || (r.status === 'ERR' && /Failed host lookup/.test(r.body)) ? undefined : `${r.status} ${r.body.slice(0, 120)}`;
 const releaseWant = Object.fromEntries(NET_LABELS.map((l) => [l, releaseOk])) as Record<Label, (r: DemoResult) => string | undefined>;
 
+/** One device's run: its kind for the guards, and why it is skipped once it stopped answering. */
+interface DeviceRun {
+  dev: string;
+  tag: string;
+  kind: DeviceKind;
+  dead?: string;
+}
+
+/** What a case body gets: its failure list, and the watchdog's abort reason once it expired. */
+interface CaseCtx {
+  failures: string[];
+  state: { aborted?: string };
+}
+
 export async function runDevicesSuite(): Promise<RunOutcome[]> {
   const devices = (process.env.FI_DEVICES ?? '').split(',').map((d) => d.trim()).filter(Boolean);
   const results: RunOutcome[] = [];
   registerOutputTracker();
+  // Session bookkeeping: a wait ends at once when its session ended; leftovers are stopped after a failed case.
+  const live = new Map<string, vscode.DebugSession>();
+  const ended = new Set<string>();
+  const subs = [
+    vscode.debug.onDidStartDebugSession((s) => live.set(s.id, s)),
+    vscode.debug.onDidTerminateDebugSession((s) => {
+      live.delete(s.id);
+      ended.add(s.id);
+    }),
+  ];
   const { api } = await activateBoth();
   const port = await freePort(); // never 8899
   const cfg = vscode.workspace.getConfiguration('flutterIntercept');
@@ -161,6 +212,7 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
   const root = folder.uri.fsPath;
   const entry = path.join(root, '.dart_tool', 'flutter_intercept', 'entry_lib__main.dart');
   const reply = (_m: HostMsg) => undefined;
+  const tools = { adb: adbPath(), xcrun: XCRUN };
   console.log(`[suite] devices ${devices.join(', ')} proxy port setting :${port} workspace ${root}`);
   if (api.getRules().length) throw new Error(`fresh profile has rules: ${JSON.stringify(api.getRules())}`);
 
@@ -173,11 +225,92 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
     console.log(`[suite] ${failures.length ? 'FAIL' : 'ok  '} ${name} (${out.ms} ms)${out.mode ? ` ${out.mode}` : ''}${failures.length ? `\n         ${failures.join('\n         ')}` : ''}`);
   }
 
+  const ours = () => [...live.values()].filter((s) => s.name.startsWith('FI-D '));
+
+  async function untilEnded(id: string, ms: number): Promise<boolean> {
+    for (const end = Date.now() + ms; Date.now() < end; await sleep(250)) if (ended.has(id)) return true;
+    return ended.has(id);
+  }
+
+  /**
+   * Stops a session and waits (bounded) for it to end. stopDebugging itself can hang forever: flutter's app.stop
+   * runs `simctl terminate` / `adb … am force-stop` without a timeout, and the debug adapter waits for it. Then the
+   * hung device tool is killed, which fails flutter's stop and lets the session end.
+   */
+  async function stopBounded(session: vscode.DebugSession, dg: Pick<DeviceRun, 'dev' | 'kind'>): Promise<boolean> {
+    if (ended.has(session.id)) return true;
+    // VS Code rejects with "Canceled" when the adapter is already shutting the session down; what counts is that it ends.
+    void withTimeout(Promise.resolve(vscode.debug.stopDebugging(session)), STOP_MS, `stopDebugging(${session.name})`).then(undefined, (e: unknown) =>
+      console.log(`[suite] stopDebugging(${session.name}): ${String(e)}`),
+    );
+    if (await untilEnded(session.id, STOP_MS)) return true;
+    const killed = await killDeviceTools(dg.kind, dg.dev);
+    console.log(`[suite] ${session.name} still running ${STOP_MS / 1000} s after stopDebugging; killed hung device tools: ${killed.join(' | ') || 'none found'}`);
+    return untilEnded(session.id, 20_000);
+  }
+
+  /** The guard's view of a device id: Android (emulator or listed by adb), iOS simulator, or other (macOS, iPhone). */
+  const deviceKind = (dev: string): DeviceKind =>
+    /^emulator-\d+$/.test(dev) || adbDevices().includes(dev) ? 'android' : kindFromId(dev) === 'ios-simulator' ? 'ios-simulator' : 'other';
+
+  /**
+   * Clean state for the next case: (stopSessions) no session of ours left; and, once none is left, no adb reverse
+   * left for our port. Without stopSessions a running session is kept (A's, which I/B/C reuse).
+   */
+  async function ensureClean(dg: DeviceRun, why: string, stopSessions: boolean): Promise<void> {
+    if (stopSessions) {
+      for (const s of ours()) {
+        const sdev = String(s.configuration.deviceId ?? dg.dev);
+        console.log(`[suite] ${why}: stopping leftover session ${s.name}`);
+        if (!(await stopBounded(s, sdev === dg.dev ? dg : { dev: sdev, kind: deviceKind(sdev) }))) console.log(`[suite] ${why}: ${s.name} did not end`);
+      }
+    }
+    if (dg.kind === 'android' && !dg.dead && !ours().length) {
+      const p = api.proxyHost.port || port;
+      if (adbReverseList(dg.dev).includes(`tcp:${p}`)) {
+        const err = adbReverseRemove(dg.dev, p);
+        console.log(`[suite] ${why}: removed leftover adb reverse tcp:${p} on ${dg.dev}${err ? ` (failed: ${err})` : ''}`);
+      }
+    }
+  }
+
+  /**
+   * Runs one case: FAIL at once when the device stopped answering; otherwise the body under a watchdog
+   * (`innerMs` = the body's longest wait). After an exception or the watchdog every session of ours is stopped;
+   * after any failure a leftover adb reverse is removed (once no session of ours runs) and the device re-checked —
+   * when it no longer answers, its remaining cases are reported without running. `reuse`: the case works on a
+   * session an earlier case started (A's for I/B/C, K1's for the grpcMock check), so leftovers are not stopped first.
+   */
+  async function runCase(dg: DeviceRun, name: string, innerMs: number, body: (c: CaseCtx) => Promise<Partial<RunOutcome> | void>, opts: { reuse?: boolean } = {}): Promise<boolean> {
+    const t0 = Date.now();
+    if (dg.dead) {
+      check(name, [dg.dead], t0);
+      return false;
+    }
+    if (!opts.reuse) await ensureClean(dg, `before ${name}`, true);
+    const failures: string[] = [];
+    const r = await runWithWatchdog(innerMs + WATCHDOG_MARGIN_MS, (state) => body({ failures, state }), (reason) => ensureClean(dg, `${name}: ${reason}`, true));
+    if (r.ok) check(name, [...failures], t0, r.value ?? {});
+    else check(name, [...failures, `exception: ${(r.error as Error)?.message ?? String(r.error)}`], t0);
+    const passed = r.ok && failures.length === 0;
+    if (!passed) {
+      await ensureClean(dg, `after ${name}`, !r.ok);
+      const sick = await checkDeviceHealth(dg.kind, dg.dev, tools);
+      if (sick) {
+        dg.dead = sick;
+        console.log(`[suite] ${dg.tag}: ${sick}; its remaining cases are reported FAIL without running`);
+        await ensureClean(dg, `${dg.tag} not responding`, true);
+      }
+    }
+    return passed;
+  }
+
   async function launch(name: string, deviceId: string, extra: Record<string, unknown> = {}) {
     const config: vscode.DebugConfiguration = { type: 'dart', request: 'launch', name, deviceId, ...extra };
     for (let attempt = 1; ; attempt++) {
       try {
-        return await startSession(folder, config, 120_000);
+        // startDebugging has no bound of its own (Dart-Code asks the flutter daemon for the device first).
+        return await withTimeout(startSession(folder, config, 120_000), START_MS, `starting ${name}`);
       } catch (e) {
         if (attempt >= 3 || !String(e).includes('startDebugging returned false')) throw e;
         console.log(`[suite] ${name}: device not ready, retrying in 10 s`);
@@ -186,11 +319,32 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
     }
   }
 
-  /** Waits until the session printed `DEMO_BATCH done` `count` times after `from` chars. */
-  async function waitBatch(session: vscode.DebugSession, from: number, timeoutMs: number): Promise<string> {
-    await waitFor(() => (/DEMO_BATCH done/.test(outputOf(session).slice(from)) ? true : undefined), timeoutMs, 250);
+  /** Waits for `marker` in the session's output after `from`; ends early when the session ended or the build failed. */
+  const waitMarker = (session: vscode.DebugSession, marker: RegExp, label: string, timeoutMs: number, state: CaseCtx['state'], from = 0) =>
+    waitForMarker({ output: () => outputOf(session), ended: () => ended.has(session.id), aborted: () => state.aborted, marker, label, from, timeoutMs });
+
+  /** Waits until the session printed `DEMO_BATCH done` after `from` chars. */
+  async function waitBatch(session: vscode.DebugSession, from: number, timeoutMs: number, state: CaseCtx['state']): Promise<string> {
+    await waitMarker(session, /DEMO_BATCH done/, 'DEMO_BATCH done', timeoutMs, state, from);
     await sleep(300);
     return outputOf(session).slice(from);
+  }
+
+  /** waitFor that also ends when the session ended or the case was aborted. */
+  async function waitAlive<T>(session: vscode.DebugSession, state: CaseCtx['state'], what: string, fn: () => T | undefined | false, timeoutMs: number, everyMs = 100): Promise<T> {
+    return waitFor(
+      () => {
+        if (state.aborted) throw new Error(`${state.aborted} (waiting for ${what})`);
+        const v = fn();
+        if (v !== undefined && v !== false) return v;
+        if (ended.has(session.id)) throw new Error(`the debug session ended while waiting for ${what}`);
+        return undefined;
+      },
+      timeoutMs,
+      everyMs,
+    ).catch((e: unknown) => {
+      throw (e as Error).message === 'timed out' ? new Error(`timed out after ${Math.round(timeoutMs / 1000)} s waiting for ${what}`) : e;
+    });
   }
 
   /**
@@ -275,37 +429,40 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
       check(`DEV ${tag} physical iOS`, ['physical iPhone in FI_DEVICES but FI_ALLOW_PHYSICAL_IOS=1 is not set: skipped'], Date.now());
       continue;
     }
+    const dg: DeviceRun = { dev, tag, kind: isAndroid ? 'android' : kindFromId(dev) === 'ios-simulator' ? 'ios-simulator' : 'other' };
+    await ensureClean(dg, `before ${tag}`, true);
+    const t0Health = Date.now();
+    dg.dead = await checkDeviceHealth(dg.kind, dev, tools);
+    console.log(`[suite] ${tag}: ${dg.dead ? `${dg.dead}; its cases are reported FAIL without running` : `device answers (${dg.kind}, ${Date.now() - t0Health} ms)`}`);
     const lanIp = physicalIos ? (await defaultRouteIPv4())?.address : undefined;
     const wantHost = physicalIos ? lanIp ?? '(no LAN address)' : isEmu ? '10.0.2.2' : 'localhost';
     await api.setRules([]);
 
     // ---- J. bypass detection + native clients through the proxy (§14.7) ----
-    if (isEmu && (!process.env.FI_DEVICES_ONLY || process.env.FI_DEVICES_ONLY === 'J')) await checkJ(dev, tag);
+    if (isEmu && (!process.env.FI_DEVICES_ONLY || process.env.FI_DEVICES_ONLY === 'J')) await checkJ(dg);
     if (process.env.FI_DEVICES_ONLY === 'J') continue;
 
     // ---- K. gRPC (§16, template v6) ----
-    if (!physicalIos && (!process.env.FI_DEVICES_ONLY || process.env.FI_DEVICES_ONLY === 'K')) await checkK(dev, tag);
+    if (!physicalIos && (!process.env.FI_DEVICES_ONLY || process.env.FI_DEVICES_ONLY === 'K')) await checkK(dg);
     if (process.env.FI_DEVICES_ONLY === 'K') continue;
 
     // ---- L. iOS simulator CA trust (§19.3): opt-in twice (FI_SIM_TRUST=1 and a simulator id) ----
-    if (kindFromId(dev) === 'ios-simulator' && process.env.FI_SIM_TRUST === '1' && (!process.env.FI_DEVICES_ONLY || process.env.FI_DEVICES_ONLY === 'L')) await checkL(dev, tag);
+    if (kindFromId(dev) === 'ios-simulator' && process.env.FI_SIM_TRUST === '1' && (!process.env.FI_DEVICES_ONLY || process.env.FI_DEVICES_ONLY === 'L')) await checkL(dg);
     if (process.env.FI_DEVICES_ONLY === 'L') continue;
 
     // ---- A. launch like F5 (deviceId only) ----
-    let session: vscode.DebugSession | undefined;
-    let t0 = Date.now();
-    let failures: string[] = [];
-    let since = Date.now();
-    try {
-      session = await launch(`FI-D A ${tag}`, dev);
+    const a: { session?: vscode.DebugSession; since: number } = { since: Date.now() };
+    await runCase(dg, `DEV ${tag} A launch (F5, deviceId only)`, 600_000, async ({ failures, state }) => {
+      a.since = Date.now();
+      const session = (a.session = await launch(`FI-D A ${tag}`, dev));
       const c = session.configuration;
       if (c.program !== entry) failures.push(`program ${c.program}`);
       if (c.flutterInterceptOriginalProgram !== path.join(root, 'lib', 'main.dart')) failures.push(`original ${c.flutterInterceptOriginalProgram}`);
       if (c.flutterInterceptProxyHost !== wantHost) failures.push(`proxy host ${c.flutterInterceptProxyHost} != ${wantHost}`);
       if (c.debuggerType !== 2) failures.push(`debuggerType ${c.debuggerType}`);
-      const sha = ((c.toolArgs ?? []) as string[]).filter((a) => a.startsWith('--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA='));
+      const sha = ((c.toolArgs ?? []) as string[]).filter((x) => x.startsWith('--dart-define=FLUTTER_INTERCEPT_ENTRY_SHA='));
       if (sha.length !== 1) failures.push(`sha defines ${JSON.stringify(sha)}`);
-      const proxyDefine = ((c.toolArgs ?? []) as string[]).filter((a) => a.startsWith('--dart-define=FLUTTER_INTERCEPT_PROXY='));
+      const proxyDefine = ((c.toolArgs ?? []) as string[]).filter((x) => x.startsWith('--dart-define=FLUTTER_INTERCEPT_PROXY='));
       if (physicalIos) {
         // flutter-intercept:<43-char base64url token>@<lanIp>:<port>; the token appears nowhere else.
         const re = new RegExp(`^--dart-define=FLUTTER_INTERCEPT_PROXY=flutter-intercept:([A-Za-z0-9_-]{43})@${(lanIp ?? '').replace(/\./g, '\\.')}:${c.flutterInterceptPort}$`);
@@ -321,31 +478,35 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
       } else if (proxyDefine.length !== 1 || proxyDefine[0] !== `--dart-define=FLUTTER_INTERCEPT_PROXY=${wantHost}:${c.flutterInterceptPort}`) {
         failures.push(`proxy define ${JSON.stringify(proxyDefine)}`);
       }
-      const text = await waitBatch(session, 0, 600_000);
-      const { recorded } = checkBatch(text, since, true, failures);
+      const text = await waitBatch(session, 0, 600_000, state);
+      const { recorded } = checkBatch(text, a.since, true, failures);
       const gz = recorded.find((e) => sameUrl(e, 'GET', URLS.http_gzip.url));
       const enc = String(gz?.responseHeaders?.['content-encoding'] ?? '');
       if (!gz || !/gzip/.test(enc) || !/"gzipped": ?true/.test(gz.responseBody?.text ?? '')) failures.push(`gzip exchange: enc=${enc} body=${gz?.responseBody?.text?.slice(0, 80)}`);
       const plain = recorded.find((e) => e.url.startsWith('http://httpbin.org/get'));
       if (!plain) failures.push('plain http not recorded');
-      const sources = await checkSources(since, failures);
+      const sources = await checkSources(a.since, failures);
       if (isAndroid) {
         const list = adbReverseList(dev);
         if (list.includes(`tcp:${api.proxyHost.port}`)) failures.push(`adb reverse exists for an emulator: ${list.trim()}`);
       }
-      check(`DEV ${tag} A launch (F5, deviceId only)`, failures, t0, { output: evidence(text), mode: `host=${c.flutterInterceptProxyHost} port=${c.flutterInterceptPort} exchanges=${recorded.length} ${sources}` });
-    } catch (e) {
-      check(`DEV ${tag} A launch (F5, deviceId only)`, [...failures, `exception: ${(e as Error).message}`], t0);
-    }
+      return { output: evidence(text), mode: `host=${c.flutterInterceptProxyHost} port=${c.flutterInterceptPort} exchanges=${recorded.length} ${sources}` };
+    });
+    /** I/B need A's app running; when it ended (build failure, crash, watchdog) they are reported, not run. */
+    const aGone = (failures: string[]) => {
+      if (a.session && !ended.has(a.session.id)) return false;
+      failures.push('not run: the A session is not running (see A)');
+      return true;
+    };
 
     // ---- I. background isolates intercepted (§13.3) + screenshots (§13.8) ----
-    if (session && !physicalIos) {
-      t0 = Date.now();
-      failures = [];
-      const s = session;
-      const notes: string[] = [];
-      try {
-        await waitFor(() => (/DEMO_COVERAGE done/.test(outputOf(s)) ? true : undefined), 180_000, 250);
+    if ((a.session || dg.dead) && !physicalIos) {
+      await runCase(dg, `DEV ${tag} I background isolates intercepted + screenshots`, 180_000, async ({ failures, state }) => {
+        if (aGone(failures)) return;
+        const s = a.session!;
+        const since = a.since;
+        const notes: string[] = [];
+        await waitMarker(s, /DEMO_COVERAGE done/, 'DEMO_COVERAGE done', 180_000, state);
         await sleep(500);
         const res = demoResults(outputOf(s));
         const isoUrls: Record<string, string> = { isolate_todo: `${JP}/todos/2`, compute_todo: `${JP}/todos/3`, spawn_todo: `${JP}/todos/4` };
@@ -364,85 +525,89 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
         // Screenshots: VM service through Dart-Code, then the device tool alone.
         const exec: ScreenshotDeps['exec'] = (cmd, args, opts) =>
           new Promise((resolve, reject) =>
-            execFile(cmd, args, { encoding: 'buffer', timeout: opts?.timeoutMs ?? 20_000, maxBuffer: opts?.maxBuffer ?? 32 * 1024 * 1024 }, (err, stdout, stderr) =>
+            execFile(cmd, args, { encoding: 'buffer', timeout: opts?.timeoutMs ?? 20_000, killSignal: 'SIGKILL', maxBuffer: opts?.maxBuffer ?? 32 * 1024 * 1024 }, (err, stdout, stderr) =>
               err ? reject(err) : resolve({ stdout, stderr: String(stderr) }),
             ),
           );
         const log = (m: string) => notes.push(m);
-        const vmShot = await takeScreenshot({ sessionId: s.id, deviceId: dev, projectRoot: root }, { callService: (_id, m, p) => vmCallService(s, m, p), exec, log });
+        const vmShot = await withTimeout(
+          takeScreenshot({ sessionId: s.id, deviceId: dev, projectRoot: root }, { callService: (_id, m, p) => withTimeout(vmCallService(s, m, p), 60_000, `callService ${m}`), exec, log }),
+          120_000,
+          'the VM-service screenshot',
+        );
         if (vmShot.method !== 'vm-service' || !vmShot.width || !vmShot.height || !fs.existsSync(vmShot.path)) failures.push(`VM screenshot: ${vmShot.method} ${vmShot.width}x${vmShot.height}`);
         if (!vmShot.path.startsWith(path.join(root, '.dart_tool', 'flutter_intercept', 'screenshots') + path.sep)) failures.push(`screenshot saved at ${vmShot.path}`);
         notes.push(`vm ${vmShot.width}x${vmShot.height} ${vmShot.png.length}B`);
         fs.rmSync(vmShot.path, { force: true });
         if (isAndroid || kindFromId(dev) === 'ios-simulator') {
-          const toolShot = await takeScreenshot({ sessionId: s.id, deviceId: dev, projectRoot: root }, { exec, log });
+          const toolShot = await withTimeout(takeScreenshot({ sessionId: s.id, deviceId: dev, projectRoot: root }, { exec, log }), 120_000, 'the device-tool screenshot');
           if (toolShot.method !== (isAndroid ? 'adb' : 'simctl') || !toolShot.width) failures.push(`tool screenshot: ${toolShot.method} ${toolShot.width}x${toolShot.height}`);
           notes.push(`${toolShot.method} ${toolShot.width}x${toolShot.height} ${toolShot.png.length}B`);
           fs.rmSync(toolShot.path, { force: true });
         }
-        check(`DEV ${tag} I background isolates intercepted + screenshots`, failures, t0, { output: evidence(outputOf(s)).split('\n').filter((l) => /_todo/.test(l)).join('\n'), mode: notes.filter((n) => !/^screenshot:/.test(n)).join(' ') });
-      } catch (e) {
-        check(`DEV ${tag} I background isolates intercepted + screenshots`, [...failures, `exception: ${(e as Error).message}`], t0);
-      }
+        return { output: evidence(outputOf(s)).split('\n').filter((l) => /_todo/.test(l)).join('\n'), mode: notes.filter((n) => !/^screenshot:/.test(n)).join(' ') };
+      }, { reuse: true });
     }
 
     // ---- B. rules + hot restart ----
-    if (session) {
-      t0 = Date.now();
-      failures = [];
-      try {
-        api.setRules([
-          { id: 'dev-mock', enabled: true, match: { method: 'GET', url: `${JP}*/users/2*` }, action: { kind: 'mock', status: 200, headers: { 'content-type': 'application/json' }, body: '{"mocked":true}' } },
-          { id: 'dev-block', enabled: true, match: { url: `${JP}*/comments/1*` }, action: { kind: 'block', mode: 'status', status: 403 } },
-          { id: 'dev-bp', enabled: true, match: { method: 'GET', url: `${JP}*/todos/1*` }, action: { kind: 'breakpoint', phase: 'response' } },
-        ]);
-        const from = outputOf(session).length;
-        since = Date.now();
-        await session.customRequest('hotRestart');
-        const paused = await waitFor(
-          () => api.getExchanges().find((e) => e.startedAt >= since && e.state === 'paused-response' && sameUrl(e, 'GET', URLS.http_todo.url)),
-          120_000,
-          100,
-        );
-        const pausedCount = api.controller.pausedCount;
-        await api.controller.handle({ type: 'resume', id: paused.id, edit: { body: '{"edited":true}' } }, reply);
-        const text = await waitBatch(session, from, 120_000);
-        if (!/DEMO_START/.test(text)) failures.push('no DEMO_START after hot restart');
-        if (!/Restarted application/.test(text)) failures.push('no "Restarted application" line');
-        const { recorded } = checkBatch(text, since, true, failures, {
-          dio_user2: (r) => (r.status === '200' && r.body.includes('"mocked":true') ? undefined : `mock not applied: ${r.status} ${r.body}`),
-          http_comment: (r) => (r.status === '403' && /Blocked by Flutter Intercept/.test(r.body) ? undefined : `block not applied: ${r.status} ${r.body}`),
-          http_todo: (r) => (r.status === '200' && r.body.includes('"edited":true') ? undefined : `edit not applied: ${r.status} ${r.body}`),
-        });
-        const st = (l: Label) => recorded.find((e) => sameUrl(e, URLS[l].method, URLS[l].url))?.state;
-        if (st('dio_user2') !== 'mocked') failures.push(`dio_user2 state ${st('dio_user2')}`);
-        if (st('http_comment') !== 'blocked') failures.push(`http_comment state ${st('http_comment')}`);
-        if (pausedCount < 1) failures.push(`paused count while paused = ${pausedCount}`);
-        const sources = await checkSources(since, failures);
-        check(`DEV ${tag} B mock+block+breakpoint edit after hot restart`, failures, t0, { output: evidence(text), mode: `pausedCount=${pausedCount} exchanges=${recorded.length} ${sources}` });
-      } catch (e) {
-        check(`DEV ${tag} B mock+block+breakpoint edit after hot restart`, [...failures, `exception: ${(e as Error).message}`], t0);
-      }
-      api.setRules([]);
+    if (a.session || dg.dead) {
+      await runCase(dg, `DEV ${tag} B mock+block+breakpoint edit after hot restart`, 240_000, async ({ failures, state }) => {
+        if (aGone(failures)) return;
+        const session = a.session!;
+        try {
+          api.setRules([
+            { id: 'dev-mock', enabled: true, match: { method: 'GET', url: `${JP}*/users/2*` }, action: { kind: 'mock', status: 200, headers: { 'content-type': 'application/json' }, body: '{"mocked":true}' } },
+            { id: 'dev-block', enabled: true, match: { url: `${JP}*/comments/1*` }, action: { kind: 'block', mode: 'status', status: 403 } },
+            { id: 'dev-bp', enabled: true, match: { method: 'GET', url: `${JP}*/todos/1*` }, action: { kind: 'breakpoint', phase: 'response' } },
+          ]);
+          const from = outputOf(session).length;
+          const since = Date.now();
+          await withTimeout(session.customRequest('hotRestart'), 120_000, 'hotRestart');
+          const paused = await waitAlive(
+            session,
+            state,
+            'the paused todos/1 response',
+            () => api.getExchanges().find((e) => e.startedAt >= since && e.state === 'paused-response' && sameUrl(e, 'GET', URLS.http_todo.url)),
+            120_000,
+          );
+          const pausedCount = api.controller.pausedCount;
+          await api.controller.handle({ type: 'resume', id: paused.id, edit: { body: '{"edited":true}' } }, reply);
+          const text = await waitBatch(session, from, 120_000, state);
+          if (!/DEMO_START/.test(text)) failures.push('no DEMO_START after hot restart');
+          if (!/Restarted application/.test(text)) failures.push('no "Restarted application" line');
+          const { recorded } = checkBatch(text, since, true, failures, {
+            dio_user2: (r) => (r.status === '200' && r.body.includes('"mocked":true') ? undefined : `mock not applied: ${r.status} ${r.body}`),
+            http_comment: (r) => (r.status === '403' && /Blocked by Flutter Intercept/.test(r.body) ? undefined : `block not applied: ${r.status} ${r.body}`),
+            http_todo: (r) => (r.status === '200' && r.body.includes('"edited":true') ? undefined : `edit not applied: ${r.status} ${r.body}`),
+          });
+          const st = (l: Label) => recorded.find((e) => sameUrl(e, URLS[l].method, URLS[l].url))?.state;
+          if (st('dio_user2') !== 'mocked') failures.push(`dio_user2 state ${st('dio_user2')}`);
+          if (st('http_comment') !== 'blocked') failures.push(`http_comment state ${st('http_comment')}`);
+          if (pausedCount < 1) failures.push(`paused count while paused = ${pausedCount}`);
+          const sources = await checkSources(since, failures);
+          return { output: evidence(text), mode: `pausedCount=${pausedCount} exchanges=${recorded.length} ${sources}` };
+        } finally {
+          api.setRules([]);
+        }
+      }, { reuse: true });
 
       // ---- C. stop ----
-      t0 = Date.now();
-      failures = [];
-      const stopped = await stopSession(session);
-      if (!stopped) failures.push('session did not terminate');
-      await sleep(1500);
-      if (physicalIos) {
-        await waitFor(() => (api.proxyHost.lan ? undefined : true), 10_000).catch(() => failures.push(`LAN listener still open after the last iPhone session: ${JSON.stringify(api.proxyHost.lan)}`));
-      }
-      if (isAndroid) {
-        const list = adbReverseList(dev);
-        if (list.includes(`tcp:${api.proxyHost.port}`)) failures.push(`adb reverse left behind: ${list.trim()}`);
-      }
-      check(`DEV ${tag} C stop leaves no adb reverse${physicalIos ? ' / closes the LAN listener' : ''}`, failures, t0);
+      await runCase(dg, `DEV ${tag} C stop leaves no adb reverse${physicalIos ? ' / closes the LAN listener' : ''}`, STOP_MS + 60_000, async ({ failures }) => {
+        const session = a.session;
+        if (session && !(await stopBounded(session, dg))) failures.push('session did not terminate');
+        await sleep(1500);
+        if (physicalIos) {
+          await waitFor(() => (api.proxyHost.lan ? undefined : true), 10_000).catch(() => failures.push(`LAN listener still open after the last iPhone session: ${JSON.stringify(api.proxyHost.lan)}`));
+        }
+        if (isAndroid) {
+          const list = adbReverseList(dev);
+          if (list.includes(`tcp:${api.proxyHost.port}`)) failures.push(`adb reverse left behind: ${list.trim()}`);
+        }
+      }, { reuse: true });
     }
 
     // ---- D. APP_FINDPROXY=charles ----
-    await runSimple(`DEV ${tag} D APP_FINDPROXY=charles still intercepted`, dev, { toolArgs: ['--dart-define=APP_FINDPROXY=charles'] }, true, (text, f) => {
+    await runSimple(dg, `DEV ${tag} D APP_FINDPROXY=charles still intercepted`, { toolArgs: ['--dart-define=APP_FINDPROXY=charles'] }, true, (text, f) => {
       if (!/\[flutter_intercept\] ignored app findProxy/.test(text)) f.push('missing "[flutter_intercept] ignored app findProxy" note');
       if (!/findProxy=charles/.test(text)) f.push('app did not run in charles mode');
     });
@@ -450,8 +615,8 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
     // ---- H. captureSource=false: no x-fi-id, no traces, no source ----
     const hStart = Date.now();
     await cfg.update('captureSource', false, vscode.ConfigurationTarget.Global);
-    await runSimple(`DEV ${tag} H captureSource=false: no request sources`, dev, {}, true, (_t, f, c) => {
-      const trace = ((c.toolArgs ?? []) as string[]).filter((a) => a.startsWith('--dart-define=FLUTTER_INTERCEPT_TRACE='));
+    await runSimple(dg, `DEV ${tag} H captureSource=false: no request sources`, {}, true, (_t, f, c) => {
+      const trace = ((c.toolArgs ?? []) as string[]).filter((x) => x.startsWith('--dart-define=FLUTTER_INTERCEPT_TRACE='));
       if (trace.length !== 1 || trace[0] !== '--dart-define=FLUTTER_INTERCEPT_TRACE=0') f.push(`trace define ${JSON.stringify(trace)}`);
       const withSource = api.getExchanges().filter((e) => e.startedAt >= hStart && e.source);
       if (withSource.length) f.push(`${withSource.length} exchange(s) got a source although capture is off`);
@@ -460,7 +625,7 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
 
     // ---- E. interception off ----
     await cfg.update('enabled', false, vscode.ConfigurationTarget.Global);
-    await runSimple(`DEV ${tag} E enabled=false launches lib/main.dart directly`, dev, {}, false, (_t, f, c) => {
+    await runSimple(dg, `DEV ${tag} E enabled=false launches lib/main.dart directly`, {}, false, (_t, f, c) => {
       if (c.program !== path.join(root, 'lib', 'main.dart')) f.push(`program ${c.program}`);
       if (c.flutterInterceptOriginalProgram) f.push('config still carries flutterInterceptOriginalProgram');
     });
@@ -468,87 +633,93 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
 
     // ---- F/G. profile + release (Android and physical iOS; simulators have neither) ----
     if ((isAndroid || physicalIos) && i === devices.findIndex((d) => d === dev)) {
-      await runSimple(`DEV ${tag} F flutterMode=profile`, dev, { flutterMode: 'profile' }, true, (text, f, c) => {
+      await runSimple(dg, `DEV ${tag} F flutterMode=profile`, { flutterMode: 'profile' }, true, (text, f, c) => {
         if (c.program !== entry) f.push(`program ${c.program}`);
         if (!/profile/i.test(text)) f.push('no profile-mode build output');
       });
       // ---- G. release is never intercepted (template v2 relaxes certificate checks) ----
-      await runSimple(`DEV ${tag} G flutterMode=release NOT intercepted`, dev, { flutterMode: 'release' }, false, (text, f, c) => {
+      await runSimple(dg, `DEV ${tag} G flutterMode=release NOT intercepted`, { flutterMode: 'release' }, false, (text, f, c) => {
         if (c.program !== path.join(root, 'lib', 'main.dart')) f.push(`program ${c.program}`);
         if (c.flutterInterceptOriginalProgram) f.push('config carries flutterInterceptOriginalProgram');
-        if (((c.toolArgs ?? []) as string[]).some((a) => a.includes('FLUTTER_INTERCEPT_ENTRY_SHA'))) f.push('SHA define added');
+        if (((c.toolArgs ?? []) as string[]).some((x) => x.includes('FLUTTER_INTERCEPT_ENTRY_SHA'))) f.push('SHA define added');
         if (!/release/i.test(text)) f.push('no release-mode build output');
       }, releaseWant, physicalIos);
     }
   }
+  for (const d of subs) d.dispose();
   return results;
 
-  async function checkJ(dev: string, tag: string) {
+  async function checkJ(dg: DeviceRun) {
+    const { dev, tag } = dg;
     const name = `DEV ${tag} J bypass warnings + native clients routed (Android global proxy)`;
-    const t0 = Date.now();
-    const failures: string[] = [];
-    const notes: string[] = [];
-    const adb = (...args: string[]) => execFileSync('adb', ['-s', dev, ...args], { encoding: 'utf8' }).trim();
-    const before = adb('shell', 'settings', 'get', 'global', 'http_proxy');
-    const key = 'suite-J';
-    const gp = new AndroidGlobalProxy({ log: (m) => notes.push(m) });
-    const routeFailures: (string | undefined)[] = [];
-    const ownWarnings = new Map<string, SessionWarning[]>();
-    const watcher = createVmWatcher({
-      record: () => [],
-      update: () => undefined,
-      setWarnings: (sid, w) => ownWarnings.set(sid, w),
-      log: () => undefined,
-      nativeClients: () => 'proxy',
-      backgroundIsolates: () => 'warn', // the extension's own watcher installs; this one only reads
-      nativeRouted: () => gp.isRouted(key),
-      nativeRouteFailed: (_sid, client) => {
-        routeFailures.push(client);
-        void gp.release(key);
-      },
-    });
-    let session: vscode.DebugSession | undefined;
-    try {
-      const applied = await gp.apply(key, dev, api.proxyHost.port || port);
-      if (!applied.applied) failures.push(`global proxy not applied: ${JSON.stringify(applied)}`);
-      notes.push(`http_proxy during: ${adb('shell', 'settings', 'get', 'global', 'http_proxy')}`);
-      session = await launch(`FI-D J ${tag}`, dev, { toolArgs: ['--dart-define=APP_ZONE_OVERRIDES=true', '--dart-define=NATIVE_HTTP=true'] });
-      void watcher.attach({ sessionId: session.id });
-      const s = session;
-      await waitFor(() => (/DEMO_COVERAGE done/.test(outputOf(s)) ? true : undefined), 600_000, 250);
-      await sleep(4000);
-      const res = demoResults(outputOf(s));
-      const bypass = (api.controller.status().warnings ?? []).filter((w) => w.kind === 'bypass' && w.sessionId === s.id);
-      if (!bypass.some((w) => /jsonplaceholder\.typicode\.com bypass the proxy: an HttpOverrides zone/.test(w.text))) {
-        failures.push(`no bypass warning for jsonplaceholder.typicode.com: ${bypass.map((w) => w.text).join(' | ') || 'none'}`);
+    await runCase(dg, name, 600_000, async ({ failures, state }) => {
+      const notes: string[] = [];
+      const adb = (...args: string[]) => execFileSync('adb', ['-s', dev, ...args], { encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL' }).trim();
+      const before = adb('shell', 'settings', 'get', 'global', 'http_proxy');
+      const key = 'suite-J';
+      const gp = new AndroidGlobalProxy({ log: (m) => notes.push(m) });
+      const routeFailures: (string | undefined)[] = [];
+      const ownWarnings = new Map<string, SessionWarning[]>();
+      const watcher = createVmWatcher({
+        record: () => [],
+        update: () => undefined,
+        setWarnings: (sid, w) => ownWarnings.set(sid, w),
+        log: () => undefined,
+        nativeClients: () => 'proxy',
+        backgroundIsolates: () => 'warn', // the extension's own watcher installs; this one only reads
+        nativeRouted: () => gp.isRouted(key),
+        nativeRouteFailed: (_sid, client) => {
+          routeFailures.push(client);
+          void gp.release(key);
+        },
+      });
+      let session: vscode.DebugSession | undefined;
+      try {
+        const applied = await gp.apply(key, dev, api.proxyHost.port || port);
+        if (!applied.applied) failures.push(`global proxy not applied: ${JSON.stringify(applied)}`);
+        notes.push(`http_proxy during: ${adb('shell', 'settings', 'get', 'global', 'http_proxy')}`);
+        session = await launch(`FI-D J ${tag}`, dev, { toolArgs: ['--dart-define=APP_ZONE_OVERRIDES=true', '--dart-define=NATIVE_HTTP=true'] });
+        void watcher.attach({ sessionId: session.id });
+        const s = session;
+        await waitMarker(s, /DEMO_COVERAGE done/, 'DEMO_COVERAGE done', 600_000, state);
+        await sleep(4000);
+        const res = demoResults(outputOf(s));
+        const bypass = (api.controller.status().warnings ?? []).filter((w) => w.kind === 'bypass' && w.sessionId === s.id);
+        if (!bypass.some((w) => /jsonplaceholder\.typicode\.com bypass the proxy: an HttpOverrides zone/.test(w.text))) {
+          failures.push(`no bypass warning for jsonplaceholder.typicode.com: ${bypass.map((w) => w.text).join(' | ') || 'none'}`);
+        }
+        notes.push(`bypass hosts: ${bypass.map((w) => /Requests to (\S+)/.exec(w.text)?.[1]).join(',')}`);
+        const ng = res.native_get;
+        if (!ng || ng.status !== 'ERR' || !/CERT_AUTHORITY_INVALID/.test(ng.body)) failures.push(`native_get through the proxy should fail the CA check: ${ng ? `${ng.status} ${ng.body.slice(0, 120)}` : 'no result'}`);
+        if (!routeFailures.includes('cronet_http')) failures.push(`trust failure not reported (${JSON.stringify(routeFailures)})`);
+        const route = (ownWarnings.get(s.id) ?? []).find((w) => w.id === `native-route:${s.id}`);
+        if (!route || !/^cronet_http rejected the proxy's certificate/.test(route.text)) failures.push(`route warning: ${route?.text ?? 'none'}`);
+        await waitFor(() => (gp.isRouted(key) ? undefined : true), 10_000).catch(() => failures.push('routing not released after the trust failure'));
+        const after = adb('shell', 'settings', 'get', 'global', 'http_proxy');
+        if (after !== before) failures.push(`http_proxy ${after} after release (was ${before})`);
+        if (adb('shell', 'settings', 'get', 'global', 'global_http_proxy_host') !== '' && before === 'null') failures.push('ConnectivityService global proxy still set');
+      } catch (e) {
+        failures.push(`exception: ${(e as Error).message}`);
+      } finally {
+        watcher.dispose();
+        await gp.releaseAll();
+        if (session) await stopBounded(session, dg);
+        await sleep(1500);
+        try {
+          const end = adb('shell', 'settings', 'get', 'global', 'http_proxy');
+          if (end !== before) failures.push(`http_proxy ${end} at the end (was ${before})`);
+        } catch (e) {
+          failures.push(`http_proxy at the end: ${(e as Error).message}`);
+        }
       }
-      notes.push(`bypass hosts: ${bypass.map((w) => /Requests to (\S+)/.exec(w.text)?.[1]).join(',')}`);
-      const ng = res.native_get;
-      if (!ng || ng.status !== 'ERR' || !/CERT_AUTHORITY_INVALID/.test(ng.body)) failures.push(`native_get through the proxy should fail the CA check: ${ng ? `${ng.status} ${ng.body.slice(0, 120)}` : 'no result'}`);
-      if (!routeFailures.includes('cronet_http')) failures.push(`trust failure not reported (${JSON.stringify(routeFailures)})`);
-      const route = (ownWarnings.get(s.id) ?? []).find((w) => w.id === `native-route:${s.id}`);
-      if (!route || !/^cronet_http rejected the proxy's certificate/.test(route.text)) failures.push(`route warning: ${route?.text ?? 'none'}`);
-      await waitFor(() => (gp.isRouted(key) ? undefined : true), 10_000).catch(() => failures.push('routing not released after the trust failure'));
-      const after = adb('shell', 'settings', 'get', 'global', 'http_proxy');
-      if (after !== before) failures.push(`http_proxy ${after} after release (was ${before})`);
-      if (adb('shell', 'settings', 'get', 'global', 'global_http_proxy_host') !== '' && before === 'null') failures.push('ConnectivityService global proxy still set');
-    } catch (e) {
-      failures.push(`exception: ${(e as Error).message}`);
-    } finally {
-      watcher.dispose();
-      await gp.releaseAll();
-      if (session) await stopSession(session).catch(() => false);
-      await sleep(1500);
-      const end = adb('shell', 'settings', 'get', 'global', 'http_proxy');
-      if (end !== before) failures.push(`http_proxy ${end} at the end (was ${before})`);
-    }
-    check(name, failures, t0, { mode: notes.filter((n) => !/^native proxy:/.test(n)).join(' ') });
+      return { mode: notes.filter((n) => !/^native proxy:/.test(n)).join(' ') };
+    });
   }
 
   /** scripts/e2e/grpc_server on 127.0.0.1 / ::1: h2c on `port`, TLS (self-signed, minted at start) on `port + 1`. */
   async function startGrpcServer(grpcPort: number): Promise<{ stop: () => void; log: () => string }> {
     const dir = path.resolve(root, '..', '..', 'scripts', 'e2e', 'grpc_server');
-    execFileSync('dart', ['pub', 'get'], { cwd: dir, stdio: 'pipe', timeout: 180_000 });
+    execFileSync('dart', ['pub', 'get'], { cwd: dir, stdio: 'pipe', timeout: 180_000, killSignal: 'SIGKILL' });
     const p = spawn('dart', ['run', 'bin/server.dart', '--port', String(grpcPort), '--tls-port', String(grpcPort + 1)], { cwd: dir });
     let out = '';
     p.stdout.on('data', (d) => (out += d));
@@ -560,12 +731,22 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
     return { stop: () => p.kill(), log: () => out };
   }
 
-  async function checkK(dev: string, tag: string) {
+  async function checkK(dg: DeviceRun) {
+    const { dev, tag } = dg;
+    const names = {
+      k1: `DEV ${tag} K1 gRPC recorded (h2c calls, streaming, status, isolate, TLS tunnel)`,
+      mock: `DEV ${tag} K1 grpcMock (code 14) after hot restart`,
+      k2: `DEV ${tag} K2 grpc.enabled=false: direct, nothing recorded`,
+    };
+    if (dg.dead) {
+      for (const n of Object.values(names)) await runCase(dg, n, 0, async () => undefined);
+      return;
+    }
     const grpcPort = Number(process.env.FI_GRPC_PORT) || (await freePortPair());
     const svc = '/demo.orders.v1.OrderService/';
     const defines = [`--dart-define=GRPC_PORT=${grpcPort}`, `--dart-define=GRPC_TLS_PORT=${grpcPort + 1}`, '--dart-define=COVERAGE=false'];
-    const waitGrpc = async (s: vscode.DebugSession, from: number) => {
-      await waitFor(() => (/DEMO_GRPC done/.test(outputOf(s).slice(from)) ? true : undefined), 600_000, 250);
+    const waitGrpc = async (s: vscode.DebugSession, from: number, state: CaseCtx['state']) => {
+      await waitMarker(s, /DEMO_GRPC done/, 'DEMO_GRPC done', 600_000, state, from);
       await sleep(500);
       return outputOf(s).slice(from);
     };
@@ -579,187 +760,189 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
     }
     try {
       // ---- K1: intercepted ----
-      let t0 = Date.now();
-      let failures: string[] = [];
-      let session: vscode.DebugSession | undefined;
-      let since = Date.now();
+      const k1: { session?: vscode.DebugSession } = {};
       try {
-        await api.setRules([]);
-        session = await launch(`FI-D K1 ${tag}`, dev, { toolArgs: defines });
-        const args = (session.configuration.toolArgs ?? []) as string[];
-        if (args.some((a) => a.startsWith('--dart-define=FLUTTER_INTERCEPT_GRPC='))) failures.push(`gRPC define although enabled: ${args.join(' ')}`);
-        const text = await waitGrpc(session, 0);
-        const res = demoResults(text);
-        const ok = (label: string, re: RegExp) => {
-          const r = res[label];
-          if (!r || !re.test(`${r.status} ${r.body}`)) failures.push(`${label}: ${r ? `${r.status} ${r.body.slice(0, 160)}` : 'no DEMO_RESULT'}`);
-        };
-        ok('grpc_unary', /^0 .*"status":"ORDER_STATUS_SHIPPED"/);
-        ok('grpc_stream', /^0 .*"events":\["1:ORDER_STATUS_PENDING","2:ORDER_STATUS_SHIPPED","3:ORDER_STATUS_DELIVERED"\]/);
-        ok('grpc_client_stream', /^0 .*"count":3,"quantity":6/);
-        ok('grpc_bidi', /^0 .*"replies":\["echo: hello 1","echo: hello 2","echo: hello 3"\]/);
-        ok('grpc_missing', /^ERR .*code: 5/);
-        ok('grpc_tls', /^0 .*"status":"ORDER_STATUS_SHIPPED"/);
-        ok('grpc_isolate', /^0 .*"overridesInIsolate":true/);
-        const calls = grpcCalls(since);
-        const byMethod = (m: string) => calls.filter((e) => e.url.endsWith(svc + m) && e.state === 'completed');
-        const getOrders = byMethod('GetOrder');
-        if (!getOrders.some((e) => e.grpc?.statusCode === 0 && e.grpc.messagesReceived === 1)) failures.push(`GetOrder OK not recorded (${calls.map((e) => `${e.url} ${e.state} ${e.grpc?.statusCode}`).join(', ') || 'no gRPC exchanges'})`);
-        if (!getOrders.some((e) => e.grpc?.statusCode === 5)) failures.push('GetOrder NOT_FOUND not recorded with grpc-status 5');
-        if (getOrders.filter((e) => e.grpc?.statusCode === 0).length < 2) failures.push('the Isolate.run GetOrder was not recorded');
-        if (!byMethod('WatchOrders').some((e) => e.grpc?.statusCode === 0 && e.grpc.messagesReceived === 3)) failures.push('WatchOrders: no completed call with 3 messages received');
-        if (!byMethod('UploadItems').some((e) => e.grpc?.statusCode === 0 && e.grpc.messagesSent === 3)) failures.push('UploadItems: no completed call with 3 messages sent');
-        if (!byMethod('Chat').some((e) => e.grpc?.statusCode === 0 && e.grpc.messagesSent === 3 && e.grpc.messagesReceived === 3)) failures.push('Chat: no completed call with 3 messages each way');
-        for (const e of calls) if (e.method !== 'POST') failures.push(`gRPC exchange method ${e.method}`);
-        const tunnels = api.getExchanges().filter((e) => e.startedAt >= since && e.kind === 'tunnel' && e.grpcTunnel && e.url.includes(`:${grpcPort + 1}`));
-        if (!tunnels.length) failures.push(`TLS call not recorded as a grpcTunnel (${api.getExchanges().filter((e) => e.startedAt >= since && e.url.includes(`:${grpcPort + 1}`)).map((e) => `${e.kind} ${e.url}`).join(', ') || 'nothing'})`);
-        check(`DEV ${tag} K1 gRPC recorded (h2c calls, streaming, status, isolate, TLS tunnel)`, failures, t0, { output: evidence(text), mode: `grpc=${calls.length} tunnels=${tunnels.length}` });
+        await runCase(dg, names.k1, 600_000, async ({ failures, state }) => {
+          await api.setRules([]);
+          const since = Date.now();
+          const session = (k1.session = await launch(`FI-D K1 ${tag}`, dev, { toolArgs: defines }));
+          const args = (session.configuration.toolArgs ?? []) as string[];
+          if (args.some((x) => x.startsWith('--dart-define=FLUTTER_INTERCEPT_GRPC='))) failures.push(`gRPC define although enabled: ${args.join(' ')}`);
+          const text = await waitGrpc(session, 0, state);
+          const res = demoResults(text);
+          const ok = (label: string, re: RegExp) => {
+            const r = res[label];
+            if (!r || !re.test(`${r.status} ${r.body}`)) failures.push(`${label}: ${r ? `${r.status} ${r.body.slice(0, 160)}` : 'no DEMO_RESULT'}`);
+          };
+          ok('grpc_unary', /^0 .*"status":"ORDER_STATUS_SHIPPED"/);
+          ok('grpc_stream', /^0 .*"events":\["1:ORDER_STATUS_PENDING","2:ORDER_STATUS_SHIPPED","3:ORDER_STATUS_DELIVERED"\]/);
+          ok('grpc_client_stream', /^0 .*"count":3,"quantity":6/);
+          ok('grpc_bidi', /^0 .*"replies":\["echo: hello 1","echo: hello 2","echo: hello 3"\]/);
+          ok('grpc_missing', /^ERR .*code: 5/);
+          ok('grpc_tls', /^0 .*"status":"ORDER_STATUS_SHIPPED"/);
+          ok('grpc_isolate', /^0 .*"overridesInIsolate":true/);
+          const calls = grpcCalls(since);
+          const byMethod = (m: string) => calls.filter((e) => e.url.endsWith(svc + m) && e.state === 'completed');
+          const getOrders = byMethod('GetOrder');
+          if (!getOrders.some((e) => e.grpc?.statusCode === 0 && e.grpc.messagesReceived === 1)) failures.push(`GetOrder OK not recorded (${calls.map((e) => `${e.url} ${e.state} ${e.grpc?.statusCode}`).join(', ') || 'no gRPC exchanges'})`);
+          if (!getOrders.some((e) => e.grpc?.statusCode === 5)) failures.push('GetOrder NOT_FOUND not recorded with grpc-status 5');
+          if (getOrders.filter((e) => e.grpc?.statusCode === 0).length < 2) failures.push('the Isolate.run GetOrder was not recorded');
+          if (!byMethod('WatchOrders').some((e) => e.grpc?.statusCode === 0 && e.grpc.messagesReceived === 3)) failures.push('WatchOrders: no completed call with 3 messages received');
+          if (!byMethod('UploadItems').some((e) => e.grpc?.statusCode === 0 && e.grpc.messagesSent === 3)) failures.push('UploadItems: no completed call with 3 messages sent');
+          if (!byMethod('Chat').some((e) => e.grpc?.statusCode === 0 && e.grpc.messagesSent === 3 && e.grpc.messagesReceived === 3)) failures.push('Chat: no completed call with 3 messages each way');
+          for (const e of calls) if (e.method !== 'POST') failures.push(`gRPC exchange method ${e.method}`);
+          const tunnels = api.getExchanges().filter((e) => e.startedAt >= since && e.kind === 'tunnel' && e.grpcTunnel && e.url.includes(`:${grpcPort + 1}`));
+          if (!tunnels.length) failures.push(`TLS call not recorded as a grpcTunnel (${api.getExchanges().filter((e) => e.startedAt >= since && e.url.includes(`:${grpcPort + 1}`)).map((e) => `${e.kind} ${e.url}`).join(', ') || 'nothing'})`);
+          return { output: evidence(text), mode: `grpc=${calls.length} tunnels=${tunnels.length}` };
+        });
 
-        // grpcMock + hot restart
-        t0 = Date.now();
-        failures = [];
-        await api.setRules([{ id: 'grpc-mock', enabled: true, match: { method: 'POST', url: `*${svc}GetOrder` }, action: { kind: 'grpcMock', code: 14, message: 'mocked by suite' } }]);
-        const from = outputOf(session).length;
-        since = Date.now();
-        await session.customRequest('hotRestart');
-        const text2 = await waitGrpc(session, from);
-        const r = demoResults(text2).grpc_unary;
-        if (!r || r.status !== 'ERR' || !/code: 14/.test(r.body) || !/mocked by suite/.test(r.body)) failures.push(`grpc_unary after the mock: ${r ? `${r.status} ${r.body.slice(0, 160)}` : 'no DEMO_RESULT'}`);
-        const mocked = grpcCalls(since).filter((e) => e.url.endsWith(svc + 'GetOrder') && e.grpc?.statusCode === 14);
-        if (!mocked.length) failures.push('mocked GetOrder not recorded with grpc-status 14');
-        const stream = demoResults(text2).grpc_stream;
-        if (!stream || stream.status !== '0') failures.push(`grpc_stream (not mocked) after the restart: ${stream ? stream.status : 'none'}`);
-        check(`DEV ${tag} K1 grpcMock (code 14) after hot restart`, failures, t0, { output: evidence(text2), mode: `mocked=${mocked.length}` });
-      } catch (e) {
-        check(`DEV ${tag} K1 gRPC`, [...failures, `exception: ${(e as Error).message}`], t0);
+        // grpcMock + hot restart (in K1's session)
+        await runCase(dg, names.mock, 600_000, async ({ failures, state }) => {
+          const session = k1.session;
+          if (!session || ended.has(session.id)) {
+            failures.push('not run: the K1 session is not running (see K1)');
+            return;
+          }
+          await api.setRules([{ id: 'grpc-mock', enabled: true, match: { method: 'POST', url: `*${svc}GetOrder` }, action: { kind: 'grpcMock', code: 14, message: 'mocked by suite' } }]);
+          const from = outputOf(session).length;
+          const since = Date.now();
+          await withTimeout(session.customRequest('hotRestart'), 120_000, 'hotRestart');
+          const text2 = await waitGrpc(session, from, state);
+          const r = demoResults(text2).grpc_unary;
+          if (!r || r.status !== 'ERR' || !/code: 14/.test(r.body) || !/mocked by suite/.test(r.body)) failures.push(`grpc_unary after the mock: ${r ? `${r.status} ${r.body.slice(0, 160)}` : 'no DEMO_RESULT'}`);
+          const mocked = grpcCalls(since).filter((e) => e.url.endsWith(svc + 'GetOrder') && e.grpc?.statusCode === 14);
+          if (!mocked.length) failures.push('mocked GetOrder not recorded with grpc-status 14');
+          const stream = demoResults(text2).grpc_stream;
+          if (!stream || stream.status !== '0') failures.push(`grpc_stream (not mocked) after the restart: ${stream ? stream.status : 'none'}`);
+          return { output: evidence(text2), mode: `mocked=${mocked.length}` };
+        }, { reuse: true });
       } finally {
         await api.setRules([]);
-        if (session) await stopSession(session).catch(() => false);
+        if (k1.session) await stopBounded(k1.session, dg);
         await sleep(1500);
       }
 
       // ---- K2: grpc.enabled=false ----
-      t0 = Date.now();
-      failures = [];
-      session = undefined;
-      await cfg.update('grpc.enabled', false, vscode.ConfigurationTarget.Global);
-      try {
-        since = Date.now();
-        session = await launch(`FI-D K2 ${tag}`, dev, { toolArgs: defines });
-        const args = (session.configuration.toolArgs ?? []) as string[];
-        const def = args.filter((a) => a.startsWith('--dart-define=FLUTTER_INTERCEPT_GRPC='));
-        if (def.length !== 1 || def[0] !== '--dart-define=FLUTTER_INTERCEPT_GRPC=0') failures.push(`gRPC define ${JSON.stringify(def)}`);
-        const text = await waitGrpc(session, 0);
-        const res = demoResults(text);
-        for (const l of ['grpc_unary', 'grpc_stream', 'grpc_client_stream', 'grpc_bidi', 'grpc_tls', 'grpc_isolate']) {
-          if (res[l]?.status !== '0') failures.push(`${l}: ${res[l] ? `${res[l].status} ${res[l].body.slice(0, 120)}` : 'no DEMO_RESULT'}`);
+      await runCase(dg, names.k2, 600_000, async ({ failures, state }) => {
+        let session: vscode.DebugSession | undefined;
+        await cfg.update('grpc.enabled', false, vscode.ConfigurationTarget.Global);
+        try {
+          const since = Date.now();
+          session = await launch(`FI-D K2 ${tag}`, dev, { toolArgs: defines });
+          const args = (session.configuration.toolArgs ?? []) as string[];
+          const def = args.filter((x) => x.startsWith('--dart-define=FLUTTER_INTERCEPT_GRPC='));
+          if (def.length !== 1 || def[0] !== '--dart-define=FLUTTER_INTERCEPT_GRPC=0') failures.push(`gRPC define ${JSON.stringify(def)}`);
+          const text = await waitGrpc(session, 0, state);
+          const res = demoResults(text);
+          for (const l of ['grpc_unary', 'grpc_stream', 'grpc_client_stream', 'grpc_bidi', 'grpc_tls', 'grpc_isolate']) {
+            if (res[l]?.status !== '0') failures.push(`${l}: ${res[l] ? `${res[l].status} ${res[l].body.slice(0, 120)}` : 'no DEMO_RESULT'}`);
+          }
+          const recorded = api.getExchanges().filter((e) => e.startedAt >= since && (e.kind === 'grpc' || e.grpcTunnel || e.url.includes(`:${grpcPort}`) || e.url.includes(`:${grpcPort + 1}`)));
+          if (recorded.length) failures.push(`${recorded.length} gRPC exchange(s) recorded although gRPC is off: ${recorded.map((e) => e.url).join(', ')}`);
+          return { output: evidence(text) };
+        } finally {
+          await cfg.update('grpc.enabled', undefined, vscode.ConfigurationTarget.Global);
+          if (session) await stopBounded(session, dg);
+          await sleep(1500);
         }
-        const recorded = api.getExchanges().filter((e) => e.startedAt >= since && (e.kind === 'grpc' || e.grpcTunnel || e.url.includes(`:${grpcPort}`) || e.url.includes(`:${grpcPort + 1}`)));
-        if (recorded.length) failures.push(`${recorded.length} gRPC exchange(s) recorded although gRPC is off: ${recorded.map((e) => e.url).join(', ')}`);
-        check(`DEV ${tag} K2 grpc.enabled=false: direct, nothing recorded`, failures, t0, { output: evidence(text) });
-      } catch (e) {
-        check(`DEV ${tag} K2 grpc.enabled=false`, [...failures, `exception: ${(e as Error).message}`], t0);
-      } finally {
-        await cfg.update('grpc.enabled', undefined, vscode.ConfigurationTarget.Global);
-        if (session) await stopSession(session).catch(() => false);
-        await sleep(1500);
-      }
+      });
     } finally {
       server.stop();
     }
   }
 
   /** CONTRACTS §19.3: trust on a booted iOS simulator → TLS gRPC decrypted; the row removed again at session end. */
-  async function checkL(dev: string, tag: string) {
+  async function checkL(dg: DeviceRun) {
+    const { dev, tag } = dg;
     const name = `DEV ${tag} L simulator CA trust: TLS gRPC decrypted, trust removed at session end`;
-    const t0 = Date.now();
-    const failures: string[] = [];
-    const notes: string[] = [];
-    const udid = dev.toUpperCase();
-    let session: vscode.DebugSession | undefined;
-    let server: { stop: () => void; log: () => string } | undefined;
-    let store: string | undefined;
-    let sha: string | undefined;
-    let preExisting = false;
-    let text = '';
-    const rowPresent = async () => {
-      const r = await readTrustRow(simExec, nodeFs, store!, sha!);
-      if ('problem' in r) throw new Error(r.problem);
-      return r.present;
-    };
-    try {
-      // Read-only "before" state, with the setting still off: the CA (from the entry the provider writes) and its row.
-      await cfg.update('grpc.trustOnSimulator', undefined, vscode.ConfigurationTarget.Global);
-      await api.prepare(folder, { type: 'dart', request: 'launch', name: `FI-D L prepare ${tag}`, deviceId: dev });
-      const pem = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/.exec(fs.readFileSync(entry, 'utf8'))?.[0];
-      const fp = caFingerprint(pem);
-      if ('problem' in fp) throw new Error(`CA from the entry: ${fp.problem}`);
-      sha = fp.sha256;
-      if (!(await new IosSimTrust({ caCertPem: fp.certPem, heartbeatMs: 0 }).isSimulator(udid))) throw new Error(`${dev} is not a booted iOS simulator`);
-      const sim = parseSimulators((await simExec(XCRUN, ['simctl', 'list', 'devices', '-j'], 10_000)).stdout).find((d) => d.udid === udid);
-      if (!sim?.dataPath) throw new Error('no dataPath for the simulator');
-      store = trustStorePath(sim.dataPath);
-      preExisting = await rowPresent();
-      notes.push(`preExisting=${preExisting}`);
+    await runCase(dg, name, 600_000, async ({ failures, state }) => {
+      const notes: string[] = [];
+      const udid = dev.toUpperCase();
+      let session: vscode.DebugSession | undefined;
+      let server: { stop: () => void; log: () => string } | undefined;
+      let store: string | undefined;
+      let sha: string | undefined;
+      let preExisting = false;
+      let text = '';
+      const rowPresent = async () => {
+        const r = await readTrustRow(simExec, nodeFs, store!, sha!);
+        if ('problem' in r) throw new Error(r.problem);
+        return r.present;
+      };
+      try {
+        // Read-only "before" state, with the setting still off: the CA (from the entry the provider writes) and its row.
+        await cfg.update('grpc.trustOnSimulator', undefined, vscode.ConfigurationTarget.Global);
+        await withTimeout(api.prepare(folder, { type: 'dart', request: 'launch', name: `FI-D L prepare ${tag}`, deviceId: dev }), 120_000, 'prepare');
+        const pem = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/.exec(fs.readFileSync(entry, 'utf8'))?.[0];
+        const fp = caFingerprint(pem);
+        if ('problem' in fp) throw new Error(`CA from the entry: ${fp.problem}`);
+        sha = fp.sha256;
+        if (!(await withTimeout(new IosSimTrust({ caCertPem: fp.certPem, heartbeatMs: 0 }).isSimulator(udid), 30_000, 'isSimulator'))) throw new Error(`${dev} is not a booted iOS simulator`);
+        const sim = parseSimulators((await withTimeout(simExec(XCRUN, ['simctl', 'list', 'devices', '-j'], 10_000), 20_000, 'simctl list')).stdout).find((d) => d.udid === udid);
+        if (!sim?.dataPath) throw new Error('no dataPath for the simulator');
+        store = trustStorePath(sim.dataPath);
+        preExisting = await rowPresent();
+        notes.push(`preExisting=${preExisting}`);
 
-      const grpcPort = Number(process.env.FI_GRPC_PORT) || (await freePortPair());
-      server = await startGrpcServer(grpcPort);
-      await api.setRules([]);
-      await cfg.update('grpc.trustOnSimulator', true, vscode.ConfigurationTarget.Global);
-      const since = Date.now();
-      session = await launch(`FI-D L ${tag}`, dev, { toolArgs: [`--dart-define=GRPC_PORT=${grpcPort}`, `--dart-define=GRPC_TLS_PORT=${grpcPort + 1}`, '--dart-define=COVERAGE=false'] });
-      // The trust is added right after the session starts (asynchronously): give it a few seconds.
-      let trusted = false;
-      for (const end = Date.now() + 15_000; !trusted && Date.now() < end; await sleep(250)) trusted = await rowPresent();
-      if (!trusted) failures.push('the CA is not in the simulator trust store during the session');
-      const s = session;
-      await waitFor(() => (/DEMO_GRPC done/.test(outputOf(s)) ? true : undefined), 600_000, 250);
-      await sleep(500);
-      text = outputOf(s);
-      const tls = demoResults(text).grpc_tls;
-      const tlsUrl = `:${grpcPort + 1}/demo.orders.v1.OrderService/GetOrder`;
-      // Decrypted = the proxy read the call (a gRPC exchange with the app's request message), not a tunnel. The e2e
-      // server's certificate is self-signed (the app accepts it itself); the proxy verifies upstream certificates, so
-      // the decrypted call then fails upstream with a certificate error — a documented limit (docs: TLS gRPC on the
-      // iOS simulator). Either the call succeeded, or it failed exactly that way.
-      const decrypted = api.getExchanges().filter((e) => e.startedAt >= since && e.kind === 'grpc' && e.url.includes(tlsUrl));
-      const ok = decrypted.filter(
-        (e) => !!e.grpc && (e.grpc.statusCode === 0 ? e.grpc.messagesSent >= 1 && e.grpc.messagesReceived >= 1 : /certificate/i.test(`${e.grpc.statusMessage ?? ''} ${e.error ?? ''}`)),
-      );
-      if (tls && !ok.length) notes.push(`grpc_tls: ${tls.status} ${tls.body.slice(0, 120)}`);
-      if (!ok.length) {
-        const seen = api.getExchanges().filter((e) => e.startedAt >= since && e.url.includes(`:${grpcPort + 1}`));
-        failures.push(`TLS GetOrder not recorded decrypted (a gRPC exchange, not a tunnel): ${seen.map((e) => `${e.kind} ${e.url} ${e.state} ${e.grpc?.statusCode ?? ''} ${e.error ?? ''}`).join(', ') || 'nothing recorded'}`);
-      }
-      notes.push(`decrypted=${ok.length}`);
+        const grpcPort = Number(process.env.FI_GRPC_PORT) || (await freePortPair());
+        server = await startGrpcServer(grpcPort);
+        await api.setRules([]);
+        await cfg.update('grpc.trustOnSimulator', true, vscode.ConfigurationTarget.Global);
+        const since = Date.now();
+        session = await launch(`FI-D L ${tag}`, dev, { toolArgs: [`--dart-define=GRPC_PORT=${grpcPort}`, `--dart-define=GRPC_TLS_PORT=${grpcPort + 1}`, '--dart-define=COVERAGE=false'] });
+        // The trust is added right after the session starts (asynchronously): give it a few seconds.
+        let trusted = false;
+        for (const end = Date.now() + 15_000; !trusted && Date.now() < end; await sleep(250)) trusted = await rowPresent();
+        if (!trusted) failures.push('the CA is not in the simulator trust store during the session');
+        const s = session;
+        await waitMarker(s, /DEMO_GRPC done/, 'DEMO_GRPC done', 600_000, state);
+        await sleep(500);
+        text = outputOf(s);
+        const tls = demoResults(text).grpc_tls;
+        const tlsUrl = `:${grpcPort + 1}/demo.orders.v1.OrderService/GetOrder`;
+        // Decrypted = the proxy read the call (a gRPC exchange with the app's request message), not a tunnel. The e2e
+        // server's certificate is self-signed (the app accepts it itself); the proxy verifies upstream certificates, so
+        // the decrypted call then fails upstream with a certificate error — a documented limit (docs: TLS gRPC on the
+        // iOS simulator). Either the call succeeded, or it failed exactly that way.
+        const decrypted = api.getExchanges().filter((e) => e.startedAt >= since && e.kind === 'grpc' && e.url.includes(tlsUrl));
+        const ok = decrypted.filter(
+          (e) => !!e.grpc && (e.grpc.statusCode === 0 ? e.grpc.messagesSent >= 1 && e.grpc.messagesReceived >= 1 : /certificate/i.test(`${e.grpc.statusMessage ?? ''} ${e.error ?? ''}`)),
+        );
+        if (tls && !ok.length) notes.push(`grpc_tls: ${tls.status} ${tls.body.slice(0, 120)}`);
+        if (!ok.length) {
+          const seen = api.getExchanges().filter((e) => e.startedAt >= since && e.url.includes(`:${grpcPort + 1}`));
+          failures.push(`TLS GetOrder not recorded decrypted (a gRPC exchange, not a tunnel): ${seen.map((e) => `${e.kind} ${e.url} ${e.state} ${e.grpc?.statusCode ?? ''} ${e.error ?? ''}`).join(', ') || 'nothing recorded'}`);
+        }
+        notes.push(`decrypted=${ok.length}`);
 
-      // Session end → our row removed (a pre-existing one stays).
-      await stopSession(session).catch(() => false);
-      session = undefined;
-      const want = preExisting;
-      let settled = false; // (waitFor is synchronous)
-      for (const end = Date.now() + 20_000; !settled && Date.now() < end; await sleep(500)) settled = (await rowPresent()) === want;
-      if (!settled) failures.push(preExisting ? 'a pre-existing trust row was removed' : 'the CA is still trusted after the session ended');
-    } catch (e) {
-      failures.push(`exception: ${(e as Error).message}`);
-    } finally {
-      if (session) await stopSession(session).catch(() => false);
-      server?.stop();
-      await cfg.update('grpc.trustOnSimulator', undefined, vscode.ConfigurationTarget.Global);
-      if (cfg.inspect('grpc.trustOnSimulator')?.globalValue !== undefined) failures.push('flutterIntercept.grpc.trustOnSimulator not restored');
-      // Never leave the developer's simulator changed: if our row survived (a failure above), delete exactly it.
-      if (store && sha && !preExisting && (await rowPresent().catch(() => false))) {
-        await simExec(SQLITE3, ['-bail', '-cmd', '.timeout 5000', store, `DELETE FROM tsettings WHERE sha256 = x'${sha}';`], 10_000).catch((e: unknown) => failures.push(`cleanup failed: ${String(e)}`));
-        notes.push('cleanup: removed the row left behind');
+        // Session end → our row removed (a pre-existing one stays).
+        await stopBounded(session, dg);
+        session = undefined;
+        const want = preExisting;
+        let settled = false; // (waitFor is synchronous)
+        for (const end = Date.now() + 20_000; !settled && Date.now() < end; await sleep(500)) settled = (await rowPresent()) === want;
+        if (!settled) failures.push(preExisting ? 'a pre-existing trust row was removed' : 'the CA is still trusted after the session ended');
+      } catch (e) {
+        failures.push(`exception: ${(e as Error).message}`);
+      } finally {
+        if (session) await stopBounded(session, dg);
+        server?.stop();
+        await cfg.update('grpc.trustOnSimulator', undefined, vscode.ConfigurationTarget.Global);
+        if (cfg.inspect('grpc.trustOnSimulator')?.globalValue !== undefined) failures.push('flutterIntercept.grpc.trustOnSimulator not restored');
+        // Never leave the developer's simulator changed: if our row survived (a failure above), delete exactly it.
+        if (store && sha && !preExisting && (await rowPresent().catch(() => false))) {
+          await simExec(SQLITE3, ['-bail', '-cmd', '.timeout 5000', store, `DELETE FROM tsettings WHERE sha256 = x'${sha}';`], 10_000).catch((e: unknown) => failures.push(`cleanup failed: ${String(e)}`));
+          notes.push('cleanup: removed the row left behind');
+        }
+        await sleep(1500);
       }
-      await sleep(1500);
-    }
-    check(name, failures, t0, { output: evidence(text), mode: notes.join(' ') });
+      return { output: evidence(text), mode: notes.join(' ') };
+    });
   }
 
   async function runSimple(
+    dg: DeviceRun,
     name: string,
-    dev: string,
     extra: Record<string, unknown>,
     intercept: boolean,
     more: (text: string, failures: string[], conf: vscode.DebugConfiguration) => void,
@@ -769,33 +952,31 @@ export async function runDevicesSuite(): Promise<RunOutcome[]> {
     // nothing was rewritten or recorded.
     silentApp = false,
   ) {
-    const t0 = Date.now();
-    const failures: string[] = [];
-    let session: vscode.DebugSession | undefined;
-    try {
-      await api.setRules([]);
-      const since = Date.now();
-      session = await launch(name.replace(/^DEV /, 'FI-D '), dev, extra);
-      let text: string;
-      let recorded: Exchange[];
-      if (silentApp && !intercept) {
-        const s = session;
-        await waitFor(() => (/release/i.test(outputOf(s)) ? true : undefined), 900_000, 500);
-        await sleep(30_000);
-        text = outputOf(s);
-        recorded = api.getExchanges().filter((e) => e.startedAt >= since);
-        if (recorded.length) failures.push(`${recorded.length} exchange(s) recorded although release is never intercepted`);
-      } else {
-        text = await waitBatch(session, 0, 900_000);
-        ({ recorded } = checkBatch(text, since, intercept, failures, want));
+    await runCase(dg, name, 900_000, async ({ failures, state }) => {
+      let session: vscode.DebugSession | undefined;
+      try {
+        await api.setRules([]);
+        const since = Date.now();
+        session = await launch(name.replace(/^DEV /, 'FI-D '), dg.dev, extra);
+        let text: string;
+        let recorded: Exchange[];
+        if (silentApp && !intercept) {
+          const s = session;
+          await waitMarker(s, /release/i, 'the release build line', 900_000, state);
+          await sleep(30_000);
+          text = outputOf(s);
+          recorded = api.getExchanges().filter((e) => e.startedAt >= since);
+          if (recorded.length) failures.push(`${recorded.length} exchange(s) recorded although release is never intercepted`);
+        } else {
+          text = await waitBatch(session, 0, 900_000, state);
+          ({ recorded } = checkBatch(text, since, intercept, failures, want));
+        }
+        more(text, failures, session.configuration);
+        return { output: evidence(text), mode: `program=${path.relative(root, session.configuration.program)} exchanges=${recorded.length}` };
+      } finally {
+        if (session) await stopBounded(session, dg);
+        await sleep(1500);
       }
-      more(text, failures, session.configuration);
-      check(name, failures, t0, { output: evidence(text), mode: `program=${path.relative(root, session.configuration.program)} exchanges=${recorded.length}` });
-    } catch (e) {
-      check(name, [...failures, `exception: ${(e as Error).message}`], t0);
-    } finally {
-      if (session) await stopSession(session).catch(() => false);
-      await sleep(1500);
-    }
+    });
   }
 }
