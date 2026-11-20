@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.15.0
+
+### Mock from a collection — no test server needed
+
+- **Point Flutter Intercept at your team's Postman collection or OpenAPI 3 document** (JSON or YAML) and every request
+  in it is answered from its saved examples. Your app keeps calling its real URLs; nothing changes in its code.
+  **Mock from a Collection…** is in the new **Collections** tab and the command palette.
+- **Postman** v2.0 / v2.1 with folders, `:id` and `{{variable}}` URLs, several examples per request (pick which one
+  answers, e.g. "Wrong password" to test your error screen) and examples chosen by query parameters (`?page=2`).
+  A Postman environment file fills `{{baseUrl}}`; its values never leave the extension.
+- **OpenAPI 3.0 / 3.1**: written examples first; without one, a body generated from the schema (the same every time).
+- **A request with no example** answers `501` with a clear message, and the panel offers **Mock it with a rule**.
+  Requests the collection doesn't know go to the real server, or fail like offline with one switch.
+- **Shared, but your changes stay yours.** The link lives in `.vscode/flutter-intercept.json` for the team and the
+  collection file is watched. Turning a collection off, picking an example or turning a request off is **for you
+  only** until you choose **Save for the team**; **Reset** puts the team's settings back.
+- **Safe by default.** Answers that would redirect the app, set cookies, change CORS / CSP or serve HTML / JS are sent
+  without those parts until you approve the collection once (**Review & approve**); plain JSON answers are never
+  affected. An edit to the collection, a git checkout or a new `baseUrl` asks again.
+- **What's missing**: the Collections tab lists the requests your app sent that the collection doesn't have, and the
+  ones answered 501, each with **Mock it with a rule**.
+- **Copy without credentials**: importing a file from outside the project copies it in with auth blocks, secret
+  variables, credential headers and request-body passwords removed.
+- Your own rules always run first, so a fault, a breakpoint or another mock still wins over the collection.
+
+### Agents
+
+- New tools: `list_collections`, `get_collection`, `get_collection_example`, `import_collection`, `set_collection`.
+- Every request a collection answered says so (`collection: {id, endpoint, example}`), a request can be named by its
+  id (`set_collection {request, example}`), and `list_collections` shows what the collection lacks.
+- Changes an agent makes are for you only by default (no diff in the team's file); agents can't approve a collection.
+
+### Also
+- The Android Studio / IntelliJ plugin and the CLI (`--collection`, `--collection-env`, `--collection-var`,
+  `--collection-unmatched`) support collections too.
+- The extension is 136 KB larger (the parsers and a YAML reader, loaded only when a YAML file is imported).
+- Fix: `stop_app` no longer reports "Canceled" when the app did stop (VS Code can cancel the stop request while the
+  session is ending).
+
 ## 0.14.1
 
 ### What the server sees, and turning automatic passthrough off

@@ -86,6 +86,13 @@ instead of the app: use a certificate you're allowed to use for testing. **Pass 
 Settings → Tools → Flutter Intercept turns the automatic part off. Step by step:
 [Apps with their own certificate](../extension/README.md#apps-with-their-own-certificate-mtls).
 
+## Mock from a collection
+
+No test server? **Tools → Flutter Intercept → Mock from a Collection…** (or the Collections tab) links a Postman
+collection (v2.0 / v2.1) or an OpenAPI 3 document (JSON or YAML); the app's requests are answered from its saved
+examples. Pick which example answers, see what the collection lacks, and approve once before answers that redirect,
+set cookies or serve HTML are sent in full. Same behaviour as the VS Code extension.
+
 ## Differences from VS Code
 
 - Android Studio shows the traffic through the Flutter plugin's embedded browser (see above).

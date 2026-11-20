@@ -37,6 +37,19 @@ and the traffic shows up.
   `grpc:unavailable` (prefix any of them with `-` to exclude).
 - Keyboard navigation and a resizable detail pane.
 
+**Mock from a collection — no test server needed**
+- Point Flutter Intercept at your team's Postman collection (v2.0 / v2.1) or OpenAPI 3 document (JSON or YAML): every
+  request in it is answered from its saved examples, while the app keeps calling its real URLs. OpenAPI operations
+  without an example get a body generated from the schema.
+- Pick which example answers (an error case, for instance). What you change stays on your computer until you choose
+  **Save for the team**; the link itself lives in `.vscode/flutter-intercept.json`.
+- A request with no example answers 501 with **Mock it with a rule**; the Collections tab lists the requests your app
+  sent that the collection doesn't have.
+- Answers that would redirect, set cookies or serve HTML are sent without those parts until you approve the
+  collection once. Your own rules always run first.
+
+![Collections tab: a Postman collection with its requests, the example that answers each, and what it lacks](media/screenshots/collections-dark.png)
+
 **Where a request came from**
 - The detail pane shows the line of your code that made the request (for example
   `CatalogApi.fetchAlbum  lib/api/catalog_api.dart:37`). **Open source** jumps there; expand it for the whole
@@ -372,6 +385,7 @@ Running the command again updates it in place, and the rest of the file is left 
 - "Make the products endpoint return 500 and check that the error UI shows up, then remove the mock."
 - "Mock the feed endpoint with a 10-second delay and check the loading state."
 - "Pause the next checkout request, change the quantity to 3, and resume it."
+- "The backend is down: mock the app from our Postman collection and show the wrong-password error."
 
 ## Flutter Web
 
@@ -401,107 +415,112 @@ endpoints.
 2. [Read the traffic list and request details](#read-the-traffic-list-and-request-details)
 3. [Find requests with filters and search](#find-requests-with-filters-and-search)
 
+**No test server**
+
+4. [Mock your app from a Postman collection or OpenAPI file](#mock-your-app-from-a-postman-collection-or-openapi-file)
+
 **Change what your app sends and receives**
 
-4. [Pause and edit a request or response](#pause-and-edit-a-request-or-response)
-5. [Mock a response](#mock-a-response)
-6. [Block a request](#block-a-request)
-7. [Organize your rules](#organize-your-rules)
-8. [Make a rule remove itself](#make-a-rule-remove-itself)
+5. [Pause and edit a request or response](#pause-and-edit-a-request-or-response)
+6. [Mock a response](#mock-a-response)
+7. [Block a request](#block-a-request)
+8. [Organize your rules](#organize-your-rules)
+9. [Make a rule remove itself](#make-a-rule-remove-itself)
 
 **Debug a request**
 
-9. [Jump from a request to the code that sent it](#jump-from-a-request-to-the-code-that-sent-it)
-10. [Copy a request as cURL, Dart or Dio](#copy-a-request-as-curl-dart-or-dio)
-11. [Resend a request, or edit it and resend](#resend-a-request-or-edit-it-and-resend)
+10. [Jump from a request to the code that sent it](#jump-from-a-request-to-the-code-that-sent-it)
+11. [Copy a request as cURL, Dart or Dio](#copy-a-request-as-curl-dart-or-dio)
+12. [Resend a request, or edit it and resend](#resend-a-request-or-edit-it-and-resend)
 
 **Bad networks**
 
-12. [Simulate a slow, flaky or offline network](#simulate-a-slow-flaky-or-offline-network)
-13. [Slow down or break a single endpoint](#slow-down-or-break-a-single-endpoint)
+13. [Simulate a slow, flaky or offline network](#simulate-a-slow-flaky-or-offline-network)
+14. [Slow down or break a single endpoint](#slow-down-or-break-a-single-endpoint)
 
 **Your models vs the real API**
 
-14. [Check responses against your models](#check-responses-against-your-models)
-15. [Break a field on purpose](#break-a-field-on-purpose)
-16. [Generate a Dart model from traffic](#generate-a-dart-model-from-traffic)
-17. [Generate a fixture test](#generate-a-fixture-test)
+15. [Check responses against your models](#check-responses-against-your-models)
+16. [Break a field on purpose](#break-a-field-on-purpose)
+17. [Generate a Dart model from traffic](#generate-a-dart-model-from-traffic)
+18. [Generate a fixture test](#generate-a-fixture-test)
 
 **Web, sockets and GraphQL**
 
-18. [Run a Flutter Web app in Chrome](#run-a-flutter-web-app-in-chrome)
-19. [Get past CORS errors while you develop](#get-past-cors-errors-while-you-develop)
-20. [Watch WebSocket messages and SSE events](#watch-websocket-messages-and-sse-events)
-21. [Work with GraphQL operations](#work-with-graphql-operations)
-22. [See requests from native clients and background isolates](#see-requests-from-native-clients-and-background-isolates)
+19. [Run a Flutter Web app in Chrome](#run-a-flutter-web-app-in-chrome)
+20. [Get past CORS errors while you develop](#get-past-cors-errors-while-you-develop)
+21. [Watch WebSocket messages and SSE events](#watch-websocket-messages-and-sse-events)
+22. [Work with GraphQL operations](#work-with-graphql-operations)
+23. [See requests from native clients and background isolates](#see-requests-from-native-clients-and-background-isolates)
 
 **Team rules and scenarios**
 
-23. [Share rules with your team](#share-rules-with-your-team)
-24. [Approve rules that came from the repo](#approve-rules-that-came-from-the-repo)
-25. [Keep a mock body in a file](#keep-a-mock-body-in-a-file)
-26. [Answer successive requests differently](#answer-successive-requests-differently)
-27. [Test token refresh with Expire token](#test-token-refresh-with-expire-token)
+24. [Share rules with your team](#share-rules-with-your-team)
+25. [Approve rules that came from the repo](#approve-rules-that-came-from-the-repo)
+26. [Keep a mock body in a file](#keep-a-mock-body-in-a-file)
+27. [Answer successive requests differently](#answer-successive-requests-differently)
+28. [Test token refresh with Expire token](#test-token-refresh-with-expire-token)
 
 **Record, replay and reroute**
 
-28. [Record traffic and replay it](#record-traffic-and-replay-it)
-29. [Compare two recordings](#compare-two-recordings)
-30. [Send requests to another server](#send-requests-to-another-server)
-31. [Change headers, status or body text](#change-headers-status-or-body-text)
-32. [Chain to Charles, Burp or a corporate proxy](#chain-to-charles-burp-or-a-corporate-proxy)
+29. [Record traffic and replay it](#record-traffic-and-replay-it)
+30. [Compare two recordings](#compare-two-recordings)
+31. [Send requests to another server](#send-requests-to-another-server)
+32. [Change headers, status or body text](#change-headers-status-or-body-text)
+33. [Chain to Charles, Burp or a corporate proxy](#chain-to-charles-burp-or-a-corporate-proxy)
 
 **Timing, scripts, exports and CI**
 
-33. [Open the traffic view in its own window](#open-the-traffic-view-in-its-own-window)
-34. [See where a request's time went](#see-where-a-requests-time-went)
-35. [Change requests and responses with a script](#change-requests-and-responses-with-a-script)
-36. [Export traffic as OpenAPI or Postman](#export-traffic-as-openapi-or-postman)
-37. [Get notified when requests fail](#get-notified-when-requests-fail)
-38. [Run integration tests through Flutter Intercept in CI](#run-integration-tests-through-flutter-intercept-in-ci)
+34. [Open the traffic view in its own window](#open-the-traffic-view-in-its-own-window)
+35. [See where a request's time went](#see-where-a-requests-time-went)
+36. [Change requests and responses with a script](#change-requests-and-responses-with-a-script)
+37. [Export traffic as OpenAPI or Postman](#export-traffic-as-openapi-or-postman)
+38. [Get notified when requests fail](#get-notified-when-requests-fail)
+39. [Run integration tests through Flutter Intercept in CI](#run-integration-tests-through-flutter-intercept-in-ci)
 
 **Pinned hosts, certificates and native clients**
 
-39. [Let pinned hosts through without decryption](#let-pinned-hosts-through-without-decryption)
-40. [Apps with their own certificate (mTLS)](#apps-with-their-own-certificate-mtls)
-41. [Route native clients on an Android emulator](#route-native-clients-on-an-android-emulator)
-42. [Find requests that bypass the proxy](#find-requests-that-bypass-the-proxy)
+40. [Let pinned hosts through without decryption](#let-pinned-hosts-through-without-decryption)
+41. [Apps with their own certificate (mTLS)](#apps-with-their-own-certificate-mtls)
+42. [Route native clients on an Android emulator](#route-native-clients-on-an-android-emulator)
+43. [Find requests that bypass the proxy](#find-requests-that-bypass-the-proxy)
 
 **gRPC**
 
-43. [See gRPC calls and their messages](#see-grpc-calls-and-their-messages)
-44. [Mock a gRPC call](#mock-a-grpc-call)
-45. [Pause and edit gRPC messages](#pause-and-edit-grpc-messages)
-46. [Change fields in gRPC responses](#change-fields-in-grpc-responses)
-47. [Record, replay and compare gRPC calls](#record-replay-and-compare-grpc-calls)
-48. [Read gRPC messages with .proto files](#read-grpc-messages-with-proto-files)
-49. [Fail, slow down or block gRPC calls](#fail-slow-down-or-block-grpc-calls)
-50. [See inside gRPC over TLS](#see-inside-grpc-over-tls)
-51. [Change gRPC metadata and trailers](#change-grpc-metadata-and-trailers)
-52. [Change gRPC calls with a script](#change-grpc-calls-with-a-script)
-53. [Send gRPC calls to another server](#send-grpc-calls-to-another-server)
-54. [Resend a gRPC call, or edit it and resend](#resend-a-grpc-call-or-edit-it-and-resend)
-55. [See gRPC-Web calls from Flutter Web](#see-grpc-web-calls-from-flutter-web)
-56. [Copy a gRPC call as grpcurl](#copy-a-grpc-call-as-grpcurl)
-57. [See TLS gRPC on the iOS simulator](#see-tls-grpc-on-the-ios-simulator)
+44. [See gRPC calls and their messages](#see-grpc-calls-and-their-messages)
+45. [Mock a gRPC call](#mock-a-grpc-call)
+46. [Pause and edit gRPC messages](#pause-and-edit-grpc-messages)
+47. [Change fields in gRPC responses](#change-fields-in-grpc-responses)
+48. [Record, replay and compare gRPC calls](#record-replay-and-compare-grpc-calls)
+49. [Read gRPC messages with .proto files](#read-grpc-messages-with-proto-files)
+50. [Fail, slow down or block gRPC calls](#fail-slow-down-or-block-grpc-calls)
+51. [See inside gRPC over TLS](#see-inside-grpc-over-tls)
+52. [Change gRPC metadata and trailers](#change-grpc-metadata-and-trailers)
+53. [Change gRPC calls with a script](#change-grpc-calls-with-a-script)
+54. [Send gRPC calls to another server](#send-grpc-calls-to-another-server)
+55. [Resend a gRPC call, or edit it and resend](#resend-a-grpc-call-or-edit-it-and-resend)
+56. [See gRPC-Web calls from Flutter Web](#see-grpc-web-calls-from-flutter-web)
+57. [Copy a gRPC call as grpcurl](#copy-a-grpc-call-as-grpcurl)
+58. [See TLS gRPC on the iOS simulator](#see-tls-grpc-on-the-ios-simulator)
 
 **Devices**
 
-58. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
-59. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
-60. [Run on a physical iPhone](#run-on-a-physical-iphone)
-61. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
+59. [Run on an Android emulator or phone](#run-on-an-android-emulator-or-phone)
+60. [Run on the iOS simulator or macOS](#run-on-the-ios-simulator-or-macos)
+61. [Run on a physical iPhone](#run-on-a-physical-iphone)
+62. [Call a server on your Mac from the app](#call-a-server-on-your-mac-from-the-app)
 
 **AI agents**
 
-62. [Connect an AI agent](#connect-an-ai-agent)
-63. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
-64. [Control what agents can see and do](#control-what-agents-can-see-and-do)
-65. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
-66. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
-67. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
-68. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
-69. [Let agents work with gRPC calls](#let-agents-work-with-grpc-calls)
+63. [Connect an AI agent](#connect-an-ai-agent)
+64. [Teach your agent the workflow and give it tasks](#teach-your-agent-the-workflow-and-give-it-tasks)
+65. [Control what agents can see and do](#control-what-agents-can-see-and-do)
+66. [Let agents check models and verify changes](#let-agents-check-models-and-verify-changes)
+67. [Let agents read sockets, GraphQL and CORS](#let-agents-read-sockets-graphql-and-cors)
+68. [Let agents record, replay and run scenarios](#let-agents-record-replay-and-run-scenarios)
+69. [Let agents export, time and take screenshots](#let-agents-export-time-and-take-screenshots)
+70. [Let agents work with gRPC calls](#let-agents-work-with-grpc-calls)
+71. [Let agents mock from a collection](#let-agents-mock-from-a-collection)
 
 ### Run your app with interception
 
@@ -554,6 +573,28 @@ You'll narrow a busy list down to the requests you care about.
 
 **Tip:** hover the filter box for the syntax; an invalid filter is marked and explained there. **Clear filters**
 (next to the toggles) resets everything.
+
+### Mock your app from a Postman collection or OpenAPI file
+
+You'll run your app with no test server: its requests are answered from your team's Postman collection.
+
+1. Open the **Collections** tab and click **Mock from a collection…** (or run **Flutter Intercept: Mock from a
+   Collection…**). Pick the collection file. A file outside the project is copied in; choose **Copy without
+   credentials** unless you need its auth settings.
+2. If the collection uses `{{baseUrl}}`, click **Set baseUrl…** and pick your API's address from the list (it offers
+   the hosts your app already called).
+3. Run your app with interception. Requests to that API are now answered from the saved examples.
+4. Open the collection's row: pick another example for a request (for example **Wrong password** for the login) and
+   hot restart to see your error screen.
+
+**You should see:** the requests marked **mocked**, each request detail naming the collection, and "N mocked" in the
+collection's row. A request with no saved example answers 501 and offers **Mock it with a rule**.
+
+**Tip:** picking an example, turning a request off or switching **Not in the collection** to **Fail** is for you only
+("N changes for you"); **Save for the team** writes it to `.vscode/flutter-intercept.json`, **Reset** puts the team's
+settings back. If a line says some answers are limited, click **Review & approve**: until then, answers that would
+redirect, set cookies or serve HTML are sent without those parts. OpenAPI documents work the same way; operations
+without an example answer a body generated from the schema (marked **generated**).
 
 ### Pause and edit a request or response
 
@@ -1882,6 +1923,27 @@ gRPC-Web calls (`grpc.web`) take `add_grpc_mock`, `add_block` and the HTTP-level
 message-level breakpoints, mutations and edits don't apply to them yet. The grpcurl snippet is built from the
 redacted view and never has `-insecure`. `get_status` shows `grpc.simulatorTrust` (the simulators that trust the CA,
 and whether every TLS gRPC call is decrypted); no agent tool can add or remove that trust or change the setting.
+
+### Let agents mock from a collection
+
+You'll have an agent run your app against a collection when the backend is down, and test error screens with it.
+
+1. [Connect your agent](#connect-an-ai-agent), then run **Flutter Intercept: Add AI Agent Instructions** again to
+   pick up the collection tools.
+2. Ask, for example:
+   - "The backend is down: mock the app from `api/shop.postman_collection.json` and launch it." (`import_collection`,
+     `set_collection` with `variable` for `baseUrl`, `launch_app`)
+   - "Show the wrong-password error on the login screen." (`set_collection` with `request` and `example`, then
+     `hot_restart`)
+   - "Which requests did the app send that the collection doesn't have?" (`list_collections`, `seen`)
+   - "Undo what you changed in the collection." (`set_collection` with `reset`)
+3. Approve the changes when the client asks.
+
+**You should see:** each request the agent waits for names the collection and example that answered it, and no
+change in `.vscode/flutter-intercept.json` apart from the link and `baseUrl`.
+
+**Tip:** an agent's changes are for you only, like yours in the panel. Agents can't approve a collection: if a line
+says some answers are limited, approve it yourself in the Collections tab.
 
 ## Settings and commands
 

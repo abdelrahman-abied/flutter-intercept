@@ -40,6 +40,7 @@ Intercept skips all of that:
 | **Request and response details** | Headers and bodies, with gzip/deflate/br decoded, a collapsible JSON tree and image previews. |
 | **Breakpoints** | Pause a request before it's sent or a response before your app gets it. Edit it, then resume or abort. |
 | **Mock** | Answer a request with your own status, headers, body and delay, without calling the server. |
+| **Mock from a collection** | No test server? Point it at your Postman collection or OpenAPI 3 file (JSON or YAML) and requests are answered from the saved examples. Pick which example answers; your changes stay yours until you save them for the team. |
 | **Block** | Fail a request with a connection reset or an error status. |
 | **One-click rules** | **Mock this**, **Block this** and **Break on this** on any recorded request. |
 | **Where did it come from?** | Each request shows the line of your code that made it. **Open source** jumps there. |

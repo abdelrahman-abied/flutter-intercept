@@ -335,3 +335,107 @@ sessions (HTTP, upstream proxy, LAN, gRPC). Verified: unit tests (proxy 592, web
 sidecar 52, plugin 106), VS Code default 42/42, agent 12/12 on macOS incl. the three-step mTLS check (passed through →
 decrypted with the added certificate → setting off: every call fails with the reason; the test server logged a fresh,
 unauthenticated session after removal), `verifyPlugin` Compatible.
+
+## v0.15.0 — Mock from a collection (planned 2026-11-19; WP0 done 2026-11-19)
+Contract: CONTRACTS §21. Owner request: a developer with no test server imports a Postman collection (or an OpenAPI
+3 document) and every request in it is answered from its saved examples. No proxy change: the host turns a
+collection into `mock` rules.
+
+WP0 (lead, before the owners start): the types in code (`src/mocks/types.ts`, both `protocol.ts`), the `collections`
+key in `rules/file.ts`' reader / writer, two fixture collections (Postman v2.1 with folders, variables, several
+examples; OpenAPI 3.1 with `$ref`s and no examples), the YAML bundle check (§21.3), the host-case check (§21.5).
+
+| Agent | Owns |
+|---|---|
+| M1 Postman | `src/mocks/postman.ts`, `environment.ts`, `sanitise.ts` + tests — pure (§21.1, §21.2, §21.6 sanitise) |
+| M2 OpenAPI | `src/mocks/openapi.ts`, `generate.ts` (+ YAML loading if WP0 allows it) + tests — pure (§21.3, §21.4) |
+| M3 rules | `src/mocks/toRules.ts` + tests, incl. a fuzz test of the regex builder — pure (§21.5) |
+| H host + agents | `src/mocks/core.ts`, `service.ts`, controller messages, command + `package.json` contributions, `agent/tools/collections.ts`, schema, instructions — `packages/extension/**` except `src/mocks/{postman,environment,sanitise,openapi,generate,toRules,types}.ts` and `src/ui/protocol.ts` |
+| W webview | Collections section, endpoint list, example picker, 501 banner, empty state — `packages/webview/**` except `src/protocol.ts` |
+| I plugin + CLI | sidecar wiring, IntelliJ file chooser / confirmations, CLI flags — `packages/sidecar/**`, `packages/intellij/**`, `packages/cli/**` |
+| lead | contract, WP0, wiring, demo screen + e2e (the demo app against a collection with **no** server running), README tutorial, REVIEW-15, PERF-3 |
+
+Order: WP0 → M1, M2, M3, W in parallel (M3 and W work from the fixtures and types) → H → I → lead's e2e, review,
+performance. M1–M3 and W touch no file outside their own list.
+
+Acceptance:
+- The demo app, with its API host unreachable, shows real screens from the fixture collection on the Android
+  emulator, the iOS simulator and macOS; switching `POST /login` to the "Wrong password" example changes what the
+  app shows after a hot restart, from the panel and from an agent.
+- A request with no example gets the 501 and the banner; an endpoint that isn't in the collection reaches the real
+  server, and fails once the collection is switched to `fail`.
+- Editing the collection file updates the answers without a restart; a teammate's personal "off" leaves the shared
+  file untouched.
+- An OpenAPI document with no examples gives bodies the app's generated models parse (checked with §10's contract
+  check on the demo models).
+- The environment file's values appear nowhere in the panel's messages, agent results, logs or exports (test).
+
+### v0.15.0 WP0 status (2026-11-19)
+Done (CONTRACTS §21.13): types, link parsing / writing, protocol types with placeholders, fixtures with the expected
+parser output. The contract's regex was corrected (the first draft would have been refused by the proxy's
+`isSafeRegexSource`). Owner decision: YAML supported (`js-yaml` 4.3.2, lazy, `src/mocks/yaml.ts`), bundle budget
+raised on purpose to 2.65 MB until PERF-3 measures it. Verified: unit tests (extension 2179, webview 574),
+typecheck of extension, webview, sidecar and CLI. M1, M2, M3 and W can start.
+
+### v0.15.0 M3 status (2026-11-19, lead)
+`src/mocks/toRules.ts` + `test/unit/mocks.toRules.test.ts` (34 tests: both fixtures through the real proxy matcher,
+`validateRule` on every rule, query examples, selection fallback, off / fail, hostile segments, glob fallback, a
+deterministic fuzz of 600 endpoints and a timing check). A one-off fuzz of 90 000 random endpoints: 0 unsafe or
+invalid regexes, 0 missed matches, worst 0.53 ms per lookup. Found by the fuzz and fixed in the contract (§21.5):
+clients percent-encode different characters, so special characters in literals match either form.
+
+### v0.15.0 H status (2026-11-19, lead)
+Host, controller, command, agent tools and parser wiring done (CONTRACTS §21.14). Tests: `mocks.core.test.ts` (27),
+`controller.v0150.test.ts` (15, incl. the three §21.8 decisions), `agent/api.v0150.test.ts` (11); MCP / instructions
+expectations updated. Verified: extension typecheck and 2266 unit tests (M1/M2 test files excluded while they're in
+progress), sidecar 52, CLI typecheck, bundle smoke (47 MCP tools). Budget raised to 2.70 MB (measured 2.66 MB).
+Not done here: unit tests of the VS Code layer `src/mocks/service.ts` (dialogs, watchers) — covered by the e2e step;
+the sidecar / plugin / CLI wiring is owner I's.
+
+### v0.15.0 status after M1, M2, W, H (2026-11-19)
+- M1 (Postman) and M2 (OpenAPI) done after one review round each: M1's sanitised copy kept request-body passwords
+  (contract gap, §21.6 now covers request bodies); M2 crashed on a 50 000-deep `allOf` / `oneOf` / `anyOf` chain
+  (every step down now counts toward the depth limit). Both re-checked with the lead's hostile inputs.
+- W (panel) done with the three §21.8 decisions. H (host + agents) done: core, VS Code service, proxy order,
+  controller and handlers, command, five agent tools (§21.14). Bundle 2 661 835 bytes; budget raised to 2.70 MB until
+  PERF-3 (js-yaml's unused writer, ~10 KB, can be aliased out).
+- Verified: extension 2322 tests, webview 599, protocol drift, bundle smoke (47 agent tools).
+- Next: I (sidecar + plugin + CLI), then the lead's e2e on devices, REVIEW-15, PERF-3, README tutorial.
+
+### v0.15.0 PERF-3 (2026-11-19, lead)
+docs/PERF-3.md: +0.034 ms per request at 500 endpoints (budget 0.05: met), linear (+0.125 ms at 2 000); parsing the
+largest allowed collection ≈ 27 ms + 8 ms rules + 5 ms compile; js-yaml's writer removed from the bundle (shim checked
+by the bundle smoke test); bundle 2 652 908 bytes, budget lowered to 2 675 000; activation +2.9 ms.
+
+### v0.15.0 I status and REVIEW-15 (2026-11-19)
+- I (sidecar + plugin + CLI) done: sidecar 60 tests, CLI 122, plugin 111 (fresh run on Android Studio's JBR 25:
+  `JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" ./gradlew test --rerun --offline`).
+  `verifyPlugin` not run yet (release step).
+- REVIEW-15 (docs/REVIEW-15.md): 2 MED, 4 LOW-MED, 1 LOW, INFO. #3 fixed by the lead (no glob fallback, whole-literal
+  encodings, plain hosts / methods only). #1 / #4 redesigned for UX in §21.16 (limited answers until one approval
+  per collection). M1 / M2 fix rounds briefed (`.vscode/agent-tasks/m1-fix-review15.md`, `m2-fix-review15.md`).
+
+### v0.15.0 status after REVIEW-15 fixes (2026-11-19)
+Every REVIEW-15 finding fixed (docs/REVIEW-15.md "Fixes"). §21.15 (agent-friendly) and §21.16 (limited answers until one
+approval, UX-first) built; W2 (panel) done by the lead. Verified: extension 2361,
+webview 614, sidecar 60, CLI 122, plugin 111 (JBR 25), bundle 2 678 420 / 2 700 000, smoke incl. YAML. Left before
+release: run the integration suites (default, agent incl. the new collection step, devices), the real Claude Code run,
+README tutorial + changelog, version bump, `verifyPlugin`.
+
+### v0.15.0 release verification (2026-11-20)
+README tutorials, changelogs and the 0.15.0 bump done. On the packaged VSIX: default 42/42; agent 12/12 incl. the
+collection step (import, example by request id, reset, `seen`, no diff in the team file); devices 30/30 — Android
+emulator (emulator-5554), iOS 27.0 simulator (iPhone 18 Pro) and macOS; real Claude Code 2/2 (mock task $0.27, the new
+collection task $0.32: 200 from the collection, 404 after switching the example, nothing written to the team file);
+`verifyPlugin` Compatible with AI-262. Found and fixed during the runs:
+- `stop_app: Canceled` (the flake noted since 0.10) failed both Claude runs: VS Code rejects `stopDebugging` when the
+  session ends while being stopped. `launch.ts` now treats the rejection as an error only if the session didn't end
+  (two unit tests); extension 2363 tests. Claude and agent suites rerun on the fixed VSIX.
+- The demo app needed AGP 9.1.1 (the installed Flutter refuses 9.1.0), so every Android case timed out;
+  `samples/demo_app/android/settings.gradle.kts` bumped.
+- The iOS simulator's CoreSimulator service hung (`simctl terminate` never returned, ~8 h); restarting the service fixed
+  it. Harness gap, not a product bug: the devices suite waits 10 minutes per case when the app can't build or the
+  simulator hangs — worth a fail-fast check.
+- `verifyPlugin` needs network once to fetch the Plugin Verifier (`--offline` fails).
+Not verified: physical iPhone / Android device, Cursor and other editors for 0.15.
+

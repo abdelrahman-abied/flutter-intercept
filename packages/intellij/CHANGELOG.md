@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.15.0 (preview)
+
+- **Mock from a collection**, the same as in the VS Code extension 0.15.0: a Postman collection (v2.0 / v2.1, with an
+  environment file) or an OpenAPI 3 document (JSON or YAML) answers your app's requests from its saved examples — no
+  test server needed. **Mock from a Collection…** in the Tools menu and the Collections tab.
+- Pick which example answers (for you only until **Save for the team**), see the requests the collection lacks, and
+  approve once before answers that redirect, set cookies or serve HTML are sent in full.
+
 ## 0.14.1 (preview)
 
 - The **Add client certificate** popup explains what the server sees (the same certificate, from a connection that

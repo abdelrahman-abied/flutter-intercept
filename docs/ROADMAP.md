@@ -217,6 +217,27 @@ Owner request: an mTLS app (Dio with a client certificate) fails through the pro
   a connection that looks like the app's once a certificate is added; needs a bundling / platform check (owner).
 - QUALITY-1 leftovers (unused imports / parameters, `errorMessage()` helper, `noUnusedLocals` in base configs).
 
+### 0.15.0 — Mock from a collection (planned 2026-11-19, CONTRACTS §21)
+
+Owner request: many developers have no test server. Point the extension at the team's Postman collection (or an
+OpenAPI 3 document) and the app gets answers from the saved examples, with zero app code. Postman's own mock servers
+need an account and a different base URL in the app; here the app keeps calling the real host. (Competitors not
+re-checked for this feature: do that before the README claims anything.)
+
+| Item | Notes |
+|---|---|
+| **Postman v2.0 / v2.1** | Folders, `:param` and `{{variable}}` URLs, several examples per request, per-query examples (`?page=2`). |
+| **Postman environment** | Fills `{{baseUrl}}` and other URL variables; its values never leave the extension host. |
+| **OpenAPI 3.0 / 3.1** | Written examples first; otherwise a body generated from the schema, the same every time. |
+| **No example → 501** | A clear error in the app and a banner in the panel, with "Mock it with a rule". |
+| **Shared link** | The link lives in `.vscode/flutter-intercept.json`; the collection file is watched; on / off is personal. |
+| **Not in the collection** | Real server by default; one switch per collection makes those requests fail. |
+| **Scenarios** | Pick which example answers per request (panel, agents), e.g. login → "Wrong password". |
+| **Agents, CLI, plugin** | `import_collection`, `set_collection`, `--collection`, the same panel in Android Studio. |
+
+Not in 0.15.0: Swagger 2.0, `{{variables}}` and dynamic variables inside example bodies, choosing an example by the
+request body, `x-mock-response-name` headers, remote `$ref`s, Insomnia / Bruno / HAR as a source.
+
 ## 5. Spikes and decisions before building
 - Dio's async stack depth for request → source (0.3).
 - `http_profile` over the VM service vs OS proxy for native clients (0.5).
