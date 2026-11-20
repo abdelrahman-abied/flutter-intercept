@@ -192,5 +192,35 @@ export function reducer(state: State, action: Action): State {
         grpcDecoded: { ...state.grpcDecoded, [action.id]: { ...prev, key: action.key, base: action.base, requestedAt: action.at } },
       };
     }
+
+    case 'patchCollectionEndpoint': {
+      const list = state.collectionEndpoints.get(action.id);
+      if (!list) return state;
+      const targetKey = action.patch.example?.endpoint ?? action.patch.off?.endpoint;
+      if (!targetKey) return state;
+      let changed = false;
+      const updated = list.map((ep) => {
+        if (ep.key !== targetKey) return ep;
+        changed = true;
+        const next = { ...ep };
+        if (action.patch.example) next.selected = action.patch.example.name;
+        if (action.patch.off) {
+          if (action.patch.off.off) next.off = true;
+          else delete next.off;
+        }
+        return next;
+      });
+      if (!changed) return state;
+      const nextMap = new Map(state.collectionEndpoints);
+      nextMap.set(action.id, updated);
+      return { ...state, collectionEndpoints: nextMap };
+    }
+
+    case 'collectionRequested': {
+      if (state.collectionRequested.has(action.id)) return state;
+      const next = new Set(state.collectionRequested);
+      next.add(action.id);
+      return { ...state, collectionRequested: next };
+    }
   }
 }

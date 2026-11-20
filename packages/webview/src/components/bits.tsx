@@ -108,6 +108,7 @@ export function Button(props: {
   title?: string;
   disabled?: boolean;
   pressed?: boolean;
+  expanded?: boolean;
   class?: string;
   type?: 'button' | 'submit';
 }) {
@@ -119,6 +120,7 @@ export function Button(props: {
       title={props.title}
       aria-label={kind === 'icon' ? props.title : undefined}
       aria-pressed={props.pressed}
+      aria-expanded={props.expanded}
       disabled={props.disabled}
       onClick={props.onClick}
     >

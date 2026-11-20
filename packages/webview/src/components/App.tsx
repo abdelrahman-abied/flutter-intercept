@@ -15,6 +15,7 @@ import { DetailPane } from './DetailPane';
 import { Composer } from './Editors';
 import { Icon } from './Icon';
 import { AuthFlowsView } from './AuthFlowsView';
+import { CollectionsView } from './CollectionsView';
 import { RecordingsView } from './RecordingsView';
 import { RulesView } from './RulesView';
 import { inIde, Toolbar } from './Toolbar';
@@ -86,6 +87,7 @@ export function App({ host }: { host: Host }) {
         <main class="content">
           {state.view === 'traffic' ? <TrafficView />
             : state.view === 'rules' ? <RulesView />
+            : state.view === 'collections' ? <CollectionsView />
             : state.view === 'recordings' ? <RecordingsView />
             : <AuthFlowsView />}
         </main>

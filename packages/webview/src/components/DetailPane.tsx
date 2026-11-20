@@ -2,6 +2,7 @@ import type { Ref } from 'preact';
 import { useMemo, useState } from 'preact/hooks';
 import { useApp } from '../context';
 import type { Exchange } from '../protocol';
+import { clipName, collectionIdFromRuleId, isNoExampleExchange, limitedRemoved, noExampleCollectionName } from '../collections';
 import { clientGaveUp, describeAction, findExchange, initiatorLabel, isAgentRule, ruleDisplayName } from '../state';
 import { formatBytes, formatDuration, formatTime, fullFrameLocation, isFrameworkFrame, isPaused, shortFrameLocation } from '../util';
 import { normalizePath } from '../jsonpath';
@@ -30,7 +31,7 @@ const PAUSE_TEXT = {
 } as const;
 
 export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLElement> }) {
-  const { state, dispatch } = useApp();
+  const { state, dispatch, post } = useApp();
   const framed = hasMessagesTab(ex);
   const tunnel = isTunnel(ex);
   const grpc = isGrpc(ex);
@@ -43,6 +44,8 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
   const gaveUp = clientGaveUp(state, ex);
   const rule = ex.matchedRuleId ? state.rules.find((r) => r.id === ex.matchedRuleId) : undefined;
   const ruleIndex = rule ? state.rules.indexOf(rule) : -1;
+  const colId = !rule ? collectionIdFromRuleId(ex.matchedRuleId) : undefined;
+  const matchedCol = colId ? state.status.collections?.find((c) => c.id === colId) : undefined;
   const actions = useExchangeActions(ex);
   const create = actions.createRule;
   const sentBy = initiatorLabel(ex);
@@ -124,7 +127,15 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
                 {` (${describeAction(rule.action)})`}
               </>
             )}
-            {!rule && ex.matchedRuleId && ' · matched a rule that no longer exists'}
+            {!rule && matchedCol && (
+              <>
+                {' · '}
+                <button type="button" class="link" onClick={() => dispatch({ type: 'setView', view: 'collections' })}>
+                  collection “{clipName(matchedCol.name)}”
+                </button>
+              </>
+            )}
+            {!rule && !matchedCol && ex.matchedRuleId && ' · matched a rule that no longer exists'}
             {sentBy && (
               <>
                 {' · '}
@@ -189,6 +200,31 @@ export function DetailPane({ ex, paneRef }: { ex: Exchange; paneRef?: Ref<HTMLEl
           ex.error && <div class="msg error">{ex.error}</div>
         )}
         {(ex.learnedPassthrough || ex.needsClientCertificate) && <LearnedBanner ex={ex} />}
+        {isNoExampleExchange(ex) && (
+          <NoExampleBanner
+            collectionName={noExampleCollectionName(ex, state.status.collections)}
+            disabled={!!actions.off.mock}
+            onMock={() => create('mock')}
+          />
+        )}
+        {(() => {
+          // CONTRACTS §21.16 / §21.17: one line when a collection answered in its limited form.
+          const removed = limitedRemoved(ex);
+          if (!removed) return null;
+          const colId = collectionIdFromRuleId(ex.matchedRuleId);
+          const col = colId ? state.status.collections?.find((c) => c.id === colId) : undefined;
+          return (
+            <div class="msg info collection-limited-note">
+              Limited answer from {noExampleCollectionName(ex, state.status.collections)}
+              {removed.length ? <>: {removed.join(', ')} left out</> : null} until the collection is approved.{' '}
+              {col?.limited && (
+                <button type="button" class="link" onClick={() => post({ type: 'approveCollection', id: col.id })}>
+                  Review &amp; approve
+                </button>
+              )}
+            </div>
+          );
+        })()}
         {ex.notes && ex.notes.length > 0 && (
           // CONTRACTS §19.4: informational notes (never errors) — e.g. "mutate: no schema for /pkg.Svc/Method".
           <ul class="msg info exchange-notes" aria-label="Notes">
@@ -598,6 +634,23 @@ export function ExpireTokenForm({ url: initialUrl, onSubmit, onCancel }: {
         <Button onClick={onCancel}>Cancel</Button>
       </div>
     </form>
+  );
+}
+
+/** CONTRACTS §21.5 / §21.9: an exchange answered 501 because the collection had no saved example. */
+function NoExampleBanner({ collectionName, disabled, onMock }: {
+  collectionName: string; disabled: boolean; onMock: () => void;
+}) {
+  return (
+    <div class="msg warn no-example-banner" role="note" aria-label="No example saved">
+      <span class="no-example-text">
+        No example is saved for this request in {collectionName}
+      </span>
+      <Button kind="primary" disabled={disabled} onClick={onMock}
+        title="Create a personal mock rule for this request (runs before collections)">
+        Mock it with a rule
+      </Button>
+    </div>
   );
 }
 

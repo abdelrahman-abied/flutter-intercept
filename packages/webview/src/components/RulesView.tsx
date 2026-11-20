@@ -176,6 +176,11 @@ export function RulesView() {
             })}
           </ol>
         )}
+        {(state.status.collections?.length ?? 0) > 0 && (
+          <p class="hint rules-collections-hint">
+            Enabled <button type="button" class="link" onClick={() => dispatch({ type: 'setView', view: 'collections' })}>Collections</button> run after your rules above.
+          </p>
+        )}
       </div>
       {state.editingRuleId && (state.editingRuleId === NEW_RULE || rules.some((r) => r.id === state.editingRuleId)) && (
         <RuleEditor

@@ -1,13 +1,14 @@
 /** Core state types, the initial state, persistence and the Action union. Split out of ../state.ts (QUALITY-1 Q6). */
+import type { CollectionExampleView } from '../collections';
 import type { GrpcDecodeEntry } from '../grpc';
-import type { AuthFlowSummary, ClientCertFileRole, ContractSummary, Exchange, HostMsg, RecordingSummary, Rule, RuleAction, Status } from '../protocol';
+import type { AuthFlowSummary, ClientCertFileRole, CollectionEndpointView, CollectionPatch, ContractSummary, Exchange, HostMsg, RecordingSummary, Rule, RuleAction, Status } from '../protocol';
 import type { StatusClass } from '../util';
 
 export const MAX_HOST_ERRORS = 5;
 
-/** CONTRACTS §12.7 adds Recordings and Auth flows. */
-export type View = 'traffic' | 'rules' | 'recordings' | 'auth';
-export const VIEWS: readonly View[] = ['traffic', 'rules', 'recordings', 'auth'];
+/** CONTRACTS §12.7 adds Recordings and Auth flows; §21.9 adds Collections. */
+export type View = 'traffic' | 'rules' | 'collections' | 'recordings' | 'auth';
+export const VIEWS: readonly View[] = ['traffic', 'rules', 'collections', 'recordings', 'auth'];
 /**
  * `messages` = WebSocket messages / SSE events (CONTRACTS §11.5), only for exchanges with a `kind`;
  * `timing` = the phase breakdown (CONTRACTS §13.2).
@@ -116,6 +117,13 @@ export interface State {
   ruleTemplate?: Rule;
   /** CONTRACTS §20.3: the "Add client certificate" popup, while open. */
   certDialog?: CertDialog;
+  /** CONTRACTS §21.8: cached endpoint lists by collection id, and cached example views. */
+  collectionEndpoints: ReadonlyMap<string, CollectionEndpointView[]>;
+  collectionExamples: ReadonlyMap<string, CollectionExampleView>;
+  /** Collection ids for which `getCollectionEndpoints` was sent since the last `snapshot` (`ready`). */
+  collectionRequested: ReadonlySet<string>;
+  /** Bumped on every `snapshot` (initial `ready` and reconnects) so open collections re-subscribe. */
+  snapshotSeq: number;
 }
 
 export const NEW_RULE = '__new__';
@@ -144,6 +152,10 @@ export function initialState(): State {
     showWaterfall: true,
     revealSeq: 0,
     grpcDecoded: {},
+    collectionEndpoints: new Map(),
+    collectionExamples: new Map(),
+    collectionRequested: new Set(),
+    snapshotSeq: 0,
   };
 }
 
@@ -199,4 +211,8 @@ export type Action =
   /** `chooseClientCertificateFile` posted for this role. */
   | { type: 'certPicking'; role: ClientCertFileRole }
   /** `addClientCertificate` posted for this host. */
-  | { type: 'certSaving'; host: string };
+  | { type: 'certSaving'; host: string }
+  /** CONTRACTS §21.9: optimistic endpoint patch (selected example / off) until host replies. */
+  | { type: 'patchCollectionEndpoint'; id: string; patch: Pick<CollectionPatch, 'example' | 'off'> }
+  /** CONTRACTS §21.8: `getCollectionEndpoints` posted for this collection since the last `snapshot`. */
+  | { type: 'collectionRequested'; id: string };

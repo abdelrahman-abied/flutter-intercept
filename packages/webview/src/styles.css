@@ -1457,3 +1457,130 @@ body.fi-ide { --fi-bg: var(--vscode-editor-background); }
   .modal-backdrop { padding: 8px 4px; }
   .modal-body, .modal-actions { padding-left: 8px; padding-right: 8px; }
 }
+
+/* ------------------------------------------------------------------ v0.15.0 collections (CONTRACTS §21.9) */
+
+.collections-view { flex: 1; min-height: 0; overflow: auto; }
+.collection-empty p { margin: 4px 0; }
+.collection-empty .btn { margin-top: 8px; }
+.rules-collections-hint { padding: 6px 8px; margin: 0; }
+
+.collection-items { list-style: none; margin: 0; padding: 0; }
+.collection-item { padding: 6px 8px; border-bottom: 1px solid var(--fi-border); }
+.collection-item:hover { background: var(--vscode-list-hoverBackground); }
+.collection-item.open { background: var(--fi-bg); }
+.collection-item.has-problem { border-left: 3px solid var(--vscode-editorWarning-foreground, var(--fi-warn)); }
+.collection-item.disabled .collection-main { opacity: 0.6; }
+
+.collection-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.collection-enabled { font-size: 12px; white-space: nowrap; }
+.collection-main { flex: 1 1 220px; min-width: 0; }
+.collection-name { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
+.collection-title-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.collection-title-btn:hover { text-decoration: underline; }
+.collection-format { background: transparent; color: var(--vscode-charts-blue); border: 1px solid var(--vscode-charts-blue); }
+.collection-sub { color: var(--fi-muted); font-size: 12px; overflow-wrap: anywhere; }
+.collection-file { font-size: 11px; }
+.collection-unmatched { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+.collection-unmatched-label { font-size: 12px; }
+.collection-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+
+.collection-vars { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0 2px 28px; }
+.collection-var-form {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border: 1px solid var(--fi-border);
+  border-radius: 3px;
+  background: var(--vscode-editorWidget-background, transparent);
+}
+.collection-var-label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.collection-var-label input { width: 220px; max-width: 100%; }
+.collection-problems { margin: 6px 0 2px 28px; padding-left: 22px; overflow-wrap: anywhere; }
+/* CONTRACTS §21.15 / §21.16 (W2): calm one-line notes under a collection; no colour beyond the panel's muted text. */
+.collection-note { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin: 4px 0 2px 28px; font-size: 12px; color: var(--fi-muted); overflow-wrap: anywhere; }
+.collection-note > span { color: var(--vscode-foreground); }
+.collection-note .btn { font-size: 12px; }
+.collection-seen-list { list-style: none; flex-basis: 100%; margin: 2px 0 0; padding: 0; }
+.collection-seen-list li { padding: 2px 0; overflow-wrap: anywhere; }
+.ep-overridden { display: inline-flex; align-items: center; gap: 4px; flex: none; }
+.ep-for-you { background: transparent; color: var(--vscode-charts-blue); border: 1px solid var(--vscode-charts-blue); }
+.collection-limited-note { overflow-wrap: anywhere; }
+body.vscode-high-contrast .ep-for-you { border-color: var(--fi-hc-border); color: var(--vscode-foreground); }
+
+.collection-body { margin: 8px 0 2px 28px; border-top: 1px solid var(--fi-border); padding-top: 6px; }
+.collection-ep-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.collection-ep-filter { width: 280px; max-width: 100%; flex: 0 1 280px; }
+.collection-ep-count { font-size: 12px; }
+
+.ep-folder { margin-bottom: 6px; }
+.ep-folder-head {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fi-muted);
+  padding: 3px 0;
+  border-bottom: 1px solid var(--fi-border);
+}
+.ep-items { list-style: none; margin: 0; padding: 0; }
+.ep-item { padding: 4px 4px; border-bottom: 1px solid var(--fi-border); }
+.ep-item:last-child { border-bottom: none; }
+.ep-item:hover { background: var(--vscode-list-hoverBackground); }
+.ep-item.ep-off .ep-method,
+.ep-item.ep-off .ep-url,
+.ep-item.ep-off .ep-name { opacity: 0.55; }
+
+.ep-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ep-method { font-weight: 700; min-width: 48px; font-size: 12px; }
+.ep-url { overflow-wrap: anywhere; min-width: 0; }
+.ep-name { color: var(--fi-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; max-width: 260px; white-space: nowrap; }
+.ep-picker { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ep-status { background: transparent; border: 1px solid currentColor; font-variant-numeric: tabular-nums; font-weight: 600; }
+.ep-generated { background: transparent; color: var(--vscode-charts-purple); border: 1px solid var(--vscode-charts-purple); }
+.ep-example-select { max-width: 220px; }
+.ep-example-name { font-size: 12px; color: var(--vscode-foreground); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collection-ep-more { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
+
+.collection-example {
+  margin: 6px 0 4px 20px;
+  padding: 6px 8px;
+  border: 1px solid var(--fi-border);
+  border-radius: 3px;
+  background: var(--vscode-editorWidget-background, transparent);
+}
+.collection-example-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+.collection-example-title { font-weight: 600; overflow-wrap: anywhere; }
+.collection-example-body { max-height: 280px; overflow: auto; background: var(--vscode-textCodeBlock-background, transparent); }
+
+.no-example-banner {
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.no-example-text { flex: 1 1 220px; overflow-wrap: anywhere; }
+
+body.vscode-high-contrast .collection-item.open,
+body.vscode-high-contrast .collection-example,
+body.vscode-high-contrast .collection-var-form { outline: 1px solid var(--fi-hc-border); }
+body.vscode-high-contrast .collection-title-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+
+@media (max-width: 720px) {
+  .collection-vars, .collection-problems, .collection-body, .collection-note { margin-left: 8px; }
+}

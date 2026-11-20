@@ -1,8 +1,9 @@
 /** Applying host messages (CONTRACTS §4) to the state. Split out of ../state.ts (QUALITY-1 Q6). */
+import { COLLECTION_LIMITS, collectionExampleCacheKey, type CollectionExampleView } from '../collections';
 import { EXPORT_LABEL } from '../exporting';
 import { hasMessagesTab } from '../frames';
 import { type GrpcDecodeEntry, grpcPauseKey } from '../grpc';
-import type { Exchange, HostMsg, Status } from '../protocol';
+import type { CollectionEndpointView, Exchange, HostMsg, Status } from '../protocol';
 import { sortRecordings } from '../scenarios';
 import { isPaused } from '../util';
 import { type Draft, EMPTY_FILTERS, MAX_HOST_ERRORS, NEW_RULE, type State } from './core';
@@ -51,6 +52,9 @@ export function applyHostMsg(state: State, msg: HostMsg): State {
         gaveUp: pick(state.gaveUp, byId),
         contracts: pick(state.contracts, byId),
         grpcDecoded: pick(state.grpcDecoded, byId),
+        ...pruneCollections(state.collectionEndpoints, state.collectionExamples, state.collectionRequested, msg.status.collections),
+        collectionRequested: new Set(),
+        snapshotSeq: state.snapshotSeq + 1,
       };
       if (state.editingRuleId && state.editingRuleId !== NEW_RULE && !msg.rules.some((r) => r.id === state.editingRuleId)) {
         next.editingRuleId = undefined;
@@ -153,7 +157,12 @@ export function applyHostMsg(state: State, msg: HostMsg): State {
     }
 
     case 'status':
-      return { ...state, status: msg.status, dismissedWarnings: pruneDismissed(state.dismissedWarnings, msg.status) };
+      return {
+        ...state,
+        status: msg.status,
+        dismissedWarnings: pruneDismissed(state.dismissedWarnings, msg.status),
+        ...pruneCollections(state.collectionEndpoints, state.collectionExamples, state.collectionRequested, msg.status.collections),
+      };
 
     case 'contract': {
       if (!msg.results.length) return state;
@@ -190,6 +199,7 @@ export function applyHostMsg(state: State, msg: HostMsg): State {
         ...state,
         hostErrors: [...state.hostErrors, { id: nextErrorId(), message: msg.message }].slice(-MAX_HOST_ERRORS),
         resolving: {},
+        awaitingRule: undefined,
         composer: state.composer?.sending ? { ...state.composer, sending: false } : state.composer,
         // e.g. "Adding client certificates isn't available here.": the popup stops waiting (and shows it inline).
         certDialog: state.certDialog && (state.certDialog.saving || state.certDialog.picking)
@@ -247,7 +257,78 @@ export function applyHostMsg(state: State, msg: HostMsg): State {
         : { key: '', base: 0, requestedAt: 0, decoded: msg.decoded, answeredKey: '', answeredBase: 0 };
       return { ...state, grpcDecoded: { ...state.grpcDecoded, [msg.id]: entry } };
     }
+
+    // CONTRACTS §21.8: collection endpoints and read-only example responses.
+    case 'collectionEndpoints': {
+      const cols = state.status.collections;
+      if (cols !== undefined && !cols.some((c) => c.id === msg.id)) return state;
+      const list = Array.isArray(msg.endpoints) ? msg.endpoints.slice(0, COLLECTION_LIMITS.endpoints) : [];
+      const next = new Map(state.collectionEndpoints);
+      next.set(msg.id, list);
+      return { ...state, collectionEndpoints: next };
+    }
+
+    case 'collectionExample': {
+      const cols = state.status.collections;
+      if (cols !== undefined && !cols.some((c) => c.id === msg.id)) return state;
+      const next = new Map(state.collectionExamples);
+      next.set(collectionExampleCacheKey(msg.id, msg.endpoint, msg.name), {
+        id: msg.id,
+        endpoint: msg.endpoint,
+        name: msg.name,
+        status: msg.status,
+        headers: msg.headers ?? {},
+        body: typeof msg.body === 'string' ? msg.body : '',
+        ...(msg.truncated ? { truncated: true as const } : {}),
+      });
+      return { ...state, collectionExamples: next };
+    }
   }
+}
+
+/** Drop cached endpoints / examples / request tracking for collections no longer in Status.collections. */
+function pruneCollections(
+  endpoints: ReadonlyMap<string, CollectionEndpointView[]>,
+  examples: ReadonlyMap<string, CollectionExampleView>,
+  requested: ReadonlySet<string>,
+  collections: Status['collections'],
+): {
+  collectionEndpoints: ReadonlyMap<string, CollectionEndpointView[]>;
+  collectionExamples: ReadonlyMap<string, CollectionExampleView>;
+  collectionRequested: ReadonlySet<string>;
+} {
+  const live = new Set((collections ?? []).map((c) => c.id));
+  let nextEndpoints = endpoints;
+  if (endpoints.size) {
+    let changed = false;
+    for (const k of endpoints.keys()) if (!live.has(k)) { changed = true; break; }
+    if (changed) {
+      const m = new Map<string, CollectionEndpointView[]>();
+      for (const [k, v] of endpoints) if (live.has(k)) m.set(k, v);
+      nextEndpoints = m;
+    }
+  }
+  let nextExamples = examples;
+  if (examples.size) {
+    let changed = false;
+    for (const ex of examples.values()) if (!live.has(ex.id)) { changed = true; break; }
+    if (changed) {
+      const m = new Map<string, CollectionExampleView>();
+      for (const [k, v] of examples) if (live.has(v.id)) m.set(k, v);
+      nextExamples = m;
+    }
+  }
+  let nextRequested = requested;
+  if (requested.size) {
+    let changed = false;
+    for (const id of requested) if (!live.has(id)) { changed = true; break; }
+    if (changed) {
+      const s = new Set<string>();
+      for (const id of requested) if (live.has(id)) s.add(id);
+      nextRequested = s;
+    }
+  }
+  return { collectionEndpoints: nextEndpoints, collectionExamples: nextExamples, collectionRequested: nextRequested };
 }
 
 /**

@@ -22,6 +22,8 @@ export function Toolbar() {
   const filterErrors = parseFilter(filters.text).errors;
   const browserHidden = hiddenBrowserCount(state.exchanges, filters);
   const alerts = authAlerts(state.authFlows);
+  const collections = status.collections ?? [];
+  const colIssues = collections.reduce((n, c) => n + (c.problems?.length ?? 0) + (c.unresolved?.length ?? 0), 0);
   const anyBrowser = filters.showBrowser || browserHidden > 0 || state.exchanges.some((e) => e.browserInternal);
 
   return (
@@ -34,6 +36,14 @@ export function Toolbar() {
         <button type="button" role="tab" class="seg-btn" aria-selected={view === 'rules'}
           onClick={() => dispatch({ type: 'setView', view: 'rules' })}>
           Rules{state.rules.length ? <span class="count">{state.rules.filter((r) => r.enabled).length}/{state.rules.length}</span> : null}
+        </button>
+        <button type="button" role="tab" class="seg-btn" aria-selected={view === 'collections'}
+          title={collections.length
+            ? (colIssues ? `${collections.length} collection${collections.length === 1 ? '' : 's'} — ${colIssues} issue${colIssues === 1 ? '' : 's'} to review` : 'Mock requests from Postman collections or OpenAPI 3 files')
+            : 'Mock requests from a Postman collection or OpenAPI 3 file'}
+          onClick={() => dispatch({ type: 'setView', view: 'collections' })}>
+          Collections
+          {collections.length ? <span class={`count${colIssues ? ' warn-count' : ''}`}>{collections.filter((c) => c.enabled).length}/{collections.length}</span> : null}
         </button>
         <button type="button" role="tab" class="seg-btn" aria-selected={view === 'recordings'}
           title={status.replay ? `Replaying “${status.replay.recording}”` : 'Save, replay and compare traffic'}
