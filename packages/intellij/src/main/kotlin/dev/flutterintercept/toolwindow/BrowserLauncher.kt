@@ -58,7 +58,7 @@ object BrowserLauncher {
     }
 
     /** Opens [url] in the system browser through a redirect file; [browse] gets only the file. */
-    fun open(url: String, dataDir: File, browse: (File) -> Unit = { BrowserUtil.browse(it) }) {
+    fun open(url: String, dataDir: File, browse: (File) -> Unit = { BrowserUtil.browse(it.toPath()) }) {
         val dir = redirectDir(dataDir)
         cleanup(dir)
         val file = writeRedirect(url, dir)

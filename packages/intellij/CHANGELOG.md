@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.16.1 (preview)
+
+- No longer uses IntelliJ Platform APIs that are deprecated or scheduled for removal (`BrowserUtil.browse(File)` when
+  opening the browser view, `FileEditorManager.openFile(VirtualFile, boolean)` when opening untitled files), so the
+  plugin stays compatible with IntelliJ IDEA 2026.3 and later. No change in behavior.
+
 ## 0.16.0 (preview)
 
 - **Collections that remember**, the same as in the VS Code extension 0.16.0: REST resources in a collection are found

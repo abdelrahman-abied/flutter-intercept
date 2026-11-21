@@ -148,7 +148,7 @@ object UiRequestHandler {
             val f = el as? JsonObject ?: continue
             val name = fileNameFor(f.optString("name") ?: "untitled", f.optString("language"))
             val vf = LightVirtualFile(name, fileType(name), f.optString("content") ?: "")
-            FileEditorManager.getInstance(project).openFile(vf, true)
+            FileEditorManager.getInstance(project).openEditor(OpenFileDescriptor(project, vf), true)
         }
         return null
     }
