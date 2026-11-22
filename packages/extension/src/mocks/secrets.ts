@@ -77,8 +77,32 @@ function isSecretRun(w: string): boolean {
   return false;
 }
 
+/**
+ * PERF-5 #1: names repeat (every answer of an endpoint has the same keys and headers), so the pure name checks keep
+ * their answers. Bounded: only names up to `MAX_NAME` characters, and the map starts over at `MEMO_SIZE` entries, so
+ * hostile input with endless distinct names costs at most one check each, as before, and a few MB per check at most
+ * (4 096 names of ≤ 200 characters; ~1.8 MB measured for non-Latin names).
+ */
+const MEMO_SIZE = 4096;
+
+export function memoName(check: (name: string) => boolean): (name: string) => boolean {
+  const known = new Map<string, boolean>();
+  return (name: string): boolean => {
+    if (typeof name !== 'string' || name.length > MAX_NAME) return check(name);
+    let r = known.get(name);
+    if (r === undefined) {
+      r = check(name);
+      if (known.size >= MEMO_SIZE) known.clear();
+      known.set(name, r);
+    }
+    return r;
+  };
+}
+
 /** The shared name rule (see the header). Field names, query names, form fields and header names alike. */
-export function isSecretName(name: string): boolean {
+export const isSecretName: (name: string) => boolean = memoName(secretNameCheck);
+
+function secretNameCheck(name: string): boolean {
   if (typeof name !== 'string' || name === '') return false;
   const words = fieldWords(name);
   if (words.length === 1 && words[0] === 'session') return true;

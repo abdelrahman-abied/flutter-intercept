@@ -124,6 +124,8 @@ async function start(): Promise<void> {
     },
     isThrottleOnlyRule: () => false,
     driftEnabled: () => driftOn,
+    // fake timers: a sliced tick's rest would wait for an immediate (PERF-5 #4); the real clock decides the slice
+    driftSliceMs: Infinity,
   });
   await svc.ready;
 }

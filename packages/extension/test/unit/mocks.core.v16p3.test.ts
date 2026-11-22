@@ -1043,6 +1043,55 @@ describe('more sources through the core (§24.4, §24.7)', () => {
     expect(mocked().endpoints).toBe(1); // the last good version is kept
   });
 
+  it('PERF-5 #3: Bruno files are stat-ed and read at most 16 at a time, and taken in walk order whatever finishes first', async () => {
+    const root = `${ROOT}/api/many`;
+    const bru = (n: number) => `meta {\n  name: R${n}\n  type: http\n  seq: ${n + 1}\n}\n\nget {\n  url: https://many.example/r${String(n).padStart(3, '0')}\n}\n`;
+    files.put(`${root}/bruno.json`, '{"version":"1","name":"Many","type":"collection"}');
+    for (let n = 0; n < 120; n++) files.put(`${root}/${n % 3 ? `f${n % 3}/` : ''}r${String(n).padStart(3, '0')}.bru`, bru(n));
+    // files that aren't UTF-8 each add a problem line in read order (the parser sorts requests, not problems)
+    for (let n = 0; n < 40; n++) files.put(`${root}/${n % 3 ? `f${n % 3}/` : ''}r${String(n * 3).padStart(3, '0')}x.bru`, new Uint8Array([0x6d, 0xff, 0xfe, n]));
+    files.put(FILE, link('api/many/bruno.json'));
+    await shared.reload();
+    core = makeCore();
+    await core.reload();
+    const expected = core.endpoints('shop').map((e) => e.url);
+    expect(expected).toHaveLength(120);
+    const order = (c: MockCollectionsCore) => mocked(c).problems.filter((p) => /not UTF-8/.test(p));
+    const hashOf = (c: MockCollectionsCore) => (c as unknown as { entries: { good?: { contentHash: string } }[] }).entries[0].good?.contentHash;
+    expect(order(core).length).toBeGreaterThan(5);
+
+    // the same files on a slow disk: later calls finish first
+    class SlowFs extends FakeFs {
+      now = 0;
+      most = 0;
+      calls = 0;
+      private async slow<T>(f: () => Promise<T>): Promise<T> {
+        const wait = 8 - (this.calls++ % 8);
+        this.most = Math.max(this.most, ++this.now);
+        try {
+          await new Promise((r) => setTimeout(r, wait));
+          return await f();
+        } finally {
+          this.now--;
+        }
+      }
+      override stat(p: string) {
+        return this.slow(() => super.stat(p));
+      }
+      override readFile(p: string) {
+        return this.slow(() => super.readFile(p));
+      }
+    }
+    const slow = Object.assign(new SlowFs(), { files: files.files, dirs: files.dirs });
+    const second = makeCore({ fs: slow });
+    await second.reload();
+    expect(second.endpoints('shop').map((e) => e.url)).toEqual(expected);
+    expect(order(second)).toEqual(order(core));
+    expect(hashOf(second)).toBe(hashOf(core));
+    expect(slow.most).toBeGreaterThan(1);
+    expect(slow.most).toBeLessThanOrEqual(16);
+  });
+
   it('Bruno folder limits: total size', async () => {
     const root = `${ROOT}/api/heavy`;
     files.put(`${root}/bruno.json`, '{"version":"1","name":"Heavy","type":"collection"}');

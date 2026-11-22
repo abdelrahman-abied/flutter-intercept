@@ -612,6 +612,12 @@ describe('#15g: the Bruno walk reads each file through the descriptor it checked
       expect(await inner.readWalked(byRel.get('swap.bru'))).toBeUndefined();
       expect(await inner.readWalked(byRel.get('replaced.bru'))).toBeUndefined();
       expect(new TextDecoder().decode(await inner.readWalked(byRel.get('ok.bru')))).toContain('https://in.test/ok');
+      // PERF-5 #3: reads side by side take their size from the shared budget first; none is read past it
+      let budget = 10;
+      const reserve = (n: number) => (budget -= n) >= 0;
+      const over = await (inner.readWalked as (f: unknown, r: (n: number) => boolean) => Promise<unknown>).call(core, byRel.get('ok.bru'), reserve);
+      expect(typeof over).toBe('symbol');
+      expect(budget).toBeLessThan(0);
       // a whole read after a fresh walk never follows the link
       const r = await inner.readBruno({ file: 'api/c/bruno.json', variables: {} }, ws, false);
       expect(r.parsed.endpoints.map((e) => e.name).sort()).toEqual(['NEW-FILE', 'ok']);

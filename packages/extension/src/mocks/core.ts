@@ -113,6 +113,8 @@ export const DRIFT_IGNORED_KEY = 'flutterIntercept.driftIgnored';
 /** CONTRACTS §23.3: queue debounce and batch size. */
 export const DRIFT_DEBOUNCE_MS = 500;
 export const DRIFT_PER_TICK = 50;
+/** PERF-5 #4: a tick's batch runs in slices of about this long, so a burst of big answers never blocks the host long. */
+export const DRIFT_SLICE_MS = 10;
 /** Answers larger than this are not compared (§23.3: a JSON response ≤ 1 MB). */
 const DRIFT_MAX_BODY = 1024 * 1024;
 const MAX_DRIFT_QUEUE = 1000;
@@ -134,6 +136,32 @@ export const NOT_A_COLLECTION = 'not a Postman collection, an OpenAPI 3 or Swagg
 /** CONTRACTS §24.4: directory entries looked at while walking a Bruno folder (files of every kind, before filtering). */
 export const BRUNO_MAX_ENTRIES = 20_000;
 const BRUNO_FILE_SPEC: WorkspaceFileSpec = { what: 'Bruno file', maxBytes: brunoLimits.totalBytes, maxLabel: '20 MB' };
+/** PERF-5 #3: Bruno files stat-ed and read at a time (results still taken in order, so every limit and check is as before). */
+const BRUNO_IO_WINDOW = 16;
+/** PERF-5 #3: `readWalked` did not read a file because the Bruno budget (20 MB in all) is spent. */
+const OVER_BUDGET: unique symbol = Symbol('over budget');
+
+/**
+ * PERF-5 #3: `fn` over `items`, at most `window` started and not yet taken; yields the results in input order. A
+ * consumer that stops early (a limit throws) leaves at most `window - 1` started calls, whose rejections are ignored.
+ */
+async function* inOrder<T, R>(items: readonly T[], window: number, fn: (item: T) => Promise<R>): AsyncGenerator<R> {
+  const started: Promise<R>[] = [];
+  let next = 0;
+  const fill = (): void => {
+    while (next < items.length && started.length < window) {
+      const p = fn(items[next++]);
+      p.catch(() => undefined);
+      started.push(p);
+    }
+  };
+  fill();
+  while (started.length) {
+    const r = await started.shift()!;
+    fill();
+    yield r;
+  }
+}
 /** CONTRACTS §24.1: the notes on answers of the auth gate (the panel reads them; nothing is added to them). */
 export const AUTH_NOTES = { noToken: 'auth: 401 no token', expired: 'auth: 401 expired', signedIn: 'auth: signed in', refreshed: 'auth: refreshed' } as const;
 /** A header value a rendered answer may carry (as a rule's: no CR / LF / NUL; bounded). */
@@ -209,6 +237,8 @@ export interface MockCollectionsCoreDeps {
   onDriftChange?(): void;
   /** §23.3: how long finished exchanges wait before they are looked at (default 500 ms). */
   driftDebounceMs?: number;
+  /** PERF-5 #4: how long one slice of a tick may run (default `DRIFT_SLICE_MS`; tests with fake timers: `Infinity`). */
+  driftSliceMs?: number;
 }
 
 /** CONTRACTS §22.7: this user's store settings for one collection. `snapshot: null` = start from the seed. */
@@ -660,6 +690,7 @@ export class MockCollectionsCore {
         continue;
       }
       entries = [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      const bru: { abs: string; relPath: string }[] = [];
       for (const ent of entries) {
         if (++visited > BRUNO_MAX_ENTRIES) throw new Error(`${rel}: its folder holds more than ${BRUNO_MAX_ENTRIES} files and folders (not read as a Bruno collection)`);
         const name = ent.name;
@@ -686,13 +717,19 @@ export class MockCollectionsCore {
           continue;
         }
         if (!/\.bru$/i.test(name)) continue; // only request files are ever read (never .env, scripts, data files)
-        let st: Awaited<ReturnType<RulesFs['stat']>>;
+        bru.push({ abs, relPath });
+      }
+      // PERF-5 #3: this folder's request files stat-ed a few at a time, taken in name order as before
+      const stats = inOrder(bru, BRUNO_IO_WINDOW, async (c) => {
         try {
-          st = await fs.stat(abs);
+          return { c, st: await fs.stat(c.abs) };
         } catch {
-          continue;
+          return { c, st: undefined };
         }
-        if (!st.isFile()) continue;
+      });
+      for await (const { c, st } of stats) {
+        const { abs, relPath } = c;
+        if (!st?.isFile()) continue;
         if (files.length >= brunoLimits.files) throw new Error(`${rel}: more than ${brunoLimits.files} request files in the collection folder (not read)`);
         total += st.size;
         if (total > brunoLimits.totalBytes) throw new Error(`${rel}: the collection's files are larger than 20 MB in all (not read)`);
@@ -720,14 +757,19 @@ export class MockCollectionsCore {
     const files: BrunoFile[] = [];
     const problems = [...walked.problems];
     let total = 0;
-    for (const f of walked.files) {
-      const bytes = await this.readWalked(f);
+    // PERF-5 #3: read a few at a time, each through its checked descriptor; taken in walk order as before
+    // PERF-5 #3: reads run side by side, so each one first takes its size from the 20 MB budget (never 16 × 20 MB held)
+    let reserved = 0;
+    const reserve = (n: number): boolean => (reserved += n) <= brunoLimits.totalBytes;
+    const tooLarge = () => new Error(`${link.file}: the collection's files are larger than 20 MB in all (not read)`);
+    for await (const { f, bytes } of inOrder(walked.files, BRUNO_IO_WINDOW, async (f): Promise<{ f: WalkedFile; bytes: Uint8Array | undefined | typeof OVER_BUDGET }> => ({ f, bytes: await this.readWalked(f, reserve) }))) {
+      if (bytes === OVER_BUDGET) throw tooLarge();
       if (!bytes) {
         problems.push(`${f.rel} changed while the collection was read (skipped)`);
         continue;
       }
       total += bytes.byteLength;
-      if (total > brunoLimits.totalBytes) throw new Error(`${link.file}: the collection's files are larger than 20 MB in all (not read)`);
+      if (total > brunoLimits.totalBytes) throw tooLarge();
       let text: string;
       try {
         text = decodeWorkspaceFile(bytes, f.rel, BRUNO_FILE_SPEC);
@@ -757,7 +799,7 @@ export class MockCollectionsCore {
    * walk saw. Undefined when it is no longer that file. An fs that reports no identity (in-memory, virtual) is read
    * as before.
    */
-  private async readWalked(f: WalkedFile): Promise<Uint8Array | undefined> {
+  private async readWalked(f: WalkedFile, reserve?: (bytes: number) => boolean): Promise<Uint8Array | undefined | typeof OVER_BUDGET> {
     if (f.dev === undefined || f.ino === undefined) return this.deps.fs.readFile(f.real);
     let h: Awaited<ReturnType<typeof fsPromises.open>>;
     try {
@@ -768,6 +810,7 @@ export class MockCollectionsCore {
     try {
       const st = await h.stat();
       if (!st.isFile() || st.dev !== f.dev || st.ino !== f.ino || st.size > brunoLimits.totalBytes) return undefined;
+      if (reserve && !reserve(st.size)) return OVER_BUDGET;
       return await h.readFile();
     } finally {
       await h.close().catch(() => undefined);
@@ -2653,6 +2696,9 @@ export class MockCollectionsCore {
   /** Exchange ids already looked at (classification once per exchange, like `seen`). */
   private driftDone = new Set<string>();
   private driftTimer?: ReturnType<typeof setTimeout>;
+  private driftResume?: ReturnType<typeof setImmediate>;
+  /** PERF-5 #4: what is left of the newest sliced tick (the head of the queue); the pending resume takes this many. */
+  private driftLeft = 0;
   /** `link\0endpoint\0status` → the newest qualifying exchange (Update example takes its body). */
   private driftLatest = new Map<string, string>();
 
@@ -2696,23 +2742,68 @@ export class MockCollectionsCore {
     if (this.driftTimer) return;
     this.driftTimer = setTimeout(() => {
       this.driftTimer = undefined;
-      this.flushDrift();
+      this.flushDrift(DRIFT_PER_TICK, this.driftSliceMs());
     }, this.deps.driftDebounceMs ?? DRIFT_DEBOUNCE_MS);
     (this.driftTimer as { unref?: () => void }).unref?.();
   }
 
-  /** Looks at up to `max` queued exchanges now (the debounce timer calls it; tests too). */
-  flushDrift(max = DRIFT_PER_TICK): void {
+  private driftSliceMs(): number {
+    return this.deps.driftSliceMs ?? DRIFT_SLICE_MS;
+  }
+
+  /**
+   * PERF-5 #4: the rest of a tick's batch, on the next turn of the event loop (no new debounce). A tick that ran while a
+   * resume was waiting took the older rest from the head of the queue first, so the newest count is the one to take.
+   */
+  private resumeDrift(left: number, sliceMs: number): void {
+    this.driftLeft = left;
+    if (this.driftResume) return;
+    this.driftResume = setImmediate(() => {
+      this.driftResume = undefined;
+      const n = this.driftLeft;
+      this.driftLeft = 0;
+      if (n > 0) this.flushDrift(n, sliceMs);
+    });
+    (this.driftResume as { unref?: () => void }).unref?.();
+  }
+
+  /** Cancels waiting drift work: the debounce, a sliced tick's rest and the queue (the setting off, the host disposed). */
+  stopDrift(): void {
+    this.driftQueue = [];
+    if (this.driftTimer) clearTimeout(this.driftTimer);
+    this.driftTimer = undefined;
+    if (this.driftResume) clearImmediate(this.driftResume);
+    this.driftResume = undefined;
+    this.driftLeft = 0;
+  }
+
+  /**
+   * Looks at up to `max` queued exchanges (the debounce timer calls it; tests too). PERF-5 #4: with `sliceMs`, stops
+   * once that much time has gone (after at least one exchange) and leaves the rest of the batch at the head of the
+   * queue for `resumeDrift`; without it (tests, agents) the whole batch runs now, as before.
+   */
+  flushDrift(max = DRIFT_PER_TICK, sliceMs = Infinity): void {
     const batch = this.driftQueue.splice(0, max);
     if (this.driftQueue.length) this.scheduleDrift();
     if (!batch.length || !this.driftOn()) return;
     const before = this.driftSignature();
+    const started = performance.now();
+    let done = 0;
     for (const ex of batch) {
+      if (done > 0 && performance.now() - started >= sliceMs) break;
+      done++;
       try {
         this.observeOne(ex);
       } catch (e) {
         this.deps.log?.(`collections: drift check failed: ${cleanLine((e as Error).message, 200)}`);
       }
+    }
+    if (done < batch.length) {
+      this.driftQueue.unshift(...batch.slice(done));
+      this.resumeDrift(batch.length - done, sliceMs);
+    } else {
+      // the whole batch ran, and it began at the head: a rest a resume was waiting for is in it
+      this.driftLeft = 0;
     }
     if (this.driftSignature() !== before) this.deps.onDriftChange?.();
   }
@@ -2788,10 +2879,8 @@ export class MockCollectionsCore {
     if (this.driftOn()) return;
     const had = this.driftSignature();
     this.driftTracker = undefined;
-    this.driftQueue = [];
+    this.stopDrift();
     this.driftLatest.clear();
-    if (this.driftTimer) clearTimeout(this.driftTimer);
-    this.driftTimer = undefined;
     if (had !== this.driftSignature()) this.deps.onDriftChange?.();
   }
 

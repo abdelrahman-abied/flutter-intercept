@@ -63,6 +63,8 @@ export interface MockCollectionsDeps {
   driftEnabled?(): boolean;
   /** Tests: the drift debounce (default 500 ms). */
   driftDebounceMs?: number;
+  /** Tests with fake timers: the drift slice (default 10 ms; `Infinity` = a whole tick at once). */
+  driftSliceMs?: number;
 }
 
 export interface MockCollectionsHost extends vscode.Disposable {
@@ -226,6 +228,7 @@ export function createMockCollectionsService(deps: MockCollectionsDeps): MockCol
     ...(deps.isThrottleOnlyRule ? { isThrottleOnlyRule: deps.isThrottleOnlyRule } : {}),
     ...(deps.driftEnabled ? { driftEnabled: deps.driftEnabled } : {}),
     ...(deps.driftDebounceMs !== undefined ? { driftDebounceMs: deps.driftDebounceMs } : {}),
+    ...(deps.driftSliceMs !== undefined ? { driftSliceMs: deps.driftSliceMs } : {}),
     onDriftChange: () => {
       if (!disposed) driftChanged.fire();
     },
@@ -613,6 +616,7 @@ export function createMockCollectionsService(deps: MockCollectionsDeps): MockCol
     reload,
     dispose: () => {
       disposed = true;
+      core.stopDrift();
       diffRegistration?.dispose();
       diffDocs.clear();
       clearTimeout(timer);

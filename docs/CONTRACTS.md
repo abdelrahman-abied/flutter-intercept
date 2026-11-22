@@ -3222,6 +3222,9 @@ function collectionFromTraffic(exchanges: readonly Exchange[], o: FromTrafficOpt
 - **Ignore**: workspaceState `flutterIntercept.driftIgnored[folder\0id\0endpoint\0status] = fingerprint`; it returns
   only when the set of changes differs. Setting `flutterIntercept.collectionDrift` (default true).
 - **Cost**: classification cached per exchange; queue debounced 500 ms, ≤ 50 exchanges per tick; ≤ 2 ms per 100 KB body.
+  A tick runs in slices of about 10 ms (`DRIFT_SLICE_MS`, at least one exchange each); the rest of its batch stays at
+  the head of the queue and continues on the next turn of the event loop, never past the tick's 50 (PERF-5 #4).
+  `flushDrift(max)` called without a slice (tests, agents) still runs its whole batch at once.
 ```ts
 interface DriftChange { kind: 'added' | 'removed' | 'type' | 'nullable' | 'status'; path: string; from?: string; to?: string }
 interface DriftView { endpoint: string; status: number; samples: number; changes: DriftChange[]; since: number }

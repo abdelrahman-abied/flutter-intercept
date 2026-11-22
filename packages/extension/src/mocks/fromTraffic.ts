@@ -47,6 +47,7 @@ import {
   isCredentialValue,
   isSecretHeaderName,
   isSecretName,
+  memoName,
   JWT_WHOLE,
   safeNameLabel,
   scrubNamedText,
@@ -123,6 +124,10 @@ function hasWord(name: string, words: ReadonlySet<string>): boolean {
   for (const w of fieldWords(name)) if (words.has(w)) return true;
   return false;
 }
+
+/** PERF-5 #1: keys repeat across answers; the word checks keep their answers (`memoName`, bounded). */
+const isAddressName = memoName((name) => hasWord(name, ADDRESS_WORDS));
+const isPhoneName = memoName((name) => hasWord(name, PHONE_WORDS));
 
 class JsonRewriteError extends Error {}
 
@@ -251,11 +256,11 @@ export class TrafficSanitiser {
     let out = v;
     if (!this.replacePersonalData) return out;
     if (EMAIL_WHOLE.test(out)) return this.email(out);
-    if (mode === 'address' || (key !== undefined && hasWord(key, ADDRESS_WORDS))) {
+    if (mode === 'address' || (key !== undefined && isAddressName(key))) {
       this.note('addresses and locations');
       return '';
     }
-    if ((mode === 'phone' || (key !== undefined && hasWord(key, PHONE_WORDS))) && /\d/.test(out)) return this.phone(out);
+    if ((mode === 'phone' || (key !== undefined && isPhoneName(key))) && /\d/.test(out)) return this.phone(out);
     out = this.emailsIn(out);
     return out;
   }
@@ -272,11 +277,11 @@ export class TrafficSanitiser {
       return keep('0');
     }
     if (!this.replacePersonalData) return raw;
-    if (mode === 'address' || (key !== undefined && hasWord(key, ADDRESS_WORDS))) {
+    if (mode === 'address' || (key !== undefined && isAddressName(key))) {
       this.note('addresses and locations');
       return keep('0');
     }
-    if (mode === 'phone' || (key !== undefined && hasWord(key, PHONE_WORDS))) return keep(this.phone(raw).slice(1));
+    if (mode === 'phone' || (key !== undefined && isPhoneName(key))) return keep(this.phone(raw).slice(1));
     return raw;
   }
 
@@ -286,8 +291,8 @@ export class TrafficSanitiser {
       this.note(key);
       return 'secret';
     }
-    if (this.replacePersonalData && hasWord(key, ADDRESS_WORDS)) return 'address';
-    if (this.replacePersonalData && hasWord(key, PHONE_WORDS)) return 'phone';
+    if (this.replacePersonalData && isAddressName(key)) return 'address';
+    if (this.replacePersonalData && isPhoneName(key)) return 'phone';
     return 'normal';
   }
 

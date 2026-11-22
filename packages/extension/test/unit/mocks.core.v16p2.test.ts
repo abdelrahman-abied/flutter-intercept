@@ -347,6 +347,56 @@ describe('drift (§23.3)', () => {
     expect(core.driftOf(id)).toEqual([]);
   });
 
+  it('PERF-5 #4: a tick runs in time slices; the rest of its batch follows on the next turns, still ≤ 50 per tick', async () => {
+    const id = await stale();
+    const queue = () => (core as unknown as { driftQueue: unknown[] }).driftQueue.length;
+    const turns = async (n: number) => {
+      for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r));
+    };
+    // the real 500 ms debounce must not run in the middle of this test (a slow machine): only the slices run
+    const observe = (n: number) => {
+      for (let i = 0; i < n; i++) core.observeExchange(answer('GET', `${A}/users/42`, 200, userBody({ tier: 'gold' })));
+      const c = core as unknown as { driftTimer?: ReturnType<typeof setTimeout> };
+      clearTimeout(c.driftTimer);
+      c.driftTimer = undefined;
+    };
+    observe(3);
+    core.flushDrift(50, 0); // a slice of 0 ms: one exchange, then the rest waits for the next turn
+    expect(queue()).toBe(2);
+    expect(core.driftOf(id)).toEqual([]);
+    await turns(5);
+    expect(queue()).toBe(0);
+    expect(core.driftOf(id)).toHaveLength(1);
+    expect(driftEvents).toBe(1);
+
+    // a tick never takes more than its 50, however it is sliced
+    observe(60);
+    core.flushDrift(50, 0);
+    await turns(60);
+    expect(queue()).toBe(10);
+    core.flushDrift(50);
+    expect(queue()).toBe(0);
+
+    // a whole tick that runs while a sliced tick's rest waits took that rest from the head: the resume takes nothing
+    observe(70);
+    core.flushDrift(50, 0); // 1 looked at, 49 wait for the next turn
+    core.flushDrift(50); // the debounce fires first: those 49 and one more
+    await turns(5);
+    expect(queue()).toBe(19);
+    core.flushDrift(50);
+
+    // the setting off drops what a sliced tick left
+    observe(10);
+    core.flushDrift(50, 0);
+    expect(queue()).toBe(9);
+    driftOn = false;
+    core.refreshDrift();
+    driftOn = true;
+    await turns(5);
+    expect(queue()).toBe(0);
+    expect(core.driftOf(id)).toEqual([]);
+  });
+
   it('cleared when the collection file changes (a new parse)', async () => {
     const id = await stale();
     serve(...[1, 2, 3].map(() => answer('GET', `${A}/users/42`, 200, userBody({ tier: 'gold' }))));
